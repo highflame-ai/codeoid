@@ -112,13 +112,19 @@
  * child session's only — is settled "once" without being published, as
  * such a plugin's hook does), FAKE_OPENCODE_ENV_FAIL=child (setting a child
  * session's environment answers 500), FAKE_OPENCODE_SHELLS_UNLISTED=1
- * (`GET /api/shell` lists nothing).
+ * (`GET /api/shell` lists nothing), FAKE_OPENCODE_MOVE_FEED_LAG_MS (the
+ * events of a session's move reach the feed that long after its reply),
+ * FAKE_OPENCODE_MOVE_IGNORED=1 (a move answers 204 and leaves the session
+ * where it was).
+ *
+ * A fork keeps its source's directory, as real 2.2.5's does; `POST
+ * …/move` rebinds a session to another (one that exists).
  * `GET /__fake/state` (test-only, no auth) returns everything recorded;
  * `POST /__fake/delete/<id>[?quiet=1]` deletes a session (quiet: no event);
  * `POST /__fake/tamper/<id>` sets its rules to allow-all and saves an "always".
  */
 
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
 
 const password = process.env.OPENCODE_PASSWORD ?? "";
 const version = process.env.FAKE_OPENCODE_VERSION ?? "2.2.5";
@@ -185,6 +191,8 @@ const state = {
   mcpRemoved: [] as Json[],
   patches: [] as Json[],
   forks: [] as Json[],
+  /** `POST …/move` calls that moved a session. */
+  moves: [] as Json[],
   interrupts: [] as string[],
   inboxCancels: [] as string[],
   mcpPromptCalls: [] as Json[],
@@ -1338,6 +1346,25 @@ const server = Bun.serve({
       forked.messages = ses.messages.slice(0, idx);
       state.forks.push({ source: ses.id, before: before ?? null, id: forked.id });
       return json({ data: info(forked) });
+    }
+    if (rest === "/move" && method === "POST") {
+      // As real 2.2.5: a directory that doesn't exist is refused; an idle
+      // session takes the move at once, in a short execution of its own (on
+      // the feed after the reply with FAKE_OPENCODE_MOVE_FEED_LAG_MS).
+      const directory = String(body.directory ?? "");
+      if (!existsSync(directory)) return json({ _tag: "InvalidRequestError", message: `Directory does not exist: ${directory}` }, 400);
+      if (process.env.FAKE_OPENCODE_MOVE_IGNORED !== "1") ses.directory = directory;
+      state.moves.push({ sessionID: ses.id, directory });
+      ses.busy = Date.now();
+      ses.idle = Date.now();
+      const lag = Number(process.env.FAKE_OPENCODE_MOVE_FEED_LAG_MS ?? 0);
+      const announce = () => {
+        durable(ses, "session.execution.started", {});
+        durable(ses, "session.execution.succeeded", {});
+      };
+      if (lag > 0) setTimeout(announce, lag);
+      else announce();
+      return new Response(null, { status: 204 });
     }
     if (rest === "/model" && method === "POST") {
       ses.model = body.model as Json;

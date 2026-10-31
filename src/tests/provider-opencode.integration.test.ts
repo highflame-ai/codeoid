@@ -889,4 +889,25 @@ describe("opencode (real binary)", () => {
     expect(Date.now() - started).toBeLessThan(10_000);
     await p.teardown();
   }, 180_000);
+
+  maybeScripted("I27 a native fork into a worktree of its own runs its tools there, not in its parent's directory", async () => {
+    const parentDir = join(WORK, "i27-parent");
+    const forkDir = join(WORK, "i27-fork");
+    mkdirSync(parentDir);
+    mkdirSync(forkDir);
+    const parent = provider();
+    const ref = done(await collect(parent.runTurn(opts("Remember the number 41. [[text:ok]]", { workdir: parentDir }))))!.nativeRef!;
+    const fork = provider();
+    expect(await fork.continueNatively({ history: [], forkFrom: ref, maxChars: 10_000, workdir: forkDir })).toEqual({ via: "fork" });
+    const events = await collect(fork.runTurn(opts('[[tool:shell {"command":"pwd && touch fork-marker","description":"Where"}]]', { workdir: forkDir })));
+    const complete = events.find((e) => e.type === "tool_complete") as Extract<ProviderEvent, { type: "tool_complete" }> | undefined;
+    expect(complete?.output?.trim()).toBe(forkDir);
+    expect(existsSync(join(forkDir, "fork-marker"))).toBe(true);
+    expect(existsSync(join(parentDir, "fork-marker"))).toBe(false);
+    expect(done(events)?.stopReason).toBe("stop");
+    // Still the fork of the parent's conversation.
+    expect(texts(await collect(fork.runTurn(opts("[[recall]]", { workdir: forkDir })))).join(" ")).toContain("41");
+    await fork.teardown();
+    await parent.teardown();
+  }, 180_000);
 });

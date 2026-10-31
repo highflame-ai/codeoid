@@ -366,6 +366,11 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   (`opencodeShellEnv`, `PUT …/environment` before every turn and as a child is
   learned; a child's requests are allowed only once it's set): the server's
   model keys and injected config never reach it.
+- **Location**: opencode runs a session's tools in its location, and a fork
+  keeps its source's. A fork (or a resumed session) whose location isn't the
+  workdir is moved there (`#moveInto`, `POST …/move`; the move's own
+  execution is waited out before the session is followed) before anything
+  runs; one that didn't move falls back to the transcript seed in a new session.
 - **Teardown** stops the session's execution, subagents and background shells
   (`GET`/`DELETE /api/shell`: a stopped shell still wakes its session), and the
   wake. A fresh attach to a session found running stops that leftover

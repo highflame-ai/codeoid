@@ -1577,6 +1577,66 @@ describe("opencode commands and fork", () => {
     expect(st.patches.some((x: { sessionID: string }) => x.sessionID === st.forks[0].id)).toBe(true);
   });
 
+  it("a fork into a worktree of its own is moved there before it runs: its tools act in the fork's directory", async () => {
+    // The move's own execution reaches the feed late: it's no turn's.
+    const { server } = makeServer({ FAKE_OPENCODE_MOVE_FEED_LAG_MS: "5" });
+    const parentDir = realpathSync(tmp());
+    const forkDir = realpathSync(tmp());
+    const parent = makeProvider(server);
+    const first = done(await collect(parent.runTurn(opts("hi", { workdir: parentDir }))))!;
+    const fork = makeProvider(server, { sessionId: "sess-fork", initialBackingId: "sess-fork" });
+    expect(await fork.continueNatively({ history: [], forkFrom: first.nativeRef, maxChars: 10_000, workdir: forkDir })).toEqual({ via: "fork" });
+    const events = await collect(fork.runTurn(opts("hi", { workdir: forkDir })));
+    expect(texts(events, "text_done")).toEqual(["Hello, world"]);
+    expect(events.filter((e) => e.type === "turn_done")).toHaveLength(1);
+    const st = await fakeState(server);
+    expect(fork.backingSessionId).toBe(st.forks[0].id);
+    expect(st.moves).toEqual([{ sessionID: st.forks[0].id, directory: forkDir }]);
+    expect(st.sessions.find((x: { id: string }) => x.id === st.forks[0].id).location).toEqual({ directory: forkDir });
+    expect(st.prompts.at(-1)).toMatchObject({ sessionID: st.forks[0].id, text: "hi" });
+    // The parent stays where it is.
+    expect(st.sessions.find((x: { id: string }) => x.id === parent.backingSessionId).location).toEqual({ directory: parentDir });
+    await fork.teardown();
+    await parent.teardown();
+  });
+
+  it("a fork opencode won't move goes on from the transcript, in a new session in the fork's directory", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_MOVE_IGNORED: "1" });
+    const parentDir = realpathSync(tmp());
+    const forkDir = realpathSync(tmp());
+    const parent = makeProvider(server);
+    const first = done(await collect(parent.runTurn(opts("hi", { workdir: parentDir }))))!;
+    const fork = makeProvider(server, { sessionId: "sess-fork", initialBackingId: "sess-fork" });
+    await fork.continueNatively({ history: [{ role: "user", content: "hi" } as never], forkFrom: first.nativeRef, maxChars: 10_000, workdir: forkDir });
+    const events = await collect(fork.runTurn(opts("next", { workdir: forkDir })));
+    expect(events.some((e) => e.type === "custom_message" && e.metadata?.event === "history.native_fallback")).toBe(true);
+    const st = await fakeState(server);
+    const ran = st.sessions.find((x: { id: string }) => x.id === fork.backingSessionId);
+    expect(fork.backingSessionId).not.toBe(st.forks[0].id);
+    expect(ran.location).toEqual({ directory: forkDir });
+    expect(st.prompts.at(-1).sessionID).toBe(fork.backingSessionId);
+    await fork.teardown();
+    await parent.teardown();
+  });
+
+  it("a session resumed in another directory is moved there", async () => {
+    const { server } = makeServer();
+    const before = realpathSync(tmp());
+    const after = realpathSync(tmp());
+    const a = makeProvider(server);
+    await collect(a.runTurn(opts("hi", { workdir: before })));
+    const id = a.backingSessionId;
+    await a.teardown();
+    const b = makeProvider(server, { initialBackingId: id });
+    const events = await collect(b.runTurn(opts("hi", { workdir: after })));
+    expect(texts(events, "text_done")).toEqual(["Hello, world"]);
+    expect(b.backingSessionId).toBe(id);
+    const st = await fakeState(server);
+    expect(st.moves).toEqual([{ sessionID: id, directory: after }]);
+    expect(st.sessions.find((x: { id: string }) => x.id === id).location).toEqual({ directory: after });
+    await b.teardown();
+  });
+
   it("without a native point, continueNatively declines (transcript seed)", async () => {
     const { server } = makeServer();
     expect(await makeProvider(server).continueNatively({ history: [], maxChars: 1000, workdir: "/tmp" })).toBeNull();

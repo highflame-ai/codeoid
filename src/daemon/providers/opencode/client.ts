@@ -328,6 +328,11 @@ export class OpencodeClient {
     return (await this.#request<{ data: OcSessionInfo }>("POST", `/api/session/${encodeURIComponent(sessionID)}/fork`, { body: before ? { before } : {} })).data;
   }
 
+  /** Rebind the session to another directory (an inbox item: an idle session takes it at once). */
+  async moveSession(sessionID: string, directory: string): Promise<void> {
+    await this.#request("POST", `/api/session/${encodeURIComponent(sessionID)}/move`, { body: { directory } });
+  }
+
   async switchModel(sessionID: string, model: OcModelRef): Promise<void> {
     await this.#request("POST", `/api/session/${encodeURIComponent(sessionID)}/model`, { body: { model } });
   }

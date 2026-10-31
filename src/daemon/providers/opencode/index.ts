@@ -104,6 +104,8 @@ const WAKE_GRACE_MS = 300;
 const QUEUED_START_MS = 3_000;
 /** How long a turn's end waits to read the session's running total (#finishCounted). */
 const SPEND_READ_MS = 1_000;
+/** How long a session's move waits for the feed to show the move's own execution end. */
+const MOVE_SETTLE_MS = 1_000;
 /** After a slash command, how long to wait for it to start an execution. */
 const COMMAND_START_MS = 1_500;
 /** A turn's messages read back after a feed gap — far more than one turn writes. */
@@ -282,6 +284,12 @@ export class OpencodeProvider implements SessionProvider {
   #workdir: string | null = null;
   /** The last durable seq of this session seen on the feed (duplicates and stale replays are dropped). */
   #seq = -1;
+  /**
+   * A session #openSession moves into the workdir before this provider
+   * follows it: the move runs as a short execution of its own, no turn's,
+   * waited out before the session is followed.
+   */
+  #moving: { id: string; ended: () => void } | null = null;
   /**
    * The session's spend as codeoid has counted it: its total when attached,
    * plus every step since. opencode's own running total (`usage.updated`)
@@ -834,9 +842,11 @@ export class OpencodeProvider implements SessionProvider {
     if (pending) {
       try {
         const before = await this.#messageAfter(conn, pending.source, pending.after);
-        const forked = await conn.client.forkSession(pending.source, before);
+        let forked = await conn.client.forkSession(pending.source, before);
         // A fork may not carry the source's rules; this session's are set before anything runs.
         await conn.client.updateSession(forked.id, { permissions: rules });
+        // A fork stays where its source is: one into a worktree of its own runs there, or not at all.
+        forked = await this.#moveInto(conn, forked, workdir);
         this.#sessionModel = forked.model ?? null;
         this.#freshSession();
         this.#agentApplied = forked.agent !== undefined && forked.agent === this.#agent;
@@ -855,14 +865,17 @@ export class OpencodeProvider implements SessionProvider {
         let info = await conn.client.getSession(this.#backingSessionId);
         await conn.client.updateSession(info.id, { permissions: rules });
         if (sessionRunning(info)) info = await this.#stopLeftover(conn, info);
+        info = await this.#moveInto(conn, info, workdir);
         this.#sessionModel = info.model ?? null;
         this.#agentApplied = info.agent !== undefined && info.agent === this.#agent;
         return info;
       } catch (err) {
-        if (!(err instanceof OpencodeHttpError && err.status === 404)) throw err;
-        // Gone (a pruned database, another data dir): a fresh session must
-        // not start the conversation over — unless the session already
-        // queued what the new one gets.
+        // Gone (a pruned database, another data dir), or it can't be moved
+        // where the session works now: a fresh session must not start the
+        // conversation over — unless the session already queued what the
+        // new one gets.
+        if (err instanceof UnmovedError) console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] ${err.message}`);
+        else if (!(err instanceof OpencodeHttpError && err.status === 404)) throw err;
         if (this.#pendingHistorySeed === null) {
           console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] opencode session ${this.#backingSessionId} is gone — continuing from codeoid's history`);
           this.onHistoryLost?.();
@@ -899,6 +912,30 @@ export class OpencodeProvider implements SessionProvider {
     }
     if (sessionRunning(now)) throw new Error(`opencode session ${info.id} is still running something codeoid didn't start, and didn't stop — try again`);
     return now;
+  }
+
+  /**
+   * The session, bound to `workdir`: opencode runs a session's tools where
+   * its location is, and a fork (or a session codeoid's moved since) is
+   * elsewhere. An idle session takes the move at once; one that didn't is
+   * refused.
+   */
+  async #moveInto(conn: OpencodeConnection, info: OcSessionInfo, workdir: string): Promise<OcSessionInfo> {
+    if (info.location?.directory === workdir) return info;
+    const ended = Promise.withResolvers<void>();
+    const moving = { id: info.id, ended: ended.resolve };
+    this.#moving = moving;
+    try {
+      await conn.client.moveSession(info.id, workdir).catch((err: unknown) => {
+        throw new UnmovedError(`opencode session ${info.id} couldn't move to ${workdir}: ${err instanceof Error ? err.message : String(err)}`);
+      });
+      await Promise.race([ended.promise, Bun.sleep(MOVE_SETTLE_MS)]);
+      const now = await conn.client.getSession(info.id);
+      if (now.location?.directory !== workdir) throw new UnmovedError(`opencode session ${info.id} didn't move to ${workdir}`);
+      return now;
+    } finally {
+      if (this.#moving === moving) this.#moving = null;
+    }
   }
 
   /** A new opencode session has none of the old one's selection or instructions. */
@@ -1442,6 +1479,11 @@ export class OpencodeProvider implements SessionProvider {
 
   /** One event from the live feed: this session's own (durable or not), and its children's. */
   #onLive(ev: OcEvent): void {
+    const moving = this.#moving;
+    if (moving && ev.durable?.aggregateID === moving.id) {
+      if (ev.type === "session.execution.succeeded" || ev.type === "session.execution.failed" || ev.type === "session.execution.interrupted") moving.ended();
+      return;
+    }
     const ses = this.#ses;
     if (!ses) return;
     const d = (ev.data ?? {}) as Record<string, unknown>;
@@ -2367,6 +2409,9 @@ function stepEnded(m: OcMessage): boolean {
 }
 
 /** A session executing now, by its times: busy since it last went idle. */
+/** An opencode session that couldn't be bound to the directory the codeoid session works in. */
+class UnmovedError extends Error {}
+
 function sessionRunning(info: OcSessionInfo): boolean {
   const { busy, idle } = info.time ?? {};
   return busy !== undefined && (idle === undefined || idle < busy);
