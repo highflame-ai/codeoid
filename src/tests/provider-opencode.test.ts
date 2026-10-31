@@ -845,6 +845,14 @@ describe("opencode subagents", () => {
     expect(st.patches.some((x: { sessionID: string; permissions?: unknown }) => x.sessionID === start.agentId && x.permissions)).toBe(true);
   });
 
+  it("counts a subagent's failed step, which opencode bills", async () => {
+    const { server } = makeServer();
+    const events = await collect(makeProvider(server).runTurn(opts("subagent-fail")));
+    const start = events.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>;
+    expect(events.some((e) => e.type === "subagent_stop" && e.agentId === start.agentId)).toBe(true);
+    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.25, 6);
+  });
+
   it("a background subagent is background work; opencode's own follow-up turn is adopted", async () => {
     const { server } = makeServer();
     const p = makeProvider(server);

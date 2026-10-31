@@ -1402,7 +1402,9 @@ export class OpencodeProvider implements SessionProvider {
           this.#emit({ type: "subagent_start", agentId: sid, agentType: child.agentType });
         }
         return;
+      // A failed step is billed too (interrupted after the model answered).
       case "session.step.ended":
+      case "session.step.failed":
         this.#recordStep(d.tokens as OcTokenUsage | undefined, typeof d.cost === "number" ? d.cost : undefined, false);
         return;
       case "session.tool.success":

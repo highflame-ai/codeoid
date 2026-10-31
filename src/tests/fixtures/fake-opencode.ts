@@ -34,6 +34,7 @@
  *   "unknown-action" → a permission action codeoid doesn't know
  *   "ask-user"     → a question form; answers echoed back
  *   "subagent"     → foreground subagent in a child session (with a cost)
+ *   "subagent-fail" → its child's step fails after the model answered (billed)
  *   "background"   → background subagent; opencode resumes the parent itself
  *   "slow"         → keeps stepping until interrupted
  *   "steer"        → waits for a steered input, then answers it
@@ -513,6 +514,12 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     const runChild = async () => {
       durable(child, "session.execution.started", {});
       const cm = step(child);
+      if (text.includes("subagent-fail")) {
+        // Billed although it failed: the model answered before the step did.
+        durable(child, "session.step.failed", { assistantMessageID: cm, error: { type: "aborted", message: "Step interrupted" }, cost: 0.25, tokens: TOKENS });
+        durable(child, "session.execution.failed", { error: { type: "aborted", message: "Step interrupted" } });
+        return false;
+      }
       // The child asks too, under its own session id.
       const cr = await toolCall(child, cm, "shell", { command: "grep -r auth ." }, { action: "shell", resources: ["grep -r auth ."] });
       endStep(child, cm, 0.5);
