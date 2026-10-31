@@ -35,10 +35,11 @@
  *   I13 (scripted only) a model error opencode doesn't retry ends the turn promptly, with its status
  *   I14 (scripted only) the title opencode generates is billed, once
  *   I15 a session deleted on the server while attached: the next turn goes on in a new one, from codeoid's history
+ *   I16 (scripted only) a symlink out of the workdir: a read through it isn't a safe Read, a write names its real file
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
@@ -449,4 +450,58 @@ describe("opencode (real binary)", () => {
     expect(p.backingSessionId).toMatch(/^ses/);
     await p.teardown();
   }, 180_000);
+
+  maybeScripted("I16 a symlink out of the workdir: a read through it isn't a safe Read, a write names its real file", async () => {
+    // opencode reads and writes through a symlink inside the workdir without
+    // asking external_directory; guarded mode auto-approves Read/Grep/Glob.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-link-")));
+    const work = join(root, "work");
+    const outside = join(root, "outside");
+    mkdirSync(work);
+    mkdirSync(outside);
+    writeFileSync(join(outside, "secret.txt"), "OUTSIDE-SECRET\n");
+    writeFileSync(join(outside, "profile.txt"), "original\n");
+    symlinkSync(join(outside, "secret.txt"), join(work, "notes.txt"));
+    symlinkSync(outside, join(work, "docs"));
+    symlinkSync(join(outside, "profile.txt"), join(work, "config.txt"));
+    // As guarded mode: the safe reads go through, anything else is refused.
+    const asked: Array<[string, Record<string, unknown>]> = [];
+    const guarded: ToolApprovalFn = async (_t, _a, name, input) => {
+      asked.push([name, input]);
+      return name === "Read" || name === "Grep" || name === "Glob" ? { behavior: "allow" } : { behavior: "deny", message: "not approved" };
+    };
+    try {
+      for (const call of [
+        { tool: "read", input: { path: "notes.txt" } },
+        { tool: "read", input: { path: "docs/secret.txt" } },
+        { tool: "grep", input: { pattern: "OUTSIDE-SECRET", path: "docs" } },
+      ]) {
+        const p = provider();
+        asked.length = 0;
+        const events = await collect(p.runTurn(opts(`[[tool:${call.tool} ${JSON.stringify(call.input)}]]`, { workdir: work, canUseTool: guarded })));
+        expect(asked.map(([name]) => name)).toEqual(["opencode_external_directory"]);
+        expect(asked[0]![1]).toMatchObject({ directories: [outside] });
+        expect(events.some((e) => e.type === "tool_complete" && e.output.includes("OUTSIDE-SECRET"))).toBe(false);
+        await p.teardown();
+      }
+      const p = provider();
+      asked.length = 0;
+      await collect(
+        p.runTurn(
+          opts(`[[tool:write ${JSON.stringify({ path: "config.txt", content: "changed\n" })}]]`, {
+            workdir: work,
+            canUseTool: async (_t, _a, name, input) => {
+              asked.push([name, input]);
+              return { behavior: "deny", message: "not approved" };
+            },
+          }),
+        ),
+      );
+      expect(asked).toEqual([["Write", { file_path: join(outside, "profile.txt"), content: "changed\n", requested_path: join(work, "config.txt") }]]);
+      expect(readFileSync(join(outside, "profile.txt"), "utf8")).toBe("original\n");
+      await p.teardown();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 300_000);
 });

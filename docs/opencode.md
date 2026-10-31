@@ -61,6 +61,7 @@ codeoid owns the policy, so opencode is set to ask about every action and never 
 - Every codeoid session (and every child session a subagent starts) gets the rule *ask for everything*, last, so nothing an opencode agent allows survives it. The injected config says the same globally.
 - opencode documents that a subagent uses its own permissions, and its built-in `explore` subagent allows shell commands. When the server starts, codeoid reads every agent's rules; if a subagent would act without asking, codeoid restarts the server once with overrides that turn those allows into asks, and refuses to use a server where one remains.
 - codeoid answers each request once (`once`) or rejects it with the reason, which the model reads and carries on from. It never answers "always".
+- Paths are shown as they really resolve. opencode asks about a directory outside the session's working directory only when the path as written is outside it, and reads and writes through a symlink inside it without asking; so a read or search that a symlink takes outside the working directory is asked as `opencode_external_directory`, which is never approved on its own (`Read`, `Glob` and `Grep` are, in guarded mode), and a write names the file it really changes.
 - Anything that can't be shown faithfully is rejected without asking: an action codeoid doesn't know (a plugin's, an MCP server codeoid didn't mount), another session's MCP mount, a shell request without its command. A request still waiting when the server goes away counts as rejected.
 - The tools that act without asking (opencode's session rename/move, worktree and schedule tools) are turned off.
 - Code Mode (opencode's `execute` tool, which runs a script that calls tools and `fetch`) is turned off: on opencode 2.2.2 a script's `fetch` reaches any URL without asking anyone. opencode's browser tools stay off too, as opencode's own agents have them.
@@ -70,8 +71,8 @@ What the approver sees, in codeoid's terms (so the same rules, hooks and roles a
 | opencode | codeoid |
 | --- | --- |
 | `shell` | `Bash` with the full `command` |
-| `edit` (edit / write / patch) | `Edit` / `Write` with the absolute `file_path` |
-| `read`, `glob`, `grep` | `Read`, `Glob`, `Grep` |
+| `edit` (edit / write / patch) | `Edit` / `Write` with the absolute `file_path` of the file really changed (`requested_path` when a symlink led there) |
+| `read`, `glob`, `grep` | `Read`, `Glob`, `Grep` — or `opencode_external_directory` when a symlink in the working directory leads outside it |
 | `webfetch`, `websearch` | `WebFetch`, `WebSearch` |
 | `subagent`, `skill`, `todowrite` | `Task`, `Skill`, `TodoWrite` |
 | an MCP tool of a codeoid mount | `mcp__<server>__<tool>` |

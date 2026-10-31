@@ -7,9 +7,17 @@
  * permission action is mapped onto them, with the tool call's own input
  * where opencode's request doesn't carry it (a shell request's resources are
  * the parsed sub-commands, not the command line that runs).
+ *
+ * Paths are shown as they really resolve. opencode asks `external_directory`
+ * only for a path outside the workdir as written, and reads and writes
+ * through a symlink inside it without asking; the gate auto-approves `Read`,
+ * `Glob` and `Grep` in guarded mode. So a read or search that resolves
+ * outside the workdir is asked as `opencode_external_directory` (never
+ * auto-approved), and every card names the file that is really touched.
  */
 
-import { isAbsolute, resolve } from "node:path";
+import { lstatSync, readlinkSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { EFFORT_LEVELS, type EffortLevel } from "../../../protocol/types.js";
 import type { OcError, OcModelInfo, OcModelRef, OcPermissionRequest } from "./client.js";
 import { MCP_MOUNT_PREFIX } from "./policy.js";
@@ -52,6 +60,56 @@ function resourcePath(workdir: string, r: string | undefined): string | undefine
 }
 
 /**
+ * Where an absolute path really leads: every symlink resolved, a dangling
+ * one followed to where it would create its target, and a path that doesn't
+ * exist yet resolved through its nearest existing ancestor.
+ */
+export function realTarget(p: string, depth = 0): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    /* missing, or a dangling link */
+  }
+  if (depth > 40) return p;
+  try {
+    if (lstatSync(p).isSymbolicLink()) return realTarget(resolve(dirname(p), readlinkSync(p)), depth + 1);
+  } catch {
+    /* nothing there */
+  }
+  const up = dirname(p);
+  return up === p ? p : join(realTarget(up, depth + 1), basename(p));
+}
+
+/** `p` is `root` or under it. */
+function within(root: string, p: string): boolean {
+  const rel = relative(root, p);
+  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/**
+ * A read or search of `requested` (a path inside the workdir as written)
+ * that really reaches `target` outside it: asked as an external directory,
+ * which the gate never auto-approves. Null when it stays inside.
+ */
+function escapedRead(ctx: MapContext, tool: string, requested: string | undefined, target: string | undefined): GateCall | null {
+  if (!requested || !target || !within(ctx.workdir, requested) || within(realTarget(ctx.workdir), target)) return null;
+  let dir = target;
+  try {
+    if (!statSync(target).isDirectory()) dir = dirname(target);
+  } catch {
+    dir = dirname(target);
+  }
+  return { name: "opencode_external_directory", input: { directories: [dir], tool, path: target, requested } };
+}
+
+/** The real target of a path, and the path as asked when it differs. */
+function shown(requested: string | undefined): { path: string | undefined; requested?: string } {
+  if (!requested) return { path: undefined };
+  const path = realTarget(requested);
+  return path === requested ? { path } : { path, requested };
+}
+
+/**
  * What the gate is asked for a permission request. Unknown actions — a
  * plugin's, an MCP server codeoid didn't mount, another session's mount —
  * come back `unshowable`: rejected, never allowed.
@@ -67,7 +125,7 @@ export function gateCallFor(req: OcPermissionRequest, call: OcToolCall | undefin
         name: "Bash",
         input: {
           ...(command ? { command } : {}),
-          ...(str(input.workdir) ? { cwd: abs(ctx.workdir, str(input.workdir)) } : {}),
+          ...(str(input.workdir) ? { cwd: realTarget(abs(ctx.workdir, str(input.workdir))!) } : {}),
           ...(str(input.description) ? { description: input.description } : {}),
           ...(input.background === true ? { run_in_background: true } : {}),
           ...(typeof input.timeout === "number" ? { timeout: input.timeout } : {}),
@@ -79,15 +137,17 @@ export function gateCallFor(req: OcPermissionRequest, call: OcToolCall | undefin
     case "edit": {
       const tool = call?.name;
       // The resource is what opencode authorizes; the input only says it too.
-      const path = resourcePath(ctx.workdir, resources[0]) ?? abs(ctx.workdir, str(input.path));
+      const { path, requested } = shown(resourcePath(ctx.workdir, resources[0]) ?? abs(ctx.workdir, str(input.path)));
+      const via = requested ? { requested_path: requested } : {};
       if (tool === "write") {
-        return { name: "Write", input: { file_path: path, ...(typeof input.content === "string" ? { content: input.content } : {}) } };
+        return { name: "Write", input: { file_path: path, ...(typeof input.content === "string" ? { content: input.content } : {}), ...via } };
       }
       if (tool === "edit") {
         return {
           name: "Edit",
           input: {
             file_path: path,
+            ...via,
             ...(typeof input.oldString === "string" ? { old_string: input.oldString } : {}),
             ...(typeof input.newString === "string" ? { new_string: input.newString } : {}),
             ...(input.replaceAll === true ? { replace_all: true } : {}),
@@ -95,7 +155,7 @@ export function gateCallFor(req: OcPermissionRequest, call: OcToolCall | undefin
           },
         };
       }
-      const files = resources.map((r) => resourcePath(ctx.workdir, r)).filter((p): p is string => !!p);
+      const files = resources.map((r) => resourcePath(ctx.workdir, r)).filter((p): p is string => !!p).map((p) => realTarget(p));
       if (files.length === 0) return { name: "Edit", input: {}, unshowable: "opencode didn't say which file it wants to change" };
       return {
         name: "Edit",
@@ -109,21 +169,29 @@ export function gateCallFor(req: OcPermissionRequest, call: OcToolCall | undefin
       };
     }
     case "read": {
-      const path = resourcePath(ctx.workdir, resources[0]) ?? abs(ctx.workdir, str(input.path));
-      return path ? { name: "Read", input: { file_path: path } } : { name: "Read", input: {}, unshowable: "opencode didn't say what it wants to read" };
+      const asked = resourcePath(ctx.workdir, resources[0]) ?? abs(ctx.workdir, str(input.path));
+      if (!asked) return { name: "Read", input: {}, unshowable: "opencode didn't say what it wants to read" };
+      const { path, requested } = shown(asked);
+      return escapedRead(ctx, "read", asked, path) ?? { name: "Read", input: { file_path: path, ...(requested ? { requested_path: requested } : {}) } };
     }
     case "glob":
     case "grep": {
       const pattern = str(input.pattern) ?? str(resources[0]);
+      // The root it searches (the workdir when none is given); a search
+      // below it doesn't follow symlinked directories, the root itself does.
+      const asked = abs(ctx.workdir, str(input.path));
+      const { path, requested } = shown(asked);
       const gate = {
         name: req.action === "glob" ? "Glob" : "Grep",
         input: {
           ...(pattern ? { pattern } : {}),
-          ...(str(input.path) ? { path: abs(ctx.workdir, str(input.path)) } : {}),
+          ...(path ? { path } : {}),
+          ...(requested ? { requested_path: requested } : {}),
           ...(str(input.include) ? { glob: input.include } : {}),
         },
       };
-      return pattern ? gate : { ...gate, unshowable: "opencode didn't say what it's searching for" };
+      if (!pattern) return { ...gate, unshowable: "opencode didn't say what it's searching for" };
+      return escapedRead(ctx, req.action, asked ?? ctx.workdir, path ?? realTarget(ctx.workdir)) ?? gate;
     }
     case "webfetch": {
       // The resource is what opencode authorizes. From a Code Mode script's

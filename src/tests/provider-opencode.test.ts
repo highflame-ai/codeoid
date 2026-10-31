@@ -26,7 +26,7 @@
  */
 
 import { afterAll, describe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
@@ -998,6 +998,50 @@ describe("opencode version and safety checks", () => {
     expect(gateCallFor(req("coidabc_codeoid_memory_recall", ["*"]), undefined, ctx).name).toBe("mcp__codeoid_memory__recall");
     expect(gateCallFor(req("coidzzz_codeoid_memory_recall", ["*"]), undefined, ctx).unshowable).toBeTruthy();
     expect(gateCallFor(req("context7_resolve", ["*"]), undefined, ctx).unshowable).toBeTruthy();
+  });
+
+  it("shows where a path really leads; a read or search a symlink takes out of the workdir isn't a safe Read", () => {
+    const root = realpathSync(tmp());
+    const work = join(root, "work");
+    const outside = join(root, "outside");
+    mkdirSync(join(work, "sub"), { recursive: true });
+    mkdirSync(outside);
+    writeFileSync(join(outside, "secret.txt"), "x");
+    writeFileSync(join(outside, "profile.txt"), "x");
+    writeFileSync(join(work, "plain.txt"), "x");
+    symlinkSync(join(outside, "secret.txt"), join(work, "notes.txt"));
+    symlinkSync(outside, join(work, "docs"));
+    symlinkSync(join(outside, "profile.txt"), join(work, "config.txt"));
+    symlinkSync(join(outside, "new.txt"), join(work, "dangling.txt"));
+    symlinkSync(join(work, "sub"), join(work, "inner"));
+    const ctx = { workdir: work, ownPrefix: "coidabc_", mounts: new Map<string, string>() };
+    const req = (action: string, resources: string[] = []) => ({ id: "per_1", sessionID: "ses_1", action, resources });
+    const external = (tool: string, path: string, requested: string, dir = outside) => ({ name: "opencode_external_directory", input: { directories: [dir], tool, path, requested } });
+
+    expect(gateCallFor(req("read", [join(work, "notes.txt")]), undefined, ctx)).toEqual(external("read", join(outside, "secret.txt"), join(work, "notes.txt")));
+    expect(gateCallFor(req("read", [join(work, "docs", "secret.txt")]), undefined, ctx)).toEqual(external("read", join(outside, "secret.txt"), join(work, "docs", "secret.txt")));
+    expect(gateCallFor(req("read", [join(work, "docs")]), undefined, ctx)).toEqual(external("read", outside, join(work, "docs")));
+    expect(gateCallFor(req("grep", ["TOP"]), { name: "grep", input: { pattern: "TOP", path: "docs" } }, ctx)).toEqual(external("grep", outside, join(work, "docs")));
+    expect(gateCallFor(req("glob", ["**/*.txt"]), { name: "glob", input: { pattern: "**/*.txt", path: "docs" } }, ctx)).toEqual(external("glob", outside, join(work, "docs")));
+    // Inside, as written and really: the safe names, with the real path.
+    expect(gateCallFor(req("read", [join(work, "plain.txt")]), undefined, ctx)).toEqual({ name: "Read", input: { file_path: join(work, "plain.txt") } });
+    expect(gateCallFor(req("read", [join(work, "inner")]), undefined, ctx)).toEqual({ name: "Read", input: { file_path: join(work, "sub"), requested_path: join(work, "inner") } });
+    expect(gateCallFor(req("grep", ["TOP"]), { name: "grep", input: { pattern: "TOP" } }, ctx)).toEqual({ name: "Grep", input: { pattern: "TOP" } });
+    // Outside as written: opencode asked external_directory for it already.
+    expect(gateCallFor(req("read", [join(outside, "secret.txt")]), undefined, ctx)).toEqual({ name: "Read", input: { file_path: join(outside, "secret.txt") } });
+    // A write names the file it really changes, a dangling link the file it creates.
+    expect(gateCallFor(req("edit", [join(work, "config.txt")]), { name: "write", input: { path: "config.txt", content: "hi" } }, ctx)).toEqual({
+      name: "Write",
+      input: { file_path: join(outside, "profile.txt"), content: "hi", requested_path: join(work, "config.txt") },
+    });
+    expect(gateCallFor(req("edit", [join(work, "dangling.txt")]), { name: "edit", input: { path: "dangling.txt", oldString: "a", newString: "b" } }, ctx).input).toMatchObject({
+      file_path: join(outside, "new.txt"),
+      requested_path: join(work, "dangling.txt"),
+    });
+    expect(gateCallFor(req("edit", [join(work, "config.txt")]), { name: "patch", input: { patchText: "*** x" } }, ctx).input.file_path).toBe(join(outside, "profile.txt"));
+    expect(gateCallFor(req("edit", [join(work, "new", "file.txt")]), { name: "write", input: { path: "new/file.txt", content: "" } }, ctx).input.file_path).toBe(join(work, "new", "file.txt"));
+    // A shell's working directory too.
+    expect(gateCallFor(req("shell", ["ls"]), { name: "shell", input: { command: "ls", workdir: "docs" } }, ctx).input.cwd).toBe(outside);
   });
 
   it("parses server-sent events", async () => {
