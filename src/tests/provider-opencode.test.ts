@@ -18,6 +18,9 @@
  *   O12 steering a running turn; later = queue
  *   O13 version range; agent check; saved approvals swept
  *   O14 database location, registry available / unavailable / disabled
+ *   O15 what real 2.2.2 / 2.2.5 servers showed: the feed is the only record
+ *       (the durable log replays nothing), the title is billed without a
+ *       step, a dropped feed is read back
  *
  * See provider-opencode.integration.test.ts for a real `opencode` binary.
  */
@@ -533,6 +536,22 @@ describe("opencode cost and tokens", () => {
     expect(r.nativeRef?.ref.startsWith("msg_")).toBe(true);
   });
 
+  it("bills the title opencode generates, which only its running total reports", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const first = await collect(p.runTurn(opts("hi")));
+    expect(done(first)!.totalCostUsd).toBeCloseTo(0.0123, 6);
+    // The title is billed after the first execution ended: it lands in the next turn.
+    const second = await collect(p.runTurn(opts("hi again")));
+    expect(done(second)!.totalCostUsd).toBeCloseTo(0.0123 + 0.0007, 6);
+    const side = second.filter((e) => e.type === "llm_call" && !e.isPrimary);
+    expect(side).toEqual([{ type: "llm_call", usage: { inputTokens: 40, cacheReadTokens: 0, cacheCreationTokens: 0, outputTokens: 6 }, isPrimary: false }]);
+    // Only once: the running total after it adds nothing more.
+    const third = await collect(p.runTurn(opts("and again")));
+    expect(done(third)!.totalCostUsd).toBeCloseTo(0.0123, 6);
+    await p.teardown();
+  });
+
   it("stops at maxBudgetUsd mid-turn, as the spend lands", async () => {
     const { server } = makeServer();
     const events = await collect(makeProvider(server).runTurn(opts("costly", { maxBudgetUsd: 3 })));
@@ -623,7 +642,8 @@ describe("opencode subagents", () => {
     adopted[0]!.bindGate?.({ canUseTool: allow });
     const follow = await collect(adopted[0]!);
     expect(texts(follow, "text_done")).toEqual(["background result received"]);
-    expect(done(follow)!.totalCostUsd).toBeCloseTo(0.0123 + 0.5, 6); // the child's spend, carried
+    // The child's spend and the first prompt's title (billed after that turn ended), carried.
+    expect(done(follow)!.totalCostUsd).toBeCloseTo(0.0123 + 0.5 + 0.0007, 6);
   });
 });
 
@@ -701,6 +721,31 @@ describe("opencode mid-turn messages", () => {
     }
     const st = await fakeState(server);
     expect(st.prompts.at(-1)).toMatchObject({ text: "afterwards", delivery: "queue" });
+  });
+
+  it("a later message is answered inside the running turn, which ends once", async () => {
+    // Real 2.2.x delivers a queued input in the running execution, after its reply.
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    let adopted = 0;
+    p.onSessionEvent = (e) => {
+      if (e.type === "turn_started") adopted++;
+    };
+    const run = p.runTurn(opts("steer"));
+    const events: ProviderEvent[] = [];
+    let pushed = false;
+    for await (const e of run.events) {
+      events.push(e);
+      if (!pushed && e.type === "text_done") {
+        pushed = true;
+        run.pushMidTurn?.("queued one", "later");
+      }
+      if (e.type === "turn_done" || e.type === "error") break;
+    }
+    expect(texts(events, "text_done")).toEqual(["first part", "steered: queued one (queue)"]);
+    expect(events.filter((e) => e.type === "turn_done")).toHaveLength(1);
+    expect(adopted).toBe(0);
+    await p.teardown();
   });
 });
 
@@ -866,5 +911,51 @@ describe("opencode database location and registry", () => {
     const reg = createDefaultProviderRegistry(cfg, { PATH: dir });
     expect(reg.has("opencode")).toBe(false);
     expect(reg.unavailableHint("opencode")).toBeUndefined();
+  });
+});
+
+// ── O15 what the real binaries showed ───────────────────────────────────────
+
+describe("opencode as real 2.2.x servers behave", () => {
+  it("reads its session from the live feed: the durable log replays nothing, and no turn waits on it", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const started = Date.now();
+    const events = await collect(p.runTurn(opts("hi")));
+    // The old reader waited 10s for a `log.synced` the follow stream never sends.
+    expect(Date.now() - started).toBeLessThan(5_000);
+    expect(texts(events, "text_done")).toEqual(["Hello, world"]);
+    const st = await fakeState(server);
+    expect(st.requests.some((r: string) => r.includes("/log"))).toBe(false);
+    await p.teardown();
+  });
+
+  it("a turn whose end the feed dropped is read back from the session: its text, its spend, its outcome", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const events = await collect(p.runTurn(opts("gap")));
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    expect(texts(events, "text_done")).toEqual(["before the gap", "said in the gap"]);
+    const r = done(events)!;
+    expect(r.stopReason).toBe("stop");
+    // Both steps (0.0123 + 0.5) and the title (0.0007, billed in the gap), each once.
+    expect(r.totalCostUsd).toBeCloseTo(0.0123 + 0.5 + 0.0007, 6);
+    expect(r.nativeRef?.ref.startsWith("msg_")).toBe(true);
+    // The session carries on normally after it.
+    const next = await collect(p.runTurn(opts("hi")));
+    expect(texts(next, "text_done")).toEqual(["Hello, world"]);
+    expect(done(next)!.totalCostUsd).toBeCloseTo(0.0123, 6);
+    await p.teardown();
+  });
+
+  it("a child session inherits its parent's rules, and still gets codeoid's set on it", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server, { sessionId: "sess-kid", initialBackingId: "sess-kid" });
+    await collect(p.runTurn(opts("subagent")));
+    const st = await fakeState(server);
+    const child = st.sessions.find((x: { parentID?: string }) => x.parentID);
+    expect(child.permissions).toEqual(sessionRules("sess-kid"));
+    expect(st.patches.some((x: { sessionID: string }) => x.sessionID === child.id)).toBe(true);
+    await p.teardown();
   });
 });

@@ -4,12 +4,23 @@
  *
  * Lifecycle like the real one: listens on 127.0.0.1, prints one JSON line
  * `{"url": ...}`, requires HTTP Basic `opencode:$OPENCODE_PASSWORD` on every
- * route but `/api/info`, exits when stdin closes.
+ * route, exits when stdin closes.
  *
- * Two streams like the real ones: the per-session durable log
- * (`/api/experimental/session/:id/log?after=&follow=true`, replay → `log.synced`
- * → live) and the live feed (`/api/event`, `server.connected` first; deltas,
- * permission asks and forms only here).
+ * Streams as the real 2.2.2 / 2.2.5 servers behave (see the real-binary
+ * notes in provider-opencode.integration.test.ts):
+ *   - the live feed (`/api/event`, `server.connected` first) carries
+ *     everything: each session's durable events with their
+ *     `durable: {aggregateID, seq}` envelope, and the ephemeral ones (deltas,
+ *     permission asks, forms, `session.usage.updated` running totals);
+ *   - the per-session durable log (`/api/experimental/session/:id/log`)
+ *     replays nothing: without `follow` it sends only `log.synced`, with
+ *     `follow=true` only heartbeats.
+ * Like the real server, a session's first prompt also bills a title request
+ * that no step reports (only the running total shows it, after the
+ * execution ends), a queued input runs inside the running execution, a bare
+ * reject interrupts the execution, a child session inherits its parent's
+ * rules, and a background child's result resumes the parent through a
+ * synthetic inbox item.
  *
  * Turn behavior is keyed off the prompt text:
  *   default        → text deltas + text.ended, one step with cost/tokens
@@ -29,6 +40,8 @@
  *   "costly"       → three steps of $2 each
  *   "echo-state"   → reports model/agent/synthetic/prompt text it received
  *   "die-asking"   → asks a permission, then the process dies
+ *   "gap"          → the live feed is cut (subscribers dropped) mid-turn and
+ *                    the execution ends while nobody is connected
  *
  * Knobs (env): FAKE_OPENCODE_VERSION (default 2.2.2), FAKE_OPENCODE_STARTS
  * (append a line per start), FAKE_OPENCODE_UNSAFE_AGENT=1 (an `explore`
@@ -59,7 +72,7 @@ interface Ses {
   permissions: Json[];
   agent?: string;
   model?: Json;
-  messages: Array<{ id: string; type: string }>;
+  messages: Array<{ id: string; type: string; content?: Json[]; time?: Json; [k: string]: unknown }>;
   log: Json[];
   seq: number;
   executing: boolean;
@@ -67,6 +80,12 @@ interface Ses {
   inbox: Array<{ id: string; text: string; delivery: string }>;
   title?: string;
   fork?: Json;
+  /** The running total `session.usage.updated` reports. */
+  usage: { cost: number; input: number; output: number; reasoning: number; read: number; write: number };
+  titled: boolean;
+  outcome?: string;
+  busy?: number;
+  idle?: number;
 }
 
 const state = {
@@ -107,10 +126,11 @@ const nextId = (p: string) => `${p}_${String(++counter).padStart(6, "0")}`;
 // ── Streams ────────────────────────────────────────────────────────────────
 
 const enc = new TextEncoder();
-const liveSubs = new Set<{ push: (e: Json) => void; types: Set<string> | null }>();
-const logSubs = new Map<string, Set<(e: Json) => void>>();
+const liveSubs = new Set<{ push: (e: Json) => void; types: Set<string> | null; close: () => void }>();
+/** "gap": while set, the live feed is down — nobody is subscribed and new connections wait. */
+let feedDown: Promise<void> | null = null;
 
-function sseResponse(start: (push: (e: Json) => void) => () => void): Response {
+function sseResponse(start: (push: (e: Json) => void, close: () => void) => () => void): Response {
   let stop = () => {};
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
@@ -121,7 +141,14 @@ function sseResponse(start: (push: (e: Json) => void) => () => void): Response {
           /* closed */
         }
       };
-      stop = start(push);
+      const close = () => {
+        try {
+          controller.close();
+        } catch {
+          /* closed */
+        }
+      };
+      stop = start(push, close);
     },
     cancel() {
       stop();
@@ -134,14 +161,30 @@ function publishLive(e: Json): void {
   for (const s of liveSubs) if (!s.types || s.types.has(String(e.type))) s.push(e);
 }
 
-/** A durable session event: on the session's log and the live feed. */
+/** A durable session event. The real log endpoint never delivers these: the live feed does. */
 function durable(ses: Ses, type: string, data: Json): void {
   ses.seq++;
-  const e = { id: nextId("evt"), type, created: Date.now(), data: { sessionID: ses.id, ...data }, durable: { aggregateID: ses.id, seq: ses.seq, version: 1 } };
+  const e = { id: nextId("evt"), type, created: Date.now(), location: { directory: ses.directory }, data: { sessionID: ses.id, ...data }, durable: { aggregateID: ses.id, seq: ses.seq, version: 1 } };
   ses.log.push(e);
-  for (const sub of logSubs.get(ses.id) ?? []) sub(e);
   publishLive(e);
 }
+
+/** Add to a session's running total and publish it, as opencode does after each step. */
+function bill(ses: Ses, cost: number, tokens: Json): void {
+  const t = tokens as { input?: number; output?: number; reasoning?: number; cache?: { read?: number; write?: number } };
+  ses.usage.cost += cost;
+  ses.usage.input += t.input ?? 0;
+  ses.usage.output += t.output ?? 0;
+  ses.usage.reasoning += t.reasoning ?? 0;
+  ses.usage.read += t.cache?.read ?? 0;
+  ses.usage.write += t.cache?.write ?? 0;
+  const u = ses.usage;
+  ephemeral("session.usage.updated", { sessionID: ses.id, cost: u.cost, tokens: { input: u.input, output: u.output, reasoning: u.reasoning, cache: { read: u.read, write: u.write } } });
+}
+
+/** What opencode bills for the title it generates on a session's first prompt. */
+const TITLE_COST = 0.0007;
+const TITLE_TOKENS = { input: 40, output: 6, reasoning: 0, cache: { read: 0, write: 0 } };
 
 /** An ephemeral event: live feed only. */
 function ephemeral(type: string, data: Json): void {
@@ -230,6 +273,7 @@ function askForm(ses: Ses, form: Json): Promise<{ answer?: Json; cancelled?: str
 }
 
 async function say(ses: Ses, msg: string, text: string, ordinal = 0): Promise<void> {
+  ses.messages.find((x) => x.id === msg)?.content?.push({ type: "text", text });
   durable(ses, "session.text.started", { assistantMessageID: msg, ordinal });
   const half = Math.ceil(text.length / 2);
   ephemeral("session.text.delta", { sessionID: ses.id, assistantMessageID: msg, ordinal, delta: text.slice(0, half) });
@@ -240,13 +284,16 @@ async function say(ses: Ses, msg: string, text: string, ordinal = 0): Promise<vo
 
 function step(ses: Ses): string {
   const msg = nextId("msg");
-  ses.messages.push({ id: msg, type: "assistant" });
+  ses.messages.push({ id: msg, type: "assistant", content: [], time: { created: Date.now() } });
   durable(ses, "session.step.started", { assistantMessageID: msg, agent: ses.agent ?? "build", model: ses.model ?? { providerID: "anthropic", id: "claude-sonnet-4" }, started: Date.now() });
   return msg;
 }
 
 function endStep(ses: Ses, msg: string, cost = 0.0123, tokens: Json = TOKENS): void {
   durable(ses, "session.step.ended", { assistantMessageID: msg, finish: "stop", cost, tokens });
+  const m = ses.messages.find((x) => x.id === msg);
+  if (m) Object.assign(m, { cost, tokens, finish: "stop" });
+  bill(ses, cost, tokens);
 }
 
 async function toolCall(ses: Ses, msg: string, name: string, input: Json, req: Json): Promise<{ ok: boolean; message?: string; decision: string }> {
@@ -258,11 +305,16 @@ async function toolCall(ses: Ses, msg: string, name: string, input: Json, req: J
     durable(ses, "session.tool.success", { assistantMessageID: msg, id, content: [{ type: "text", text: `${name} ran` }], executed: true });
     return { ok: true, decision: reply.decision };
   }
-  durable(ses, "session.tool.failed", { assistantMessageID: msg, id, error: { type: "permission.rejected", message: reply.message ?? "rejected" }, executed: false });
+  durable(ses, "session.tool.failed", {
+    assistantMessageID: msg,
+    id,
+    error: reply.message ? { type: "permission.rejected", message: reply.message } : { type: "aborted", message: "The user declined this tool call" },
+    executed: false,
+  });
   return { ok: false, message: reply.message, decision: reply.decision };
 }
 
-async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean }): Promise<"succeeded" | "failed"> {
+async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean }): Promise<"succeeded" | "failed" | "interrupted"> {
   const check = () => {
     if (signal.cancelled) throw new Cancelled();
   };
@@ -284,10 +336,10 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
   if (text.includes("use-shell")) {
     const msg = step(ses);
     const r = await toolCall(ses, msg, "shell", { command: "ls -la /tmp", description: "list tmp" }, { action: "shell", resources: ["ls -la /tmp"], save: ["ls *"] });
-    // A bare reject (no feedback) ends the step in opencode.
+    // A bare reject (no feedback) aborts the step, and the execution ends interrupted.
     if (!r.ok && !r.message) {
-      durable(ses, "session.step.failed", { assistantMessageID: msg, error: { type: "permission.declined", message: "declined" } });
-      return "failed";
+      durable(ses, "session.step.failed", { assistantMessageID: msg, error: { type: "aborted", message: "Step interrupted" } });
+      return "interrupted";
     }
     endStep(ses, msg);
     const msg2 = step(ses);
@@ -385,9 +437,11 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
       void (async () => {
         await sleep(150);
         await runChild();
-        // opencode notifies the parent itself and runs its main agent.
+        // opencode notifies the parent itself (a synthetic inbox item) and runs its main agent.
         await sleep(50);
-        await startExecution(ses, "__background-result");
+        const inboxID = nextId("msg");
+        durable(ses, "session.inbox.enqueued", { inboxID, item: { type: "synthetic", payload: { text: "<subagent>…</subagent>", metadata: { source: "subagent", childID: child.id, state: "completed" } }, delivery: "steer" } });
+        await startExecution(ses, "__background-result", inboxID);
       })();
       return "succeeded";
     }
@@ -447,6 +501,26 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     }
     return "succeeded";
   }
+  if (text.includes("gap")) {
+    const msg = step(ses);
+    await say(ses, msg, "before the gap");
+    endStep(ses, msg);
+    // The feed drops everyone; until it's back, events reach nobody.
+    let up!: () => void;
+    feedDown = new Promise<void>((r) => {
+      up = r;
+    });
+    for (const sub of [...liveSubs]) sub.close();
+    liveSubs.clear();
+    const msg2 = step(ses);
+    await say(ses, msg2, "said in the gap");
+    endStep(ses, msg2, 0.5);
+    setTimeout(() => {
+      feedDown = null;
+      up();
+    }, 400);
+    return "succeeded";
+  }
   if (text.includes("echo-state")) {
     const msg = step(ses);
     await say(ses, msg, JSON.stringify({ model: ses.model ?? null, agent: ses.agent ?? null, synthetic: state.synthetic.filter((s) => s.sessionID === ses.id).map((s) => s.text), prompt: text, permissions: ses.permissions }));
@@ -459,16 +533,24 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
   return "succeeded";
 }
 
-async function startExecution(ses: Ses, text: string): Promise<void> {
+async function startExecution(ses: Ses, text: string, inboxID?: string): Promise<void> {
   ses.executing = true;
+  ses.busy = Date.now();
   const signal = { cancelled: false };
   ses.cancel = () => {
     signal.cancelled = true;
   };
   durable(ses, "session.execution.started", {});
+  if (inboxID) durable(ses, "session.inbox.delivered", { inboxID });
   let outcome: "succeeded" | "failed" | "interrupted";
   try {
     outcome = await runScenario(ses, text, signal);
+    // A queued input is delivered inside the running execution, after its reply.
+    for (let i = ses.inbox.findIndex((x) => x.delivery === "queue"); outcome === "succeeded" && i >= 0; i = ses.inbox.findIndex((x) => x.delivery === "queue")) {
+      const [item] = ses.inbox.splice(i, 1);
+      durable(ses, "session.inbox.delivered", { inboxID: item!.id });
+      outcome = await runScenario(ses, item!.text, signal);
+    }
   } catch (err) {
     if (!(err instanceof Cancelled)) throw err;
     outcome = "interrupted";
@@ -476,27 +558,28 @@ async function startExecution(ses: Ses, text: string): Promise<void> {
   if (signal.cancelled && outcome !== "failed") outcome = "interrupted";
   ses.executing = false;
   ses.cancel = null;
+  ses.outcome = outcome;
+  ses.idle = Date.now();
   if (outcome === "succeeded") durable(ses, "session.execution.succeeded", {});
   else if (outcome === "interrupted") durable(ses, "session.execution.interrupted", { reason: "user" });
   else if (!ses.log.some((e) => e.type === "session.execution.failed" && (e.durable as Json).seq === ses.seq)) {
     durable(ses, "session.execution.failed", { error: { type: "unknown", message: "the step failed" } });
   }
-  ses.messages.push({ id: nextId("msg"), type: "idle" });
-  // A queued input runs as the next execution.
-  const queued = ses.inbox.findIndex((i) => i.delivery === "queue");
-  if (queued >= 0) {
-    const [item] = ses.inbox.splice(queued, 1);
-    durable(ses, "session.inbox.delivered", { inboxID: item!.id });
-    void startExecution(ses, item!.text);
+  ses.messages.push({ id: nextId("msg"), type: "idle", time: { created: Date.now() } });
+  // The title opencode generates for a session's first prompt: billed, reported by no step.
+  if (!ses.titled && !ses.parentID && !ses.fork) {
+    ses.titled = true;
+    bill(ses, TITLE_COST, TITLE_TOKENS);
   }
 }
 
 function createSession(input: { directory: string; permissions?: Json[]; agent?: string; model?: Json; parentID?: string; title?: string }): Ses {
+  const parent = input.parentID ? sessions.get(input.parentID) : undefined;
   const ses: Ses = {
     id: nextId("ses"),
     directory: input.directory,
-    // A child gets its own rules, not its parent's (opencode's documented behavior).
-    permissions: input.permissions ?? [],
+    // A child inherits its parent's rules (2.2.2 and 2.2.5 both do).
+    permissions: input.permissions ?? (parent ? [...parent.permissions] : []),
     agent: input.agent,
     model: input.model,
     parentID: input.parentID,
@@ -507,9 +590,23 @@ function createSession(input: { directory: string; permissions?: Json[]; agent?:
     executing: false,
     cancel: null,
     inbox: [],
+    usage: { cost: 0, input: 0, output: 0, reasoning: 0, read: 0, write: 0 },
+    titled: false,
   };
   sessions.set(ses.id, ses);
-  durable(ses, "session.created", { projectID: "prj_1", location: { directory: ses.directory }, slug: ses.id, version: "2", ...(ses.parentID ? { parentID: ses.parentID } : {}), ...(ses.title ? { title: ses.title } : {}), ...(ses.agent ? { agent: ses.agent } : {}) });
+  // Real servers number a session's creation 0, under its own aggregate.
+  ses.seq = -1;
+  durable(ses, "session.created", {
+    projectID: "prj_1",
+    location: { directory: ses.directory },
+    slug: ses.id,
+    version: version,
+    permissions: ses.permissions,
+    ...(ses.model ? { model: ses.model } : {}),
+    ...(ses.parentID ? { parentID: ses.parentID } : {}),
+    ...(ses.title ? { title: ses.title } : {}),
+    ...(ses.agent ? { agent: ses.agent } : {}),
+  });
   return ses;
 }
 
@@ -521,9 +618,10 @@ function info(ses: Ses): Json {
     projectID: "prj_1",
     ...(ses.agent ? { agent: ses.agent } : {}),
     ...(ses.model ? { model: ses.model } : {}),
-    cost: 0,
-    tokens: TOKENS,
-    time: { created: Date.now(), updated: Date.now() },
+    cost: ses.usage.cost,
+    tokens: { input: ses.usage.input, output: ses.usage.output, reasoning: ses.usage.reasoning, cache: { read: ses.usage.read, write: ses.usage.write } },
+    ...(ses.outcome ? { outcome: ses.outcome } : {}),
+    time: { created: Date.now(), updated: Date.now(), ...(ses.busy ? { busy: ses.busy } : {}), ...(ses.idle ? { idle: ses.idle } : {}) },
     permissions: ses.permissions,
     location: { directory: ses.directory },
   };
@@ -545,11 +643,18 @@ function directoryOf(req: Request, url: URL): string {
   return url.searchParams.get("location[directory]") ?? (header ? decodeURIComponent(header) : process.cwd());
 }
 
+/** The live feed's filterable types (what 2.2.2 and 2.2.5 accept); 1.x names like `message.updated` are refused. */
 const KNOWN_TYPES = new Set([
-  "session.text.delta", "session.reasoning.delta", "session.tool.called", "session.tool.success", "session.tool.failed",
-  "session.step.ended", "session.created", "session.execution.started", "session.execution.succeeded",
-  "session.execution.failed", "session.execution.interrupted", "permission.asked", "permission.replied",
-  "form.created", "form.replied", "form.cancelled",
+  "session.created", "session.agent.selected", "session.model.selected", "session.renamed", "session.permissions",
+  "session.usage.updated", "session.deleted", "session.forked", "session.inbox.enqueued", "session.inbox.delivered",
+  "session.inbox.cancelled", "session.execution.started", "session.execution.succeeded", "session.execution.failed",
+  "session.execution.interrupted", "session.step.started", "session.step.ended", "session.step.failed",
+  "session.step.streamed", "session.text.started", "session.text.delta", "session.text.ended",
+  "session.reasoning.started", "session.reasoning.delta", "session.reasoning.ended", "session.tool.input.started",
+  "session.tool.input.delta", "session.tool.input.ended", "session.tool.called", "session.tool.progress",
+  "session.tool.success", "session.tool.failed", "session.retry.scheduled", "session.compaction.started",
+  "session.compaction.ended", "session.compaction.failed", "session.synthetic", "session.instructions.updated",
+  "permission.asked", "permission.replied", "form.created", "form.replied", "form.cancelled",
 ]);
 
 let port = 0;
@@ -562,19 +667,21 @@ const server = Bun.serve({
     const path = url.pathname;
     const method = req.method;
     state.requests.push(`${method} ${path}`);
+    // Test-only, so tests can read it without the per-start password.
+    if (path === "/__fake/state") return json({ ...state, sessions: [...sessions.values()].map(info), mounts: Object.fromEntries([...mounts].map(([d, m]) => [d, [...m.keys()]])) });
+    // Every route needs the password, /api/info too (real 2.2.x answers 401 without it).
+    if (!authorized(req)) return json({ _tag: "UnauthorizedError", message: "Authentication required" }, 401);
     if (path === "/api/info" && method === "GET") {
       return json({ version, pid: process.pid, urls: [`http://127.0.0.1:${port}`], paths: { tmp: "/tmp" } });
     }
-    // Test-only, so tests can read it without the per-start password.
-    if (path === "/__fake/state") return json({ ...state, sessions: [...sessions.values()].map(info), mounts: Object.fromEntries([...mounts].map(([d, m]) => [d, [...m.keys()]])) });
-    if (!authorized(req)) return json({ _tag: "UnauthorizedError", message: "Authentication required" }, 401);
     const body = method === "POST" || method === "PUT" || method === "PATCH" ? ((await req.json().catch(() => ({}))) as Json) : {};
 
     if (path === "/api/event") {
       const types = url.searchParams.getAll("types");
       if (types.some((t) => !KNOWN_TYPES.has(t))) return json({ _tag: "InvalidRequestError", message: "bad types" }, 400);
-      return sseResponse((push) => {
-        const sub = { push, types: types.length > 0 ? new Set(types) : null };
+      if (feedDown) await feedDown;
+      return sseResponse((push, close) => {
+        const sub = { push, types: types.length > 0 ? new Set(types) : null, close };
         liveSubs.add(sub);
         push({ id: nextId("evt"), type: "server.connected", created: Date.now(), data: {} });
         return () => liveSubs.delete(sub);
@@ -618,14 +725,15 @@ const server = Bun.serve({
     if (m) {
       const ses = sessions.get(m[1]!);
       if (!ses) return notFound("SessionNotFoundError", "Session not found");
-      const after = url.searchParams.has("after") ? Number(url.searchParams.get("after")) : -1;
-      return sseResponse((push) => {
-        for (const e of ses.log) if (((e.durable as Json).seq as number) > after) push(e);
-        push({ type: "log.synced", aggregateID: ses.id, seq: ses.seq });
-        const subs = logSubs.get(ses.id) ?? new Set();
-        logSubs.set(ses.id, subs);
-        subs.add(push);
-        return () => subs.delete(push);
+      // As the real 2.2.x log behaves: no events, ever. Without follow, only the
+      // synced marker; with follow, not even that (the real one sends heartbeats).
+      const follow = url.searchParams.get("follow") === "true";
+      return sseResponse((push, close) => {
+        if (!follow) {
+          push({ type: "log.synced", aggregateID: ses.id, seq: ses.seq });
+          close();
+        }
+        return () => {};
       });
     }
     m = /^\/api\/experimental\/session\/([^/]+)\/instructions\/entries\/([^/]+)$/.exec(path);
@@ -670,13 +778,10 @@ const server = Bun.serve({
       const text = String(body.text ?? "");
       const delivery = String(body.delivery ?? "steer");
       state.prompts.push({ sessionID: ses.id, id, ...body });
-      ses.messages.push({ id, type: "user" });
+      ses.messages.push({ id, type: "user", text, time: { created: Date.now() } });
+      durable(ses, "session.inbox.enqueued", { inboxID: id, item: { type: "user", payload: { text }, delivery } });
       if (ses.executing) ses.inbox.push({ id, text, delivery });
-      else
-        setTimeout(() => {
-          durable(ses, "session.inbox.delivered", { inboxID: id });
-          void startExecution(ses, text);
-        }, 5);
+      else setTimeout(() => void startExecution(ses, text, id), 5);
       return json({ data: { id, sessionID: ses.id, type: "user", payload: { text }, delivery, time: { created: Date.now() } } });
     }
     if (rest === "/command" && method === "POST") {
@@ -691,7 +796,10 @@ const server = Bun.serve({
       ses.cancel?.();
       return json({ interrupted: running });
     }
-    if (rest === "/message" && method === "GET") return json({ data: ses.messages, cursor: {} });
+    if (rest === "/message" && method === "GET") {
+      // One page (the fake never has more); `order=desc` is newest first.
+      return json({ data: url.searchParams.get("order") === "desc" ? [...ses.messages].reverse() : ses.messages, cursor: {} });
+    }
     if (rest === "/permission" && method === "GET") {
       return json({ data: [...pendingPerms.values()].filter((p) => p.req.sessionID === ses.id).map((p) => p.req) });
     }

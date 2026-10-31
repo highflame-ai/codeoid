@@ -6,12 +6,16 @@
  * in the session's workdir, whose `ses_…` id is the backing id (persisted,
  * resumed by reusing it).
  *
- *   - events: the session's DURABLE log (`…/log?follow=true`, resumed by seq)
- *     is the record — text and reasoning blocks (`text_done` /
- *     `thinking_done`), tool calls and results, steps with cost and tokens
- *     (`llm_call`, summed into `turn_done`), retries, executions (turn ends).
- *     The live feed adds what only it carries: text/reasoning deltas,
- *     `permission.asked`, forms, and the child sessions subagents run in.
+ *   - events: the server's live feed, which carries the session's durable
+ *     events too (each with its `durable.seq`): text and reasoning blocks
+ *     (`text_done` / `thinking_done`), tool calls and results, steps with cost
+ *     and tokens (`llm_call`, summed into `turn_done`), retries, executions
+ *     (turn ends), and the ephemeral ones: deltas, `permission.asked`, forms,
+ *     the session's running total (`usage.updated`, which also bills the
+ *     title opencode generates), and the child sessions subagents run in.
+ *     opencode 2.2's durable log endpoint replays nothing and follows nothing
+ *     (checked on 2.2.2 and 2.2.5), so it isn't read; a gap in the feed is
+ *     made good from the session's messages when it reconnects (#reconcile).
  *   - approvals: every `permission.asked` goes through codeoid's gate under
  *     codeoid's tool names (translate.ts); the reply is `once` or `reject`
  *     (with the gate's message, so the model carries on), never `always`.
@@ -64,8 +68,10 @@ import {
   type OcFormField,
   type OcFormValue,
   type OcModelInfo,
+  type OcMessage,
   type OcModelRef,
   type OcPermissionRequest,
+  type OcSessionInfo,
   type OcTokenUsage,
 } from "./client.js";
 import { mcpNamespace, ownMountPrefix, sessionRules } from "./policy.js";
@@ -93,9 +99,8 @@ const CALL_WAIT_MS = 2_000;
 const INTERRUPT_SETTLE_MS = 5_000;
 /** After a slash command, how long to wait for it to start an execution. */
 const COMMAND_START_MS = 1_500;
-const LOG_BACKOFF_MAX_MS = 5_000;
-/** How long attaching waits for the session log's replay boundary (`log.synced`). */
-const LOG_SYNC_WAIT_MS = 10_000;
+/** A turn's messages read back after a feed gap — far more than one turn writes. */
+const RECONCILE_PAGES = 20;
 
 export interface OpencodeProviderInit {
   sessionId: string;
@@ -158,6 +163,8 @@ interface Turn {
   /** Inbox ids of those steers, to pay at their delivery. */
   steers: Set<string>;
   usage: Usage;
+  /** The user message this turn's prompt became (`prompt`'s inbox id), where its messages start. */
+  promptId?: string;
   lastAssistantMessageID?: string;
   contextWindow?: number;
   stepError?: OcError;
@@ -224,8 +231,16 @@ export class OpencodeProvider implements SessionProvider {
   /** The opencode session this provider drives, once attached. */
   #ses: string | null = null;
   #workdir: string | null = null;
-  #log: { abort: AbortController; seq: number | undefined } | null = null;
-  /** True between an execution's start and end on the session's log. */
+  /** The last durable seq of this session seen on the feed (duplicates and stale replays are dropped). */
+  #seq = -1;
+  /**
+   * The session's spend as codeoid has counted it: its total when attached,
+   * plus every step since. opencode's own running total (`usage.updated`)
+   * past this is spend no step reported — the title it generates — and is
+   * added to the turn.
+   */
+  #counted = emptyUsage();
+  /** True between an execution's start and end. */
   #executing = false;
   /** `generation:directory` the MCP mounts and the saved-rule sweep were done for. */
   #mountedFor: string | null = null;
@@ -265,6 +280,8 @@ export class OpencodeProvider implements SessionProvider {
   #endedBlocks = new Set<string>();
   /** Reasoning blocks some of whose deltas were shown. */
   #streamedBlocks = new Set<string>();
+  /** Assistant messages whose step was counted (from the feed, or read back after a gap): never twice. */
+  #countedSteps = new Set<string>();
   #blockIndex = new Map<string, number>();
   #children = new Map<string, Child>();
 
@@ -379,6 +396,7 @@ export class OpencodeProvider implements SessionProvider {
     this.#endedBlocks.clear();
     this.#streamedBlocks.clear();
     this.#blockIndex.clear();
+    this.#countedSteps.clear();
 
     void this.#startTurn(turn, opts).catch((err: unknown) => {
       this.#failTurn(turn, `opencode: ${err instanceof Error ? err.message : String(err)}`);
@@ -442,11 +460,11 @@ export class OpencodeProvider implements SessionProvider {
       }
       const skill = this.#skills.get(name!);
       if (skill) {
-        await conn.client.prompt(ses, { text: args || `/${name}`, skills: [{ id: skill }] });
+        turn.promptId = (await conn.client.prompt(ses, { text: args || `/${name}`, skills: [{ id: skill }] })).id;
         return;
       }
     }
-    await conn.client.prompt(ses, { text: seed ? `${seed}\n\n${message}` : message });
+    turn.promptId = (await conn.client.prompt(ses, { text: seed ? `${seed}\n\n${message}` : message })).id;
   }
 
   /** A message sent while the turn runs: steer it now (`now`/`next`), or queue it behind (`later`). */
@@ -598,19 +616,22 @@ export class OpencodeProvider implements SessionProvider {
       if (this.#pendingHistorySeed === null) this.onHistoryLost?.();
     }
     if (!this.#ses) {
-      const ses = await this.#openSession(conn, workdir);
-      this.#ses = ses;
+      const opened = await this.#openSession(conn, workdir);
+      this.#ses = opened.id;
       this.#workdir = workdir;
-      this.#adoptBacking(ses);
+      this.#seq = -1;
+      this.#counted = emptyUsage();
+      addTokens(this.#counted, opened.tokens, opened.cost);
+      this.#adoptBacking(opened.id);
     }
     const ses = this.#ses;
-    if (!this.#log) await this.#followLog(conn, ses);
     await this.#ensureMounts(conn, workdir);
     if (!this.#modelsReported) await this.#reportModelsOnce();
     return ses;
   }
 
-  async #openSession(conn: OpencodeConnection, workdir: string): Promise<string> {
+  /** The opencode session to drive, and its spend so far (opencode's running total starts there). */
+  async #openSession(conn: OpencodeConnection, workdir: string): Promise<OcSessionInfo> {
     const rules = sessionRules(this.#sessionId);
     const pending = this.#pendingNative;
     this.#pendingNative = null;
@@ -623,7 +644,7 @@ export class OpencodeProvider implements SessionProvider {
         this.#sessionModel = forked.model ?? null;
         this.#freshSession();
         this.#agentApplied = forked.agent !== undefined && forked.agent === this.#agent;
-        return forked.id;
+        return forked;
       } catch (err) {
         console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] native fork failed, using the transcript: ${err instanceof Error ? err.message : String(err)}`);
         this.#pendingHistorySeed = pending.fallback;
@@ -639,7 +660,7 @@ export class OpencodeProvider implements SessionProvider {
         await conn.client.updateSession(info.id, { permissions: rules });
         this.#sessionModel = info.model ?? null;
         this.#agentApplied = info.agent !== undefined && info.agent === this.#agent;
-        return info.id;
+        return info;
       } catch (err) {
         if (!(err instanceof OpencodeHttpError && err.status === 404)) throw err;
         // Gone (a pruned database, another data dir): a fresh session must
@@ -659,7 +680,7 @@ export class OpencodeProvider implements SessionProvider {
     this.#sessionModel = created.model ?? null;
     this.#freshSession();
     this.#agentApplied = this.#agent !== undefined;
-    return created.id;
+    return created;
   }
 
   /** A new opencode session has none of the old one's selection or instructions. */
@@ -700,72 +721,7 @@ export class OpencodeProvider implements SessionProvider {
     }
   }
 
-  /**
-   * Follow the session's durable log. The first read replays the session's
-   * history up to `log.synced`, which is skipped; resolves once there, so a
-   * prompt sent after it can't land in the skipped part. A reconnect resumes
-   * after the last seq seen and misses nothing.
-   */
-  async #followLog(conn: OpencodeConnection, ses: string): Promise<void> {
-    const state = { abort: new AbortController(), seq: undefined as number | undefined };
-    this.#log = state;
-    let synced = false;
-    let markSynced!: () => void;
-    const ready = new Promise<void>((resolve) => {
-      markSynced = resolve;
-    });
-    const run = async () => {
-      let backoff = 250;
-      while (!state.abort.signal.aborted && this.#log === state) {
-        try {
-          for await (const ev of conn.client.sessionLog(ses, state.seq, state.abort.signal)) {
-            if (ev.type === "log.synced") {
-              if (!synced) {
-                synced = true;
-                markSynced();
-              }
-              backoff = 250;
-              continue;
-            }
-            const seq = ev.durable?.seq;
-            if (typeof seq === "number") {
-              if (state.seq !== undefined && seq <= state.seq) continue;
-              state.seq = seq;
-            }
-            if (!synced) continue;
-            try {
-              this.#onDurable(ev);
-            } catch (err) {
-              console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] ${ev.type} failed: ${err instanceof Error ? err.message : String(err)}`);
-            }
-          }
-        } catch (err) {
-          if (state.abort.signal.aborted) return;
-          if (err instanceof OpencodeHttpError && err.status === 404) {
-            markSynced();
-            const turn = this.#turn;
-            if (turn) this.#failTurn(turn, `opencode: session ${ses} no longer exists`);
-            return;
-          }
-        }
-        if (state.abort.signal.aborted) return;
-        await Bun.sleep(backoff);
-        backoff = Math.min(backoff * 2, LOG_BACKOFF_MAX_MS);
-      }
-    };
-    void run();
-    // A server that never marks the replay boundary would hold every turn
-    // forever: past the wait, what arrives from here on is taken as new.
-    await Promise.race([ready, Bun.sleep(LOG_SYNC_WAIT_MS)]);
-    if (!synced) {
-      console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] opencode's session log didn't mark where its replay ends — reading it live from here`);
-      synced = true;
-    }
-  }
-
   #detachSession(): void {
-    this.#log?.abort.abort();
-    this.#log = null;
     const ses = this.#ses;
     const conn = this.#conn;
     const dir = this.#workdir;
@@ -784,8 +740,6 @@ export class OpencodeProvider implements SessionProvider {
   #detachServer(): void {
     this.#unlisten?.();
     this.#unlisten = null;
-    this.#log?.abort.abort();
-    this.#log = null;
     this.#conn = null;
     this.#mountedFor = null;
   }
@@ -972,7 +926,7 @@ export class OpencodeProvider implements SessionProvider {
 
   // ── Events ────────────────────────────────────────────────────────────
 
-  /** One event from the session's durable log. */
+  /** One of this session's durable events. */
   #onDurable(ev: OcEvent): void {
     const d = (ev.data ?? {}) as Record<string, unknown>;
     switch (ev.type) {
@@ -1010,12 +964,14 @@ export class OpencodeProvider implements SessionProvider {
       }
       case "session.text.ended": {
         const key = `${String(d.assistantMessageID)}:${String(d.ordinal)}`;
+        if (this.#endedBlocks.has(key)) return; // already read back after a gap
         this.#endedBlocks.add(key);
         if (typeof d.text === "string") this.#emit({ type: "text_done", content: d.text });
         return;
       }
       case "session.reasoning.ended": {
         const key = `r:${String(d.assistantMessageID)}:${String(d.ordinal)}`;
+        if (this.#endedBlocks.has(key)) return;
         this.#endedBlocks.add(key);
         const blockIndex = this.#thinkingIndex(key);
         // A reasoning block whose deltas never arrived (a reconnect gap) still reaches the record.
@@ -1028,9 +984,12 @@ export class OpencodeProvider implements SessionProvider {
       case "session.tool.input.started":
         this.#recordCall(String(d.sessionID ?? this.#ses), String(d.id ?? ""), { name: String(d.name ?? "tool") });
         return;
-      case "session.tool.called":
-        this.#recordCall(String(d.sessionID ?? this.#ses), String(d.id ?? ""), { input: (d.input as Record<string, unknown>) ?? {} });
+      case "session.tool.called": {
+        const sid = String(d.sessionID ?? this.#ses);
+        const id = String(d.id ?? "");
+        this.#recordCall(sid, id, { input: (d.input as Record<string, unknown>) ?? {} });
         return;
+      }
       case "session.tool.success":
       case "session.tool.failed":
         this.#toolSettled(String(d.sessionID ?? this.#ses), d, ev.type === "session.tool.success");
@@ -1045,11 +1004,17 @@ export class OpencodeProvider implements SessionProvider {
         } else if (this.#turn && typeof d.finish === "string") {
           this.#turn.finish = d.finish;
         }
+        if (typeof d.assistantMessageID === "string") {
+          if (this.#countedSteps.has(d.assistantMessageID)) return; // already read back after a gap
+          this.#countedSteps.add(d.assistantMessageID);
+        }
+        addTokens(this.#counted, tokens, cost);
         this.#recordStep(tokens, cost, true);
         return;
       }
       case "session.compaction.ended":
       case "session.compaction.failed":
+        addTokens(this.#counted, d.tokens as OcTokenUsage | undefined, typeof d.cost === "number" ? d.cost : undefined);
         this.#recordStep(d.tokens as OcTokenUsage | undefined, typeof d.cost === "number" ? d.cost : undefined, true, false);
         return;
       case "session.retry.scheduled": {
@@ -1143,13 +1108,49 @@ export class OpencodeProvider implements SessionProvider {
     }
   }
 
-  /** One event from the live feed: deltas, asks, forms, and child sessions. */
+  /**
+   * opencode's running total for this session. What it holds past the steps
+   * codeoid counted is spend no step reported — the title opencode generates
+   * for a session's first prompt — and is counted as a side call, in the turn
+   * it lands in (or the next one).
+   */
+  #usageUpdated(d: Record<string, unknown>): void {
+    const total = emptyUsage();
+    addTokens(total, d.tokens as OcTokenUsage | undefined, typeof d.cost === "number" ? d.cost : undefined);
+    const c = this.#counted;
+    const over = (k: keyof Usage) => Math.max(0, total[k] - c[k]);
+    // Float sums of the same costs can differ in the last bits.
+    const cost = over("cost") > 1e-9 ? over("cost") : 0;
+    const tokens: OcTokenUsage = { input: over("input"), output: over("output"), reasoning: over("reasoning"), cache: { read: over("cacheRead"), write: over("cacheWrite") } };
+    for (const k of Object.keys(c) as Array<keyof Usage>) c[k] = Math.max(c[k], total[k]);
+    if (cost === 0 && tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write === 0) return;
+    this.#recordStep(tokens, cost, false);
+  }
+
+  /** One event from the live feed: this session's own (durable or not), and its children's. */
   #onLive(ev: OcEvent): void {
     const ses = this.#ses;
     if (!ses) return;
     const d = (ev.data ?? {}) as Record<string, unknown>;
     if (ev.type === "session.created") {
       if (d.parentID === ses && typeof d.sessionID === "string") this.#childCreated(d.sessionID, d);
+      return;
+    }
+    if (ev.durable?.aggregateID === ses) {
+      // The feed is the record: a seq at or below the last one is a repeat.
+      if (typeof ev.durable.seq === "number") {
+        if (ev.durable.seq <= this.#seq) return;
+        this.#seq = ev.durable.seq;
+      }
+      try {
+        this.#onDurable(ev);
+      } catch (err) {
+        console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] ${ev.type} failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      return;
+    }
+    if (ev.type === "session.usage.updated" && d.sessionID === ses) {
+      this.#usageUpdated(d);
       return;
     }
     if (ev.type === "permission.replied") {
@@ -1184,7 +1185,7 @@ export class OpencodeProvider implements SessionProvider {
         return;
       }
       case "session.tool.called":
-        // Also on the log for our own session; recorded from whichever comes first.
+        // A child's (its own session's are durable events, handled above).
         this.#recordCall(sid, String(d.id ?? ""), { input: (d.input as Record<string, unknown>) ?? {} });
         return;
       case "permission.asked":
@@ -1448,9 +1449,15 @@ export class OpencodeProvider implements SessionProvider {
 
   // ── Server events ─────────────────────────────────────────────────────
 
-  /** The live feed (re)connected: re-read what may have been asked in the gap. */
+  /** The live feed (re)connected: re-read what may have been asked in the gap, and how a running turn went. */
   #resync(conn: OpencodeConnection): void {
     if (conn !== this.#conn || !this.#ses) return;
+    const turn = this.#turn;
+    if (turn && !turn.queue.closed) {
+      void this.#reconcile(conn, turn).catch((err: unknown) => {
+        console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] reading back a turn after a feed gap failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
     for (const sid of [this.#ses, ...this.#children.keys()]) {
       void conn.client
         .pendingPermissions(sid)
@@ -1465,6 +1472,82 @@ export class OpencodeProvider implements SessionProvider {
         })
         .catch(() => {});
     }
+  }
+
+  /**
+   * After a gap in the feed. A turn whose execution ended in the gap would
+   * wait forever: if the session went idle after the turn began, its blocks,
+   * steps and outcome are read back from the session's messages (only what
+   * the feed didn't deliver) and the turn ends as opencode says it did.
+   */
+  async #reconcile(conn: OpencodeConnection, turn: Turn): Promise<void> {
+    const ses = this.#ses;
+    if (!ses) return;
+    let info: OcSessionInfo;
+    try {
+      info = await conn.client.getSession(ses);
+    } catch (err) {
+      if (err instanceof OpencodeHttpError && err.status === 404 && this.#turn === turn) this.#failTurn(turn, `opencode: session ${ses} no longer exists`);
+      return;
+    }
+    if (this.#turn !== turn || turn.queue.closed || this.#ses !== ses) return;
+    const { busy, idle } = info.time ?? {};
+    // A turn opencode started was seen after it began; a prompted one began before.
+    const since = turn.adopted ? turn.startedAt - 5_000 : turn.startedAt;
+    if (busy === undefined || idle === undefined || idle < busy || busy < since) return; // still running, or not started yet
+    const mine: OcMessage[] = [];
+    let cursor: string | undefined;
+    let reachedStart = false;
+    for (let page = 0; page < RECONCILE_PAGES && !reachedStart; page++) {
+      const res = await conn.client.recentMessages(ses, cursor);
+      for (const m of res.data ?? []) {
+        if (m.id === turn.promptId || (m.time?.created ?? 0) < since) {
+          reachedStart = true;
+          break;
+        }
+        mine.push(m);
+      }
+      cursor = res.cursor?.next;
+      if (!cursor) break;
+    }
+    if (this.#turn !== turn || turn.queue.closed) return;
+    let lastError: OcError | undefined;
+    for (const m of mine.reverse()) {
+      if (m.type !== "assistant") continue;
+      turn.lastAssistantMessageID = m.id;
+      if (m.error) lastError = m.error;
+      let text = 0;
+      let reasoning = 0;
+      for (const block of m.content ?? []) {
+        if (block.type === "text") {
+          const key = `${m.id}:${text++}`;
+          if (this.#endedBlocks.has(key) || typeof block.text !== "string") continue;
+          this.#endedBlocks.add(key);
+          this.#emit({ type: "text_done", content: block.text });
+        } else if (block.type === "reasoning") {
+          const key = `r:${m.id}:${reasoning++}`;
+          if (this.#endedBlocks.has(key)) continue;
+          this.#endedBlocks.add(key);
+          const blockIndex = this.#thinkingIndex(key);
+          if (!this.#streamedBlocks.has(key) && block.text) this.#emit({ type: "thinking_delta", content: block.text, blockIndex });
+          this.#emit({ type: "thinking_done", blockIndex });
+        }
+      }
+      if (!this.#countedSteps.has(m.id) && (m.cost !== undefined || m.tokens)) {
+        this.#countedSteps.add(m.id);
+        addTokens(this.#counted, m.tokens, m.cost);
+        this.#recordStep(m.tokens, m.cost, true);
+      }
+    }
+    // Spend no step reported (the title), from opencode's own total.
+    this.#usageUpdated({ cost: info.cost, tokens: info.tokens });
+    if (this.#turn !== turn || turn.queue.closed) return;
+    console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] opencode's feed dropped the end of a turn — read it back from the session`);
+    this.#executing = false;
+    // Session absorbs one turn_done per steer it pushed; they were delivered in the gap.
+    while (turn.owed > 0) this.#payBoundary(turn);
+    const outcome = info.outcome ?? (lastError ? "failed" : "succeeded");
+    this.#finishTurn(turn, outcome, outcome === "failed" ? lastError : undefined);
   }
 
   /** The server went away: every pending request with it counts as rejected. */
@@ -1514,8 +1597,6 @@ export class OpencodeProvider implements SessionProvider {
     const dir = this.#workdir;
     if (conn && dir) await Promise.race([this.#unmount(conn, dir), Bun.sleep(2_000)]);
     // The opencode session stays: the next turn resumes it by id.
-    this.#log?.abort.abort();
-    this.#log = null;
     this.#ses = null;
     this.#workdir = null;
     this.#executing = false;

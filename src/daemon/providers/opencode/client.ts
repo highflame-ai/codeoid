@@ -7,15 +7,14 @@
  * bound to a directory by the `x-opencode-directory` header (URI-encoded),
  * which is how one server serves every codeoid workdir.
  *
- * Two streams:
- *   - `GET /api/experimental/session/:id/log?after=<seq>&follow=true` — the
- *     durable per-session log: replayable by seq, ends replay with a
- *     `log.synced` marker. It carries DURABLE events only (text/reasoning
- *     `.ended`, tool calls and results, steps with cost, executions).
- *   - `GET /api/event` — the server-wide live feed. Volatile (no replay; a
- *     slow reader is dropped at 4096 queued events), but the only place the
- *     ephemeral events arrive: text/reasoning deltas, `permission.asked`,
- *     `form.created`.
+ * One stream: `GET /api/event`, the server-wide live feed. It carries every
+ * session's durable events (each with `durable: {aggregateID, seq}`) and the
+ * ephemeral ones (text/reasoning deltas, `permission.asked`, `form.created`,
+ * `session.usage.updated`). Volatile: no replay, a slow reader is dropped.
+ *
+ * Not used: `GET /api/experimental/session/:id/log`. On opencode 2.2.2 and
+ * 2.2.5 it replays no events (only its `log.synced` marker) and, with
+ * `follow=true`, sends nothing but heartbeats — not even that marker.
  */
 
 // ── Wire types (subset of the OpenAPI components) ───────────────────────────
@@ -54,6 +53,10 @@ export interface OcSessionInfo {
   title?: string;
   permissions?: OcRule[];
   location?: { directory: string };
+  /** How the session's last execution ended. */
+  outcome?: "succeeded" | "failed" | "interrupted";
+  /** `busy`: when its last execution started; `idle`: when one last ended. */
+  time?: { created?: number; updated?: number; busy?: number; idle?: number };
 }
 
 /** `Permission.Request` — also the `permission.asked` event's data. */
@@ -137,10 +140,17 @@ export interface OcSkillInfo {
   description?: string;
 }
 
-/** `Session.Message.Info` (only what a fork boundary needs). */
+/** `Session.Message.Info` (what a fork boundary and a feed gap need). */
 export interface OcMessage {
   id: string;
   type: string;
+  /** An assistant message's blocks, in order. */
+  content?: Array<{ type: string; text?: string; id?: string }>;
+  cost?: number;
+  tokens?: OcTokenUsage;
+  error?: OcError;
+  finish?: string;
+  time?: { created?: number; completed?: number };
 }
 
 /** `ServerInfo`. */
@@ -314,6 +324,13 @@ export class OpencodeClient {
     });
   }
 
+  /** One page of messages, newest first. */
+  async recentMessages(sessionID: string, cursor?: string): Promise<{ data: OcMessage[]; cursor?: { next?: string } }> {
+    return this.#request("GET", `/api/session/${encodeURIComponent(sessionID)}/message`, {
+      query: cursor ? { cursor, limit: "50" } : { order: "desc", limit: "50" },
+    });
+  }
+
   /** Attach or replace one durable instruction entry (experimental). */
   async putInstruction(sessionID: string, key: string, value: string): Promise<void> {
     await this.#request("PUT", `/api/experimental/session/${encodeURIComponent(sessionID)}/instructions/entries/${encodeURIComponent(key)}`, { body: { value } });
@@ -387,13 +404,6 @@ export class OpencodeClient {
   }
 
   // ── Streams ─────────────────────────────────────────────────────────
-
-  /** The durable log of one session; see the file header. */
-  sessionLog(sessionID: string, after: number | undefined, signal: AbortSignal): AsyncIterable<OcEvent> {
-    const query = new URLSearchParams({ follow: "true" });
-    if (after !== undefined) query.set("after", String(after));
-    return this.#sse(`/api/experimental/session/${encodeURIComponent(sessionID)}/log?${query}`, signal);
-  }
 
   /** The live feed, filtered server-side to `types` (plus `server.connected`). */
   events(types: readonly string[], signal: AbortSignal): AsyncIterable<OcEvent> {

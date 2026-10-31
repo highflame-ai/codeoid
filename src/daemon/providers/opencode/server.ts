@@ -18,8 +18,8 @@
  * (policy.ts, layer 3) — restarting once with overrides if needed.
  *
  * The live feed (`GET /api/event`) is read here once for all sessions and
- * fanned out; each provider filters for its own sessions. The durable
- * per-session logs are read by the providers themselves.
+ * fanned out; each provider filters for its own sessions. It is the only
+ * stream: it carries the sessions' durable events as well.
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -30,19 +30,34 @@ import { OpencodeClient, OpencodeHttpError, type OcEvent, type OcRule } from "./
 import { agentOverrides, buildOpencodeEnv, opencodeConfig, serverEnv, unsafeAgents } from "./policy.js";
 import { opencodeVersionProblem } from "./resolve.js";
 
-/** Live-feed event types the providers read (the rest arrive on the durable logs). */
+/**
+ * Live-feed event types the providers read: every session's durable events
+ * (opencode 2.2's per-session log endpoint delivers none) and the ephemeral
+ * ones. All accepted by the filter on 2.2.2 and 2.2.5; an unknown type makes
+ * the server refuse the whole query (see #runFeed).
+ */
 export const LIVE_EVENT_TYPES = [
-  "session.text.delta",
-  "session.reasoning.delta",
-  "session.tool.called",
-  "session.tool.success",
-  "session.tool.failed",
-  "session.step.ended",
   "session.created",
   "session.execution.started",
   "session.execution.succeeded",
   "session.execution.failed",
   "session.execution.interrupted",
+  "session.inbox.delivered",
+  "session.step.started",
+  "session.step.ended",
+  "session.step.failed",
+  "session.text.delta",
+  "session.text.ended",
+  "session.reasoning.delta",
+  "session.reasoning.ended",
+  "session.tool.input.started",
+  "session.tool.called",
+  "session.tool.success",
+  "session.tool.failed",
+  "session.retry.scheduled",
+  "session.compaction.ended",
+  "session.compaction.failed",
+  "session.usage.updated",
   "permission.asked",
   "permission.replied",
   "form.created",
@@ -162,7 +177,7 @@ export class OpencodeServer {
           this.#opts.onIncompatible?.(problem);
           throw new OpencodeIncompatibleError(problem);
         }
-        // Also the auth check: /api/info answers without credentials.
+        // The auth check too (both routes need the password).
         const agents = await launched.client.agents();
         const unsafe = unsafeAgents(agents);
         if (unsafe.length > 0) {
