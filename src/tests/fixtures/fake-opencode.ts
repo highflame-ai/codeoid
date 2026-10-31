@@ -20,7 +20,9 @@
  * execution ends), a queued input runs inside the running execution, a bare
  * reject interrupts the execution, a child session inherits its parent's
  * rules, and a background child's result resumes the parent through a
- * synthetic inbox item.
+ * synthetic inbox item. An input still in the inbox when an execution is
+ * interrupted stays there and is delivered with the next prompt, unless it
+ * is withdrawn (`DELETE /api/session/:id/inbox/:inboxID`).
  *
  * Turn behavior is keyed off the prompt text:
  *   default        → text deltas + text.ended, one step with cost/tokens
@@ -140,6 +142,7 @@ const state = {
   patches: [] as Json[],
   forks: [] as Json[],
   interrupts: [] as string[],
+  inboxCancels: [] as string[],
   saved: process.env.FAKE_OPENCODE_SAVED === "1" ? [{ id: "prm_1", action: "shell", resource: "git *" }] : ([] as Json[]),
   savedRemoved: [] as string[],
 };
@@ -1021,7 +1024,6 @@ const server = Bun.serve({
       state.prompts.push({ sessionID: ses.id, id, ...body });
       durable(ses, "session.inbox.enqueued", { inboxID: id, item: { type: "user", payload: { text }, delivery } });
       // As real 2.2.x: an input becomes a user message (under its inbox id) when it is delivered.
-      if (!ses.executing) ses.messages.push({ id, type: "user", text, time: { created: Date.now() } });
       if (ses.executing) {
         ses.inbox.push({ id, text, delivery });
         // The reply can lag the steer's delivery (FAKE_OPENCODE_STEER_REPLY_MS): opencode takes it at the next step boundary.
@@ -1029,7 +1031,10 @@ const server = Bun.serve({
       } else {
         // Busy from admission: an input posted before the execution's first event joins it.
         ses.executing = true;
-        setTimeout(() => void startExecution(ses, text, id), 5);
+        // What an interrupted execution left in the inbox is delivered with this prompt, ahead of it.
+        const left = ses.inbox.splice(0);
+        for (const item of [...left, { id, text }]) ses.messages.push({ id: item.id, type: "user", text: item.text, time: { created: Date.now() } });
+        setTimeout(() => void startExecution(ses, [...left.map((x) => x.text), text].join("\n"), id), 5);
       }
       return json({ data: { id, sessionID: ses.id, type: "user", payload: { text }, delivery, time: { created: Date.now() } } });
     }
@@ -1044,6 +1049,17 @@ const server = Bun.serve({
       const running = ses.executing;
       ses.cancel?.();
       return json({ interrupted: running });
+    }
+    const ib = /^\/inbox\/([^/]+)$/.exec(rest);
+    if (ib && method === "DELETE") {
+      // An input not delivered yet is withdrawn; a delivered one is left as it is (no error).
+      const i = ses.inbox.findIndex((x) => x.id === ib[1]);
+      if (i >= 0) {
+        ses.inbox.splice(i, 1);
+        state.inboxCancels.push(ib[1]!);
+        durable(ses, "session.inbox.cancelled", { inboxID: ib[1] });
+      }
+      return new Response(null, { status: 204 });
     }
     const mm = /^\/message\/([^/]+)$/.exec(rest);
     if (mm && method === "GET") {

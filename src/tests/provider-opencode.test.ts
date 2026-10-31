@@ -1030,6 +1030,31 @@ describe("opencode mid-turn messages", () => {
     expect(st.prompts.at(-1)).toMatchObject({ text: "afterwards", delivery: "queue" });
   });
 
+  it("what the user's interrupt dropped is withdrawn from opencode's inbox: the next turn doesn't get it", async () => {
+    // The steer's request answers after the interrupt (its id comes back late); the queued one answers at once.
+    const { server } = makeServer({ FAKE_OPENCODE_STEER_REPLY_MS: "300" });
+    const p = makeProvider(server);
+    const run = p.runTurn(opts("slow"));
+    for await (const e of run.events) {
+      if (e.type === "llm_call") {
+        run.pushMidTurn?.("dropped steer", "now");
+        run.pushMidTurn?.("dropped queued", "later");
+        await Bun.sleep(100);
+        void run.interrupt();
+      }
+      if (e.type === "turn_done" || e.type === "error") break;
+    }
+    await Bun.sleep(500);
+    const next = await collect(p.runTurn(opts("echo-state")));
+    const seen = JSON.parse(texts(next, "text_done")[0]!) as { prompt: string };
+    expect(seen.prompt).toBe("echo-state");
+    const st = await fakeState(server);
+    const ids = st.prompts.filter((x: { text: string }) => x.text.startsWith("dropped")).map((x: { id: string }) => x.id);
+    expect(ids).toHaveLength(2);
+    expect([...st.inboxCancels].sort()).toEqual([...ids].sort());
+    await p.teardown();
+  });
+
   it("a later message is answered inside the running turn, which ends once", async () => {
     // Real 2.2.x delivers a queued input in the running execution, after its reply.
     const { server } = makeServer();

@@ -174,6 +174,8 @@ interface Turn {
   owed: number;
   /** Inbox ids of those steers, to pay at their delivery. */
   steers: Set<string>;
+  /** Inbox ids of messages queued behind the turn (`later`) and not delivered yet. */
+  queued: Set<string>;
   /** Steers Session counted that opencode never took (the request failed): paid just before the turn's last `turn_done`. */
   unpaid: number;
   /**
@@ -429,6 +431,7 @@ export class OpencodeProvider implements SessionProvider {
       started: false,
       owed: 0,
       steers: new Set(),
+      queued: new Set(),
       unpaid: 0,
       posted,
       markPosted,
@@ -582,7 +585,17 @@ export class OpencodeProvider implements SessionProvider {
     const conn = this.#conn;
     if (!ses || !conn) throw new Error("no opencode session to steer");
     const item = await conn.client.prompt(ses, { text: content, delivery });
-    if (delivery === "queue" || this.#turn !== turn) return;
+    if (turn.interrupted && !turn.budgetStopped) {
+      // The user stopped the turn while this was on its way: Session dropped
+      // it, so opencode mustn't hand it to the model with the next prompt.
+      this.#cancelInput(conn, ses, item.id);
+      return;
+    }
+    if (delivery === "queue") {
+      if (!turn.delivered.has(item.id)) turn.queued.add(item.id);
+      return;
+    }
+    if (this.#turn !== turn) return;
     // Delivered before its id came back: its boundary is due now.
     if (turn.delivered.has(item.id)) {
       if (turn.owed > 0) this.#payBoundary(turn);
@@ -591,18 +604,29 @@ export class OpencodeProvider implements SessionProvider {
     }
   }
 
+  #cancelInput(conn: OpencodeConnection, ses: string, id: string): void {
+    void conn.client.cancelInput(ses, id).catch((err: unknown) => {
+      console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] couldn't withdraw a message the interrupt dropped: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+
   /** Stop the turn's execution: the user's interrupt, or the provider's own budget stop (`budget`). */
   async #interrupt(turn: Turn, opts: { budget?: boolean } = {}): Promise<void> {
     turn.interrupted = true;
     // Session cancels its pending mid-turn continuations when it interrupts.
     // A budget stop is the provider's own: Session still counts the steers it
     // pushed, so they are paid before the final turn_done (#finishTurn).
+    const ses = this.#ses;
+    const conn = this.#conn;
     if (!opts.budget) {
       turn.owed = 0;
       turn.unpaid = 0;
+      // What Session dropped stays dropped: opencode would otherwise deliver
+      // an input still in its inbox with the next prompt.
+      if (ses && conn) for (const id of [...turn.steers, ...turn.queued]) this.#cancelInput(conn, ses, id);
+      turn.steers.clear();
+      turn.queued.clear();
     }
-    const ses = this.#ses;
-    const conn = this.#conn;
     if (!ses || !conn) {
       this.#finishTurn(turn, "interrupted");
       return;
@@ -1070,6 +1094,7 @@ export class OpencodeProvider implements SessionProvider {
         turn.started = true;
         const id = String(d.inboxID ?? "");
         turn.delivered.add(id);
+        turn.queued.delete(id);
         if (turn.steers.delete(id) && turn.owed > 0) this.#payBoundary(turn);
         return;
       }
@@ -1228,6 +1253,7 @@ export class OpencodeProvider implements SessionProvider {
       started: true,
       owed: 0,
       steers: new Set(),
+      queued: new Set(),
       unpaid: 0,
       posted: Promise.resolve(),
       markPosted: () => {},
@@ -1754,6 +1780,7 @@ export class OpencodeProvider implements SessionProvider {
         // opencode stores an input as it delivers it, under its inbox id: a
         // steer delivered in the gap is paid here, where its answer begins.
         turn.delivered.add(m.id);
+        turn.queued.delete(m.id);
         if (turn.steers.delete(m.id) && turn.owed > 0) this.#payBoundary(turn);
         continue;
       }

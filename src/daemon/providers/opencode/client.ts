@@ -331,6 +331,11 @@ export class OpencodeClient {
     await this.#request("POST", `/api/session/${encodeURIComponent(sessionID)}/command`, { body });
   }
 
+  /** Withdraw an input not delivered yet (one already delivered is left as it is). */
+  async cancelInput(sessionID: string, inboxID: string): Promise<void> {
+    await this.#request("DELETE", `/api/session/${encodeURIComponent(sessionID)}/inbox/${encodeURIComponent(inboxID)}`);
+  }
+
   async interrupt(sessionID: string): Promise<{ interrupted: boolean }> {
     return this.#request("POST", `/api/session/${encodeURIComponent(sessionID)}/interrupt`);
   }
