@@ -1217,6 +1217,8 @@ export class OpencodeProvider implements SessionProvider {
       case "session.execution.interrupted": {
         this.#executing = false;
         this.#lastEndAt = Date.now();
+        // Nothing of an ended execution still waits on an answer.
+        if (this.#ses) this.#withdrawAsks(this.#ses);
         const turn = this.#turn;
         if (!turn || !turn.started) return;
         const outcome = ev.type === "session.execution.succeeded" ? "succeeded" : ev.type === "session.execution.failed" ? "failed" : "interrupted";
@@ -1457,6 +1459,7 @@ export class OpencodeProvider implements SessionProvider {
   #childEnded(sid: string, child: Child, outcome: "succeeded" | "failed" | "interrupted"): void {
     if (!child.running) return;
     child.running = false;
+    this.#withdrawAsks(sid);
     this.#emit({ type: "subagent_stop", agentId: sid });
     if (child.background) {
       const status = outcome === "succeeded" ? "completed" : outcome === "failed" ? "failed" : "stopped";
@@ -1577,6 +1580,8 @@ export class OpencodeProvider implements SessionProvider {
     const id = String(d.id ?? "");
     const key = `${sessionID}:${id}`;
     this.#unfence(sessionID, key);
+    // An interrupt drops a waiting request without a `permission.replied`: the call's end is the only word of it.
+    this.#withdrawAsks(sessionID, id);
     if (this.#settledCalls.has(key)) return; // read back already, now from the feed
     remember(this.#settledCalls, key);
     const call = this.#toolCalls.get(key);
@@ -1648,6 +1653,8 @@ export class OpencodeProvider implements SessionProvider {
     const gate = this.#turn && !this.#turn.queue.closed ? this.#turn.gate : isChild ? this.#lastGate : null;
     const callKey = `${req.sessionID}:${req.source?.id ?? req.id}`;
     const source = req.source?.id ? await this.#callFor(conn, req, callKey, opts.missed === true) : undefined;
+    // Its call ended meanwhile (an interrupt dropped the request): there's nothing left to answer.
+    if (req.source?.id && this.#settledCalls.has(callKey)) return;
     // A request made from inside a Code Mode script (its `fetch`) names the
     // script's call: it gets a card of its own, settled by its reply. One
     // script can make many.
@@ -1703,6 +1710,22 @@ export class OpencodeProvider implements SessionProvider {
     if (!nested) this.#declined.add(key);
     // A message makes it feedback the model reads and carries on from; a bare reject ends the step.
     await this.#reply(conn, req, "reject", verdict.message || "The user denied this action.");
+  }
+
+  /**
+   * Withdraw what still waits at the gate for opencode requests it dropped:
+   * `callId`'s (a nested Code Mode fetch's too), or all of a session's. The
+   * gate's signal aborts, which dismisses the approval; the call's own card
+   * is settled by its result, a nested one's here.
+   */
+  #withdrawAsks(sessionID: string, callId?: string): void {
+    for (const [id, pending] of this.#pendingAsks) {
+      if (pending.sessionID !== sessionID) continue;
+      if (callId !== undefined && pending.toolId !== callId && !pending.toolId.startsWith(`${callId}:`)) continue;
+      this.#pendingAsks.delete(id);
+      pending.abort.abort();
+      if (pending.nested) this.#emit({ type: "tool_complete", sdkToolUseId: pending.toolId, output: "Withdrawn — opencode stopped waiting for an answer.", success: false, declinedByBackend: true });
+    }
   }
 
   async #reply(conn: OpencodeConnection, req: OcPermissionRequest, decision: "once" | "reject", message?: string): Promise<void> {

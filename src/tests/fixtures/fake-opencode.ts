@@ -20,9 +20,13 @@
  * execution ends), a queued input runs inside the running execution, a bare
  * reject interrupts the execution, a child session inherits its parent's
  * rules, and a background child's result resumes the parent through a
- * synthetic inbox item. An input still in the inbox when an execution is
- * interrupted stays there and is delivered with the next prompt, unless it
- * is withdrawn (`DELETE /api/session/:id/inbox/:inboxID`).
+ * synthetic inbox item (a stopped one's too). An input still in the inbox
+ * when an execution is interrupted stays there and is delivered with the
+ * next prompt, unless it is withdrawn (`DELETE /api/session/:id/inbox/:inboxID`).
+ * An interrupt drops the session's waiting permission requests (a
+ * foreground child's too) without a `permission.replied`: each call fails
+ * `aborted` "Tool execution interrupted", its step fails (billed), and the
+ * execution ends interrupted.
  *
  * Turn behavior is keyed off the prompt text:
  *   default        → text deltas + text.ended, one step with cost/tokens
@@ -126,6 +130,8 @@ interface Ses {
   /** The running total `session.usage.updated` reports. */
   usage: { cost: number; input: number; output: number; reasoning: number; read: number; write: number };
   titled: boolean;
+  /** A subagent's child session its parent's call waits on: the parent's interrupt stops it too. */
+  foreground?: boolean;
   outcome?: string;
   busy?: number;
   idle?: number;
@@ -354,6 +360,26 @@ function askPermission(ses: Ses, req: Json): Promise<{ decision: string; message
   });
 }
 
+/** As an interrupt does on real 2.2.x: the session's waiting requests are gone, with no `permission.replied`. */
+function dropAsks(sessionID: string): void {
+  for (const [id, p] of [...pendingPerms]) {
+    if (p.req.sessionID !== sessionID) continue;
+    pendingPerms.delete(id);
+    p.resolve({ decision: "interrupted" });
+  }
+}
+
+/** A call whose request an interrupt dropped: it fails, its step fails (billed), and the execution is interrupted. */
+function interruptedCall(ses: Ses, msg: string, id: string): never {
+  const block = toolBlock(ses, msg, id);
+  const error = { type: "aborted", message: "Tool execution interrupted" };
+  if (block) block.state = { ...(block.state as Json), status: "error", error };
+  durable(ses, "session.tool.failed", { assistantMessageID: msg, id, error, executed: false });
+  durable(ses, "session.step.failed", { assistantMessageID: msg, error: { type: "aborted", message: "Step interrupted" }, cost: 0.0123, tokens: TOKENS });
+  bill(ses, 0.0123, TOKENS);
+  throw new Cancelled();
+}
+
 function askForm(ses: Ses, form: Json): Promise<{ answer?: Json; cancelled?: string }> {
   const id = nextId("frm");
   const full = { id, sessionID: ses.id, ...form };
@@ -419,6 +445,7 @@ async function toolCall(ses: Ses, msg: string, name: string, input: Json, req: J
   durable(ses, "session.tool.input.started", { assistantMessageID: msg, id, name });
   durable(ses, "session.tool.called", { assistantMessageID: msg, id, input, executed: false });
   const reply = await askPermission(ses, { ...req, source: { type: "tool", messageID: msg, id } });
+  if (reply.decision === "interrupted") interruptedCall(ses, msg, id);
   afterReply?.();
   const block = toolBlock(ses, msg, id);
   if (reply.decision === "once" || reply.decision === "always") {
@@ -561,6 +588,7 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     durable(ses, "session.tool.input.started", { assistantMessageID: msg, id: call, name: "subagent" });
     durable(ses, "session.tool.called", { assistantMessageID: msg, id: call, input: { agent: "explore", description: "look around", prompt: "find it", ...(background ? { background: true } : {}) }, executed: false });
     const perm = await askPermission(ses, { action: "subagent", resources: ["explore"], source: { type: "tool", messageID: msg, id: call } });
+    if (perm.decision === "interrupted") interruptedCall(ses, msg, call);
     if (perm.decision !== "once") {
       durable(ses, "session.tool.failed", { assistantMessageID: msg, id: call, error: { type: "permission.rejected", message: perm.message ?? "" }, executed: false });
       endStep(ses, msg);
@@ -569,6 +597,7 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     // "subagent-gapstart": the child is created, starts and asks in a feed gap.
     if (text.includes("subagent-gapstart")) setTimeout(dropFeed(), 400);
     const child = createSession({ parentID: ses.id, directory: ses.directory, title: "look around", agent: "explore" });
+    child.foreground = !background;
     await sleep(20);
     // "subagent-gapend" / "background-gap": the feed drops once the child's call is approved,
     // over the rest of the child's run (and, for a background one, the parent's follow-up).
@@ -579,9 +608,23 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
             gap.up = dropFeed();
           }
         : undefined;
-    const runChild = async (afterReply?: () => void) => {
+    const runChild = async (afterReply?: () => void): Promise<boolean | "interrupted"> => {
       child.busy = Date.now();
+      child.executing = true;
       durable(child, "session.execution.started", {});
+      try {
+        return await childTurn(afterReply);
+      } catch (err) {
+        if (!(err instanceof Cancelled)) throw err;
+        child.idle = Date.now();
+        child.outcome = "interrupted";
+        durable(child, "session.execution.interrupted", { reason: "user" });
+        return "interrupted";
+      } finally {
+        child.executing = false;
+      }
+    };
+    const childTurn = async (afterReply?: () => void) => {
       const cm = step(child);
       if (text.includes("subagent-fail")) {
         // Billed although it failed: the model answered before the step did.
@@ -607,17 +650,21 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
       endStep(ses, msg2);
       void (async () => {
         await sleep(150);
-        await runChild(gapEnd);
-        // opencode notifies the parent itself (a synthetic inbox item) and runs its main agent.
+        const ran = await runChild(gapEnd);
+        // opencode notifies the parent itself (a synthetic inbox item) and runs its main agent — a stopped child too.
         await sleep(50);
         const inboxID = nextId("msg");
-        durable(ses, "session.inbox.enqueued", { inboxID, item: { type: "synthetic", payload: { text: "<subagent>…</subagent>", metadata: { source: "subagent", childID: child.id, state: "completed" } }, delivery: "steer" } });
+        const childState = ran === "interrupted" ? "interrupted" : "completed";
+        durable(ses, "session.inbox.enqueued", { inboxID, item: { type: "synthetic", payload: { text: "<subagent>…</subagent>", metadata: { source: "subagent", childID: child.id, state: childState } }, delivery: "steer" } });
         await startExecution(ses, "__background-result", inboxID);
         gap.up?.();
       })();
       return "succeeded";
     }
-    const ok = await runChild(gapEnd);
+    const ran = await runChild(gapEnd);
+    // Stopped with its parent: the parent's call fails as interrupted, and so does its execution.
+    if (ran === "interrupted") interruptedCall(ses, msg, call);
+    const ok = ran;
     const block = { type: "tool", id: call, name: "subagent", state: { status: "completed", input: {}, content: [{ type: "text", text: ok ? "found it" : "child refused" }], metadata: { sessionID: child.id, status: "completed" } } };
     ses.messages.find((x) => x.id === msg)?.content?.push(block);
     durable(ses, "session.tool.success", { assistantMessageID: msg, id: call, content: block.state.content, metadata: block.state.metadata, executed: true });
@@ -1207,6 +1254,8 @@ const server = Bun.serve({
       state.interrupts.push(ses.id);
       const running = ses.executing;
       ses.cancel?.();
+      dropAsks(ses.id);
+      for (const child of sessions.values()) if (child.parentID === ses.id && child.foreground && child.executing) dropAsks(child.id);
       return json({ interrupted: running });
     }
     const ib = /^\/inbox\/([^/]+)$/.exec(rest);

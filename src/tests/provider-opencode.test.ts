@@ -661,6 +661,68 @@ describe("opencode interrupt", () => {
     expect(adopted).not.toContain("turn_started");
     await p.teardown();
   });
+
+  /** A gate that holds `who`'s requests open until they're withdrawn; `reached` resolves at the first. */
+  function holding(who: "main" | "child") {
+    let reach = () => {};
+    const reached = new Promise<void>((r) => {
+      reach = r;
+    });
+    const held: AbortSignal[] = [];
+    const gate: ToolApprovalFn = async (_t, _a, _n, _i, signal, agentId) => {
+      if ((who === "child") !== (agentId !== undefined)) return { behavior: "allow" };
+      held.push(signal!);
+      reach();
+      return new Promise((resolve) => signal!.addEventListener("abort", () => resolve({ behavior: "deny" })));
+    };
+    return { gate, reached, held };
+  }
+
+  it("a request the interrupt dropped (opencode says nothing of it) is withdrawn from the gate", async () => {
+    const { server } = makeServer();
+    const { gate, reached, held } = holding("main");
+    const run = makeProvider(server).runTurn(opts("use-shell", { canUseTool: gate }));
+    const collected = collect(run);
+    await reached;
+    void run.interrupt();
+    const events = await collected;
+    expect(done(events)?.stopReason).toBe("interrupted");
+    expect(held[0]!.aborted).toBe(true);
+    expect(events.some((e) => e.type === "tool_complete" && !e.success && e.output.includes("Tool execution interrupted"))).toBe(true);
+    // The interrupted step is billed.
+    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123, 6);
+  });
+
+  it("a foreground subagent's request the interrupt dropped is withdrawn too", async () => {
+    const { server } = makeServer();
+    const { gate, reached, held } = holding("child");
+    const run = makeProvider(server).runTurn(opts("subagent", { canUseTool: gate }));
+    const collected = collect(run);
+    await reached;
+    void run.interrupt();
+    const events = await collected;
+    expect(done(events)?.stopReason).toBe("interrupted");
+    expect(held[0]!.aborted).toBe(true);
+    expect(events.some((e) => e.type === "subagent_stop")).toBe(true);
+  });
+
+  it("stopping a background subagent that's asking withdraws its request from the gate", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const settled: string[] = [];
+    p.onSessionEvent = (e) => {
+      if (e.type === "background_task_settled") settled.push(e.status);
+    };
+    const { gate, reached, held } = holding("child");
+    const events = await collect(p.runTurn(opts("background", { canUseTool: gate })));
+    const child = (events.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>).agentId;
+    await reached;
+    expect(await p.stopBackgroundTasks([child])).toEqual([]);
+    for (let i = 0; i < 100 && settled.length === 0; i++) await Bun.sleep(20);
+    expect(settled).toEqual(["stopped"]);
+    expect(held[0]!.aborted).toBe(true);
+    await p.teardown();
+  });
 });
 
 // ── O7 models and effort ─────────────────────────────────────────────────────
