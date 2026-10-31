@@ -238,7 +238,7 @@ export function formatRoutineList(routines: RoutineWire[], now = Date.now()): st
 }
 
 export function formatRun(run: RoutineRunWire, now = Date.now()): string[] {
-  const head = `${relativeTime(run.createdAt, now).padEnd(8)} ${run.status.padEnd(15)} ${run.trigger.padEnd(8)} ${money(run.costUsd)}`;
+  const head = `${relativeTime(run.createdAt, now).padEnd(8)} ${run.status.padEnd(15)} ${run.trigger.padEnd(8)} ${run.costUnknown ? (run.costUsd > 0 ? `${money(run.costUsd)}+` : "$?") : money(run.costUsd)}`;
   const lines = [head];
   if (run.reason) lines.push(`    ${run.reason}`);
   if (run.summary) lines.push(...run.summary.split("\n").slice(0, 6).map((l) => `    │ ${l}`));

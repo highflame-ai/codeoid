@@ -201,7 +201,16 @@ describe("translateSDKMessage – assistant", () => {
       message: { content: [], usage: { input_tokens: 1, output_tokens: 1 } },
       parent_tool_use_id: "parent-id",
     });
-    expect(events[0]).toMatchObject({ type: "llm_call", isPrimary: false });
+    expect(events[0]).toMatchObject({ type: "llm_call", isPrimary: false, parentToolUseId: "parent-id" });
+  });
+
+  it("llm_call carries the request's id: one message per content block is still one request (#430)", () => {
+    const events = collectEmits({
+      type: "assistant",
+      message: { id: "msg_1", content: [{ type: "text", text: "Let me look." }], usage: { input_tokens: 10, output_tokens: 1 } },
+      parent_tool_use_id: null,
+    });
+    expect(events[0]).toMatchObject({ type: "llm_call", requestId: "msg_1", parentToolUseId: null });
   });
 
   it("skips text_done when no text blocks", () => {
@@ -277,6 +286,15 @@ describe("translateSDKMessage – stream_event", () => {
     expect(events[0]).toMatchObject({ type: "thinking_done", blockIndex: 2 });
   });
 
+  it("emits model_output when a tool call's block starts: a request streaming no text is still a request whose usage is to come (#430)", () => {
+    const events = collectEmits({
+      type: "stream_event",
+      event: { type: "content_block_start", index: 0, content_block: { type: "tool_use", name: "Write" } },
+      parent_tool_use_id: "tu-task-2",
+    });
+    expect(events).toEqual([{ type: "model_output", parentToolUseId: "tu-task-2" }]);
+  });
+
   it("emits nothing for null event", () => {
     const events = collectEmits({ type: "stream_event", event: null });
     expect(events).toHaveLength(0);
@@ -343,6 +361,15 @@ describe("translateSDKMessage – result", () => {
         errorMessage: undefined,
       },
     });
+  });
+
+  it("its own cost is the backend's — but a $0 with tokens spent isn't a price: left for the session to price (#430)", () => {
+    const priced = collectEmits({ type: "result", subtype: "success", usage: { input_tokens: 10, output_tokens: 1 }, total_cost_usd: 0.01, modelUsage: {} });
+    expect((priced[0] as { result: { costSource?: string } }).result.costSource).toBe("backend");
+    const zero = collectEmits({ type: "result", subtype: "success", usage: { input_tokens: 10, output_tokens: 1 }, total_cost_usd: 0, modelUsage: {} });
+    expect((zero[0] as { result: { costSource?: string } }).result.costSource).toBeUndefined();
+    const nothing = collectEmits({ type: "result", subtype: "success", usage: { input_tokens: 0, output_tokens: 0 }, total_cost_usd: 0, modelUsage: {} });
+    expect((nothing[0] as { result: { costSource?: string } }).result.costSource).toBe("backend");
   });
 
   it("carries the result text of a success-subtype is_error turn as resultText (where the CLI puts a limit notice)", () => {

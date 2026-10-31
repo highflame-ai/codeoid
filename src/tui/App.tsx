@@ -672,7 +672,9 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
       lines.push(`- cache creation:       **${formatK(mostRecent.cacheCreationTokens)}** (${pct(mostRecent.cacheCreationTokens)}) — billed ~125%`);
       lines.push(`- output:               **${formatK(mostRecent.outputTokens)}**`);
       lines.push(`- **sum processed this turn: ${formatK(lastTotal)} / ${formatK(W)} = ${pct(lastTotal)}**`);
-      lines.push(`- cost: $${mostRecent.totalCostUsd.toFixed(4)} · duration ${(mostRecent.durationMs / 1000).toFixed(1)}s`);
+      const how = mostRecent.costSource === "estimated" ? " (estimated: tokens × list price)" : mostRecent.costSource === "free" ? " (free: local model)" : "";
+      const turnCost = mostRecent.costSource === "unknown" ? "unknown (no price for the model, or no token counts)" : `$${mostRecent.totalCostUsd.toFixed(4)}${how}`;
+      lines.push(`- cost: ${turnCost} · duration ${(mostRecent.durationMs / 1000).toFixed(1)}s`);
     }
     lines.push("");
     lines.push(`### Session aggregate (${u.numTurns} turns)`);
@@ -685,7 +687,10 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
     const peak = u.peakInputTokens ?? 0;
     const peakOverflow = peak > W;
     lines.push(`- peak single-turn sum: ${formatK(peak)} (${peakOverflow ? `${rawPct(peak)} — ⚠ aggregated multi-call, see note below` : pct(peak)})`);
-    lines.push(`- total cost: $${u.totalCostUsd.toFixed(4)}`);
+    const unknownTurns = u.costUnknownTurns ?? 0;
+    lines.push(
+      `- total cost: $${u.totalCostUsd.toFixed(4)}${u.costEstimated ? " (partly estimated: tokens × list price)" : ""}${unknownTurns > 0 ? ` + ${unknownTurns} turn${unknownTurns === 1 ? "" : "s"} of unknown cost` : ""}`,
+    );
     if (info.rotation && info.rotation.count > 0) {
       lines.push(`- 🔄 rotations: ${info.rotation.count}`);
     }

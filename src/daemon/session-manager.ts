@@ -513,7 +513,12 @@ export class SessionManager {
    *  session next reaches a resting status (see #statusObserver). */
   #phaseWaiters = new Map<string, (status: PhaseTurnResult["finalStatus"]) => void>();
   /** Stable observer identity — every Session reports status transitions here. */
-  #statusObserver = (sessionId: string, status: SessionInfo["status"]): void => {
+  #statusObserver = (sessionId: string, status: SessionInfo["status"], opts?: { settled: true }): void => {
+    // A turn settled without a status change: only what waits on spend cares (#430).
+    if (opts?.settled) {
+      this.#routines?.onSessionStatus(sessionId);
+      return;
+    }
     this.#dispatcher.onSessionStatus(sessionId, status);
     this.#routines?.onSessionStatus(sessionId);
     this.#loops?.workerStatusChanged(sessionId, status as Parameters<LoopService["workerStatusChanged"]>[1]);
@@ -4517,6 +4522,8 @@ mcpHub: this.#mcpHub,
       const u = s.toInfo().usage;
       if (!u) return;
       rollup.totalCostUsd += u.totalCostUsd;
+      if (u.costEstimated) rollup.costEstimated = true;
+      if (u.costUnknownTurns) rollup.costUnknownTurns = (rollup.costUnknownTurns ?? 0) + u.costUnknownTurns;
       rollup.inputTokens += u.inputTokens;
       rollup.outputTokens += u.outputTokens;
       rollup.numTurns += u.numTurns;
@@ -6764,7 +6771,9 @@ mcpHub: this.#mcpHub,
         const s = this.#sessions.get(id);
         if (!s) return null;
         const i = s.toInfo();
-        const parked = i.status === "waiting_approval" ? s.pendingToolApprovals()[0] : undefined;
+        // The main turn's request names the wait; a background agent's only if it's all there is.
+        const pending = i.status === "waiting_approval" ? s.pendingToolApprovals() : [];
+        const parked = pending.find((p) => p.approvalId === s.waitingApprovalId) ?? pending[0];
         return {
           status: i.status,
           turnQueued: i.turnQueued === true,
@@ -6774,6 +6783,18 @@ mcpHub: this.#mcpHub,
               ? `waiting for approval to run ${parked.toolName}`
               : null,
           costUsd: i.usage?.totalCostUsd ?? 0,
+          costUnknownTurns: i.usage?.costUnknownTurns ?? 0,
+          turnInFlight: s.turnInFlight,
+          backgroundTasks: s.spendingBackgroundTasks,
+          liveBackgroundTasks: s.liveBackgroundTasks,
+          backgroundTaskIds: s.liveBackgroundTaskIds,
+          pendingReportTaskIds: s.pendingReportTaskIds,
+          spendingTaskIds: s.spendingBackgroundTaskIds,
+          lastTurnOrigin: s.lastTurnOrigin,
+          waitingApprovalId: s.waitingApprovalId,
+          taskOrigins: s.backgroundTaskOrigins,
+          ambientTaskIds: s.ambientTaskIds,
+          turnRunning: s.turnRunning,
           // usage.inputTokens is uncached input only (Anthropic semantics);
           // a run reports everything the model read.
           inputTokens: (i.usage?.inputTokens ?? 0) + (i.usage?.cacheReadTokens ?? 0) + (i.usage?.cacheCreationTokens ?? 0),
@@ -6789,9 +6810,18 @@ mcpHub: this.#mcpHub,
         return { text: answered ? s.lastAssistantMessage : null, error: s.lastTurnError };
       },
       beginUnattended: (id) => this.#sessions.get(id)?.beginUnattended() ?? (() => {}),
-      interrupt: async (id) => {
+      interrupt: async (id, opts) => {
         const s = this.#sessions.get(id);
-        if (s) await s.interrupt(systemAuth(s.accountId, s.projectId));
+        if (s) await s.interrupt(systemAuth(s.accountId, s.projectId), opts);
+      },
+      approvalState: (id, approvalId) => this.#sessions.get(id)?.approvalState(approvalId) ?? "gone",
+      terminate: async (id) => {
+        const s = this.#sessions.get(id);
+        if (s) await s.terminateBackend(systemAuth(s.accountId, s.projectId), "a routine's session ran work after its run that wouldn't stop");
+      },
+      stopBackgroundTasks: async (id, ids) => {
+        const s = this.#sessions.get(id);
+        if (s) await s.stopBackgroundTasksById(ids, systemAuth(s.accountId, s.projectId));
       },
       destroy: async (id) => {
         const s = this.#sessions.get(id);
@@ -7241,6 +7271,8 @@ mcpHub: this.#mcpHub,
     let inputTokens = 0;
     let outputTokens = 0;
     let totalCostUsd = 0;
+    let costEstimated = false;
+    let costUnknownTurns = 0;
     for (const session of this.#sessions.values()) {
       if (session.accountId !== accountId || session.projectId !== projectId) continue;
       const usage = session.toInfo().usage;
@@ -7248,6 +7280,8 @@ mcpHub: this.#mcpHub,
       inputTokens += usage.inputTokens ?? 0;
       outputTokens += usage.outputTokens ?? 0;
       totalCostUsd += usage.totalCostUsd ?? 0;
+      if (usage.costEstimated) costEstimated = true;
+      costUnknownTurns += usage.costUnknownTurns ?? 0;
     }
     return {
       activeTasks: counts.active,
@@ -7255,6 +7289,8 @@ mcpHub: this.#mcpHub,
       inputTokens,
       outputTokens,
       totalCostUsd,
+      ...(costEstimated ? { costEstimated: true } : {}),
+      ...(costUnknownTurns > 0 ? { costUnknownTurns } : {}),
     };
   }
 
@@ -7978,7 +8014,14 @@ mcpHub: this.#mcpHub,
       ...(error ? { error } : {}),
       ...(reply ? { reply: reply.length > 4_000 ? `${reply.slice(0, 3_999)}…` : reply } : {}),
       ...(usage
-        ? { costUsd: usage.totalCostUsd, durationMs: usage.durationMs, inputTokens: usage.inputTokens, outputTokens: usage.outputTokens }
+        ? {
+            costUsd: usage.totalCostUsd,
+            ...(usage.costEstimated ? { costEstimated: true } : {}),
+            ...(usage.costUnknownTurns ? { costUnknownTurns: usage.costUnknownTurns } : {}),
+            durationMs: usage.durationMs,
+            inputTokens: usage.inputTokens,
+            outputTokens: usage.outputTokens,
+          }
         : {}),
       ...(files ? { files: { ...files, paths: files.paths.slice(0, 200) } } : {}),
     };

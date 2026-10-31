@@ -6,6 +6,7 @@
  * discarding the rest). The daemon does the work; this renders and asks.
  */
 
+import { formatSessionCost } from "../lib/format";
 import { Component, For, Index, Show, createEffect, createSignal, on, onCleanup, onMount } from "solid-js";
 
 import { getClient, newRequestId, refreshSessions } from "../state/connection";
@@ -93,7 +94,9 @@ const Column: Component<{
     </Show>
     <div class="flex gap-3 text-[11px] text-fg-faint">
       <Show when={props.t.costUsd !== undefined}>
-        <span>${props.t.costUsd!.toFixed(3)}</span>
+        <span title={formatSessionCost({ totalCostUsd: props.t.costUsd!, costEstimated: props.t.costEstimated, costUnknownTurns: props.t.costUnknownTurns }).title}>
+          {formatSessionCost({ totalCostUsd: props.t.costUsd!, costEstimated: props.t.costEstimated, costUnknownTurns: props.t.costUnknownTurns }).text}
+        </span>
       </Show>
       <Show when={props.t.durationMs !== undefined}>
         <span>{Math.round(props.t.durationMs! / 1000)}s</span>

@@ -152,6 +152,40 @@ describe("CodexProvider over fake-codex", () => {
     }
   });
 
+  it("a turn of several requests is priced on all of them, each request reported for the context figure (#430)", async () => {
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("multi-request")));
+    await p.teardown();
+    const done = events.find((e) => e.type === "turn_done") as Extract<ProviderEvent, { type: "turn_done" }>;
+    // Three requests of 1000 input (400 cached) + 100 output.
+    expect(done.result).toMatchObject({ inputTokens: 1800, cacheReadTokens: 1200, outputTokens: 300 });
+    const calls = events.filter((e) => e.type === "llm_call");
+    expect(calls).toHaveLength(3);
+    expect(calls[0]).toMatchObject({ isPrimary: true, usage: { inputTokens: 600, cacheReadTokens: 400, outputTokens: 100 } });
+  });
+
+  it("each turn is priced on its own requests, not the thread's total so far (#430)", async () => {
+    const p = makeProvider();
+    await collect(p.runTurn(turnOpts("hello")));
+    const second = await collect(p.runTurn(turnOpts("hello again")));
+    await p.teardown();
+    expect(second.find((e) => e.type === "turn_done")).toMatchObject({ result: { inputTokens: 100, outputTokens: 45, cacheReadTokens: 20 } });
+  });
+
+  it("a codex that sends no running total: a turn of several requests is unknown, not its last request (#430)", async () => {
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("no-total")));
+    await p.teardown();
+    expect(events.find((e) => e.type === "turn_done")).toMatchObject({ result: { costSource: "unknown" } });
+  });
+
+  it("a turn with no usage reported has an unknown cost, not $0 (#430)", async () => {
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("no-usage")));
+    await p.teardown();
+    expect(events.find((e) => e.type === "turn_done")).toMatchObject({ result: { costSource: "unknown" } });
+  });
+
   it("C1: text turn streams thinking + text and completes with usage", async () => {
     const p = makeProvider();
     const events = await collect(p.runTurn(turnOpts("hello")));

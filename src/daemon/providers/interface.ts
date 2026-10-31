@@ -195,6 +195,19 @@ export interface NormalizedTurnResult {
   /** Claude-specific; 0 for other providers. */
   cacheCreationTokens: number;
   totalCostUsd: number;
+  /**
+   * Where `totalCostUsd` comes from (#430). `backend`: the backend said what
+   * the turn cost (Claude, pi). `free`: nothing to pay (a model on this
+   * machine). `unknown`: the backend can't tell (no token counts). Absent: it
+   * gave tokens but no cost, and the session prices them.
+   */
+  costSource?: "backend" | "free" | "unknown";
+  /**
+   * The largest single request's prompt in the turn (input + cache), for a
+   * backend that sums several requests into the turn's counts and reports no
+   * per-request usage (#430): prices with a long-context tier need it.
+   */
+  largestPromptTokens?: number;
   durationMs: number;
   /**
    * Context window of the model that ran this turn, as the backend stated it.
@@ -347,7 +360,25 @@ export type ProviderEvent =
   | { type: "subagent_stop"; agentId: string }
   | { type: "mcp_init"; servers: Record<string, string>; tools: Record<string, string[]> }
   /** Per-LLM-call usage, split by primary vs subagent (null parent_tool_use_id = primary). */
-  | { type: "llm_call"; usage: LLMCallUsage; isPrimary: boolean }
+  | {
+      type: "llm_call";
+      usage: LLMCallUsage;
+      isPrimary: boolean;
+      /** The request's id, for a backend that reports one request several times: a repeat replaces the earlier report (#430). */
+      requestId?: string;
+      /** The sub-agent whose request this is (its spawning tool call's id), where the backend says (#430). */
+      parentToolUseId?: string | null;
+    }
+  /**
+   * A request was sent to the model (#430), for a backend whose usage arrives
+   * only when the request ends: a turn stopped before then still spent.
+   */
+  | { type: "model_request" }
+  /**
+   * The model began streaming an output block (a tool call's, say) that no
+   * text or thinking delta shows (#430): its request's usage hasn't come yet.
+   */
+  | { type: "model_output"; parentToolUseId?: string | null }
   | { type: "api_retry"; attempt?: number; retryDelayMs?: number; errorStatus?: number | null }
   /**
    * The backend's plan rate-limit state changed (Claude's `rate_limit_event`,
@@ -426,6 +457,8 @@ export interface BackgroundTaskSnapshot {
   kind: string;
   description: string;
   status: string;
+  /** The backend says it's ambient (a watcher it started itself): not the agent's work. */
+  ambient?: boolean;
 }
 
 /**
@@ -678,6 +711,11 @@ export interface AgentProvider {
    * true only after its tool mount is confirmed.
    */
   readonly supportsMemoryTools?: boolean;
+  /**
+   * Its turns cost nothing (a model on the user's own server, #430) — also the
+   * ones that end with no result, which the session records itself.
+   */
+  readonly free?: boolean;
   /**
    * True when the backend runs the `updatedInput` an `allow` verdict carries —
    * a hook's rewrite of a tool call, or an approver's form answers — instead

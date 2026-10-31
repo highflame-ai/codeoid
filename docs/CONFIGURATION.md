@@ -200,6 +200,36 @@ TELEGRAM_ALLOWED_USER_IDS=6714605885
 # ANTHROPIC_API_KEY=          # only if you have neither a sign-in nor a Claude Code login
 ```
 
+## Model prices
+
+Some backends report what each turn cost (Claude, pi); the others report tokens only (Codex, OpenAI and OpenAI-compatible endpoints, Gemini, Qwen).
+For those, codeoid prices the tokens at the model's list price, so session totals, routine spend caps and the fleet board count them; the UI marks such a total as an estimate (`~$0.42`).
+A model on your own machine costs nothing: llama.cpp on a loopback host (`127.0.0.1`, `localhost`) that answers `/props` as llama-server (a proxy on a loopback port doesn't, so it isn't free unless you say so).
+For your own server elsewhere on your network, set `providers.llamacpp.free: true`; anything else (it could be a gateway forwarding to a paid API) is priced like any other backend, and a price in `pricing.models` always wins.
+
+Prices come from a snapshot of [LiteLLM's maintained price table](https://github.com/BerriAI/litellm) (MIT), shipped with codeoid; `bun scripts/update-pricing.ts` refreshes it.
+Your own prices win, per model, in USD per million tokens:
+
+```json
+{
+  "pricing": {
+    "models": {
+      "qwen3-coder-plus": { "input": 1, "output": 5 },
+      "my-company-model": { "input": 2, "output": 8, "cacheRead": 0.2 },
+      "my-ollama-model": { "input": 0, "output": 0 }
+    }
+  }
+}
+```
+
+`cacheRead` and `cacheWrite` default to the input price; `inputAbove200k` / `outputAbove200k` (and `cacheReadAbove200k` / `cacheWriteAbove200k`, which default to the cache rates raised as input's is) apply to a request whose prompt is over 200k tokens.
+Each request is billed at its own tier when the backend reported every request's tokens; otherwise the whole turn is billed at its largest request's tier.
+The snapshot never lists a model as free (a provider's free tier isn't the model's price elsewhere); only `pricing.models` can.
+A model with no price (here or in the snapshot) has an **unknown** cost, shown as `$?` (or `$0.42+` when some turns were priced), never as $0; a routine with a spend cap stops on such a turn (docs/routines.md).
+The Gemini CLI reports no token counts, so its turns are always of unknown cost; so is a turn whose usage never arrived (a server that leaves it out of the stream), a turn that ended mid-way (an error, a stop) without saying what it spent, or while a request was still streaming (its usage comes only when it ends), a Qwen turn that used more than one model, and a Qwen turn that ran a sub-agent (qwen-code reports no usage for its requests).
+A turn that failed before reaching the model spent nothing.
+Qwen doesn't report thinking tokens separately, so a Qwen estimate leaves them out.
+
 ## Worktree setup recipe
 
 A worktree codeoid creates (a fork, a compare branch, a routine's `--worktree` run) holds tracked files only.

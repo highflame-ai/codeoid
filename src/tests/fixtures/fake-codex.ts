@@ -52,7 +52,13 @@ function serverRequest(method: string, params: Record<string, unknown>): Promise
 function tokenUsage() {
   return { totalTokens: 165, inputTokens: 120, cachedInputTokens: 20, outputTokens: 45, reasoningOutputTokens: 0 };
 }
+/** The running total per thread, as real codex keeps it (#430). */
+const threadTotals = new Map<string, ReturnType<typeof tokenUsage>>();
 function emitUsage(threadId: string): void {
+  const last = tokenUsage();
+  const prev = threadTotals.get(threadId);
+  const total = prev ? Object.fromEntries(Object.entries(last).map(([k, v]) => [k, v + prev[k as keyof typeof last]])) as typeof last : last;
+  threadTotals.set(threadId, total);
   send({
     method: "thread/tokenUsage/updated",
     // `ThreadTokenUsage` carries THREE fields on the real wire — `last`,
@@ -62,7 +68,7 @@ function emitUsage(threadId: string): void {
     params: {
       threadId,
       turnId: "turn-1",
-      tokenUsage: { total: tokenUsage(), last: tokenUsage(), modelContextWindow: 272_000 },
+      tokenUsage: { total, last, modelContextWindow: 272_000 },
     },
   });
 }
@@ -343,7 +349,19 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: "Hello world" } } });
   }
 
-  emitUsage(threadId);
+  if (prompt.includes("no-total")) {
+    // An older codex: per-request usage only, no running total.
+    for (let i = 0; i < 2; i++) send({ method: "thread/tokenUsage/updated", params: { threadId, turnId: "turn-1", tokenUsage: { last: tokenUsage() } } });
+  } else if (prompt.includes("multi-request")) {
+    // A turn of three model requests: `last` is each one, `total` the thread's running sum (#430).
+    const req = { totalTokens: 1100, inputTokens: 1000, cachedInputTokens: 400, outputTokens: 100, reasoningOutputTokens: 30 };
+    for (let i = 1; i <= 3; i++) {
+      const total = Object.fromEntries(Object.entries(req).map(([k, v]) => [k, v * i]));
+      send({ method: "thread/tokenUsage/updated", params: { threadId, turnId: "turn-1", tokenUsage: { total, last: req, modelContextWindow: 272_000 } } });
+    }
+  } else if (!prompt.includes("no-usage")) {
+    emitUsage(threadId);
+  }
   send({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed" } } });
 }
 

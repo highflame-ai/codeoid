@@ -67,6 +67,16 @@ export interface OpenAIProviderInit {
    */
   id?: string;
   displayName?: string;
+  /**
+   * A model on the user's own machine (llama.cpp): its turns cost nothing
+   * (#430). A function is asked each turn (an endpoint whose address can change).
+   */
+  free?: boolean | (() => boolean);
+  /**
+   * Settles what `free` answers, before a turn's first request (#430): a turn
+   * that fails or is stopped part-way is priced by it, with no result to wait for.
+   */
+  proveFree?: () => Promise<void>;
   /** Explicit API key — falls back to OPENAI_API_KEY env var. */
   apiKey?: string;
   /**
@@ -187,9 +197,17 @@ export class OpenAIProvider implements AgentProvider {
   #toolsTransform: ((tools: OpenAIFunctionTool[]) => OpenAIFunctionTool[]) | null;
   #effortParams: (effort: EffortLevel) => Record<string, unknown>;
   #resolveApiKey: (() => { key: string; fingerprint: string } | null) | null;
+  readonly #free: boolean | (() => boolean);
+  readonly #proveFree: (() => Promise<void>) | null;
+
+  get free(): boolean {
+    return typeof this.#free === "function" ? this.#free() : this.#free;
+  }
 
   constructor(init: OpenAIProviderInit = {}) {
     this.id = init.id ?? "openai";
+    this.#free = init.free ?? false;
+    this.#proveFree = init.proveFree ?? null;
     this.displayName = init.displayName ?? "GPT (OpenAI)";
     this.#staticConnection = {
       ...(init.baseURL ? { baseURL: init.baseURL } : {}),
@@ -300,6 +318,7 @@ export class OpenAIProvider implements AgentProvider {
     let model = opts.model ?? this.#defaultModel;
 
     try {
+      await this.#proveFree?.().catch(() => undefined);
       if (!opts.model && this.#resolveDefaultModel) model = (await this.#resolveDefaultModel()) ?? this.#defaultModel;
       const { client, conn } = this.#clientForTurn();
       const maxTokens = this.#maxTokens?.(model);
@@ -356,6 +375,8 @@ export class OpenAIProvider implements AgentProvider {
 
       let finalText = "";
       let inputTokens = 0;
+      let cacheReadTokens = 0;
+      let largestPrompt = 0;
       let outputTokens = 0;
       let stopReason: string | undefined;
 
@@ -365,7 +386,24 @@ export class OpenAIProvider implements AgentProvider {
       // must answer. A no-memory turn runs exactly one round (tools undefined).
       for (let round = 0; ; round++) {
         const offerTools = tools && round < MAX_MEMORY_TOOL_ROUNDS;
-        const stream = await client.chat.completions.create(
+        // The request counts once the server takes it (#430) — a refusal (a bad
+        // key, an unknown model, an outage) spent nothing; one stopped while
+        // pending may have.
+        const spent = () => {
+          try {
+            queue.push({ type: "model_request" });
+          } catch {
+            // The turn's queue already closed.
+          }
+        };
+        let stream!: Awaited<ReturnType<typeof client.chat.completions.create>>;
+        // No silent SDK retries: each attempt may be billed (a gateway that
+        // fails after the upstream answered), and a retried request would be
+        // counted once (#430). A rate limit is refused before any work, so it
+        // alone is retried here — counted as unsent each time.
+        for (let attempt = 0; ; attempt++) {
+        try {
+          stream = await client.chat.completions.create(
           {
             model,
             messages,
@@ -376,8 +414,25 @@ export class OpenAIProvider implements AgentProvider {
             // Thinking effort (#417): a model that doesn't reason rejects it, and the turn says so.
             ...(opts.effort ? this.#effortParams(opts.effort) : {}),
           },
-          { signal: ac.signal },
-        );
+          { signal: ac.signal, maxRetries: 0 },
+          );
+          break;
+        } catch (err) {
+          // Only a refusal before any work is unsent: anything else (a 5xx, a
+          // timeout, a reset — say a gateway that fails after the upstream
+          // request was billed) may have spent (#430).
+          if (ac.signal.aborted || !isRefusal(err)) spent();
+          if (!ac.signal.aborted && (err as { status?: number })?.status === 429 && attempt < RATE_LIMIT_RETRIES) {
+            await new Promise((r) => setTimeout(r, 1_000 * 2 ** attempt));
+            if (ac.signal.aborted) return;
+            continue;
+          }
+          throw err;
+        }
+        }
+        spent();
+        // The request's usage, from its usage chunks.
+        let roundUsage: RoundUsage | null = null;
 
         let roundText = "";
         // OpenAI streams tool_calls as indexed deltas — accumulate by index.
@@ -404,13 +459,29 @@ export class OpenAIProvider implements AgentProvider {
             if (tc.function?.name) slot.name = tc.function.name;
             if (tc.function?.arguments) slot.args += tc.function.arguments;
           }
-          if (chunk.usage) {
-            inputTokens += chunk.usage.prompt_tokens ?? 0;
-            outputTokens += chunk.usage.completion_tokens ?? 0;
-          }
+          // Field by field, the largest seen: right for a server that repeats it
+          // cumulatively and for one that splits it across chunks (#430).
+          if (chunk.usage) roundUsage = mergeUsage(roundUsage, chunk.usage as unknown as RoundUsage);
           if (choice?.finish_reason) finish = choice.finish_reason;
         }
         if (ac.signal.aborted) return;
+        if (roundUsage) {
+          // prompt_tokens includes the cached ones; split them out (#430), as
+          // the other backends report them, so each is priced at its rate.
+          const cached = roundUsage.prompt_tokens_details?.cached_tokens ?? 0;
+          const usage = {
+            inputTokens: Math.max(0, (roundUsage.prompt_tokens ?? 0) - cached),
+            cacheReadTokens: cached,
+            cacheCreationTokens: 0,
+            outputTokens: roundUsage.completion_tokens ?? 0,
+          };
+          inputTokens += usage.inputTokens;
+          cacheReadTokens += cached;
+          outputTokens += usage.outputTokens;
+          largestPrompt = Math.max(largestPrompt, roundUsage.prompt_tokens ?? 0);
+          // This request's own usage, once, so a turn that ends mid-loop is still counted.
+          queue.push({ type: "llm_call", isPrimary: true, usage });
+        }
         if (chunks === 0) {
           // A stream that ends before its first chunk is a failure the server
           // reported in a form the client could not parse: llama-server sends
@@ -478,9 +549,11 @@ export class OpenAIProvider implements AgentProvider {
         model,
         inputTokens,
         outputTokens,
-        cacheReadTokens: 0,
+        cacheReadTokens,
         cacheCreationTokens: 0,
-        totalCostUsd: 0, // OpenAI does not return cost in the streaming response.
+        totalCostUsd: 0, // no cost in the response: the session prices the tokens (#430)
+        ...(largestPrompt > 0 ? { largestPromptTokens: largestPrompt } : {}),
+        ...(this.free ? { costSource: "free" as const } : {}),
         durationMs: Date.now() - startMs,
         stopReason,
         ...(contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {}),
@@ -521,4 +594,34 @@ export class OpenAIProvider implements AgentProvider {
 /** OpenAI's reasoning effort for codeoid's scale (#417): Off is "none"; it has nothing above XHigh, so Max is XHigh. */
 export function openAIEffortParams(effort: EffortLevel): Record<string, unknown> {
   return { reasoning_effort: effort === "off" ? "none" : effort === "max" ? "xhigh" : effort };
+}
+
+/** Retries of a rate-limited request (#430): refused before any work, so unbilled. */
+const RATE_LIMIT_RETRIES = 2;
+
+/** Two usage chunks of one request, field by field, the larger of each. */
+function mergeUsage(a: RoundUsage | null, b: RoundUsage): RoundUsage {
+  const max = (x?: number, y?: number) => (x === undefined ? y : y === undefined ? x : Math.max(x, y));
+  return {
+    prompt_tokens: max(a?.prompt_tokens, b.prompt_tokens),
+    completion_tokens: max(a?.completion_tokens, b.completion_tokens),
+    prompt_tokens_details: { cached_tokens: max(a?.prompt_tokens_details?.cached_tokens, b.prompt_tokens_details?.cached_tokens) },
+  };
+}
+
+/** A completion request's usage, as the stream reports it. */
+interface RoundUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
+}
+
+/**
+ * A request the server refused before doing any work (#430): a client error
+ * it answered at once — bad request, bad key, forbidden, no such model,
+ * unprocessable, rate limited. Anything else may have been billed.
+ */
+function isRefusal(err: unknown): boolean {
+  const status = (err as { status?: unknown } | null)?.status;
+  return typeof status === "number" && [400, 401, 403, 404, 422, 429].includes(status);
 }

@@ -168,4 +168,6 @@ export interface RunRow {
   loopRunId: string | null;
   /** The loop run's status as last seen; terminal once the routine run ended. */
   loopStatus: LoopStatus | null;
+  /** The run spent an amount nobody can count: a turn of unknown cost (#430). */
+  costUnknown?: boolean;
 }

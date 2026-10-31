@@ -261,3 +261,40 @@ describe("nextTurnNumber", () => {
     reopened.close();
   });
 });
+
+describe("where a turn's cost came from (#430)", () => {
+  it("is kept with the turn, and the totals say what's estimated and what's unknown", () => {
+    store.recordTurnUsage({ workspaceId: WS, sessionId: "s1", turn: { ...mkTurn(1, { totalCostUsd: 0.5 }), costSource: "backend" } });
+    store.recordTurnUsage({ workspaceId: WS, sessionId: "s1", turn: { ...mkTurn(2, { totalCostUsd: 0.25 }), costSource: "estimated" } });
+    store.recordTurnUsage({ workspaceId: WS, sessionId: "s1", turn: { ...mkTurn(3, { totalCostUsd: 0 }), costSource: "unknown" } });
+    store.recordTurnUsage({ workspaceId: WS, sessionId: "s1", turn: { ...mkTurn(4, { totalCostUsd: 0 }), costSource: "unknown" } });
+    expect(store.listTurnsForSession("s1").map((t) => t.costSource)).toEqual(["unknown", "unknown", "estimated", "backend"]);
+    const totals = store.sessionUsageTotals("s1");
+    expect(totals.totalCostUsd).toBeCloseTo(0.75, 9);
+    expect(totals.costEstimated).toBe(true);
+    expect(totals.costUnknownTurns).toBe(2);
+  });
+
+  it("reads turns recorded before it as plain reported costs", () => {
+    store.recordTurnUsage({ workspaceId: WS, sessionId: "s2", turn: mkTurn(1, { totalCostUsd: 0.1 }) });
+    expect(store.listTurnsForSession("s2")[0]?.costSource).toBeUndefined();
+    const totals = store.sessionUsageTotals("s2");
+    expect(totals.costEstimated).toBe(false);
+    expect(totals.costUnknownTurns).toBe(0);
+  });
+
+  it("adds the column to a database made before it", () => {
+    const old = new (require("bun:sqlite").Database)(join(tmp, "old.db"));
+    old.exec(`CREATE TABLE turn_usage (
+      workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, turn_number INTEGER NOT NULL, created_at INTEGER NOT NULL,
+      input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_tokens INTEGER NOT NULL DEFAULT 0, cache_creation_tokens INTEGER NOT NULL DEFAULT 0,
+      total_cost_usd REAL NOT NULL DEFAULT 0, duration_ms INTEGER NOT NULL DEFAULT 0, stop_reason TEXT,
+      PRIMARY KEY (session_id, turn_number))`);
+    old.close();
+    const upgraded = new SqliteEpisodeStore(join(tmp, "old.db"));
+    upgraded.recordTurnUsage({ workspaceId: WS, sessionId: "s3", turn: { ...mkTurn(1), costSource: "estimated" } });
+    expect(upgraded.listTurnsForSession("s3")[0]?.costSource).toBe("estimated");
+    upgraded.close();
+  });
+});

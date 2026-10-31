@@ -351,6 +351,12 @@ What differs from the cloud `openai` backend, and why:
   them into a grammar and 500s the whole request on an annotation-only
   subschema such as `{ "description": "any value" }`.
 
+Turn cost (#430): a backend that reports none (Codex, OpenAI-compatible,
+Gemini, Qwen) has its tokens priced in `Session.#turnCost` from
+`src/daemon/pricing/` — a LiteLLM snapshot (`bun scripts/update-pricing.ts`)
+under `pricing.models` overrides. A turn with no price is `unknown`, never $0:
+it's counted apart (`SessionUsage.costUnknownTurns`) and stops a capped routine.
+
 Config file at `~/.codeoid/config.json` (optional). Env vars take precedence.
 
 Data stored at:

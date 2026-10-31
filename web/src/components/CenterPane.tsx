@@ -7,7 +7,7 @@ import { Component, Show } from "solid-js";
 
 import {
   ctxWindowColorClass,
-  formatCostUsd,
+  formatSessionCost,
   formatDuration,
   formatPercent,
   formatTokens,
@@ -182,8 +182,8 @@ const CollapsedHeader: Component = () => (
                 {formatTokens(u().outputTokens)}
               </span>
               <span class="text-fg-faint">·</span>
-              <span class="font-mono font-semibold text-accent">
-                {formatCostUsd(u().totalCostUsd)}
+              <span class="font-mono font-semibold text-accent" title={formatSessionCost(u()).title}>
+                {formatSessionCost(u()).text}
               </span>
             </>
           )}
@@ -253,9 +253,9 @@ const UsageStrip: Component = () => (
         />
         <Stat
           label="Cost"
-          value={formatCostUsd(u().totalCostUsd)}
+          value={formatSessionCost(u()).text}
           accent
-          hint="SDK-reported, daemon-canonical"
+          hint={formatSessionCost(u()).title}
         />
       </div>
     )}

@@ -293,32 +293,87 @@ describe("translateQwenMessage — streaming + result", () => {
     expect(events[1]).toMatchObject({ type: "thinking_delta", content: "hmm", blockIndex: 1 });
   });
 
-  test("result maps usage and marks errors", () => {
+  test("a turn's usage is its own requests' — never the result's session-cumulative totals (#430)", () => {
     const { events, emit } = collector();
+    const state = freshState();
+    // Two requests in the turn; qwen-code's input_tokens includes the cached ones.
+    for (const u of [
+      { input_tokens: 1000, output_tokens: 50, cache_read_input_tokens: 600 },
+      { input_tokens: 1200, output_tokens: 30, cache_read_input_tokens: 1000 },
+    ]) {
+      translateQwenMessage({ type: "assistant", parent_tool_use_id: null, message: { content: [], usage: u } } as never, emit, "qwen", state);
+    }
     translateQwenMessage(
       {
         type: "result",
         subtype: "success",
         is_error: false,
         duration_ms: 1200,
-        usage: { input_tokens: 10, output_tokens: 4, cache_read_input_tokens: 7 },
+        // The session so far, earlier turns included: not this turn's.
+        usage: { input_tokens: 99_999, output_tokens: 9_999, cache_read_input_tokens: 77_777 },
         modelUsage: { "qwen3.8-max": {} },
       } as never,
       emit,
       "qwen",
-      freshState(),
+      state,
     );
     expect(events.at(-1)).toMatchObject({
       type: "turn_done",
-      result: {
-        providerId: "qwen",
-        model: "qwen3.8-max",
-        inputTokens: 10,
-        outputTokens: 4,
-        cacheReadTokens: 7,
-        durationMs: 1200,
-      },
+      result: { providerId: "qwen", model: "qwen3.8-max", inputTokens: 600, outputTokens: 80, cacheReadTokens: 1600, durationMs: 1200 },
     });
+    expect(events.filter((e) => e.type === "llm_call")[0]).toMatchObject({ usage: { inputTokens: 400, cacheReadTokens: 600 } });
+    // The next turn starts from nothing.
+    translateQwenMessage({ type: "result", subtype: "success", is_error: false, usage: { input_tokens: 1 } } as never, emit, "qwen", state);
+    expect(events.at(-1)).toMatchObject({ type: "turn_done", result: { inputTokens: 0, costSource: "unknown" } });
+  });
+
+  test("a turn on several models is of unknown cost, not priced at whichever is listed first (#430)", () => {
+    const { events, emit } = collector();
+    const state = freshState();
+    translateQwenMessage({ type: "assistant", parent_tool_use_id: null, message: { content: [], usage: { input_tokens: 10, output_tokens: 1 } } } as never, emit, "qwen", state);
+    translateQwenMessage({ type: "result", subtype: "success", is_error: false, modelUsage: { "cheap-model": {}, "pricey-model": {} } } as never, emit, "qwen", state);
+    expect(events.at(-1)).toMatchObject({ type: "turn_done", result: { costSource: "unknown" } });
+  });
+
+  test("a turn that ran a sub-agent is of unknown cost: qwen-code reports no usage for its requests (#430)", () => {
+    const { events, emit } = collector();
+    const state = freshState();
+    translateQwenMessage({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "tool_use", id: "t1", name: "task", input: {} }], usage: { input_tokens: 1000, output_tokens: 50 } } } as never, emit, "qwen", state);
+    // The sub-agent's requests, as the SDK sends them: usage all zeros.
+    translateQwenMessage({ type: "assistant", parent_tool_use_id: "t1", message: { content: [], usage: { input_tokens: 0, output_tokens: 0 } } } as never, emit, "qwen", state);
+    translateQwenMessage({ type: "result", subtype: "success", is_error: false, modelUsage: { "qwen3.8-max": {} } } as never, emit, "qwen", state);
+    expect(events.at(-1)).toMatchObject({ type: "turn_done", result: { costSource: "unknown" } });
+    // The next turn, with no sub-agent, is priced again.
+    translateQwenMessage({ type: "assistant", parent_tool_use_id: null, message: { content: [], usage: { input_tokens: 10, output_tokens: 1 } } } as never, emit, "qwen", state);
+    translateQwenMessage({ type: "result", subtype: "success", is_error: false, modelUsage: { "qwen3.8-max": {} } } as never, emit, "qwen", state);
+    expect((events.at(-1) as { result: { costSource?: string } }).result.costSource).toBeUndefined();
+  });
+
+  test("a request's zeroed per-block report is no report, a sub-agent's is a request never reported, and a tool call's block marks output streaming (#430)", () => {
+    const { events, emit } = collector();
+    const state = freshState();
+    // qwen-code finalizes a request's text block with zeroed usage as it turns to a tool call.
+    translateQwenMessage({ type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: "Let me" }], usage: { input_tokens: 0, output_tokens: 0 } } } as never, emit, "qwen", state);
+    translateQwenMessage({ type: "stream_event", parent_tool_use_id: null, event: { type: "content_block_start", index: 0, content_block: { type: "tool_use" } } } as never, emit, "qwen", state);
+    translateQwenMessage({ type: "assistant", parent_tool_use_id: "t1", message: { content: [], usage: { input_tokens: 0, output_tokens: 0 } } } as never, emit, "qwen", state);
+    expect(events.map((e) => e.type)).toEqual(["text_done", "model_output", "subagent_start", "model_request"]);
+  });
+
+  test("a failed turn that never reached the model spent nothing — not an unknown that blocks a capped routine (#430)", () => {
+    const { events, emit } = collector();
+    translateQwenMessage({ type: "result", subtype: "error_during_execution", is_error: true, error: { message: "auth" } } as never, emit, "qwen", freshState());
+    expect((events.at(-1) as { result: { costSource?: string } }).result.costSource).toBeUndefined();
+  });
+
+  test("result marks errors", () => {
+    const { events, emit } = collector();
+    translateQwenMessage(
+      { type: "result", subtype: "error_during_execution", is_error: true, error: { message: "boom" } } as never,
+      emit,
+      "qwen",
+      freshState(),
+    );
+    expect(events.at(-1)).toMatchObject({ type: "turn_done", result: { isError: true, errorMessage: "boom" } });
   });
 
   test("falls back to the requested model when the gateway omits modelUsage", () => {

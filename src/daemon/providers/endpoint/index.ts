@@ -10,6 +10,7 @@
  * them refuse to run rather than fall back to another backend.
  */
 
+import { isOwnServer } from "../llamacpp/index.js";
 import type { McpServerSource } from "../../mcp/tool-source.js";
 import { AccountError, type ResolvedAccount } from "../../accounts.js";
 import {
@@ -225,11 +226,26 @@ export function endpointFactory(
   return {
     id,
     displayName,
-    create: (init: ProviderSessionInit) =>
-      new StatelessSessionProvider(
+    create: (init: ProviderSessionInit) => {
+      // The address whose /props answered as llama-server: a loopback proxy to a paid API doesn't (#430).
+      let llamaServerAt: string | null = null;
+      return new StatelessSessionProvider(
         new OpenAIProvider({
           id,
           displayName,
+          // A llama-server on this machine costs nothing (#430); a LAN one is
+          // free by a $0 price in pricing.models — it may be a paid gateway.
+          // Asked each turn: the endpoint's address can change under a live session.
+          free: () => {
+            const e = store.get(name);
+            return e?.flavor === "llamacpp" && isOwnServer(e.baseUrl) && llamaServerAt === e.baseUrl;
+          },
+          // Before the first request, not only at a result: a first turn that fails or is stopped is priced too.
+          proveFree: async () => {
+            const e = store.get(name);
+            if (e?.flavor !== "llamacpp" || !isOwnServer(e.baseUrl) || llamaServerAt === e.baseUrl) return;
+            if (await fetchLlamaCppContext(connectionOf(e)).catch(() => undefined)) llamaServerAt = e.baseUrl;
+          },
           connection: () => {
             const conn = withAccount(store.resolveConnection(name), init.resolveAccount?.() ?? null); // throws when removed
             const e = store.get(name)!;
@@ -245,7 +261,10 @@ export function endpointFactory(
             // beats anything configured, which can drift from it.
             if (e.flavor === "llamacpp") {
               const live = await fetchLlamaCppContext(connectionOf(e)).catch(() => undefined);
-              if (live) return live;
+              if (live) {
+                llamaServerAt = e.baseUrl;
+                return live;
+              }
             }
             return configuredContextWindow(e, model);
           },
@@ -260,7 +279,8 @@ export function endpointFactory(
           mcpHub: init.mcpHub,
         }),
         init.sessionId,
-      ),
+      );
+    },
   };
 }
 

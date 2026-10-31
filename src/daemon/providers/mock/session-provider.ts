@@ -390,6 +390,8 @@ function defaultResult(providerId: string): NormalizedTurnResult {
     cacheReadTokens: 0,
     cacheCreationTokens: 0,
     totalCostUsd: 0,
+    // A mock stands for a backend that reports its own cost (#430); tests of priced turns say otherwise.
+    costSource: "backend",
     durationMs: 1,
   };
 }

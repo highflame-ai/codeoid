@@ -192,6 +192,8 @@ export class PiProvider implements SessionProvider {
     // re-captured (and persisted) on the next turn's get_state.
     this.#proc?.send({ type: "new_session" });
     this.#hasQueried = false;
+    // pi's stats are the session file's: a new one counts from zero (#430).
+    this.#lastStats = EMPTY_STATS;
   }
 
   setHasQueried(value: boolean): void {
@@ -558,6 +560,9 @@ export class PiProvider implements SessionProvider {
       cacheReadTokens: Math.max(0, stats.tokens.cacheRead - prev.tokens.cacheRead),
       cacheCreationTokens: Math.max(0, stats.tokens.cacheWrite - prev.tokens.cacheWrite),
       totalCostUsd: Math.max(0, stats.cost - prev.cost),
+      // pi prices from its model registry, where a model with no cost entry is
+      // $0: trust only a figure it actually has, else the session prices the tokens (#430).
+      ...(stats.cost - prev.cost > 0 ? { costSource: "backend" as const } : {}),
       durationMs: Date.now() - this.#turnStartedAt,
       ...(stats.contextWindow !== undefined ? { contextWindow: stats.contextWindow } : {}),
       stopReason: this.#lastStopReason,

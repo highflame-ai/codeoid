@@ -18,6 +18,7 @@ export function toRunWire(r: RunRow): RoutineRunWire {
     ...(r.endedAt !== null ? { endedAt: iso(r.endedAt) } : {}),
     ...(r.sessionId ? { sessionId: r.sessionId } : {}),
     costUsd: r.costUsd,
+    ...(r.costUnknown ? { costUnknown: true as const } : {}),
     inputTokens: r.inputTokens,
     outputTokens: r.outputTokens,
     ...(r.summary ? { summary: r.summary } : {}),
