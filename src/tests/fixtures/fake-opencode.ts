@@ -43,6 +43,8 @@
  *   "retry"        → session.retry.scheduled before answering
  *   "fail"         → execution.failed with a structured rate-limit error
  *   "costly"       → three steps of $2 each
+ *   "compact"      → a step, an auto compaction of two requests ($0.002 +
+ *                    $0.001, billed in the running total), another step
  *   "echo-state"   → reports model/agent/synthetic/prompt text it received
  *   "die-asking"   → asks a permission, then the process dies
  *   "use-codemode" → a Code Mode `execute` call. A session rule denying
@@ -307,6 +309,8 @@ function agents(): Json[] {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const TOKENS = { input: 100, output: 20, reasoning: 5, cache: { read: 30, write: 10 } };
+
+const COMPACTION_TOKENS = { input: 1000, output: 20, reasoning: 0, cache: { read: 0, write: 0 } };
 
 class Cancelled extends Error {}
 
@@ -601,6 +605,22 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     durable(ses, "session.step.failed", { assistantMessageID: msg, error: { type: "provider.rate-limit", message: "Rate limit reached", status: 429, retryAfterMs: 5000 }, cost: 0.25, tokens: TOKENS });
     durable(ses, "session.execution.failed", { error: { type: "provider.rate-limit", message: "Rate limit reached", status: 429, retryAfterMs: 5000 } });
     return "failed";
+  }
+  if (text.includes("compact")) {
+    // As real 2.2.x compacts: each of its requests is billed in the running
+    // total as it happens; its end reports their sum.
+    const msg = step(ses);
+    await say(ses, msg, "before compaction");
+    endStep(ses, msg);
+    durable(ses, "session.compaction.started", { reason: "auto" });
+    bill(ses, 0.002, COMPACTION_TOKENS);
+    bill(ses, 0.001, COMPACTION_TOKENS);
+    const sum = { input: 2 * COMPACTION_TOKENS.input, output: 2 * COMPACTION_TOKENS.output, reasoning: 0, cache: { read: 0, write: 0 } };
+    durable(ses, "session.compaction.ended", { reason: "auto", cost: 0.003, tokens: sum });
+    const msg2 = step(ses);
+    await say(ses, msg2, "after compaction");
+    endStep(ses, msg2);
+    return "succeeded";
   }
   if (text.includes("costly")) {
     for (let i = 0; i < 3; i++) {

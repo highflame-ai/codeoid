@@ -718,6 +718,19 @@ describe("opencode cost and tokens", () => {
     await p.teardown();
   });
 
+  it("counts a compaction's requests once: as the running total bills them, not again at its end", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hi")));
+    const events = await collect(p.runTurn(opts("compact")));
+    const r = done(events)!;
+    // Two steps, the compaction's two requests, and the first turn's title (billed after it ended, carried).
+    expect(r.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.003 + 0.0007, 6);
+    expect(r.inputTokens).toBe(100 * 2 + 2 * 1000 + 40);
+    expect(events.filter((e) => e.type === "llm_call" && !e.isPrimary)).toHaveLength(3);
+    await p.teardown();
+  });
+
   it("stops at maxBudgetUsd mid-turn, as the spend lands", async () => {
     const { server } = makeServer();
     const events = await collect(makeProvider(server).runTurn(opts("costly", { maxBudgetUsd: 3 })));

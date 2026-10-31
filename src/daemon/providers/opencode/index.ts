@@ -1175,11 +1175,6 @@ export class OpencodeProvider implements SessionProvider {
         this.#recordStep(tokens, cost, true);
         return;
       }
-      case "session.compaction.ended":
-      case "session.compaction.failed":
-        addTokens(this.#counted, d.tokens as OcTokenUsage | undefined, typeof d.cost === "number" ? d.cost : undefined);
-        this.#recordStep(d.tokens as OcTokenUsage | undefined, typeof d.cost === "number" ? d.cost : undefined, true, false);
-        return;
       case "session.retry.scheduled": {
         const error = d.error as OcError | undefined;
         this.#emit({
@@ -1279,8 +1274,8 @@ export class OpencodeProvider implements SessionProvider {
   }
 
   /** One step's usage: an `llm_call`, and spend for the turn (or the next one). */
-  #recordStep(tokens: OcTokenUsage | undefined, cost: number | undefined, isPrimary: boolean, isCall = true): void {
-    if (tokens && isCall) {
+  #recordStep(tokens: OcTokenUsage | undefined, cost: number | undefined, isPrimary: boolean): void {
+    if (tokens) {
       this.#emit({
         type: "llm_call",
         usage: {
@@ -1305,8 +1300,10 @@ export class OpencodeProvider implements SessionProvider {
   /**
    * opencode's running total for this session. What it holds past the steps
    * codeoid counted is spend no step reported — the title opencode generates
-   * for a session's first prompt — and is counted as a side call, in the turn
-   * it lands in (or the next one).
+   * for a session's first prompt, each request of a compaction — and is
+   * counted as a side call, in the turn it lands in (or the next one). A
+   * compaction's end (`session.compaction.ended` / `failed`) reports the sum
+   * of its requests again, so it isn't counted.
    */
   #usageUpdated(d: Record<string, unknown>): void {
     const total = emptyUsage();
