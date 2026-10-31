@@ -641,7 +641,10 @@ describe("opencode (real binary)", () => {
       };
       await collect(p.runTurn(opts("[[text:hi]]", { canUseTool: deny })));
       const conn = await server!.ensure();
-      expect((await conn.client.commands(WORK)).map((c) => c.name)).toContain("summarize");
+      // A server already running picks the file up when its config watcher fires.
+      const listed = async () => (await conn.client.commands(WORK)).map((c) => c.name);
+      for (let i = 0; i < 100 && !(await listed()).includes("summarize"); i++) await Bun.sleep(100);
+      expect(await listed()).toContain("summarize");
       // The built-ins are recognized as the real server lists them; the config command isn't offered.
       const commands = (await p.listCommands()).filter((c) => c.source === "command").map((c) => c.name);
       expect(commands).toEqual(["init", "review", "goal"]);
