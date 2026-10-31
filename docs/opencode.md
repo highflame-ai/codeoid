@@ -46,12 +46,12 @@
 | Resume | A daemon restart, or a server restart, resumes the opencode session by its id. If opencode lost it, the conversation continues from codeoid's history. |
 | Fork, rewind | A fork at a turn opencode ran forks opencode's own session there (nothing lost, reasoning included). Otherwise — a turn from another backend, a rewound history — opencode gets a transcript. Files are codeoid's checkpoints, as on every backend. |
 | Models and effort | The picker lists opencode's models with a credential (`provider/model`), each with its context window; a model's reasoning variants named like codeoid's levels (`minimal` … `max`, `none` = Off) are its efforts. Model and effort are switched on the session before a prompt when they changed. |
-| Cost | opencode reports the dollar cost and tokens (input, output, reasoning, cache read and write) of every step. Each turn carries their sum, subagents' included, so spend caps count real spend, and a routine's cap stops the turn as the spend lands, not only between turns. |
+| Cost | opencode reports the dollar cost and tokens (input, output, reasoning, cache read and write) of every step. Each turn carries their sum, subagents' included, and the title opencode writes for a session's first prompt (billed without a step: codeoid takes it from opencode's running total), so spend caps count real spend, and a routine's cap stops the turn as the spend lands, not only between turns. |
 | MCP | codeoid's memory, the goal blackboard, the registry's servers and its OAuth servers (through the daemon's relay) are mounted for the session. Memory recall is auto-approved as on other backends. |
 | Subagents | opencode's subagents show as subagents, their calls ask codeoid like the main agent's, and their spend counts. A background subagent shows as background work; when it finishes, opencode hands the result to the model and answers, and codeoid shows that turn. |
 | Commands and skills | opencode's slash commands and skills are listed in the command palette and run with `/name args`. |
 | Questions | opencode's questions (its forms) are asked through codeoid's dialogs; dismissing one tells the model you didn't answer. |
-| Messages mid-turn | A message sent while opencode works steers the running turn (opencode takes it at the next step); one sent as "later" waits behind it. |
+| Messages mid-turn | A message sent while opencode works steers the running turn (opencode takes it at the next step); one sent as "later" is answered after the current reply, in the same turn. |
 | Agent | `providers.opencode.agent` picks the opencode agent sessions run. |
 
 ## Approvals
@@ -63,6 +63,7 @@ codeoid owns the policy, so opencode is set to ask about every action and never 
 - codeoid answers each request once (`once`) or rejects it with the reason, which the model reads and carries on from. It never answers "always".
 - Anything that can't be shown faithfully is rejected without asking: an action codeoid doesn't know (a plugin's, an MCP server codeoid didn't mount), another session's MCP mount, a shell request without its command. A request still waiting when the server goes away counts as rejected.
 - The tools that act without asking (opencode's session rename/move, worktree and schedule tools) are turned off.
+- Code Mode (opencode's `execute` tool, which runs a script that calls tools and `fetch`) is turned off: on opencode 2.2.2 a script's `fetch` reaches any URL without asking anyone. opencode's browser tools stay off too, as opencode's own agents have them.
 
 What the approver sees, in codeoid's terms (so the same rules, hooks and roles apply as on Claude):
 
@@ -95,4 +96,5 @@ Because every call reaches the gate under these names, a pipeline phase's capabi
 - *opencode X is installed, but codeoid supports opencode 2.2.x* — install a 2.2 release.
 - *opencode agents … would run tools without asking codeoid* — an agent's rules allow tools in a way codeoid's overrides can't reach (a plugin, say). Remove it from your global opencode config.
 - *No models in the picker* — opencode lists only models it has a credential for; see Setup.
+- *A session runs a model you didn't pick* — with no model chosen, opencode uses its own default, which with no credentials set up is one of opencode's free hosted models (on opencode.ai). Pick a model, or set one in your opencode config.
 - The server's log goes nowhere by default; run `opencode serve` by hand with the same `OPENCODE_DB` to see what it says about your configuration.
