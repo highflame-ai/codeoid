@@ -85,6 +85,7 @@ Because every call reaches the gate under these names, a pipeline phase's capabi
 ## Limits
 
 - **Your own opencode MCP servers and plugins aren't loaded.** Mount servers through codeoid's registry instead (`mcpServers` in codeoid's config); they reach opencode and every other backend.
+- **The private server is private from other users, not from your own processes.** opencode takes its password only from its environment, which any process running as the daemon's user can read (`/proc/<pid>/environ`) — including a command you approved. Such a process can drive the server directly, outside codeoid's gate and audit. codeoid re-applies each session's rules and deletes saved "always" approvals before every turn, and stops a server that ran anything without asking, but it can't keep the password from your own user. To separate them, run the daemon as a dedicated user.
 - **A question asks twice in guarded mode**: once to let opencode ask, then the question.
 - **codeoid accounts don't apply** (`codeoid account …`): opencode's credentials are its environment keys and its own sign-ins.
 - **Another backend's history reaches opencode as a transcript**, not as opencode messages.

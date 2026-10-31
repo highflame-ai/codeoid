@@ -264,7 +264,7 @@ export class OpencodeProvider implements SessionProvider {
   #counted = emptyUsage();
   /** True between an execution's start and end. */
   #executing = false;
-  /** `generation:directory` the MCP mounts and the saved-rule sweep were done for. */
+  /** `generation:directory` the MCP mounts were done for. */
   #mountedFor: string | null = null;
   /** Normalized mount name → codeoid's server name, for this session's mounts. */
   #mounts = new Map<string, string>();
@@ -682,7 +682,9 @@ export class OpencodeProvider implements SessionProvider {
       this.#detachSession();
       if (this.#pendingHistorySeed === null) this.onHistoryLost?.();
     }
-    if (!this.#ses) {
+    // A session opened here got its rules as it opened (#openSession).
+    const fresh = !this.#ses;
+    if (fresh) {
       const opened = await this.#openSession(conn, workdir);
       this.#ses = opened.id;
       this.#workdir = workdir;
@@ -691,10 +693,14 @@ export class OpencodeProvider implements SessionProvider {
       addTokens(this.#counted, opened.tokens, opened.cost);
       this.#adoptBacking(opened.id);
     }
-    const ses = this.#ses;
+    const ses = this.#ses!;
     await this.#ensureMounts(conn, workdir);
-    // Before every turn: a plugin dropped into a config dir opencode watches
-    // takes effect without a restart (#ensureMounts' requests loaded the location).
+    // Before every turn, what anything holding the server's password (any
+    // process of the daemon's user can read it) could have changed since:
+    // the session's rules, a saved "always", a plugin dropped into a config
+    // dir opencode watches (#ensureMounts' requests loaded the location).
+    if (!fresh) await conn.client.updateSession(ses, { permissions: sessionRules(this.#sessionId) });
+    await this.#sweepSaved(conn, workdir);
     await this.#server.checkPlugins(conn, workdir);
     if (!this.#modelsReported) await this.#reportModelsOnce();
     return ses;
@@ -928,7 +934,6 @@ export class OpencodeProvider implements SessionProvider {
     const key = `${conn.generation}:${workdir}`;
     if (this.#mountedFor === key) return;
     this.#mountedFor = key;
-    await this.#sweepSaved(conn, workdir);
     const prefix = ownMountPrefix(this.#sessionId);
     const configs: Array<{ name: string; config: Record<string, unknown> }> = [];
     if (this.#memoryMcp) {

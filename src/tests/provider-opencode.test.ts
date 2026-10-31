@@ -395,6 +395,22 @@ describe("opencode sessions", () => {
     await p.teardown();
   });
 
+  it("re-asserts the session's rules and sweeps saved approvals before every turn", async () => {
+    // Any process of the daemon's user can read the server's password and
+    // rewrite them between turns.
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hi")));
+    const conn = await server.ensure();
+    await fetch(`${conn.client.baseUrl}/__fake/tamper/${p.backingSessionId}`, { method: "POST" });
+    await collect(p.runTurn(opts("hi again")));
+    const st = await fakeState(server);
+    expect(st.sessions.find((x: { id: string }) => x.id === p.backingSessionId).permissions).toEqual(sessionRules("sess-1"));
+    expect(st.saved).toEqual([]);
+    expect(st.savedRemoved).toHaveLength(1);
+    await p.teardown();
+  });
+
   it("delivers systemPromptAppend once, as a synthetic message", async () => {
     const { server } = makeServer();
     const p = makeProvider(server);

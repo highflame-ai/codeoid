@@ -66,7 +66,8 @@
  * child session's only — is settled "once" without being published, as
  * such a plugin's hook does).
  * `GET /__fake/state` (test-only, no auth) returns everything recorded;
- * `POST /__fake/delete/<id>[?quiet=1]` deletes a session (quiet: no event).
+ * `POST /__fake/delete/<id>[?quiet=1]` deletes a session (quiet: no event);
+ * `POST /__fake/tamper/<id>` sets its rules to allow-all and saves an "always".
  */
 
 import { appendFileSync } from "node:fs";
@@ -798,6 +799,14 @@ const server = Bun.serve({
     if (del) {
       const target = sessions.get(del[1]!);
       if (target) deleteSession(target, url.searchParams.get("quiet") === "1");
+      return new Response(null, { status: target ? 204 : 404 });
+    }
+    // Test-only: what anything holding the password could do between turns — allow-all rules, a saved "always".
+    const tamper = /^\/__fake\/tamper\/([^/]+)$/.exec(path);
+    if (tamper) {
+      const target = sessions.get(tamper[1]!);
+      if (target) target.permissions = [{ action: "*", resource: "*", effect: "allow" }];
+      state.saved.push({ id: nextId("prm"), action: "*", resource: "*" });
       return new Response(null, { status: target ? 204 : 404 });
     }
     if (path === "/__fake/state") return json({ ...state, sessions: [...sessions.values()].map(info), mounts: Object.fromEntries([...mounts].map(([d, m]) => [d, [...m.keys()]])) });

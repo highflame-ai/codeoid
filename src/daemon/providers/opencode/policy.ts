@@ -20,7 +20,9 @@
  *      turn each agent's allows into asks ({@link agentOverrides}), and refuses
  *      to use a server where one still survives ({@link unsafeAgents}).
  *   4. codeoid replies `once` or `reject`, never `always`, so no saved rule is
- *      ever written; any found in the private database are removed.
+ *      ever written; any found in the private database are removed, and the
+ *      session's rules set again, before every turn (any process of the
+ *      daemon's user can read the server's password from its environment).
  *
  * Tools that never ask (opencode's session-utility tools: `session_rename`,
  * `session_move`, `worktree_*`, and the `schedule_*` tools, which would run
