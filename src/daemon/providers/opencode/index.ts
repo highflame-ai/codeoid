@@ -1374,7 +1374,9 @@ export class OpencodeProvider implements SessionProvider {
       // Another execution of the turn began meanwhile (a steer taken late): its end ends the turn.
       if (this.#turn !== turn || turn.queue.closed || turn.executions !== executions) return;
       if (info && this.#ses === ses) this.#usageUpdated({ cost: info.cost, tokens: info.tokens });
-      this.#finishTurn(turn, outcome, error);
+      // A message pushed while the total was read: opencode runs it next, still this turn.
+      if (turn.settling.size > 0 || turn.owed > 0 || turn.queued.size > 0) this.#executionEnded(turn, outcome, error);
+      else this.#finishTurn(turn, outcome, error);
     });
   }
 

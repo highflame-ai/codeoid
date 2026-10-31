@@ -34,7 +34,7 @@ import { OpencodeServer, OpencodeIncompatibleError } from "../daemon/providers/o
 import { buildOpencodeEnv, commandlessShellLine, opencodeConfig, opencodeShellEnv, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents } from "../daemon/providers/opencode/policy.js";
 import { OPENCODE_INSTALL_HINT, opencodeDbPath, opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
 import { effortOfVariant, gateCallFor, parseModelValue } from "../daemon/providers/opencode/translate.js";
-import { parseSse } from "../daemon/providers/opencode/client.js";
+import { OpencodeClient, parseSse } from "../daemon/providers/opencode/client.js";
 import { createDefaultProviderRegistry } from "../daemon/providers/registry.js";
 import { BUDGET_STOP_MESSAGE, type ProviderEvent, type ToolApprovalFn, type TurnOpts, type TurnRun, type UiRequest, type UiResponse } from "../daemon/providers/interface.js";
 import { MemoryMcpHttp } from "../daemon/memory/mcp-http.js";
@@ -1288,6 +1288,45 @@ describe("opencode mid-turn messages", () => {
     const doneEvents = events.filter((e) => e.type === "turn_done") as Array<Extract<ProviderEvent, { type: "turn_done" }>>;
     expect(doneEvents.map((d) => d.result.stopReason)).toEqual(["steered", "stop"]);
     expect(texts(events, "text_done")).toEqual(["first part", "steered: also this (steer)"]);
+    const st = await fakeState(server);
+    expect(st.prompts.at(-1)).toMatchObject({ text: "also this", delivery: "steer" });
+  });
+
+  it("a message pushed while the turn's end reads opencode's total is still this turn's: one absorbed boundary, then its answer", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const adopted: unknown[] = [];
+    p.onSessionEvent = (e) => adopted.push(e.type);
+    const run = p.runTurn(opts("hi"));
+    const events: ProviderEvent[] = [];
+    let armed = false;
+    const read = OpencodeClient.prototype.getSession;
+    // The push lands just as the read answers, before opencode starts the steer's execution.
+    OpencodeClient.prototype.getSession = async function (this: OpencodeClient, id: string) {
+      const info = await read.call(this, id);
+      if (armed) {
+        armed = false;
+        run.pushMidTurn?.("also this", "now");
+      }
+      return info;
+    };
+    try {
+      let dones = 0;
+      const reader = (async () => {
+        for await (const e of run.events) {
+          events.push(e);
+          if (e.type === "text_done" && dones === 0) armed = true;
+          if ((e.type === "turn_done" && ++dones === 2) || e.type === "error") break;
+        }
+      })();
+      await Promise.race([reader, Bun.sleep(5_000)]);
+    } finally {
+      OpencodeClient.prototype.getSession = read;
+    }
+    const doneEvents = events.filter((e) => e.type === "turn_done") as Array<Extract<ProviderEvent, { type: "turn_done" }>>;
+    expect(doneEvents.map((d) => d.result.stopReason)).toEqual(["steered", "stop"]);
+    expect(texts(events, "text_done")).toEqual(["Hello, world", "Hello, world"]);
+    expect(adopted).toEqual([]);
     const st = await fakeState(server);
     expect(st.prompts.at(-1)).toMatchObject({ text: "also this", delivery: "steer" });
   });
