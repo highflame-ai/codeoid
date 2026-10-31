@@ -86,6 +86,8 @@ export interface OpencodeServerOptions {
   startTimeoutMs?: number;
   /** Told once a server reports a version outside the supported range. */
   onIncompatible?: (hint: string) => void;
+  /** Model providers added to the server's config (opencode's `providers`; tests point one at a local scripted model). */
+  modelProviders?: Record<string, unknown>;
 }
 
 /** One running server, as handed to a provider. `generation` changes on every start. */
@@ -206,7 +208,7 @@ export class OpencodeServer {
     const password = randomBytes(32).toString("base64url");
     const env = {
       ...(this.#opts.env?.() ?? buildOpencodeEnv()),
-      ...serverEnv({ password, dbPath: this.#opts.dbPath, config: opencodeConfig(this.#overrides) }),
+      ...serverEnv({ password, dbPath: this.#opts.dbPath, config: opencodeConfig(this.#overrides, this.#opts.modelProviders) }),
     };
     const proc = spawn(
       this.#opts.command,

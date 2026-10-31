@@ -128,9 +128,14 @@ export function agentOverrides(agents: readonly OcAgentInfo[]): Record<string, {
   return out;
 }
 
-/** The config injected with `OPENCODE_CONFIG_CONTENT`. */
-export function opencodeConfig(overrides: Record<string, { permissions: OcRule[] }> = {}): Record<string, unknown> {
+/**
+ * The config injected with `OPENCODE_CONFIG_CONTENT`. `providers` adds model
+ * providers (opencode's `providers` key) and nothing else: the policy keys
+ * aren't reachable from it.
+ */
+export function opencodeConfig(overrides: Record<string, { permissions: OcRule[] }> = {}, providers?: Record<string, unknown>): Record<string, unknown> {
   return {
+    ...(providers && Object.keys(providers).length > 0 ? { providers } : {}),
     permissions: [{ action: "*", resource: "*", effect: "ask" }, ...HIDDEN_TOOL_RULES],
     plugins: [...DISABLED_PLUGINS],
     // codeoid pins the version it speaks; opencode must not replace itself.
