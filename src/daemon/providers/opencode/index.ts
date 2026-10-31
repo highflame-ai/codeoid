@@ -1784,7 +1784,11 @@ export class OpencodeProvider implements SessionProvider {
         continue;
       }
       if (m.type !== "assistant") continue;
-      if (ended) turn.lastAssistantMessageID = m.id;
+      if (ended) {
+        turn.lastAssistantMessageID = m.id;
+        // The last step's finish is the turn's (the feed may have shown only an earlier one).
+        if (m.finish) turn.finish = m.finish;
+      }
       if (m.error) lastError = m.error;
       // Once the execution ended every message is final.
       if (this.#emitReadBack(ses, m, ended || messageStreamed(m))) this.#streamingReadBack.add(m.id);

@@ -353,11 +353,11 @@ function step(ses: Ses): string {
   return msg;
 }
 
-function endStep(ses: Ses, msg: string, cost = 0.0123, tokens: Json = TOKENS): void {
+function endStep(ses: Ses, msg: string, cost = 0.0123, tokens: Json = TOKENS, finish = "stop"): void {
   // As stored: the response ended (`streamed`), then the step (`completed`, finish, cost).
   const m = ses.messages.find((x) => x.id === msg);
-  if (m) Object.assign(m, { cost, tokens, finish: "stop", time: { ...m.time, streamed: Date.now(), completed: Date.now() } });
-  durable(ses, "session.step.ended", { assistantMessageID: msg, finish: "stop", cost, tokens });
+  if (m) Object.assign(m, { cost, tokens, finish, time: { ...m.time, streamed: Date.now(), completed: Date.now() } });
+  durable(ses, "session.step.ended", { assistantMessageID: msg, finish, cost, tokens });
   bill(ses, cost, tokens);
 }
 
@@ -740,7 +740,8 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
   if (text.includes("gap")) {
     const msg = step(ses);
     await say(ses, msg, "before the gap");
-    endStep(ses, msg);
+    // A step that goes on to another ends `tool-calls`; only the last one says how the turn ended.
+    endStep(ses, msg, 0.0123, TOKENS, "tool-calls");
     // The feed drops everyone; until it's back, events reach nobody.
     const up = dropFeed();
     const msg2 = step(ses);
