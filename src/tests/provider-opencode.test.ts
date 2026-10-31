@@ -13,7 +13,7 @@
  *   O7  models and efforts (variants), switched only when changed
  *   O8  cost and tokens per turn, llm_call per step, budget stop
  *   O9  MCP mounts per session, memory recall under codeoid's name
- *   O10 subagents (foreground and background, turn_started)
+ *   O10 subagents (foreground and background, turn_started); background shells
  *   O11 questions (forms) → requestUserInput; cancel = no answer
  *   O12 steering a running turn; later = queue
  *   O13 version range; agent check; saved approvals swept
@@ -1156,6 +1156,73 @@ describe("opencode subagents", () => {
     expect(st.requests.filter((r: string) => r === `GET /api/session/${other.backingSessionId}`)).toHaveLength(1);
     await other.teardown();
     await p.teardown();
+  });
+});
+
+describe("opencode background shells", () => {
+  /** A turn that an unanswered request would hang: interrupted after `ms`, so the test reads it, not a timeout. */
+  async function bounded(run: TurnRun, ms = 4_000): Promise<{ events: ProviderEvent[]; hung: boolean }> {
+    let hung = false;
+    const timer = setTimeout(() => {
+      hung = true;
+      void run.interrupt();
+    }, ms);
+    const events = await collect(run);
+    clearTimeout(timer);
+    return { events, hung };
+  }
+
+  it("while attached, a background shell's wake is adopted and its call gated", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const adopted: TurnRun[] = [];
+    p.onSessionEvent = (e) => {
+      if (e.type === "turn_started") adopted.push(e.run);
+    };
+    const asked: string[] = [];
+    const events = await collect(p.runTurn(opts("bg-shell", { canUseTool: allowing((_n, input) => asked.push(String(input.command))) })));
+    expect(texts(events, "text_done")).toEqual(["started it in the background"]);
+    for (let i = 0; i < 100 && adopted.length === 0; i++) await Bun.sleep(20);
+    const follow = await collect(adopted[0]!);
+    expect(texts(follow, "text_done")).toEqual(["woke and ran it"]);
+    expect(asked).toEqual(["sleep 1; echo bg", "echo woke-tool"]);
+    await p.teardown();
+  });
+
+  it("tearing down stops the session's background shells and the wake that follows: the rebuilt backend's turn answers", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_BG_SHELL_MS: "1500" });
+    const p = makeProvider(server, { sessionId: "sess-bg", initialBackingId: "sess-bg" });
+    await collect(p.runTurn(opts("bg-shell")));
+    const ses = p.backingSessionId;
+    await p.teardown();
+    const st = await fakeState(server);
+    expect(st.shellsRemoved).toHaveLength(1);
+    // The wake opencode ran for the removed shell was stopped, its request with it.
+    expect(st.interrupts).toContain(ses);
+    await Bun.sleep(1_800);
+    const rebuilt = makeProvider(server, { sessionId: "sess-bg", initialBackingId: ses });
+    const { events, hung } = await bounded(rebuilt.runTurn(opts("hi")));
+    expect(hung).toBe(false);
+    expect(texts(events, "text_done")).toEqual(["Hello, world"]);
+    await rebuilt.teardown();
+  });
+
+  it("a wake that ran after the backend was torn down is stopped when the session is attached again, not queued behind", async () => {
+    // Teardown can't find the shell, so its wake runs unwatched and asks.
+    const { server } = makeServer({ FAKE_OPENCODE_SHELLS_UNLISTED: "1", FAKE_OPENCODE_BG_SHELL_MS: "300" });
+    const p = makeProvider(server, { sessionId: "sess-bg2", initialBackingId: "sess-bg2" });
+    await collect(p.runTurn(opts("bg-shell")));
+    const ses = p.backingSessionId;
+    await p.teardown();
+    await Bun.sleep(800);
+    const conn = await server.ensure();
+    expect(await conn.client.pendingPermissions(ses)).toHaveLength(1);
+    const rebuilt = makeProvider(server, { sessionId: "sess-bg2", initialBackingId: ses });
+    const { events, hung } = await bounded(rebuilt.runTurn(opts("hi")));
+    expect(hung).toBe(false);
+    expect(texts(events, "text_done")).toEqual(["Hello, world"]);
+    expect(await conn.client.pendingPermissions(ses)).toEqual([]);
+    await rebuilt.teardown();
   });
 });
 

@@ -46,6 +46,7 @@
  *   I23 (scripted only) a subagent continued by its id after the provider was rebuilt: its request reaches the gate, the turn ends
  *   I24 (scripted only) shell lines with no command in them, which opencode runs unasked by its own rule, keep the server, and a concurrent turn
  *   I25 (scripted only) a session's shell has no key: a line of assignments that runs unasked can't print one, nor the injected config
+ *   I26 (scripted only) a background shell finishing after its backend was torn down: its wake is stopped, the rebuilt backend's turn answers
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -865,4 +866,27 @@ describe("opencode (real binary)", () => {
     expect(JSON.stringify(stored)).not.toContain(PROBE_VALUE);
   }, 180_000);
 
+  maybeScripted("I26 a background shell finishing after its backend was torn down: its wake is stopped, the rebuilt backend's turn answers", async () => {
+    // The shell's output makes the wake's reply call a tool: unanswered, it would hold the session.
+    const sessionId = `it-bg-${Math.random().toString(36).slice(2)}`;
+    const command = `sleep 3; X=tool; printf '[[%s:shell {"command":"echo woke-tool"}]]' $X`;
+    const first = provider({ sessionId });
+    const t1 = await collect(first.runTurn(opts(`[[tool:shell ${JSON.stringify({ command, background: true })}]]`)));
+    expect(done(t1)?.stopReason).toBe("stop");
+    const ses = first.backingSessionId;
+    await first.teardown();
+    // Past the time the shell would have finished and woken the session.
+    await Bun.sleep(4_000);
+    const conn = await server!.ensure();
+    expect(await conn.client.pendingPermissions(ses)).toEqual([]);
+    const p = provider({ sessionId, initialBackingId: ses });
+    const run = p.runTurn(opts("[[text:second turn reply]]"));
+    const timer = setTimeout(() => void run.interrupt(), 20_000);
+    const started = Date.now();
+    const events = await collect(run);
+    clearTimeout(timer);
+    expect(texts(events)).toContain("second turn reply");
+    expect(Date.now() - started).toBeLessThan(10_000);
+    await p.teardown();
+  }, 180_000);
 });

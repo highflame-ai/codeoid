@@ -90,6 +90,13 @@
  *                    value of each `$NAME` in it, from the session's
  *                    environment (`PUT …/environment`) if one was set, else
  *                    the server's own, as the real shell expands them
+ *   "bg-shell"     → a background shell call (asks first): its result says
+ *                    `status: "running"` with a `shellID`, and it is listed
+ *                    (`GET /api/shell`) until it finishes (FAKE_OPENCODE_BG_SHELL_MS,
+ *                    default 400) or is removed (`DELETE /api/shell/:id`).
+ *                    Either way opencode wakes the session itself (a
+ *                    synthetic inbox item) and runs it: the wake calls
+ *                    shell `echo woke-tool`, which asks
  *
  * Knobs (env): FAKE_OPENCODE_VERSION (default 2.2.5), FAKE_OPENCODE_STARTS
  * (append a line per start), FAKE_OPENCODE_UNSAFE_AGENT=1 (an `explore`
@@ -104,7 +111,8 @@
  * posted), FAKE_OPENCODE_AUTOALLOW=1|child (every permission request — or a
  * child session's only — is settled "once" without being published, as
  * such a plugin's hook does), FAKE_OPENCODE_ENV_FAIL=child (setting a child
- * session's environment answers 500).
+ * session's environment answers 500), FAKE_OPENCODE_SHELLS_UNLISTED=1
+ * (`GET /api/shell` lists nothing).
  * `GET /__fake/state` (test-only, no auth) returns everything recorded;
  * `POST /__fake/delete/<id>[?quiet=1]` deletes a session (quiet: no event);
  * `POST /__fake/tamper/<id>` sets its rules to allow-all and saves an "always".
@@ -185,11 +193,14 @@ const state = {
   fetched: [] as string[],
   /** `PUT …/environment` calls, in order. */
   environments: [] as Json[],
+  shellsRemoved: [] as string[],
   saved: process.env.FAKE_OPENCODE_SAVED === "1" ? [{ id: "prm_1", action: "shell", resource: "git *" }] : ([] as Json[]),
   savedRemoved: [] as string[],
 };
 
 const sessions = new Map<string, Ses>();
+/** Background shells still running: id → its session, and how to end it. */
+const shells = new Map<string, { sessionID: string; directory: string; command: string; finish: (state: string) => void }>();
 const mounts = new Map<string, Map<string, Json>>(); // directory → name → config
 const pendingPerms = new Map<string, { req: Json; resolve: (r: { decision: string; message?: string }) => void }>();
 const pendingForms = new Map<string, { form: Json; resolve: (r: { answer?: Json; cancelled?: string }) => void }>();
@@ -516,6 +527,55 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     const msg2 = step(ses);
     await say(ses, msg2, "ran it");
     endStep(ses, msg2);
+    return "succeeded";
+  }
+  if (text === "__shell-wake") {
+    const msg = step(ses);
+    const r = await toolCall(ses, msg, "shell", { command: "echo woke-tool" }, { action: "shell", resources: ["echo woke-tool"] });
+    endStep(ses, msg);
+    const msg2 = step(ses);
+    await say(ses, msg2, r.ok ? "woke and ran it" : `woke, refused: ${r.message}`);
+    endStep(ses, msg2);
+    return "succeeded";
+  }
+  if (text.includes("bg-shell")) {
+    const msg = step(ses);
+    const command = "sleep 1; echo bg";
+    const id = nextId("call");
+    const input = { command, background: true };
+    ses.messages.find((x) => x.id === msg)?.content?.push({ type: "tool", id, name: "shell", state: { status: "running", input, metadata: {} } });
+    durable(ses, "session.tool.input.started", { assistantMessageID: msg, id, name: "shell" });
+    durable(ses, "session.tool.called", { assistantMessageID: msg, id, input, executed: false });
+    const reply = await askPermission(ses, { action: "shell", resources: [command], source: { type: "tool", messageID: msg, id } });
+    if (reply.decision === "interrupted") interruptedCall(ses, msg, id);
+    if (reply.decision !== "once") {
+      durable(ses, "session.tool.failed", { assistantMessageID: msg, id, error: { type: "permission.rejected", message: reply.message ?? "" }, executed: false });
+      endStep(ses, msg);
+      return "succeeded";
+    }
+    const shellID = nextId("sh");
+    const content = [{ type: "text", text: `Command moved to the background (shell ID: ${shellID}).` }];
+    durable(ses, "session.tool.success", { assistantMessageID: msg, id, content, metadata: { status: "running", shellID }, executed: true });
+    endStep(ses, msg);
+    const msg2 = step(ses);
+    await say(ses, msg2, "started it in the background");
+    endStep(ses, msg2);
+    let ended = false;
+    const finish = (shellState: string) => {
+      if (ended) return;
+      ended = true;
+      shells.delete(shellID);
+      // As real 2.2.5 (`notifyWhenDone`): a finished, failed or removed job wakes its session.
+      void (async () => {
+        while (ses.executing) await sleep(10);
+        const inboxID = nextId("msg");
+        durable(ses, "session.inbox.enqueued", { inboxID, item: { type: "synthetic", payload: { text: `<shell id="${shellID}" state="${shellState}">`, metadata: { source: "shell" } }, delivery: "steer" } });
+        ses.messages.push({ id: inboxID, type: "synthetic", time: { created: Date.now() } });
+        await startExecution(ses, "__shell-wake", inboxID);
+      })();
+    };
+    shells.set(shellID, { sessionID: ses.id, directory: ses.directory, command, finish });
+    setTimeout(() => finish("completed"), Number(process.env.FAKE_OPENCODE_BG_SHELL_MS ?? 400));
     return "succeeded";
   }
   if (text.includes("use-shell")) {
@@ -1218,6 +1278,18 @@ const server = Bun.serve({
       const loc = body.location as { directory?: string } | undefined;
       const ses = createSession({ directory: loc?.directory ?? directoryOf(req, url), permissions: body.permissions as Json[], agent: body.agent as string, model: body.model as Json });
       return json({ data: info(ses) });
+    }
+    if (path === "/api/shell" && method === "GET") {
+      const dir = directoryOf(req, url);
+      const list = process.env.FAKE_OPENCODE_SHELLS_UNLISTED === "1" ? [] : [...shells].filter(([, sh]) => sh.directory === dir);
+      return json({ location: { directory: dir }, data: list.map(([id, sh]) => ({ id, status: "running", command: sh.command, cwd: sh.directory, shell: "/bin/bash", file: "/tmp/x.out", metadata: { sessionID: sh.sessionID }, time: { started: Date.now() } })) });
+    }
+    m = /^\/api\/shell\/([^/]+)$/.exec(path);
+    if (m && method === "DELETE") {
+      const sh = shells.get(m[1]!);
+      state.shellsRemoved.push(m[1]!);
+      sh?.finish("error");
+      return new Response(null, { status: 204 });
     }
     m = /^\/api\/experimental\/session\/([^/]+)\/log$/.exec(path);
     if (m) {

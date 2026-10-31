@@ -850,8 +850,9 @@ export class OpencodeProvider implements SessionProvider {
       }
     } else if (this.#backingSessionId.startsWith("ses_")) {
       try {
-        const info = await conn.client.getSession(this.#backingSessionId);
+        let info = await conn.client.getSession(this.#backingSessionId);
         await conn.client.updateSession(info.id, { permissions: rules });
+        if (sessionRunning(info)) info = await this.#stopLeftover(conn, info);
         this.#sessionModel = info.model ?? null;
         this.#agentApplied = info.agent !== undefined && info.agent === this.#agent;
         return info;
@@ -875,6 +876,27 @@ export class OpencodeProvider implements SessionProvider {
     this.#freshSession();
     this.#agentApplied = this.#agent !== undefined;
     return created;
+  }
+
+  /**
+   * The session runs an execution nobody watches: opencode started it for a
+   * backend codeoid tore down (a background shell or subagent that finished
+   * after it). Its requests wait for an answer that never comes, and a
+   * prompt would queue behind it. It is the torn-down backend's work, gone
+   * with it: stopped (a waiting request with it), then the session is read
+   * again for the spend it starts from.
+   */
+  async #stopLeftover(conn: OpencodeConnection, info: OcSessionInfo): Promise<OcSessionInfo> {
+    console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] opencode session ${info.id} runs an execution started after its backend was torn down — stopping it`);
+    await conn.client.interrupt(info.id).catch(() => {});
+    const until = Date.now() + INTERRUPT_SETTLE_MS;
+    let now = info;
+    while (sessionRunning(now) && Date.now() < until) {
+      await Bun.sleep(50);
+      now = await conn.client.getSession(info.id);
+    }
+    if (sessionRunning(now)) throw new Error(`opencode session ${info.id} is still running something codeoid didn't start, and didn't stop — try again`);
+    return now;
   }
 
   /** A new opencode session has none of the old one's selection or instructions. */
@@ -1478,6 +1500,8 @@ export class OpencodeProvider implements SessionProvider {
     // A child session's own lifecycle (its log isn't followed: the parent's turn shows it as a subagent).
     switch (ev.type) {
       case "session.execution.started":
+        // Tearing down: a child woken now (its background shell stopped) is stopped too.
+        if (this.#stopping) void this.#conn?.client.interrupt(sid).catch(() => {});
         if (!child.running) {
           child.running = true;
           this.#emit({ type: "subagent_start", agentId: sid, agentType: child.agentType });
@@ -2204,6 +2228,26 @@ export class OpencodeProvider implements SessionProvider {
     return [];
   }
 
+  /**
+   * Stop the background shells of `sessions` (opencode's `shell` with
+   * `background`): they outlive the call, and the one that finishes wakes
+   * its session with nobody attached — the wake's requests then wait
+   * forever, and the next turn's prompt queues behind them. Returns how
+   * many were stopped (each still wakes its session, at once).
+   */
+  async #stopShells(conn: OpencodeConnection, directory: string, sessions: ReadonlySet<string>): Promise<number> {
+    let listed: Awaited<ReturnType<typeof conn.client.shells>>;
+    try {
+      listed = await conn.client.shells(directory);
+    } catch (err) {
+      console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] couldn't list background shells to stop: ${err instanceof Error ? err.message : String(err)}`);
+      return 0;
+    }
+    const mine = listed.filter((sh) => sh.status === "running" && sessions.has(String(sh.metadata?.sessionID ?? "")));
+    await Promise.all(mine.map((sh) => conn.client.removeShell(sh.id, directory).catch(() => {})));
+    return mine.length;
+  }
+
   async teardown(): Promise<void> {
     this.#stopping = true;
     try {
@@ -2228,11 +2272,13 @@ export class OpencodeProvider implements SessionProvider {
       // counts a torn-down backend's background work as gone with it.
       const running = [...this.#children.entries()].filter(([, c]) => c.running);
       const stops = [...(ses && this.#executing ? [ses] : []), ...running.map(([id]) => id)].map((id) => conn.client.interrupt(id).catch(() => {}));
-      await Promise.race([Promise.all(stops), Bun.sleep(2_000)]);
-      if (running.some(([, c]) => c.background)) {
-        // opencode hands a stopped background subagent's result to its
-        // parent and runs it: that execution is stopped too (#onDurable),
-        // so wait for the subagents' ends and the wake that follows.
+      const shells = ses && this.#workdir ? this.#stopShells(conn, this.#workdir, new Set([ses, ...this.#children.keys()])) : Promise.resolve(0);
+      const [, stoppedShells] = await Promise.race([Promise.all([Promise.all(stops), shells]), Bun.sleep(2_000).then(() => [undefined, 1] as const)]);
+      if (running.some(([, c]) => c.background) || stoppedShells > 0) {
+        // opencode hands a stopped background subagent's result, and a
+        // stopped background shell's, to its session and runs it: that
+        // execution is stopped too (#onDurable), so wait for the subagents'
+        // ends and the wake that follows.
         const until = Date.now() + TEARDOWN_SETTLE_MS;
         while (Date.now() < until && running.some(([, c]) => c.running)) await Bun.sleep(25);
         await Bun.sleep(WAKE_GRACE_MS);

@@ -42,6 +42,14 @@ export interface OcRule {
 }
 
 /** `Session.Info` (public). */
+/** A shell command (`GET /api/shell`): only running ones are listed. */
+export interface OcShellInfo {
+  id: string;
+  status: string;
+  command: string;
+  metadata?: { sessionID?: string; [k: string]: unknown };
+}
+
 export interface OcSessionInfo {
   id: string;
   parentID?: string;
@@ -299,6 +307,16 @@ export class OpencodeClient {
 
   async updateSession(sessionID: string, body: { permissions?: OcRule[]; title?: string }): Promise<void> {
     await this.#request("PATCH", `/api/session/${encodeURIComponent(sessionID)}`, { body });
+  }
+
+  /** Shell commands still running at a location (a background one's `metadata.sessionID` names its session). */
+  async shells(directory: string): Promise<OcShellInfo[]> {
+    return (await this.#request<{ data: OcShellInfo[] }>("GET", "/api/shell", { directory })).data ?? [];
+  }
+
+  /** Terminate a shell command (its job ends, and opencode still notifies its session). */
+  async removeShell(id: string, directory: string): Promise<void> {
+    await this.#request("DELETE", `/api/shell/${encodeURIComponent(id)}`, { directory });
   }
 
   /** Replace the environment the session's shell commands run with (opencode 2.2.5: `process.env` otherwise). */
