@@ -29,6 +29,10 @@
  *   "think"        → reasoning deltas + reasoning.ended first
  *   "use-shell"    → shell call; permission.asked; runs or fails per the reply
  *   "use-edit"     → edit call (path/oldString/newString) asking "edit"
+ *   "use-webfetch" → a webfetch of https://docs.example/start, which redirects
+ *                    to another site (169.254.169.254); "use-webfetch-same" to
+ *                    the same one. As real 2.2.x: the hop is checked only
+ *                    against the session's rules, never asked about
  *   "use-mcp"      → a call to this session's mounted codeoid_memory `recall`
  *   "foreign-mcp"  → a call to ANOTHER session's mount (must be rejected)
  *   "unknown-action" → a permission action codeoid doesn't know
@@ -156,6 +160,8 @@ const state = {
   inboxCancels: [] as string[],
   mcpPromptCalls: [] as Json[],
   shellRan: [] as string[],
+  /** URLs a webfetch call really fetched (each redirect hop too). */
+  fetched: [] as string[],
   saved: process.env.FAKE_OPENCODE_SAVED === "1" ? [{ id: "prm_1", action: "shell", resource: "git *" }] : ([] as Json[]),
   savedRemoved: [] as string[],
 };
@@ -325,6 +331,17 @@ const COMPACTION_TOKENS = { input: 1000, output: 20, reasoning: 0, cache: { read
 
 class Cancelled extends Error {}
 
+/** opencode's `Wildcard.match`: `*` matches any run, the rest is literal. */
+function wildcardMatch(value: string, pattern: string): boolean {
+  return new RegExp(`^${pattern.split("*").map((p) => p.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`, "s").test(value);
+}
+
+/** What the session's rules say about an action on a resource: the last match wins; none is `ask`. */
+function ruleEffect(ses: Ses, action: string, resource: string): string {
+  const rule = ses.permissions.findLast((r) => wildcardMatch(action, String(r.action)) && wildcardMatch(resource, String(r.resource)));
+  return rule ? String(rule.effect) : "ask";
+}
+
 function askPermission(ses: Ses, req: Json): Promise<{ decision: string; message?: string }> {
   const id = nextId("per");
   const full = { id, sessionID: ses.id, ...req };
@@ -446,6 +463,36 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     endStep(ses, msg);
     const msg2 = step(ses);
     await say(ses, msg2, r.ok ? "listed it" : `not allowed: ${r.message}`);
+    endStep(ses, msg2);
+    return "succeeded";
+  }
+  if (text.includes("use-webfetch")) {
+    const msg = step(ses);
+    const start = "https://docs.example/start";
+    const hop = text.includes("use-webfetch-same") ? "https://docs.example/final" : "http://169.254.169.254/latest/meta-data/";
+    const id = nextId("call");
+    const input = { url: start, format: "text" };
+    ses.messages.find((x) => x.id === msg)?.content?.push({ type: "tool", id, name: "webfetch", state: { status: "running", input, metadata: {} } });
+    durable(ses, "session.tool.input.started", { assistantMessageID: msg, id, name: "webfetch" });
+    durable(ses, "session.tool.called", { assistantMessageID: msg, id, input, executed: false });
+    const reply = await askPermission(ses, { action: "webfetch", resources: [start], save: ["*"], metadata: input, source: { type: "tool", messageID: msg, id } });
+    let fetched = false;
+    if (reply.decision === "once") {
+      state.fetched.push(start);
+      // opencode follows the redirect itself: the hop is checked against the rules (`assertNotDenied`), never asked.
+      if (ruleEffect(ses, "webfetch", hop) === "deny") {
+        durable(ses, "session.tool.failed", { assistantMessageID: msg, id, error: { type: "permission.rejected", message: "Permission denied: webfetch" }, executed: true });
+      } else {
+        state.fetched.push(hop);
+        fetched = true;
+        durable(ses, "session.tool.success", { assistantMessageID: msg, id, content: [{ type: "text", text: `fetched ${hop}` }], executed: true });
+      }
+    } else {
+      durable(ses, "session.tool.failed", { assistantMessageID: msg, id, error: { type: "permission.rejected", message: reply.message ?? "" }, executed: false });
+    }
+    endStep(ses, msg);
+    const msg2 = step(ses);
+    await say(ses, msg2, fetched ? "fetched it" : "couldn't fetch it");
     endStep(ses, msg2);
     return "succeeded";
   }

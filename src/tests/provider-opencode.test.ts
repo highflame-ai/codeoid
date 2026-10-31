@@ -590,6 +590,37 @@ describe("opencode approvals", () => {
     expect(events.some((e) => e.type === "tool_complete" && !e.success && e.output.includes("server stopped"))).toBe(true);
     expect(events.at(-1)?.type).toBe("error");
   });
+
+  it("an approved fetch can't follow a redirect to another site; the fence is lifted when it ends", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const asked: unknown[] = [];
+    const events = await collect(p.runTurn(opts("use-webfetch", { canUseTool: allowing((name, input) => asked.push([name, input])) })));
+    expect(asked).toEqual([["WebFetch", { url: "https://docs.example/start" }]]);
+    // opencode checks the hop only against the rules: the fence refused it, so it never went out.
+    const st = await fakeState(server);
+    expect(st.fetched).toEqual(["https://docs.example/start"]);
+    expect(events.some((e) => e.type === "tool_complete" && !e.success && e.output.includes("Permission denied"))).toBe(true);
+    expect(texts(events, "text_done")).toEqual(["couldn't fetch it"]);
+    // Set before the reply, lifted after: no fetch is fenced once it's over.
+    const fenced = st.patches.filter((x: { permissions?: Array<{ action: string; effect: string }> }) => x.permissions?.some((r) => r.action === "webfetch" && r.effect === "deny"));
+    expect(fenced).toHaveLength(1);
+    expect(st.replies.at(-1)).toMatchObject({ decision: "once" });
+    let rules: unknown;
+    for (let i = 0; i < 50; i++) {
+      rules = (await fakeState(server)).sessions.find((x: { id: string }) => x.id === p.backingSessionId)?.permissions;
+      if (JSON.stringify(rules) === JSON.stringify(sessionRules("sess-1"))) break;
+      await Bun.sleep(20);
+    }
+    expect(rules).toEqual(sessionRules("sess-1"));
+  });
+
+  it("an approved fetch still follows a redirect on the site that was approved", async () => {
+    const { server } = makeServer();
+    const events = await collect(makeProvider(server).runTurn(opts("use-webfetch-same")));
+    expect((await fakeState(server)).fetched).toEqual(["https://docs.example/start", "https://docs.example/final"]);
+    expect(texts(events, "text_done")).toEqual(["fetched it"]);
+  });
 });
 
 // ── O6 interrupt ─────────────────────────────────────────────────────────────

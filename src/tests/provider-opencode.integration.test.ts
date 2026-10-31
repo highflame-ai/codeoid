@@ -42,6 +42,7 @@
  *   I19 (scripted only) a steer the user's interrupt dropped is withdrawn from opencode's inbox: the next turn doesn't get it
  *   I20 (scripted only) only opencode's built-in commands run as commands: a config command's shell spans never run
  *   I21 (scripted only) a shell line made only of redirections asks first: denied, the file outside the workdir is untouched
+ *   I22 (scripted only) an approved fetch doesn't follow a redirect to another site; one on the approved site is followed
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -50,7 +51,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
 import { OpencodeIncompatibleError, OpencodeServer } from "../daemon/providers/opencode/server.js";
-import { buildOpencodeEnv } from "../daemon/providers/opencode/policy.js";
+import { buildOpencodeEnv, sessionRules } from "../daemon/providers/opencode/policy.js";
 import { opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
 import type { ProviderEvent, ToolApprovalFn, TurnOpts, TurnRun, UiRequest } from "../daemon/providers/interface.js";
 import type { Store } from "../daemon/store.js";
@@ -710,6 +711,61 @@ describe("opencode (real binary)", () => {
       }
     } finally {
       rmSync(outside, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  maybeScripted("I22 an approved fetch doesn't follow a redirect to another site; one on the approved site is followed", async () => {
+    // opencode follows redirects itself and checks each hop only against the
+    // rules: under ask-everything an approved fetch reached any address.
+    const hits: string[] = [];
+    const internal = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        hits.push(`internal ${new URL(req.url).pathname}`);
+        return new Response("INTERNAL-SECRET", { headers: { "content-type": "text/plain" } });
+      },
+    });
+    const site = Bun.serve({
+      hostname: "127.0.0.1",
+      port: 0,
+      fetch(req) {
+        const path = new URL(req.url).pathname;
+        hits.push(`site ${path}`);
+        if (path === "/final") return new Response("SAME-SITE-FINAL", { headers: { "content-type": "text/plain" } });
+        const location = path === "/same" ? "/final" : `http://127.0.0.1:${internal.port}/latest/meta-data/`;
+        return new Response(null, { status: 302, headers: { location } });
+      },
+    });
+    try {
+      const sessionId = `it-fetch-${Math.random().toString(36).slice(2)}`;
+      const p = provider({ sessionId });
+      const asked: unknown[] = [];
+      const gate: ToolApprovalFn = async (_t, _a, name, input) => {
+        asked.push([name, input]);
+        return { behavior: "allow" };
+      };
+      const away = await collect(p.runTurn(opts(`[[tool:webfetch {"url":"http://127.0.0.1:${site.port}/docs","format":"text"}]]`, { canUseTool: gate })));
+      expect(asked).toEqual([["WebFetch", { url: `http://127.0.0.1:${site.port}/docs` }]]);
+      expect(hits).toEqual(["site /docs"]);
+      expect(JSON.stringify(away)).not.toContain("INTERNAL-SECRET");
+      // The fence is lifted once the call ended.
+      const conn = await server!.ensure();
+      let rules: unknown;
+      for (let i = 0; i < 50; i++) {
+        rules = (await conn.client.getSession(p.backingSessionId)).permissions;
+        if (JSON.stringify(rules) === JSON.stringify(sessionRules(sessionId))) break;
+        await Bun.sleep(100);
+      }
+      expect(rules).toEqual(sessionRules(sessionId));
+      hits.length = 0;
+      const same = await collect(p.runTurn(opts(`[[tool:webfetch {"url":"http://127.0.0.1:${site.port}/same","format":"text"}]]`, { canUseTool: gate })));
+      expect(hits).toEqual(["site /same", "site /final"]);
+      expect(texts(same).join(" ")).toContain("SAME-SITE-FINAL");
+      await p.teardown();
+    } finally {
+      internal.stop();
+      site.stop();
     }
   }, 180_000);
 });

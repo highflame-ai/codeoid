@@ -74,7 +74,7 @@ import {
   type OcSessionInfo,
   type OcTokenUsage,
 } from "./client.js";
-import { mcpNamespace, ownMountPrefix, runnableCommand, sessionRules } from "./policy.js";
+import { fetchFence, fetchOrigin, mcpNamespace, ownMountPrefix, runnableCommand, sessionRules } from "./policy.js";
 import type { OpencodeConnection, OpencodeServer } from "./server.js";
 import {
   type OcToolCall,
@@ -338,6 +338,12 @@ export class OpencodeProvider implements SessionProvider {
   #streamingReadBack = new Set<string>();
   #blockIndex = new Map<string, number>();
   #children = new Map<string, Child>();
+  /**
+   * Approved fetches still running, per opencode session: call key → the
+   * origin its redirects may stay on. While any runs, the session's rules
+   * carry the fence (policy.ts `fetchFence`).
+   */
+  #fences = new Map<string, Map<string, string | null>>();
 
   constructor(init: OpencodeProviderInit) {
     this.#sessionId = init.sessionId;
@@ -785,7 +791,7 @@ export class OpencodeProvider implements SessionProvider {
     // process of the daemon's user can read it) could have changed since:
     // the session's rules, a saved "always", a plugin dropped into a config
     // dir opencode watches (#ensureMounts' requests loaded the location).
-    if (!fresh) await conn.client.updateSession(ses, { permissions: sessionRules(this.#sessionId) });
+    if (!fresh) await conn.client.updateSession(ses, { permissions: this.#rulesFor(ses) });
     await this.#sweepSaved(conn, workdir);
     await this.#server.checkPlugins(conn, workdir);
     if (!this.#modelsReported) await this.#reportModelsOnce();
@@ -1476,7 +1482,7 @@ export class OpencodeProvider implements SessionProvider {
     // The child may not carry this session's rules (its agent's own come
     // first); set them before its first step. The server's agent check
     // (policy.ts) is what guarantees it, this is belt and braces.
-    void this.#conn?.client.updateSession(id, { permissions: sessionRules(this.#sessionId) }).catch(() => {});
+    void this.#conn?.client.updateSession(id, { permissions: this.#rulesFor(id) }).catch(() => {});
     this.#emit({ type: "subagent_start", agentId: id, agentType: child.agentType });
   }
 
@@ -1570,6 +1576,7 @@ export class OpencodeProvider implements SessionProvider {
   #toolSettled(sessionID: string, d: Record<string, unknown>, success: boolean): void {
     const id = String(d.id ?? "");
     const key = `${sessionID}:${id}`;
+    this.#unfence(sessionID, key);
     if (this.#settledCalls.has(key)) return; // read back already, now from the feed
     remember(this.#settledCalls, key);
     const call = this.#toolCalls.get(key);
@@ -1680,6 +1687,13 @@ export class OpencodeProvider implements SessionProvider {
     }
     if (this.#pendingAsks.get(req.id) !== pending) return; // withdrawn: settled elsewhere, or the server went away
     this.#pendingAsks.delete(req.id);
+    if (verdict.behavior === "allow" && !nested && req.action === "webfetch" && !(await this.#fence(conn, req.sessionID, key, String(mapped.input.url ?? "")))) {
+      // Unfenced, its redirects would reach any site unasked: not run.
+      this.#declined.add(key);
+      this.#emit({ type: "tool_complete", sdkToolUseId: toolId, output: "Declined — codeoid couldn't keep this fetch to the site you approved.", success: false, declinedByBackend: true });
+      await this.#reply(conn, req, "reject", "codeoid declined this: it couldn't keep the fetch to the approved site. Try again.");
+      return;
+    }
     if (verdict.behavior === "allow") {
       await this.#reply(conn, req, "once");
       // No result of its own comes back: it is part of the script's.
@@ -1700,6 +1714,36 @@ export class OpencodeProvider implements SessionProvider {
         console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] permission reply failed: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+  }
+
+  /** The rules a session of this provider's (its own, or a child's) carries now: codeoid's, and the fence while a fetch runs. */
+  #rulesFor(sessionID: string): ReturnType<typeof sessionRules> {
+    const running = this.#fences.get(sessionID);
+    return [...sessionRules(this.#sessionId), ...(running && running.size > 0 ? fetchFence(running.values()) : [])];
+  }
+
+  /** Fence an approved fetch before it runs (policy.ts `fetchFence`); false when the rules couldn't be set. */
+  async #fence(conn: OpencodeConnection, sessionID: string, key: string, url: string): Promise<boolean> {
+    const running = this.#fences.get(sessionID) ?? new Map<string, string | null>();
+    this.#fences.set(sessionID, running);
+    running.set(key, fetchOrigin(url));
+    try {
+      await conn.client.updateSession(sessionID, { permissions: this.#rulesFor(sessionID) });
+      return true;
+    } catch (err) {
+      console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] couldn't fence a fetch: ${err instanceof Error ? err.message : String(err)}`);
+      this.#unfence(sessionID, key);
+      return false;
+    }
+  }
+
+  /** A fenced fetch ended: its origin leaves the fence, and the fence goes with the last one. */
+  #unfence(sessionID: string, key: string): void {
+    const running = this.#fences.get(sessionID);
+    if (!running?.delete(key)) return;
+    if (running.size === 0) this.#fences.delete(sessionID);
+    // Failing to lift it fails closed: the next fetch's hops stay fenced until the next turn sets the rules again.
+    void this.#conn?.client.updateSession(sessionID, { permissions: this.#rulesFor(sessionID) }).catch(() => {});
   }
 
   // ── Forms (opencode's question tool, MCP elicitations) ─────────────────
@@ -1993,6 +2037,8 @@ export class OpencodeProvider implements SessionProvider {
     this.#appliedSelection = null;
     this.#executing = false;
     this.#children.clear();
+    // The next attach sets each session's rules again.
+    this.#fences.clear();
     if (hadBackground) this.#emitBackgroundLevel();
     if (turn) this.#failTurn(turn, `opencode: the server stopped (${reason})`);
   }
@@ -2025,6 +2071,7 @@ export class OpencodeProvider implements SessionProvider {
     this.#workdir = null;
     this.#executing = false;
     this.#children.clear();
+    this.#fences.clear();
     this.#appliedSelection = null;
     this.#agentApplied = false;
     this.#sentInstructions = null;

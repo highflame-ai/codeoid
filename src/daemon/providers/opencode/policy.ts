@@ -127,6 +127,39 @@ export function sessionRules(sessionId: string): OcRule[] {
 }
 
 /**
+ * opencode's `webfetch` follows redirects itself, checking each hop only
+ * against the rules (a hop is never asked about: under ask-everything, every
+ * one passes). So while an approved fetch runs, its session's rules also
+ * carry this fence: every other site is denied, and a redirect there fails
+ * the call — the model has to fetch the new address as a call of its own,
+ * which asks. Hops on an approved fetch's own origin still pass. `origins`:
+ * of the session's approved fetches still running; null for one whose
+ * origin can't be pinned (none of its hops pass).
+ */
+export function fetchFence(origins: Iterable<string | null>): OcRule[] {
+  const pinned = [...new Set([...origins].filter((o): o is string => o !== null))];
+  return [
+    { action: "webfetch", resource: "*", effect: "deny" },
+    ...pinned.map((origin) => ({ action: "webfetch", resource: `${origin}/*`, effect: "ask" as const })),
+  ];
+}
+
+/**
+ * The origin a fetch of `url` stays on, as opencode writes each hop's URL
+ * (`URL.href`: `<origin>/…`). Null when it can't be pinned: not http(s), or a
+ * `*` in it (a wildcard in a rule).
+ */
+export function fetchOrigin(url: string): string | null {
+  try {
+    const u = new URL(url);
+    if ((u.protocol !== "http:" && u.protocol !== "https:") || u.origin.includes("*")) return null;
+    return u.origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * opencode's wildcard (`Wildcard.match`): `*` matches any run, the rest is
  * literal. Used to judge whether one rule's pattern covers another's.
  */
