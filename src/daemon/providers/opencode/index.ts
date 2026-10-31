@@ -1750,6 +1750,13 @@ export class OpencodeProvider implements SessionProvider {
     if (this.#turn !== turn || turn.queue.closed || this.#ses !== ses) return;
     let lastError: OcError | undefined;
     for (const m of mine.reverse()) {
+      if (m.type === "user") {
+        // opencode stores an input as it delivers it, under its inbox id: a
+        // steer delivered in the gap is paid here, where its answer begins.
+        turn.delivered.add(m.id);
+        if (turn.steers.delete(m.id) && turn.owed > 0) this.#payBoundary(turn);
+        continue;
+      }
       if (m.type !== "assistant") continue;
       if (ended) turn.lastAssistantMessageID = m.id;
       if (m.error) lastError = m.error;

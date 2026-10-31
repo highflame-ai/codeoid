@@ -35,6 +35,9 @@
  *   "background"   → background subagent; opencode resumes the parent itself
  *   "slow"         → keeps stepping until interrupted
  *   "steer"        → waits for a steered input, then answers it
+ *   "steer-gap"    → the feed drops after the first step; the steer is
+ *                    delivered and answered in the gap, which closes while
+ *                    the execution still runs
  *   "retry"        → session.retry.scheduled before answering
  *   "fail"         → execution.failed with a structured rate-limit error
  *   "costly"       → three steps of $2 each
@@ -355,6 +358,12 @@ function toolBlock(ses: Ses, msg: string, id: string): Json | undefined {
   return ses.messages.find((x) => x.id === msg)?.content?.find((b) => b.type === "tool" && b.id === id);
 }
 
+/** Deliver a pending input into the running execution: stored as a user message, then announced. */
+function deliver(ses: Ses, item: { id: string; text: string }): void {
+  ses.messages.push({ id: item.id, type: "user", text: item.text, time: { created: Date.now() } });
+  durable(ses, "session.inbox.delivered", { inboxID: item.id });
+}
+
 /** Drop every live-feed subscriber; until `up()`, events reach nobody and new connections wait. */
 function dropFeed(): () => void {
   let up!: () => void;
@@ -537,6 +546,29 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     }
     return "succeeded";
   }
+  if (text.includes("steer-gap")) {
+    // The steer is delivered and answered in a feed gap that closes while
+    // the execution still runs.
+    const msg = step(ses);
+    await say(ses, msg, "first part");
+    endStep(ses, msg);
+    const up = dropFeed();
+    for (let i = 0; i < 100 && ses.inbox.length === 0; i++) await sleep(20);
+    const steered = ses.inbox.shift();
+    if (steered) {
+      deliver(ses, steered);
+      const msg2 = step(ses);
+      await say(ses, msg2, `steered: ${steered.text}`);
+      endStep(ses, msg2);
+    }
+    up();
+    await sleep(600);
+    check();
+    const msg3 = step(ses);
+    await say(ses, msg3, "after the gap");
+    endStep(ses, msg3);
+    return "succeeded";
+  }
   if (text.includes("steer")) {
     const msg = step(ses);
     await say(ses, msg, "first part");
@@ -547,7 +579,7 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     }
     const steered = ses.inbox.shift();
     if (steered) {
-      durable(ses, "session.inbox.delivered", { inboxID: steered.id });
+      deliver(ses, steered);
       const msg2 = step(ses);
       await say(ses, msg2, `steered: ${steered.text} (${steered.delivery})`);
       endStep(ses, msg2);
@@ -714,7 +746,7 @@ async function startExecution(ses: Ses, text: string, inboxID?: string): Promise
     // A queued input is delivered inside the running execution, after its reply.
     for (let i = ses.inbox.findIndex((x) => x.delivery === "queue"); outcome === "succeeded" && i >= 0; i = ses.inbox.findIndex((x) => x.delivery === "queue")) {
       const [item] = ses.inbox.splice(i, 1);
-      durable(ses, "session.inbox.delivered", { inboxID: item!.id });
+      deliver(ses, item!);
       outcome = await runScenario(ses, item!.text, signal);
     }
   } catch (err) {
@@ -741,6 +773,7 @@ async function startExecution(ses: Ses, text: string, inboxID?: string): Promise
   const steer = outcome === "succeeded" ? ses.inbox.findIndex((x) => x.delivery === "steer") : -1;
   if (steer >= 0) {
     const [item] = ses.inbox.splice(steer, 1);
+    ses.messages.push({ id: item!.id, type: "user", text: item!.text, time: { created: Date.now() } });
     setTimeout(() => void startExecution(ses, item!.text, item!.id), 5);
   }
 }
@@ -986,8 +1019,9 @@ const server = Bun.serve({
       const delivery = String(body.delivery ?? "steer");
       if (ses.executing && delivery === "steer" && process.env.FAKE_OPENCODE_STEER_FAIL === "1") return json({ _tag: "UnknownError", message: "steer refused" }, 500);
       state.prompts.push({ sessionID: ses.id, id, ...body });
-      ses.messages.push({ id, type: "user", text, time: { created: Date.now() } });
       durable(ses, "session.inbox.enqueued", { inboxID: id, item: { type: "user", payload: { text }, delivery } });
+      // As real 2.2.x: an input becomes a user message (under its inbox id) when it is delivered.
+      if (!ses.executing) ses.messages.push({ id, type: "user", text, time: { created: Date.now() } });
       if (ses.executing) {
         ses.inbox.push({ id, text, delivery });
         // The reply can lag the steer's delivery (FAKE_OPENCODE_STEER_REPLY_MS): opencode takes it at the next step boundary.

@@ -991,6 +991,28 @@ describe("opencode mid-turn messages", () => {
     expect(doneEvents.map((d) => d.result.stopReason)).toEqual(["steered", "stop"]);
   });
 
+  it("a steer delivered in a feed gap that closes before the execution ends is paid from the read-back", async () => {
+    const { server } = makeServer();
+    const run = makeProvider(server).runTurn(opts("steer-gap"));
+    const events: ProviderEvent[] = [];
+    let pushed = false;
+    let dones = 0;
+    const reader = (async () => {
+      for await (const e of run.events) {
+        events.push(e);
+        if (!pushed && e.type === "text_done") {
+          pushed = true;
+          run.pushMidTurn?.("also this", "now");
+        }
+        if ((e.type === "turn_done" && ++dones === 2) || e.type === "error") break;
+      }
+    })();
+    await Promise.race([reader, Bun.sleep(6_000)]);
+    const order = events.flatMap((e) => (e.type === "text_done" ? [e.content] : e.type === "turn_done" ? [`turn_done ${e.result.stopReason}`] : []));
+    // The boundary falls where the steer was taken, before its answer.
+    expect(order).toEqual(["first part", "turn_done steered", "steered: also this", "after the gap", "turn_done stop"]);
+  });
+
   it("a later message is queued behind the turn", async () => {
     const { server } = makeServer();
     const p = makeProvider(server);
