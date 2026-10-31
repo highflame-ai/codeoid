@@ -50,6 +50,9 @@
  *                    feed drops over the rest of its run and the parent's
  *                    follow-up execution, and is back after both ended
  *   "background"   → background subagent; opencode resumes the parent itself
+ *   "… continue:<ses_id>" (with "subagent" or "background") → the call
+ *                    continues that existing child session: reused, no
+ *                    `session.created` (as opencode's `sessionID` input)
  *   "slow"         → keeps stepping until interrupted
  *   "steer"        → waits for a steered input, then answers it
  *   "steer-gap"    → the feed drops after the first step; the steer is
@@ -596,7 +599,9 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     }
     // "subagent-gapstart": the child is created, starts and asks in a feed gap.
     if (text.includes("subagent-gapstart")) setTimeout(dropFeed(), 400);
-    const child = createSession({ parentID: ses.id, directory: ses.directory, title: "look around", agent: "explore" });
+    // Continuing an existing child (the call's `sessionID`): opencode reuses it and announces nothing.
+    const continued = /continue:(ses_\w+)/.exec(text);
+    const child = (continued ? sessions.get(continued[1]!) : undefined) ?? createSession({ parentID: ses.id, directory: ses.directory, title: "look around", agent: "explore" });
     child.foreground = !background;
     await sleep(20);
     // "subagent-gapend" / "background-gap": the feed drops once the child's call is approved,

@@ -43,6 +43,7 @@
  *   I20 (scripted only) only opencode's built-in commands run as commands: a config command's shell spans never run
  *   I21 (scripted only) a shell line made only of redirections asks first: denied, the file outside the workdir is untouched
  *   I22 (scripted only) an approved fetch doesn't follow a redirect to another site; one on the approved site is followed
+ *   I23 (scripted only) a subagent continued by its id after the provider was rebuilt: its request reaches the gate, the turn ends
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -767,5 +768,32 @@ describe("opencode (real binary)", () => {
       internal.stop();
       site.stop();
     }
+  }, 180_000);
+
+  maybeScripted("I23 a subagent continued by its id after the provider was rebuilt: its request reaches the gate, the turn ends", async () => {
+    // opencode reuses the child session (the subagent tool's `sessionID`)
+    // and publishes no `session.created` for it.
+    const sessionId = `it-cont-${Math.random().toString(36).slice(2)}`;
+    const first = provider({ sessionId });
+    const sub = { agent: "general", description: "child work", prompt: '[[tool:shell {"command":"echo turn1-child"}]]' };
+    const events1 = await collect(first.runTurn(opts(`[[tool:subagent ${JSON.stringify(sub)}]]`)));
+    const child = (events1.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>).agentId;
+    await first.teardown();
+    // Rebuilt, as a model switch or a daemon restart does.
+    const p = provider({ sessionId, initialBackingId: first.backingSessionId });
+    const asked: string[] = [];
+    const gate: ToolApprovalFn = async (_t, _a, name, _input, _signal, agentId) => {
+      asked.push(agentId === child ? `${name}@child` : name);
+      return { behavior: "allow" };
+    };
+    const follow = { agent: "general", description: "follow up", sessionID: child, prompt: '[[tool:shell {"command":"echo turn2-child"}]]' };
+    const run = p.runTurn(opts(`[[tool:subagent ${JSON.stringify(follow)}]]`, { canUseTool: gate }));
+    const timer = setTimeout(() => void run.interrupt(), 25_000);
+    const events = await collect(run);
+    clearTimeout(timer);
+    expect(asked).toEqual(["Task", "Bash@child"]);
+    expect(done(events)?.stopReason).toBe("stop");
+    expect(events.some((e) => e.type === "subagent_stop" && e.agentId === child)).toBe(true);
+    await p.teardown();
   }, 180_000);
 });

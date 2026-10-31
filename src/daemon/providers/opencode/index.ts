@@ -104,6 +104,8 @@ const WAKE_GRACE_MS = 300;
 const COMMAND_START_MS = 1_500;
 /** A turn's messages read back after a feed gap — far more than one turn writes. */
 const RECONCILE_PAGES = 20;
+/** Events naming a session the provider doesn't know that make it look the session up: a child starting or asking. */
+const LEARN_CHILD_ON = new Set(["session.execution.started", "permission.asked", "form.created"]);
 /** Ids remembered across turns (settled calls, counted steps): far more than a feed can lag by. */
 const REMEMBERED = 4_096;
 /**
@@ -344,6 +346,13 @@ export class OpencodeProvider implements SessionProvider {
   #streamingReadBack = new Set<string>();
   #blockIndex = new Map<string, number>();
   #children = new Map<string, Child>();
+  /**
+   * Sessions being looked up (#whenChild): what arrives for one meanwhile
+   * waits, in order, until it's known whether it is a child of this one.
+   */
+  #learning = new Map<string, Array<(child: Child) => void>>();
+  /** Sessions on the shared server known not to be this one's children (other sessions', theirs). */
+  #notChildren = new Set<string>();
   /**
    * Approved fetches still running, per opencode session: call key → the
    * origin its redirects may stay on. While any runs, the session's rules
@@ -909,6 +918,7 @@ export class OpencodeProvider implements SessionProvider {
     this.#sentInstructions = null;
     this.#sessionModel = null;
     this.#children.clear();
+    this.#learning.clear();
   }
 
   #detachServer(): void {
@@ -1400,7 +1410,14 @@ export class OpencodeProvider implements SessionProvider {
     if (!sid) return;
     const own = sid === ses;
     const child = this.#children.get(sid);
-    if (!own && !child) return;
+    if (!own && !child) {
+      // A child this provider never saw created: one a subagent call
+      // continues by its id after the provider was rebuilt (opencode reuses
+      // the session, announcing nothing). Unanswered, its requests would
+      // block its parent's turn. Learned when it starts or asks.
+      if (this.#learning.has(sid) || LEARN_CHILD_ON.has(ev.type)) this.#whenChild(sid, () => this.#onLive(ev));
+      return;
+    }
     switch (ev.type) {
       case "session.text.delta": {
         if (!own || !this.#turn) return;
@@ -1442,6 +1459,8 @@ export class OpencodeProvider implements SessionProvider {
         if (!child.running) {
           child.running = true;
           this.#emit({ type: "subagent_start", agentId: sid, agentType: child.agentType });
+          // A background subagent continued: background work again.
+          if (child.background) this.#emitBackgroundLevel();
         }
         return;
       // A failed step is billed too (interrupted after the model answered).
@@ -1497,6 +1516,51 @@ export class OpencodeProvider implements SessionProvider {
     // (policy.ts) is what guarantees it, this is belt and braces.
     void this.#conn?.client.updateSession(id, { permissions: this.#rulesFor(id) }).catch(() => {});
     this.#emit({ type: "subagent_start", agentId: id, agentType: child.agentType });
+  }
+
+  /**
+   * Run `then` on session `sid`'s child record: now if it's known, else once
+   * it's been looked up and found to be a child of this session (never, if
+   * it isn't one). What waits on a lookup runs in the order it came.
+   */
+  #whenChild(sid: string, then: (child: Child) => void): void {
+    const known = this.#children.get(sid);
+    if (known) {
+      then(known);
+      return;
+    }
+    const waiting = this.#learning.get(sid);
+    if (waiting) {
+      waiting.push(then);
+      return;
+    }
+    const conn = this.#conn;
+    const ses = this.#ses;
+    if (!conn || !ses || this.#notChildren.has(sid)) return;
+    this.#learning.set(sid, [then]);
+    void conn.client.getSession(sid).then(
+      (info) => {
+        const queued = this.#learning.get(sid) ?? [];
+        this.#learning.delete(sid);
+        if (conn !== this.#conn || ses !== this.#ses) return;
+        if (info.parentID !== ses) {
+          remember(this.#notChildren, sid);
+          return;
+        }
+        let child = this.#children.get(sid);
+        if (!child) {
+          child = { agentType: info.agent ?? "subagent", title: info.title || "subagent", background: false, running: false };
+          this.#children.set(sid, child);
+          void conn.client.updateSession(sid, { permissions: this.#rulesFor(sid) }).catch(() => {});
+        }
+        for (const run of queued) run(child);
+      },
+      (err: unknown) => {
+        // Unknown still: what it asks stays unanswered (never allowed). The next event asks again.
+        this.#learning.delete(sid);
+        console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] couldn't look up opencode session ${sid}: ${err instanceof Error ? err.message : String(err)}`);
+      },
+    );
   }
 
   #backgroundLevel(): Array<{ id: string; kind: string; description: string; status: string }> {
@@ -1619,11 +1683,10 @@ export class OpencodeProvider implements SessionProvider {
     const metadata = d.metadata as Record<string, unknown> | undefined;
     if (!child && call?.name === "subagent" && metadata?.status === "running" && typeof metadata.sessionID === "string") {
       // A background subagent: it outlives this call.
-      const bg = this.#children.get(metadata.sessionID);
-      if (bg) {
+      this.#whenChild(metadata.sessionID, (bg) => {
         bg.background = true;
         this.#emitBackgroundLevel();
-      }
+      });
     }
     this.#emit({
       type: "tool_complete",
@@ -2070,6 +2133,7 @@ export class OpencodeProvider implements SessionProvider {
     this.#appliedSelection = null;
     this.#executing = false;
     this.#children.clear();
+    this.#learning.clear();
     // The next attach sets each session's rules again.
     this.#fences.clear();
     if (hadBackground) this.#emitBackgroundLevel();
@@ -2131,6 +2195,7 @@ export class OpencodeProvider implements SessionProvider {
     this.#workdir = null;
     this.#executing = false;
     this.#children.clear();
+    this.#learning.clear();
     this.#fences.clear();
     this.#appliedSelection = null;
     this.#agentApplied = false;

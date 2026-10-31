@@ -991,6 +991,77 @@ describe("opencode subagents", () => {
     // The child's spend and the first prompt's title (billed after that turn ended), carried.
     expect(done(follow)!.totalCostUsd).toBeCloseTo(0.0123 + 0.5 + 0.0007, 6);
   });
+
+  /** A turn that an unanswered request would hang: interrupted after `ms`, so the test reads "interrupted", not a timeout. */
+  async function bounded(run: TurnRun, ms = 4_000): Promise<ProviderEvent[]> {
+    const timer = setTimeout(() => void run.interrupt(), ms);
+    try {
+      return await collect(run);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  it("a subagent continued by its id after the provider was rebuilt is learned: asked, shown, counted", async () => {
+    // opencode reuses the child session and announces nothing; a rebuilt
+    // provider (a model switch, a daemon restart) never saw it created.
+    const { server } = makeServer();
+    const first = makeProvider(server);
+    const events1 = await collect(first.runTurn(opts("subagent")));
+    const child = (events1.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>).agentId;
+    await first.teardown();
+    const p = makeProvider(server, { initialBackingId: first.backingSessionId });
+    const asks: Array<[string, string | undefined]> = [];
+    const events = await bounded(p.runTurn(opts(`subagent continue:${child}`, { canUseTool: allowing((name, _input, agentId) => asks.push([name, agentId])) })));
+    expect(done(events)?.stopReason).toBe("stop");
+    expect(asks).toEqual([
+      ["Task", undefined],
+      ["Bash", child],
+    ]);
+    expect(events.some((e) => e.type === "subagent_start" && e.agentId === child)).toBe(true);
+    expect(events.some((e) => e.type === "subagent_stop" && e.agentId === child)).toBe(true);
+    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.5, 6);
+  });
+
+  it("a background subagent continued after a rebuild is background work again, and settles", async () => {
+    const { server } = makeServer();
+    const first = makeProvider(server);
+    const events1 = await collect(first.runTurn(opts("subagent")));
+    const child = (events1.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>).agentId;
+    await first.teardown();
+    const p = makeProvider(server, { initialBackingId: first.backingSessionId });
+    const levels: unknown[] = [];
+    const settled: string[] = [];
+    p.onSessionEvent = (e) => {
+      if (e.type === "background_tasks") levels.push(e.tasks);
+      if (e.type === "background_task_settled") settled.push(e.taskId);
+    };
+    const asks: string[] = [];
+    await bounded(p.runTurn(opts(`background continue:${child}`, { canUseTool: allowing((name, _input, agentId) => asks.push(agentId ? `${name}@child` : name)) })));
+    for (let i = 0; i < 100 && settled.length === 0; i++) await Bun.sleep(20);
+    expect(asks).toEqual(["Task", "Bash@child"]);
+    expect(levels).toContainEqual([{ id: child, kind: "subagent", description: "look around", status: "running" }]);
+    expect(settled).toEqual([child]);
+    expect(levels.at(-1)).toEqual([]);
+    await p.teardown();
+  });
+
+  it("another session's executions and requests on the shared server are looked up once, and left alone", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hi")));
+    const other = makeProvider(server, { sessionId: "sess-other", initialBackingId: "sess-other" });
+    const asks: string[] = [];
+    p.onSessionEvent = () => {};
+    for (let i = 0; i < 2; i++) await collect(other.runTurn(opts("use-shell", { canUseTool: allowing((name) => asks.push(name)) })));
+    expect(asks).toEqual(["Bash", "Bash"]);
+    const st = await fakeState(server);
+    // `p` answered none of it, and read the other session once (to learn it isn't a child of its own).
+    expect(st.replies).toHaveLength(2);
+    expect(st.requests.filter((r: string) => r === `GET /api/session/${other.backingSessionId}`)).toHaveLength(1);
+    await other.teardown();
+    await p.teardown();
+  });
 });
 
 // ── O11 questions ────────────────────────────────────────────────────────────
