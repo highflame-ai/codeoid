@@ -50,6 +50,7 @@ import {
   createRegistry,
 } from "./compress/index.js";
 import { createHookBus } from "./hooks/bus.js";
+import { stopOpencodeServers } from "./providers/opencode/server.js";
 import type { CodeoidConfig, McpControlConfig } from "../config.js";
 import { CAPABILITIES, PROTOCOL_VERSION, type AuthContext, type DaemonMessage } from "../protocol/types.js";
 import { parseAuthMsg, parseClientMessage } from "@highflame/codeoid-protocol/schemas";
@@ -389,6 +390,9 @@ export class DaemonServer {
       this.#mcpHub?.closeAll();
     });
     this.#shutdown.register("store", () => this.#store.close());
+    // The shared opencode server outlives any one session; it stops once
+    // they have drained (LIFO: registered before "sessions", runs after it).
+    this.#shutdown.register("opencode", () => stopOpencodeServers());
     this.#shutdown.register("sessions", () => this.#manager.drain(10_000));
     // LIFO: registered after sessions → stops BEFORE the drain, so the
     // dispatcher can't claim new work or inject events into draining sessions.

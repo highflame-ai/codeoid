@@ -165,8 +165,10 @@ export function roleDeniesTool(role: ToolRole, toolName: string): string | null 
  *  tool names this file keys off. Other backends use their own tool names, skip
  *  canUseTool in autonomous mode (codex), or expose no write tools — so a role
  *  there is ADVISORY: the constitution + role-contract system prompt guide the
- *  model, but nothing hard-denies. See docs/pipeline-run.md (enforcement matrix). */
-const HARD_ROLE_ENFORCEMENT = new Set(["claude"]);
+ *  model, but nothing hard-denies. See docs/pipeline-run.md (enforcement matrix).
+ *  opencode asks codeoid about every action in every mode, under these names
+ *  (opencode/translate.ts), so a role is enforced there too. */
+const HARD_ROLE_ENFORCEMENT = new Set(["claude", "opencode"]);
 
 /** Whether the capability-role tool gate is HARD-enforced on `providerId`, or
  *  only ADVISORY (soft, prompt-contract-only). */

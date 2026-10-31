@@ -73,7 +73,7 @@ export class Codeoid {
         session: { defaultProvider: "scripted" },
         memory: { enabled: false },
         workspaceIndex: { enabled: false },
-        providers: { pi: { enabled: false }, codex: { enabled: false }, geminiCli: { enabled: false }, qwen: { enabled: false } },
+        providers: { pi: { enabled: false }, codex: { enabled: false }, geminiCli: { enabled: false }, qwen: { enabled: false }, opencode: { enabled: false } },
       }),
     );
     c.initRepo(c.workdir);
