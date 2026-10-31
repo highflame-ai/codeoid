@@ -100,6 +100,8 @@ const INTERRUPT_SETTLE_MS = 5_000;
 /** At teardown, how long to wait for the stopped subagents to end, and then for opencode to wake their parent. */
 const TEARDOWN_SETTLE_MS = 1_500;
 const WAKE_GRACE_MS = 300;
+/** After an execution ends with a `later` message still queued, how long to wait for the one opencode runs it in. */
+const QUEUED_START_MS = 3_000;
 /** After a slash command, how long to wait for it to start an execution. */
 const COMMAND_START_MS = 1_500;
 /** A turn's messages read back after a feed gap — far more than one turn writes. */
@@ -586,7 +588,10 @@ export class OpencodeProvider implements SessionProvider {
   /** A message sent while the turn runs: steer it now (`now`/`next`), or queue it behind (`later`). */
   async #push(turn: Turn, content: string, priority: "now" | "next" | "later"): Promise<void> {
     if (priority === "later") {
-      await this.#send(turn, content, "queue");
+      // The execution's end waits for the request: whether opencode queued it decides whether the turn goes on.
+      const queued = this.#send(turn, content, "queue");
+      this.#settling(turn, queued);
+      await queued;
       return;
     }
     // Owed from the moment Session counts it: its delivery can beat the
@@ -1266,6 +1271,17 @@ export class OpencodeProvider implements SessionProvider {
       // absorbs it); the turn waits for the next execution.
       this.#payBoundary(turn);
       turn.started = false;
+      return;
+    }
+    if (turn.queued.size > 0 && outcome === "succeeded" && !turn.interrupted) {
+      // A `later` message queued after the last step: opencode runs it next,
+      // in an execution of its own — still this turn (Session merged it in,
+      // and absorbs no boundary for it). Bounded, in case opencode drops it.
+      turn.started = false;
+      const executions = turn.executions;
+      setTimeout(() => {
+        if (this.#turn === turn && !turn.queue.closed && !turn.started && turn.executions === executions) this.#finishTurn(turn, outcome, error);
+      }, QUEUED_START_MS).unref?.();
       return;
     }
     this.#finishTurn(turn, outcome, error);

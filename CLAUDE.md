@@ -383,7 +383,8 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   Session one absorbed `turn_done` (paid at the steer's
   `session.inbox.delivered`, when its request answers if delivery came first,
   or — refused — just before the turn's last `turn_done`); `later` is
-  delivered inside the running execution. A user interrupt withdraws the
+  delivered inside the running execution (one queued after its last step
+  runs in the next execution, which the turn waits for). A user interrupt withdraws the
   turn's undelivered inputs from opencode's inbox.
 - **Code Mode** (`execute`) and opencode's `browser` tools are hidden by deny
   rules: on 2.2.2 a Code Mode script's `fetch` runs without asking.

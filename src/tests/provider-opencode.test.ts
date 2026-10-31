@@ -1286,6 +1286,34 @@ describe("opencode mid-turn messages", () => {
     expect(adopted).toBe(0);
     await p.teardown();
   });
+
+  it("a later message queued as the execution ends is answered in the same turn, which ends once", async () => {
+    // Real 2.2.x takes a queued input only between steps: one that lands
+    // after the last step runs in an execution of its own, right after.
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    let adopted = 0;
+    p.onSessionEvent = (e) => {
+      if (e.type === "turn_started") adopted++;
+    };
+    const run = p.runTurn(opts("hi"));
+    const events: ProviderEvent[] = [];
+    let pushed = false;
+    for await (const e of run.events) {
+      events.push(e);
+      if (!pushed && e.type === "text_done") {
+        pushed = true;
+        run.pushMidTurn?.("again", "later");
+      }
+      if (e.type === "turn_done" || e.type === "error") break;
+    }
+    expect(texts(events, "text_done")).toEqual(["Hello, world", "Hello, world"]);
+    expect(events.filter((e) => e.type === "turn_done")).toHaveLength(1);
+    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.0007, 6);
+    await Bun.sleep(300);
+    expect(adopted).toBe(0);
+    await p.teardown();
+  });
 });
 
 // ── commands, fork ───────────────────────────────────────────────────────────

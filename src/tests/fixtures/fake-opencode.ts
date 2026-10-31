@@ -17,7 +17,8 @@
  *     `follow=true` only heartbeats.
  * Like the real server, a session's first prompt also bills a title request
  * that no step reports (only the running total shows it, after the
- * execution ends), a queued input runs inside the running execution, a bare
+ * execution ends), a queued input runs inside the running execution (one
+ * queued after its last step ended runs next, in one of its own), a bare
  * reject interrupts the execution, a child session inherits its parent's
  * rules, and a background child's result resumes the parent through a
  * synthetic inbox item (a stopped one's too). An input still in the inbox
@@ -895,6 +896,9 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
   return "succeeded";
 }
 
+/** Between an execution's last step and its end. */
+const END_WINDOW_MS = 30;
+
 async function startExecution(ses: Ses, text: string, inboxID?: string): Promise<void> {
   ses.executing = true;
   ses.busy = Date.now();
@@ -917,6 +921,9 @@ async function startExecution(ses: Ses, text: string, inboxID?: string): Promise
     if (!(err instanceof Cancelled)) throw err;
     outcome = "interrupted";
   }
+  // As real 2.2.x: the last step has ended, the execution hasn't yet. An
+  // input queued from here on isn't taken by this execution; it runs next.
+  if (outcome === "succeeded" && !signal.cancelled) await sleep(END_WINDOW_MS);
   if (signal.cancelled && outcome !== "failed") outcome = "interrupted";
   ses.executing = false;
   ses.cancel = null;
@@ -933,8 +940,8 @@ async function startExecution(ses: Ses, text: string, inboxID?: string): Promise
     ses.titled = true;
     bill(ses, TITLE_COST, TITLE_TOKENS);
   }
-  // A steer that came after the last step runs next, in an execution of its own.
-  const steer = outcome === "succeeded" ? ses.inbox.findIndex((x) => x.delivery === "steer") : -1;
+  // A steer (or a queued input) that came after the last step runs next, in an execution of its own.
+  const steer = outcome === "succeeded" ? ses.inbox.findIndex((x) => x.delivery === "steer" || x.delivery === "queue") : -1;
   if (steer >= 0) {
     const [item] = ses.inbox.splice(steer, 1);
     ses.messages.push({ id: item!.id, type: "user", text: item!.text, time: { created: Date.now() } });
