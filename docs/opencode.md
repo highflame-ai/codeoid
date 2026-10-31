@@ -43,7 +43,7 @@
 | Streaming | Reply and thinking stream as opencode writes them; each block ends in the session's history, so forks, backend switches, rewinds and routine summaries see the reply. |
 | Tool cards and approvals | Every action opencode takes asks codeoid first (below). |
 | Stop | Stop interrupts opencode's execution. |
-| Resume | A daemon restart, or a server restart, resumes the opencode session by its id. If opencode lost it, the conversation continues from codeoid's history. |
+| Resume | A daemon restart, or a server restart, resumes the opencode session by its id. If opencode lost it, or it's deleted on the opencode server while in use (a turn running on it ends with an error), the conversation continues in a new one from codeoid's history. |
 | Fork, rewind | A fork at a turn opencode ran forks opencode's own session there (nothing lost, reasoning included). Otherwise — a turn from another backend, a rewound history — opencode gets a transcript. Files are codeoid's checkpoints, as on every backend. |
 | Models and effort | The picker lists opencode's models with a credential (`provider/model`), each with its context window; a model's reasoning variants named like codeoid's levels (`minimal` … `max`, `none` = Off) are its efforts. Model and effort are switched on the session before a prompt when they changed. |
 | Cost | opencode reports the dollar cost and tokens (input, output, reasoning, cache read and write) of every step. Each turn carries their sum, subagents' included, and the title opencode writes for a session's first prompt (billed without a step: codeoid takes it from opencode's running total), so spend caps count real spend, and a routine's cap stops the turn as the spend lands, not only between turns. |

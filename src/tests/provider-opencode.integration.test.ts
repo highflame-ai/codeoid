@@ -34,6 +34,7 @@
  *   I12 (scripted only) Code Mode is hidden: a script's fetch can't get past the gate (2.2.2 runs it unasked)
  *   I13 (scripted only) a model error opencode doesn't retry ends the turn promptly, with its status
  *   I14 (scripted only) the title opencode generates is billed, once
+ *   I15 a session deleted on the server while attached: the next turn goes on in a new one, from codeoid's history
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -139,6 +140,15 @@ function done(events: ProviderEvent[]) {
   const d = events.filter((e) => e.type === "turn_done");
   return d.length > 0 ? (d[d.length - 1] as Extract<ProviderEvent, { type: "turn_done" }>).result : undefined;
 }
+
+/** The server's own API, as codeoid's client authenticates to it (for what codeoid never does itself). */
+let serverAuth = "";
+const clientFetch = globalThis.fetch;
+globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+  const auth = (init?.headers as Record<string, string> | undefined)?.authorization;
+  if (auth) serverAuth = auth;
+  return clientFetch(input, init);
+}) as typeof fetch;
 
 function texts(events: ProviderEvent[]): string[] {
   return events.flatMap((e) => (e.type === "text_done" ? [e.content] : []));
@@ -413,6 +423,30 @@ describe("opencode (real binary)", () => {
     const info = await conn.client.getSession(p.backingSessionId);
     // Everything opencode billed this session, counted exactly once across the turns.
     expect(turns.reduce((a, b) => a + b, 0)).toBeCloseTo(info.cost ?? 0, 9);
+    await p.teardown();
+  }, 180_000);
+
+  maybeTurn("I15 a session deleted on the server while attached: the next turn goes on in a new one, from codeoid's history", async () => {
+    const p = provider();
+    let lost = 0;
+    p.onHistoryLost = () => {
+      lost++;
+      p.seedText("Earlier you said: one.");
+    };
+    await collect(p.runTurn(opts(ask("Reply: one", "[[text:one]]"))));
+    const gone = p.backingSessionId;
+    const conn = await server!.ensure();
+    const res = await fetch(`${conn.client.baseUrl}/api/session/${gone}`, { method: "DELETE", headers: { authorization: serverAuth } });
+    expect(res.status).toBe(204);
+    await Bun.sleep(300);
+    for (const word of ["two", "three"]) {
+      const events = await collect(p.runTurn(opts(ask(`Reply: ${word}`, `[[text:${word}]]`))));
+      expect(events.find((e) => e.type === "error")).toBeUndefined();
+      if (SCRIPTED) expect(texts(events)).toEqual([word]);
+    }
+    expect(lost).toBe(1);
+    expect(p.backingSessionId).not.toBe(gone);
+    expect(p.backingSessionId).toMatch(/^ses/);
     await p.teardown();
   }, 180_000);
 });

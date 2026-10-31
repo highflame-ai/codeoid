@@ -267,6 +267,53 @@ describe("opencode sessions", () => {
     expect(st.prompts.at(-1).text).toBe("PRIOR CONTEXT\n\necho-state");
   });
 
+  it("a session deleted while attached, unannounced, goes on in a new one from codeoid's history", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    let lost = 0;
+    // As Session does: the history is handed over at once.
+    p.onHistoryLost = () => {
+      lost++;
+      p.seedText("PRIOR CONTEXT");
+    };
+    await collect(p.runTurn(opts("hi")));
+    const gone = p.backingSessionId;
+    const conn = await server.ensure();
+    await fetch(`${conn.client.baseUrl}/__fake/delete/${gone}?quiet=1`, { method: "POST" });
+    const events = await collect(p.runTurn(opts("echo-state")));
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    expect(lost).toBe(1);
+    expect(p.backingSessionId).not.toBe(gone);
+    expect(p.backingSessionId.startsWith("ses_")).toBe(true);
+    const st = await fakeState(server);
+    expect(st.prompts.at(-1)).toMatchObject({ sessionID: p.backingSessionId, text: "PRIOR CONTEXT\n\necho-state" });
+    await p.teardown();
+  });
+
+  it("a session deleted under a running turn ends it; the next turn goes on in a new one", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    let lost = 0;
+    p.onHistoryLost = () => lost++;
+    const run = p.runTurn(opts("slow"));
+    const events: ProviderEvent[] = [];
+    const conn = await server.ensure();
+    for await (const e of run.events) {
+      events.push(e);
+      if (e.type === "llm_call" && events.filter((x) => x.type === "llm_call").length === 1) {
+        void fetch(`${conn.client.baseUrl}/__fake/delete/${p.backingSessionId}`, { method: "POST" });
+      }
+      if (e.type === "turn_done" || e.type === "error") break;
+    }
+    expect(events.at(-1)).toMatchObject({ type: "error", message: expect.stringContaining("deleted") });
+    const gone = p.backingSessionId;
+    const next = await collect(p.runTurn(opts("hi")));
+    expect(texts(next, "text_done")).toEqual(["Hello, world"]);
+    expect(lost).toBe(1);
+    expect(p.backingSessionId).not.toBe(gone);
+    await p.teardown();
+  });
+
   it("delivers systemPromptAppend once, as a synthetic message", async () => {
     const { server } = makeServer();
     const p = makeProvider(server);

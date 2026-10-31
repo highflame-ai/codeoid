@@ -456,6 +456,21 @@ export class OpencodeProvider implements SessionProvider {
     const stale = () => this.#turn !== turn || turn.interrupted;
     const conn = await this.#server.ensure();
     if (stale()) return;
+    try {
+      await this.#post(conn, turn, opts, stale);
+    } catch (err) {
+      if (!sessionGone(err) || stale()) throw err;
+      // Deleted on the server while attached (pruned, or through opencode's
+      // own API) and the feed didn't say so: the turn goes to a new session,
+      // which continues from codeoid's history (#openSession).
+      console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] opencode session ${this.#ses} is gone — continuing in a new one`);
+      this.#detachSession();
+      await this.#post(conn, turn, opts, stale);
+    }
+  }
+
+  /** Attach, switch what changed, and post the turn's prompt (or command). */
+  async #post(conn: OpencodeConnection, turn: Turn, opts: TurnOpts, stale: () => boolean): Promise<void> {
     const ses = await this.#attach(conn, opts.workdir);
     if (stale()) return;
     await this.#applySelection(conn, ses, opts);
@@ -998,6 +1013,16 @@ export class OpencodeProvider implements SessionProvider {
         const id = String(d.inboxID ?? "");
         turn.delivered.add(id);
         if (turn.steers.delete(id) && turn.owed > 0) this.#payBoundary(turn);
+        return;
+      }
+      case "session.deleted": {
+        // Deleted on the server (pruned, or through opencode's own API): a
+        // turn on it ends, and the next one continues in a new session from
+        // codeoid's history (#openSession).
+        const turn = this.#turn;
+        console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] opencode session ${this.#ses} was deleted`);
+        this.#detachSession();
+        if (turn) this.#failTurn(turn, "opencode: its session was deleted on the opencode server");
         return;
       }
       case "session.step.started": {
@@ -1717,6 +1742,11 @@ function remote(url: string, token: string | undefined): Record<string, unknown>
 /** The permission action a tool asks under (for a call recorded without a request). */
 function actionOfTool(name: string): string {
   return name === "write" || name === "patch" ? "edit" : name;
+}
+
+/** A request about a session opencode no longer has. */
+function sessionGone(err: unknown): boolean {
+  return err instanceof OpencodeHttpError && err.status === 404 && err.tag === "SessionNotFoundError";
 }
 
 /** A field's `when` conditions against the answers so far (all must hold). */

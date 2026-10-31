@@ -38,6 +38,7 @@ import { opencodeVersionProblem } from "./resolve.js";
  */
 export const LIVE_EVENT_TYPES = [
   "session.created",
+  "session.deleted",
   "session.execution.started",
   "session.execution.succeeded",
   "session.execution.failed",

@@ -55,7 +55,8 @@
  * FAKE_OPENCODE_STEER_REPLY_MS (answer a steer's prompt request that long
  * after taking it, so its delivery comes first), FAKE_OPENCODE_SLOW_SYNTHETIC_MS
  * (answer a synthetic input that late).
- * `GET /__fake/state` (test-only, no auth) returns everything recorded.
+ * `GET /__fake/state` (test-only, no auth) returns everything recorded;
+ * `POST /__fake/delete/<id>[?quiet=1]` deletes a session (quiet: no event).
  */
 
 import { appendFileSync } from "node:fs";
@@ -647,6 +648,13 @@ function createSession(input: { directory: string; permissions?: Json[]; agent?:
   return ses;
 }
 
+/** As the real one: a running execution stops, and a durable `session.deleted` is published. */
+function deleteSession(ses: Ses, quiet: boolean): void {
+  ses.cancel?.();
+  sessions.delete(ses.id);
+  if (!quiet) durable(ses, "session.deleted", {});
+}
+
 function info(ses: Ses): Json {
   return {
     id: ses.id,
@@ -705,6 +713,13 @@ const server = Bun.serve({
     const method = req.method;
     state.requests.push(`${method} ${path}`);
     // Test-only, so tests can read it without the per-start password.
+    // Test-only: delete a session as opencode's API (or a pruned database) would; `?quiet=1` as if the feed missed it.
+    const del = /^\/__fake\/delete\/([^/]+)$/.exec(path);
+    if (del) {
+      const target = sessions.get(del[1]!);
+      if (target) deleteSession(target, url.searchParams.get("quiet") === "1");
+      return new Response(null, { status: target ? 204 : 404 });
+    }
     if (path === "/__fake/state") return json({ ...state, sessions: [...sessions.values()].map(info), mounts: Object.fromEntries([...mounts].map(([d, m]) => [d, [...m.keys()]])) });
     // Every route needs the password, /api/info too (real 2.2.x answers 401 without it).
     if (!authorized(req)) return json({ _tag: "UnauthorizedError", message: "Authentication required" }, 401);
@@ -781,6 +796,10 @@ const server = Bun.serve({
     if (!ses) return notFound("SessionNotFoundError", `Session not found: ${m[1]}`);
     const rest = m[2] ?? "";
     if (rest === "" && method === "GET") return json({ data: info(ses) });
+    if (rest === "" && method === "DELETE") {
+      deleteSession(ses, false);
+      return new Response(null, { status: 204 });
+    }
     if (rest === "" && method === "PATCH") {
       if (Array.isArray(body.permissions)) ses.permissions = body.permissions as Json[];
       state.patches.push({ sessionID: ses.id, ...body });
