@@ -715,6 +715,31 @@ describe("opencode mid-turn messages", () => {
     expect(st.prompts.at(-1)).toMatchObject({ text: "also this", delivery: "steer" });
   });
 
+  it("a steer delivered and answered before its request returns still ends the turn", async () => {
+    // The feed can beat the prompt reply: opencode takes the steer at the
+    // step boundary and answers it in the same execution.
+    const { server } = makeServer({ FAKE_OPENCODE_STEER_REPLY_MS: "400" });
+    const run = makeProvider(server).runTurn(opts("steer"));
+    const events: ProviderEvent[] = [];
+    let pushed = false;
+    let dones = 0;
+    const reader = (async () => {
+      for await (const e of run.events) {
+        events.push(e);
+        if (!pushed && e.type === "text_done") {
+          pushed = true;
+          run.pushMidTurn?.("also this", "now");
+        }
+        if (e.type === "turn_done" && ++dones === 2) break;
+        if (e.type === "error") break;
+      }
+    })();
+    await Promise.race([reader, Bun.sleep(5_000)]);
+    const doneEvents = events.filter((e) => e.type === "turn_done") as Array<Extract<ProviderEvent, { type: "turn_done" }>>;
+    expect(doneEvents.map((d) => d.result.stopReason)).toEqual(["steered", "stop"]);
+    expect(texts(events, "text_done")).toEqual(["first part", "steered: also this (steer)"]);
+  });
+
   it("a later message is queued behind the turn", async () => {
     const { server } = makeServer();
     const p = makeProvider(server);

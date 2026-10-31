@@ -168,6 +168,12 @@ interface Turn {
   owed: number;
   /** Inbox ids of those steers, to pay at their delivery. */
   steers: Set<string>;
+  /** Steers whose request hasn't answered yet: opencode can take one before codeoid learns its id. */
+  inflight: Set<Promise<void>>;
+  /** Inbox ids opencode delivered while this turn ran. */
+  delivered: Set<string>;
+  /** Executions started in this turn: an end decided late is moot once another began. */
+  executions: number;
   usage: Usage;
   /** The user message this turn's prompt became (`prompt`'s inbox id), where its messages start. */
   promptId?: string;
@@ -391,6 +397,9 @@ export class OpencodeProvider implements SessionProvider {
       started: false,
       owed: 0,
       steers: new Set(),
+      inflight: new Set(),
+      delivered: new Set(),
+      executions: 0,
       usage: emptyUsage(),
       budgetStopped: false,
       interrupted: false,
@@ -486,11 +495,28 @@ export class OpencodeProvider implements SessionProvider {
     }
     // Owed before the request goes out: its delivery can beat the reply.
     turn.owed++;
-    const item = await conn.client.prompt(ses, { text: content, delivery: "steer" }).catch((err: unknown) => {
-      turn.owed = Math.max(0, turn.owed - 1);
-      throw err;
-    });
-    if (this.#turn === turn) turn.steers.add(item.id);
+    const sent = conn.client.prompt(ses, { text: content, delivery: "steer" }).then(
+      (item) => {
+        if (this.#turn !== turn) return;
+        // Delivered before its id came back: its boundary is due now.
+        if (turn.delivered.has(item.id)) {
+          if (turn.owed > 0) this.#payBoundary(turn);
+        } else {
+          turn.steers.add(item.id);
+        }
+      },
+      (err: unknown) => {
+        turn.owed = Math.max(0, turn.owed - 1);
+        throw err;
+      },
+    );
+    const settled = sent.then(
+      () => {},
+      () => {},
+    );
+    turn.inflight.add(settled);
+    void settled.then(() => turn.inflight.delete(settled));
+    await sent;
   }
 
   async #interrupt(turn: Turn): Promise<void> {
@@ -943,6 +969,7 @@ export class OpencodeProvider implements SessionProvider {
         const turn = this.#turn;
         if (turn) {
           turn.started = true;
+          turn.executions++;
           return;
         }
         this.#adoptTurn();
@@ -953,6 +980,7 @@ export class OpencodeProvider implements SessionProvider {
         if (!turn) return;
         turn.started = true;
         const id = String(d.inboxID ?? "");
+        turn.delivered.add(id);
         if (turn.steers.delete(id) && turn.owed > 0) this.#payBoundary(turn);
         return;
       }
@@ -1042,19 +1070,33 @@ export class OpencodeProvider implements SessionProvider {
         this.#executing = false;
         const turn = this.#turn;
         if (!turn || !turn.started) return;
-        if (turn.owed > 0) {
-          // The steered input arrived after the last step: opencode runs it
-          // next. This execution's part of the turn ends here (Session
-          // absorbs it); the turn waits for the next execution.
-          this.#payBoundary(turn);
-          turn.started = false;
-          return;
-        }
         const outcome = ev.type === "session.execution.succeeded" ? "succeeded" : ev.type === "session.execution.failed" ? "failed" : "interrupted";
-        this.#finishTurn(turn, outcome, outcome === "failed" ? (d.error as OcError) : undefined);
+        this.#executionEnded(turn, outcome, outcome === "failed" ? (d.error as OcError) : undefined);
         return;
       }
     }
+  }
+
+  /** The execution the turn waits on ended: so does the turn, unless a steer is still to run in another. */
+  #executionEnded(turn: Turn, outcome: "succeeded" | "interrupted" | "failed", error: OcError | undefined): void {
+    if (turn.inflight.size > 0) {
+      // A steer's request hasn't answered: whether opencode took it in this
+      // execution (its delivery can come first) decides what comes next.
+      const executions = turn.executions;
+      void Promise.all([...turn.inflight]).then(() => {
+        if (this.#turn === turn && !turn.queue.closed && turn.executions === executions) this.#executionEnded(turn, outcome, error);
+      });
+      return;
+    }
+    if (turn.owed > 0) {
+      // The steered input arrived after the last step: opencode runs it
+      // next. This execution's part of the turn ends here (Session
+      // absorbs it); the turn waits for the next execution.
+      this.#payBoundary(turn);
+      turn.started = false;
+      return;
+    }
+    this.#finishTurn(turn, outcome, error);
   }
 
   /** Session absorbs one `turn_done` per steer: the part of the reply before the steered message was taken. */
@@ -1075,6 +1117,9 @@ export class OpencodeProvider implements SessionProvider {
       started: true,
       owed: 0,
       steers: new Set(),
+      inflight: new Set(),
+      delivered: new Set(),
+      executions: 1,
       usage: emptyUsage(),
       budgetStopped: false,
       interrupted: false,

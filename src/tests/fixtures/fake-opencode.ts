@@ -51,7 +51,9 @@
  * Knobs (env): FAKE_OPENCODE_VERSION (default 2.2.2), FAKE_OPENCODE_STARTS
  * (append a line per start), FAKE_OPENCODE_UNSAFE_AGENT=1 (an `explore`
  * subagent that allows shell unless overridden), FAKE_OPENCODE_STUBBORN=1
- * (ignore agent overrides), FAKE_OPENCODE_SAVED=1 (one saved "always" rule).
+ * (ignore agent overrides), FAKE_OPENCODE_SAVED=1 (one saved "always" rule),
+ * FAKE_OPENCODE_STEER_REPLY_MS (answer a steer's prompt request that long
+ * after taking it, so its delivery comes first).
  * `GET /__fake/state` (test-only, no auth) returns everything recorded.
  */
 
@@ -814,8 +816,11 @@ const server = Bun.serve({
       state.prompts.push({ sessionID: ses.id, id, ...body });
       ses.messages.push({ id, type: "user", text, time: { created: Date.now() } });
       durable(ses, "session.inbox.enqueued", { inboxID: id, item: { type: "user", payload: { text }, delivery } });
-      if (ses.executing) ses.inbox.push({ id, text, delivery });
-      else setTimeout(() => void startExecution(ses, text, id), 5);
+      if (ses.executing) {
+        ses.inbox.push({ id, text, delivery });
+        // The reply can lag the steer's delivery (FAKE_OPENCODE_STEER_REPLY_MS): opencode takes it at the next step boundary.
+        if (delivery === "steer" && process.env.FAKE_OPENCODE_STEER_REPLY_MS) await sleep(Number(process.env.FAKE_OPENCODE_STEER_REPLY_MS));
+      } else setTimeout(() => void startExecution(ses, text, id), 5);
       return json({ data: { id, sessionID: ses.id, type: "user", payload: { text }, delivery, time: { created: Date.now() } } });
     }
     if (rest === "/command" && method === "POST") {
