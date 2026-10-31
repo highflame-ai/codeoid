@@ -35,6 +35,12 @@
  *   "ask-user"     → a question form; answers echoed back
  *   "subagent"     → foreground subagent in a child session (with a cost)
  *   "subagent-fail" → its child's step fails after the model answered (billed)
+ *   "subagent-gapstart" → the child is created, starts and asks in a feed gap
+ *   "subagent-gapend" → the feed drops once the child's call is approved, over
+ *                    the rest of the child's run; back while the parent runs
+ *   "background-gap" → a background child whose call is approved, then the
+ *                    feed drops over the rest of its run and the parent's
+ *                    follow-up execution, and is back after both ended
  *   "background"   → background subagent; opencode resumes the parent itself
  *   "slow"         → keeps stepping until interrupted
  *   "steer"        → waits for a steered input, then answers it
@@ -118,6 +124,7 @@ interface Ses {
   outcome?: string;
   busy?: number;
   idle?: number;
+  created: number;
 }
 
 const state = {
@@ -509,20 +516,36 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
       endStep(ses, msg);
       return "succeeded";
     }
+    // "subagent-gapstart": the child is created, starts and asks in a feed gap.
+    if (text.includes("subagent-gapstart")) setTimeout(dropFeed(), 400);
     const child = createSession({ parentID: ses.id, directory: ses.directory, title: "look around", agent: "explore" });
     await sleep(20);
-    const runChild = async () => {
+    // "subagent-gapend" / "background-gap": the feed drops once the child's call is approved,
+    // over the rest of the child's run (and, for a background one, the parent's follow-up).
+    const gap: { up?: () => void } = {};
+    const gapEnd =
+      text.includes("subagent-gapend") || text.includes("background-gap")
+        ? () => {
+            gap.up = dropFeed();
+          }
+        : undefined;
+    const runChild = async (afterReply?: () => void) => {
+      child.busy = Date.now();
       durable(child, "session.execution.started", {});
       const cm = step(child);
       if (text.includes("subagent-fail")) {
         // Billed although it failed: the model answered before the step did.
         durable(child, "session.step.failed", { assistantMessageID: cm, error: { type: "aborted", message: "Step interrupted" }, cost: 0.25, tokens: TOKENS });
         durable(child, "session.execution.failed", { error: { type: "aborted", message: "Step interrupted" } });
+        child.idle = Date.now();
+        child.outcome = "failed";
         return false;
       }
       // The child asks too, under its own session id.
-      const cr = await toolCall(child, cm, "shell", { command: "grep -r auth ." }, { action: "shell", resources: ["grep -r auth ."] });
+      const cr = await toolCall(child, cm, "shell", { command: "grep -r auth ." }, { action: "shell", resources: ["grep -r auth ."] }, afterReply);
       endStep(child, cm, 0.5);
+      child.idle = Date.now();
+      child.outcome = "succeeded";
       durable(child, "session.execution.succeeded", {});
       return cr.ok;
     };
@@ -534,18 +557,26 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
       endStep(ses, msg2);
       void (async () => {
         await sleep(150);
-        await runChild();
+        await runChild(gapEnd);
         // opencode notifies the parent itself (a synthetic inbox item) and runs its main agent.
         await sleep(50);
         const inboxID = nextId("msg");
         durable(ses, "session.inbox.enqueued", { inboxID, item: { type: "synthetic", payload: { text: "<subagent>…</subagent>", metadata: { source: "subagent", childID: child.id, state: "completed" } }, delivery: "steer" } });
         await startExecution(ses, "__background-result", inboxID);
+        gap.up?.();
       })();
       return "succeeded";
     }
-    const ok = await runChild();
-    durable(ses, "session.tool.success", { assistantMessageID: msg, id: call, content: [{ type: "text", text: ok ? "found it" : "child refused" }], metadata: { sessionID: child.id, status: "completed" }, executed: true });
+    const ok = await runChild(gapEnd);
+    const block = { type: "tool", id: call, name: "subagent", state: { status: "completed", input: {}, content: [{ type: "text", text: ok ? "found it" : "child refused" }], metadata: { sessionID: child.id, status: "completed" } } };
+    ses.messages.find((x) => x.id === msg)?.content?.push(block);
+    durable(ses, "session.tool.success", { assistantMessageID: msg, id: call, content: block.state.content, metadata: block.state.metadata, executed: true });
     endStep(ses, msg);
+    if (gap.up) {
+      // Back while the parent still runs.
+      gap.up();
+      await sleep(600);
+    }
     const msg2 = step(ses);
     await say(ses, msg2, "subagent done");
     endStep(ses, msg2);
@@ -828,6 +859,7 @@ function createSession(input: { directory: string; permissions?: Json[]; agent?:
     inbox: [],
     usage: { cost: 0, input: 0, output: 0, reasoning: 0, read: 0, write: 0 },
     titled: false,
+    created: Date.now(),
   };
   sessions.set(ses.id, ses);
   // Real servers number a session's creation 0, under its own aggregate.
@@ -864,7 +896,8 @@ function info(ses: Ses): Json {
     cost: ses.usage.cost,
     tokens: { input: ses.usage.input, output: ses.usage.output, reasoning: ses.usage.reasoning, cache: { read: ses.usage.read, write: ses.usage.write } },
     ...(ses.outcome ? { outcome: ses.outcome } : {}),
-    time: { created: Date.now(), updated: Date.now(), ...(ses.busy ? { busy: ses.busy } : {}), ...(ses.idle ? { idle: ses.idle } : {}) },
+    ...(ses.title ? { title: ses.title } : {}),
+    time: { created: ses.created, updated: Date.now(), ...(ses.busy ? { busy: ses.busy } : {}), ...(ses.idle ? { idle: ses.idle } : {}) },
     permissions: ses.permissions,
     location: { directory: ses.directory },
   };
@@ -981,6 +1014,12 @@ const server = Bun.serve({
         state.mcpRemoved.push({ directory: dir, name: decodeURIComponent(m[1]!) });
       }
       return new Response(null, { status: 204 });
+    }
+    if (path === "/api/session" && method === "GET") {
+      // `parentID` filters to one session's children (newest first, as `order=desc`).
+      const parentID = url.searchParams.get("parentID");
+      const list = [...sessions.values()].filter((x) => !parentID || x.parentID === parentID).reverse();
+      return json({ data: list.map(info), cursor: {} });
     }
     if (path === "/api/session" && method === "POST") {
       const loc = body.location as { directory?: string } | undefined;

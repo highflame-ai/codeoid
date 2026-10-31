@@ -37,6 +37,7 @@
  *   I15 a session deleted on the server while attached: the next turn goes on in a new one, from codeoid's history
  *   I16 (scripted only) a symlink out of the workdir: a read through it isn't a safe Read, a write names its real file
  *   I17 (scripted only) a plugin can't settle permissions: the user's global one isn't loaded, one in codeoid's config dir is refused
+ *   I18 (scripted only) a subagent created in a feed gap is found again (`?parentID=`): its request reaches the gate
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -147,9 +148,31 @@ function done(events: ProviderEvent[]) {
 /** The server's own API, as codeoid's client authenticates to it (for what codeoid never does itself). */
 let serverAuth = "";
 const clientFetch = globalThis.fetch;
-globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+/** A feed gap on demand: `cutFeed` drops the live feed's connections, and a new one waits for `restoreFeed`. */
+const feeds: AbortController[] = [];
+let feedHeld: { wait: Promise<void>; release: () => void } | null = null;
+function cutFeed(): void {
+  let release = () => {};
+  const wait = new Promise<void>((r) => {
+    release = r;
+  });
+  feedHeld = { wait, release };
+  for (const c of feeds.splice(0)) c.abort();
+}
+function restoreFeed(): void {
+  feedHeld?.release();
+  feedHeld = null;
+}
+globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
   const auth = (init?.headers as Record<string, string> | undefined)?.authorization;
   if (auth) serverAuth = auth;
+  if (String(input instanceof Request ? input.url : input).includes("/api/event")) {
+    if (feedHeld) await feedHeld.wait;
+    const c = new AbortController();
+    feeds.push(c);
+    init?.signal?.addEventListener("abort", () => c.abort());
+    return clientFetch(input, { ...init, signal: c.signal });
+  }
   return clientFetch(input, init);
 }) as typeof fetch;
 
@@ -554,4 +577,27 @@ describe("opencode (real binary)", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 300_000);
+
+  maybeScripted("I18 a subagent created in a feed gap is found again: its request reaches the gate, and the turn ends", async () => {
+    // The feed drops as the parent's subagent call is approved: the child's
+    // `session.created` and its permission request fall in the gap.
+    const asked: string[] = [];
+    const gate: ToolApprovalFn = async (_t, _a, name, _input, _signal, agentId) => {
+      asked.push(agentId ? `${name}@child` : name);
+      if (!agentId) {
+        cutFeed();
+        setTimeout(restoreFeed, 2_500);
+      }
+      return { behavior: "allow" };
+    };
+    const p = provider();
+    const sub = { agent: "general", description: "gap child", prompt: '[[tool:shell {"command":"echo from-child"}]]' };
+    const events = await collect(p.runTurn(opts(`[[tool:subagent ${JSON.stringify(sub)}]]`, { canUseTool: gate })));
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    expect(asked).toEqual(["Task", "Bash@child"]);
+    const start = events.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>;
+    expect(events.some((e) => e.type === "subagent_stop" && e.agentId === start.agentId)).toBe(true);
+    expect(done(events)?.stopReason).toBe("stop");
+    await p.teardown();
+  }, 180_000);
 });

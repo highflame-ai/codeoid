@@ -207,6 +207,8 @@ interface Turn {
   interrupted: boolean;
   /** A turn opencode started by itself (`turn_started`). */
   adopted: boolean;
+  /** Where a read-back of the turn starts (server time), when not its start: an execution adopted after a gap. */
+  since?: number;
 }
 
 interface Child {
@@ -278,6 +280,10 @@ export class OpencodeProvider implements SessionProvider {
   #counted = emptyUsage();
   /** True between an execution's start and end. */
   #executing = false;
+  /** When codeoid last saw this session's execution end (or attached to it idle): one that started later and wasn't seen ran in a feed gap. */
+  #lastEndAt = 0;
+  /** When the opencode session was attached: a child listed after a gap that's older and ended isn't news. */
+  #attachedAt = 0;
   /** `generation:directory` the MCP mounts were done for. */
   #mountedFor: string | null = null;
   /** Normalized mount name → codeoid's server name, for this session's mounts. */
@@ -322,7 +328,11 @@ export class OpencodeProvider implements SessionProvider {
   #endedBlocks = new Set<string>();
   /** Reasoning blocks some of whose deltas were shown. */
   #streamedBlocks = new Set<string>();
-  /** Assistant messages whose step was counted (from the feed, or read back after a gap): never twice. */
+  /**
+   * Assistant messages whose step was counted (from the feed, or read back
+   * after a gap), this session's and its children's: never twice. Kept
+   * across turns (a background child's steps land in later ones), bounded.
+   */
   #countedSteps = new Set<string>();
   /** Assistant messages read back after a gap while still being written: read again when their step ends. */
   #streamingReadBack = new Set<string>();
@@ -451,7 +461,6 @@ export class OpencodeProvider implements SessionProvider {
     this.#endedBlocks.clear();
     this.#streamedBlocks.clear();
     this.#blockIndex.clear();
-    this.#countedSteps.clear();
     this.#streamingReadBack.clear();
 
     void this.#startTurn(turn, opts).catch((err: unknown) => {
@@ -763,6 +772,9 @@ export class OpencodeProvider implements SessionProvider {
       this.#seq = -1;
       this.#counted = emptyUsage();
       addTokens(this.#counted, opened.tokens, opened.cost);
+      this.#attachedAt = Date.now();
+      // What ran before codeoid attached isn't a missed execution.
+      this.#lastEndAt = Math.max(this.#attachedAt, opened.time?.busy ?? 0, opened.time?.idle ?? 0);
       this.#adoptBacking(opened.id);
     }
     const ses = this.#ses!;
@@ -1169,7 +1181,7 @@ export class OpencodeProvider implements SessionProvider {
           // Read back while still being written: its last block may have ended in the gap.
           if (this.#streamingReadBack.delete(d.assistantMessageID)) this.#catchUp(d.assistantMessageID);
           if (this.#countedSteps.has(d.assistantMessageID)) return; // already read back after a gap
-          this.#countedSteps.add(d.assistantMessageID);
+          remember(this.#countedSteps, d.assistantMessageID);
         }
         addTokens(this.#counted, tokens, cost);
         this.#recordStep(tokens, cost, true);
@@ -1189,6 +1201,7 @@ export class OpencodeProvider implements SessionProvider {
       case "session.execution.failed":
       case "session.execution.interrupted": {
         this.#executing = false;
+        this.#lastEndAt = Date.now();
         const turn = this.#turn;
         if (!turn || !turn.started) return;
         const outcome = ev.type === "session.execution.succeeded" ? "succeeded" : ev.type === "session.execution.failed" ? "failed" : "interrupted";
@@ -1237,9 +1250,9 @@ export class OpencodeProvider implements SessionProvider {
     this.#emitTo(turn, { type: "turn_done", result: this.#result(turn, "steered") });
   }
 
-  /** A turn opencode started by itself: hand it to the session. */
-  #adoptTurn(): void {
-    if (!this.onSessionEvent) return;
+  /** A turn opencode started by itself: hand it to the session. `since`: it began unseen, in a feed gap, then. */
+  #adoptTurn(since?: number): Turn | null {
+    if (!this.onSessionEvent) return null;
     const turn: Turn = {
       queue: new AsyncQueue<ProviderEvent>({ maxBuffered: 20_000 }),
       gate: this.#lastGate ?? { canUseTool: null, requestUserInput: undefined },
@@ -1259,9 +1272,11 @@ export class OpencodeProvider implements SessionProvider {
       budgetStopped: false,
       interrupted: false,
       adopted: true,
+      ...(since !== undefined ? { since } : {}),
     };
     this.#turn = turn;
     this.onSessionEvent({ type: "turn_started", run: this.#runFor(turn) });
+    return turn;
   }
 
   #thinkingIndex(key: string): number {
@@ -1405,6 +1420,10 @@ export class OpencodeProvider implements SessionProvider {
       // A failed step is billed too (interrupted after the model answered).
       case "session.step.ended":
       case "session.step.failed":
+        if (typeof d.assistantMessageID === "string") {
+          if (this.#countedSteps.has(d.assistantMessageID)) return; // already read back after a gap
+          remember(this.#countedSteps, d.assistantMessageID);
+        }
         this.#recordStep(d.tokens as OcTokenUsage | undefined, typeof d.cost === "number" ? d.cost : undefined, false);
         return;
       case "session.tool.success":
@@ -1413,22 +1432,26 @@ export class OpencodeProvider implements SessionProvider {
         return;
       case "session.execution.succeeded":
       case "session.execution.failed":
-      case "session.execution.interrupted": {
-        if (!child.running) return;
-        child.running = false;
-        this.#emit({ type: "subagent_stop", agentId: sid });
-        if (child.background) {
-          const status = ev.type === "session.execution.succeeded" ? "completed" : ev.type === "session.execution.failed" ? "failed" : "stopped";
-          this.#emitBackgroundLevel();
-          this.onSessionEvent?.({
-            type: "background_task_settled",
-            taskId: sid,
-            status,
-            summary: `Subagent "${child.title}" ${status === "completed" ? "finished" : status}.`,
-          });
-        }
+      case "session.execution.interrupted":
+        this.#childEnded(sid, child, ev.type === "session.execution.succeeded" ? "succeeded" : ev.type === "session.execution.failed" ? "failed" : "interrupted");
         return;
-      }
+    }
+  }
+
+  /** A child session's execution ended: its subagent stops, and a background one settles. */
+  #childEnded(sid: string, child: Child, outcome: "succeeded" | "failed" | "interrupted"): void {
+    if (!child.running) return;
+    child.running = false;
+    this.#emit({ type: "subagent_stop", agentId: sid });
+    if (child.background) {
+      const status = outcome === "succeeded" ? "completed" : outcome === "failed" ? "failed" : "stopped";
+      this.#emitBackgroundLevel();
+      this.onSessionEvent?.({
+        type: "background_task_settled",
+        taskId: sid,
+        status,
+        summary: `Subagent "${child.title}" ${status === "completed" ? "finished" : status}.`,
+      });
     }
   }
 
@@ -1703,20 +1726,35 @@ export class OpencodeProvider implements SessionProvider {
 
   // ── Server events ─────────────────────────────────────────────────────
 
-  /** The live feed (re)connected: re-read what may have been asked in the gap, and how a running turn went. */
+  /**
+   * The live feed (re)connected: re-read what the gap swallowed — children
+   * created in it, what was asked, how each child went, and the running turn
+   * (or an execution opencode ran by itself with no turn open).
+   */
   #resync(conn: OpencodeConnection): void {
-    if (conn !== this.#conn || !this.#ses) return;
-    const turn = this.#turn;
-    if (turn && !turn.queue.closed) {
-      // The turn's end waits for it: what the gap swallowed comes first.
-      this.#settling(
-        turn,
-        this.#reconcile(conn, turn).catch((err: unknown) => {
-          console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] reading back a turn after a feed gap failed: ${err instanceof Error ? err.message : String(err)}`);
-        }),
-      );
+    const ses = this.#ses;
+    if (conn !== this.#conn || !ses) return;
+    const open = this.#turn;
+    const turn = open && !open.queue.closed ? open : null;
+    const work = this.#afterGap(conn, ses, turn).catch((err: unknown) => {
+      console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] reading back after a feed gap failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    // The turn's end waits for it: what the gap swallowed comes first.
+    if (turn) this.#settling(turn, work);
+  }
+
+  async #afterGap(conn: OpencodeConnection, ses: string, turn: Turn | null): Promise<void> {
+    const live = () => conn === this.#conn && this.#ses === ses;
+    // A child whose `session.created` fell in the gap would never be learned:
+    // its requests and forms ignored, a foreground one blocking the turn.
+    const listed = await conn.client.childSessions(ses).catch(() => [] as OcSessionInfo[]);
+    if (!live()) return;
+    for (const info of listed) {
+      if (this.#children.has(info.id) || info.parentID !== ses) continue;
+      if (!sessionRunning(info) && (info.time?.created ?? 0) < this.#attachedAt) continue; // an old one, done before codeoid attached
+      this.#childCreated(info.id, { agent: info.agent, title: info.title });
     }
-    for (const sid of [this.#ses, ...this.#children.keys()]) {
+    for (const sid of [ses, ...this.#children.keys()]) {
       void conn.client
         .pendingPermissions(sid)
         .then((reqs) => {
@@ -1730,6 +1768,68 @@ export class OpencodeProvider implements SessionProvider {
         })
         .catch(() => {});
     }
+    // Children first: a foreground one's spend belongs to the turn its parent's read-back may end.
+    await Promise.all(
+      [...this.#children.entries()]
+        .filter(([, c]) => c.running)
+        .map(([id, c]) =>
+          this.#readBackChild(conn, id, c).catch((err: unknown) => {
+            console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] reading back subagent ${id} after a feed gap failed: ${err instanceof Error ? err.message : String(err)}`);
+          }),
+        ),
+    );
+    if (!live()) return;
+    if (turn) await this.#reconcile(conn, turn);
+    else await this.#adoptMissed(conn, ses);
+  }
+
+  /**
+   * A child after a feed gap (its events are ephemeral to this session, so
+   * nothing replays them): the cards of its calls that settled, its steps
+   * that ended (each once), and its end if it's idle now.
+   */
+  async #readBackChild(conn: OpencodeConnection, id: string, child: Child): Promise<void> {
+    // The session first: once it says idle, the messages read after it are final.
+    const info = await conn.client.getSession(id);
+    const messages: OcMessage[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < RECONCILE_PAGES; page++) {
+      const res = await conn.client.recentMessages(id, cursor);
+      messages.push(...(res.data ?? []));
+      cursor = res.cursor?.next;
+      if (!cursor) break;
+    }
+    if (this.#children.get(id) !== child || !child.running) return;
+    for (const m of messages.reverse()) {
+      if (m.type !== "assistant") continue;
+      for (const block of m.content ?? []) {
+        if (block.type !== "tool" || !block.id || !this.#announced.has(`${id}:${block.id}`)) continue;
+        const state = block.state;
+        if (state?.status === "completed") this.#toolSettled(id, { id: block.id, content: state.content, metadata: state.metadata }, true);
+        else if (state?.status === "error") this.#toolSettled(id, { id: block.id, content: state.content, error: state.error, metadata: state.metadata }, false);
+      }
+      if (!this.#countedSteps.has(m.id) && stepEnded(m)) {
+        remember(this.#countedSteps, m.id);
+        this.#recordStep(m.tokens, m.cost, false);
+      }
+    }
+    if (!sessionRunning(info) && info.time?.busy !== undefined) this.#childEnded(id, child, info.outcome ?? "succeeded");
+  }
+
+  /**
+   * No turn was open, and opencode ran an execution by itself in the gap (a
+   * background subagent's result): it is adopted as a turn and read back, so
+   * its reply reaches the session's history and its spend its turn.
+   */
+  async #adoptMissed(conn: OpencodeConnection, ses: string): Promise<void> {
+    if (this.#executing || !this.onSessionEvent) return;
+    const info = await conn.client.getSession(ses);
+    if (conn !== this.#conn || this.#ses !== ses || this.#turn || this.#executing) return;
+    const busy = info.time?.busy;
+    if (busy === undefined || busy <= this.#lastEndAt) return; // nothing ran that the feed didn't show
+    this.#executing = true;
+    const turn = this.#adoptTurn(busy);
+    if (turn) await this.#reconcile(conn, turn);
   }
 
   /**
@@ -1754,7 +1854,7 @@ export class OpencodeProvider implements SessionProvider {
     if (this.#turn !== turn || turn.queue.closed || this.#ses !== ses) return;
     const { busy, idle } = info.time ?? {};
     // A turn opencode started was seen after it began; a prompted one began before.
-    const since = turn.adopted ? turn.startedAt - 5_000 : turn.startedAt;
+    const since = turn.since ?? (turn.adopted ? turn.startedAt - 5_000 : turn.startedAt);
     if (busy === undefined || busy < since) return; // not started yet: the feed has it all
     const ended = idle !== undefined && idle >= busy;
     const mine: OcMessage[] = [];
@@ -1799,6 +1899,7 @@ export class OpencodeProvider implements SessionProvider {
     if (this.#turn !== turn || turn.queue.closed) return;
     console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] opencode's feed dropped the end of a turn — read it back from the session`);
     this.#executing = false;
+    this.#lastEndAt = Math.max(this.#lastEndAt, idle ?? 0, Date.now());
     // Session absorbs one turn_done per steer it pushed; they were delivered in the gap.
     while (turn.owed > 0) this.#payBoundary(turn);
     const outcome = info.outcome ?? (lastError ? "failed" : "succeeded");
@@ -1837,8 +1938,8 @@ export class OpencodeProvider implements SessionProvider {
         else if (state?.status === "error") this.#toolSettled(ses, { id: block.id, content: state.content, error: state.error, metadata: state.metadata }, false);
       }
     }
-    if (!this.#countedSteps.has(m.id) && (m.finish !== undefined || m.time?.completed !== undefined) && (m.cost !== undefined || m.tokens)) {
-      this.#countedSteps.add(m.id);
+    if (!this.#countedSteps.has(m.id) && stepEnded(m)) {
+      remember(this.#countedSteps, m.id);
       addTokens(this.#counted, m.tokens, m.cost);
       this.#recordStep(m.tokens, m.cost, true);
     }
@@ -1952,6 +2053,17 @@ function actionOfTool(name: string): string {
 /** An assistant message whose response ended: all its text and reasoning blocks are final. */
 function messageStreamed(m: OcMessage): boolean {
   return m.time?.streamed !== undefined || m.time?.completed !== undefined || m.finish !== undefined || m.error !== undefined;
+}
+
+/** A step that ended (its message holds its final cost and tokens). */
+function stepEnded(m: OcMessage): boolean {
+  return (m.finish !== undefined || m.time?.completed !== undefined) && (m.cost !== undefined || m.tokens !== undefined);
+}
+
+/** A session executing now, by its times: busy since it last went idle. */
+function sessionRunning(info: OcSessionInfo): boolean {
+  const { busy, idle } = info.time ?? {};
+  return busy !== undefined && (idle === undefined || idle < busy);
 }
 
 /** A request about a session opencode no longer has. */

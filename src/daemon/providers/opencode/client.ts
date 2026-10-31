@@ -292,6 +292,11 @@ export class OpencodeClient {
     return (await this.#request<{ data: OcSessionInfo }>("GET", `/api/session/${encodeURIComponent(sessionID)}`)).data;
   }
 
+  /** The sessions `sessionID`'s subagents run in (newest first, up to 50). */
+  async childSessions(sessionID: string): Promise<OcSessionInfo[]> {
+    return (await this.#request<{ data: OcSessionInfo[] }>("GET", "/api/session", { query: { parentID: sessionID, order: "desc" } })).data ?? [];
+  }
+
   async updateSession(sessionID: string, body: { permissions?: OcRule[]; title?: string }): Promise<void> {
     await this.#request("PATCH", `/api/session/${encodeURIComponent(sessionID)}`, { body });
   }

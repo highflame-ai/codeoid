@@ -1443,6 +1443,65 @@ describe("opencode as real 2.2.x servers behave", () => {
     await p.teardown();
   });
 
+  it("a subagent created in a feed gap is found again: its request is asked and answered, and the turn ends", async () => {
+    const { server } = makeServer();
+    const asks: Array<[string, string | undefined]> = [];
+    const p = makeProvider(server);
+    const run = p.runTurn(opts("subagent-gapstart", { canUseTool: allowing((name, _input, agentId) => asks.push([name, agentId])) }));
+    const events = await Promise.race([collect(run), Bun.sleep(8_000).then(() => [] as ProviderEvent[])]);
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    const start = events.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>;
+    expect(start?.agentType).toBe("explore");
+    expect(asks).toEqual([["Task", undefined], ["Bash", start.agentId]]);
+    expect(events.some((e) => e.type === "subagent_stop" && e.agentId === start.agentId)).toBe(true);
+    expect(texts(events, "text_done")).toEqual(["subagent done"]);
+    // The parent's two steps and the child's; the title lands in this turn or the next.
+    const next = await collect(p.runTurn(opts("hi")));
+    expect(done(events)!.totalCostUsd + done(next)!.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.5 + 0.0123 + 0.0007, 6);
+    await p.teardown();
+  });
+
+  it("a subagent that ends in a feed gap is read back: its card settles, its spend counts, it stops", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const events = await Promise.race([collect(p.runTurn(opts("subagent-gapend"))), Bun.sleep(8_000).then(() => [] as ProviderEvent[])]);
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    const start = events.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>;
+    const cards = events.filter((e) => e.type === "tool_start") as Array<Extract<ProviderEvent, { type: "tool_start" }>>;
+    const childCard = cards.find((c) => c.sdkAgentId === start.agentId)!;
+    expect(events.filter((e) => e.type === "tool_complete").map((e) => (e as { sdkToolUseId: string }).sdkToolUseId).sort()).toEqual(cards.map((c) => c.toolId).sort());
+    expect(events.find((e) => e.type === "tool_complete" && e.sdkToolUseId === childCard.toolId)).toMatchObject({ success: true, output: "shell ran: grep -r auth ." });
+    expect(events.some((e) => e.type === "subagent_stop" && e.agentId === start.agentId)).toBe(true);
+    expect(texts(events, "text_done")).toEqual(["subagent done"]);
+    // The parent's two steps and the child's, each once.
+    expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.5, 6);
+    await p.teardown();
+  });
+
+  it("a background subagent that ends in a gap with no turn open settles, and opencode's follow-up in the gap is adopted", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const levels: unknown[] = [];
+    const settled: unknown[] = [];
+    const adopted: TurnRun[] = [];
+    p.onSessionEvent = (e) => {
+      if (e.type === "background_tasks") levels.push(e.tasks);
+      if (e.type === "background_task_settled") settled.push(e);
+      if (e.type === "turn_started") adopted.push(e.run);
+    };
+    const events = await collect(p.runTurn(opts("background-gap")));
+    expect(texts(events, "text_done")).toEqual(["launched"]);
+    for (let i = 0; i < 150 && adopted.length === 0; i++) await Bun.sleep(20);
+    expect(settled).toMatchObject([{ status: "completed" }]);
+    expect(levels.at(-1)).toEqual([]);
+    expect(adopted).toHaveLength(1);
+    const follow = await Promise.race([collect(adopted[0]!), Bun.sleep(3_000).then(() => [] as ProviderEvent[])]);
+    expect(texts(follow, "text_done")).toEqual(["background result received"]);
+    // The follow-up's step, the child's (read back with no turn open, carried) and the first prompt's title.
+    expect(done(follow)!.totalCostUsd).toBeCloseTo(0.0123 + 0.5 + 0.0007, 6);
+    await p.teardown();
+  });
+
   it("a child session inherits its parent's rules, and still gets codeoid's set on it", async () => {
     const { server } = makeServer();
     const p = makeProvider(server, { sessionId: "sess-kid", initialBackingId: "sess-kid" });
