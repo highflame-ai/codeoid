@@ -97,6 +97,9 @@ const INSTRUCTIONS_DESCRIPTION = "codeoid session instructions";
 const CALL_WAIT_MS = 2_000;
 /** After an interrupt, how long to wait for opencode to report the execution ended. */
 const INTERRUPT_SETTLE_MS = 5_000;
+/** At teardown, how long to wait for the stopped subagents to end, and then for opencode to wake their parent. */
+const TEARDOWN_SETTLE_MS = 1_500;
+const WAKE_GRACE_MS = 300;
 /** After a slash command, how long to wait for it to start an execution. */
 const COMMAND_START_MS = 1_500;
 /** A turn's messages read back after a feed gap — far more than one turn writes. */
@@ -299,6 +302,9 @@ export class OpencodeProvider implements SessionProvider {
   #modelsReported = false;
   #commands: ProviderCommand[] = [];
   #skills = new Map<string, string>();
+
+  /** Tearing down: an execution opencode starts by itself now (a stopped subagent waking its parent) is stopped, not adopted. */
+  #stopping = false;
 
   // Turn state.
   #turn: Turn | null = null;
@@ -1110,6 +1116,10 @@ export class OpencodeProvider implements SessionProvider {
         if (turn) {
           turn.started = true;
           turn.executions++;
+          return;
+        }
+        if (this.#stopping) {
+          if (this.#ses && this.#conn) void this.#conn.client.interrupt(this.#ses).catch(() => {});
           return;
         }
         this.#adoptTurn();
@@ -2078,15 +2088,42 @@ export class OpencodeProvider implements SessionProvider {
   }
 
   async teardown(): Promise<void> {
+    this.#stopping = true;
+    try {
+      await this.#teardown();
+    } finally {
+      this.#stopping = false;
+    }
+  }
+
+  async #teardown(): Promise<void> {
     const turn = this.#turn;
     if (turn) this.#closeTurn(turn, "teardown");
     this.#turn = null;
     const conn = this.#conn;
     const ses = this.#ses;
-    // Detached from codeoid, opencode would keep running the execution unobserved.
-    if (conn && ses && this.#executing) await conn.client.interrupt(ses).catch(() => {});
-    for (const pending of this.#pendingAsks.values()) pending.abort.abort();
+    const pending = [...this.#pendingAsks.entries()];
     this.#pendingAsks.clear();
+    for (const [, ask] of pending) ask.abort.abort();
+    if (conn) {
+      // Detached from codeoid, opencode would keep running them unobserved
+      // on the shared server: the execution, and the subagents — Session
+      // counts a torn-down backend's background work as gone with it.
+      const running = [...this.#children.entries()].filter(([, c]) => c.running);
+      const stops = [...(ses && this.#executing ? [ses] : []), ...running.map(([id]) => id)].map((id) => conn.client.interrupt(id).catch(() => {}));
+      await Promise.race([Promise.all(stops), Bun.sleep(2_000)]);
+      if (running.some(([, c]) => c.background)) {
+        // opencode hands a stopped background subagent's result to its
+        // parent and runs it: that execution is stopped too (#onDurable),
+        // so wait for the subagents' ends and the wake that follows.
+        const until = Date.now() + TEARDOWN_SETTLE_MS;
+        while (Date.now() < until && running.some(([, c]) => c.running)) await Bun.sleep(25);
+        await Bun.sleep(WAKE_GRACE_MS);
+      }
+      // A request the interrupts didn't drop would wait forever: refused (one already gone answers 404, ignored).
+      const replies = pending.map(([id, ask]) => this.#reply(conn, { id, sessionID: ask.sessionID } as OcPermissionRequest, "reject", "codeoid stopped this session's backend; this wasn't run."));
+      await Promise.race([Promise.all(replies), Bun.sleep(2_000)]);
+    }
     const dir = this.#workdir;
     if (conn && dir) await Promise.race([this.#unmount(conn, dir), Bun.sleep(2_000)]);
     // The opencode session stays: the next turn resumes it by id.

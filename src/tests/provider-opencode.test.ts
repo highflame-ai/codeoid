@@ -723,6 +723,28 @@ describe("opencode interrupt", () => {
     expect(held[0]!.aborted).toBe(true);
     await p.teardown();
   });
+
+  it("teardown stops the session's background subagents on the shared server, and the wake that follows", async () => {
+    // Session counts a torn-down backend's background work as gone; the
+    // server outlives the provider, so the provider stops it there.
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const seen: string[] = [];
+    p.onSessionEvent = (e) => seen.push(e.type);
+    const { gate, reached, held } = holding("child");
+    const events = await collect(p.runTurn(opts("background", { canUseTool: gate })));
+    const child = (events.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>).agentId;
+    await reached;
+    const parent = p.backingSessionId;
+    await p.teardown();
+    expect(held[0]!.aborted).toBe(true);
+    const st = await fakeState(server);
+    expect(st.interrupts).toContain(child);
+    expect(st.sessions.find((x: { id: string }) => x.id === child)).toMatchObject({ outcome: "interrupted" });
+    // opencode woke the parent with the stopped subagent's result: stopped too, not handed to a torn-down session.
+    expect(st.interrupts).toContain(parent);
+    expect(seen).not.toContain("turn_started");
+  });
 });
 
 // ── O7 models and effort ─────────────────────────────────────────────────────
