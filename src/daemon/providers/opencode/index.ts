@@ -74,7 +74,7 @@ import {
   type OcSessionInfo,
   type OcTokenUsage,
 } from "./client.js";
-import { fetchFence, fetchOrigin, mcpNamespace, opencodeShellEnv, ownMountPrefix, runnableCommand, sessionRules } from "./policy.js";
+import { commandlessShellLine, fetchFence, fetchOrigin, mcpNamespace, opencodeShellEnv, ownMountPrefix, runnableCommand, sessionRules } from "./policy.js";
 import type { OpencodeConnection, OpencodeServer } from "./server.js";
 import {
   type OcToolCall,
@@ -1704,14 +1704,16 @@ export class OpencodeProvider implements SessionProvider {
     }
     const child = sessionID !== this.#ses;
     // Every opencode tool asks before it acts (a Code Mode script is
-    // announced when called): one that succeeded unasked means something
-    // settled its request itself — a plugin, a rule codeoid didn't set.
+    // announced when called), but for a shell line with no command in it:
+    // one that succeeded unasked otherwise means something settled its
+    // request itself — a plugin, a rule codeoid didn't set.
     const unasked = !this.#announced.has(key);
+    const ownRule = call?.name === "shell" && typeof call.input.command === "string" && commandlessShellLine(call.input.command);
     if (unasked) {
       // A child's calls are shown only when they asked; the main agent's
       // are always recorded (one refused unasked, e.g. a hidden tool).
       if (child || !call) {
-        if (success) this.#ranUnasked(call?.name ?? "a tool");
+        if (success && !ownRule) this.#ranUnasked(call?.name ?? "a tool");
         return;
       }
       const retro = gateCallFor({ id: "", sessionID, action: actionOfTool(call.name), resources: [] }, call, this.#mapContext());
@@ -1732,19 +1734,22 @@ export class OpencodeProvider implements SessionProvider {
       output: toolOutputText(d.content, success ? undefined : (d.error as OcError)),
       success,
     });
-    if (unasked && success) this.#ranUnasked(call!.name);
+    if (unasked && success && !ownRule) this.#ranUnasked(call!.name);
   }
 
   /**
    * opencode ran a tool codeoid never approved: the server can't be trusted
-   * to ask. It is stopped — every turn on it ends with the reason — and the
-   * next one starts a new server, checked again.
+   * to ask. It is stopped — every turn on it ends — and the next one starts
+   * a new server, checked again. This session's turn says why; the other
+   * sessions on the shared server are told only that it was restarted.
    */
   #ranUnasked(tool: string): void {
     const conn = this.#conn;
     const reason = `opencode ran ${tool} without asking codeoid — something in its configuration settles permission requests itself`;
     console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] ${reason}`);
-    if (conn) void this.#server.distrust(conn, reason);
+    const turn = this.#turn;
+    if (turn) this.#failTurn(turn, `opencode: the server stopped (${reason})`);
+    if (conn) void this.#server.distrust(conn, reason, "codeoid restarted the shared opencode server: a tool ran without asking codeoid in another session");
   }
 
   #mapContext() {

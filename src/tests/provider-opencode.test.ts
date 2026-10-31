@@ -31,7 +31,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
 import { OpencodeServer, OpencodeIncompatibleError } from "../daemon/providers/opencode/server.js";
-import { buildOpencodeEnv, opencodeConfig, opencodeShellEnv, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents } from "../daemon/providers/opencode/policy.js";
+import { buildOpencodeEnv, commandlessShellLine, opencodeConfig, opencodeShellEnv, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents } from "../daemon/providers/opencode/policy.js";
 import { OPENCODE_INSTALL_HINT, opencodeDbPath, opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
 import { effortOfVariant, gateCallFor, parseModelValue } from "../daemon/providers/opencode/translate.js";
 import { parseSse } from "../daemon/providers/opencode/client.js";
@@ -244,6 +244,42 @@ describe("opencode server lifecycle", () => {
     await p.teardown();
   });
 
+  it("a shell line with no command in it, which opencode runs unasked by its own rule, keeps the server", async () => {
+    const { server } = makeServer();
+    const generation = (await server.ensure()).generation;
+    for (const line of ["cd .", "export FOO=bar", "X=1", "# just a comment", "cd src && X=1"]) {
+      const p = makeProvider(server, { sessionId: `sess-${line.length}`, initialBackingId: `sess-${line.length}` });
+      const events = await collect(p.runTurn(opts(`unasked-shell:${line}`)));
+      expect(events.find((e) => e.type === "error")).toBeUndefined();
+      // Shown as a card that ran without asking, and the turn goes on.
+      expect(events.find((e) => e.type === "tool_start")).toMatchObject({ name: "Bash", input: { command: line }, approvalId: expect.stringMatching(/^opencode-auto-/) });
+      expect(texts(events, "text_done")).toEqual(["ran it"]);
+      expect(server.running).toBe(true);
+      await p.teardown();
+    }
+    expect((await server.ensure()).generation).toBe(generation);
+  });
+
+  it("a genuine unasked call tells the session that saw it why, and the other sessions only that the server restarted", async () => {
+    const { server } = makeServer();
+    const a = makeProvider(server, { sessionId: "sess-a", initialBackingId: "sess-a" });
+    const b = makeProvider(server, { sessionId: "sess-b", initialBackingId: "sess-b" });
+    await collect(b.runTurn(opts("hi")));
+    const bRun = collect(b.runTurn(opts("slow")));
+    await Bun.sleep(150);
+    // A line with a command word in it never runs unasked on its own: something settled it.
+    const aEvents = await collect(a.runTurn(opts("unasked-shell:ls")));
+    const bEvents = await bRun;
+    const [aEnd, bEnd] = [aEvents.at(-1), bEvents.at(-1)] as Array<{ type: string; message: string }>;
+    expect(aEnd!.type).toBe("error");
+    expect(aEnd!.message).toContain("something in its configuration settles permission requests");
+    expect(bEnd!.type).toBe("error");
+    expect(bEnd!.message).toContain("a tool ran without asking codeoid in another session");
+    expect(bEnd!.message).not.toContain("configuration");
+    await a.teardown();
+    await b.teardown();
+  });
+
   it("a session's shell runs without the server's environment: a line that runs unasked can't print a key", async () => {
     const { server } = makeServer({ R4_SECRET_API_KEY: "sk-test-not-for-the-shell" });
     const p = makeProvider(server);
@@ -348,6 +384,17 @@ describe("opencode server lifecycle", () => {
       NO_PROXY: "localhost,.internal",
     });
     expect(env).toEqual({ PATH: "/bin", HOME: "/home/u", LC_ALL: "C", HTTP_PROXY: "http://proxy:3128", NO_PROXY: "localhost,.internal" });
+  });
+
+  it("tells a shell line with no command in it from one that could act", () => {
+    for (const line of ["cd .", "cd src", "cd 'my dir'", "export FOO=bar", "X=1", "X=1 Y='a b'", "# a comment", "cd src && X=1", "X=1; Y=2\nunset X", "readonly A"]) {
+      expect([line, commandlessShellLine(line)]).toEqual([line, true]);
+    }
+    const acting = [
+      "ls", "echo hi", "true", ":", "X=1 touch f", "cd x; ls", "X=$(id)", "X=`id`", "X=${U?$KEY}", "X=1 > f", "cat < f", "a | b",
+      "X=1 &", "(X=1)", "{ X=1; }", "export", "export -p", "readonly -p", "X=a\\$b", "! X=1", "X='unterminated", "cd a b c",
+    ];
+    for (const line of acting) expect([line, commandlessShellLine(line)]).toEqual([line, false]);
   });
 });
 

@@ -209,10 +209,14 @@ export class OpencodeServer {
     throw new OpencodeUntrustedError(reason);
   }
 
-  /** Stop the server because it did something codeoid can't allow (a call that ran without asking). */
-  async distrust(conn: OpencodeConnection, reason: string): Promise<void> {
+  /**
+   * Stop the server because it did something codeoid can't allow (a call
+   * that ran without asking). `told` is what its sessions are told: the
+   * session that saw it says why itself.
+   */
+  async distrust(conn: OpencodeConnection, reason: string, told = reason): Promise<void> {
     console.error(`[opencode-server] stopping the server: ${reason}`);
-    if (this.#conn === conn) await this.stop(reason);
+    if (this.#conn === conn) await this.stop(told);
   }
 
   /** codeoid's own config dir for the server (`OPENCODE_CONFIG_DIR`): nothing in it but what codeoid puts there. */

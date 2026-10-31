@@ -44,6 +44,7 @@
  *   I21 (scripted only) a shell line made only of redirections asks first: denied, the file outside the workdir is untouched
  *   I22 (scripted only) an approved fetch doesn't follow a redirect to another site; one on the approved site is followed
  *   I23 (scripted only) a subagent continued by its id after the provider was rebuilt: its request reaches the gate, the turn ends
+ *   I24 (scripted only) shell lines with no command in them, which opencode runs unasked by its own rule, keep the server, and a concurrent turn
  *   I25 (scripted only) a session's shell has no key: a line of assignments that runs unasked can't print one, nor the injected config
  */
 
@@ -800,6 +801,33 @@ describe("opencode (real binary)", () => {
     expect(done(events)?.stopReason).toBe("stop");
     expect(events.some((e) => e.type === "subagent_stop" && e.agentId === child)).toBe(true);
     await p.teardown();
+  }, 180_000);
+
+  maybeScripted("I24 shell lines with no command in them run unasked by opencode's own rule: the server stays, and so does a concurrent turn", async () => {
+    // 2.2.5 asks about a shell line only when its scanner finds a command in it.
+    const generation = (await server!.ensure()).generation;
+    const other = provider();
+    await collect(other.runTurn(opts("[[text:warm]]")));
+    const slow = collect(other.runTurn(opts("[[slow:400]][[text:one two three four five six seven eight nine ten eleven twelve]]")));
+    for (const command of ["cd .", "export A=1", "X=1", "# only a comment"]) {
+      const asked: string[] = [];
+      const p = provider();
+      const deny: ToolApprovalFn = async (_t, _a, name) => {
+        asked.push(name);
+        return { behavior: "deny", message: "not approved" };
+      };
+      const events = await collect(p.runTurn(opts(`[[tool:shell ${JSON.stringify({ command })}]]`, { canUseTool: deny })));
+      expect(asked).toEqual([]);
+      expect(events.find((e) => e.type === "error")).toBeUndefined();
+      expect(events.find((e) => e.type === "tool_start")).toMatchObject({ name: "Bash", input: { command } });
+      expect(done(events)?.stopReason).toBe("stop");
+      await p.teardown();
+    }
+    const concurrent = await slow;
+    expect(concurrent.find((e) => e.type === "error")).toBeUndefined();
+    expect(done(concurrent)?.stopReason).toBe("stop");
+    expect((await server!.ensure()).generation).toBe(generation);
+    await other.teardown();
   }, 180_000);
 
   maybeScripted("I25 a session's shell has no key: a line of assignments that runs unasked can't print one, nor the injected config", async () => {

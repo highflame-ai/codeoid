@@ -358,9 +358,11 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   (`OPENCODE_CONFIG_DIR`, `config/` beside the DB; only the provider and model
   keys of the user's `~/.config/opencode` are carried in), a server listing a
   plugin that isn't a built-in is refused at start and before every turn
-  (`checkPlugins`), and a call that succeeded without asking stops the server.
-  opencode 2.2.5 runs a shell line with no command in it unasked, and such a
-  line can expand a variable, so every session's and child's shell runs with a bare environment
+  (`checkPlugins`), and a call that succeeded without asking stops the server
+  (its own turn says why; the server's other sessions get a neutral reason) —
+  except a shell line with no command in it (`commandlessShellLine`), which
+  opencode 2.2.5 runs unasked by its own rule. Such a line can still expand a
+  variable, so every session's and child's shell runs with a bare environment
   (`opencodeShellEnv`, `PUT …/environment` before every turn and as a child is
   learned; a child's requests are allowed only once it's set): the server's
   model keys and injected config never reach it.

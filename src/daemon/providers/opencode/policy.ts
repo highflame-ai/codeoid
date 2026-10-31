@@ -295,6 +295,64 @@ export function buildOpencodeEnv(base: Record<string, string | undefined> = proc
   return env;
 }
 
+/** Anything that could substitute, redirect, pipe, group, escape or background: never in a {@link commandlessShellLine}. */
+const SHELL_ACTIVE = /[$`<>|(){}\\!]|(?<!&)&(?!&)|&&&/;
+const SHELL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SHELL_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*\+?=/;
+/** Builtins that only change the shell's own state (it ends with the call), given names or assignments. */
+const SHELL_STATE_BUILTINS = new Set(["export", "unset", "readonly"]);
+
+/**
+ * A shell line opencode runs without asking, as 2.2.5 does a line its
+ * scanner finds no command in (`shell.ts`: it asks only `if
+ * (parsed.commands.length > 0)`), that can do nothing outside the shell
+ * process of the call: only assignments, `cd`, `export`/`unset`/`readonly`,
+ * comments and separators (`;`, `&&`, newlines), with no substitution,
+ * expansion, redirection, pipe, group, escape or background in it. Such a
+ * call succeeding unasked is opencode's own rule, not something settling
+ * requests behind codeoid's back. Conservative: any other line that ran
+ * unasked still stops the server.
+ */
+export function commandlessShellLine(command: string): boolean {
+  if (SHELL_ACTIVE.test(command)) return false;
+  const segments: string[][] = [[]];
+  let word: string | null = null;
+  const end = () => {
+    if (word !== null) segments.at(-1)!.push(word);
+    word = null;
+  };
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    if (ch === "'" || ch === '"') {
+      const close = command.indexOf(ch, i + 1);
+      if (close < 0) return false;
+      word = (word ?? "") + command.slice(i + 1, close);
+      i = close;
+    } else if (ch === "#" && word === null) {
+      // A comment, to the end of its line.
+      const nl = command.indexOf("\n", i);
+      if (nl < 0) break;
+      i = nl - 1;
+    } else if (ch === ";" || ch === "\n" || ch === "&") {
+      end();
+      segments.push([]);
+      if (ch === "&") i++; // `&&` (a lone `&` is refused above)
+    } else if (ch === " " || ch === "\t") {
+      end();
+    } else {
+      word = (word ?? "") + ch;
+    }
+  }
+  end();
+  return segments.every(([first, ...rest]) => {
+    if (first === undefined) return true;
+    if (first === "cd") return rest.length <= 2;
+    // With no name, or an option (`export -p`), they print variables instead.
+    if (SHELL_STATE_BUILTINS.has(first)) return rest.length > 0 && rest.every((w) => SHELL_NAME.test(w) || SHELL_ASSIGNMENT.test(w));
+    return [first, ...rest].every((w) => SHELL_ASSIGNMENT.test(w));
+  });
+}
+
 /** What a session's shell keeps of the daemon's environment: nothing secret-bearing. */
 const SHELL_EXACT = new Set([
   "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TZ", "TERM", "TMPDIR", "TEMP", "TMP", "COLORTERM",
