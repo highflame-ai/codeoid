@@ -6,7 +6,8 @@
  * so the mock stands in for every provider.
  */
 
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, it } from "bun:test";
+import { loadShellParser } from "../daemon/shell/parse.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -648,6 +649,10 @@ describe("going back a turn: the agent really forgets", () => {
 });
 
 describe("irreversibleEffects", () => {
+  beforeAll(async () => {
+    await loadShellParser();
+  });
+
   it("lists external tool calls and shell commands with effects outside the workdir", () => {
     const effects = irreversibleEffects([
       { role: "user", content: "x" },
@@ -665,12 +670,74 @@ describe("irreversibleEffects", () => {
           { id: "4", name: "write_file", originalName: "Write", input: { file_path: "a" }, output: "", success: true },
         ],
       },
-    ]);
+    ], { workdir: "/w/proj" });
     expect(effects).toEqual([
       { tool: "Bash", detail: "git push origin main" },
       { tool: "mcp__github__create_pr", detail: '{"title":"x"}' },
       { tool: "bash", detail: "curl -H 'Authorization: «redacted»' https://x" },
       { tool: "run_shell_command", detail: "npm publish" },
+    ]);
+  });
+
+  it("reads what a command runs, not its text (#431)", () => {
+    const shell = (command: string) => ({ id: command, name: "run_shell", originalName: "Bash", input: { command }, output: "", success: true });
+    const effects = irreversibleEffects(
+      [
+        { role: "user", content: "x" },
+        {
+          role: "assistant",
+          content: "",
+          providerId: "p",
+          model: "m",
+          toolCalls: [
+            shell("echo 'git push is how you publish'"), // only text
+            shell("rm -rf build"), // inside the workspace: going back restores it
+            shell("mv a.ts src/a.ts"),
+            shell("bash -c 'git push -f'"), // through a wrapper
+            shell("sudo make install"),
+            shell("echo x > ~/.bashrc"), // a write outside
+            shell("rm -rf ../sibling"),
+            shell('eval "$CMD"'), // can't be read: not promised either
+          ],
+        },
+      ],
+      { workdir: "/w/proj" },
+    );
+    expect(effects.map((e) => e.detail)).toEqual(["bash -c 'git push -f'", "sudo make install", "echo x > ~/.bashrc", "rm -rf ../sibling", 'eval "$CMD"']);
+  });
+
+  it("lists more of what going back can't undo, and not git's reads (round-1 audit)", () => {
+    const shell = (command: string) => ({ id: command, name: "run_shell", originalName: "Bash", input: { command }, output: "", success: true });
+    const effects = irreversibleEffects(
+      [
+        { role: "user", content: "x" },
+        {
+          role: "assistant",
+          content: "",
+          providerId: "p",
+          model: "m",
+          toolCalls: [
+            shell("find /tmp -delete"),
+            shell("find . -name '*.o' -delete"), // inside the workspace
+            shell("sed -i 's/a/b/' ~/.bashrc"),
+            shell("sed -i 's/a/b/' src/a.ts"),
+            shell("python3 -m pip install x"),
+            shell("npm --global install x"),
+            shell("bash -o pipefail -c 'git push'"),
+            shell("echo 'git push' | sh"),
+            shell("git config --get user.name"),
+          ],
+        },
+      ],
+      { workdir: "/w/proj" },
+    );
+    expect(effects.map((e) => e.detail)).toEqual([
+      "find /tmp -delete",
+      "sed -i 's/a/b/' ~/.bashrc",
+      "python3 -m pip install x",
+      "npm --global install x",
+      "bash -o pipefail -c 'git push'",
+      "echo 'git push' | sh",
     ]);
   });
 });

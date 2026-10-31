@@ -6,10 +6,11 @@
 
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
-import { mcpRefreshSummary } from "@highflame/codeoid-core";
+import { formatToolRisk, mcpRefreshSummary } from "@highflame/codeoid-core";
 import type { CodeoidConfig } from "../config.js";
 import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
+  ToolRisk,
   ClientMessage,
   CollaborationConfig,
   EffortLevel,
@@ -154,7 +155,7 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
     }
 
     case "session.message": {
-      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string } }; identity?: { name?: string; type?: string } };
+      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string; risk?: ToolRisk } }; identity?: { name?: string; type?: string } };
       const id = sm.identity?.name ? `${DIM}${S(sm.identity.name)}${RESET} ` : "";
       switch (sm.role) {
         case "user":
@@ -183,7 +184,8 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
             state.latestApprovalId = sm.tool?.state?.approvalId ?? null;
             state.latestApprovalMsgId = sm.messageId ?? null;
             state.lastPrompt = "tool";
-            return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n  Type 'yes' to approve, 'no' to deny\n`;
+            const risk = formatToolRisk(sm.tool?.state?.risk);
+            return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n${risk ? `  ${RED}▲ ${S(risk)}${RESET}\n` : ""}  Type 'yes' to approve, 'no' to deny\n`;
           }
           return `\n${id}${YELLOW}⚡ ${name} [${phase}]${RESET}\n${reshow}`;
         }
@@ -1189,6 +1191,8 @@ export class TerminalClient {
     // can't restyle or overwrite.
     if (all.length > 1) console.log(`${all.length} tool calls are waiting; this is [${n}] (pick another with --pick N):`);
     console.log(`${oneLine(pending.toolName)}  (${oneLine(pending.approvalId)})`);
+    const risk = formatToolRisk(pending.risk);
+    if (risk) console.log(`▲ ${oneLine(risk)}`);
     const shown = plainText(pending.input === undefined ? "" : JSON.stringify(pending.input, null, 2) ?? "");
     const cut = shown.length > APPROVE_SHOW_MAX;
     console.log(cut ? shown.slice(0, APPROVE_SHOW_MAX) : shown);

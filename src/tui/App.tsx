@@ -1332,7 +1332,7 @@ export function App({ config, createClient = (c, d) => new TuiWsClient(c, d) }: 
   //   - working          → mid-turn queue hint; Enter pushes now, Claude sees mid-stream
   //   - idle             → normal send copy
   const promptHint = focusedSession?.pendingApproval
-    ? `⎆ ${focusedSession.pendingApproval.toolName}: ${focusedSession.pendingApproval.description} — press y/n`
+    ? `⎆ ${focusedSession.pendingApproval.toolName}: ${focusedSession.pendingApproval.description}${focusedSession.pendingApproval.risk ? ` ▲ ${focusedSession.pendingApproval.risk}` : ""} — press y/n`
     : pendingDialog
       ? dialogHint(pendingDialog)
       : focusedSession?.info.status === "thinking" ||

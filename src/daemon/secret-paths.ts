@@ -26,11 +26,13 @@
  * (a `Grep` over the home directory) is not refused — it is usually innocent —
  * but never runs unprompted: the owner sees it and decides.
  *
- * LIMITS. Only file and search tools are judged: a shell command line can't be
- * parsed reliably. Whether a shell `cat` prompts depends on the backend and
- * mode — guarded mode asks on Claude and the Gemini CLI, but Codex's
+ * Shell commands are judged too (#431): the risk check (risk/shell-risk.ts)
+ * parses a command line and runs every path it recognises through this verdict
+ * (a best effort: a path spelled in a way it doesn't follow isn't checked).
+ *
+ * LIMITS. A command a backend runs without asking codeoid isn't seen: Codex's
  * `untrusted` policy and qwen run commands they consider read-only without
- * asking, and autonomous mode runs every command. And code the workdir itself
+ * asking, and Codex in autonomous mode asks about nothing (#442). And code the workdir itself
  * runs (a project's Claude hooks, MCP servers) runs with the daemon user's
  * full rights; nothing here contains it. See docs/CONFIGURATION.md.
  *
@@ -149,6 +151,11 @@ function candidatePaths(toolName: string, input: unknown): string[] {
   // A search with no root searches the workdir.
   if (out.length === 0 && SEARCH_TOOLS.has(toolName)) out.push(".");
   return out;
+}
+
+/** The directories credential files live in: codeoid's config dir and each agent CLI's login dir. */
+export function secretDirsOf(configDir: string): string[] {
+  return [resolve(configDir), ...cliCredentialFiles().map((f) => dirname(f))];
 }
 
 /**

@@ -32,6 +32,8 @@ export interface TuiSession {
     approvalId: string;
     toolName: string;
     description: string;
+    /** A shell command's risk, said in the prompt (#431). */
+    risk?: string;
   } | null;
 }
 
