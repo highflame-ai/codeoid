@@ -864,7 +864,7 @@ export class OpencodeProvider implements SessionProvider {
       try {
         let info = await conn.client.getSession(this.#backingSessionId);
         await conn.client.updateSession(info.id, { permissions: rules });
-        if (sessionRunning(info)) info = await this.#stopLeftover(conn, info);
+        if (sessionRunning(info) && (await this.#runsNow(conn, info.id))) info = await this.#stopLeftover(conn, info);
         info = await this.#moveInto(conn, info, workdir);
         this.#sessionModel = info.model ?? null;
         this.#agentApplied = info.agent !== undefined && info.agent === this.#agent;
@@ -905,13 +905,22 @@ export class OpencodeProvider implements SessionProvider {
     console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] opencode session ${info.id} runs an execution started after its backend was torn down — stopping it`);
     await conn.client.interrupt(info.id).catch(() => {});
     const until = Date.now() + INTERRUPT_SETTLE_MS;
-    let now = info;
-    while (sessionRunning(now) && Date.now() < until) {
+    let running = await this.#runsNow(conn, info.id);
+    while (running && Date.now() < until) {
       await Bun.sleep(50);
-      now = await conn.client.getSession(info.id);
+      running = await this.#runsNow(conn, info.id);
     }
-    if (sessionRunning(now)) throw new Error(`opencode session ${info.id} is still running something codeoid didn't start, and didn't stop — try again`);
-    return now;
+    if (running) throw new Error(`opencode session ${info.id} is still running something codeoid didn't start, and didn't stop — try again`);
+    return conn.client.getSession(info.id);
+  }
+
+  /**
+   * Whether the server runs the session now. Its stored `busy`/`idle` say
+   * what it last recorded: a server that died mid-execution never wrote the
+   * `idle`, so a session it left looks busy for good on the next one.
+   */
+  async #runsNow(conn: OpencodeConnection, id: string): Promise<boolean> {
+    return id in (await conn.client.activeSessions());
   }
 
   /**

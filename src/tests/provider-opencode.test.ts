@@ -1231,6 +1231,28 @@ describe("opencode background shells", () => {
     expect(await conn.client.pendingPermissions(ses)).toEqual([]);
     await rebuilt.teardown();
   });
+
+  it("a session its dead server left marked busy, running nothing, takes the next turn: nothing is stopped", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server, { sessionId: "sess-died", initialBackingId: "sess-died" });
+    await collect(p.runTurn(opts("hi")));
+    const ses = p.backingSessionId;
+    await p.teardown();
+    const conn = await server.ensure();
+    await fetch(`${conn.client.baseUrl}/__fake/died/${ses}`, { method: "POST" });
+    for (const provider of [p, makeProvider(server, { sessionId: "sess-died", initialBackingId: ses })]) {
+      const interrupts = (await fakeState(server)).interrupts.length;
+      const started = Date.now();
+      const events = await collect(provider.runTurn(opts("hi")));
+      expect(events.find((e) => e.type === "error")).toBeUndefined();
+      expect(texts(events, "text_done")).toEqual(["Hello, world"]);
+      expect(Date.now() - started).toBeLessThan(3_000);
+      expect(provider.backingSessionId).toBe(ses);
+      expect((await fakeState(server)).interrupts.slice(interrupts)).toEqual([]);
+      await provider.teardown();
+      await fetch(`${conn.client.baseUrl}/__fake/died/${ses}`, { method: "POST" });
+    }
+  });
 });
 
 // ── O11 questions ────────────────────────────────────────────────────────────

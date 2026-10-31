@@ -121,7 +121,9 @@
  * …/move` rebinds a session to another (one that exists).
  * `GET /__fake/state` (test-only, no auth) returns everything recorded;
  * `POST /__fake/delete/<id>[?quiet=1]` deletes a session (quiet: no event);
- * `POST /__fake/tamper/<id>` sets its rules to allow-all and saves an "always".
+ * `POST /__fake/tamper/<id>` sets its rules to allow-all and saves an "always";
+ * `POST /__fake/died/<id>` leaves its record as a server that died
+ * mid-execution does (busy, never idle again, nothing running).
  */
 
 import { appendFileSync, existsSync } from "node:fs";
@@ -1215,6 +1217,18 @@ const server = Bun.serve({
       const target = sessions.get(tamper[1]!);
       if (target) target.permissions = [{ action: "*", resource: "*", effect: "allow" }];
       state.saved.push({ id: nextId("prm"), action: "*", resource: "*" });
+      return new Response(null, { status: target ? 204 : 404 });
+    }
+    const died = /^\/__fake\/died\/([^/]+)$/.exec(path);
+    if (died) {
+      // What real 2.2.5 keeps of a session whose server died mid-execution:
+      // `busy` past `idle` for good, though nothing runs (not in `/active`),
+      // and an interrupt finds nothing to stop, so writes no `idle`.
+      const target = sessions.get(died[1]!);
+      if (target) {
+        target.idle = Date.now() - 10;
+        target.busy = Date.now();
+      }
       return new Response(null, { status: target ? 204 : 404 });
     }
     if (path === "/__fake/state") return json({ ...state, sessions: [...sessions.values()].map(info), mounts: Object.fromEntries([...mounts].map(([d, m]) => [d, [...m.keys()]])) });

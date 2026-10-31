@@ -374,7 +374,9 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
 - **Teardown** stops the session's execution, subagents and background shells
   (`GET`/`DELETE /api/shell`: a stopped shell still wakes its session), and the
   wake. A fresh attach to a session found running stops that leftover
-  execution before prompting (`#stopLeftover`).
+  execution before prompting (`#stopLeftover`). Running means listed in
+  `GET /api/session/active`: a server that died mid-execution never wrote
+  the session's `idle`, so its stored `busy` is stale on the next server.
 - **Events**: the live feed is the only stream: it carries each session's
   durable events (blocks, tools, steps with cost, executions; deduped by
   `durable.seq`) and the ephemeral ones (deltas, `permission.asked`, forms,

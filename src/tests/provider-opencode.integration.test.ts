@@ -910,4 +910,33 @@ describe("opencode (real binary)", () => {
     await fork.teardown();
     await parent.teardown();
   }, 180_000);
+
+  maybeScripted("I28 a session whose server died mid-turn (killed, or stopped by codeoid) answers its next turns", async () => {
+    for (const how of ["kill", "stop"] as const) {
+      const sessionId = `it-died-${how}-${Math.random().toString(36).slice(2)}`;
+      const p = provider({ sessionId });
+      expect(done(await collect(p.runTurn(opts("[[text:first]]"))))?.stopReason).toBe("stop");
+      // The server goes away while the turn's shell runs: opencode never records the execution's end.
+      const gate: ToolApprovalFn = async () => {
+        setTimeout(async () => {
+          const conn = await server!.ensure();
+          if (how === "kill") process.kill(conn.pid!, "SIGKILL");
+          else await server!.stop("I28 stop");
+        }, 500);
+        return { behavior: "allow" };
+      };
+      const dead = await collect(p.runTurn(opts('[[tool:shell {"command":"sleep 5","description":"Wait"}]]', { canUseTool: gate })));
+      expect(dead.some((e) => e.type === "error")).toBe(true);
+      const ses = p.backingSessionId;
+      for (const backend of [p, provider({ sessionId, initialBackingId: ses })]) {
+        const started = Date.now();
+        const events = await collect(backend.runTurn(opts("[[text:after the server died]]")));
+        expect(events.find((e) => e.type === "error")).toBeUndefined();
+        expect(texts(events)).toContain("after the server died");
+        expect(Date.now() - started).toBeLessThan(5_000);
+        expect(backend.backingSessionId).toBe(ses);
+        await backend.teardown();
+      }
+    }
+  }, 180_000);
 });
