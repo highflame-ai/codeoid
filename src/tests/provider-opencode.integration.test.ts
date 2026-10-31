@@ -38,6 +38,7 @@
  *   I16 (scripted only) a symlink out of the workdir: a read through it isn't a safe Read, a write names its real file
  *   I17 (scripted only) a plugin can't settle permissions: the user's global one isn't loaded, one in codeoid's config dir is refused
  *   I18 (scripted only) a subagent created in a feed gap is found again (`?parentID=`): its request reaches the gate
+ *   I19 (scripted only) a steer the user's interrupt dropped is withdrawn from opencode's inbox: the next turn doesn't get it
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -598,6 +599,28 @@ describe("opencode (real binary)", () => {
     const start = events.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>;
     expect(events.some((e) => e.type === "subagent_stop" && e.agentId === start.agentId)).toBe(true);
     expect(done(events)?.stopReason).toBe("stop");
+    await p.teardown();
+  }, 180_000);
+
+  maybeScripted("I19 a steer the user's interrupt dropped is withdrawn: the next turn doesn't get it", async () => {
+    // Real 2.2.x keeps a steer it hadn't taken in the inbox and delivers it with the next prompt.
+    const p = provider();
+    const run = p.runTurn(opts("[[slow:200]] [[text:a b c d e f g h i j k l m n o p q r s t]]"));
+    let pushed = false;
+    for await (const e of run.events) {
+      if (!pushed && e.type === "text_delta") {
+        pushed = true;
+        run.pushMidTurn?.("[[text:dropped-steer]]", "now");
+        setTimeout(() => void run.interrupt(), 150);
+      }
+      if (e.type === "turn_done" || e.type === "error") break;
+    }
+    await Bun.sleep(500);
+    const next = await collect(p.runTurn(opts("[[text:fresh]]")));
+    expect(texts(next)).toEqual(["fresh"]);
+    const conn = await server!.ensure();
+    const stored = JSON.stringify((await conn.client.messages(p.backingSessionId)).data);
+    expect(stored).not.toContain("dropped-steer");
     await p.teardown();
   }, 180_000);
 });
