@@ -566,6 +566,25 @@ describe("opencode cost and tokens", () => {
     const st = await fakeState(server);
     expect(st.interrupts).toHaveLength(1);
   });
+
+  it("a turn the server's death ended still reports its spend, on the next turn", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const run = p.runTurn(opts("costly"));
+    const events: ProviderEvent[] = [];
+    let calls = 0;
+    for await (const e of run.events) {
+      events.push(e);
+      if (e.type === "llm_call" && ++calls === 2) process.kill(server.pid!, "SIGKILL");
+      if (e.type === "turn_done" || e.type === "error") break;
+    }
+    expect(events.at(-1)?.type).toBe("error");
+    expect(calls).toBe(2);
+    // Two $2 steps ran before the death; Session records no cost for an error.
+    const next = await collect(p.runTurn(opts("hi")));
+    expect(done(next)!.totalCostUsd).toBeCloseTo(4 + 0.0123, 6);
+    await p.teardown();
+  });
 });
 
 // ── O9 MCP ───────────────────────────────────────────────────────────────────

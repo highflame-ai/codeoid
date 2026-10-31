@@ -151,6 +151,10 @@ function addTokens(u: Usage, t: OcTokenUsage | undefined, cost: number | undefin
   if (typeof cost === "number" && Number.isFinite(cost)) u.cost += cost;
 }
 
+function addUsage(into: Usage, from: Usage): void {
+  for (const k of Object.keys(into) as Array<keyof Usage>) into[k] += from[k];
+}
+
 interface Gate {
   canUseTool: ToolApprovalFn | null;
   requestUserInput: UiRequestFn | undefined;
@@ -572,13 +576,19 @@ export class OpencodeProvider implements SessionProvider {
     if (turn.adopted && reason === "superseded") {
       this.#emitTo(turn, { type: "turn_done", result: this.#result(turn, "superseded") });
     }
+    // Spend no turn_done reported (an error, a replaced or torn-down turn —
+    // Session records no cost for those) counts on the next one.
+    addUsage(this.#carry, turn.usage);
+    turn.usage = emptyUsage();
     turn.queue.close();
     if (this.#turn === turn) this.#turn = null;
   }
 
+  /** The turn's spend so far (and what was carried into it) as a result; reported once. */
   #result(turn: Turn, stopReason: string): NormalizedTurnResult {
     const u = turn.usage;
     const c = this.#carry;
+    turn.usage = emptyUsage();
     this.#carry = emptyUsage();
     return {
       providerId: this.id,
@@ -600,14 +610,7 @@ export class OpencodeProvider implements SessionProvider {
     if (turn.queue.closed) return;
     if (outcome === "failed" && !turn.budgetStopped) {
       // The structured error is what the usage-limit classifier reads; the
-      // spend so far still counts, on the next turn.
-      const u = turn.usage;
-      this.#carry.input += u.input;
-      this.#carry.output += u.output;
-      this.#carry.reasoning += u.reasoning;
-      this.#carry.cacheRead += u.cacheRead;
-      this.#carry.cacheWrite += u.cacheWrite;
-      this.#carry.cost += u.cost;
+      // spend so far still counts, on the next turn (#closeTurn).
       const detail = errorDetail(error ?? turn.stepError);
       this.#emitTo(turn, { type: "error", message: `opencode: ${describeError(error ?? turn.stepError)}`, ...(detail ? { detail } : {}) });
       this.#closeTurn(turn, "failed");
@@ -1103,7 +1106,6 @@ export class OpencodeProvider implements SessionProvider {
   #payBoundary(turn: Turn): void {
     turn.owed--;
     this.#emitTo(turn, { type: "turn_done", result: this.#result(turn, "steered") });
-    turn.usage = emptyUsage();
   }
 
   /** A turn opencode started by itself: hand it to the session. */
