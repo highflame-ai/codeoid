@@ -1156,6 +1156,17 @@ describe("opencode as real 2.2.x servers behave", () => {
     await p.teardown();
   });
 
+  it("a permission asked in a gap is judged on the call opencode stored, not refused", async () => {
+    const { server } = makeServer();
+    const asked: Array<[string, Record<string, unknown>]> = [];
+    const p = makeProvider(server);
+    const events = await collect(p.runTurn(opts("gap-ask", { canUseTool: allowing((name, input) => asked.push([name, input])) })));
+    expect(asked).toEqual([["Bash", { command: "echo gap-ok", description: "x" }]]);
+    expect(events.find((e) => e.type === "tool_complete")).toMatchObject({ success: true });
+    expect(texts(events, "text_done")).toEqual(["about to run a shell", "ran it"]);
+    await p.teardown();
+  });
+
   it("a child session inherits its parent's rules, and still gets codeoid's set on it", async () => {
     const { server } = makeServer();
     const p = makeProvider(server, { sessionId: "sess-kid", initialBackingId: "sess-kid" });

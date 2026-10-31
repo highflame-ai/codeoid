@@ -357,7 +357,8 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   replays nothing and follows nothing, so it isn't read; after a feed gap
   the turn is read back from the session's messages (`#reconcile`: ended
   blocks, steps, settled cards; a turn whose execution ended in the gap ends
-  there). Spend past the steps in `usage.updated` (the title opencode
+  there), and a request re-offered after one takes its call's input from the
+  stored message. Spend past the steps in `usage.updated` (the title opencode
   generates) is billed as a side call. A turn ends with its execution (after
   any steer request still in flight, and any read-back); a `now`/`next` push
   steers and owes Session one absorbed `turn_done` (paid at the steer's

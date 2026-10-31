@@ -1412,6 +1412,27 @@ export class OpencodeProvider implements SessionProvider {
     this.#emit({ type: "tool_start", toolId: id, sdkToolUseId: id, name, input: call!.input, approvalId: `opencode-auto-${id}` });
   }
 
+  /**
+   * The call a request names: as the feed announced it, else as opencode
+   * stored it (the announcement fell in a feed gap — the stored message
+   * holds the call and the input it runs).
+   */
+  async #callFor(conn: OpencodeConnection, req: OcPermissionRequest, key: string, missed: boolean): Promise<OcToolCall | undefined> {
+    const known = missed ? this.#toolCalls.get(key) : await this.#waitForCall(key);
+    if (known && Object.keys(known.input).length > 0) return known;
+    const source = req.source!;
+    try {
+      const m = await conn.client.message(req.sessionID, source.messageID);
+      const block = m.content?.find((b) => b.type === "tool" && b.id === source.id);
+      const input = block?.state?.input;
+      // A `streaming` call's input is still partial text: not something to show.
+      if (block?.name && input && typeof input === "object" && !Array.isArray(input)) this.#recordCall(req.sessionID, source.id, { name: block.name, input });
+    } catch {
+      /* not stored: the request is judged on what it says itself */
+    }
+    return this.#toolCalls.get(key);
+  }
+
   async #waitForCall(key: string): Promise<OcToolCall | undefined> {
     const known = this.#toolCalls.get(key);
     if (known && Object.keys(known.input).length > 0) return known;
@@ -1475,7 +1496,8 @@ export class OpencodeProvider implements SessionProvider {
 
   // ── Approvals ─────────────────────────────────────────────────────────
 
-  async #onAsk(req: OcPermissionRequest): Promise<void> {
+  /** A permission request. `missed`: re-offered after a feed gap, so its call's announcement may be lost. */
+  async #onAsk(req: OcPermissionRequest, opts: { missed?: boolean } = {}): Promise<void> {
     if (!req?.id || this.#handledAsks.has(req.id)) return;
     this.#handledAsks.add(req.id);
     const conn = this.#conn;
@@ -1484,7 +1506,7 @@ export class OpencodeProvider implements SessionProvider {
     const isChild = req.sessionID !== ses;
     const gate = this.#turn && !this.#turn.queue.closed ? this.#turn.gate : isChild ? this.#lastGate : null;
     const callKey = `${req.sessionID}:${req.source?.id ?? req.id}`;
-    const source = req.source?.id ? await this.#waitForCall(callKey) : undefined;
+    const source = req.source?.id ? await this.#callFor(conn, req, callKey, opts.missed === true) : undefined;
     // A request made from inside a Code Mode script (its `fetch`) names the
     // script's call: it gets a card of its own, settled by its reply. One
     // script can make many.
@@ -1596,7 +1618,7 @@ export class OpencodeProvider implements SessionProvider {
       void conn.client
         .pendingPermissions(sid)
         .then((reqs) => {
-          for (const r of reqs) void this.#onAsk(r).catch(() => {});
+          for (const r of reqs) void this.#onAsk(r, { missed: true }).catch(() => {});
         })
         .catch(() => {});
       void conn.client

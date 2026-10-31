@@ -52,6 +52,7 @@
  *                    still runs
  *   "gap-open"     → a block ends in the gap, the feed is back while its
  *                    step still runs (a call follows in the same message)
+ *   "gap-ask"      → a shell call and its permission request fall in the gap
  *
  * Knobs (env): FAKE_OPENCODE_VERSION (default 2.2.2), FAKE_OPENCODE_STARTS
  * (append a line per start), FAKE_OPENCODE_UNSAFE_AGENT=1 (an `explore`
@@ -601,6 +602,20 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     endStep(ses, msg);
     const msg2 = step(ses);
     await say(ses, msg2, "after the gap");
+    endStep(ses, msg2);
+    return "succeeded";
+  }
+  if (text.includes("gap-ask")) {
+    // The call and its permission request fall in the gap; the request is
+    // re-offered once the feed is back.
+    const msg = step(ses);
+    await say(ses, msg, "about to run a shell");
+    const up = dropFeed();
+    setTimeout(up, 400);
+    const r = await toolCall(ses, msg, "shell", { command: "echo gap-ok", description: "x" }, { action: "shell", resources: ["echo gap-ok"] });
+    endStep(ses, msg);
+    const msg2 = step(ses);
+    await say(ses, msg2, r.ok ? "ran it" : `refused: ${r.message}`);
     endStep(ses, msg2);
     return "succeeded";
   }
