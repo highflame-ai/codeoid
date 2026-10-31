@@ -360,19 +360,34 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   `durable.seq`) and the ephemeral ones (deltas, `permission.asked`, forms,
   `usage.updated`, child sessions). opencode 2.2's per-session log endpoint
   replays nothing and follows nothing, so it isn't read; after a feed gap
-  the turn is read back from the session's messages (`#reconcile`: ended
-  blocks, steps, settled cards; a turn whose execution ended in the gap ends
-  there), and a request re-offered after one takes its call's input from the
-  stored message. Spend past the steps in `usage.updated` (the title opencode
-  generates) is billed as a side call. A turn ends with its execution (after
-  any steer request still in flight, and any read-back); a `now`/`next` push
-  steers and owes Session one absorbed `turn_done` (paid at the steer's
-  `session.inbox.delivered`, or when its request answers if delivery came
-  first); `later` is delivered inside the running execution.
+  (`#afterGap`) children created in it are listed (`?parentID=`) and each
+  running child is read back (cards, steps, end), then the turn is read back
+  from the session's messages (`#reconcile`: ended blocks, steps, settled
+  cards, steers delivered — a delivered input is a user message under its
+  inbox id; a turn whose execution ended in the gap ends there), or with no
+  turn open an execution that started unseen is adopted and read back. A
+  request re-offered after one takes its call's input from the stored
+  message. Settled calls and counted steps are remembered across turns, so a
+  late feed repeats nothing. Spend past the steps in `usage.updated` (the
+  title opencode generates, a compaction's requests) is billed as a side
+  call; a compaction's end isn't counted. A turn ends with its execution
+  (after any steer request still in flight, and any read-back); a
+  `now`/`next` push waits for the turn's prompt to be posted, steers and owes
+  Session one absorbed `turn_done` (paid at the steer's
+  `session.inbox.delivered`, when its request answers if delivery came first,
+  or — refused — just before the turn's last `turn_done`); `later` is
+  delivered inside the running execution. A user interrupt withdraws the
+  turn's undelivered inputs from opencode's inbox.
 - **Code Mode** (`execute`) and opencode's `browser` tools are hidden by deny
   rules: on 2.2.2 a Code Mode script's `fetch` runs without asking.
 - **MCP** mounts are per location in opencode, so each session's are named
   `coid<sha(session)>_<name>` and its rules deny other sessions' (`coid*`).
+- **Commands** (`runnableCommand`, policy.ts): only opencode's built-ins
+  (known by name and listed description: a config command replaces one of
+  the same name) and the prompts of the session's own mounts run as
+  commands. Another session's mount prompt would run with its credential;
+  a config command's template runs `` !`…` `` through the shell, arguments
+  included, unasked. Any other `/name …` goes to the model as text.
 
 ### Local models (llama.cpp)
 
