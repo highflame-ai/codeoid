@@ -60,7 +60,11 @@
  * (ignore agent overrides), FAKE_OPENCODE_SAVED=1 (one saved "always" rule),
  * FAKE_OPENCODE_STEER_REPLY_MS (answer a steer's prompt request that long
  * after taking it, so its delivery comes first), FAKE_OPENCODE_SLOW_SYNTHETIC_MS
- * (answer a synthetic input that late).
+ * (answer a synthetic input that late), FAKE_OPENCODE_PLUGIN=1|late (a
+ * plugin that isn't a built-in, listed from the start or once a prompt was
+ * posted), FAKE_OPENCODE_AUTOALLOW=1|child (every permission request — or a
+ * child session's only — is settled "once" without being published, as
+ * such a plugin's hook does).
  * `GET /__fake/state` (test-only, no auth) returns everything recorded;
  * `POST /__fake/delete/<id>[?quiet=1]` deletes a session (quiet: no event).
  */
@@ -106,6 +110,7 @@ interface Ses {
 const state = {
   env: {
     OPENCODE_DB: process.env.OPENCODE_DB,
+    OPENCODE_CONFIG_DIR: process.env.OPENCODE_CONFIG_DIR,
     OPENCODE_DISABLE_PROJECT_CONFIG: process.env.OPENCODE_DISABLE_PROJECT_CONFIG,
     OPENCODE_DISABLE_CLAUDE_CODE: process.env.OPENCODE_DISABLE_CLAUDE_CODE,
     passwordSet: password.length > 0,
@@ -272,6 +277,9 @@ class Cancelled extends Error {}
 function askPermission(ses: Ses, req: Json): Promise<{ decision: string; message?: string }> {
   const id = nextId("per");
   const full = { id, sessionID: ses.id, ...req };
+  // A plugin's `permission.evaluate` hook settled it: never published.
+  const auto = process.env.FAKE_OPENCODE_AUTOALLOW;
+  if (auto === "1" || (auto === "child" && ses.parentID)) return Promise.resolve({ decision: "once" });
   return new Promise((resolve) => {
     pendingPerms.set(id, { req: full, resolve });
     ephemeral("permission.asked", full);
@@ -812,6 +820,14 @@ const server = Bun.serve({
       });
     }
     if (path === "/api/agent") return json({ location: { directory: directoryOf(req, url) }, data: agents() });
+    if (path === "/api/plugin") {
+      const builtin = ["opencode.tool.input.repair", "opencode.config.mcp"].map((id) => ({ id, source: { type: "builtin" }, features: { server: true }, state: { status: "active" } }));
+      const foreign = { id: "user.autoallow", source: { type: "local", path: "/home/u/.config/opencode/plugins/autoallow.js" }, features: { server: true }, state: { status: "active" } };
+      // FAKE_OPENCODE_PLUGIN: `1` from the start, `late` once a prompt was posted (dropped into a watched dir).
+      const knob = process.env.FAKE_OPENCODE_PLUGIN;
+      const listed = knob === "1" || (knob === "late" && state.prompts.length > 0);
+      return json({ location: { directory: directoryOf(req, url) }, data: listed ? [...builtin, foreign] : builtin });
+    }
     if (path === "/api/model") return json({ location: { directory: directoryOf(req, url) }, data: MODELS });
     if (path === "/api/model/default") return json({ location: { directory: directoryOf(req, url) }, data: MODELS[0] });
     if (path === "/api/command") return json({ location: { directory: directoryOf(req, url) }, data: [{ name: "review", description: "Review changes" }, { name: "noop", description: "Does nothing" }] });

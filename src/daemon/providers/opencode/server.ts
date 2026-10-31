@@ -10,12 +10,17 @@
  * Launch: `opencode serve --stdio --port 0 --hostname 127.0.0.1`, which prints
  * one JSON line `{"url": ...}` when it listens. A fresh random password per
  * start (`OPENCODE_PASSWORD`, HTTP Basic). The database is codeoid's
- * (`OPENCODE_DB`), never the user's, and codeoid's policy rides in
- * `OPENCODE_CONFIG_CONTENT` (policy.ts).
+ * (`OPENCODE_DB`), never the user's, so is its global config directory
+ * (`OPENCODE_CONFIG_DIR`, `config/` beside the database), and codeoid's
+ * policy rides in `OPENCODE_CONFIG_CONTENT` (policy.ts), with the provider
+ * and model keys of the user's own global config.
  *
  * Before a server is handed out it must: report a supported version
- * (`GET /api/info`), accept the password, and pass the agent check
- * (policy.ts, layer 3) — restarting once with overrides if needed.
+ * (`GET /api/info`), accept the password, pass the agent check (policy.ts,
+ * layer 3) — restarting once with overrides if needed — and run no plugin
+ * but opencode's built-ins. The plugin check is made again for each
+ * session's location before every turn (`checkPlugins`); a server that fails
+ * it is stopped.
  *
  * The live feed (`GET /api/event`) is read here once for all sessions and
  * fanned out; each provider filters for its own sessions. It is the only
@@ -25,9 +30,19 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { OpencodeClient, OpencodeHttpError, type OcEvent, type OcRule } from "./client.js";
-import { agentOverrides, buildOpencodeEnv, opencodeConfig, serverEnv, unsafeAgents } from "./policy.js";
+import {
+  agentOverrides,
+  buildOpencodeEnv,
+  describePlugin,
+  foreignPlugins,
+  opencodeConfig,
+  serverEnv,
+  unsafeAgents,
+  userModelConfig,
+  userOpencodeConfigDir,
+} from "./policy.js";
 import { opencodeVersionProblem } from "./resolve.js";
 
 /**
@@ -89,6 +104,13 @@ export interface OpencodeServerOptions {
   onIncompatible?: (hint: string) => void;
   /** Model providers added to the server's config (opencode's `providers`; tests point one at a local scripted model). */
   modelProviders?: Record<string, unknown>;
+  /** The user's own opencode global config dir, whose provider and model keys are carried over; null: none. Default: as opencode finds it. */
+  userConfigDir?: string | null;
+}
+
+/** A server running a plugin codeoid doesn't know: refused. */
+export class OpencodeUntrustedError extends Error {
+  override name = "OpencodeUntrustedError";
 }
 
 /** One running server, as handed to a provider. `generation` changes on every start. */
@@ -162,15 +184,45 @@ export class OpencodeServer {
     return conn;
   }
 
-  async stop(): Promise<void> {
+  /** Stop the server; `reason` is what its sessions are told. */
+  async stop(reason = "opencode server stopped"): Promise<void> {
     const launched = this.#launched;
-    this.#detach("opencode server stopped");
+    this.#detach(reason);
     if (launched) await shutdown(launched);
     LIVE_SERVERS.delete(this);
   }
 
+  /**
+   * Refuse a server that runs a plugin opencode doesn't ship, for
+   * `directory`'s location (the server's own when omitted): a plugin can
+   * settle permission requests itself, so codeoid would never see them.
+   * The server is stopped (the next turn starts a new one, which is checked
+   * again). The location must have been used (a request naming it) for its
+   * plugins to be listed.
+   */
+  async checkPlugins(conn: OpencodeConnection, directory?: string): Promise<void> {
+    const foreign = foreignPlugins(await conn.client.plugins(directory));
+    if (foreign.length === 0) return;
+    const reason = untrustedPlugins(foreign.map(describePlugin));
+    console.error(`[opencode-server] ${reason}`);
+    if (this.#conn === conn) await this.stop(reason);
+    throw new OpencodeUntrustedError(reason);
+  }
+
+  /** Stop the server because it did something codeoid can't allow (a call that ran without asking). */
+  async distrust(conn: OpencodeConnection, reason: string): Promise<void> {
+    console.error(`[opencode-server] stopping the server: ${reason}`);
+    if (this.#conn === conn) await this.stop(reason);
+  }
+
+  /** codeoid's own config dir for the server (`OPENCODE_CONFIG_DIR`): nothing in it but what codeoid puts there. */
+  get configDir(): string {
+    return join(dirname(this.#opts.dbPath), "config");
+  }
+
   async #start(): Promise<OpencodeConnection> {
     mkdirSync(dirname(this.#opts.dbPath), { recursive: true, mode: 0o700 });
+    mkdirSync(this.configDir, { recursive: true, mode: 0o700 });
     for (let attempt = 0; ; attempt++) {
       const launched = await this.#launch();
       try {
@@ -180,7 +232,8 @@ export class OpencodeServer {
           this.#opts.onIncompatible?.(problem);
           throw new OpencodeIncompatibleError(problem);
         }
-        // The auth check too (both routes need the password).
+        // The auth check too (both routes need the password). It also loads
+        // the server's own location, so its plugins are listed below.
         const agents = await launched.client.agents();
         const unsafe = unsafeAgents(agents);
         if (unsafe.length > 0) {
@@ -194,6 +247,9 @@ export class OpencodeServer {
             `opencode agents ${unsafe.map((a) => JSON.stringify(a.id)).join(", ")} would run tools without asking codeoid, even with codeoid's overrides — refusing to use this opencode server`,
           );
         }
+        // Global plugins (the system config dir's, codeoid's own config dir's) show in every location.
+        const foreign = foreignPlugins(await launched.client.plugins());
+        if (foreign.length > 0) throw new OpencodeUntrustedError(untrustedPlugins(foreign.map(describePlugin)));
         return this.#adopt(launched);
       } catch (err) {
         await shutdown(launched);
@@ -207,9 +263,11 @@ export class OpencodeServer {
 
   async #launch(): Promise<Launched> {
     const password = randomBytes(32).toString("base64url");
+    const userDir = this.#opts.userConfigDir === undefined ? userOpencodeConfigDir() : this.#opts.userConfigDir;
+    const config = opencodeConfig(this.#overrides, this.#opts.modelProviders, userDir ? userModelConfig(userDir) : {});
     const env = {
       ...(this.#opts.env?.() ?? buildOpencodeEnv()),
-      ...serverEnv({ password, dbPath: this.#opts.dbPath, config: opencodeConfig(this.#overrides, this.#opts.modelProviders) }),
+      ...serverEnv({ password, dbPath: this.#opts.dbPath, configDir: this.configDir, config }),
     };
     const proc = spawn(
       this.#opts.command,
@@ -359,6 +417,10 @@ async function shutdown(launched: Launched): Promise<void> {
   proc.kill("SIGTERM");
   const termed = await Promise.race([launched.exited.then(() => true), Bun.sleep(STOP_GRACE_MS).then(() => false)]);
   if (!termed) proc.kill("SIGKILL");
+}
+
+function untrustedPlugins(names: readonly string[]): string {
+  return `opencode runs plugins codeoid doesn't know (${names.join(", ")}), which can settle permission requests without asking codeoid — refusing to use this opencode server. Remove them from opencode's system configuration, or from codeoid's own opencode config dir.`;
 }
 
 function isLoopbackUrl(url: string): boolean {

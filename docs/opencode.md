@@ -33,7 +33,7 @@
 ## How it runs
 
 - **One private server per daemon.** The first opencode session's first turn starts `opencode serve --stdio --port 0 --hostname 127.0.0.1`; every opencode session shares it. It listens on loopback only, with a fresh random password each start (HTTP Basic). If it dies, the next turn starts a new one and sessions resume. It stops with the daemon, and can't outlive one: it exits when the pipe codeoid holds closes.
-- **Never your own opencode.** Its database is codeoid's (`dbPath` above), so codeoid's sessions don't mix with yours. Your `OPENCODE_*` environment doesn't reach it; your global opencode config (`~/.config/opencode`) does, for providers and models. A repository's own opencode config is not read (`OPENCODE_DISABLE_PROJECT_CONFIG`), nor are `.claude` skills (`OPENCODE_DISABLE_CLAUDE_CODE`).
+- **Never your own opencode.** Its database is codeoid's (`dbPath` above), so codeoid's sessions don't mix with yours, and so is its global config directory (`config/` beside the database). Your `OPENCODE_*` environment doesn't reach it. From your global opencode config (`~/.config/opencode/opencode.json[c]`) it takes only which providers and models you have (`provider`, `providers`, `model`, `small_model`, `enabled_providers`, `disabled_providers`); your plugins, agents, permissions, MCP servers and instructions there are not loaded. A repository's own opencode config is not read (`OPENCODE_DISABLE_PROJECT_CONFIG`), nor are `.claude` skills (`OPENCODE_DISABLE_CLAUDE_CODE`). opencode still keeps its logs and shell-output files under your own opencode data directories (`~/.local/share/opencode`, `~/.local/state/opencode`, `~/.cache/opencode`): moving them would change those directories for every command opencode runs for you.
 - **One opencode session per codeoid session**, in the session's working directory. Its `ses_…` id is the session's backing id: a daemon restart resumes it.
 
 ## What works
@@ -64,6 +64,7 @@ codeoid owns the policy, so opencode is set to ask about every action and never 
 - Paths are shown as they really resolve. opencode asks about a directory outside the session's working directory only when the path as written is outside it, and reads and writes through a symlink inside it without asking; so a read or search that a symlink takes outside the working directory is asked as `opencode_external_directory`, which is never approved on its own (`Read`, `Glob` and `Grep` are, in guarded mode), and a write names the file it really changes.
 - Anything that can't be shown faithfully is rejected without asking: an action codeoid doesn't know (a plugin's, an MCP server codeoid didn't mount), another session's MCP mount, a shell request without its command. A request still waiting when the server goes away counts as rejected.
 - The tools that act without asking (opencode's session rename/move, worktree and schedule tools) are turned off.
+- No plugin but opencode's own runs: a plugin can settle a request itself, so opencode would never ask codeoid. Your global plugins aren't loaded (above); a server that lists any other (from opencode's system config directory, say `/etc/opencode`) is refused when it starts and before every turn, and if opencode ever runs a call without asking codeoid, codeoid stops the server and the turn ends saying so.
 - Code Mode (opencode's `execute` tool, which runs a script that calls tools and `fetch`) is turned off: on opencode 2.2.2 a script's `fetch` reaches any URL without asking anyone. opencode's browser tools stay off too, as opencode's own agents have them.
 
 What the approver sees, in codeoid's terms (so the same rules, hooks and roles apply as on Claude):
@@ -83,7 +84,7 @@ Because every call reaches the gate under these names, a pipeline phase's capabi
 
 ## Limits
 
-- **Your own opencode MCP servers and plugin tools are refused.** Mount servers through codeoid's registry instead (`mcpServers` in codeoid's config); they reach opencode and every other backend.
+- **Your own opencode MCP servers and plugins aren't loaded.** Mount servers through codeoid's registry instead (`mcpServers` in codeoid's config); they reach opencode and every other backend.
 - **A question asks twice in guarded mode**: once to let opencode ask, then the question.
 - **codeoid accounts don't apply** (`codeoid account …`): opencode's credentials are its environment keys and its own sign-ins.
 - **Another backend's history reaches opencode as a transcript**, not as opencode messages.
@@ -95,7 +96,9 @@ Because every call reaches the gate under these names, a pipeline phase's capabi
 
 - *opencode is unavailable: no opencode binary found* — install it, or set `providers.opencode.command`.
 - *opencode X is installed, but codeoid supports opencode 2.2.x* — install a 2.2 release.
-- *opencode agents … would run tools without asking codeoid* — an agent's rules allow tools in a way codeoid's overrides can't reach (a plugin, say). Remove it from your global opencode config.
+- *opencode agents … would run tools without asking codeoid* — an agent's rules allow tools in a way codeoid's overrides can't reach. Remove it from opencode's system config directory (`/etc/opencode`).
+- *opencode runs plugins codeoid doesn't know* — a plugin in opencode's system config directory, or in codeoid's own opencode config dir (`config/` beside its database), which codeoid never writes. Remove it there.
+- *opencode ran … without asking codeoid* — something settled a permission request itself; codeoid stopped the server. The next turn starts a new one, checked again.
 - *No models in the picker* — opencode lists only models it has a credential for; see Setup.
 - *A session runs a model you didn't pick* — with no model chosen, opencode uses its own default, which with no credentials set up is one of opencode's free hosted models (on opencode.ai). Pick a model, or set one in your opencode config.
-- The server's log goes nowhere by default; run `opencode serve` by hand with the same `OPENCODE_DB` to see what it says about your configuration.
+- The server's log goes nowhere by default; run `opencode serve` by hand with the same `OPENCODE_DB` and `OPENCODE_CONFIG_DIR` to see what it says about your configuration.

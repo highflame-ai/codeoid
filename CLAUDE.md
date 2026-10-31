@@ -349,7 +349,12 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   that would act unasked gets overrides (one restart) or the server is refused;
   never-asking tool plugins are disabled; saved "always" rules are deleted.
   Replies are `once` or `reject` with a message, never `always`
-  (`OpencodeClient.replyPermission` can't express it).
+  (`OpencodeClient.replyPermission` can't express it). A plugin can settle a
+  request itself, so the server's global config dir is codeoid's
+  (`OPENCODE_CONFIG_DIR`, `config/` beside the DB; only the provider and model
+  keys of the user's `~/.config/opencode` are carried in), a server listing a
+  plugin that isn't a built-in is refused at start and before every turn
+  (`checkPlugins`), and a call that succeeded without asking stops the server.
 - **Events**: the live feed is the only stream: it carries each session's
   durable events (blocks, tools, steps with cost, executions; deduped by
   `durable.seq`) and the ephemeral ones (deltas, `permission.asked`, forms,

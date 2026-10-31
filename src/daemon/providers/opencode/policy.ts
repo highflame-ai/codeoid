@@ -31,11 +31,23 @@
  * codeoid's gate. With Code Mode gone opencode lists the tools it kept in its
  * catalog directly, so opencode's own `browser` deny (its agents have it,
  * and codeoid's ask-everything would reopen it) is kept too.
+ *
+ * A plugin can settle a permission request itself (its `permission.evaluate`
+ * hook runs after the rules), so opencode would never publish it. The server
+ * reads its global config — plugins, agents, MCP servers, instructions — from
+ * a codeoid-owned directory (`OPENCODE_CONFIG_DIR`), never the user's; only
+ * the provider and model keys of the user's global config are carried over
+ * ({@link userModelConfig}). A server listing any plugin that isn't one of
+ * opencode's built-ins is refused (server.ts), and a call that ran without
+ * asking stops it (index.ts).
  */
 
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { buildSubprocessEnv } from "../env.js";
-import type { OcAgentInfo, OcRule } from "./client.js";
+import type { OcAgentInfo, OcPluginInfo, OcRule } from "./client.js";
 
 /** Plugins whose tools act without asking — disabled (`-<id>`, opencode's plugin control). */
 export const DISABLED_PLUGINS = ["-opencode.tools", "-opencode.tool.schedule"] as const;
@@ -129,13 +141,63 @@ export function agentOverrides(agents: readonly OcAgentInfo[]): Record<string, {
 }
 
 /**
- * The config injected with `OPENCODE_CONFIG_CONTENT`. `providers` adds model
- * providers (opencode's `providers` key) and nothing else: the policy keys
- * aren't reachable from it.
+ * The keys of the user's global opencode config codeoid's server takes:
+ * which models and providers it has. Nothing that changes what runs or what
+ * asks (plugins, agents, permissions, MCP servers, instructions).
  */
-export function opencodeConfig(overrides: Record<string, { permissions: OcRule[] }> = {}, providers?: Record<string, unknown>): Record<string, unknown> {
+const CARRIED_KEYS = ["provider", "providers", "model", "small_model", "enabled_providers", "disabled_providers"] as const;
+
+/** The user's own opencode global config directory, as their opencode finds it. */
+export function userOpencodeConfigDir(env: Record<string, string | undefined> = process.env): string {
+  return join(env.XDG_CONFIG_HOME || join(env.HOME || homedir(), ".config"), "opencode");
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * The provider and model keys ({@link CARRIED_KEYS}) of the user's global
+ * opencode config in `dir` (`opencode.json`, then `opencode.jsonc`, as
+ * opencode merges them). Unreadable or absent: nothing.
+ */
+export function userModelConfig(dir: string): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const name of ["opencode.json", "opencode.jsonc"]) {
+    let parsed: unknown;
+    try {
+      parsed = Bun.JSONC.parse(readFileSync(join(dir, name), "utf8"));
+    } catch {
+      continue;
+    }
+    if (!isRecord(parsed)) continue;
+    for (const k of CARRIED_KEYS) {
+      if (!(k in parsed)) continue;
+      const prev = out[k];
+      out[k] = isRecord(prev) && isRecord(parsed[k]) ? { ...prev, ...parsed[k] } : parsed[k];
+    }
+  }
+  return out;
+}
+
+/**
+ * The config injected with `OPENCODE_CONFIG_CONTENT`. `providers` adds model
+ * providers (opencode's `providers` key), `carried` the user's provider and
+ * model keys ({@link userModelConfig}); the policy keys aren't reachable from
+ * either.
+ */
+export function opencodeConfig(
+  overrides: Record<string, { permissions: OcRule[] }> = {},
+  providers?: Record<string, unknown>,
+  carried: Record<string, unknown> = {},
+): Record<string, unknown> {
+  const models: Record<string, unknown> = {};
+  for (const k of CARRIED_KEYS) if (carried[k] !== undefined) models[k] = carried[k];
+  const allProviders = { ...(isRecord(models.providers) ? models.providers : {}), ...(providers ?? {}) };
+  delete models.providers;
   return {
-    ...(providers && Object.keys(providers).length > 0 ? { providers } : {}),
+    ...models,
+    ...(Object.keys(allProviders).length > 0 ? { providers: allProviders } : {}),
     permissions: [{ action: "*", resource: "*", effect: "ask" }, ...HIDDEN_TOOL_RULES],
     plugins: [...DISABLED_PLUGINS],
     // codeoid pins the version it speaks; opencode must not replace itself.
@@ -166,14 +228,31 @@ export function buildOpencodeEnv(base: Record<string, string | undefined> = proc
 }
 
 /** The server's own settings, set last over {@link buildOpencodeEnv}. */
-export function serverEnv(opts: { password: string; dbPath: string; config: Record<string, unknown> }): Record<string, string> {
+export function serverEnv(opts: { password: string; dbPath: string; configDir: string; config: Record<string, unknown> }): Record<string, string> {
   return {
     OPENCODE_PASSWORD: opts.password,
     OPENCODE_DB: opts.dbPath,
+    // Its global config (plugins, agents, MCP servers) is codeoid's, not the
+    // user's `~/.config/opencode`: a plugin there could settle permissions.
+    OPENCODE_CONFIG_DIR: opts.configDir,
     OPENCODE_CONFIG_CONTENT: JSON.stringify(opts.config),
     // A repo's opencode.json could allow tools or add MCP servers codeoid
     // never sees; codeoid's own Claude-side settings aren't opencode's.
     OPENCODE_DISABLE_PROJECT_CONFIG: "1",
     OPENCODE_DISABLE_CLAUDE_CODE: "1",
   };
+}
+
+/**
+ * Plugins a server runs that aren't opencode's own built-ins: any of them
+ * could settle permission requests without codeoid seeing them.
+ */
+export function foreignPlugins(plugins: readonly OcPluginInfo[]): OcPluginInfo[] {
+  return plugins.filter((p) => p.source?.type !== "builtin");
+}
+
+/** How a plugin is named in a refusal. */
+export function describePlugin(p: OcPluginInfo): string {
+  const where = p.source?.path ?? p.source?.target;
+  return `${p.id ?? "(unnamed)"}${where ? ` (${where})` : ""}`;
 }

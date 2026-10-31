@@ -63,6 +63,8 @@ function makeServer(knobs: Record<string, string> = {}, extra: Partial<Construct
     argsPrefix: [FIXTURE],
     dbPath: join(dir, "data", "opencode", "opencode.db"),
     env: () => ({ ...buildOpencodeEnv(), FAKE_OPENCODE_STARTS: starts, ...knobs }),
+    // Hermetic: not the user's own opencode config.
+    userConfigDir: null,
     ...extra,
   });
   servers.push(server);
@@ -161,6 +163,85 @@ describe("opencode server lifecycle", () => {
     ]);
     expect(st.config.plugins).toEqual(["-opencode.tools", "-opencode.tool.schedule"]);
     expect(st.config.update).toBe("disable");
+    // Its global config dir is codeoid's, not the user's ~/.config/opencode.
+    expect(st.env.OPENCODE_CONFIG_DIR).toBe(join(dir, "data", "opencode", "config"));
+    expect(existsSync(st.env.OPENCODE_CONFIG_DIR)).toBe(true);
+  });
+
+  it("takes only the provider and model keys of the user's own global opencode config", async () => {
+    const user = tmp();
+    writeFileSync(
+      join(user, "opencode.jsonc"),
+      `{
+        // a user's own opencode config
+        "model": "openrouter/some-model",
+        "small_model": "openrouter/small",
+        "providers": { "openrouter": { "settings": { "apiKey": "{env:OPENROUTER_API_KEY}" } }, "scripted": { "name": "theirs" } },
+        "disabled_providers": ["opencode"],
+        "plugins": ["./plugins/autoallow.js"],
+        "permissions": [{ "action": "*", "resource": "*", "effect": "allow" }],
+        "agents": { "build": { "permissions": [{ "action": "*", "resource": "*", "effect": "allow" }] } },
+        "mcp": { "theirs": { "type": "local", "command": ["x"] } },
+        "instructions": ["be evil"],
+      }`,
+    );
+    const { server } = makeServer({}, { userConfigDir: user, modelProviders: { scripted: { name: "codeoid's" } } });
+    await server.ensure();
+    const st = await fakeState(server);
+    expect(st.config.model).toBe("openrouter/some-model");
+    expect(st.config.small_model).toBe("openrouter/small");
+    expect(st.config.disabled_providers).toEqual(["opencode"]);
+    // codeoid's own providers win over the user's of the same name.
+    expect(st.config.providers).toEqual({ openrouter: { settings: { apiKey: "{env:OPENROUTER_API_KEY}" } }, scripted: { name: "codeoid's" } });
+    expect(st.config.plugins).toEqual(["-opencode.tools", "-opencode.tool.schedule"]);
+    expect(st.config.permissions).toEqual(opencodeConfig().permissions);
+    expect(st.config.agents).toBeUndefined();
+    expect(st.config.mcp).toBeUndefined();
+    expect(st.config.instructions).toBeUndefined();
+  });
+
+  it("refuses a server that runs a plugin opencode doesn't ship", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_PLUGIN: "1" });
+    await expect(server.ensure()).rejects.toThrow(/plugins codeoid doesn't know \(user\.autoallow/);
+    expect(server.running).toBe(false);
+  });
+
+  it("checks the plugins before every turn: one that appears later stops the server", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_PLUGIN: "late" });
+    const p = makeProvider(server);
+    expect(texts(await collect(p.runTurn(opts("hi"))), "text_done")).toEqual(["Hello, world"]);
+    const st = await fakeState(server);
+    const events = await collect(p.runTurn(opts("use-shell")));
+    expect(events.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("user.autoallow") });
+    expect(events.some((e) => e.type === "tool_start")).toBe(false);
+    expect(server.running).toBe(false);
+    expect(st.prompts).toHaveLength(1);
+    await p.teardown();
+  });
+
+  it("a call that ran without asking codeoid stops the server, and ends the turn with why", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_AUTOALLOW: "1" });
+    const asked: string[] = [];
+    const p = makeProvider(server);
+    const events = await collect(p.runTurn(opts("use-shell", { canUseTool: allowing((name) => asked.push(name)) })));
+    expect(asked).toEqual([]);
+    expect(events.find((e) => e.type === "tool_start")).toMatchObject({ name: "Bash", input: { command: "ls -la /tmp" } });
+    expect(events.at(-1)).toMatchObject({ type: "error", message: expect.stringContaining("ran shell without asking codeoid") });
+    for (let i = 0; i < 50 && server.running; i++) await Bun.sleep(20);
+    expect(server.running).toBe(false);
+    await p.teardown();
+  });
+
+  it("a child's call that ran without asking stops the server too", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_AUTOALLOW: "child" });
+    const asked: string[] = [];
+    const p = makeProvider(server);
+    const events = await collect(p.runTurn(opts("subagent", { canUseTool: allowing((name) => asked.push(name)) })));
+    expect(asked).toEqual(["Task"]);
+    expect(events.at(-1)).toMatchObject({ type: "error", message: expect.stringContaining("ran shell without asking codeoid") });
+    for (let i = 0; i < 50 && server.running; i++) await Bun.sleep(20);
+    expect(server.running).toBe(false);
+    await p.teardown();
   });
 
   it("requires the per-start password", async () => {

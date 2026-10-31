@@ -127,6 +127,13 @@ export interface OcAgentInfo {
   permissions: OcRule[];
 }
 
+/** `Plugin.Info` (subset). */
+export interface OcPluginInfo {
+  id?: string;
+  source: { type: "builtin" | "package" | "local" | "sdk" | string; path?: string; target?: string };
+  state?: { status: string; error?: string };
+}
+
 /** `Command.Info`. */
 export interface OcCommandInfo {
   name: string;
@@ -268,6 +275,11 @@ export class OpencodeClient {
 
   async agents(directory?: string): Promise<OcAgentInfo[]> {
     return (await this.#request<{ data: OcAgentInfo[] }>("GET", "/api/agent", { directory })).data ?? [];
+  }
+
+  /** The plugins the server runs for `directory`'s location (empty until the location has been used). */
+  async plugins(directory?: string): Promise<OcPluginInfo[]> {
+    return (await this.#request<{ data: OcPluginInfo[] }>("GET", "/api/plugin", { directory })).data ?? [];
   }
 
   // ── Sessions ────────────────────────────────────────────────────────
