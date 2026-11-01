@@ -364,7 +364,7 @@ export class MockSessionProvider implements SessionProvider {
         // Without this flush the cleanup arrives before the registration.
         await new Promise<void>((r) => setTimeout(r, 0));
         try {
-          const result = await opts.canUseTool(event.toolId, event.approvalId, event.name, event.input);
+          const result = await opts.canUseTool(event.toolId, event.approvalId, event.name, event.input, undefined, undefined, event.shellCwd);
           this.canUseToolResults.push(result);
         } catch {
           // canUseTool rejection (very unusual — normally returns {behavior}) — treat as denial.

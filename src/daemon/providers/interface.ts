@@ -58,6 +58,14 @@ export type ToolApprovalFn = (
    * gate refuse an agent that isn't this session's (a fork's parent's).
    */
   agentId?: string,
+  /**
+   * For a shell call, the directory the backend reports its shell is in for
+   * this call (Claude's Bash keeps a `cd` between calls; its PreToolUse
+   * hook's `cwd`): relative write targets are judged from there
+   * (outside-writes.ts). Null: the backend's shell may have moved and it
+   * didn't say where. Absent: the backend's shell starts in the workdir.
+   */
+  shellCwd?: string | null,
 ) => Promise<{
   behavior: "allow" | "deny";
   updatedInput?: Record<string, unknown>;
@@ -358,6 +366,8 @@ export type ProviderEvent =
        * the daemon's approval sanitizer doesn't need per-tool hardcoding.
        */
       patchableKeys?: string[];
+      /** As {@link ToolApprovalFn}'s `shellCwd`: where the backend reports this shell call runs. */
+      shellCwd?: string | null;
     }
   /** Fired when a tool result is available (from the provider's user message). */
   | {

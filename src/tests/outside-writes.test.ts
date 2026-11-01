@@ -441,9 +441,9 @@ async function until(cond: () => boolean, ms = 5_000): Promise<void> {
 type Card = { phase: string; risk?: { level: string; reasons: string[] } };
 
 /** One call of `name`/`input` through a real Session's gate: whether it asked, its card, the budget after. */
-async function gateCall(name: string, input: Record<string, unknown>, mode: SessionMode, opts: { unattended?: boolean } = {}) {
+async function gateCall(name: string, input: Record<string, unknown>, mode: SessionMode, opts: { unattended?: boolean; shellCwd?: string | null } = {}) {
   const events: ProviderEvent[] = [
-    { type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name, input, approvalId: "ap-1" },
+    { type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name, input, approvalId: "ap-1", ...(opts.shellCwd !== undefined ? { shellCwd: opts.shellCwd } : {}) },
     { type: "turn_done", result: { providerId: "mock", model: "m", inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0, durationMs: 1 } },
   ];
   const provider = new MockSessionProvider("mock", [events]);
@@ -510,6 +510,24 @@ describe("autonomous mode asks before a write outside the working directory, at 
       const r = await gateCall(name, input, "autonomous");
       expect([name, r.asked, r.behavior]).toEqual([name, false, "allow"]);
       expect(r.card?.risk?.reasons[0] ?? "").not.toContain("outside the working directory");
+    }
+  });
+
+  test("a shell call is judged from the cwd its backend reports: outside or unknown asks, the card and the pending list agree (round 25)", async () => {
+    mkdirSync(join(workdir, "sub"));
+    writeFileSync(join(elsewhere, "f"), "f");
+    symlinkSync(join(elsewhere, "f"), join(workdir, "sub", "notes"));
+    const out = await gateCall("Bash", { command: "echo x >> notes" }, "autonomous", { shellCwd: join(workdir, "sub") });
+    expect([out.asked, out.card?.risk?.reasons[0]]).toEqual([true, `writes outside the working directory: ${join(elsewhere, "f")}`]);
+    expect(out.pending[0]?.risk?.reasons[0]).toBe(`writes outside the working directory: ${join(elsewhere, "f")}`);
+    const skills = await gateCall("Bash", { command: "echo planted > my-skill/NOTE.md" }, "autonomous", { shellCwd: elsewhere });
+    expect(skills.asked).toBe(true);
+    const unknown = await gateCall("Bash", { command: "echo x > notes.txt" }, "autonomous", { shellCwd: null });
+    expect(unknown.asked).toBe(true);
+    // In the workdir, or a backend that reports none: as before.
+    for (const shellCwd of [workdir, undefined]) {
+      const r = await gateCall("Bash", { command: "echo x > notes.txt" }, "autonomous", { shellCwd });
+      expect([shellCwd, r.asked, r.behavior]).toEqual([shellCwd, false, "allow"]);
     }
   });
 

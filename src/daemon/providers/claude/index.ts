@@ -28,7 +28,7 @@ import {
 import { randomUUID } from "node:crypto";
 import { readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve as resolvePath } from "node:path";
+import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { AsyncQueue } from "../../async-queue.js";
 import type { AgentIdentityManager } from "../../agent-identity.js";
 import type { Store } from "../../store.js";
@@ -328,6 +328,13 @@ export class ClaudeProvider implements SessionProvider {
    * double-emit for a tool that does reach the gate.
    */
   #autoApprovedTools = new Set<string>();
+  /**
+   * The cwd the PreToolUse hook reported for each shell call, by tool_use_id,
+   * until canUseTool takes it: Claude's Bash keeps a `cd` between calls, so
+   * a call's relative write targets are judged from there (outside-writes.ts).
+   * Bounded: a call the CLI allows itself never reaches canUseTool.
+   */
+  #shellCwds = new Map<string, string>();
   /** Id-keyed lifecycle events that arrived with no live queue, replayed into
    *  the next turn. See #handleUndeliverable. */
   #carryover: ProviderEvent[] = [];
@@ -617,6 +624,14 @@ export class ClaudeProvider implements SessionProvider {
    * handed to canUseTool (`ask`); one reading a credential file is refused.
    * Fail-closed, as #secretPathDecision is: a throw asks.
    */
+  /** Keep the cwd the hook reports for a shell call, for canUseTool (#shellCwds). */
+  #rememberShellCwd(input: PreToolUseHookInput): void {
+    const cwd = hookShellCwd(input);
+    if (!cwd || !input.tool_use_id || !isShellTool(input.tool_name)) return;
+    this.#shellCwds.set(input.tool_use_id, cwd);
+    if (this.#shellCwds.size > 256) this.#shellCwds.delete(this.#shellCwds.keys().next().value!);
+  }
+
   /** `ask` for a write outside the working directory in autonomous mode, so it reaches codeoid's gate; null otherwise. */
   #outsideWriteDecision(
     input: PreToolUseHookInput,
@@ -625,7 +640,7 @@ export class ClaudeProvider implements SessionProvider {
     let reason: string;
     try {
       if (this.#init.sessionMode?.() !== "autonomous") return null;
-      const outside = outsideWriteOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, workdir);
+      const outside = outsideWriteOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, workdir, hookShellCwd(input));
       if (!outside) return null;
       reason = outsideWriteReason(outside);
     } catch (err) {
@@ -649,7 +664,7 @@ export class ClaudeProvider implements SessionProvider {
       }
       if (!shell) return null;
       const risk = assessShellCommandSync(shell.command, {
-        cwd: resolvePath(workdir, shell.cwd ?? "."),
+        cwd: resolvePath(hookShellCwd(input) ?? workdir, shell.cwd ?? "."),
         workdir,
         configDir: getConfigDir(),
       });
@@ -1269,6 +1284,9 @@ export class ClaudeProvider implements SessionProvider {
               // this hook sees every call.
               const foreign = this.#refuseForeignCall(input);
               if (foreign) return foreign;
+              // Where the CLI says this shell call runs, for the gate's own
+              // judgement in canUseTool (#shellCwds).
+              this.#rememberShellCwd(input);
               // The secret-path rule (secret-paths.ts) is enforced HERE too,
               // not only in Session's canUseTool gate: the CLI allows some calls
               // itself without asking canUseTool (reads inside the workdir in
@@ -1390,6 +1408,11 @@ export class ClaudeProvider implements SessionProvider {
           const foreign = this.#refuseForeignCall({ tool_name: toolName, tool_input: input, ...(sdkAgentId ? { agent_id: sdkAgentId } : {}) });
           if (foreign) return { behavior: "deny" as const, message: foreign.hookSpecificOutput.permissionDecisionReason };
 
+          // A shell call is judged from where the CLI's Bash is now, as its
+          // PreToolUse hook reported; not known (null) when it didn't.
+          const shellCwd = isShellTool(toolName) ? (this.#shellCwds.get(sdkToolUseId) ?? null) : undefined;
+          this.#shellCwds.delete(sdkToolUseId);
+
           // Emit tool_start — Session creates the SessionMessage.
           this.#emit({
             type: "tool_start",
@@ -1399,12 +1422,13 @@ export class ClaudeProvider implements SessionProvider {
             name: toolName,
             input: inputObj,
             approvalId,
+            ...(shellCwd !== undefined ? { shellCwd } : {}),
           });
 
           // Call Session's approval gate (may block until user responds).
           const canUse = this.#currentCanUseTool;
           if (!canUse) return { behavior: "deny" as const, message: "provider not ready" };
-          const result = await canUse(toolId, approvalId, toolName, inputObj, options?.signal, sdkAgentId);
+          const result = await canUse(toolId, approvalId, toolName, inputObj, options?.signal, sdkAgentId, shellCwd);
           if (result.behavior === "allow") {
             return { behavior: "allow", updatedInput: result.updatedInput as Record<string, unknown> | undefined };
           }
@@ -2282,6 +2306,15 @@ export function translateSDKMessage(
  *  project tiers when a pack is activated under `skillScope: "session"`. */
 export function pluginSkillDirs(pluginDirs?: readonly string[]): string[] {
   return (pluginDirs ?? []).map((d) => join(d, "skills"));
+}
+
+/**
+ * The directory a PreToolUse hook input says the call runs in, when it is
+ * absolute: Claude's Bash keeps its cwd between calls (a `cd` in one call
+ * moves the next), and the hook's `cwd` is where it is now. Null otherwise.
+ */
+export function hookShellCwd(input: { cwd?: unknown }): string | null {
+  return typeof input.cwd === "string" && isAbsolute(input.cwd) ? input.cwd : null;
 }
 
 /**

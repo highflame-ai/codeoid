@@ -129,7 +129,7 @@ import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "
 import { getConfigDir } from "../config.js";
 import { mcpToolPrefix } from "../daemon/mcp/types.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryEngine } from "../daemon/memory/engine.js";
 import { applyAccountEnv, bedrockModel, type ResolvedClaudeAccount, type StoredClaudeAccount } from "../daemon/claude-accounts.js";
@@ -2777,6 +2777,48 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
     mode = "guarded";
     expect(await hookCall("Write", { file_path: outside, content: "x" })).toEqual({});
     openGate();
+    await p.teardown();
+  });
+
+  it("a shell call's relative writes are judged from the cwd the CLI reports, in the hook and at codeoid's gate (round 25)", async () => {
+    await loadShellParser();
+    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => "autonomous" });
+    const gated: Array<{ name: string; shellCwd: string | null | undefined }> = [];
+    const events: ProviderEvent[] = [];
+    const run = p.runTurn({
+      history: [],
+      userMessage: "go",
+      workdir: "/tmp",
+      canUseTool: async (_id, _ap, name, _input, _signal, _agent, shellCwd) => {
+        gated.push({ name, shellCwd });
+        return { behavior: "allow" as const };
+      },
+    });
+    const drain = (async () => {
+      for await (const e of run.events) events.push(e);
+    })();
+    // Claude's Bash kept a `cd` into a directory outside the workdir: a relative target there is outside.
+    const elsewhere = join(homedir(), "codeoid-r25-elsewhere");
+    const hook = (command: string, cwd: string, tool_use_id: string) =>
+      preToolUseOf()({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command }, tool_use_id, cwd });
+    expect(await hook("echo planted > my-skill/NOTE.md", elsewhere, "tu-out")).toEqual({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: `writes outside the working directory: ${elsewhere}/my-skill/NOTE.md` },
+    });
+    expect(await hook("echo x > notes.txt", "/tmp", "tu-in")).toEqual({});
+    // canUseTool hands the hook's cwd to the gate (and to tool_start); a shell call it has none for is unknown; a file tool has none.
+    const gate = (capturedQueryOpts as { options: { canUseTool: (n: string, i: unknown, o: { toolUseID: string; signal: AbortSignal }) => Promise<unknown> } }).options.canUseTool;
+    const signal = new AbortController().signal;
+    await gate("Bash", { command: "echo planted > my-skill/NOTE.md" }, { toolUseID: "tu-out", signal });
+    await gate("Bash", { command: "echo x > notes.txt" }, { toolUseID: "tu-unseen", signal });
+    await gate("Write", { file_path: "/tmp/a", content: "x" }, { toolUseID: "tu-w", signal });
+    expect(gated).toEqual([
+      { name: "Bash", shellCwd: elsewhere },
+      { name: "Bash", shellCwd: null },
+      { name: "Write", shellCwd: undefined },
+    ]);
+    expect(events.flatMap((e) => (e.type === "tool_start" ? [e.shellCwd] : []))).toEqual([elsewhere, null, undefined]);
+    openGate();
+    await drain;
     await p.teardown();
   });
 

@@ -72,7 +72,7 @@ import type {
   SessionWorktree,
   McpReconnectResult,
 } from "../protocol/types.js";
-import { basename, dirname, join, resolve as resolvePath } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
@@ -1378,7 +1378,7 @@ export class Session {
    * (qwen) could otherwise show one call while another is parked. Set just
    * before parking, cleared when the wait returns.
    */
-  #approvalInputs = new Map<string, { toolName: string; input: unknown }>();
+  #approvalInputs = new Map<string, { toolName: string; input: unknown; shellCwd?: string | null }>();
   /**
    * Decisions that arrived BEFORE canUseTool registered its resolver. The
    * event consumer broadcasts the waiting_confirmation tool message (and the
@@ -4875,8 +4875,8 @@ export class Session {
     for (const approvalId of this.#pendingApprovals.keys()) {
       const gated = this.#approvalInputs.get(approvalId);
       if (!gated) continue;
-      const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>);
-      const outside = this.#outsideWrite(gated.toolName, gated.input as Record<string, unknown>);
+      const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
+      const outside = this.#outsideWrite(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
       out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, outside) });
     }
     return out;
@@ -7392,11 +7392,13 @@ export class Session {
    * loaded at daemon start), so the gate and the approval card it draws
    * read the same verdict.
    */
-  #shellRisk(toolName: string, input: Record<string, unknown>): ShellRisk | null {
+  #shellRisk(toolName: string, input: Record<string, unknown>, shellCwd?: string | null): ShellRisk | null {
     if (isUnresolvedPathTool(toolName)) return this.#unresolvedShellRisk(input);
     const call = shellCallOf(toolName, input);
     if (!call) return isShellTool(toolName) ? UNREADABLE_SHELL_CALL : null;
-    const cwd = call.cwd ? resolvePath(this.workdir, call.cwd) : this.workdir;
+    // Where the backend reports its shell is (Claude's Bash keeps a `cd`), else the workdir.
+    const base = typeof shellCwd === "string" && isAbsolute(shellCwd) ? shellCwd : this.workdir;
+    const cwd = call.cwd ? resolvePath(base, call.cwd) : base;
     return assessShellCommandSync(call.command, { cwd, workdir: this.workdir, configDir: getConfigDir() });
   }
 
@@ -7444,10 +7446,10 @@ export class Session {
    * call that writes nowhere outside. Fail closed: a judgement that throws
    * asks.
    */
-  #outsideWrite(toolName: string, input: Record<string, unknown>): OutsideWrite | null {
+  #outsideWrite(toolName: string, input: Record<string, unknown>, shellCwd?: string | null): OutsideWrite | null {
     if (this.#mode !== "autonomous") return null;
     try {
-      return outsideWriteOf(toolName, input, this.workdir);
+      return outsideWriteOf(toolName, input, this.workdir, shellCwd);
     } catch (err) {
       console.error(`[codeoid/session ${this.id}] judging where ${toolName} writes failed, asking: ${err instanceof Error ? err.message : String(err)}`);
       return { path: "(couldn't be judged)", resolved: false };
@@ -7471,7 +7473,7 @@ export class Session {
     // here, not at call time, so the rewrite check below refers to it even if
     // the session's provider has changed by the time a call arrives.
     const provider = this.#provider;
-    return async (toolId, approvalId, toolName, inputObj, signal, agentId) => {
+    return async (toolId, approvalId, toolName, inputObj, signal, agentId, shellCwd) => {
       // One of a fork's parent's agents, still running in the fork's backend:
       // it is the parent's work, and nothing it asks for runs or asks here.
       // Its tool card was never shown (#isForeignActivity). A later layer:
@@ -7624,7 +7626,7 @@ export class Session {
       const secret = secretPathVerdict(toolName, effectiveInput, { workdir: this.workdir, configDir: getConfigDir() });
       // A shell command is judged by what it runs (#431): one naming a
       // credential file is refused like the file tools; a risky one asks.
-      const risk = this.#shellRisk(toolName, effectiveInput);
+      const risk = this.#shellRisk(toolName, effectiveInput, shellCwd);
       const refused = secret?.action === "deny" ? secret : risk?.secret?.action === "deny" ? risk.secret : null;
       if (refused) {
         const reason = `${refused.path} holds credentials — agents can't read it. Manage it through codeoid instead.`;
@@ -7654,7 +7656,7 @@ export class Session {
       const riskAsks = this.#riskAsks(risk);
       // Autonomous mode asks before writing outside the working directory, as
       // a high-risk command asks: no budget spent, an unattended run parks.
-      const outside = this.#outsideWrite(toolName, effectiveInput);
+      const outside = this.#outsideWrite(toolName, effectiveInput, shellCwd);
       const autoApprove =
         !riskAsks &&
         !outside &&
@@ -7681,7 +7683,7 @@ export class Session {
       // with or without a turn: it is what renders the approval bar.
       this.#setStatus("waiting_approval");
       this.#withdrawOnAbort(approvalId, signal);
-      this.#approvalInputs.set(approvalId, { toolName, input: effectiveInput });
+      this.#approvalInputs.set(approvalId, { toolName, input: effectiveInput, ...(shellCwd !== undefined ? { shellCwd } : {}) });
       // This request's own decision, never a past one's under the same id (#430).
       if (this.#earlyApprovals.get(approvalId)?.owner) this.#noteOwnerApproval(approvalId);
       else this.#ownerApproved.delete(approvalId);
@@ -8305,8 +8307,8 @@ export class Session {
         // #shouldAutoApprove. Using #shouldAutoApprove here would decrement
         // twice per tool call (this handler runs in the same microtask batch
         // as canUseTool's synchronous section, always after it).
-        const risk = this.#shellRisk(event.name, event.input);
-        const outside = this.#outsideWrite(event.name, event.input);
+        const risk = this.#shellRisk(event.name, event.input, event.shellCwd);
+        const outside = this.#outsideWrite(event.name, event.input, event.shellCwd);
         const autoApprove =
           secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir() }) === null &&
           !risk?.secret &&
