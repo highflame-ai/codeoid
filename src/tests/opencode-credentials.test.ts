@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CodeoidConfig, loadConfig, QWEN_BASE_URL_PRESETS } from "../config.js";
@@ -564,6 +564,28 @@ describe("opencode's data dirs", () => {
     // No bash on the server's PATH: opencode's own fallback.
     expect(opencodeServerShell("/nonexistent")).toBe("/bin/sh");
     expect(opencodeShellEnv(user).SHELL).toBe("/usr/bin/pwsh");
+  });
+
+  it("the server's shell is never a relative path: a relative PATH entry names another file in each directory a line runs in (round-17 audit)", () => {
+    const root = mkdtempSync(join(tmpdir(), "oc-shell-"));
+    mkdirSync(join(root, "bin"));
+    for (const f of [join(root, "bin", "bash"), join(root, "bash")]) {
+      writeFileSync(f, "#!/bin/sh\nexit 0\n");
+      chmodSync(f, 0o755);
+    }
+    const cwd = process.cwd();
+    process.chdir(root);
+    try {
+      const system = opencodeServerShell(process.env.PATH);
+      for (const path of [`bin:${process.env.PATH}`, `.:${process.env.PATH}`, `:${process.env.PATH}`]) expect(opencodeServerShell(path)).toBe(system);
+      expect(opencodeServerShell("bin")).toBe("/bin/sh");
+      expect(opencodeServerShell(".")).toBe("/bin/sh");
+      // An absolute entry is taken as it is.
+      expect(opencodeServerShell(`${join(root, "bin")}:${process.env.PATH}`)).toBe(join(root, "bin", "bash"));
+    } finally {
+      process.chdir(cwd);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   describe("loadConfig resolves providers.opencode.dataDir", () => {

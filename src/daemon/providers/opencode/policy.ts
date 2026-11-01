@@ -596,7 +596,9 @@ export function opencodeServerDirs(dataDir: string): { XDG_DATA_HOME: string; XD
  * otherwise (pwsh, tcsh, xonsh) could run what the card doesn't show.
  */
 export function opencodeServerShell(path: string | undefined = process.env.PATH): string {
-  return Bun.which("bash", { PATH: path ?? "" }) ?? "/bin/sh";
+  // Absolute entries only: a relative one (`.`, `bin`) names another file in each directory a line runs in.
+  const found = Bun.which("bash", { PATH: (path ?? "").split(":").filter(isAbsolute).join(":") });
+  return found && isAbsolute(found) ? found : "/bin/sh";
 }
 
 /** The server's own settings, set last over {@link buildOpencodeEnv}. */

@@ -404,7 +404,7 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   learned; a child's requests are allowed only once it's set): the server's
   model keys and injected config never reach it. The server's own `SHELL`,
   which opencode runs every line with (any but fish and nu), is pinned to
-  bash (`opencodeServerShell`), the shell #431 judges lines as.
+  bash (`opencodeServerShell`: absolute `PATH` entries only), the shell #431 judges lines as.
 - **Paths** (translate.ts): every path a call names (cards, the secret-path
   gate's input, a shell's workdir, directory cards) is judged by one rule,
   `realTarget`: resolved as the kernel does in opencode's process, one
