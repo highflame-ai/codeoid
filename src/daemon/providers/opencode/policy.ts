@@ -299,16 +299,44 @@ function rebasedFileReferences(value: unknown, dir: string): unknown {
 }
 
 /**
+ * `value` with every literal string in it (but a `package`/`npm` name, and
+ * one naming a `{file:…}` already) replaced by `file(string)`, a `{file:…}`
+ * reference to a file holding it: a key written in the user's config must not
+ * ride the injected config, which is in the server's environment. Null when
+ * one can't go through a file as written: opencode trims what it reads.
+ */
+function literalsToFiles(value: unknown, file: (literal: string) => string, key?: string): unknown {
+  if (typeof value === "string") {
+    if (key === "package" || key === "npm" || /\{file:[^}]+\}/.test(value)) return value;
+    return value.trim() === value ? file(value) : null;
+  }
+  if (Array.isArray(value)) {
+    const out = value.map((v) => literalsToFiles(v, file));
+    return out.includes(null) ? null : out;
+  }
+  if (!isRecord(value)) return value;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) {
+    const r = literalsToFiles(v, file, k);
+    if (r === null) return null;
+    out[k] = r;
+  }
+  return out;
+}
+
+/**
  * What codeoid's server may take of one carried key from the user's config
  * in `dir`. A provider entry is dropped whole when it names a package
  * opencode doesn't bundle (opencode would import it — a `file://` module,
  * or one it installs from npm — into the server, with the injected config
  * in its environment), or holds an `{env:…}` (it reads the server's
  * environment, its password included; no key is there). Its relative
- * `{file:…}` references are made the user's config dir's. A default model
- * must be a `provider/model` id (`OPENCODE_MODEL_ID`), as codeoid's own is.
+ * `{file:…}` references are made the user's config dir's, and its literal
+ * strings go through files (`literalsToFiles`, `file`), as codeoid's own keys
+ * do. A default model must be a `provider/model` id (`OPENCODE_MODEL_ID`),
+ * as codeoid's own is.
  */
-function carriedValue(key: (typeof CARRIED_KEYS)[number], value: unknown, dir: string, skipped: string[]): unknown {
+function carriedValue(key: (typeof CARRIED_KEYS)[number], value: unknown, dir: string, skipped: string[], file: (literal: string) => string): unknown {
   if (key === "provider" || key === "providers") {
     if (!isRecord(value)) return undefined;
     const kept: Record<string, unknown> = {};
@@ -319,7 +347,12 @@ function carriedValue(key: (typeof CARRIED_KEYS)[number], value: unknown, dir: s
       else if (/\{env:/.test(JSON.stringify(entry)) || SUBSTITUTION.test(id) || substitutionInKey(entry)) {
         skipped.push(`${key}.${id}: it holds an {env:…} reference, which codeoid's server would read from its own environment (no key is there; name a key with {file:…})`);
       } else if (rebased === null) skipped.push(`${key}.${id}: a {file:…} path in it can't be passed on as written`);
-      else kept[id] = rebased;
+      else {
+        // A dry run first: an entry not carried leaves no file.
+        const filed = literalsToFiles(rebased, (l) => l) === null ? null : literalsToFiles(rebased, file);
+        if (filed === null) skipped.push(`${key}.${id}: a value in it has leading or trailing whitespace, which opencode would lose reading it from a file (codeoid hands opencode no key in its environment)`);
+        else kept[id] = filed;
+      }
     }
     return kept;
   }
@@ -346,9 +379,11 @@ function isRecord(v: unknown): v is Record<string, unknown> {
  * The provider and model keys ({@link CARRIED_KEYS}) of the user's global
  * opencode config in `dir` (`opencode.json`, then `opencode.jsonc`, as
  * opencode merges them), less what {@link carriedValue} drops (each said in
- * `skipped`). Unreadable or absent: nothing.
+ * `skipped`). A provider's literal strings are handed to `file`, which keeps
+ * each in a file and returns its `{file:…}` reference. Unreadable or absent:
+ * nothing.
  */
-export function userModelConfig(dir: string, skipped: string[] = []): Record<string, unknown> {
+export function userModelConfig(dir: string, skipped: string[], file: (literal: string) => string): Record<string, unknown> {
   const merged: Record<string, unknown> = {};
   for (const name of ["opencode.json", "opencode.jsonc"]) {
     let parsed: unknown;
@@ -367,7 +402,7 @@ export function userModelConfig(dir: string, skipped: string[] = []): Record<str
   const out: Record<string, unknown> = {};
   for (const k of CARRIED_KEYS) {
     if (!(k in merged)) continue;
-    const v = carriedValue(k, merged[k], dir, skipped);
+    const v = carriedValue(k, merged[k], dir, skipped, file);
     if (v !== undefined) out[k] = v;
   }
   return out;

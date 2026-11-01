@@ -39,7 +39,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { getConfigDir, OPENCODE_MODEL_ID } from "../../../config.js";
 import { OpencodeClient, OpencodeHttpError, type OcEvent, type OcRule } from "./client.js";
-import { clearOpencodeCredentials, type OpencodeCredentialInputs, planOpencodeCredentials, writeOpencodeCredentials } from "./credentials.js";
+import { clearOpencodeCredentials, fileReference, type OpencodeCredentialInputs, planOpencodeCredentials, writeOpencodeCredentials } from "./credentials.js";
 import {
   agentOverrides,
   buildOpencodeEnv,
@@ -352,21 +352,25 @@ export class OpencodeServer {
     // codeoid's keys as files, named by the config: never in the server's environment.
     const plan = planOpencodeCredentials((await this.#opts.credentials?.()) ?? { env: {} }, this.credentialsDir);
     for (const why of plan.skipped) console.error(`[opencode-server] not handed to opencode: ${why}`);
+    // The user's own providers too: what is written literally in them goes through files as well.
+    const secrets = new Map(plan.secrets);
+    const carriedSkipped: string[] = [];
+    const carried = userDir
+      ? userModelConfig(userDir, carriedSkipped, (literal) => {
+          const name = `carried-${secrets.size}.value`;
+          secrets.set(name, literal);
+          return fileReference(this.credentialsDir, name);
+        })
+      : {};
+    for (const why of carriedSkipped) console.error(`[opencode-server] not taken from your opencode config: ${why}`);
     // Before anything is kept there: the location stays covered once the config moves away.
     if (this.#opts.locationsFile) recordOpencodeDbPath(this.#opts.locationsFile, this.#opts.dbPath);
-    writeOpencodeCredentials(this.credentialsDir, plan.secrets);
+    writeOpencodeCredentials(this.credentialsDir, secrets);
     const defaultModel = this.#opts.defaultModel;
     if (defaultModel && !OPENCODE_MODEL_ID.test(defaultModel)) {
       console.error(`[opencode-server] providers.opencode.model isn't a \`provider/model\` id codeoid hands opencode (no \`{\`, \`}\`, quotes or spaces): opencode's own default is used`);
     }
-    const carriedSkipped: string[] = [];
-    const config = opencodeConfig(
-      this.#overrides,
-      { ...plan.providers, ...this.#opts.modelProviders },
-      userDir ? userModelConfig(userDir, carriedSkipped) : {},
-      { model: this.#opts.defaultModel },
-    );
-    for (const why of carriedSkipped) console.error(`[opencode-server] not taken from your opencode config: ${why}`);
+    const config = opencodeConfig(this.#overrides, { ...plan.providers, ...this.#opts.modelProviders }, carried, { model: this.#opts.defaultModel });
     const base = this.#opts.env?.() ?? buildOpencodeEnv();
     const env = {
       ...base,

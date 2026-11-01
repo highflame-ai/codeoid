@@ -391,7 +391,8 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   (`OPENCODE_CONFIG_DIR`, `config/` beside the DB; only the provider and model
   keys of the user's `~/.config/opencode` are carried in, less a provider whose
   package opencode doesn't bundle or with an `{env:}`, its relative `{file:}`
-  made the user's config dir's: `userModelConfig`), a server listing a
+  made the user's config dir's, its literal strings handed over from
+  `carried-<n>.value` files beside codeoid's keys: `userModelConfig`), a server listing a
   plugin that isn't a built-in is refused at start and before every turn
   (`checkPlugins`), and a call that succeeded without asking stops the server
   (its own turn says why; the server's other sessions get a neutral reason;

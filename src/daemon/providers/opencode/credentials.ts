@@ -33,6 +33,9 @@
  *     `openai` provider then doesn't also get.
  *   - codeoid's OpenAI-compatible endpoints (`oai:<name>`) with a model →
  *     `oai-<name>`, its key and header values as files too.
+ *   - the literal strings of a provider carried from the user's own opencode
+ *     config (`userModelConfig`) → `carried-<n>.value`: a key written there
+ *     is no more in the server's environment than codeoid's own.
  *
  * Every string codeoid puts in the config beside the references is checked
  * for a substitution of its own (`{file:` / `{env:`): a model id set through
@@ -303,7 +306,7 @@ export function planOpencodeCredentials(inputs: OpencodeCredentialInputs, dir: s
  * endpoint names are `[a-z0-9-]`), and their temp files: the only entries it
  * ever removes there. Anything else is left alone, and never recursed into.
  */
-const CREDENTIAL_FILE = /^(?:(?:anthropic|openai|google|qwen)\.key|oai-[a-z0-9][a-z0-9-]*\.(?:key|header-\d+))$/;
+const CREDENTIAL_FILE = /^(?:(?:anthropic|openai|google|qwen)\.key|oai-[a-z0-9][a-z0-9-]*\.(?:key|header-\d+)|carried-\d+\.value)$/;
 const CREDENTIAL_TEMP = /^\.(.+)\.\d+\.tmp$/;
 
 function isCredentialFile(name: string): boolean {

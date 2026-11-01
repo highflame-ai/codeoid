@@ -320,8 +320,12 @@ describe("opencode server lifecycle", () => {
       }),
     );
     const skipped: string[] = [];
-    const carried = userModelConfig(user, skipped);
+    const literals: string[] = [];
+    const carried = userModelConfig(user, skipped, (literal) => `{file:/f/${literals.push(literal)}}`);
     expect(Object.keys(carried.providers as object)).toEqual(["gw", "bundled"]);
+    // Only the names went through files: the references stay as they are, and so do packages.
+    expect(literals).toEqual(["x", "x"]);
+    expect((carried.providers as Record<string, Record<string, unknown>>).gw?.package).toBe("@ai-sdk/openai-compatible");
     expect(carried.provider).toEqual({});
     expect(carried.model).toBeUndefined();
     expect(carried.small_model).toBe("gw/small");
@@ -333,6 +337,44 @@ describe("opencode server lifecycle", () => {
     const st = await fakeState(server);
     expect((st.providersAt[work] as Record<string, { settings: { baseURL: string } }>).gw?.settings.baseURL).toBe("http://user-gateway.example/v1");
     expect(st.configText).not.toContain("module.mjs");
+  });
+
+  it("hands opencode a key written literally in the user's own opencode config from a 0600 file, never through the server's environment (round-20 audit)", async () => {
+    const KEY = "sk-unit-user-literal";
+    const user = realpathSync(tmp());
+    const work = realpathSync(tmp());
+    writeFileSync(
+      join(user, "opencode.json"),
+      JSON.stringify({
+        providers: {
+          gw: { package: "@ai-sdk/openai-compatible", name: "My gateway", settings: { apiKey: KEY, baseURL: "http://gw.example/v1", headers: { "X-Token": `${KEY}-hdr` } }, models: { m1: { name: "M1", limit: { context: 1000 } } } },
+          // opencode trims what it reads from a file: such a value can't go through one, so the entry isn't carried.
+          padded: { package: "@ai-sdk/openai-compatible", settings: { apiKey: ` ${KEY}-padded` } },
+        },
+      }),
+    );
+    const { server } = makeServer({}, { userConfigDir: user });
+    await collect(makeProvider(server).runTurn(opts("hi", { workdir: work })));
+    const st = await fakeState(server);
+    // Not in the injected config, nor anywhere else in the server's environment.
+    expect(st.configText).not.toContain(KEY);
+    expect(JSON.stringify(st.env)).not.toContain(KEY);
+    const creds = server.credentialsDir;
+    const files = readdirSync(creds).filter((f) => f.startsWith("carried-")).sort();
+    for (const f of files) expect(statSync(join(creds, f)).mode & 0o777).toBe(0o600);
+    // The gateway's strings, each in a file; none for the entry not carried.
+    expect(files.map((f) => readFileSync(join(creds, f), "utf8")).sort()).toEqual(["M1", "My gateway", KEY, `${KEY}-hdr`, "http://gw.example/v1"].sort());
+    // As opencode reads it in the session's location: the key, from its file.
+    const gw = (st.providersAt[work] as Record<string, { name: string; package: string; settings: { apiKey: string; headers: Record<string, string> }; models: Record<string, { name: string; limit: { context: number } }> }>).gw!;
+    expect(gw.settings.apiKey).toBe(KEY);
+    expect(gw.settings.headers["X-Token"]).toBe(`${KEY}-hdr`);
+    expect(gw.name).toBe("My gateway");
+    expect(gw.package).toBe("@ai-sdk/openai-compatible");
+    expect(gw.models.m1).toEqual({ name: "M1", limit: { context: 1000 } });
+    expect((st.config.providers as Record<string, unknown>).padded).toBeUndefined();
+    // Gone with the server.
+    await server.stop();
+    expect(existsSync(creds) ? readdirSync(creds).filter((f) => f.startsWith("carried-")) : []).toEqual([]);
   });
 
   it("hands codeoid's keys to opencode through its config, from 0600 files, and none through the server's environment", async () => {

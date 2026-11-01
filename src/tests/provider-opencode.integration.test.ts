@@ -86,6 +86,8 @@
  *       opencode fails the step with the response's 200 and retries; that request was served, so the turn's cost is unknown
  *   I55 (scripted only) the server runs in an empty, read-only directory alone in a fresh root, outside codeoid's data and
  *       temp dir: a shell's `/proc/$PPID/cwd` lists nothing, and no directory above it up to / holds anything of codeoid's
+ *   I56 (scripted only) a key written literally in the user's own opencode config reaches the model from a 0600 file, never
+ *       through the server's environment (which every process opencode starts inherits)
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -2194,6 +2196,66 @@ describe("opencode (real binary)", () => {
       await own.stop();
       rmSync(root, { recursive: true, force: true });
       rmSync(login, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  maybeScripted("I56 a key written literally in the user's own opencode config reaches the model from a 0600 file, never the server's environment", async () => {
+    const KEY = `sk-it-user-literal-${Math.random().toString(36).slice(2)}`;
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-userkey-")));
+    const user = join(root, "user-config");
+    const work = join(root, "work");
+    mkdirSync(user);
+    mkdirSync(work);
+    // A model that answers 401 unless the request carries KEY.
+    const keyed = Bun.spawn([process.execPath, join(import.meta.dir, "fixtures", "scripted-chat-model.ts")], {
+      stdout: "pipe",
+      stderr: "inherit",
+      env: { ...process.env, SCRIPTED_API_KEY: KEY },
+    });
+    const reader = (keyed.stdout as ReadableStream<Uint8Array>).getReader();
+    const { url } = JSON.parse(new TextDecoder().decode((await reader.read()).value)) as { url: string };
+    reader.releaseLock();
+    writeFileSync(
+      join(user, "opencode.json"),
+      JSON.stringify({
+        providers: {
+          mygw: {
+            name: "My gateway",
+            package: "@opencode/ai/providers/openai-compatible",
+            settings: { baseURL: url, apiKey: KEY },
+            models: { "scripted-1": { name: "Scripted 1", capabilities: { tools: true }, limit: { context: 64_000, output: 4_096 } } },
+          },
+        },
+      }),
+    );
+    const own = new OpencodeServer({
+      command: resolved!.command,
+      argsPrefix: resolved!.argsPrefix,
+      dbPath: join(root, "data", "opencode", "opencode.db"),
+      env: () => ({ ...buildOpencodeEnv(), HOME: join(root, "home") }),
+      userConfigDir: user,
+    });
+    try {
+      const conn = await own.ensure();
+      const environ = serverEnviron(conn.pid);
+      if (environ !== null) expect(environ.includes(KEY)).toBe(false);
+      const creds = own.credentialsDir;
+      const files = readdirSync(creds).filter((f) => f.startsWith("carried-"));
+      expect(files.some((f) => readFileSync(join(creds, f), "utf8") === KEY)).toBe(true);
+      for (const f of files) expect(statSync(join(creds, f)).mode & 0o777).toBe(0o600);
+      const models = await conn.client.models(work);
+      expect(models.find((m) => m.providerID === "mygw" && m.id === "scripted-1")?.name).toBe("Scripted 1");
+      // The key reached opencode from its file: the model refuses a request without it.
+      const p = new OpencodeProvider({ sessionId: "it-userkey", initialBackingId: "it-userkey", server: own, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
+      const events = await collect(p.runTurn(opts("[[text:keyed]]", { workdir: work, model: "mygw/scripted-1" })));
+      expect(texts(events)).toEqual(["keyed"]);
+      await p.teardown();
+      await own.stop();
+      expect(existsSync(creds) ? readdirSync(creds).filter((f) => f.startsWith("carried-")) : []).toEqual([]);
+    } finally {
+      await own.stop();
+      keyed.kill();
+      rmSync(root, { recursive: true, force: true });
     }
   }, 180_000);
 
