@@ -184,7 +184,7 @@
  * mid-execution does (busy, never idle again, nothing running).
  */
 
-import { appendFileSync, existsSync, readFileSync } from "node:fs";
+import { accessSync, appendFileSync, constants, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -263,6 +263,7 @@ const state = {
     OPENCODE_CONFIG_DIR: process.env.OPENCODE_CONFIG_DIR,
     OPENCODE_DISABLE_PROJECT_CONFIG: process.env.OPENCODE_DISABLE_PROJECT_CONFIG,
     OPENCODE_DISABLE_CLAUDE_CODE: process.env.OPENCODE_DISABLE_CLAUDE_CODE,
+    PATH: process.env.PATH,
     passwordSet: password.length > 0,
     leakedUserVar: process.env.OPENCODE_USER_SETTING,
     leakedSecret: process.env.CODEOID_API_KEY,
@@ -1473,7 +1474,19 @@ function loadVcs(directory: string): void {
   if (vcsLoaded.has(directory)) return;
   vcsLoaded.add(directory);
   const run = (cmd: string, args: string[], cwd: string, extra: Record<string, string> = {}) => {
-    const bin = Bun.which(cmd, { PATH: process.env.PATH ?? "" });
+    // As real 2.2.5 resolves it: a relative PATH entry from the directory it runs in.
+    const bin = (process.env.PATH ?? "")
+      .split(":")
+      .filter(Boolean)
+      .map((dir) => resolve(cwd, dir, cmd))
+      .find((f) => {
+        try {
+          accessSync(f, constants.X_OK);
+          return true;
+        } catch {
+          return false;
+        }
+      });
     if (bin) Bun.spawnSync([bin, ...args], { cwd, env: { ...process.env, ...extra }, stdin: "ignore", timeout: 10_000 });
   };
   for (let at = directory; ; at = dirname(at)) {

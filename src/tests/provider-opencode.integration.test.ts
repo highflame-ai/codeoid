@@ -92,7 +92,7 @@
  *       the execution's start and interruption, no step; the turn's cost is unknown, never a known $0
  *   I58 (scripted only) the version control opencode runs unasked in a workspace runs none of the repository's code: every git
  *       it runs gets codeoid's overrides (a hostile .git/config's fsmonitor, hooks, diff, filter, signing and ext:: remote run
- *       nothing), hg skips the repository's hgrc and its plugin is off, a workdir under a .hg is refused when the hg can't
+ *       nothing), a `.` on the daemon's PATH doesn't make it run the repository's own ./git or ./rg, hg skips the repository's hgrc and its plugin is off, a workdir under a .hg is refused when the hg can't
  *       skip it, and a session's own shell has none of it
  *   I59 (scripted only) a message pushed mid-turn and still in opencode's inbox when the backend is torn down (a model switch,
  *       an MCP refresh) is withdrawn: the next turn, on the session the teardown kept, answers only its own prompt
@@ -2376,12 +2376,15 @@ describe("opencode (real binary)", () => {
           "[protocol]", "\tallow = always", '[remote "origin"]', `\turl = ext::${mark} ext-transport`, "",
         ].join("\n"),
     );
+    // Programs of the repository's own, which a `.` on opencode's PATH would run in place of the real ones.
+    for (const name of ["git", "hg", "rg"]) writeFileSync(join(ws, name), `#!/bin/sh\necho "repo-${name} $*" >> '${marks}'\nexit 1\n`, { mode: 0o755 });
     const lines = () => (existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : []);
     const own = new OpencodeServer({
       command: resolved!.command,
       argsPrefix: resolved!.argsPrefix,
       dbPath: join(root, "data", "opencode", "opencode.db"),
-      env: () => ({ ...buildOpencodeEnv(), HOME: join(root, "home"), PATH: `${bin}:${process.env.PATH}` }),
+      // A relative entry first, as a daemon's PATH may have: the workspace holds programs of its own.
+      env: () => ({ ...buildOpencodeEnv(), HOME: join(root, "home"), PATH: `.:${bin}:${process.env.PATH}` }),
       userConfigDir: null,
       defaultModel: "scripted/scripted-1",
       modelProviders,
@@ -2393,6 +2396,8 @@ describe("opencode (real binary)", () => {
         "[[text:hello]]",
         `[[tool:write ${JSON.stringify({ path: "new.txt", content: "new\n" })}]]`,
         `[[tool:edit ${JSON.stringify({ path: "a.txt", oldString: "hello", newString: "bye" })}]]`,
+        `[[tool:glob ${JSON.stringify({ pattern: "*.txt" })}]]`,
+        `[[tool:grep ${JSON.stringify({ pattern: "bye" })}]]`,
       ]) {
         expect(done(await collect(p.runTurn(opts(msg, { workdir: ws }))))).toBeTruthy();
       }

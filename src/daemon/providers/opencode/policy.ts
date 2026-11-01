@@ -631,8 +631,7 @@ export function opencodeServerDirs(dataDir: string): { XDG_DATA_HOME: string; XD
  * otherwise (pwsh, tcsh, xonsh) could run what the card doesn't show.
  */
 export function opencodeServerShell(path: string | undefined = process.env.PATH): string {
-  // Absolute entries only: a relative one (`.`, `bin`) names another file in each directory a line runs in.
-  const found = Bun.which("bash", { PATH: (path ?? "").split(":").filter(isAbsolute).join(":") });
+  const found = Bun.which("bash", { PATH: absolutePath(path) });
   return found && isAbsolute(found) ? found : "/bin/sh";
 }
 
@@ -694,9 +693,21 @@ export function gitOverrideEnv(overrides: ReadonlyArray<readonly [string, string
   return env;
 }
 
+/**
+ * A `PATH`'s absolute entries: a relative one (`.`, `bin`) names another file
+ * in each directory a program is started in, and opencode starts git, hg and
+ * ripgrep in the workspace unasked: with `.` on its `PATH`, a repository's
+ * own `./git` would run.
+ */
+export function absolutePath(path: string | undefined): string {
+  return (path ?? "").split(":").filter(isAbsolute).join(":");
+}
+
 /** The server's own settings, set last over {@link buildOpencodeEnv}. */
-export function serverEnv(opts: { password: string; dbPath: string; configDir: string; dataDir: string; config: Record<string, unknown>; shell?: string }): Record<string, string> {
+export function serverEnv(opts: { password: string; dbPath: string; configDir: string; dataDir: string; config: Record<string, unknown>; shell?: string; path?: string }): Record<string, string> {
   return {
+    // What it runs on its own resolves to the same program wherever it runs it.
+    ...(opts.path !== undefined ? { PATH: absolutePath(opts.path) } : {}),
     // The shell its lines run with is the one codeoid judges them as; a
     // session's commands still see the user's own `$SHELL` (opencodeShellEnv).
     SHELL: opts.shell ?? opencodeServerShell(),

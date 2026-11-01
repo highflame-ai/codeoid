@@ -381,7 +381,7 @@ export class OpencodeServer {
     const base = this.#opts.env?.() ?? buildOpencodeEnv();
     const env = {
       ...base,
-      ...serverEnv({ password, dbPath: this.#opts.dbPath, configDir: this.configDir, dataDir: this.dataDir, config, shell: opencodeServerShell(base.PATH) }),
+      ...serverEnv({ password, dbPath: this.#opts.dbPath, configDir: this.configDir, dataDir: this.dataDir, config, shell: opencodeServerShell(base.PATH), path: base.PATH }),
     };
     this.#home = homeOf(env);
     // Requests name their directory; the server's own cwd is only its default.

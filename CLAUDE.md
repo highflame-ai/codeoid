@@ -412,7 +412,8 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   environment gives every git `OPENCODE_GIT_OVERRIDES` through
   `GIT_CONFIG_COUNT` plus `OPENCODE_GIT_ENV` (no transport, no lazy fetch),
   and every hg `OPENCODE_HG_ENV` (`HGRCSKIPREPO`, empty `HGRCPATH`); the hg
-  plugin is disabled. A workdir under a `.hg` is refused when the server's
+  plugin is disabled; the server's `PATH` is only the daemon's absolute
+  entries (`absolutePath`: a `.` would run a repo's `./git`). A workdir under a `.hg` is refused when the server's
   hg is older than 5.4 or won't say (`mercurialProblem`, `mercurialCheckout`).
   Filter/textconv drivers can't be overridden by name; 2.2.5 applies none
   unasked. A session's shell has its own environment, so none of it.

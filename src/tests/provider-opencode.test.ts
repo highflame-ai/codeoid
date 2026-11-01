@@ -308,6 +308,19 @@ describe("opencode server lifecycle", () => {
     }
   });
 
+  it("a relative entry of the daemon's PATH never reaches the server: opencode would run a repository's own ./git", async () => {
+    const marks = join(tmp(), "marks.log");
+    const ws = realpathSync(tmp());
+    mkdirSync(join(ws, ".git"));
+    writeFileSync(join(ws, "git"), `#!/bin/sh\necho "repo git $*" >> '${marks}'\n`, { mode: 0o755 });
+    const { server } = makeServer({}, { env: () => ({ ...buildOpencodeEnv(), PATH: `.:bin:${process.env.PATH}` }) });
+    expect(done(await collect(makeProvider(server).runTurn(opts("hi", { workdir: ws }))))).toBeTruthy();
+    expect(existsSync(marks) ? readFileSync(marks, "utf8") : "").toBe("");
+    expect((await fakeState(server)).env.PATH).toBe(process.env.PATH);
+    // The session's shell keeps the daemon's PATH as it is: what runs there is asked.
+    expect(opencodeShellEnv({ PATH: ".:/usr/bin" }).PATH).toBe(".:/usr/bin");
+  });
+
   it("hg opencode runs on its own skips the repository's hgrc, and opencode's hg plugin is off", async () => {
     const m = vcsMarkers("6.8.1");
     const { server } = makeServer({}, { env: () => ({ ...buildOpencodeEnv(), PATH: `${m.bin}:${process.env.PATH}` }) });
