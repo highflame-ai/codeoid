@@ -35,6 +35,8 @@
  *   "use-shell"    → shell call; permission.asked; runs or fails per the reply
  *   "ask-shell:<json>" → a shell call of exactly that input (command, workdir),
  *                    asked first; nothing runs, an allowed one answers "ran it"
+ *   "ask-write:<json>" → a `write` call of exactly that input (`{"path": …, "content": …}`),
+ *                    asking "edit" for its path; nothing is written, an allowed one answers "wrote it"
  *   "use-edit"     → edit call (path/oldString/newString) asking "edit"
  *   "use-patch-two" → patch call with two targets, asking "edit" once for both (as 2.2.5's patch.ts)
  *   "use-grep-home" → a grep of `~/.codeoid/config.json`: `~` is the server's
@@ -819,6 +821,16 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     endStep(ses, msg);
     const msg2 = step(ses);
     await say(ses, msg2, r.ok ? "ran it" : `not allowed: ${r.message}`);
+    endStep(ses, msg2);
+    return "succeeded";
+  }
+  if (text.startsWith("ask-write:")) {
+    const input = JSON.parse(text.slice("ask-write:".length)) as Json;
+    const msg = step(ses);
+    const r = await toolCall(ses, msg, "write", input, { action: "edit", resources: [String(input.path ?? "")] });
+    endStep(ses, msg);
+    const msg2 = step(ses);
+    await say(ses, msg2, r.ok ? "wrote it" : `not allowed: ${r.message}`);
     endStep(ses, msg2);
     return "succeeded";
   }

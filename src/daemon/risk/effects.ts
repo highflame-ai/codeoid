@@ -113,6 +113,75 @@ export function outsideEffects(command: string, ctx: EffectContext): boolean {
   return false;
 }
 
+/** Programs whose every operand is a file they change, create or remove. */
+const WRITES_EVERY_OPERAND = new Set(["rm", "rmdir", "mkdir", "touch", "chmod", "chown", "chgrp", "truncate", "shred", "tee", "mv", "unlink"]);
+/** Programs whose last operand (or `-t DIR`) is what they write: `cp a b`, `ln -s target name`, `install a /usr/bin/a`. */
+const WRITES_LAST_OPERAND = new Set(["cp", "ln", "install"]);
+/** Files a redirect may name without writing a file: discarding, the terminal, the process's own descriptors. */
+const NOT_A_FILE = /^\/dev\/(?:null|zero|tty|stdout|stderr|stdin|fd\/\d+)$/;
+
+/**
+ * The files `command` writes, edits, creates, removes or moves that the
+ * parse can name, each as an absolute path (lexical: the caller resolves
+ * links): redirects, what `rm`/`mv`/`cp`/`tee`/`ln`/`touch`/… write, `dd of=`,
+ * `sed -i`'s files, `find -delete`'s roots. A target the reader can't place
+ * (a variable, a relative path after a `cd` it can't follow) is left out:
+ * this lists what is provably written, it isn't a sandbox. A command that
+ * can't be parsed has none.
+ */
+export function shellWriteTargets(command: string, ctx: EffectContext): string[] {
+  const parsed = parseShellSync(command);
+  if (parsed.problems.length > 0) return [];
+  const home = ctx.home ?? homedir();
+  let cwd: string | null = ctx.cwd ?? ctx.workdir;
+  const out: string[] = [];
+  const add = (w: ShellWord | undefined) => {
+    if (!w) return;
+    const at = pathOf(w, cwd, home);
+    if (at !== null && !NOT_A_FILE.test(at)) out.push(at);
+  };
+  for (const cmd of parsed.commands) {
+    const prog = programOf(cmd);
+    for (const r of cmd.redirects) {
+      if (!r.target || r.op === "<" || r.op === "<<" || r.op === "<<<" || r.op === "<<-" || r.op === "<&") continue;
+      if (r.op === ">&" && /^\d+$|^-$/.test(r.target.value ?? "")) continue;
+      add(r.target);
+    }
+    if (prog === null) continue;
+    if (prog === "cd" || prog === "pushd") {
+      // `cd -` and options (`cd -P dir`) aren't followed: where they lead isn't told here.
+      const to = cmd.argv[1];
+      cwd = to ? (to.value === null || to.value.startsWith("-") ? null : pathOf(to, cwd, home)) : home;
+      continue;
+    }
+    if (prog === "popd") {
+      cwd = null;
+      continue;
+    }
+    const args = cmd.argv.slice(1);
+    const operands = args.filter((w) => w.value === null || !w.value.startsWith("-"));
+    if (WRITES_EVERY_OPERAND.has(prog)) for (const w of operands) add(w);
+    if (WRITES_LAST_OPERAND.has(prog)) {
+      const t = args.findIndex((w) => w.value === "-t" || w.value === "--target-directory");
+      const eq = args.find((w) => w.value?.startsWith("--target-directory="));
+      if (t >= 0) add(args[t + 1]);
+      else if (eq?.value) add({ value: eq.value.slice("--target-directory=".length), raw: eq.raw, glob: false });
+      else if (operands.length >= (prog === "ln" ? 1 : 2)) add(operands.at(-1));
+    }
+    if (prog === "dd") {
+      const of = args.find((w) => w.value?.startsWith("of="));
+      if (of?.value) add({ value: of.value.slice(3), raw: of.raw, glob: false });
+    }
+    const values = args.map((w) => w.value);
+    if (prog === "sed" && values.some((x) => x !== null && (/^-[a-zA-Z]*i/.test(x) || x.startsWith("--in-place")))) {
+      const scripted = values.some((x) => x !== null && /^(-[a-zA-Z]*[ef]|--expression|--file)/.test(x));
+      for (const w of scripted ? operands : operands.slice(1)) add(w);
+    }
+    if (prog === "find" && values.some((x) => x === "-delete")) for (const w of findRoots(cmd)) add(w);
+  }
+  return out;
+}
+
 function targetInside(path: string, cwd: string | null, workdir: string, home: string): boolean {
   const at = pathOf({ value: path, raw: path, glob: false }, cwd, home);
   return at !== null && inside(at, workdir);

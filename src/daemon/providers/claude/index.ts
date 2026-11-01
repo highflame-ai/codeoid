@@ -48,10 +48,11 @@ import { LOOP_MCP_SERVER_NAME, LOOP_REPORT_TOOL_FQ } from "../../loops/tools.js"
 import { rewriteBashToolInput } from "../../compress/index.js";
 import { type CodeoidConfig, getConfigDir } from "../../../config.js";
 import { assessShellCommandSync } from "../../risk/shell-risk.js";
+import { outsideWriteOf, outsideWriteReason } from "../../outside-writes.js";
 import { secretPathVerdict } from "../../secret-paths.js";
 import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "../../fork-isolation.js";
 import { isShellTool, shellCallOf } from "../../shell/tool-call.js";
-import { type AuthContext, EFFORT_LEVELS, type EffortLevel, SYSTEM_IDENTITY } from "../../../protocol/types.js";
+import { type AuthContext, EFFORT_LEVELS, type EffortLevel, type SessionMode, SYSTEM_IDENTITY } from "../../../protocol/types.js";
 import type {
   BackendMcpServerState,
   SessionProvider,
@@ -143,6 +144,8 @@ export interface ClaudeProviderInit {
   forkBoundary?: () => string | undefined;
   /** An agent id that is a fork's parent's (ProviderSessionInit.isForeignAgent): its every tool call is denied. */
   isForeignAgent?: (agentId: string) => boolean;
+  /** The session's mode now (ProviderSessionInit.sessionMode): an outside write in autonomous mode goes to the gate. */
+  sessionMode?: () => SessionMode;
   /** A task id that is a fork's parent's (ProviderSessionInit.isForeignTask). */
   isForeignTask?: (taskId: string) => boolean;
   /** This session is a fork (ProviderSessionInit.isFork). */
@@ -614,6 +617,24 @@ export class ClaudeProvider implements SessionProvider {
    * handed to canUseTool (`ask`); one reading a credential file is refused.
    * Fail-closed, as #secretPathDecision is: a throw asks.
    */
+  /** `ask` for a write outside the working directory in autonomous mode, so it reaches codeoid's gate; null otherwise. */
+  #outsideWriteDecision(
+    input: PreToolUseHookInput,
+    workdir: string,
+  ): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "ask"; permissionDecisionReason: string } } | null {
+    let reason: string;
+    try {
+      if (this.#init.sessionMode?.() !== "autonomous") return null;
+      const outside = outsideWriteOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, workdir);
+      if (!outside) return null;
+      reason = outsideWriteReason(outside);
+    } catch (err) {
+      console.error(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] judging where a write leads failed, asking the owner: ${err instanceof Error ? err.message : String(err)}`);
+      reason = "codeoid couldn't tell where this write leads, so it needs the owner's approval.";
+    }
+    return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: reason } };
+  }
+
   #shellRiskDecision(
     input: PreToolUseHookInput,
     workdir: string,
@@ -1263,6 +1284,10 @@ export class ClaudeProvider implements SessionProvider {
               // Fail-closed (#shellRiskDecision).
               const shellRisk = this.#shellRiskDecision(input, opts.workdir);
               if (shellRisk) return shellRisk;
+              // In autonomous mode a write outside the working directory asks
+              // (outside-writes.ts): never on an allow rule either. Fail-closed.
+              const outside = this.#outsideWriteDecision(input, opts.workdir);
+              if (outside) return outside;
               // Past this point a throw fails OPEN: the CLI takes a hook that
               // errors as having no opinion (its createHookCallback returns {}),
               // so a call it would allow itself goes ahead.

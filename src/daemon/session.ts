@@ -193,6 +193,7 @@ import { secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir } from "./compress/spill.js";
 import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
+import { type OutsideWrite, outsideWriteOf, outsideWriteReason } from "./outside-writes.js";
 import { outsideEffects } from "./risk/effects.js";
 import { assessShellCommandSync, type ShellRisk, UNREADABLE_SHELL_CALL } from "./risk/shell-risk.js";
 import { loadShellParser, shellParserReady } from "./shell/parse.js";
@@ -1769,6 +1770,7 @@ export class Session {
       // Read per query: a fork is primed after its provider is built.
       forkBoundary: () => this.#forkIsolation?.boundaryAt,
       isForeignAgent: (agentId) => this.#isForeignAgent(agentId),
+      sessionMode: () => this.#mode,
       isForeignTask: (taskId) => this.#forkIsolation?.foreignTasks.has(taskId) === true,
       isFork: () => this.#forkIsolation !== null,
       isOwnTask: (taskId) => this.#isOwnTask(taskId),
@@ -4874,7 +4876,8 @@ export class Session {
       const gated = this.#approvalInputs.get(approvalId);
       if (!gated) continue;
       const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>);
-      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...(risk ? { risk: { level: risk.level, reasons: risk.reasons } } : {}) });
+      const outside = this.#outsideWrite(gated.toolName, gated.input as Record<string, unknown>);
+      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, outside) });
     }
     return out;
   }
@@ -7434,6 +7437,35 @@ export class Session {
     return risk?.level === "low" && !risk.secret && this.#mode === "guarded" && (this.#config?.approvals?.autoAllowLowRisk ?? false);
   }
 
+  /**
+   * In autonomous mode, a write, edit, delete or move whose target provably
+   * resolves outside the working directory, or can't be resolved for certain
+   * (outside-writes.ts): asked, not run. Null in every other mode, and for a
+   * call that writes nowhere outside. Fail closed: a judgement that throws
+   * asks.
+   */
+  #outsideWrite(toolName: string, input: Record<string, unknown>): OutsideWrite | null {
+    if (this.#mode !== "autonomous") return null;
+    try {
+      return outsideWriteOf(toolName, input, this.workdir);
+    } catch (err) {
+      console.error(`[codeoid/session ${this.id}] judging where ${toolName} writes failed, asking: ${err instanceof Error ? err.message : String(err)}`);
+      return { path: "(couldn't be judged)", resolved: false };
+    }
+  }
+
+  /**
+   * What the approval card says of a call's risk: a shell command's (#431),
+   * and an outside write's reason — first when it is what makes the call ask,
+   * after a high or not-understood command's own.
+   */
+  #cardRisk(risk: ShellRisk | null, outside: OutsideWrite | null): { risk?: { level: ShellRisk["level"]; reasons: string[] } } {
+    if (!outside) return risk ? { risk: { level: risk.level, reasons: risk.reasons } } : {};
+    const why = outsideWriteReason(outside);
+    if (risk && riskWeight(risk) > 1) return { risk: { level: risk.level, reasons: [...risk.reasons, why] } };
+    return { risk: { level: "medium", reasons: [why, ...(risk?.reasons ?? [])] } };
+  }
+
   #makeCanUseToolFn(sender: AuthContext): ToolApprovalFn {
     // The backend this gate is handed to — the one that will ASK. Captured
     // here, not at call time, so the rewrite check below refers to it even if
@@ -7620,11 +7652,19 @@ export class Session {
       // ends the attempt instead — whatever else would have asked about it.
       if (this.#budgetSpentFor(toolName)) return this.#endAttemptOnBudget(approvalId, toolName, sender);
       const riskAsks = this.#riskAsks(risk);
+      // Autonomous mode asks before writing outside the working directory, as
+      // a high-risk command asks: no budget spent, an unattended run parks.
+      const outside = this.#outsideWrite(toolName, effectiveInput);
       const autoApprove =
-        !riskAsks && secret?.action !== "ask" && !settingsWrite && (this.#riskAllows(toolName, risk) || this.#shouldAutoApprove(toolName));
+        !riskAsks &&
+        !outside &&
+        secret?.action !== "ask" &&
+        !settingsWrite &&
+        (this.#riskAllows(toolName, risk) || this.#shouldAutoApprove(toolName));
       if (riskAsks && this.#mode === "autonomous") {
         this.#store.audit(sender.sub, "session.risk_ask", this.id, `tool=${toolName} risk=${risk?.level} ${risk?.reasons[0] ?? ""}`.trim());
       }
+      if (outside) this.#store.audit(sender.sub, "session.outside_write_ask", this.id, `tool=${toolName} path=${outside.path}`);
 
       if (autoApprove) {
         this.#approvalIdToMessageId.delete(approvalId); // clean up — no manual approval will reference this
@@ -8266,10 +8306,12 @@ export class Session {
         // twice per tool call (this handler runs in the same microtask batch
         // as canUseTool's synchronous section, always after it).
         const risk = this.#shellRisk(event.name, event.input);
+        const outside = this.#outsideWrite(event.name, event.input);
         const autoApprove =
           secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir() }) === null &&
           !risk?.secret &&
           !this.#riskAsks(risk) &&
+          !outside &&
           (this.#riskAllows(event.name, risk) || this.#peekAutoApprove(event.name));
         // end_attempt: the gate will refuse this call outright — no approval card.
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
@@ -8292,7 +8334,7 @@ export class Session {
                   description: `${event.name}(${Object.keys(event.input).join(", ")})`,
                   approvalId: event.approvalId,
                   ...this.#collaborationCostFor(event.name),
-                  ...(risk ? { risk: { level: risk.level, reasons: risk.reasons } } : {}),
+                  ...this.#cardRisk(risk, outside),
                 } as unknown as ToolState),
           },
         );

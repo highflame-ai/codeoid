@@ -8,6 +8,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Autonomous mode asks before writing outside the working directory** (#447).
+  A write, edit, delete or move whose target resolves outside the session's working directory (symlinks and `..` followed; the temp dir counts as inside) asks in autonomous mode, on every backend's file tools and on shell commands whose write targets the risk parser can name, with the card saying where it lands; a path that can't be resolved for certain counts as outside.
+  Reads and searches outside it, and guarded and interactive mode, are unchanged; an unattended run parks on such a write for your approval, as on a high-risk command.
+  See [docs/approvals.md](docs/approvals.md#writes-outside-the-working-directory).
+
 - **A second daemon on the same data is refused** (#447).
   `codeoid start` locks each directory the daemon owns (its database's, transcripts and checkpoints, opencode's database and data dirs, memory's) before it opens anything, and a start on data another live daemon uses exits, naming that daemon (pid, host, port) and how to clear a stale lock, instead of running alongside it and corrupting both.
   A lock left by a daemon that's gone (killed outright: its pid no longer runs, or now belongs to another process) is taken over with a log line; one from another host or container is never guessed at.

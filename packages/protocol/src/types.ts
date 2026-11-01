@@ -996,7 +996,11 @@ export interface ToolWaitingConfirmationState {
    * roll-up could not be computed.
    */
   collaborationCost?: CollaborationCost;
-  /** A shell command's risk, judged from what it runs (#431). Absent for other tools. */
+  /**
+   * A shell command's risk, judged from what it runs (#431); in autonomous
+   * mode also a write outside the working directory, its reason first
+   * ("writes outside the working directory: <path>"). Absent otherwise.
+   */
   risk?: ToolRisk;
 }
 

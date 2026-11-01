@@ -25,6 +25,7 @@ import type { CompressionRegistry } from "../compress/index.js";
 import type { CodeoidConfig } from "../../config.js";
 import type { SessionProvider, CatalogEntry } from "./interface.js";
 import { CLAUDE_PROVIDER_ID } from "../models.js";
+import type { SessionMode } from "../../protocol/types.js";
 import { ClaudeProvider } from "./claude/index.js";
 import { GeminiProvider } from "./gemini/index.js";
 import { OpenAIProvider } from "./openai/index.js";
@@ -115,6 +116,12 @@ export interface ProviderSessionInit {
    * approves itself included.
    */
   isForeignAgent?: (agentId: string) => boolean;
+  /**
+   * The session's mode now (it can change mid-turn). Claude only: in
+   * autonomous mode its PreToolUse hook hands a write outside the working
+   * directory to codeoid's gate past an allow rule (outside-writes.ts).
+   */
+  sessionMode?: () => SessionMode;
   /**
    * When this session is a fork: whether a task id is one of its parent's
    * (fork-isolation.ts). Claude only: a native fork's copy of the parent's
@@ -442,6 +449,7 @@ export function createDefaultProviderRegistry(
         extraEnv: init.extraEnv,
         forkBoundary: init.forkBoundary,
         isForeignAgent: init.isForeignAgent,
+        sessionMode: init.sessionMode,
         isForeignTask: init.isForeignTask,
         isFork: init.isFork,
         isOwnTask: init.isOwnTask,

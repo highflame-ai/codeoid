@@ -136,7 +136,7 @@ import { applyAccountEnv, bedrockModel, type ResolvedClaudeAccount, type StoredC
 import { SqliteEpisodeStore } from "../daemon/memory/store.js";
 import { MEMORY_TOOL_NAMES } from "../daemon/memory/index.js";
 import type { Embedder } from "../daemon/memory/embedder.js";
-import type { EffortLevel } from "../protocol/types.js";
+import type { EffortLevel, SessionMode } from "../protocol/types.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -2758,6 +2758,24 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
     const secret = join(getConfigDir(), "config.json");
     expect((await hookCall("Read", { file_path: secret })) as unknown).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
     expect(audits.filter((a) => a === "session.secret_path_deny")).toHaveLength(2);
+    openGate();
+    await p.teardown();
+  });
+
+  it("in autonomous mode a write outside the working directory goes to codeoid's gate, past any allow rule; not in guarded mode (#447)", async () => {
+    let mode: SessionMode = "autonomous";
+    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => mode });
+    turnOn(p);
+    const outside = "/opt/codeoid-elsewhere/a.ts";
+    expect(await hookCall("Write", { file_path: outside, content: "x" })).toEqual({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: `writes outside the working directory: ${outside}` },
+    });
+    expect(await hookCall("NotebookEdit", { notebook_path: "/opt/codeoid-elsewhere/n.ipynb" })).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask" } });
+    // Inside the working directory (the turn's is the temp dir), and a read outside: no opinion.
+    expect(await hookCall("Write", { file_path: "/tmp/codeoid-inside.ts", content: "x" })).toEqual({});
+    expect(await hookCall("Read", { file_path: outside })).toEqual({});
+    mode = "guarded";
+    expect(await hookCall("Write", { file_path: outside, content: "x" })).toEqual({});
     openGate();
     await p.teardown();
   });

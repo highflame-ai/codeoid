@@ -85,6 +85,19 @@ The approval prompt says the level and why, in the web UI, the terminal UI, Tele
 
 Rewinding uses the same reading of a command for its "not undone by going back" list: it lists commands with effects outside the workspace's files (a push, an install, a write outside the workspace, `sudo`), not every command whose text mentions one. A command is read in the directory it ran in, as the gate read it: one opencode ran with a `workdir` outside the workspace is listed when it writes there, and one in a directory opencode couldn't resolve for certain is judged in each place it may have run.
 
+## Writes outside the working directory
+
+In autonomous mode, a write, edit, delete or move whose target resolves outside the session's working directory asks, on every backend, as a high-risk command does; the card says why (`writes outside the working directory: /home/u/other/file`) and names where the write really lands.
+Reads, searches and listings outside it run as before (credential files are refused in every mode), and guarded and interactive mode are unchanged: they ask about every write already.
+
+- **Inside** is the session's working directory (a worktree session's is its worktree; codeoid gives a session no other directories) and the system temp dir (`$TMPDIR`, and `/tmp`), where scratch files are routine.
+- **File tools** are judged by the paths they name, whatever the backend calls them: Claude's `Write`, `Edit`, `MultiEdit` and `NotebookEdit`; opencode's write, edit and patch (every file a patch changes or moves); Codex's file changes (each path, and a move's destination); pi's `write` and `edit`; Qwen Code's `write_file`, `edit` and `notebook_edit`; the Gemini CLI's edits. A path is resolved as the credential check resolves it: against the working directory, `~` expanded, `..` taken as the kernel takes it, and through every symlink of the part that exists, so a link in the workspace that points outside it is outside. A path that can't be resolved for certain (none given, a path under `/proc`, another user's `~name`) counts as outside: the real Gemini CLI names no path in its approval requests, so in autonomous mode each of its edits asks.
+- **Shell commands** are judged by the targets the parser can name: redirects (`> file`, `>> file`, `2> file`, not `/dev/null` or the terminal), what `rm`, `mv`, `cp`, `tee`, `ln`, `install`, `touch`, `mkdir`, `chmod`, `truncate`, `dd of=`, `sed -i` and `find -delete` write, after any `cd` it can follow. A target it can't place (a variable, a path after a `cd` it can't follow, a program it doesn't model as a writer, see Limits) isn't asked for this: shell levels are guidance, not a sandbox (#448).
+- It doesn't use up the autonomous tool budget.
+- **Unattended runs** (routines, loops, dispatched workers) follow the rule a high-risk command follows there: nobody answers in the moment, so the call parks the run on your approval (a routine run shows `needs_attention`, a loop run `waiting`) until you approve or deny it from any device.
+- On Claude, such a write never runs on a `permissions.allow` rule in your Claude settings: the PreToolUse hook hands it to codeoid's gate.
+- Codex in autonomous mode asks codeoid about nothing (#442), so its writes aren't covered there; in guarded mode every file change asks anyway.
+
 ## Which backends
 
 | Backend | Covered |

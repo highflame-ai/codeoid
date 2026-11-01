@@ -63,6 +63,7 @@ src/
 │   ├── rate-limit.ts             # Per-user session creation + concurrency limits
 │   ├── shutdown.ts               # Cleanup registry, signal handlers, grace period
 │   ├── data-lock.ts              # One daemon per data dir: lock files taken at `codeoid start`
+│   ├── outside-writes.ts         # Autonomous mode asks before a write outside the workdir, every backend
 │   └── index.ts
 ├── protocol/                     # re-export shims for @highflame/codeoid-protocol (packages/protocol)
 │   ├── types.ts                  # Client<->Daemon message protocol
@@ -242,6 +243,7 @@ levels are guidance, not a sandbox: high and not-understood commands ask in ever
 mode and a recognised credential path is refused, as a best effort. Low is a strict
 allow-list (`notLow` in shell-risk.ts); keep it one, never widen it by rules.
 On Claude the PreToolUse hook routes high and not-understood ones to the gate past any allow rule.
+In autonomous mode a write, edit, delete or move whose target provably resolves outside the session's workdir (and the temp dir), or can't be resolved, asks on every backend (`outside-writes.ts`: each backend's write tool names and path keys, `shellWriteTargets` in risk/effects.ts for shell; the card's `risk` says why); it spends no budget, parks an unattended run like a high-risk command, and on Claude the PreToolUse hook routes it to the gate past allow rules (`ProviderSessionInit.sessionMode`). Codex autonomous asks nothing (#442).
 A command that could read another process's environment (a `/proc/<pid>/environ` however written, what a search of /proc hands on, `ps` unless its options and the line's variables prove it shows none) is refused as a credential read on every backend, failing closed (`refuseEnvironRead`, shell-risk.ts); a word's possible values are its `shape` (parse.ts).
 
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
