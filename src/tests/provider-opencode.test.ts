@@ -2971,6 +2971,36 @@ describe("opencode mid-turn messages", () => {
     expect(adopted).toBe(0);
     await p.teardown();
   });
+
+  it("a later message whose execution opencode doesn't start in time is withdrawn, and the user is told (round-23 audit)", async () => {
+    // Past QUEUED_START_MS (3s): the turn ends without it.
+    const { server } = makeServer({ FAKE_OPENCODE_QUEUED_START_MS: "4500" });
+    const p = makeProvider(server);
+    const run = p.runTurn(opts("hi"));
+    const events: ProviderEvent[] = [];
+    let pushed = false;
+    for await (const e of run.events) {
+      events.push(e);
+      if (!pushed && e.type === "text_done") {
+        pushed = true;
+        run.pushMidTurn?.("again", "later");
+      }
+      if (e.type === "turn_done" || e.type === "error") break;
+    }
+    expect(texts(events, "text_done")).toEqual(["Hello, world"]);
+    const notice = events.find((e) => e.type === "custom_message") as Extract<ProviderEvent, { type: "custom_message" }> | undefined;
+    expect(notice?.metadata).toMatchObject({ event: "opencode.queued_message_withdrawn" });
+    // Before the turn's end.
+    expect(events.indexOf(notice!)).toBeLessThan(events.findIndex((e) => e.type === "turn_done"));
+    expect(done(events)?.stopReason).toBe("stop");
+    // Withdrawn from opencode's inbox: nothing runs it later.
+    await Bun.sleep(2_000);
+    const st = await fakeState(server);
+    const id = st.prompts.find((x: { text: string }) => x.text === "again")?.id;
+    expect(st.inboxCancels).toEqual([id]);
+    expect(st.prompts.filter((x: { text: string }) => x.text === "again")).toHaveLength(1);
+    await p.teardown();
+  }, 10_000);
 });
 
 // ── commands, fork ───────────────────────────────────────────────────────────

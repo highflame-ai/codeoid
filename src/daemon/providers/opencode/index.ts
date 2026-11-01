@@ -1793,7 +1793,17 @@ export class OpencodeProvider implements SessionProvider {
       turn.started = false;
       const executions = turn.executions;
       setTimeout(() => {
-        if (this.#turn === turn && !turn.queue.closed && !turn.started && turn.executions === executions) this.#finishCounted(turn, outcome, error);
+        if (this.#turn !== turn || turn.queue.closed || turn.started || turn.executions !== executions) return;
+        // The turn's end withdraws it (#closeTurn): Session merged it into
+        // this turn, so the user hears it went unanswered.
+        if (turn.queued.size > 0) {
+          this.#emitTo(turn, {
+            type: "custom_message",
+            content: "⚠️ opencode didn't start running the message sent mid-turn in time: it was withdrawn, not run.",
+            metadata: { event: "opencode.queued_message_withdrawn", count: turn.queued.size },
+          });
+        }
+        this.#finishCounted(turn, outcome, error);
       }, QUEUED_START_MS).unref?.();
       return;
     }

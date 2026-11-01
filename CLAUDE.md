@@ -488,7 +488,8 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   or — refused — just before the turn's last `turn_done`); `later` is
   delivered inside the running execution (one queued after its last step
   runs in the next execution, which the turn waits for, after a failed one
-  too). A user interrupt or a budget stop
+  too; not started in 3s, it is withdrawn as the turn ends, saying so:
+  `opencode.queued_message_withdrawn`). A user interrupt or a budget stop
   withdraws the turn's undelivered inputs from opencode's inbox, and so does
   an execution interrupted from outside codeoid (`#dropPushed`: the turn ends
   there, a steer's boundary paid), and a teardown, which keeps the session

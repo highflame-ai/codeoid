@@ -168,7 +168,9 @@
  * where it was), FAKE_OPENCODE_FORM_CANCEL_UNSEEN=1 (a form an interrupt
  * cancels isn't announced, as if the feed dropped `form.cancelled`),
  * FAKE_OPENCODE_SLOW_START_MS (report the address, and answer `/api/info`,
- * that long late: a start a test can stop midway), FAKE_OPENCODE_SLOW_PROMPT_MS
+ * that long late: a start a test can stop midway), FAKE_OPENCODE_QUEUED_START_MS
+ * (an input that came after the last step starts its execution that long
+ * after the one before ended, waiting in the inbox meanwhile), FAKE_OPENCODE_SLOW_PROMPT_MS
  * (a prompt that starts an execution is admitted that long after it arrives,
  * as a loaded server stores one: an interrupt meanwhile finds nothing running),
  * FAKE_OPENCODE_PERSIST=1 (its sessions — their messages, rules and inbox —
@@ -1479,7 +1481,18 @@ async function startExecution(ses: Ses, text: string, inboxID?: string): Promise
   // A steer (or a queued input) that came after the last step runs next, in
   // an execution of its own, after a failed execution too (real 2.2.5).
   const steer = outcome === "succeeded" || outcome === "failed" ? ses.inbox.findIndex((x) => x.delivery === "steer" || x.delivery === "queue") : -1;
-  if (steer >= 0) {
+  const lag = Number(process.env.FAKE_OPENCODE_QUEUED_START_MS ?? 0);
+  if (steer >= 0 && lag > 0) {
+    // A loaded server: the input stays in the inbox (withdrawable) until its execution starts.
+    const { id } = ses.inbox[steer]!;
+    setTimeout(() => {
+      const i = ses.inbox.findIndex((x) => x.id === id);
+      if (i < 0) return;
+      const [item] = ses.inbox.splice(i, 1);
+      ses.messages.push({ id: item!.id, type: "user", text: item!.text, time: { created: Date.now() } });
+      void startExecution(ses, item!.text, item!.id);
+    }, lag);
+  } else if (steer >= 0) {
     const [item] = ses.inbox.splice(steer, 1);
     ses.messages.push({ id: item!.id, type: "user", text: item!.text, time: { created: Date.now() } });
     setTimeout(() => void startExecution(ses, item!.text, item!.id), tail ? TAIL_NEXT_START_MS : 5);
