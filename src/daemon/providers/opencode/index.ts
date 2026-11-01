@@ -364,6 +364,12 @@ export class OpencodeProvider implements SessionProvider {
   /** True between an execution's start and end. */
   #executing = false;
   /**
+   * Whether the session's execution the feed showed starting has started a
+   * step yet (null: none seen starting). One interrupted before its first
+   * step may still have sent the step's request (#noStepInterrupted).
+   */
+  #stepSeen: boolean | null = null;
+  /**
    * The running execution started before the open turn posted its prompt:
    * not the turn's (its end doesn't end it), unless the turn's input is
    * delivered into it.
@@ -1012,6 +1018,17 @@ export class OpencodeProvider implements SessionProvider {
     if ((d.error as OcError | undefined)?.type === "compaction.interrupted") this.#spendTarget().lost++;
   }
 
+  /**
+   * An execution interrupted before it announced a step: real 2.2.5 has then
+   * often sent the step's request already (an interrupt within milliseconds
+   * of the prompt being stored), and reports neither a step nor its spend,
+   * so the spend isn't known to be $0 (#430). One stopped before its request
+   * looks the same, and is counted the same.
+   */
+  #noStepInterrupted(): void {
+    this.#spendTarget().lost++;
+  }
+
   /** Steps still open when the session or its server goes: nothing will ever report what they spent (#430). */
   #dropOpenSteps(): void {
     if (this.#openSteps.size === 0) return;
@@ -1484,6 +1501,7 @@ export class OpencodeProvider implements SessionProvider {
     switch (ev.type) {
       case "session.execution.started": {
         this.#executing = true;
+        this.#stepSeen = false;
         this.#foreign = false;
         const turn = this.#turn;
         if (turn && !turn.sending) {
@@ -1529,6 +1547,7 @@ export class OpencodeProvider implements SessionProvider {
         return;
       }
       case "session.step.started": {
+        this.#stepSeen = true;
         // A retry starts the step again: its new attempt has carried nothing yet.
         if (typeof d.assistantMessageID === "string") this.#answeredSteps.delete(d.assistantMessageID);
         if (typeof d.assistantMessageID === "string" && this.#ses && !this.#countedSteps.has(d.assistantMessageID)) this.#openSteps.set(d.assistantMessageID, this.#ses);
@@ -1621,6 +1640,8 @@ export class OpencodeProvider implements SessionProvider {
         this.#executing = false;
         this.#lastEndAt = Date.now();
         this.#foreign = false;
+        if (ev.type === "session.execution.interrupted" && this.#stepSeen === false) this.#noStepInterrupted();
+        this.#stepSeen = null;
         // Nothing of an ended execution still waits on an answer.
         if (this.#ses) this.#withdrawAsks(this.#ses);
         const turn = this.#turn;
@@ -2855,6 +2876,7 @@ export class OpencodeProvider implements SessionProvider {
     this.#ses = null;
     this.#workdir = null;
     this.#executing = false;
+    this.#stepSeen = null;
     this.#foreign = false;
     this.#children.clear();
     this.#learning.clear();

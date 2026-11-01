@@ -1190,7 +1190,7 @@ describe("opencode interrupt", () => {
     await p.teardown();
   });
 
-  it("an interrupt while the turn's prompt is still being stored stops the execution it starts, which ends this turn and bills it", async () => {
+  it("an interrupt while the turn's prompt is still being stored stops the execution it starts, which ends this turn", async () => {
     // Round-19 audit: the interrupt finds nothing running (a no-op), the
     // prompt lands after it and its execution ran on unobserved, its spend
     // carried into the next turn.
@@ -1204,11 +1204,34 @@ describe("opencode interrupt", () => {
     const conn = await server.ensure();
     expect(p.backingSessionId! in (await conn.client.activeSessions())).toBe(false);
     expect((await fakeState(server)).interrupts.length).toBeGreaterThanOrEqual(2);
-    // What it spent is this turn's (the first prompt's title included), not the next one's.
-    const spent = done(events)!.totalCostUsd;
-    expect(spent).toBeGreaterThan(0);
+    // Stopped before its first step, as real 2.2.5 stops it: the step's
+    // request may have gone out, and nothing reports it (round-20 audit):
+    // not a known $0. Nothing of it is carried into the next turn.
+    expect((await fakeState(server)).unreported).toBe(1);
+    expect(done(events)!.costSource).toBe("unknown");
     const next = await collect(p.runTurn(opts("hi")));
     expect(done(next)!.totalCostUsd).toBeCloseTo(0.0123, 6);
+    expect(done(next)!.costSource).toBe("backend");
+    await p.teardown();
+  });
+
+  it("an interrupt that lands as a warm session's prompt is stored leaves the turn's cost unknown, never a known $0 (round-20 audit)", async () => {
+    // Real 2.2.5 then sends the step's request, and shows only the
+    // execution's start and its interruption: no step, no spend.
+    const { server } = makeServer({ FAKE_OPENCODE_SLOW_PROMPT_MS: "400" });
+    const p = makeProvider(server);
+    expect(done(await collect(p.runTurn(opts("hi"))))!.costSource).toBe("backend");
+    const run = p.runTurn(opts("slow"));
+    const collected = collect(run);
+    while ((await fakeState(server)).prompts.length < 2) await Bun.sleep(5);
+    void run.interrupt();
+    const events = await collected;
+    expect(done(events)?.stopReason).toBe("interrupted");
+    expect((await fakeState(server)).unreported).toBe(1);
+    expect(done(events)!.totalCostUsd).toBe(0);
+    expect(done(events)!.costSource).toBe("unknown");
+    // Only that turn: the next is priced again.
+    expect(done(await collect(p.runTurn(opts("hi"))))!.costSource).toBe("backend");
     await p.teardown();
   });
 

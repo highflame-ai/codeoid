@@ -285,6 +285,8 @@ const state = {
   /** `POST …/move` calls that moved a session. */
   moves: [] as Json[],
   interrupts: [] as string[],
+  /** Executions interrupted before their first step, whose request real 2.2.5 may have sent: spend nobody reports. */
+  unreported: 0,
   inboxCancels: [] as string[],
   mcpPromptCalls: [] as Json[],
   shellRan: [] as string[],
@@ -1356,6 +1358,13 @@ async function startExecution(ses: Ses, text: string, inboxID?: string): Promise
   if (inboxID) durable(ses, "session.inbox.delivered", { inboxID });
   let outcome: "succeeded" | "failed" | "interrupted";
   try {
+    // Interrupted as its prompt was stored: as real 2.2.5, the step's request
+    // has often gone out already, but no step is announced or stored, and
+    // nothing reports its spend (`state.unreported`).
+    if (signal.cancelled) {
+      state.unreported++;
+      throw new Cancelled();
+    }
     outcome = await runScenario(ses, text, signal);
     // A queued input is delivered inside the running execution, after its reply.
     for (let i = ses.inbox.findIndex((x) => x.delivery === "queue"); outcome === "succeeded" && i >= 0; i = ses.inbox.findIndex((x) => x.delivery === "queue")) {
