@@ -85,7 +85,10 @@
  *                    "zero-cost-mixed" → a priced step, then such a step
  *   "no-usage"     → a step that ends reporting no usage at all
  *   "compact"      → a step, an auto compaction of two requests ($0.002 +
- *                    $0.001, billed in the running total), another step
+ *                    $0.001, billed in the running total), another step;
+ *                    "compact-interrupt" → a step, then a compaction whose
+ *                    request streams until interrupted: as on real 2.2.5 it
+ *                    fails `compaction.interrupted`, nothing billed for it
  *   "echo-state"   → reports model/agent/synthetic/prompt text it received
  *   "die-asking"   → asks a permission, then the process dies
  *   "use-codemode" → a Code Mode `execute` call. A session rule denying
@@ -1027,13 +1030,21 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     durable(ses, "session.execution.failed", { error });
     return "failed";
   }
-  if (text.includes("compact")) {
-    // As real 2.2.x compacts: each of its requests is billed in the running
-    // total as it happens; its end reports their sum.
+  if (text.includes("compact-interrupt")) {
     const msg = step(ses);
     await say(ses, msg, "before compaction");
     endStep(ses, msg);
-    durable(ses, "session.compaction.started", { reason: "auto" });
+    // Real 2.2.5 announces no compaction start; a request's spend comes only as it finishes.
+    for (let i = 0; i < 200 && !signal.cancelled; i++) await sleep(10);
+    durable(ses, "session.compaction.failed", { reason: "auto", error: { type: "compaction.interrupted", message: "Compaction was interrupted" } });
+    return "interrupted";
+  }
+  if (text.includes("compact")) {
+    // As real 2.2.x compacts: each of its requests is billed in the running
+    // total as it happens; its end reports their sum. It announces no start.
+    const msg = step(ses);
+    await say(ses, msg, "before compaction");
+    endStep(ses, msg);
     bill(ses, 0.002, COMPACTION_TOKENS);
     bill(ses, 0.001, COMPACTION_TOKENS);
     const sum = { input: 2 * COMPACTION_TOKENS.input, output: 2 * COMPACTION_TOKENS.output, reasoning: 0, cache: { read: 0, write: 0 } };

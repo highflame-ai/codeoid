@@ -15,8 +15,13 @@
  *   [[slow:<ms>]]           wait that long between streamed chunks
  *   [[fail:<status>]]       answer with that HTTP error (after [[slow:<ms>]], if given)
  *   [[recall]]              reply with the first number in an earlier user message
+ *   [[usage:<n>]]           report <n> prompt tokens (a context near its limit: opencode compacts next)
+ *   [[compact-slow:<ms>]]   anywhere in the conversation: opencode's compaction request ("You MUST
+ *                           summarize the conversation above…") streams its summary that slowly
  * No directive: "ok". Usage is on the last chunk: 100 + 10 per request
  * served prompt tokens, 7 completion tokens.
+ *
+ * With SCRIPTED_LOG set, each request is appended to that file as a JSON line.
  *
  * With SCRIPTED_API_KEY set, a request whose bearer token isn't that value is
  * answered 401: a test can tell the key reached opencode's provider.
@@ -32,6 +37,7 @@ function text(c: unknown): string {
 }
 
 interface Plan {
+  usage?: number;
   think?: string;
   text?: string;
   call?: { name: string; args: string };
@@ -42,7 +48,13 @@ interface Plan {
 function plan(messages: Msg[]): Plan {
   const lastUser = messages.findLastIndex((m) => m.role === "user");
   const u = lastUser >= 0 ? text(messages[lastUser]!.content) : "";
+  if (u.startsWith("You MUST summarize the conversation above")) {
+    const all = messages.map((m) => text(m.content)).join(" ");
+    return { slow: Number(/\[\[compact-slow:(\d+)\]\]/.exec(all)?.[1] ?? 0), text: "summary ".repeat(40) };
+  }
   const slow = Number(/\[\[slow:(\d+)\]\]/.exec(u)?.[1] ?? 0);
+  const usage = /\[\[usage:(\d+)\]\]/.exec(u);
+  if (usage) return { slow, usage: Number(usage[1]), text: /\[\[text:([^\]]*)\]\]/.exec(u)?.[1] ?? "ok" };
   const fail = /\[\[fail:(\d+)\]\]/.exec(u);
   if (fail) return { slow, fail: Number(fail[1]) };
   const think = /\[\[think:([^\]]*)\]\]/.exec(u)?.[1];
@@ -72,8 +84,13 @@ const server = Bun.serve({
     }
     if (req.method === "GET" && url.pathname.endsWith("/models")) return Response.json({ object: "list", data: [{ id: "scripted-1", object: "model" }] });
     if (!url.pathname.endsWith("/chat/completions")) return new Response("not found", { status: 404 });
-    const body = (await req.json()) as { messages: Msg[] };
+    const body = (await req.json()) as { messages: Msg[]; tools?: unknown[] };
     const id = ++served;
+    if (process.env.SCRIPTED_LOG) {
+      const lastUser = body.messages.findLast((m) => m.role === "user");
+      const line = { id, tools: body.tools?.length ?? 0, messages: body.messages.length, system: text(body.messages.find((m) => m.role === "system")?.content).slice(0, 120), lastUser: text(lastUser?.content).slice(0, 300) };
+      await Bun.write(process.env.SCRIPTED_LOG, `${(await Bun.file(process.env.SCRIPTED_LOG).exists()) ? await Bun.file(process.env.SCRIPTED_LOG).text() : ""}${JSON.stringify(line)}\n`);
+    }
     const p = plan(body.messages);
     if (p.fail && p.slow) await Bun.sleep(p.slow);
     if (p.fail) return Response.json({ error: { message: `scripted failure ${p.fail}`, type: "server_error" } }, { status: p.fail });
@@ -96,7 +113,8 @@ const server = Bun.serve({
           }
           if (p.call) ctrl.enqueue(chunk({ tool_calls: [{ index: 0, id: `call_${id}`, type: "function", function: { name: p.call.name, arguments: p.call.args } }] }));
           ctrl.enqueue(chunk({}, p.call ? "tool_calls" : "stop"));
-          ctrl.enqueue(chunk({}, null, { prompt_tokens: 100 + 10 * id, completion_tokens: 7, total_tokens: 107 + 10 * id }));
+          const prompt = p.usage ?? 100 + 10 * id;
+          ctrl.enqueue(chunk({}, null, { prompt_tokens: prompt, completion_tokens: 7, total_tokens: prompt + 7 }));
           ctrl.enqueue(enc.encode("data: [DONE]\n\n"));
           ctrl.close();
         } catch {

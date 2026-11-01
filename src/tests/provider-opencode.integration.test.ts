@@ -77,6 +77,8 @@
  *       lines as; the session's own commands still see the user's `$SHELL`
  *   I51 (scripted only) a declaration builtin with no operand or only options (`export -p`, `declare -p`, `unset -v X`), which opencode
  *       runs unasked, keeps the server: it lists the session's bare shell state, nothing outside the call
+ *   I52 (scripted only) an auto compaction interrupted while its summary streams: its request was sent and served, but opencode
+ *       reports no spend for it, so the turn's cost is unknown, never a known $0
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -239,6 +241,13 @@ beforeAll(async () => {
             capabilities: { tools: true, reasoning: { supported: true, effort: ["low", "high"] } },
             cost: { input: 1, output: 2 },
             limit: { context: 64_000, output: 4_096 },
+          },
+          // A small context: a prompt reported near its limit makes opencode compact next (I52).
+          "scripted-small": {
+            name: "Scripted small",
+            capabilities: { tools: true },
+            cost: { input: 1, output: 2 },
+            limit: { context: 8_000, output: 1_024 },
           },
           // Priced at $0 in its catalog, as a subscription sign-in or a free hosted model is (I44).
           "scripted-free": {
@@ -1981,6 +1990,23 @@ describe("opencode (real binary)", () => {
       await p.teardown();
     }
     expect((await server!.ensure()).generation).toBe(generation);
+  }, 180_000);
+
+  maybeScripted("I52 an auto compaction interrupted while its summary streams: the turn's cost is unknown, not a known $0", async () => {
+    const p = provider();
+    const small = { model: "scripted/scripted-small" };
+    // Near the context limit: opencode compacts before the next request; its summary streams slowly.
+    const first = done(await collect(p.runTurn(opts("[[usage:7600]] [[compact-slow:300]] [[text:near the limit]]", small))));
+    expect(first?.costSource).toBe("backend");
+    const run = p.runTurn(opts("[[text:after]]", small));
+    setTimeout(() => void run.interrupt(), 2_500);
+    const events = await collect(run);
+    const r = done(events)!;
+    expect(r.stopReason).toBe("interrupted");
+    // opencode records nothing for the summary request it was stopped in.
+    expect(r.totalCostUsd).toBe(0);
+    expect(r.costSource).toBe("unknown");
+    await p.teardown();
   }, 180_000);
 
   maybe("I32 the user's own opencode data, state, cache and temp dirs are untouched by the whole run", () => {

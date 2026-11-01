@@ -914,6 +914,18 @@ export class OpencodeProvider implements SessionProvider {
     this.#spendTarget().lost++;
   }
 
+  /**
+   * A compaction stopped while its request streamed (`compaction.interrupted`:
+   * an interrupt, a budget stop, a restarted server's stale one): opencode
+   * reports each of its requests' spend only as the request finishes, and
+   * the one it was stopped in never does, though it was sent with the whole
+   * conversation (#430). Not a step, and real 2.2.5 announces no compaction
+   * start, so this end is the only word of it.
+   */
+  #compactionFailed(d: Record<string, unknown>): void {
+    if ((d.error as OcError | undefined)?.type === "compaction.interrupted") this.#spendTarget().lost++;
+  }
+
   /** Steps still open when the session or its server goes: nothing will ever report what they spent (#430). */
   #dropOpenSteps(): void {
     if (this.#openSteps.size === 0) return;
@@ -1473,6 +1485,9 @@ export class OpencodeProvider implements SessionProvider {
         this.#recordStep(tokens, cost, true);
         return;
       }
+      case "session.compaction.failed":
+        this.#compactionFailed(d);
+        return;
       case "session.retry.scheduled": {
         // The attempt was refused (it bills nothing); a retry starts the step again.
         if (typeof d.assistantMessageID === "string") this.#openSteps.delete(d.assistantMessageID);
@@ -1795,6 +1810,9 @@ export class OpencodeProvider implements SessionProvider {
         return;
       case "session.retry.scheduled":
         if (typeof d.assistantMessageID === "string") this.#openSteps.delete(d.assistantMessageID);
+        return;
+      case "session.compaction.failed":
+        this.#compactionFailed(d);
         return;
       // A failed step is billed too (interrupted after the model answered).
       case "session.step.ended":

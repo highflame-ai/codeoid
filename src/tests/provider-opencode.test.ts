@@ -1321,6 +1321,28 @@ describe("opencode cost and tokens", () => {
     await p.teardown();
   });
 
+  it("a compaction interrupted while its request streams makes the turn's cost unknown, never a known $0 (round-16 audit)", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hi")));
+    const run = p.runTurn(opts("compact-interrupt"));
+    const events: ProviderEvent[] = [];
+    for await (const e of run.events) {
+      events.push(e);
+      // The compaction starts once the step before it ends.
+      if (e.type === "text_done") setTimeout(() => void run.interrupt(), 100);
+      if (e.type === "turn_done" || e.type === "error") break;
+    }
+    const r = done(events)!;
+    expect(r.stopReason).toBe("interrupted");
+    // The step before it is billed; the summary request nobody reported.
+    expect(r.totalCostUsd).toBeCloseTo(0.0123, 6);
+    expect(r.costSource).toBe("unknown");
+    // A compaction that completes is opencode's own figure.
+    expect(done(await collect(p.runTurn(opts("compact"))))!.costSource).toBe("backend");
+    await p.teardown();
+  });
+
   it("stops at maxBudgetUsd mid-turn, as the spend lands", async () => {
     const { server } = makeServer();
     const events = await collect(makeProvider(server).runTurn(opts("costly", { maxBudgetUsd: 3 })));
