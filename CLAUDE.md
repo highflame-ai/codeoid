@@ -478,7 +478,9 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   too). A user interrupt or a budget stop
   withdraws the turn's undelivered inputs from opencode's inbox, and so does
   an execution interrupted from outside codeoid (`#dropPushed`: the turn ends
-  there, a steer's boundary paid). An
+  there, a steer's boundary paid), and a teardown, which keeps the session
+  (it also waits, bounded, for a push still being posted: `#send` withdraws
+  one that lands after its turn closed). An
   interrupted execution whose end the feed doesn't show in 5s is read
   back (`#settleInterrupt`, bounded) before the turn ends, so its cards
   settle and its aborted step is billed to it.

@@ -94,6 +94,8 @@
  *       it runs gets codeoid's overrides (a hostile .git/config's fsmonitor, hooks, diff, filter, signing and ext:: remote run
  *       nothing), hg skips the repository's hgrc and its plugin is off, a workdir under a .hg is refused when the hg can't
  *       skip it, and a session's own shell has none of it
+ *   I59 (scripted only) a message pushed mid-turn and still in opencode's inbox when the backend is torn down (a model switch,
+ *       an MCP refresh) is withdrawn: the next turn, on the session the teardown kept, answers only its own prompt
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -2440,6 +2442,30 @@ describe("opencode (real binary)", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 240_000);
+
+  maybeScripted("I59 a message still in opencode's inbox when the backend is torn down is withdrawn: the next turn answers only its own prompt", async () => {
+    for (const priority of ["later", "now"] as const) {
+      const p = provider();
+      const run = p.runTurn(opts("[[slow:300]] [[text:a b c d e f g h i j k l m n o p q r s t]]"));
+      for await (const e of run.events) {
+        if (e.type === "text_delta") {
+          run.pushMidTurn?.(`R21-STALE-${priority} [[text:answered-stale]]`, priority);
+          await Bun.sleep(400);
+          await p.teardown();
+          break;
+        }
+      }
+      const next = await collect(p.runTurn(opts("[[text:fresh-turn]]")));
+      expect(texts(next)).toEqual(["fresh-turn"]);
+      expect(done(next)?.stopReason).not.toBe("interrupted");
+      await Bun.sleep(1_000);
+      // Nothing answers it later either.
+      const conn = await server!.ensure();
+      const stored = JSON.stringify((await conn.client.messages(p.backingSessionId)).data);
+      expect(stored).not.toContain("answered-stale");
+      await p.teardown();
+    }
+  }, 180_000);
 
   maybe("I32 the user's own opencode data, state, cache and temp dirs are untouched by the whole run", () => {
     expect(userOpencodeDirs()).toBe(USER_DIRS_BEFORE);

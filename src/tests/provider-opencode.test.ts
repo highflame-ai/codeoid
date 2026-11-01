@@ -2641,6 +2641,35 @@ describe("opencode mid-turn messages", () => {
     await p.teardown();
   });
 
+  it("what a teardown leaves in opencode's inbox is withdrawn: the next turn, on the session the teardown kept, doesn't answer it (round-21 audit)", async () => {
+    // `late`: the steer's request answers after the teardown (its id comes back late), so #send withdraws it itself.
+    for (const late of [false, true]) {
+      const { server } = makeServer(late ? { FAKE_OPENCODE_STEER_REPLY_MS: "300" } : {});
+      const p = makeProvider(server);
+      const run = p.runTurn(opts("slow"));
+      for await (const e of run.events) {
+        if (e.type === "llm_call") {
+          run.pushMidTurn?.("stale steer", "now");
+          run.pushMidTurn?.("stale queued", "later");
+          await Bun.sleep(100);
+          // A model switch, an MCP refresh, a backend switch: Session tears the backend down and keeps the session.
+          await p.teardown();
+          break;
+        }
+      }
+      await Bun.sleep(500);
+      const next = await collect(p.runTurn(opts("echo-state")));
+      const seen = JSON.parse(texts(next, "text_done")[0]!) as { prompt: string };
+      expect(seen.prompt).toBe("echo-state");
+      expect(texts(next, "text_done").join(" ")).not.toContain("stale");
+      const st = await fakeState(server);
+      const ids = st.prompts.filter((x: { text: string }) => x.text.startsWith("stale")).map((x: { id: string }) => x.id);
+      expect(ids).toHaveLength(2);
+      expect([...st.inboxCancels].sort()).toEqual([...ids].sort());
+      await p.teardown();
+    }
+  });
+
   it("an execution interrupted from outside codeoid while a pushed message waits: the turn ends, the message is withdrawn and its boundary paid (round-17 audit)", async () => {
     for (const priority of ["now", "later"] as const) {
       const { server } = makeServer();

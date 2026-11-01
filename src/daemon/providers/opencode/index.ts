@@ -713,7 +713,7 @@ export class OpencodeProvider implements SessionProvider {
    * the teardown waits for it (#teardown).
    */
   async #stopLanded(conn: OpencodeConnection, ses: string, id?: string, turn?: Turn): Promise<void> {
-    if (id) this.#cancelInput(conn, ses, id);
+    if (id) void this.#cancelInput(conn, ses, id);
     await conn.client.interrupt(ses).catch(() => {});
     // Torn down: nothing settles it here, and a turn after the teardown would
     // join it: the teardown waits until it has stopped (bounded).
@@ -761,15 +761,21 @@ export class OpencodeProvider implements SessionProvider {
       // The turn was stopped while this was on its way (Session dropped it,
       // or the budget ran out): opencode mustn't hand it to the model with
       // the next prompt. A budget stop still pays its steer's boundary.
-      this.#cancelInput(conn, ses, item.id);
+      void this.#cancelInput(conn, ses, item.id);
       if (turn.budgetStopped) this.#budgetDropped(turn);
+      return;
+    }
+    if (this.#turn !== turn || turn.queue.closed) {
+      // The turn ended while this was on its way (a teardown: the session
+      // stays, the next turn resumes it): opencode would deliver it with
+      // whatever is prompted next. The teardown waits for this.
+      await this.#cancelInput(conn, ses, item.id);
       return;
     }
     if (delivery === "queue") {
       if (!turn.delivered.has(item.id)) turn.queued.add(item.id);
       return;
     }
-    if (this.#turn !== turn) return;
     // Delivered before its id came back: its boundary is due now.
     if (turn.delivered.has(item.id)) {
       if (turn.owed > 0) this.#payBoundary(turn);
@@ -789,8 +795,8 @@ export class OpencodeProvider implements SessionProvider {
     });
   }
 
-  #cancelInput(conn: OpencodeConnection, ses: string, id: string): void {
-    void conn.client.cancelInput(ses, id).catch((err: unknown) => {
+  #cancelInput(conn: OpencodeConnection, ses: string, id: string): Promise<void> {
+    return conn.client.cancelInput(ses, id).catch((err: unknown) => {
       console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] couldn't withdraw a message the interrupt dropped: ${err instanceof Error ? err.message : String(err)}`);
     });
   }
@@ -811,7 +817,7 @@ export class OpencodeProvider implements SessionProvider {
     // deliver an input still in its inbox with the next prompt, whoever
     // sends it and however much later.
     const dropped = turn.steers.size + turn.queued.size;
-    if (ses && conn) for (const id of [...turn.steers, ...turn.queued]) this.#cancelInput(conn, ses, id);
+    if (ses && conn) for (const id of [...turn.steers, ...turn.queued]) void this.#cancelInput(conn, ses, id);
     turn.steers.clear();
     turn.queued.clear();
     if (opts.budget && dropped > 0) this.#budgetDropped(turn);
@@ -1724,7 +1730,7 @@ export class OpencodeProvider implements SessionProvider {
   #dropPushed(turn: Turn): void {
     const ses = this.#ses;
     const conn = this.#conn;
-    if (ses && conn) for (const id of [...turn.steers, ...turn.queued]) this.#cancelInput(conn, ses, id);
+    if (ses && conn) for (const id of [...turn.steers, ...turn.queued]) void this.#cancelInput(conn, ses, id);
     turn.steers.clear();
     turn.queued.clear();
     turn.unpaid += turn.owed;
@@ -2857,10 +2863,16 @@ export class OpencodeProvider implements SessionProvider {
   async #teardown(): Promise<void> {
     this.#epoch++;
     const turn = this.#turn;
-    if (turn) this.#closeTurn(turn, "teardown");
-    this.#turn = null;
     const conn = this.#conn;
     const ses = this.#ses;
+    // The session stays (the next turn resumes it), and opencode would
+    // deliver an input still in its inbox with whatever is prompted next, as
+    // after an interrupt (#interrupt): withdrawn before this returns.
+    const withdrawn = turn && conn && ses ? [...turn.steers, ...turn.queued].map((id) => this.#cancelInput(conn, ses, id)) : [];
+    turn?.steers.clear();
+    turn?.queued.clear();
+    if (turn) this.#closeTurn(turn, "teardown");
+    this.#turn = null;
     const pending = [...this.#pendingAsks.entries()];
     this.#pendingAsks.clear();
     for (const [, ask] of pending) ask.abort.abort();
@@ -2893,7 +2905,9 @@ export class OpencodeProvider implements SessionProvider {
     // A prompt still being posted is waited out too (bounded): one that lands
     // after this is stopped by #post, here, before a turn that follows the
     // teardown can prompt the same opencode session.
-    if (turn) await Promise.race([turn.posted, Bun.sleep(ATTACH_WAIT_MS)]);
+    // So is a message pushed mid-turn whose request is still out: #send
+    // withdraws one that lands now.
+    if (turn) await Promise.race([Promise.all([turn.posted, ...turn.settling, ...withdrawn]), Bun.sleep(ATTACH_WAIT_MS)]);
     const dir = this.#workdir;
     if (conn && dir) await Promise.race([this.#unmount(conn, dir), Bun.sleep(2_000)]);
     // The opencode session stays: the next turn resumes it by id.
