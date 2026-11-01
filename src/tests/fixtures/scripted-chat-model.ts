@@ -18,6 +18,8 @@
  *   [[usage:<n>]]           report <n> prompt tokens (a context near its limit: opencode compacts next)
  *   [[compact-slow:<ms>]]   anywhere in the conversation: opencode's compaction request ("You MUST
  *                           summarize the conversation above…") streams its summary that slowly
+ *   [[midfail:<n>]]         in any user message: the first <n> requests of that conversation stream
+ *                           some text, then end the stream with no finish_reason (a dropped stream)
  * No directive: "ok". Usage is on the last chunk: 100 + 10 per request
  * served prompt tokens, 7 completion tokens.
  *
@@ -43,11 +45,23 @@ interface Plan {
   call?: { name: string; args: string };
   slow: number;
   fail?: number;
+  /** Stream the text, then end the stream without a finish_reason. */
+  drop?: boolean;
 }
+
+/** Requests served per `[[midfail:N]]` conversation (keyed by the user message holding it). */
+const midfails = new Map<string, number>();
 
 function plan(messages: Msg[]): Plan {
   const lastUser = messages.findLastIndex((m) => m.role === "user");
   const u = lastUser >= 0 ? text(messages[lastUser]!.content) : "";
+  const midfailIn = messages.map((m) => (m.role === "user" ? text(m.content) : "")).findLast((t) => /\[\[midfail:\d+\]\]/.test(t));
+  if (midfailIn !== undefined) {
+    const served = (midfails.get(midfailIn) ?? 0) + 1;
+    midfails.set(midfailIn, served);
+    if (served <= Number(/\[\[midfail:(\d+)\]\]/.exec(midfailIn)![1])) return { slow: 0, text: "partial answer words ", drop: true };
+    return { slow: 0, text: /\[\[text:([^\]]*)\]\]/.exec(midfailIn)?.[1] ?? "ok" };
+  }
   if (u.startsWith("You MUST summarize the conversation above")) {
     const all = messages.map((m) => text(m.content)).join(" ");
     return { slow: Number(/\[\[compact-slow:(\d+)\]\]/.exec(all)?.[1] ?? 0), text: "summary ".repeat(40) };
@@ -110,6 +124,10 @@ const server = Bun.serve({
           for (const w of p.text?.match(/\S+\s*/g) ?? []) {
             ctrl.enqueue(chunk({ content: w }));
             await pause();
+          }
+          if (p.drop) {
+            ctrl.close();
+            return;
           }
           if (p.call) ctrl.enqueue(chunk({ tool_calls: [{ index: 0, id: `call_${id}`, type: "function", function: { name: p.call.name, arguments: p.call.args } }] }));
           ctrl.enqueue(chunk({}, p.call ? "tool_calls" : "stop"));

@@ -81,6 +81,8 @@
  *       reports no spend for it, so the turn's cost is unknown, never a known $0
  *   I53 (scripted only) a model endpoint that refuses connections: opencode retries, then fails the step with a
  *       `provider.transport` error and no status; nothing was sent, so the failed turn is opencode's $0, not unknown (~90s)
+ *   I54 (scripted only) a response that broke off after part of an answer (a stream ended without finish_reason, a reset mid-body):
+ *       opencode fails the step with the response's 200 and retries; that request was served, so the turn's cost is unknown
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -2044,6 +2046,73 @@ describe("opencode (real binary)", () => {
       await p.teardown();
     } finally {
       await own.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 240_000);
+
+  maybeScripted("I54 a response that broke off after part of an answer, then retried: that request was served, so the turn's cost is unknown", async () => {
+    // The stream ends with no finish_reason: opencode fails the step with the response's 200 and retries.
+    const p = provider();
+    await collect(p.runTurn(opts("[[text:warm]]")));
+    const dropped = await collect(p.runTurn(opts("[[midfail:1]] [[text:final words]]")));
+    expect(dropped.find((e) => e.type === "api_retry")).toMatchObject({ errorStatus: 200 });
+    expect(texts(dropped)).toEqual(["partial answer words ", "final words"]);
+    expect(done(dropped)?.costSource).toBe("unknown");
+    await p.teardown();
+
+    // The connection is reset mid-body: a `provider.transport` error, again with the response's 200.
+    const net = await import("node:net");
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-reset-")));
+    let main = 0;
+    const sse = (delta: unknown, finish: string | null = null, usage?: unknown) =>
+      `data: ${JSON.stringify({ id: "c", object: "chat.completion.chunk", created: 1, model: "m", choices: [{ index: 0, delta, finish_reason: finish }], ...(usage ? { usage } : {}) })}\n\n`;
+    const chunked = (t: string) => `${Buffer.byteLength(t).toString(16)}\r\n${t}\r\n`;
+    const tcp = net.createServer((sock) => {
+      let buf = "";
+      sock.on("data", (d) => {
+        buf += d.toString();
+        const head = buf.indexOf("\r\n\r\n");
+        if (head < 0 || buf.length < head + 4 + Number(/content-length: (\d+)/i.exec(buf.slice(0, head))?.[1] ?? 0)) return;
+        // The session's own requests carry tools; the title's doesn't, and always answers.
+        const reset = buf.slice(head + 4).includes('"tools"') && ++main === 1;
+        sock.write("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n");
+        for (const c of [sse({ role: "assistant", content: "" }), sse({ content: "hello there " }), sse({ content: "more words " })]) sock.write(chunked(c));
+        if (reset) {
+          setTimeout(() => sock.destroy(), 30);
+          return;
+        }
+        sock.write(chunked(sse({}, "stop")));
+        sock.write(chunked(sse({}, null, { prompt_tokens: 100, completion_tokens: 7, total_tokens: 107 })));
+        sock.end(`${chunked("data: [DONE]\n\n")}0\r\n\r\n`);
+      });
+    });
+    await new Promise<void>((r) => tcp.listen(0, "127.0.0.1", () => r()));
+    const own = new OpencodeServer({
+      command: resolved!.command,
+      argsPrefix: resolved!.argsPrefix,
+      dbPath: join(root, "data", "opencode", "opencode.db"),
+      env: () => ({ ...buildOpencodeEnv(), HOME: join(root, "home") }),
+      userConfigDir: null,
+      defaultModel: "flaky/m",
+      modelProviders: {
+        flaky: {
+          name: "Flaky",
+          package: "@opencode/ai/providers/openai-compatible",
+          settings: { baseURL: `http://127.0.0.1:${(tcp.address() as { port: number }).port}/v1`, apiKey: "x" },
+          models: { m: { name: "m", capabilities: { tools: true }, cost: { input: 1, output: 2 }, limit: { context: 8_000, output: 1_024 } } },
+        },
+      },
+    });
+    try {
+      const q = new OpencodeProvider({ sessionId: "it-reset", initialBackingId: "it-reset", server: own, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
+      const events = await collect(q.runTurn(opts("hello", { workdir: root, model: "flaky/m" })));
+      expect(main).toBe(2);
+      expect(events.find((e) => e.type === "api_retry")).toMatchObject({ errorStatus: 200 });
+      expect(done(events)?.costSource).toBe("unknown");
+      await q.teardown();
+    } finally {
+      await own.stop();
+      tcp.close();
       rmSync(root, { recursive: true, force: true });
     }
   }, 240_000);

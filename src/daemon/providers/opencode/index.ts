@@ -189,6 +189,11 @@ function neverConnected(error: OcError | undefined): boolean {
   return error?.type === "provider.transport" && /\b(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|ConnectionRefused)\b|Unable to connect/.test(error.message ?? "");
 }
 
+/** An error status the provider refused the request with (a 2xx is the status of a response that was served). */
+function refusedStatus(error: OcError | undefined): boolean {
+  return typeof error?.status === "number" && error.status >= 400;
+}
+
 /** A stored assistant message that holds anything of an answer. */
 function answeredMessage(m: OcMessage): boolean {
   return (m.content?.length ?? 0) > 0 || m.time?.streamed !== undefined;
@@ -937,10 +942,12 @@ export class OpencodeProvider implements SessionProvider {
   /**
    * A step ended, on the feed or read back: it's no longer open, and one
    * with no usage spent what nobody reported (opencode bills a step stopped
-   * while the model answered nothing) — unless the provider refused its
-   * request, which bills nothing (an error with a status, after opencode's
-   * own retries), or it was never sent: a connection that couldn't be made
-   * (`neverConnected`) and nothing of an answer came (#430). `answered`:
+   * while the model answered nothing) — unless nothing of an answer came
+   * and the provider refused its request, which bills nothing (an error
+   * status, after opencode's own retries), or it was never sent: a
+   * connection that couldn't be made (`neverConnected`) (#430). A response
+   * that broke off after part of an answer was served, whatever its status
+   * (real 2.2.5 fails it with the response's 200, then retries). `answered`:
    * read back from the stored message; on the feed, what the step carried.
    */
   #stepSettled(id: string | undefined, tokens: OcTokenUsage | undefined, cost: number | undefined, error: OcError | undefined, answered?: boolean): void {
@@ -949,9 +956,21 @@ export class OpencodeProvider implements SessionProvider {
       this.#openSteps.delete(id);
       this.#answeredSteps.delete(id);
     }
-    if (hasTokens(tokens) || (typeof cost === "number" && cost > 0) || typeof error?.status === "number") return;
-    if (!came && neverConnected(error)) return;
+    if (hasTokens(tokens) || (typeof cost === "number" && cost > 0)) return;
+    if (!came && (refusedStatus(error) || neverConnected(error))) return;
     this.#spendTarget().lost++;
+  }
+
+  /**
+   * opencode retries a step: an attempt that answered something and wasn't
+   * failed first (real 2.2.5 fails one before retrying it, #stepSettled)
+   * was served, and nothing will report what it spent; a retry starts the
+   * step again.
+   */
+  #retryScheduled(id: unknown): void {
+    if (typeof id !== "string") return;
+    this.#openSteps.delete(id);
+    if (this.#answeredSteps.delete(id)) this.#spendTarget().lost++;
   }
 
   /**
@@ -1532,11 +1551,7 @@ export class OpencodeProvider implements SessionProvider {
         this.#compactionFailed(d);
         return;
       case "session.retry.scheduled": {
-        // The attempt was refused (it bills nothing); a retry starts the step again.
-        if (typeof d.assistantMessageID === "string") {
-          this.#openSteps.delete(d.assistantMessageID);
-          this.#answeredSteps.delete(d.assistantMessageID);
-        }
+        this.#retryScheduled(d.assistantMessageID);
         const error = d.error as OcError | undefined;
         this.#emit({
           type: "api_retry",
@@ -1873,10 +1888,7 @@ export class OpencodeProvider implements SessionProvider {
         if (typeof d.assistantMessageID === "string" && !this.#countedSteps.has(d.assistantMessageID)) this.#openSteps.set(d.assistantMessageID, sid);
         return;
       case "session.retry.scheduled":
-        if (typeof d.assistantMessageID === "string") {
-          this.#openSteps.delete(d.assistantMessageID);
-          this.#answeredSteps.delete(d.assistantMessageID);
-        }
+        this.#retryScheduled(d.assistantMessageID);
         return;
       case "session.compaction.failed":
         this.#compactionFailed(d);

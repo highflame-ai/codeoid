@@ -76,7 +76,8 @@
  *   "steer-gap"    → the feed drops after the first step; the steer is
  *                    delivered and answered in the gap, which closes while
  *                    the execution still runs
- *   "retry"        → session.retry.scheduled before answering
+ *   "retry"        → session.retry.scheduled before answering; "retry-after-text"
+ *                    → after part of an answer, with no step.failed first
  *   "fail"         → a 429 retried once, then execution.failed with a structured
  *                    rate-limit error; the failed step bills nothing
  *   "transport:<kind>" → as real 2.2.5 fails a model endpoint it can't reach: a
@@ -85,6 +86,12 @@
  *                    "refused" (ECONNREFUSED: never connected), "reset"
  *                    (ECONNRESET), "refused-after-text" (the retry's attempt
  *                    streams some text first)
+ *   "midstream:<error>:<then>" → as real 2.2.5 fails an attempt whose
+ *                    response broke off after part of an answer: the step
+ *                    fails with status 200, unbilled; the retry runs in a
+ *                    new message. <error>: "invalid" (the stream ended
+ *                    without finish_reason) or "reset" (ECONNRESET mid-body);
+ *                    <then>: "ok" (the retry answers) or "refused" (it can't connect)
  *   "costly"       → three steps of $2 each; "costly-free" → three steps
  *                    that used tokens, each billed $0
  *   "zero-cost"    → a step that used tokens opencode billed $0 for (a
@@ -1020,10 +1027,44 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
   }
   if (text.includes("retry")) {
     const msg = step(ses);
+    // Not a shape real 2.2.5 was seen in (it fails an answered attempt first, "midstream:"): a retry straight after part of an answer.
+    if (text.includes("retry-after-text")) ephemeral("session.text.delta", { sessionID: ses.id, assistantMessageID: msg, ordinal: 0, delta: "partial" });
     // As real 2.2.5 numbers it: the attempt being scheduled, so the first retry is attempt 2.
     durable(ses, "session.retry.scheduled", { assistantMessageID: msg, attempt: 2, at: Date.now() + 1000, error: { type: "provider.overloaded", message: "overloaded", status: 529 } });
     await say(ses, msg, "after retry");
     endStep(ses, msg);
+    return "succeeded";
+  }
+  if (text.startsWith("midstream:")) {
+    // As real 2.2.5 fails an attempt whose response broke off after the
+    // model answered part of it: the step fails with status 200 (the
+    // response's), unbilled, though the request was served; the retry
+    // runs in a new message after a synthetic "continue" one.
+    const [kind, then] = text.slice("midstream:".length).split(":");
+    const error =
+      kind === "reset"
+        ? { type: "provider.transport", message: "Connection lost while reading the response: ECONNRESET: The socket connection was closed unexpectedly.", status: 200 }
+        : { type: "provider.invalid-output", message: "OpenAI Chat stream ended without finish_reason", status: 200 };
+    const msg = step(ses);
+    await say(ses, msg, "partial answer words ");
+    const m = ses.messages.find((x) => x.id === msg);
+    if (m) Object.assign(m, { finish: "error", error, time: { ...m.time, streamed: Date.now(), completed: Date.now() } });
+    durable(ses, "session.step.failed", { assistantMessageID: msg, error });
+    durable(ses, "session.retry.scheduled", { assistantMessageID: msg, attempt: 2, at: Date.now() + 30, error });
+    await sleep(30);
+    ses.messages.push({ id: nextId("msg"), type: "synthetic", text: "The previous response was interrupted. Continue from where you left off without repeating completed content.", time: { created: Date.now() } });
+    const retry = step(ses);
+    if (then === "refused") {
+      const refused = { type: "provider.transport", message: "ECONNREFUSED: Unable to connect. Is the computer able to access the url?" };
+      durable(ses, "session.retry.scheduled", { assistantMessageID: retry, attempt: 3, at: Date.now() + 30, error: refused });
+      await sleep(30);
+      durable(ses, "session.step.started", { assistantMessageID: retry, agent: ses.agent ?? "build", model: ses.model ?? { providerID: "anthropic", id: "claude-sonnet-4" }, started: Date.now() });
+      durable(ses, "session.step.failed", { assistantMessageID: retry, error: refused });
+      durable(ses, "session.execution.failed", { error: refused });
+      return "failed";
+    }
+    await say(ses, retry, "final words");
+    endStep(ses, retry);
     return "succeeded";
   }
   if (text.startsWith("transport:")) {

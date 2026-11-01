@@ -1339,6 +1339,29 @@ describe("opencode cost and tokens", () => {
     await p.teardown();
   });
 
+  it("an attempt whose response broke off after part of an answer was served: its retry leaves the turn's cost unknown, never a known figure (round-17 audit)", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hi")));
+    for (const kind of ["invalid", "reset"]) {
+      // The retry answers: only its own spend is reported.
+      const ok = await collect(p.runTurn(opts(`midstream:${kind}:ok`)));
+      expect(ok.find((e) => e.type === "api_retry")).toMatchObject({ errorStatus: 200 });
+      expect(texts(ok, "text_done")).toEqual(["partial answer words ", "final words"]);
+      expect(done(ok)!).toMatchObject({ totalCostUsd: 0.0123, costSource: "unknown" });
+      // The retry can't connect: nothing of it was sent, but the first attempt was.
+      const refused = await collect(p.runTurn(opts(`midstream:${kind}:refused`)));
+      const end = refused.at(-1) as Extract<ProviderEvent, { type: "error" }>;
+      expect(end.type).toBe("error");
+      expect(end.result).toMatchObject({ totalCostUsd: 0, costSource: "unknown" });
+    }
+    // A provider error that refused the request still bills nothing.
+    expect(done(await collect(p.runTurn(opts("retry"))))?.costSource).toBe("backend");
+    // A retry scheduled straight after part of an answer, with no failed step first: that attempt was served too.
+    expect(done(await collect(p.runTurn(opts("retry-after-text"))))?.costSource).toBe("unknown");
+    await p.teardown();
+  });
+
   it("a compaction interrupted while its request streams makes the turn's cost unknown, never a known $0 (round-16 audit)", async () => {
     const { server } = makeServer();
     const p = makeProvider(server);
