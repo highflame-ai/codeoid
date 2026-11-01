@@ -105,6 +105,29 @@ export function hostedEntry(entry: unknown, hosted: ReadonlySet<string> = new Se
 }
 
 /**
+ * Whether a provider entry has a `{file:…}` (or other substitution) whose
+ * text can't be checked for opencode.ai before opencode reads it: anywhere
+ * but a credential (`apiKey`, a header's value). A URL written that way
+ * (`baseURL`, `api`, `url`, `canonical`, …) may name opencode's hosted
+ * service, which is only seen once opencode substitutes it.
+ */
+export function uncheckedReference(entry: unknown, key?: string): boolean {
+  if (typeof entry === "string") return key !== "apiKey" && SUBSTITUTION.test(entry);
+  if (Array.isArray(entry)) return entry.some((v) => uncheckedReference(v));
+  if (!isRecord(entry)) return false;
+  return Object.entries(entry).some(([k, v]) => (k === "headers" && isRecord(v) ? Object.keys(v).some((h) => SUBSTITUTION.test(h)) : uncheckedReference(v, k)));
+}
+
+/**
+ * Whether a model opencode lists (`GET /api/model`, its `settings` with
+ * every `{file:}` substituted) is served by opencode's hosted service: a
+ * hosted provider's, or one whose settings carry an opencode.ai URL.
+ */
+export function hostedModelInfo(m: { providerID: string; settings?: unknown }): boolean {
+  return isHostedProvider(m.providerID) || hostedEntry({ settings: m.settings });
+}
+
+/**
  * The ids of `providers` (an id → entry map, the user's or codeoid's) that
  * reach opencode's hosted service: a hosted id, or an entry that does
  * ({@link hostedEntry}), each in turn until none is added (an entry whose
@@ -424,6 +447,11 @@ function carriedValue(
             ? `${key}.${id}: opencode's hosted provider is off (set providers.opencode.hostedModels to use it)`
             : `${key}.${id}: it reaches opencode's hosted service (opencode.ai), which is off (set providers.opencode.hostedModels to use it)`,
         );
+        continue;
+      }
+      // Off, a URL that only opencode's substitution shows can't be checked for opencode.ai.
+      if (hosted && uncheckedReference(entry)) {
+        skipped.push(`${key}.${id}: a {file:…} reference in it (outside its apiKey and headers) may name opencode's hosted service, which is off and can't be checked there (write the URL itself, or set providers.opencode.hostedModels)`);
         continue;
       }
       const pkg = foreignPackage(entry);
@@ -890,14 +918,27 @@ export function serverEnv(opts: {
 }
 
 /**
- * Why a server offers opencode's hosted provider though codeoid turned it
- * off (`providers` from `GET /api/provider`), or null. The injected deny
- * should have removed it; a config document opencode ranks above the
- * injected one (`/etc/opencode`) could allow it again. Fail closed: refused.
+ * Why a server offers opencode's hosted service though codeoid turned it
+ * off, or null. `providers` from `GET /api/provider`; `models` from
+ * `GET /api/model`, whose settings opencode has substituted; `config` the
+ * documents of `GET /api/config`. The injected deny should have removed the
+ * hosted providers, and the carried config drops what reaches them; a
+ * config document opencode ranks above the injected one (`/etc/opencode`)
+ * could still add one, under any id, by an opencode.ai URL. Refused: a
+ * listed provider of a hosted id, one copying one (`canonical`), one a
+ * config document makes reach opencode.ai ({@link hostedIdsOf}), one with a
+ * model whose settings name opencode.ai. Fail closed.
  */
-export function hostedProviderProblem(providers: ReadonlyArray<{ id: string; canonical?: string }>, hostedModels: boolean): string | null {
+export function hostedProviderProblem(
+  providers: ReadonlyArray<{ id: string; canonical?: string }>,
+  hostedModels: boolean,
+  more: { models?: ReadonlyArray<{ providerID: string; settings?: unknown }>; config?: ReadonlyArray<{ info?: Record<string, unknown> }> } = {},
+): string | null {
   if (hostedModels) return null;
-  const found = providers.filter((p) => isHostedProvider(p.id) || (typeof p.canonical === "string" && isHostedProvider(p.canonical)));
+  const configured = hostedIdsOf(...(more.config ?? []).flatMap((e) => [e.info?.provider, e.info?.providers]));
+  const byModel = new Set((more.models ?? []).filter(hostedModelInfo).map((m) => m.providerID));
+  const listed = [...providers, ...[...byModel].filter((id) => !providers.some((p) => p.id === id)).map((id) => ({ id }))];
+  const found = listed.filter((p: { id: string; canonical?: string }) => configured.has(p.id) || byModel.has(p.id) || (typeof p.canonical === "string" && isHostedProvider(p.canonical)));
   if (found.length === 0) return null;
   return `opencode offers its own hosted models (provider ${found.map((p) => `\`${p.id}\``).join(", ")}, opencode.ai) though codeoid turned them off — refusing to use this opencode server. Remove what enables them from opencode's system configuration, or set providers.opencode.hostedModels to use them.`;
 }

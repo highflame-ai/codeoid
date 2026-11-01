@@ -547,9 +547,14 @@ describe("opencode server lifecycle", () => {
         provider: { legacy: { npm: "file:///tmp/x.mjs" } },
       }),
     );
+    // While opencode's hosted models are off, a base URL through {file:} can't be checked for opencode.ai: dropped (round 25).
+    const off: string[] = [];
+    expect(Object.keys(userModelConfig(user, off, (l) => l).providers as object)).toEqual([]);
+    expect(off.filter((w) => w.includes("can't be checked")).map((w) => w.split(":")[0])).toEqual(["providers.gw", "providers.bundled", "providers.local", "providers.npm", "providers.perModel", "providers.sneaky", "providers.env"]);
+    // With them on, a relative {file:} is the user's config dir's.
     const skipped: string[] = [];
     const literals: string[] = [];
-    const carried = userModelConfig(user, skipped, (literal) => `{file:/f/${literals.push(literal)}}`);
+    const carried = userModelConfig(user, skipped, (literal) => `{file:/f/${literals.push(literal)}}`, { hostedModels: true });
     expect(Object.keys(carried.providers as object)).toEqual(["gw", "bundled"]);
     // Only the names went through files: the references stay as they are, and so do packages.
     expect(literals).toEqual(["x", "x"]);
@@ -560,7 +565,7 @@ describe("opencode server lifecycle", () => {
     expect((carried.providers as Record<string, { settings: unknown }>).gw?.settings).toEqual({ baseURL: `{file:${join(user, "gw-url")}}`, apiKey: "{file:~/.secrets/gw}" });
     expect(skipped.map((w) => w.split(":")[0])).toEqual(["provider.legacy", "providers.local", "providers.npm", "providers.perModel", "providers.sneaky", "providers.env", "model"]);
     // As the server reads it in the session's workdir: the user's file, not the repository's.
-    const { server } = makeServer({}, { userConfigDir: user });
+    const { server } = makeServer({}, { userConfigDir: user, hostedModels: true });
     await collect(makeProvider(server).runTurn(opts("hi", { workdir: work })));
     const st = await fakeState(server);
     expect((st.providersAt[work] as Record<string, { settings: { baseURL: string } }>).gw?.settings.baseURL).toBe("http://user-gateway.example/v1");
@@ -1884,6 +1889,91 @@ describe("round 24: everything that reaches opencode.ai is hosted", () => {
     expect([...providers].sort()).toEqual(["anthropic", "openai"]);
   });
 });
+
+describe("round 25: a URL opencode.ai can't be checked for, or that only opencode resolves, is hosted", () => {
+  const userDir = (doc: Record<string, unknown>) => {
+    const user = realpathSync(tmp());
+    writeFileSync(join(user, "zen-url"), "https://opencode.ai/zen/v1\n");
+    writeFileSync(join(user, "key"), "k\n");
+    writeFileSync(join(user, "opencode.json"), JSON.stringify(doc));
+    return user;
+  };
+  const zenf = { package: "@ai-sdk/openai-compatible", settings: { baseURL: "{file:./zen-url}", apiKey: "public" }, models: { "big-pickle": {} } };
+
+  it("while they're off, a carried provider with a {file:} anywhere but its apiKey or headers is dropped, saying why; a key through a file is carried", () => {
+    const user = userDir({
+      model: "zenf/big-pickle",
+      providers: {
+        zenf,
+        canon: { canonical: "{file:./canon}", settings: { apiKey: "public" } },
+        keyed: { package: "@ai-sdk/openai-compatible", settings: { baseURL: "http://gw.example/v1", apiKey: "{file:./key}", headers: { Authorization: "{file:./key}" } }, models: { m: {} } },
+      },
+    });
+    const skipped: string[] = [];
+    const carried = userModelConfig(user, skipped, (l) => l);
+    expect(Object.keys(carried.providers as object)).toEqual(["keyed"]);
+    expect(carried.model).toBe("zenf/big-pickle");
+    expect(skipped.filter((w) => w.includes("can't be checked"))).toHaveLength(2);
+    // Opted in: carried as written.
+    const opted: string[] = [];
+    expect(Object.keys(userModelConfig(user, opted, (l) => l, { hostedModels: true }).providers as object).sort()).toEqual(["canon", "keyed", "zenf"]);
+    expect(opted).toEqual([]);
+  });
+
+  it("a server listing a provider by an opencode.ai URL — in a config document, or a model's resolved settings — is refused", () => {
+    const etc = [{ info: { providers: { zen2: { package: "@ai-sdk/openai-compatible", options: { baseURL: "https://opencode.ai/zen/v1" } } } } }];
+    expect(hostedProviderProblem([{ id: "anthropic" }, { id: "zen2" }], false, { config: etc })).toContain("`zen2`");
+    const models = [{ providerID: "zenf", settings: { baseURL: "https://opencode.ai/zen/v1" } }, { providerID: "anthropic", settings: {} }];
+    expect(hostedProviderProblem([{ id: "anthropic" }, { id: "zenf" }], false, { models })).toContain("`zenf`");
+    expect(hostedProviderProblem([{ id: "anthropic" }], false, { models: [{ providerID: "gw", settings: { baseURL: "https://notopencode.ai/v1" } }], config: [{ info: {} }] })).toBeNull();
+    expect(hostedProviderProblem([{ id: "zen2" }], true, { config: etc, models })).toBeNull();
+  });
+
+  it("end to end: the user's {file:} alias of opencode.ai is neither listed nor the default; the turn runs on codeoid's", async () => {
+    const { server } = makeServer({}, { userConfigDir: userDir({ model: "zenf/big-pickle", providers: { zenf } }) });
+    const p = makeProvider(server);
+    expect(events_ok(await collect(p.runTurn(opts("echo-state"))))).toBe(true);
+    const listed = await p.listModels();
+    expect(listed.some((m) => m.id.startsWith("zenf/"))).toBe(false);
+    expect(listed.find((m) => m.isDefault)?.id).toBe("anthropic/claude-sonnet-4");
+    expect(JSON.parse((await fakeState(server)).configText).providers?.zenf).toBeUndefined();
+  });
+
+  it("end to end: a system config document adding opencode.ai under another id refuses the server; with them on it runs", async () => {
+    const system = JSON.stringify({ providers: { zen2: { package: "@ai-sdk/openai-compatible", options: { baseURL: "https://opencode.ai/zen/v1", apiKey: "public" }, models: { "big-pickle": {} } } } });
+    const { server } = makeServer({ FAKE_OPENCODE_SYSTEM_CONFIG: system });
+    const events = await collect(makeProvider(server).runTurn(opts("hi")));
+    expect(events.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("`zen2`") });
+    expect((await fakeState(server).catch(() => ({ prompts: [] }))).prompts ?? []).toHaveLength(0);
+    const on = makeServer({ FAKE_OPENCODE_SYSTEM_CONFIG: system }, { hostedModels: true });
+    expect(events_ok(await collect(makeProvider(on.server).runTurn(opts("hi"))))).toBe(true);
+  });
+
+  it("a model whose resolved settings name opencode.ai, under an id that isn't hosted, is never offered or picked", async () => {
+    // A system document that appears after the start (the start-up check saw none).
+    const system = JSON.stringify({ model: "zen2/big-pickle", providers: { zen2: { package: "@ai-sdk/openai-compatible", options: { baseURL: "https://opencode.ai/zen/v1" }, models: { "big-pickle": {} } } } });
+    const { server } = makeServer({ FAKE_OPENCODE_SYSTEM_CONFIG_LATE: system });
+    const p = makeProvider(server);
+    expect(events_ok(await collect(p.runTurn(opts("hi"))))).toBe(true);
+    expect((await p.listModels()).some((m) => m.id.startsWith("zen2/"))).toBe(false);
+    const picked = await collect(p.runTurn(opts("hi", { model: "zen2/big-pickle" })));
+    expect(picked.find((e) => e.type === "error")).toBeDefined();
+    // opencode's default is now that model: the session keeps its own, never switching to it.
+    expect(events_ok(await collect(p.runTurn(opts("hi"))))).toBe(true);
+    const st = await fakeState(server);
+    expect(st.prompts).toHaveLength(2);
+    expect(JSON.stringify(st.prompts)).not.toContain("zen2");
+    expect(JSON.stringify(st.modelSwitches ?? [])).not.toContain("zen2");
+    // A fresh session takes opencode's default only when codeoid offers it: not this one.
+    const fresh = await collect(makeProvider(server).runTurn(opts("hi")));
+    expect(fresh.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("opencode has no model to run this turn") });
+  });
+});
+
+/** A turn that ended without an error. */
+function events_ok(events: ProviderEvent[]): boolean {
+  return events.every((e) => e.type !== "error") && events.some((e) => e.type === "turn_done");
+}
 
 // ── O7 models and effort ─────────────────────────────────────────────────────
 

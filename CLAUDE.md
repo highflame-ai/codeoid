@@ -382,12 +382,15 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   `disabled_providers` names them (a `provider.use` deny), nothing carried
   from the user's config or codeoid's own reaches them (`hostedIdsOf`: a
   hosted id, an entry whose `canonical` copies one, one with a URL on
-  opencode.ai, and models on those; `userModelConfig`), a carried
+  opencode.ai, one with a `{file:}` outside its apiKey and headers
+  (`uncheckedReference`: a URL only opencode resolves), and models on those;
+  `userModelConfig`), a carried
   `enabled_providers` stays a restriction less those ids, with codeoid's
   own provider ids added, the server's env sets `OPENCODE_DISABLE_FREE_MODELS` and
   `OPENCODE_DISABLE_MODELS_FETCH` (2.2.5 fetches its catalog from
   models.opencode.ai at every start), a server still offering one is refused
-  (`hostedProviderProblem`), and a turn with no usable model fails before its
+  (`hostedProviderProblem`: by id, `canonical`, a config document's opencode.ai URL,
+  or a listed model's substituted settings, `hostedModelInfo`, which `#offered` applies per turn too), and a turn with no usable model fails before its
   prompt, saying what to set (`#checkModel`).
 - **Credentials** (credentials.ts): the server's environment carries none
   (`buildOpencodeEnv`), nor a proxy URL with credentials. codeoid's

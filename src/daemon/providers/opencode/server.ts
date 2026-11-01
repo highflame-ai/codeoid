@@ -366,10 +366,14 @@ export class OpencodeServer {
         const foreign = foreignPlugins(await launched.client.plugins());
         if (foreign.length > 0) throw new OpencodeUntrustedError(untrustedPlugins(foreign.map(describePlugin)));
         // So do formatters a config document above codeoid's turns on.
-        const formatters = formatterProblem(await launched.client.config());
+        const config = await launched.client.config();
+        const formatters = formatterProblem(config);
         if (formatters) throw new OpencodeUntrustedError(formatters);
-        // And opencode's hosted provider, off unless the owner opted in.
-        const hosted = hostedProviderProblem(await launched.client.providers(), this.hostedModels);
+        // And opencode's hosted service, off unless the owner opted in: by id, by
+        // a config document's URL, by a model's substituted settings.
+        const hosted = this.hostedModels
+          ? null
+          : hostedProviderProblem(await launched.client.providers(), false, { models: await launched.client.models(), config });
         if (hosted) throw new OpencodeUntrustedError(hosted);
         overtaken();
         return this.#adopt(launched);

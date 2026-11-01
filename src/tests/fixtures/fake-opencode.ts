@@ -551,13 +551,50 @@ const GO_MODELS = [
 const HOSTED_IDS = ["opencode", "opencode-go"];
 
 /** The config's provider entries (`providers`, and the older `provider`), by id. */
+/** The system document (`/etc/opencode`): FAKE_OPENCODE_SYSTEM_CONFIG from the start, …_LATE once a prompt was posted. */
+function systemConfig(): Json {
+  const text = process.env.FAKE_OPENCODE_SYSTEM_CONFIG ?? (state.prompts.length > 0 ? process.env.FAKE_OPENCODE_SYSTEM_CONFIG_LATE : undefined);
+  return text ? (JSON.parse(text) as Json) : {};
+}
+
 function configuredProviders(): Record<string, Json> {
   const out: Record<string, Json> = {};
-  for (const k of ["provider", "providers"]) {
-    const v = config[k];
-    if (v && typeof v === "object" && !Array.isArray(v)) Object.assign(out, v as Record<string, Json>);
+  // The system document outranks the injected config.
+  for (const doc of [config, systemConfig()]) {
+    for (const k of ["provider", "providers"]) {
+      const v = doc[k];
+      if (v && typeof v === "object" && !Array.isArray(v)) Object.assign(out, v as Record<string, Json>);
+    }
   }
   return out;
+}
+
+/** `value` with each `{file:path}` replaced by that file's trimmed text, as real 2.2.5 substitutes a config it loads. */
+function substituted(value: unknown): unknown {
+  if (typeof value === "string") {
+    return value.replace(/\{file:([^}]+)\}/g, (_ref, path: string) => {
+      try {
+        return readFileSync(path.startsWith("~/") ? join(homedir(), path.slice(2)) : path, "utf8").trim();
+      } catch {
+        return "";
+      }
+    });
+  }
+  if (Array.isArray(value)) return value.map(substituted);
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, substituted(v)]));
+  return value;
+}
+
+/**
+ * A configured provider's own models (an entry with `models`, no
+ * `canonical`), as real 2.2.5 lists them: each with the entry's `settings`
+ * (or `options`), `{file:}` substituted — where its base URL shows.
+ */
+function customModels(id: string, entry: Json): Json[] {
+  const models = entry.models;
+  if (!models || typeof models !== "object" || Array.isArray(models) || typeof entry.canonical === "string") return [];
+  const settings = substituted(entry.settings ?? entry.options ?? {}) as Json;
+  return Object.keys(models as Json).map((m) => ({ id: m, modelID: m, providerID: id, name: m, variants: [], enabled: true, settings: { ...settings, provider: id } }));
 }
 
 /**
@@ -593,14 +630,16 @@ function listedModels(): Json[] {
     if (typeof canonical !== "string" || providerDenied(id)) return [];
     return catalogOf(canonical).map((m) => ({ ...m, providerID: id }));
   });
+  const custom = Object.entries(configured).flatMap(([id, entry]) => (providerDenied(id) || HOSTED_IDS.includes(id) ? [] : customModels(id, entry as Json)));
   const own = process.env.FAKE_OPENCODE_NO_CREDENTIALS === "1" ? [] : MODELS.filter((m) => !providerDenied(m.providerID));
-  return [...hosted, ...go, ...copies, ...own];
+  return [...hosted, ...go, ...copies, ...custom, ...own];
 }
 
 /** `GET /api/model/default`: the config's `model` when listed, else the first usable model, else none. */
 function defaultModelOf(): Json | null {
   const listed = listedModels().filter((m) => m.enabled !== false);
-  const named = typeof config.model === "string" ? listed.find((m) => `${m.providerID}/${m.id}` === config.model) : undefined;
+  const model = systemConfig().model ?? config.model;
+  const named = typeof model === "string" ? listed.find((m) => `${m.providerID}/${m.id}` === model) : undefined;
   return named ?? listed[0] ?? null;
 }
 
@@ -1877,8 +1916,8 @@ const server = Bun.serve({
       }
       if (dir) entries.push({ type: "directory", path: dir });
       entries.push({ type: "document", info: readConfig(directoryOf(req, url)) });
-      const system = process.env.FAKE_OPENCODE_SYSTEM_CONFIG ?? (state.prompts.length > 0 ? process.env.FAKE_OPENCODE_SYSTEM_CONFIG_LATE : undefined);
-      if (system) entries.push({ type: "document", path: "/etc/opencode/opencode.json", info: JSON.parse(system) as Json }, { type: "directory", path: "/etc/opencode" });
+      const system = systemConfig();
+      if (Object.keys(system).length > 0) entries.push({ type: "document", path: "/etc/opencode/opencode.json", info: system }, { type: "directory", path: "/etc/opencode" });
       return json(entries);
     }
     if (path === "/api/plugin") {

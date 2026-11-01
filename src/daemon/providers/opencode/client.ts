@@ -118,6 +118,8 @@ export interface OcModelInfo {
   id: string;
   providerID: string;
   name: string;
+  /** The provider settings it runs with, `{file:}` substituted (its `baseURL` among them). */
+  settings?: Record<string, unknown>;
   type?: string;
   variants: Array<{ id: string }>;
   enabled: boolean;
