@@ -1321,6 +1321,24 @@ describe("opencode cost and tokens", () => {
     await p.teardown();
   });
 
+  it("a model endpoint that can't be reached spent nothing: the failed turn is opencode's $0, not unknown — unless the request may have been served (round-16 audit)", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const failed = async (kind: string) => {
+      const events = await collect(p.runTurn(opts(`transport:${kind}`)));
+      const end = events.at(-1) as Extract<ProviderEvent, { type: "error" }>;
+      expect(end.type).toBe("error");
+      expect(events.some((e) => e.type === "api_retry")).toBe(true);
+      return end.result!;
+    };
+    // Never connected: nothing was sent.
+    expect(await failed("refused")).toMatchObject({ totalCostUsd: 0, costSource: "backend" });
+    // A reset may come after the request was served; a refused retry after part of an answer came isn't nothing either.
+    expect((await failed("reset")).costSource).toBe("unknown");
+    expect((await failed("refused-after-text")).costSource).toBe("unknown");
+    await p.teardown();
+  });
+
   it("a compaction interrupted while its request streams makes the turn's cost unknown, never a known $0 (round-16 audit)", async () => {
     const { server } = makeServer();
     const p = makeProvider(server);

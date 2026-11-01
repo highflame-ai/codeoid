@@ -168,6 +168,23 @@ function hasTokens(t: OcTokenUsage | undefined): boolean {
   return !!t && (t.input || 0) + (t.output || 0) + (t.reasoning || 0) + (t.cache?.read || 0) + (t.cache?.write || 0) > 0;
 }
 
+/** Events that bound a step's attempt: none of them says the model answered. */
+const STEP_BOUNDARIES = new Set(["session.step.started", "session.step.ended", "session.step.failed", "session.retry.scheduled"]);
+
+/**
+ * A transport error that says the request never left: the connection
+ * couldn't be made (refused, no such host, unreachable). A reset or a
+ * timeout doesn't say so — the request may have been served — so it isn't.
+ */
+function neverConnected(error: OcError | undefined): boolean {
+  return error?.type === "provider.transport" && /\b(ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|ConnectionRefused)\b|Unable to connect/.test(error.message ?? "");
+}
+
+/** A stored assistant message that holds anything of an answer. */
+function answeredMessage(m: OcMessage): boolean {
+  return (m.content?.length ?? 0) > 0 || m.time?.streamed !== undefined;
+}
+
 function addTokens(u: Usage, t: OcTokenUsage | undefined, cost: number | undefined): void {
   if (t) {
     u.input += t.input || 0;
@@ -396,6 +413,8 @@ export class OpencodeProvider implements SessionProvider {
   #countedSteps = new Set<string>();
   /** Steps started and not ended yet, this session's and its children's: message id → opencode session (#430). */
   #openSteps = new Map<string, string>();
+  /** Open steps whose current attempt carried anything past its start: the model answered something (#430). */
+  #answeredSteps = new Set<string>();
   /** Assistant messages read back after a gap while still being written: read again when their step ends. */
   #streamingReadBack = new Set<string>();
   #blockIndex = new Map<string, number>();
@@ -891,6 +910,7 @@ export class OpencodeProvider implements SessionProvider {
     for (const [id, sid] of this.#openSteps) {
       if (sid !== this.#ses && this.#children.get(sid)?.background !== false) continue;
       this.#openSteps.delete(id);
+      this.#answeredSteps.delete(id);
       turn.usage.lost++;
     }
   }
@@ -906,11 +926,18 @@ export class OpencodeProvider implements SessionProvider {
    * with no usage spent what nobody reported (opencode bills a step stopped
    * while the model answered nothing) — unless the provider refused its
    * request, which bills nothing (an error with a status, after opencode's
-   * own retries) (#430).
+   * own retries), or it was never sent: a connection that couldn't be made
+   * (`neverConnected`) and nothing of an answer came (#430). `answered`:
+   * read back from the stored message; on the feed, what the step carried.
    */
-  #stepSettled(id: string | undefined, tokens: OcTokenUsage | undefined, cost: number | undefined, error: OcError | undefined): void {
-    if (id) this.#openSteps.delete(id);
+  #stepSettled(id: string | undefined, tokens: OcTokenUsage | undefined, cost: number | undefined, error: OcError | undefined, answered?: boolean): void {
+    const came = answered ?? (id === undefined || this.#answeredSteps.has(id));
+    if (id) {
+      this.#openSteps.delete(id);
+      this.#answeredSteps.delete(id);
+    }
     if (hasTokens(tokens) || (typeof cost === "number" && cost > 0) || typeof error?.status === "number") return;
+    if (!came && neverConnected(error)) return;
     this.#spendTarget().lost++;
   }
 
@@ -930,6 +957,7 @@ export class OpencodeProvider implements SessionProvider {
   #dropOpenSteps(): void {
     if (this.#openSteps.size === 0) return;
     this.#openSteps.clear();
+    this.#answeredSteps.clear();
     this.#spendTarget().lost++;
   }
 
@@ -1417,6 +1445,8 @@ export class OpencodeProvider implements SessionProvider {
         return;
       }
       case "session.step.started": {
+        // A retry starts the step again: its new attempt has carried nothing yet.
+        if (typeof d.assistantMessageID === "string") this.#answeredSteps.delete(d.assistantMessageID);
         if (typeof d.assistantMessageID === "string" && this.#ses && !this.#countedSteps.has(d.assistantMessageID)) this.#openSteps.set(d.assistantMessageID, this.#ses);
         const turn = this.#turn;
         const model = d.model as OcModelRef | undefined;
@@ -1490,7 +1520,10 @@ export class OpencodeProvider implements SessionProvider {
         return;
       case "session.retry.scheduled": {
         // The attempt was refused (it bills nothing); a retry starts the step again.
-        if (typeof d.assistantMessageID === "string") this.#openSteps.delete(d.assistantMessageID);
+        if (typeof d.assistantMessageID === "string") {
+          this.#openSteps.delete(d.assistantMessageID);
+          this.#answeredSteps.delete(d.assistantMessageID);
+        }
         const error = d.error as OcError | undefined;
         this.#emit({
           type: "api_retry",
@@ -1708,6 +1741,10 @@ export class OpencodeProvider implements SessionProvider {
     const ses = this.#ses;
     if (!ses) return;
     const d = (ev.data ?? {}) as Record<string, unknown>;
+    // Anything an open step carries past its start (a delta, a block, a tool input): the model answered.
+    if (typeof d.assistantMessageID === "string" && this.#openSteps.has(d.assistantMessageID) && !STEP_BOUNDARIES.has(ev.type)) {
+      this.#answeredSteps.add(d.assistantMessageID);
+    }
     if (ev.type === "session.created") {
       if (d.parentID === ses && typeof d.sessionID === "string") this.#childCreated(d.sessionID, d);
       return;
@@ -1806,10 +1843,14 @@ export class OpencodeProvider implements SessionProvider {
         }
         return;
       case "session.step.started":
+        if (typeof d.assistantMessageID === "string") this.#answeredSteps.delete(d.assistantMessageID);
         if (typeof d.assistantMessageID === "string" && !this.#countedSteps.has(d.assistantMessageID)) this.#openSteps.set(d.assistantMessageID, sid);
         return;
       case "session.retry.scheduled":
-        if (typeof d.assistantMessageID === "string") this.#openSteps.delete(d.assistantMessageID);
+        if (typeof d.assistantMessageID === "string") {
+          this.#openSteps.delete(d.assistantMessageID);
+          this.#answeredSteps.delete(d.assistantMessageID);
+        }
         return;
       case "session.compaction.failed":
         this.#compactionFailed(d);
@@ -2380,7 +2421,7 @@ export class OpencodeProvider implements SessionProvider {
       for (const block of m.content ?? []) if (block.type === "tool") this.#settleReadBack(id, m, block);
       if (!this.#countedSteps.has(m.id) && stepEnded(m)) {
         remember(this.#countedSteps, m.id);
-        this.#stepSettled(m.id, m.tokens, m.cost, m.error);
+        this.#stepSettled(m.id, m.tokens, m.cost, m.error, answeredMessage(m));
         this.#recordStep(m.tokens, m.cost, false);
       }
     }
@@ -2524,7 +2565,7 @@ export class OpencodeProvider implements SessionProvider {
     if (!this.#countedSteps.has(m.id) && stepEnded(m)) {
       remember(this.#countedSteps, m.id);
       addTokens(this.#counted, m.tokens, m.cost);
-      this.#stepSettled(m.id, m.tokens, m.cost, m.error);
+      this.#stepSettled(m.id, m.tokens, m.cost, m.error, answeredMessage(m));
       this.#recordStep(m.tokens, m.cost, true);
     }
     return open !== undefined;

@@ -502,7 +502,8 @@ it's counted apart (`SessionUsage.costUnknownTurns`) and stops a capped routine.
 opencode's turns carry its own figure (`costSource: "backend"`), `unknown` when
 part of the spend went unreported (`Usage.lost`: a step aborted with no usage,
 still open when its turn ended or its server went, a gap read-back that failed,
-a compaction ended `compaction.interrupted`: real 2.2.5 announces no start),
+a compaction ended `compaction.interrupted`: real 2.2.5 announces no start;
+not a step whose connection was never made with nothing streamed, `neverConnected`),
 and no source for a $0 with tokens (`Usage.unpriced`: Session prices those, as
 Claude's); a failed turn's result rides its `error` event (`error.result`), never
 carried into the next one.

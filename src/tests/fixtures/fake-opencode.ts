@@ -79,6 +79,12 @@
  *   "retry"        → session.retry.scheduled before answering
  *   "fail"         → a 429 retried once, then execution.failed with a structured
  *                    rate-limit error; the failed step bills nothing
+ *   "transport:<kind>" → as real 2.2.5 fails a model endpoint it can't reach: a
+ *                    `provider.transport` error with no status, retried once,
+ *                    then the step and execution fail, billed nothing. <kind>:
+ *                    "refused" (ECONNREFUSED: never connected), "reset"
+ *                    (ECONNRESET), "refused-after-text" (the retry's attempt
+ *                    streams some text first)
  *   "costly"       → three steps of $2 each
  *   "zero-cost"    → a step that used tokens opencode billed $0 for (a
  *                    subscription sign-in, a model its catalog prices at $0);
@@ -1018,6 +1024,25 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     await say(ses, msg, "after retry");
     endStep(ses, msg);
     return "succeeded";
+  }
+  if (text.startsWith("transport:")) {
+    const kind = text.slice("transport:".length);
+    const error = {
+      type: "provider.transport",
+      message: kind === "reset" ? "ECONNRESET: The socket connection was closed unexpectedly." : "ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
+    };
+    const msg = step(ses);
+    durable(ses, "session.retry.scheduled", { assistantMessageID: msg, attempt: 2, at: Date.now() + 30, error });
+    await sleep(30);
+    // opencode starts the same step again for the retry.
+    durable(ses, "session.step.started", { assistantMessageID: msg, agent: ses.agent ?? "build", model: ses.model ?? { providerID: "anthropic", id: "claude-sonnet-4" }, started: Date.now() });
+    if (kind === "refused-after-text") {
+      ephemeral("session.text.delta", { sessionID: ses.id, assistantMessageID: msg, ordinal: 0, delta: "partial" });
+      await sleep(5);
+    }
+    durable(ses, "session.step.failed", { assistantMessageID: msg, error });
+    durable(ses, "session.execution.failed", { error });
+    return "failed";
   }
   if (text.includes("fail")) {
     // As real 2.2.5 fails a provider error: a 429 is retried first, and the

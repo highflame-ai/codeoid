@@ -79,6 +79,8 @@
  *       runs unasked, keeps the server: it lists the session's bare shell state, nothing outside the call
  *   I52 (scripted only) an auto compaction interrupted while its summary streams: its request was sent and served, but opencode
  *       reports no spend for it, so the turn's cost is unknown, never a known $0
+ *   I53 (scripted only) a model endpoint that refuses connections: opencode retries, then fails the step with a
+ *       `provider.transport` error and no status; nothing was sent, so the failed turn is opencode's $0, not unknown (~90s)
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -2008,6 +2010,43 @@ describe("opencode (real binary)", () => {
     expect(r.costSource).toBe("unknown");
     await p.teardown();
   }, 180_000);
+
+  maybeScripted("I53 a model endpoint that refuses connections: the failed turn spent nothing, opencode's $0, not unknown", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-down-")));
+    // A port nothing listens on any more: every connection is refused.
+    const gone = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
+    const port = gone.port;
+    gone.stop(true);
+    const own = new OpencodeServer({
+      command: resolved!.command,
+      argsPrefix: resolved!.argsPrefix,
+      dbPath: join(root, "data", "opencode", "opencode.db"),
+      env: () => ({ ...buildOpencodeEnv(), HOME: join(root, "home") }),
+      userConfigDir: null,
+      defaultModel: "down/m",
+      modelProviders: {
+        down: {
+          name: "Down",
+          package: "@opencode/ai/providers/openai-compatible",
+          settings: { baseURL: `http://127.0.0.1:${port}/v1`, apiKey: "x" },
+          models: { m: { name: "m", capabilities: { tools: true }, cost: { input: 1, output: 2 }, limit: { context: 8_000, output: 1_024 } } },
+        },
+      },
+    });
+    try {
+      const p = new OpencodeProvider({ sessionId: "it-down", initialBackingId: "it-down", server: own, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
+      const events = await collect(p.runTurn(opts("hello", { workdir: root, model: "down/m" })));
+      const end = events.at(-1) as Extract<ProviderEvent, { type: "error" }>;
+      expect(end.type).toBe("error");
+      expect(end.message).toContain("ECONNREFUSED");
+      expect(events.filter((e) => e.type === "api_retry").every((e) => (e as { errorStatus: unknown }).errorStatus === null)).toBe(true);
+      expect(end.result).toMatchObject({ totalCostUsd: 0, inputTokens: 0, costSource: "backend" });
+      await p.teardown();
+    } finally {
+      await own.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 240_000);
 
   maybe("I32 the user's own opencode data, state, cache and temp dirs are untouched by the whole run", () => {
     expect(userOpencodeDirs()).toBe(USER_DIRS_BEFORE);
