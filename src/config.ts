@@ -507,6 +507,14 @@ const SessionSchema = z
      * The transcript is still the fallback. Off = transcript everywhere.
      */
     nativeContinuation: z.boolean().default(true),
+    /**
+     * Minutes a session may sit idle before its backend process (the Claude
+     * CLI, codex, pi, the Gemini CLI, Qwen) and the MCP servers it started are
+     * stopped (#451). The next message starts it again and resumes the same
+     * conversation. Never while a turn, background work or an approval is
+     * pending. 0 keeps every backend running for the daemon's lifetime.
+     */
+    idleReleaseMinutes: z.number().min(0).default(30),
   })
   .default({
     turnStallTimeoutMs: 300_000,
@@ -517,6 +525,7 @@ const SessionSchema = z
     seedCharsPerToken: 2,
     seedWindowFraction: 0.7,
     nativeContinuation: true,
+    idleReleaseMinutes: 30,
   })
   // Enforce the "SDK signals first" contract across BOTH fields — not just the
   // defaults. An env override / config file could otherwise set the MCP timeout
@@ -1402,6 +1411,8 @@ export interface CodeoidConfig {
     mcpToolTimeoutMs?: number;
     /** Tail window (bytes) replayed on attach for `scrollback.paging` clients; older history is paged on demand. Defaults to 524288 (512 KiB) when omitted. */
     attachTailBytes?: number;
+    /** Minutes idle before a session's backend process and its MCP servers are stopped; the next message resumes (#451). 0 = never. Defaults to 30 when omitted. */
+    idleReleaseMinutes?: number;
     /** Sessions restored from disk at daemon start, newest-first by last activity. Resume is also time-boxed, so this is the coarse guard; the remainder stays on disk. Defaults to 200 when omitted. */
     resumeMaxSessions?: number;
     /** Per-turn workspace snapshots (#354). Enabled unless `enabled: false`. */
@@ -1658,6 +1669,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: DEFAULT_PROVIDER_ENV, path: "session.defaultProvider", kind: "string" },
   { env: "CODEOID_DEFAULT_MODEL", path: "session.defaultModel", kind: "string" },
   { env: "CODEOID_DEFAULT_EFFORT", path: "session.defaultEffort", kind: "string" },
+  { env: "CODEOID_IDLE_RELEASE_MINUTES", path: "session.idleReleaseMinutes", kind: "float" },
   { env: "CODEOID_MCP_OAUTH_REDIRECT_BASE_URL", path: "mcpOAuth.redirectBaseUrl", kind: "string" },
   // Dispatch kill switch — disable send-class fleet dispatch per-invocation
   // without touching config.json. Other dispatch knobs are file-config only,
