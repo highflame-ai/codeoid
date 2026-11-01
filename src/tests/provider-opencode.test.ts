@@ -2214,6 +2214,39 @@ describe("opencode mid-turn messages", () => {
     await p.teardown();
   });
 
+  it("an execution interrupted from outside codeoid while a pushed message waits: the turn ends, the message is withdrawn and its boundary paid (round-17 audit)", async () => {
+    for (const priority of ["now", "later"] as const) {
+      const { server } = makeServer();
+      const p = makeProvider(server);
+      const run = p.runTurn(opts("slow"));
+      const events: ProviderEvent[] = [];
+      const timer = setTimeout(() => void run.interrupt(), 8_000);
+      for await (const e of run.events) {
+        events.push(e);
+        if (e.type === "llm_call" && events.filter((x) => x.type === "llm_call").length === 1) {
+          run.pushMidTurn?.("never run", priority);
+          await Bun.sleep(150);
+          // Another holder of the server's password (or opencode itself) stops the execution.
+          await (await server.ensure()).client.interrupt(p.backingSessionId!);
+        }
+        if (e.type === "turn_done" && e.result.stopReason !== "steered") break;
+        if (e.type === "error") break;
+      }
+      clearTimeout(timer);
+      const ends = events.filter((e) => e.type === "turn_done").map((e) => (e as Extract<ProviderEvent, { type: "turn_done" }>).result.stopReason);
+      // Session absorbs one turn_done for a steer, none for a queued message.
+      expect(ends).toEqual(priority === "now" ? ["steered", "interrupted"] : ["interrupted"]);
+      expect(events.some((e) => e.type === "custom_message" && e.metadata?.event === "opencode.interrupted_dropped_messages")).toBe(true);
+      const st = await fakeState(server);
+      const id = st.prompts.find((x: { text: string }) => x.text === "never run")?.id;
+      expect(st.inboxCancels).toContain(id);
+      // The next turn doesn't get it.
+      const next = await collect(p.runTurn(opts("echo-state")));
+      expect((JSON.parse(texts(next, "text_done")[0]!) as { prompt: string }).prompt).toBe("echo-state");
+      await p.teardown();
+    }
+  }, 30_000);
+
   it("a later message is answered inside the running turn, which ends once", async () => {
     // Real 2.2.x delivers a queued input in the running execution, after its reply.
     const { server } = makeServer();

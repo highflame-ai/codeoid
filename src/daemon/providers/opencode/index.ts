@@ -1591,6 +1591,15 @@ export class OpencodeProvider implements SessionProvider {
       });
       return;
     }
+    if (outcome === "interrupted" && !turn.interrupted && (turn.owed > 0 || turn.queued.size > 0)) {
+      // Stopped from outside codeoid (codeoid's own interrupt owes nothing):
+      // opencode runs no input after an interrupted execution, and would
+      // hand one still in its inbox to the next prompt. Session still
+      // absorbs a turn_done per steer, paid at the turn's end.
+      this.#dropPushed(turn);
+      this.#finishCounted(turn, outcome, error);
+      return;
+    }
     if (turn.owed > 0 && !turn.budgetStopped) {
       // The steered input arrived after the last step: opencode runs it
       // next. This execution's part of the turn ends here (Session
@@ -1615,6 +1624,22 @@ export class OpencodeProvider implements SessionProvider {
       return;
     }
     this.#finishCounted(turn, outcome, error);
+  }
+
+  /** The execution was interrupted with mid-turn messages waiting: withdraw them, owe Session their boundaries, and say so. */
+  #dropPushed(turn: Turn): void {
+    const ses = this.#ses;
+    const conn = this.#conn;
+    if (ses && conn) for (const id of [...turn.steers, ...turn.queued]) this.#cancelInput(conn, ses, id);
+    turn.steers.clear();
+    turn.queued.clear();
+    turn.unpaid += turn.owed;
+    turn.owed = 0;
+    this.#emitTo(turn, {
+      type: "custom_message",
+      content: "⚠️ opencode's execution was interrupted: the message sent mid-turn wasn't run.",
+      metadata: { event: "opencode.interrupted_dropped_messages" },
+    });
   }
 
   /** The execution failed with a mid-turn message waiting, which opencode runs next: say why, without ending the turn. */

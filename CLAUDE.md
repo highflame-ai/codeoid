@@ -460,7 +460,9 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   delivered inside the running execution (one queued after its last step
   runs in the next execution, which the turn waits for, after a failed one
   too). A user interrupt or a budget stop
-  withdraws the turn's undelivered inputs from opencode's inbox. An
+  withdraws the turn's undelivered inputs from opencode's inbox, and so does
+  an execution interrupted from outside codeoid (`#dropPushed`: the turn ends
+  there, a steer's boundary paid). An
   interrupted execution whose end the feed doesn't show in 5s is read
   back (`#settleInterrupt`, bounded) before the turn ends, so its cards
   settle and its aborted step is billed to it.
