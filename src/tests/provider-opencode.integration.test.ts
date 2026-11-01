@@ -88,6 +88,8 @@
  *       temp dir: a shell's `/proc/$PPID/cwd` lists nothing, and no directory above it up to / holds anything of codeoid's
  *   I56 (scripted only) a key written literally in the user's own opencode config reaches the model from a 0600 file, never
  *       through the server's environment (which every process opencode starts inherits)
+ *   I57 (scripted only) an interrupt that lands as the prompt is stored: opencode sends the step's request but shows only
+ *       the execution's start and interruption, no step; the turn's cost is unknown, never a known $0
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -96,6 +98,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { type CodeoidConfig, getConfigDir, loadConfig } from "../config.js";
 import { opencodeCredentialInputs } from "../daemon/providers/opencode/credentials.js";
+import { OpencodeClient } from "../daemon/providers/opencode/client.js";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
 import { OpencodeIncompatibleError, OpencodeServer } from "../daemon/providers/opencode/server.js";
 import { buildOpencodeEnv, sessionRules } from "../daemon/providers/opencode/policy.js";
@@ -2258,6 +2261,73 @@ describe("opencode (real binary)", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 180_000);
+
+  maybeScripted("I57 an interrupt that lands as the prompt is stored: the request went out, no step is shown, and the turn's cost is unknown, never a known $0", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-instant-")));
+    const work = join(root, "work");
+    mkdirSync(work);
+    const log = join(root, "model.jsonl");
+    const logged = Bun.spawn([process.execPath, join(import.meta.dir, "fixtures", "scripted-chat-model.ts")], { stdout: "pipe", stderr: "inherit", env: { ...process.env, SCRIPTED_LOG: log } });
+    const reader = (logged.stdout as ReadableStream<Uint8Array>).getReader();
+    const { url } = JSON.parse(new TextDecoder().decode((await reader.read()).value)) as { url: string };
+    reader.releaseLock();
+    const requests = () => (existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean).length : 0);
+    const own = new OpencodeServer({
+      command: resolved!.command,
+      argsPrefix: resolved!.argsPrefix,
+      dbPath: join(root, "data", "opencode", "opencode.db"),
+      env: () => ({ ...buildOpencodeEnv(), HOME: join(root, "home") }),
+      userConfigDir: null,
+      defaultModel: "scripted/scripted-1",
+      modelProviders: { scripted: { ...(modelProviders!.scripted as Record<string, unknown>), settings: { baseURL: url, apiKey: "scripted" } } },
+    });
+    // The interrupt goes out a few milliseconds after the prompt's request: once opencode stored it, before its step shows.
+    let onPrompt: (() => void) | null = null;
+    const prompt = OpencodeClient.prototype.prompt;
+    OpencodeClient.prototype.prompt = function (this: OpencodeClient, ...args: Parameters<typeof prompt>) {
+      const out = prompt.apply(this, args);
+      const hook = onPrompt;
+      onPrompt = null;
+      hook?.();
+      return out;
+    } as typeof prompt;
+    const p = new OpencodeProvider({ sessionId: "it-instant", initialBackingId: "it-instant", server: own, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
+    try {
+      expect(done(await collect(p.runTurn(opts("[[text:warm]]", { workdir: work }))))?.costSource).toBe("backend");
+      let hits = 0;
+      for (let attempt = 0; attempt < 12 && hits < 2; attempt++) {
+        await Bun.sleep(300);
+        const before = requests();
+        const feed: string[] = [];
+        const off = own.listen({ onEvent: (e) => feed.push(e.type) });
+        const run = p.runTurn(opts("[[text:stopped]]", { workdir: work }));
+        onPrompt = () => setTimeout(() => void run.interrupt(), 2 + (attempt % 4) * 2);
+        const result = done(await collect(run))!;
+        await Bun.sleep(500);
+        off();
+        const sent = requests() - before;
+        const noStep = feed.includes("session.execution.interrupted") && !feed.includes("session.step.started");
+        // Whatever the timing: a request opencode sent and reported nothing of is never a priced $0.
+        if (sent > 0 && result.inputTokens === 0) expect(result.costSource).toBe("unknown");
+        if (noStep && sent > 0) {
+          hits++;
+          expect(result.stopReason).toBe("interrupted");
+          expect(result.totalCostUsd).toBe(0);
+          expect(result.costSource).toBe("unknown");
+        }
+        // The session works on: the next turn is priced again.
+        expect(done(await collect(p.runTurn(opts("[[text:next]]", { workdir: work }))))?.costSource).toBe("backend");
+      }
+      // The timing was hit (real 2.2.5 shows it within a few ms of the prompt being stored).
+      expect(hits).toBeGreaterThan(0);
+      await p.teardown();
+    } finally {
+      OpencodeClient.prototype.prompt = prompt;
+      await own.stop();
+      logged.kill();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 240_000);
 
   maybe("I32 the user's own opencode data, state, cache and temp dirs are untouched by the whole run", () => {
     expect(userOpencodeDirs()).toBe(USER_DIRS_BEFORE);
