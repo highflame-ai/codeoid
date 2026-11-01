@@ -47,6 +47,7 @@ import {
   foreignPlugins,
   opencodeConfig,
   opencodeServerDirs,
+  opencodeServerShell,
   serverEnv,
   unsafeAgents,
   userModelConfig,
@@ -332,9 +333,10 @@ export class OpencodeServer {
       { model: this.#opts.defaultModel },
     );
     for (const why of carriedSkipped) console.error(`[opencode-server] not taken from your opencode config: ${why}`);
+    const base = this.#opts.env?.() ?? buildOpencodeEnv();
     const env = {
-      ...(this.#opts.env?.() ?? buildOpencodeEnv()),
-      ...serverEnv({ password, dbPath: this.#opts.dbPath, configDir: this.configDir, dataDir: this.dataDir, config }),
+      ...base,
+      ...serverEnv({ password, dbPath: this.#opts.dbPath, configDir: this.configDir, dataDir: this.dataDir, config, shell: opencodeServerShell(base.PATH) }),
     };
     this.#home = homeOf(env);
     const proc = spawn(

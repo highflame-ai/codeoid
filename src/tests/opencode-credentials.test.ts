@@ -24,7 +24,7 @@ import {
   planOpencodeCredentials,
   writeOpencodeCredentials,
 } from "../daemon/providers/opencode/credentials.js";
-import { buildOpencodeEnv, opencodeConfig, opencodeServerDirs, opencodeShellEnv, serverEnv } from "../daemon/providers/opencode/policy.js";
+import { buildOpencodeEnv, opencodeConfig, opencodeServerDirs, opencodeServerShell, opencodeShellEnv, serverEnv } from "../daemon/providers/opencode/policy.js";
 import { AccountStore } from "../daemon/accounts.js";
 import {
   OPENCODE_CREDENTIALS_PROCESS_DIR,
@@ -551,6 +551,19 @@ describe("opencode's data dirs", () => {
     const env = { ...buildOpencodeEnv({ TMPDIR: "/tmp", HOME: "/h" }), ...serverEnv({ password: "pw", dbPath: "/x.db", configDir: "/c", dataDir: "/d", config: {} }) };
     expect(env.TMPDIR).toBe("/d/tmp");
     expect(opencodeShellEnv({ TMPDIR: "/tmp", HOME: "/h" }).TMPDIR).toBe("/tmp");
+  });
+
+  it("the server runs lines with bash whatever the user's login shell; a session's shell keeps the user's $SHELL (round-16 audit)", () => {
+    // opencode takes the server's $SHELL for any shell but fish and nu; codeoid judges lines as bash.
+    const user = { SHELL: "/usr/bin/pwsh", PATH: process.env.PATH, HOME: "/h" };
+    const env = { ...buildOpencodeEnv(user), ...serverEnv({ password: "pw", dbPath: "/x.db", configDir: "/c", dataDir: "/d", config: {}, shell: opencodeServerShell(user.PATH) }) };
+    expect(env.SHELL).toBe(Bun.which("bash", { PATH: user.PATH ?? "" })!);
+    expect(env.SHELL).toEndWith("/bash");
+    // Without a shell given, the daemon's PATH's bash.
+    expect(serverEnv({ password: "pw", dbPath: "/x.db", configDir: "/c", dataDir: "/d", config: {} }).SHELL).toBe(env.SHELL!);
+    // No bash on the server's PATH: opencode's own fallback.
+    expect(opencodeServerShell("/nonexistent")).toBe("/bin/sh");
+    expect(opencodeShellEnv(user).SHELL).toBe("/usr/bin/pwsh");
   });
 
   describe("loadConfig resolves providers.opencode.dataDir", () => {

@@ -575,9 +575,23 @@ export function opencodeServerDirs(dataDir: string): { XDG_DATA_HOME: string; XD
   return { XDG_DATA_HOME: join(dataDir, "data"), XDG_STATE_HOME: join(dataDir, "state"), XDG_CACHE_HOME: join(dataDir, "cache"), TMPDIR: join(dataDir, "tmp") };
 }
 
+/**
+ * The shell opencode runs a session's lines with: the `bash` on `PATH`, else
+ * `/bin/sh` (opencode's own fallback). opencode 2.2.5 takes the server's
+ * `$SHELL` for any shell but fish and nu, `-Command` for pwsh, while codeoid
+ * judges every line as bash reads it (#431): a login shell that reads a line
+ * otherwise (pwsh, tcsh, xonsh) could run what the card doesn't show.
+ */
+export function opencodeServerShell(path: string | undefined = process.env.PATH): string {
+  return Bun.which("bash", { PATH: path ?? "" }) ?? "/bin/sh";
+}
+
 /** The server's own settings, set last over {@link buildOpencodeEnv}. */
-export function serverEnv(opts: { password: string; dbPath: string; configDir: string; dataDir: string; config: Record<string, unknown> }): Record<string, string> {
+export function serverEnv(opts: { password: string; dbPath: string; configDir: string; dataDir: string; config: Record<string, unknown>; shell?: string }): Record<string, string> {
   return {
+    // The shell its lines run with is the one codeoid judges them as; a
+    // session's commands still see the user's own `$SHELL` (opencodeShellEnv).
+    SHELL: opts.shell ?? opencodeServerShell(),
     // Its logs, shell output, state, caches and temp files: codeoid's, never
     // the user's `~/.local/share/opencode`, `~/.cache/opencode` or a shared
     // `/tmp/opencode`. A session's shell keeps the user's own (opencodeShellEnv).

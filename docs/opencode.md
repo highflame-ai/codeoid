@@ -102,7 +102,7 @@ What the approver sees, in codeoid's terms (so the same rules, hooks and roles a
 
 | opencode | codeoid |
 | --- | --- |
-| `shell` | `Bash` with the full `command`, and its `cwd` when the call names a `workdir` (resolved as every path is, above) — judged by risk as Claude's `Bash` is ([docs/approvals.md](approvals.md)) |
+| `shell` | `Bash` with the full `command`, and its `cwd` when the call names a `workdir` (resolved as every path is, above) — judged by risk as Claude's `Bash` is ([docs/approvals.md](approvals.md)). opencode runs each line with bash (the `bash` on the daemon's `PATH`, else `/bin/sh`), whatever your login shell: opencode would otherwise use your `$SHELL`, and a shell that reads a line differently (pwsh, tcsh) could run what the card doesn't show. The command itself still sees your `$SHELL`. |
 | `edit` (edit / write / patch) | `Edit` / `Write` with the absolute `file_path` of the file really changed (`requested_path` when a symlink led there) |
 | `read`, `glob`, `grep` | `Read`, `Glob`, `Grep` — or `opencode_external_directory` when a symlink in the working directory leads outside it |
 | `webfetch`, `websearch` | `WebFetch`, `WebSearch` |

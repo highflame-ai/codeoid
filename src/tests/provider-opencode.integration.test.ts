@@ -73,6 +73,8 @@
  *   I48 (scripted only) a model opencode prices at $0: the turn's $0 isn't a price (no cost source: Session prices the tokens), as on Claude
  *   I49 (scripted only) through a Session, a shell call is judged by risk as Claude's Bash: `rm -rf ~` asks in autonomous mode,
  *       `git status` runs unasked in guarded mode with autoAllowLowRisk, a credential read is refused
+ *   I50 (scripted only) the daemon user's `$SHELL` isn't the shell opencode runs a line with: it's bash, the shell codeoid judges
+ *       lines as; the session's own commands still see the user's `$SHELL`
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -1909,6 +1911,51 @@ describe("opencode (real binary)", () => {
       store.close();
     }
   }, 240_000);
+
+  maybeScripted("I50 the daemon user's $SHELL isn't the shell opencode runs a line with: it's bash, the shell codeoid judges lines as", async () => {
+    // opencode 2.2.5 runs a line with `$SHELL -c` for any shell but fish and nu
+    // (pwsh with `-Command`): a line bash reads as one `echo` could be two
+    // commands there. A login shell that logs each call stands in for one.
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-shell-")));
+    const home = join(root, "home");
+    const work = join(root, "work");
+    mkdirSync(home);
+    mkdirSync(work);
+    const log = join(root, "login-shell.log");
+    const loginShell = join(root, "loginsh");
+    writeFileSync(loginShell, `#!/bin/sh\nprintf '%s\\n' "$*" >> '${log}'\nexec /bin/sh "$@"\n`, { mode: 0o755 });
+    // The daemon user's login shell: the server's environment and the session's shell are built from it.
+    const realShell = process.env.SHELL;
+    process.env.SHELL = loginShell;
+    const own = new OpencodeServer({
+      command: resolved!.command,
+      argsPrefix: resolved!.argsPrefix,
+      dbPath: join(root, "data", "opencode", "opencode.db"),
+      env: () => ({ ...buildOpencodeEnv(), HOME: home }),
+      userConfigDir: null,
+      modelProviders,
+      defaultModel: "scripted/scripted-1",
+    });
+    try {
+      const p = new OpencodeProvider({ sessionId: "it-shell", initialBackingId: "it-shell", server: own, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
+      const command = 'printf "%s|%s" "$BASH_VERSION" "$SHELL"';
+      const events = await collect(p.runTurn(opts(`[[tool:shell ${JSON.stringify({ command, description: "x" })}]]`, { workdir: work })));
+      expect(events.find((e) => e.type === "error")).toBeUndefined();
+      const out = (events.find((e) => e.type === "tool_complete") as Extract<ProviderEvent, { type: "tool_complete" }> | undefined)?.output ?? "";
+      const [bashVersion, shell] = out.trim().split("|");
+      // bash ran it, and the user's login shell never did...
+      expect(bashVersion).toMatch(/^\d+\./);
+      expect(existsSync(log)).toBe(false);
+      // ...while the command's own environment keeps the user's $SHELL.
+      expect(shell).toBe(loginShell);
+      await p.teardown();
+    } finally {
+      if (realShell === undefined) delete process.env.SHELL;
+      else process.env.SHELL = realShell;
+      await own.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 180_000);
 
   maybe("I32 the user's own opencode data, state, cache and temp dirs are untouched by the whole run", () => {
     expect(userOpencodeDirs()).toBe(USER_DIRS_BEFORE);
