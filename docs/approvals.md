@@ -80,6 +80,7 @@ Rewinding uses the same reading of a command for its "not undone by going back" 
 | Claude | Every shell command, including ones a `permissions.allow` rule in your Claude settings would run unasked: a high-risk or not-understood one is handed to codeoid's gate first. A medium one still runs on such a rule. |
 | Gemini CLI, pi | Every shell command that asks for approval. |
 | Qwen Code | Commands Qwen Code itself judges read-only run without asking codeoid (see CLAUDE.md, "Known gap"); everything else is covered. |
+| opencode | Every shell command, its subagents' too, judged in the directory the call names (`workdir`); where that directory can't be resolved for certain, the call is asked in every mode and its command judged in each place it may lead. A line with no command in it (only `cd`, assignments, `export` / `unset` / `readonly`, comments) runs without asking, as opencode 2.2.5 runs it: it can't act outside its own shell, and rates medium at most ([docs/opencode.md](opencode.md)). |
 | Codex | Guarded mode only. Its `untrusted` policy runs commands it judges safe without asking; in autonomous mode codeoid runs Codex with no approvals at all, so no command reaches the gate (#442). |
 | OpenAI, Gemini API, llama.cpp | These backends have no shell tool. |
 

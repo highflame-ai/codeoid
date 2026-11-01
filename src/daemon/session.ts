@@ -802,6 +802,12 @@ interface TurnCounts {
   unreported?: boolean;
 }
 
+/** How serious a shell call's verdict is: a refusal, then a credential ask, then its level (#431). */
+function riskWeight(r: ShellRisk): number {
+  const level = { low: 0, medium: 1, unknown: 2, high: 3 }[r.level];
+  return (r.secret?.action === "deny" ? 20 : r.secret ? 10 : 0) + (r.unreadable ? 4 : level);
+}
+
 /** A usage report that counts some tokens. */
 function hasTokens(u: LLMCallUsage): boolean {
   return u.inputTokens + u.outputTokens + u.cacheReadTokens + u.cacheCreationTokens > 0;
@@ -7371,10 +7377,33 @@ export class Session {
    * read the same verdict.
    */
   #shellRisk(toolName: string, input: Record<string, unknown>): ShellRisk | null {
+    if (isUnresolvedPathTool(toolName)) return this.#unresolvedShellRisk(input);
     const call = shellCallOf(toolName, input);
     if (!call) return isShellTool(toolName) ? UNREADABLE_SHELL_CALL : null;
     const cwd = call.cwd ? resolvePath(this.workdir, call.cwd) : this.workdir;
     return assessShellCommandSync(call.command, { cwd, workdir: this.workdir, configDir: getConfigDir() });
+  }
+
+  /**
+   * A shell call whose directory can't be resolved for certain (opencode's
+   * `opencode_unresolved_path` card: `tool`, `paths` it may lead to, `call`):
+   * asked in every mode already, its command is judged in each of those
+   * places and the worst verdict stands, so a credential read is refused
+   * there as anywhere (#431). Null for a card wrapping any other tool.
+   */
+  #unresolvedShellRisk(input: Record<string, unknown>): ShellRisk | null {
+    const tool = typeof input.tool === "string" ? input.tool : "";
+    const call = input.call && typeof input.call === "object" ? (input.call as Record<string, unknown>) : null;
+    if (!isShellTool(tool) || !call) return null;
+    const command = shellCallOf(tool, call)?.command;
+    if (command === undefined) return UNREADABLE_SHELL_CALL;
+    const places = Array.isArray(input.paths) ? input.paths.filter((p): p is string => typeof p === "string" && p.length > 0) : [];
+    let worst: ShellRisk | null = null;
+    for (const cwd of places.length > 0 ? places : [this.workdir]) {
+      const r = this.#shellRisk("Bash", { command, cwd });
+      if (r && (!worst || riskWeight(r) > riskWeight(worst))) worst = r;
+    }
+    return worst;
   }
 
   /** A shell call that asks whatever the mode: high risk, a credential search, or not understood (#431). */

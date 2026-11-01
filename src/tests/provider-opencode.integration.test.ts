@@ -71,13 +71,15 @@
  *   I46 (scripted only) an interrupt in a feed gap longer than the interrupt's settle wait: the turn is read back, its card settled and its step billed to it
  *   I47 (scripted only) a provider error opencode retries: the first retry is attempt 1, and the failed request bills nothing
  *   I48 (scripted only) a model opencode prices at $0: the turn's $0 isn't a price (no cost source: Session prices the tokens), as on Claude
+ *   I49 (scripted only) through a Session, a shell call is judged by risk as Claude's Bash: `rm -rf ~` asks in autonomous mode,
+ *       `git status` runs unasked in guarded mode with autoAllowLowRisk, a credential read is refused
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { type CodeoidConfig, loadConfig } from "../config.js";
+import { type CodeoidConfig, getConfigDir, loadConfig } from "../config.js";
 import { opencodeCredentialInputs } from "../daemon/providers/opencode/credentials.js";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
 import { OpencodeIncompatibleError, OpencodeServer } from "../daemon/providers/opencode/server.js";
@@ -85,7 +87,11 @@ import { buildOpencodeEnv, sessionRules } from "../daemon/providers/opencode/pol
 import { opencodeSecretLocations, opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
 import type { ProviderEvent, ToolApprovalFn, TurnOpts, TurnRun, UiRequest } from "../daemon/providers/interface.js";
 import { secretPathVerdict } from "../daemon/secret-paths.js";
-import type { Store } from "../daemon/store.js";
+import { Session } from "../daemon/session.js";
+import { loadShellParser } from "../daemon/shell/parse.js";
+import { Store } from "../daemon/store.js";
+import { TranscriptStore } from "../daemon/transcript.js";
+import type { AuthContext, SessionMode } from "../protocol/types.js";
 
 const resolved = resolveOpencodeCommand(process.env.CODEOID_OPENCODE_COMMAND);
 const ENABLED = process.env.CODEOID_OPENCODE_INTEGRATION === "1" && resolved !== null;
@@ -1819,6 +1825,90 @@ describe("opencode (real binary)", () => {
     expect(r.costSource).toBeUndefined();
     await p.teardown();
   }, 180_000);
+
+  maybeScripted("I49 through a Session, a shell call is judged by risk as Claude's Bash: high asks in autonomous mode, a low read runs unasked when allowed, a credential read is refused", async () => {
+    await loadShellParser();
+    const root = mkdtempSync(join(WORK, "risk-"));
+    const workdir = join(root, "work");
+    mkdirSync(workdir);
+    const store = new Store(join(root, "codeoid.db"));
+    const transcriptStore = new TranscriptStore(join(root, "transcripts"));
+    const auth = { sub: "it", scopes: [], delegationDepth: 0, accountId: "a", projectId: "p" } as unknown as AuthContext;
+    // Defense in depth: whatever the Session decides, opencode is told `once`
+    // only for the one harmless line this case means to run. Every other
+    // command is data, and is refused here before it could reach a shell.
+    const RUNNABLE = new Set(["git status"]);
+    // And the session's shell (its environment is codeoid's, set before each turn) has a throwaway home.
+    const realHome = process.env.HOME;
+    process.env.HOME = join(root, "home");
+    mkdirSync(process.env.HOME);
+    const verdicts: Array<{ command: unknown; behavior: string }> = [];
+    const guarded =
+      (inner: ToolApprovalFn): ToolApprovalFn =>
+      async (toolId, approvalId, name, input, signal, agentId) => {
+        const v = await inner(toolId, approvalId, name, input, signal, agentId);
+        verdicts.push({ command: input.command, behavior: v.behavior });
+        if (v.behavior === "allow" && !(typeof input.command === "string" && RUNNABLE.has(input.command))) return { behavior: "deny", message: "integration guard: not run" };
+        return v;
+      };
+    const run = async (command: string, mode: SessionMode, approvals?: CodeoidConfig["approvals"]) => {
+      const id = `it-risk-${Math.random().toString(36).slice(2)}`;
+      store.createSession({ id, name: id, workdir, status: "idle", createdBy: auth.sub, createdAt: new Date().toISOString(), attachedClients: 0, accountId: "a", projectId: "p" });
+      const p = provider();
+      const runTurn = p.runTurn.bind(p);
+      p.runTurn = (o) => runTurn({ ...o, canUseTool: guarded(o.canUseTool) });
+      const session = new Session({
+        name: id, workdir, auth, store, transcriptStore, existingId: id, _testProvider: p,
+        initialMode: { mode, ...(mode === "autonomous" ? { maxTurns: 10 } : {}) },
+        config: {
+          workspaceIndex: { enabled: false, episodeThreshold: 5, timeThresholdMs: 60_000, debounceMs: 15_000 },
+          compress: { enabled: false, excludeCommands: [], excludePatterns: [], compressPipes: false, minBytes: 1024 },
+          labeling: {},
+          telemetry: { osc8: "auto" },
+          autoRotate: { enabled: false, warnPct: 0.6, rotatePct: 0.8, hardRotatePct: 0.9, minTurnsBeforeRotate: 3, strategy: "task-anchor" },
+          session: {},
+          ...(approvals ? { approvals } : {}),
+        } as unknown as CodeoidConfig,
+      });
+      const cards: Array<{ phase: string; risk?: { level: string } }> = [];
+      session.attach({ id: "c", auth, send: (m: { type: string; role?: string; tool?: { state?: unknown } }) => { if (m.type === "session.message" && m.role === "tool_call") cards.push(structuredClone(m.tool?.state) as never); } } as never);
+      const before = verdicts.length;
+      void session.send(`[[tool:shell ${JSON.stringify({ command, description: "Probe" })}]]`, auth);
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline && session.pendingToolApprovals().length === 0 && verdicts.length === before) await Bun.sleep(20);
+      const pending = session.pendingToolApprovals();
+      for (const a of pending) session.approve(a.approvalId, false, auth);
+      while (Date.now() < deadline && !(session.status === "idle" && session.canonicalHistory.at(-1)?.role === "assistant")) await Bun.sleep(20);
+      const reply = session.canonicalHistory.at(-1) as { content?: string; toolCalls?: Array<{ originalName: string }> } | undefined;
+      await session.interrupt(auth).catch(() => {});
+      await p.teardown();
+      return { pending, card: cards[0], verdict: verdicts[before], tool: reply?.toolCalls?.[0], said: String(reply?.content ?? "") };
+    };
+    try {
+      // High risk asks even in autonomous mode; the card and the pending approval say so.
+      const rm = await run("rm -rf ~", "autonomous");
+      expect(rm.pending).toHaveLength(1);
+      expect(rm.pending[0]?.risk?.level).toBe("high");
+      expect(rm.card).toMatchObject({ phase: "waiting_confirmation", risk: { level: "high" } });
+      expect(rm.verdict?.behavior).toBe("deny");
+      // A low read runs unasked in guarded mode with autoAllowLowRisk.
+      const status = await run("git status", "guarded", { autoAllowLowRisk: true, askOnUnknown: true });
+      expect(status.pending).toHaveLength(0);
+      expect(status.verdict).toEqual({ command: "git status", behavior: "allow" });
+      expect(status.card?.phase).toBe("executing");
+      expect(status.tool?.originalName).toBe("Bash");
+      // A credential read is refused, never asked.
+      const secret = await run(`cat ${join(getConfigDir(), "config.json")}`, "autonomous");
+      expect(secret.pending).toHaveLength(0);
+      expect(secret.verdict?.behavior).toBe("deny");
+      // The scripted model echoes the call's result: the gate's reason.
+      expect(secret.said).toContain("holds credentials");
+    } finally {
+      process.env.HOME = realHome;
+      await transcriptStore.flush().catch(() => {});
+      store.close();
+    }
+  }, 240_000);
 
   maybe("I32 the user's own opencode data, state, cache and temp dirs are untouched by the whole run", () => {
     expect(userOpencodeDirs()).toBe(USER_DIRS_BEFORE);

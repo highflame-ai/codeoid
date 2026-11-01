@@ -33,6 +33,8 @@
  *   default        → text deltas + text.ended, one step with cost/tokens
  *   "think"        → reasoning deltas + reasoning.ended first
  *   "use-shell"    → shell call; permission.asked; runs or fails per the reply
+ *   "ask-shell:<json>" → a shell call of exactly that input (command, workdir),
+ *                    asked first; nothing runs, an allowed one answers "ran it"
  *   "use-edit"     → edit call (path/oldString/newString) asking "edit"
  *   "use-patch-two" → patch call with two targets, asking "edit" once for both (as 2.2.5's patch.ts)
  *   "use-grep-home" → a grep of `~/.codeoid/config.json`: `~` is the server's
@@ -662,6 +664,18 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     };
     shells.set(shellID, { sessionID: ses.id, directory: ses.directory, command, finish });
     setTimeout(() => finish("completed"), Number(process.env.FAKE_OPENCODE_BG_SHELL_MS ?? 400));
+    return "succeeded";
+  }
+  if (text.startsWith("ask-shell:")) {
+    // A shell call of exactly this input (`{"command": …, "workdir": …}`), asked
+    // first. Nothing runs here: an allowed call answers "ran it".
+    const input = JSON.parse(text.slice("ask-shell:".length)) as Json;
+    const msg = step(ses);
+    const r = await toolCall(ses, msg, "shell", input, { action: "shell", resources: [String(input.command ?? "")] });
+    endStep(ses, msg);
+    const msg2 = step(ses);
+    await say(ses, msg2, r.ok ? "ran it" : `not allowed: ${r.message}`);
+    endStep(ses, msg2);
     return "succeeded";
   }
   if (text.includes("use-shell")) {
