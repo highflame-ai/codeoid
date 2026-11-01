@@ -167,6 +167,10 @@ export class OpencodeServer {
   #launched: Launched | null = null;
   #conn: OpencodeConnection | null = null;
   #starting: Promise<OpencodeConnection> | null = null;
+  /** The process a start launched and hasn't adopted yet. */
+  #launching: Launched["proc"] | null = null;
+  /** Bumped by every stop: a start it overtook gives up what it launched. */
+  #stops = 0;
   #generation = 0;
   /** Agent overrides learned from a server's own agent list; kept for restarts. */
   #overrides: Record<string, { permissions: OcRule[] }> = {};
@@ -195,6 +199,8 @@ export class OpencodeServer {
   /** The running server, starting one if none runs. Concurrent callers share one start. */
   async ensure(): Promise<OpencodeConnection> {
     if (this.#conn) return this.#conn;
+    // A daemon shutdown reaches a start in flight too.
+    LIVE_SERVERS.add(this);
     this.#starting ??= this.#start().finally(() => {
       this.#starting = null;
     });
@@ -206,11 +212,16 @@ export class OpencodeServer {
   /** Stop the server; `reason` is what its sessions are told. */
   async stop(reason = "opencode server stopped"): Promise<void> {
     const launched = this.#launched;
+    const starting = this.#starting;
+    this.#stops++;
     this.#detach(reason);
     // Before any await: a start that follows writes them again, and must not lose them to this.
     if (launched) clearOpencodeCredentials([this.credentialsDir]);
+    // A start in flight gives up (#start): what it launched is told to go now, and is waited out.
+    this.#launching?.stdin.end();
     if (launched) await shutdown(launched);
-    LIVE_SERVERS.delete(this);
+    if (starting) await starting.catch(() => {});
+    if (!this.#conn && !this.#starting) LIVE_SERVERS.delete(this);
   }
 
   /**
@@ -261,22 +272,32 @@ export class OpencodeServer {
   }
 
   async #start(): Promise<OpencodeConnection> {
+    const stops = this.#stops;
     try {
-      return await this.#startChecked();
+      return await this.#startChecked(stops);
     } catch (err) {
       // A server refused (or never up) reads no key: its files go with it.
       clearOpencodeCredentials([this.credentialsDir]);
+      if (this.#stops !== stops) throw new Error("opencode server stopped while it was starting");
       throw err;
+    } finally {
+      this.#launching = null;
     }
   }
 
-  async #startChecked(): Promise<OpencodeConnection> {
+  /** `stops`: the stop count the start began at; a stop since (a daemon shutdown) and it gives up, never adopting a server. */
+  async #startChecked(stops: number): Promise<OpencodeConnection> {
+    const overtaken = () => {
+      if (this.#stops !== stops) throw new Error("opencode server stopped while it was starting");
+    };
     mkdirSync(dirname(this.#opts.dbPath), { recursive: true, mode: 0o700 });
     mkdirSync(this.configDir, { recursive: true, mode: 0o700 });
     for (const dir of Object.values(opencodeServerDirs(this.dataDir))) mkdirSync(dir, { recursive: true, mode: 0o700 });
     for (let attempt = 0; ; attempt++) {
+      overtaken();
       const launched = await this.#launch();
       try {
+        overtaken();
         const info = await launched.client.info();
         const problem = opencodeVersionProblem(info?.version);
         if (problem) {
@@ -301,6 +322,7 @@ export class OpencodeServer {
         // Global plugins (the system config dir's, codeoid's own config dir's) show in every location.
         const foreign = foreignPlugins(await launched.client.plugins());
         if (foreign.length > 0) throw new OpencodeUntrustedError(untrustedPlugins(foreign.map(describePlugin)));
+        overtaken();
         return this.#adopt(launched);
       } catch (err) {
         await shutdown(launched);
@@ -345,6 +367,7 @@ export class OpencodeServer {
       // Requests name their directory; the server's own cwd is only its default.
       { cwd: dirname(this.#opts.dbPath), stdio: ["pipe", "pipe", "pipe"], env },
     );
+    this.#launching = proc;
     // A child that dies mid-write must not crash the daemon.
     proc.stdin.on("error", () => {});
     let stderrTail = "";

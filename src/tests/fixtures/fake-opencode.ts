@@ -157,7 +157,9 @@
  * events of a session's move reach the feed that long after its reply),
  * FAKE_OPENCODE_MOVE_IGNORED=1 (a move answers 204 and leaves the session
  * where it was), FAKE_OPENCODE_FORM_CANCEL_UNSEEN=1 (a form an interrupt
- * cancels isn't announced, as if the feed dropped `form.cancelled`).
+ * cancels isn't announced, as if the feed dropped `form.cancelled`),
+ * FAKE_OPENCODE_SLOW_START_MS (report the address, and answer `/api/info`,
+ * that long late: a start a test can stop midway).
  *
  * A fork keeps its source's directory, as real 2.2.5's does; `POST
  * …/move` rebinds a session to another (one that exists).
@@ -204,6 +206,7 @@ function readConfig(directory = process.cwd()): Record<string, unknown> {
   }
 }
 const config = readConfig();
+const SLOW_START_MS = Number(process.env.FAKE_OPENCODE_SLOW_START_MS ?? 0);
 if (process.env.FAKE_OPENCODE_STARTS) appendFileSync(process.env.FAKE_OPENCODE_STARTS, `${process.pid}\n`);
 
 type Json = Record<string, unknown>;
@@ -1564,6 +1567,7 @@ const server = Bun.serve({
     // Every route needs the password, /api/info too (real 2.2.x answers 401 without it).
     if (!authorized(req)) return json({ _tag: "UnauthorizedError", message: "Authentication required" }, 401);
     if (path === "/api/info" && method === "GET") {
+      await sleep(SLOW_START_MS);
       return json({ version, pid: process.pid, urls: [`http://127.0.0.1:${port}`], paths: { tmp: "/tmp" } });
     }
     const body = method === "POST" || method === "PUT" || method === "PATCH" ? ((await req.json().catch(() => ({}))) as Json) : {};
@@ -1846,7 +1850,7 @@ const server = Bun.serve({
 });
 
 port = server.port ?? 0;
-process.stdout.write(`${JSON.stringify({ url: `http://127.0.0.1:${port}` })}\n`);
 process.stdin.on("end", () => process.exit(0));
 process.stdin.on("close", () => process.exit(0));
+setTimeout(() => process.stdout.write(`${JSON.stringify({ url: `http://127.0.0.1:${port}` })}\n`), SLOW_START_MS);
 process.stdin.resume();

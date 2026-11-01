@@ -30,7 +30,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
-import { OpencodeServer, OpencodeIncompatibleError } from "../daemon/providers/opencode/server.js";
+import { OpencodeServer, OpencodeIncompatibleError, stopOpencodeServers } from "../daemon/providers/opencode/server.js";
 import { secretPathVerdict } from "../daemon/secret-paths.js";
 import { buildOpencodeEnv, commandlessShellLine, opencodeConfig, opencodeShellEnv, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents, userModelConfig } from "../daemon/providers/opencode/policy.js";
 import { OPENCODE_CREDENTIALS_PROCESS_DIR, OPENCODE_INSTALL_HINT, opencodeCredentialsDir, opencodeDbPath, opencodeSecretLocations, opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
@@ -335,6 +335,54 @@ describe("opencode server lifecycle", () => {
     await expect(old.ensure()).rejects.toBeInstanceOf(OpencodeIncompatibleError);
     expect(existsSync(join(old.credentialsDir, "anthropic.key"))).toBe(false);
   });
+
+  it("a daemon shutdown during a server's start stops what it launched and removes its key files: the start fails (round-17 audit)", async () => {
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const launched = (starts: string) => (existsSync(starts) ? readFileSync(starts, "utf8").trim().split("\n").map(Number) : []);
+    // Stopped while codeoid reads its keys, while the server comes up, while its info is read, and
+    // during the relaunch that applies agent overrides.
+    for (const phase of ["credentials", "ready", "info", "relaunch"] as const) {
+      let release = () => {};
+      const held = new Promise<void>((r) => {
+        release = r;
+      });
+      let reads = 0;
+      const credentials = async () => {
+        if (phase === "credentials" && ++reads === 1) await held;
+        return { env: { ANTHROPIC_API_KEY: "sk-ant-mid-start" } };
+      };
+      const knobs = { FAKE_OPENCODE_SLOW_START_MS: phase === "credentials" ? "0" : "300", ...(phase === "relaunch" ? { FAKE_OPENCODE_UNSAFE_AGENT: "1" } : {}) };
+      const { server, starts } = makeServer(knobs, { credentials });
+      const started = server.ensure();
+      started.catch(() => {});
+      const spawned = phase === "relaunch" ? 2 : phase === "credentials" ? 0 : 1;
+      for (let i = 0; i < 250 && launched(starts).length < spawned; i++) await Bun.sleep(20);
+      expect(launched(starts)).toHaveLength(spawned);
+      // Past the address (300ms), into the info request (300ms more).
+      if (phase === "info") await Bun.sleep(450);
+      else await Bun.sleep(50);
+      const stopped = stopOpencodeServers();
+      release();
+      await stopped;
+      await expect(started).rejects.toThrow(/stopped while it was starting/);
+      expect(server.running).toBe(false);
+      expect(existsSync(join(server.credentialsDir, "anthropic.key"))).toBe(false);
+      const pids = launched(starts);
+      for (let i = 0; i < 100 && pids.some(alive); i++) await Bun.sleep(20);
+      expect(pids.filter(alive)).toEqual([]);
+      // A later start goes ahead.
+      await server.ensure();
+      expect(server.running).toBe(true);
+      await server.stop();
+    }
+  }, 60_000);
 
   it("keeps its key files while another daemon sharing its config starts: a location it loads afterwards still gets the keys", async () => {
     const { server, dir } = makeServer({}, { credentials: () => ({ env: { ANTHROPIC_API_KEY: "sk-ant-live" } }) });
