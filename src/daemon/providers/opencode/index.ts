@@ -100,6 +100,8 @@ const INSTRUCTIONS_DESCRIPTION = "codeoid session instructions";
 const CALL_WAIT_MS = 2_000;
 /** After an interrupt, how long to wait for opencode to report the execution ended. */
 const INTERRUPT_SETTLE_MS = 5_000;
+/** How long a teardown waits for an attach in flight to see it. */
+const ATTACH_WAIT_MS = 3_000;
 /** How long an interrupted turn whose end the feed didn't show waits for its read-back. */
 const INTERRUPT_READ_MS = 3_000;
 /** At teardown, how long to wait for the stopped subagents to end, and then for opencode to wake their parent. */
@@ -389,6 +391,10 @@ export class OpencodeProvider implements SessionProvider {
 
   /** Tearing down: an execution opencode starts by itself now (a stopped subagent waking its parent) is stopped, not adopted. */
   #stopping = false;
+  /** Bumped by every teardown: an attach it overtook mounts nothing and adopts no session. */
+  #epoch = 0;
+  /** The attach in flight, which a teardown waits out (bounded) before it unmounts and revokes. */
+  #attaching: Promise<unknown> | null = null;
 
   // Turn state.
   #turn: Turn | null = null;
@@ -1023,6 +1029,19 @@ export class OpencodeProvider implements SessionProvider {
 
   /** Attach to the server and the opencode session, creating, resuming or forking it. Returns its id. */
   async #attach(conn: OpencodeConnection, workdir: string): Promise<string> {
+    const attaching = this.#attachIn(conn, workdir, this.#epoch);
+    this.#attaching = attaching;
+    try {
+      return await attaching;
+    } finally {
+      if (this.#attaching === attaching) this.#attaching = null;
+    }
+  }
+
+  async #attachIn(conn: OpencodeConnection, workdir: string, epoch: number): Promise<string> {
+    const overtaken = () => {
+      if (this.#epoch !== epoch) throw new Error("the session's backend was stopped while it attached");
+    };
     if (this.#conn !== conn) {
       this.#detachServer();
       this.#conn = conn;
@@ -1042,6 +1061,11 @@ export class OpencodeProvider implements SessionProvider {
     const fresh = !this.#ses;
     if (fresh) {
       const opened = await this.#openSession(conn, workdir);
+      // Torn down meanwhile (a move or a leftover's stop can take seconds):
+      // nothing is mounted for it, no token minted. The session stays on
+      // the server, and the next turn resumes it by id.
+      if (this.#epoch !== epoch) this.#adoptBacking(opened.id);
+      overtaken();
       this.#ses = opened.id;
       this.#workdir = workdir;
       this.#seq = -1;
@@ -1053,7 +1077,9 @@ export class OpencodeProvider implements SessionProvider {
       this.#adoptBacking(opened.id);
     }
     const ses = this.#ses!;
-    await this.#ensureMounts(conn, workdir);
+    overtaken();
+    await this.#ensureMounts(conn, workdir, epoch);
+    overtaken();
     // Before every turn, what anything holding the server's password (any
     // process of the daemon's user can read it) could have changed since:
     // the session's rules, a saved "always", a plugin dropped into a config
@@ -1376,7 +1402,7 @@ export class OpencodeProvider implements SessionProvider {
    * last until the server restarts, so they're redone for each server.
    * Named for this session (policy.ts) — the location is shared.
    */
-  async #ensureMounts(conn: OpencodeConnection, workdir: string): Promise<void> {
+  async #ensureMounts(conn: OpencodeConnection, workdir: string, epoch: number): Promise<void> {
     const key = `${conn.generation}:${workdir}`;
     if (this.#mountedFor === key) return;
     this.#mountedFor = key;
@@ -1414,6 +1440,11 @@ export class OpencodeProvider implements SessionProvider {
       const normalized = mcpNamespace(name);
       try {
         await conn.client.addMcp(workdir, `${prefix}${normalized}`, config);
+        if (this.#epoch !== epoch) {
+          // A teardown that didn't wait for this (bounded) has unmounted what it saw: this one goes too, and nothing more is added.
+          await conn.client.removeMcp(workdir, `${prefix}${normalized}`).catch(() => {});
+          return;
+        }
         this.#mounts.set(normalized, name);
       } catch (err) {
         console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] MCP server "${name}" isn't mounted: ${err instanceof Error ? err.message : String(err)}`);
@@ -2783,6 +2814,7 @@ export class OpencodeProvider implements SessionProvider {
   }
 
   async #teardown(): Promise<void> {
+    this.#epoch++;
     const turn = this.#turn;
     if (turn) this.#closeTurn(turn, "teardown");
     this.#turn = null;
@@ -2813,6 +2845,10 @@ export class OpencodeProvider implements SessionProvider {
       const replies = pending.map(([id, ask]) => this.#reply(conn, { id, sessionID: ask.sessionID } as OcPermissionRequest, "reject", "codeoid stopped this session's backend; this wasn't run."));
       await Promise.race([Promise.all(replies), Bun.sleep(2_000)]);
     }
+    // An attach in flight mounts nothing more once it sees the teardown; one
+    // already mounting is waited out, so what it mounted is unmounted here
+    // and its token revoked below.
+    if (this.#attaching) await Promise.race([this.#attaching.catch(() => {}), Bun.sleep(ATTACH_WAIT_MS)]);
     const dir = this.#workdir;
     if (conn && dir) await Promise.race([this.#unmount(conn, dir), Bun.sleep(2_000)]);
     // The opencode session stays: the next turn resumes it by id.

@@ -422,7 +422,9 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   runs; one that didn't move falls back to the transcript seed in a new session.
 - **Teardown** stops the session's execution, subagents and background shells
   (`GET`/`DELETE /api/shell`: a stopped shell still wakes its session), and the
-  wake. A fresh attach to a session found running stops that leftover
+  wake. An attach it overtakes mounts nothing more and adopts no session
+  (`#epoch`); one already mounting is waited out (bounded), so its mounts and
+  token go with the rest. A fresh attach to a session found running stops that leftover
   execution before prompting (`#stopLeftover`). Running means listed in
   `GET /api/session/active`, for a child as for the session: a server that
   died mid-execution never wrote their `idle`, so a stored `busy` is stale

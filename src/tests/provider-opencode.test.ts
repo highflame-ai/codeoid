@@ -1633,6 +1633,42 @@ describe("opencode MCP mounts", () => {
     expect(after.mcpRemoved.map((r: { name: string }) => r.name)).toContain(mount.name);
   });
 
+  it("a teardown while the turn is still attaching leaves no mount on the server and no live token", async () => {
+    // Round-19 audit: the attach was waiting on the fork's move when the
+    // backend was torn down; it then mounted the session's servers with a
+    // fresh token nobody revoked.
+    const engine = new MemoryEngine({ store: new SqliteEpisodeStore(":memory:"), embedder: new FakeEmbedder() });
+    await engine.init();
+    const endpoint = new MemoryMcpHttp(engine);
+    const { server } = makeServer({ FAKE_OPENCODE_MOVE_FEED_LAG_MS: "900" });
+    const parentDir = realpathSync(tmp());
+    const forkDir = realpathSync(tmp());
+    const parent = makeProvider(server);
+    const first = done(await collect(parent.runTurn(opts("hi", { workdir: parentDir }))))!;
+    const fork = makeProvider(server, { sessionId: "sess-fork", initialBackingId: "sess-fork", memoryMcp: { endpoint, url: "http://127.0.0.1:65535/mcp/memory" }, workspaceId: "ws1" });
+    expect(await fork.continueNatively({ history: [], forkFrom: first.nativeRef, maxChars: 10_000, workdir: forkDir })).toEqual({ via: "fork" });
+    const run = fork.runTurn(opts("hi", { workdir: forkDir }));
+    const collected = collect(run);
+    await Bun.sleep(300);
+    await fork.teardown();
+    await collected;
+    // Long enough for the move to finish and the attach to go on.
+    await Bun.sleep(1_500);
+    const st = await fakeState(server);
+    expect(st.mounts[forkDir] ?? []).toEqual([]);
+    expect(endpoint.activeTokens).toBe(0);
+    // No prompt went out for the torn-down turn.
+    expect(st.prompts.filter((x: { sessionID: string }) => x.sessionID === st.forks[0].id)).toEqual([]);
+    // The backend still works afterwards, and cleans up after itself.
+    const again = await collect(fork.runTurn(opts("hi", { workdir: forkDir })));
+    expect(texts(again, "text_done")).toEqual(["Hello, world"]);
+    expect(endpoint.activeTokens).toBe(1);
+    await fork.teardown();
+    expect(endpoint.activeTokens).toBe(0);
+    expect((await fakeState(server)).mounts[forkDir] ?? []).toEqual([]);
+    await parent.teardown();
+  });
+
   it("session rules deny every codeoid mount but the session's own, and hide Code Mode", () => {
     const rules = sessionRules("sess-1");
     expect(rules).toEqual([
