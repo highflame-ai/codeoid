@@ -137,8 +137,29 @@ export function registerSecretPaths(paths: { dirs?: readonly string[]; files?: r
 
 const SQLITE_SIDECARS = ["", "-wal", "-shm", "-journal"];
 
-/** `/proc/<pid>/environ`, `/proc/self/mem`, `/proc/<pid>/task/<tid>/fd/3`, … */
-const PROC_SECRET = /^\/proc\/[^/]+(?:\/task\/[^/]+)?\/(?:environ|mem|fd|fdinfo|map_files)(?:\/|$)/;
+/**
+ * `/proc/<pid>/environ`, `/proc/self/mem`, `/proc/<pid>/task/<tid>/fd/3`, …:
+ * any such component below /proc, so a path through a process's `root` or
+ * `cwd` link (`/proc/self/root/proc/1/environ`) is one too.
+ */
+const PROC_SECRET = /^\/proc\/(?:[^/]+\/)+?(?:environ|mem|fd|fdinfo|map_files)(?:\/|$)/;
+/** `/proc/<pid>/root`, a process's view of `/`: what follows it is that path from the root. */
+const PROC_ROOT_LINK = /^\/proc\/[^/]+(?:\/task\/[^/]+)?\/root(?=\/|$)/;
+
+/** A path that hands over a process's environment, memory or open files, as written. */
+export function isProcSecretPath(path: string): boolean {
+  return PROC_SECRET.test(path);
+}
+
+/** A path and what it names through each `/proc/<pid>/root` link at its start (`/proc/1/root/home/u/x` is `/home/u/x`). */
+function throughProcRoots(path: string): string[] {
+  const out = [path];
+  for (let p = path; PROC_ROOT_LINK.test(p) && out.length < 16; ) {
+    p = p.replace(PROC_ROOT_LINK, "") || "/";
+    out.push(p);
+  }
+  return out;
+}
 /** `/proc`, `/proc/<pid>`, `/proc/<pid>/task[/<tid>]` — roots a search would recurse into the above from. */
 const PROC_ROOT = /^\/proc(?:\/(?:\d+|self|thread-self)(?:\/task(?:\/\d+)?)?)?$/;
 /** A named-account login's staging home (auth/backend-login.ts), current and #392's prefix. */
@@ -214,9 +235,20 @@ export function secretPathVerdict(
   let verdict: SecretPathVerdict = null;
   for (const raw of candidatePaths(toolName, input)) {
     const literal = expand(raw, opts.workdir);
-    const p = real(literal);
     // Both forms: `/proc/self/fd/3` resolves to whatever the fd points at.
-    if (PROC_SECRET.test(literal) || PROC_SECRET.test(p)) return { action: "deny", path: raw };
+    // And through a process's root link: `/proc/4242/root/home/u/.codeoid/config.json`.
+    const forms = [...new Set([literal, real(literal)].flatMap(throughProcRoots).flatMap((f) => [f, real(f)]))];
+    if (forms.some((f) => PROC_SECRET.test(f))) return { action: "deny", path: raw };
+    for (const p of forms) {
+      const v = verdictOf(p, raw);
+      if (v?.action === "deny") return v;
+      verdict ??= v;
+    }
+  }
+  return verdict;
+
+  function verdictOf(p: string, raw: string): SecretPathVerdict {
+    let verdict: SecretPathVerdict = null;
     if (norm(dirname(p)) === norm(configDir) && isSecretConfigFile(norm(basename(p)))) return { action: "deny", path: raw };
     if (secretFiles.some((f) => norm(f) === norm(p))) return { action: "deny", path: raw };
     if (registeredDirs.some((d) => within(p, d))) return { action: "deny", path: raw };
@@ -230,6 +262,6 @@ export function secretPathVerdict(
     // A root that CONTAINS one of them (the dir itself, home, /) reaches it
     // by recursion; so does `/proc` itself.
     if (secretDirs.some((d) => within(d, p)) || PROC_ROOT.test(p)) verdict ??= { action: "ask", path: raw };
+    return verdict;
   }
-  return verdict;
 }

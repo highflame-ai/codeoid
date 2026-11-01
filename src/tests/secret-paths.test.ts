@@ -81,6 +81,14 @@ describe("secretPathVerdict", () => {
     }
   });
 
+  test("denies one reached through a process's root link, and a credential file through it, for a pid that isn't running too (#447 round-18 audit)", () => {
+    for (const p of ["/proc/4242/root/proc/4242/environ", "/proc/self/root/proc/4242/environ", "/proc/4242/task/1/root/proc/1/environ", "/proc/4242/root/proc/4242/root/proc/1/fd/3", `/proc/4242/root${configDir}/config.json`]) {
+      expect([p, verdict({ file_path: p })?.action]).toEqual([p, "deny"]);
+    }
+    expect(verdict({ file_path: "/proc/4242/status" })).toBeNull();
+    expect(verdict({ file_path: "/proc/4242/root/etc/hostname" })).toBeNull();
+  });
+
   test("asks — never auto-runs — a search rooted above the credential files", () => {
     expect(verdict({ pattern: "sk-ant", path: join(root, "home") }, "Grep")?.action).toBe("ask");
     expect(verdict({ pattern: "sk-ant", path: configDir }, "Grep")?.action).toBe("ask");
