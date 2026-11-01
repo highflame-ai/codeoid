@@ -242,6 +242,13 @@ describe("opencode server lifecycle", () => {
     mkdirSync(join(b, "x"));
     expect(leadsToCodeoid(join(b, "x"), [b], fakeTemp)).toBe(`${join(b, "x")} is inside ${b}`);
     expect(leadsToCodeoid(join(b, "nope"), [], fakeTemp)).toBe("doesn't exist");
+    // A base holding the temp dir at any depth (TMPDIR=/var/tmp/<user>) leads to its sign-in homes.
+    const holder = realpathSync(tmp());
+    const userTmp = join(holder, "a", "user-tmp");
+    mkdirSync(join(userTmp, "codeoid-login-x"), { recursive: true });
+    expect(leadsToCodeoid(holder, [], userTmp)).toBe(`${holder} holds the daemon's temp dir ${userTmp}`);
+    expect(leadsToCodeoid(join(holder, "a"), [], userTmp)).toBe(`${join(holder, "a")} holds the daemon's temp dir ${userTmp}`);
+    expect(leadsToCodeoid(join(userTmp, "codeoid-login-x"), [], userTmp)).toContain("is inside the daemon's temp dir");
     // Another server's root is no bar: the walk goes on up (to the temp dir, which holds these tests' codeoid-oc-…).
     const clean = realpathSync(tmp());
     mkdirSync(join(clean, `${SERVER_CWD_PREFIX}other`));

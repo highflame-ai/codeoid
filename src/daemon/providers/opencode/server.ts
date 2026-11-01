@@ -606,8 +606,8 @@ export function opencodeServerCwd(
 /**
  * Why `/proc/$PPID/cwd` and its `..`s would reach something of codeoid's
  * from a root made in `base`, or null: some directory from `base` up to `/`
- * is one of `codeoidPaths`, inside one, or holds one; is the daemon's temp
- * dir; or holds an entry named codeoid (another daemon's temp dirs, a
+ * is one of `codeoidPaths`, inside one, or holds one; is, is inside or
+ * holds (at any depth) the daemon's temp dir; or holds an entry named codeoid (another daemon's temp dirs, a
  * `.codeoid`) other than a server cwd root. One that can't be read or
  * resolved fails closed.
  */
@@ -629,7 +629,12 @@ export function leadsToCodeoid(base: string, codeoidPaths: readonly string[], te
   const places = codeoidPaths.map(real);
   const temp = real(tempDir);
   for (;;) {
+    // Sign-in homes sit inside the temp dir, so a directory holding it at
+    // any depth leads to them, not only one holding it directly (but `/`,
+    // which holds everything: reaching it is the known #448 limit).
     if (dir === temp) return `${dir} is the daemon's temp dir`;
+    if (dir !== sep && temp.startsWith(`${dir}${sep}`)) return `${dir} holds the daemon's temp dir ${temp}`;
+    if (dir.startsWith(`${temp}${sep}`)) return `${dir} is inside the daemon's temp dir ${temp}`;
     for (const p of places) {
       if (p === dir || dirname(p) === dir) return `${dir} holds ${p}`;
       if (dir.startsWith(`${p}${sep}`)) return `${dir} is inside ${p}`;
