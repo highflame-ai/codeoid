@@ -499,7 +499,7 @@ export class GeminiAcpProvider implements SessionProvider {
           toolId: id,
           sdkToolUseId: id,
           name: acpToolName(update),
-          input: (update.rawInput as Record<string, unknown>) ?? { title: update.title ?? "" },
+          input: acpToolInput(update),
           approvalId: `acp-${id}`,
         });
         break;
@@ -545,16 +545,11 @@ export class GeminiAcpProvider implements SessionProvider {
           toolId: id,
           sdkToolUseId: id,
           name: acpToolName(toolCall),
-          input: (toolCall.rawInput as Record<string, unknown>) ?? { title: toolCall.title ?? "" },
+          input: acpToolInput(toolCall),
           approvalId: `acp-${id}`,
         });
       }
-      const verdict = await canUseTool(
-        id,
-        `acp-${id}`,
-        acpToolName(toolCall),
-        (toolCall.rawInput as Record<string, unknown>) ?? {},
-      );
+      const verdict = await canUseTool(id, `acp-${id}`, acpToolName(toolCall), acpToolInput(toolCall, false));
       if (verdict.behavior === "allow") {
         return { outcome: { outcome: "selected", optionId: allow.optionId } };
       }
@@ -566,6 +561,28 @@ export class GeminiAcpProvider implements SessionProvider {
     // refused rather than guessed (fail closed).
     throw new Error(`codeoid does not handle ACP request: ${method}`);
   }
+}
+
+/**
+ * What the gate (and the card) is shown of an ACP tool call: its `rawInput`
+ * (the Gemini CLI sends none), plus the files the call says it touches —
+ * its `locations` (`{path, line?}`) and its diffs' `path` — as `locations`,
+ * so an edit is judged by where it writes (outside-writes.ts). A call with
+ * neither names no path, and an edit then asks in autonomous mode.
+ */
+function acpToolInput(toolCall: Record<string, unknown>, withTitle = true): Record<string, unknown> {
+  const raw = toolCall.rawInput && typeof toolCall.rawInput === "object" ? (toolCall.rawInput as Record<string, unknown>) : null;
+  const paths: string[] = [];
+  const pathOf = (v: unknown) => {
+    const p = v && typeof v === "object" ? (v as { path?: unknown }).path : undefined;
+    if (typeof p === "string" && p.length > 0 && !paths.includes(p)) paths.push(p);
+  };
+  if (Array.isArray(toolCall.locations)) for (const l of toolCall.locations) pathOf(l);
+  if (Array.isArray(toolCall.content)) for (const c of toolCall.content) if ((c as { type?: unknown } | null)?.type === "diff") pathOf(c);
+  const base = raw ?? (withTitle ? { title: toolCall.title ?? "" } : {});
+  if (paths.length === 0) return base;
+  const own = Array.isArray(base.locations) ? base.locations : [];
+  return { ...base, locations: [...own, ...paths] };
 }
 
 /** ACP tool kinds ("execute", "edit", "read", …) → codeoid tool names. */
