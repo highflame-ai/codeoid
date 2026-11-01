@@ -17,6 +17,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `providers.opencode.agent` picks the opencode agent (`plan` for read-only planning).
   A turn part of whose spend opencode didn't report (a step stopped while the model answered, a dropped connection that couldn't be read back) is of unknown cost, as is one opencode prices at $0 (a subscription sign-in, a free model) unless `pricing.models` prices it (#430).
   docs/opencode.md has setup and limits.
+  opencode's own hosted models (opencode.ai / Zen, free ones included, which opencode would otherwise pick as the default with no credential) are off unless `providers.opencode.hostedModels` (`CODEOID_OPENCODE_HOSTED_MODELS`) is set: not offered, not listed, not re-enabled by your opencode config, and opencode doesn't fetch its catalog from opencode.ai. A turn with no usable model fails before anything is sent, saying what to set.
 
 - **Approvals judge what a shell command does** (#431).
   Every shell command an agent wants to run is parsed (pipelines, chains, subshells, `bash -c`, `sudo`, `xargs`, `find -exec` and other wrappers seen through) and given a risk level: low, medium, high, or not understood.

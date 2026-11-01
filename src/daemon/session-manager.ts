@@ -2091,6 +2091,10 @@ mcpHub: this.#mcpHub,
     const liveModels = this.#modelsCache.get(providerId);
     if (liveModels) return { models: liveModels, live: true };
     const persisted = this.#persistedModels(providerId);
+    // A catalog an earlier daemon saved may list opencode's hosted models, off unless opted in (docs/opencode.md).
+    if (persisted && providerId === "opencode" && this.#config?.providers?.opencode?.hostedModels !== true) {
+      return { models: persisted.filter((m) => !m.value.startsWith("opencode/")), live: false };
+    }
     if (persisted) return { models: persisted, live: false };
     return {
       // The built-in fallback is Claude's catalog, whatever the default is.

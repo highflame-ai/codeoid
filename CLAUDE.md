@@ -357,6 +357,16 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   from `GET /api/info` must be 2.2.x from 2.2.5 on (`opencodeVersionProblem`;
   2.2.2 runs a redirection-only shell line unasked); outside it the
   registry takes the backend off with the reason as its hint.
+- **Hosted models** (policy.ts `HOSTED_PROVIDER_ID`): opencode's own provider
+  `opencode` (opencode.ai / Zen, free no-key models 2.2.5 makes the default
+  with no credential) is off unless `providers.opencode.hostedModels`: the
+  injected config's `disabled_providers` names it (a `provider.use` deny),
+  nothing carried from the user's config names it (`userModelConfig`), the
+  server's env sets `OPENCODE_DISABLE_FREE_MODELS` and
+  `OPENCODE_DISABLE_MODELS_FETCH` (2.2.5 fetches its catalog from
+  models.opencode.ai at every start), a server still offering it is refused
+  (`hostedProviderProblem`), and a turn with no usable model fails before its
+  prompt, saying what to set (`#checkModel`).
 - **Credentials** (credentials.ts): the server's environment carries none
   (`buildOpencodeEnv`), nor a proxy URL with credentials. codeoid's
   Anthropic/OpenAI/Google keys (each with the gateway its `*_BASE_URL`

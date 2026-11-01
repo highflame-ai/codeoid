@@ -1643,6 +1643,134 @@ describe("opencode interrupt", () => {
   });
 });
 
+// ── O7b opencode's hosted models (opencode.ai) ───────────────────────────────
+
+describe("opencode's hosted models (opencode.ai)", () => {
+  it("are off by default: denied in the injected config, no catalog fetch or free models, none listed or picked", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hi")));
+    const st = await fakeState(server);
+    expect(JSON.parse(st.configText).disabled_providers).toEqual(["opencode"]);
+    expect(st.env.names).toContain("OPENCODE_DISABLE_MODELS_FETCH");
+    expect(st.env.names).toContain("OPENCODE_DISABLE_FREE_MODELS");
+    const models = (await p.listModels()).map((m) => m.id);
+    expect(models.some((m) => m.startsWith("opencode/"))).toBe(false);
+    expect(models).toContain("anthropic/claude-sonnet-4");
+  });
+
+  it("with no credential, a turn fails before anything is posted, saying what to set — never falls back to a hosted model", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_NO_CREDENTIALS: "1" });
+    const reported: unknown[] = [];
+    const p = makeProvider(server, { onModels: (m) => reported.push(...m) });
+    const events = await collect(p.runTurn(opts("hi")));
+    const err = events.find((e) => e.type === "error") as Extract<ProviderEvent, { type: "error" }> | undefined;
+    expect(err?.message).toContain("opencode has no model to run this turn");
+    expect(err?.message).toContain("providers.opencode.model");
+    expect(err?.message).toContain("hostedModels");
+    expect(events.some((e) => e.type === "turn_done")).toBe(false);
+    const st = await fakeState(server);
+    expect(st.prompts).toHaveLength(0);
+    expect(st.modelSwitches).toHaveLength(0);
+    expect(await p.listModels()).toEqual([]);
+    expect(reported).toEqual([]);
+  });
+
+  it("a session that picks a hosted model while they're off fails before anything is posted", async () => {
+    const { server } = makeServer();
+    const events = await collect(makeProvider(server).runTurn(opts("hi", { model: "opencode/big-pickle" })));
+    expect(events.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("opencode/big-pickle is one of opencode's hosted models") });
+    const st = await fakeState(server);
+    expect(st.prompts).toHaveLength(0);
+    expect(st.modelSwitches).toHaveLength(0);
+  });
+
+  it("a picked model opencode can't use (no credential for it) fails the turn before anything is posted", async () => {
+    const { server } = makeServer();
+    const events = await collect(makeProvider(server).runTurn(opts("hi", { model: "mistral/no-key" })));
+    expect(events.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("opencode can't use mistral/no-key") });
+    expect((await fakeState(server)).prompts).toHaveLength(0);
+  });
+
+  it("providers.opencode.model naming a hosted model isn't handed to opencode while they're off", async () => {
+    const { server } = makeServer({}, { defaultModel: "opencode/big-pickle" });
+    const events = await collect(makeProvider(server).runTurn(opts("hi")));
+    expect(done(events)?.isError).toBeFalsy();
+    const st = await fakeState(server);
+    expect(JSON.parse(st.configText).model).toBeUndefined();
+  });
+
+  it("a server that offers them anyway (a system config allowing them) is refused", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_HOSTED_ALLOWED: "1" });
+    const events = await collect(makeProvider(server).runTurn(opts("hi")));
+    expect(events.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("offers its own hosted models") });
+  });
+
+  it("are offered when the owner opts in: not denied, fetched, listed, and the default with no credential", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_NO_CREDENTIALS: "1" }, { hostedModels: true });
+    const p = makeProvider(server);
+    const events = await collect(p.runTurn(opts("hi")));
+    expect(done(events)?.isError).toBeFalsy();
+    const st = await fakeState(server);
+    expect(JSON.parse(st.configText).disabled_providers).toBeUndefined();
+    expect(st.env.names).not.toContain("OPENCODE_DISABLE_MODELS_FETCH");
+    expect(st.env.names).not.toContain("OPENCODE_DISABLE_FREE_MODELS");
+    expect((await p.listModels()).map((m) => m.id)).toEqual(["opencode/big-pickle"]);
+    expect(st.prompts).toHaveLength(1);
+  });
+
+  it("the user's own opencode config can't bring them back: its hosted provider entries, models and enabled_providers entry are dropped, saying so", () => {
+    const user = realpathSync(tmp());
+    writeFileSync(
+      join(user, "opencode.json"),
+      JSON.stringify({
+        model: "opencode/big-pickle",
+        small_model: "opencode/flint-40b-free",
+        enabled_providers: ["opencode", "gw"],
+        disabled_providers: ["mistral"],
+        providers: { opencode: { settings: { apiKey: "public" } }, gw: { package: "@ai-sdk/openai-compatible", settings: { baseURL: "http://gw.example/v1" } } },
+        provider: { opencode: { options: {} } },
+      }),
+    );
+    const skipped: string[] = [];
+    const carried = userModelConfig(user, skipped, (l) => `{file:/f/${l.length}}`);
+    expect(Object.keys(carried.providers as object)).toEqual(["gw"]);
+    expect(carried.provider).toEqual({});
+    expect(carried.model).toBeUndefined();
+    expect(carried.small_model).toBeUndefined();
+    expect(carried.enabled_providers).toEqual(["gw"]);
+    expect(skipped.map((w) => w.split(":")[0]).sort()).toEqual(["enabled_providers", "model", "provider.opencode", "providers.opencode", "small_model"]);
+    for (const why of skipped) expect(why).toContain("providers.opencode.hostedModels");
+    // What the server is given: the user's own deny kept, opencode's added after it.
+    const config = opencodeConfig({}, undefined, carried);
+    expect(config.disabled_providers).toEqual(["mistral", "opencode"]);
+    expect(config.enabled_providers).toEqual(["gw"]);
+    // Only opencode named: the list goes whole (empty, it would deny every provider).
+    writeFileSync(join(user, "opencode.json"), JSON.stringify({ enabled_providers: ["opencode"] }));
+    const only: string[] = [];
+    expect(userModelConfig(user, only, (l) => l).enabled_providers).toBeUndefined();
+    expect(only).toHaveLength(1);
+    // Opted in: carried as written.
+    writeFileSync(join(user, "opencode.json"), JSON.stringify({ model: "opencode/big-pickle", enabled_providers: ["opencode"], providers: { opencode: { settings: {} } } }));
+    const none: string[] = [];
+    const opted = userModelConfig(user, none, (l) => l, { hostedModels: true });
+    expect(none).toEqual([]);
+    expect(opted).toMatchObject({ model: "opencode/big-pickle", enabled_providers: ["opencode"] });
+    expect(opencodeConfig({}, undefined, opted, { hostedModels: true }).disabled_providers).toBeUndefined();
+  });
+
+  it("nothing codeoid itself hands opencode names the hosted provider while it's off", () => {
+    const config = opencodeConfig({}, { opencode: { settings: { apiKey: "x" } }, anthropic: { settings: {} } }, { model: "opencode/big-pickle", enabled_providers: ["opencode"] }, { model: "opencode/big-pickle" });
+    expect(Object.keys(config.providers as object)).toEqual(["anthropic"]);
+    expect(config.model).toBeUndefined();
+    expect(config.enabled_providers).toBeUndefined();
+    expect(config.disabled_providers).toEqual(["opencode"]);
+    const env = serverEnv({ password: "p", dbPath: "/d/db", configDir: "/d/c", dataDir: "/d/data", config });
+    expect(env.OPENCODE_DISABLE_MODELS_FETCH).toBe("1");
+    expect(serverEnv({ password: "p", dbPath: "/d/db", configDir: "/d/c", dataDir: "/d/data", config, hostedModels: true }).OPENCODE_DISABLE_MODELS_FETCH).toBeUndefined();
+  });
+});
+
 // ── O7 models and effort ─────────────────────────────────────────────────────
 
 describe("opencode models and effort", () => {
@@ -1653,11 +1781,11 @@ describe("opencode models and effort", () => {
     expect(await p.listModels()).toEqual([]); // no server started for a list
     await collect(p.runTurn(opts("hi")));
     const models = await p.listModels();
-    expect(models.map((m) => m.id)).toEqual(["anthropic/claude-sonnet-4", "openai/gpt-5"]);
+    expect(models.map((m) => m.id)).toEqual(["anthropic/claude-sonnet-4", "openai/gpt-5", "anthropic/claude-sonnet-4-5", "nowhere/unpriced-1"]);
     expect(models[0]).toMatchObject({ contextWindow: 200_000, efforts: ["high", "max"], isDefault: true });
     // "fancy" isn't an effort level: not offered as one.
     expect(models[1]?.efforts).toEqual(["minimal", "low", "medium", "high"]);
-    expect(reported).toHaveLength(2);
+    expect(reported).toHaveLength(4);
   });
 
   it("switches model and variant before the prompt, only when they change", async () => {

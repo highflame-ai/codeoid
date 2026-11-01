@@ -990,8 +990,15 @@ const ProvidersSchema = z
           .string()
           .regex(OPENCODE_MODEL_ID, "must be `provider/model`, without `{`, `}`, quotes, backslashes or spaces")
           .optional(),
+        /**
+         * Offer opencode's own hosted models (provider `opencode`: opencode.ai
+         * / Zen, its free no-key models included) and let the server fetch
+         * its model catalog from opencode.ai. Off: a session's prompts never
+         * go to a vendor codeoid wasn't given a credential for.
+         */
+        hostedModels: z.boolean().default(false),
       })
-      .default({ enabled: true, command: "opencode" }),
+      .default({ enabled: true, command: "opencode", hostedModels: false }),
   })
   .default({
     pi: { enabled: true, command: "pi" },
@@ -999,7 +1006,7 @@ const ProvidersSchema = z
     geminiCli: { enabled: true, command: "gemini" },
     qwen: { enabled: true },
     llamacpp: { enabled: false, baseUrl: "http://127.0.0.1:8080/v1", apiKey: "sk-local", mcpServers: [] },
-    opencode: { enabled: true, command: "opencode" },
+    opencode: { enabled: true, command: "opencode", hostedModels: false },
   });
 
 /**
@@ -1607,6 +1614,8 @@ export interface CodeoidConfig {
       dataDir?: string;
       agent?: string;
       model?: string;
+      /** opencode's own hosted models (provider `opencode`, opencode.ai) offered; default false. */
+      hostedModels?: boolean;
     };
   };
   /**
@@ -1751,6 +1760,8 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_SEED_CHARS_PER_TOKEN", path: "session.seedCharsPerToken", kind: "float" },
   { env: "CODEOID_SEED_WINDOW_FRACTION", path: "session.seedWindowFraction", kind: "float" },
   { env: "CODEOID_NATIVE_CONTINUATION", path: "session.nativeContinuation", kind: "boolean" },
+  // opencode's hosted models (opencode.ai) — off unless the owner opts in.
+  { env: "CODEOID_OPENCODE_HOSTED_MODELS", path: "providers.opencode.hostedModels", kind: "boolean" },
   // Embed-SSO trusted framing origins (comma-separated). Each is an exact
   // origin (scheme://host[:port]) permitted to frame the web UI and hand it a
   // credential via the URL hash. Empty ⇒ hash handoff disabled (safe default).

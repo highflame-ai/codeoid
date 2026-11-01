@@ -225,6 +225,7 @@ describe("settings store", () => {
       "providers.opencode.command",
       "providers.opencode.agent",
       "providers.opencode.model",
+      "providers.opencode.hostedModels",
       "providers.opencode.dbPath",
       "providers.opencode.dataDir",
     ]);
@@ -246,6 +247,16 @@ describe("settings store", () => {
     expect(s.values["providers.opencode.dataDir"]).toEqual({ value: "oc-data", source: "config" });
     const oc = loadConfig().providers?.opencode;
     expect(oc).toMatchObject({ enabled: true, agent: "plan", model: "qwen/qwen3.8-max", dbPath: "/var/lib/oc/opencode.db", dataDir: join(tmp, "codeoid", "oc-data") });
+  });
+
+  it("opencode's hosted models are off unless set, from the settings or CODEOID_OPENCODE_HOSTED_MODELS", () => {
+    expect(loadConfig().providers?.opencode?.hostedModels).toBe(false);
+    expect(getSnapshot().values["providers.opencode.hostedModels"]).toMatchObject({ value: false });
+    const r = applyPatches([{ key: "providers.opencode.hostedModels", value: true }]);
+    expect(r.ok).toBe(true);
+    expect(r.restartRequired).toBe(true);
+    expect(loadConfig().providers?.opencode?.hostedModels).toBe(true);
+    expect(loadConfig({ env: { ...process.env, CODEOID_OPENCODE_HOSTED_MODELS: "false" } }).providers?.opencode?.hostedModels).toBe(false);
   });
 
   it("refuses an opencode default model opencode would expand a substitution in, and writes nothing", () => {

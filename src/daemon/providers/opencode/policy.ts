@@ -54,6 +54,23 @@ import type { OcAgentInfo, OcPluginInfo, OcRule } from "./client.js";
 /** Plugins whose tools act without asking — disabled (`-<id>`, opencode's plugin control). */
 export const DISABLED_PLUGINS = ["-opencode.tools", "-opencode.tool.schedule", "-opencode.vcs.hg"] as const;
 
+/**
+ * opencode's own hosted provider: opencode.ai / Zen, whose free models need
+ * no key (2.2.5 enables it with the key `public` when it has none). Off
+ * unless the owner opts in (`providers.opencode.hostedModels`): the injected
+ * config's `disabled_providers` names it (opencode turns that into a
+ * `provider.use` deny, which removes the provider and its models from every
+ * listing and from the default), nothing carried from the user's config may
+ * bring it back, and the server's environment turns off its catalog fetch
+ * from opencode.ai and its free models ({@link serverEnv}).
+ */
+export const HOSTED_PROVIDER_ID = "opencode";
+
+/** Whether a `provider/model` id names opencode's hosted provider. */
+export function isHostedModel(model: string): boolean {
+  return model.startsWith(`${HOSTED_PROVIDER_ID}/`);
+}
+
 /** Prefix of every MCP server codeoid mounts on opencode (`coid<session>_<name>`). */
 export const MCP_MOUNT_PREFIX = "coid";
 
@@ -336,11 +353,22 @@ function literalsToFiles(value: unknown, file: (literal: string) => string, key?
  * do. A default model must be a `provider/model` id (`OPENCODE_MODEL_ID`),
  * as codeoid's own is.
  */
-function carriedValue(key: (typeof CARRIED_KEYS)[number], value: unknown, dir: string, skipped: string[], file: (literal: string) => string): unknown {
+function carriedValue(
+  key: (typeof CARRIED_KEYS)[number],
+  value: unknown,
+  dir: string,
+  skipped: string[],
+  file: (literal: string) => string,
+  hosted: boolean,
+): unknown {
   if (key === "provider" || key === "providers") {
     if (!isRecord(value)) return undefined;
     const kept: Record<string, unknown> = {};
     for (const [id, entry] of Object.entries(value)) {
+      if (id === HOSTED_PROVIDER_ID && !hosted) {
+        skipped.push(`${key}.${id}: opencode's hosted provider is off (set providers.opencode.hostedModels to use it)`);
+        continue;
+      }
       const pkg = foreignPackage(entry);
       const rebased = pkg === undefined ? rebasedFileReferences(entry, dir) : null;
       if (pkg !== undefined) skipped.push(`${key}.${id}: its package ${JSON.stringify(pkg)} isn't one opencode bundles, and opencode would load it into codeoid's server`);
@@ -357,11 +385,26 @@ function carriedValue(key: (typeof CARRIED_KEYS)[number], value: unknown, dir: s
     return kept;
   }
   if (key === "model" || key === "small_model") {
+    if (typeof value === "string" && isHostedModel(value) && !hosted) {
+      skipped.push(`${key}: ${value} is one of opencode's hosted models, which are off (set providers.opencode.hostedModels to use them)`);
+      return undefined;
+    }
     if (typeof value === "string" && OPENCODE_MODEL_ID.test(value)) return value;
     skipped.push(`${key}: it isn't a \`provider/model\` id (no \`{\`, \`}\`, quotes or spaces)`);
     return undefined;
   }
-  if (Array.isArray(value) && value.every((v) => typeof v === "string") && !hasSubstitution(value)) return value;
+  if (Array.isArray(value) && value.every((v) => typeof v === "string") && !hasSubstitution(value)) {
+    if (key !== "enabled_providers" || hosted || !value.includes(HOSTED_PROVIDER_ID)) return value;
+    // Naming it would not re-enable it (the injected deny comes later), but say it isn't.
+    const rest = value.filter((v) => v !== HOSTED_PROVIDER_ID);
+    // An empty list would deny every provider: the list goes whole when it named only that one.
+    skipped.push(
+      rest.length > 0
+        ? `${key}: its ${JSON.stringify(HOSTED_PROVIDER_ID)} entry, opencode's hosted provider, which is off (set providers.opencode.hostedModels to use it)`
+        : `${key}: it names only opencode's hosted provider, which is off (set providers.opencode.hostedModels to use it)`,
+    );
+    return rest.length > 0 ? rest : undefined;
+  }
   skipped.push(`${key}: it isn't a list of provider ids`);
   return undefined;
 }
@@ -380,10 +423,17 @@ function isRecord(v: unknown): v is Record<string, unknown> {
  * opencode config in `dir` (`opencode.json`, then `opencode.jsonc`, as
  * opencode merges them), less what {@link carriedValue} drops (each said in
  * `skipped`). A provider's literal strings are handed to `file`, which keeps
- * each in a file and returns its `{file:…}` reference. Unreadable or absent:
- * nothing.
+ * each in a file and returns its `{file:…}` reference. Without `hostedModels`,
+ * nothing naming opencode's hosted provider is carried ({@link HOSTED_PROVIDER_ID}:
+ * its provider entry, a `model` or `small_model` on it, its `enabled_providers`
+ * entry). Unreadable or absent: nothing.
  */
-export function userModelConfig(dir: string, skipped: string[], file: (literal: string) => string): Record<string, unknown> {
+export function userModelConfig(
+  dir: string,
+  skipped: string[],
+  file: (literal: string) => string,
+  opts: { hostedModels?: boolean } = {},
+): Record<string, unknown> {
   const merged: Record<string, unknown> = {};
   for (const name of ["opencode.json", "opencode.jsonc"]) {
     let parsed: unknown;
@@ -402,7 +452,7 @@ export function userModelConfig(dir: string, skipped: string[], file: (literal: 
   const out: Record<string, unknown> = {};
   for (const k of CARRIED_KEYS) {
     if (!(k in merged)) continue;
-    const v = carriedValue(k, merged[k], dir, skipped, file);
+    const v = carriedValue(k, merged[k], dir, skipped, file, opts.hostedModels === true);
     if (v !== undefined) out[k] = v;
   }
   return out;
@@ -419,16 +469,36 @@ export function userModelConfig(dir: string, skipped: string[], file: (literal: 
  * model, over the user's, when it is a `provider/model` id
  * (`OPENCODE_MODEL_ID`): one holding a substitution would have opencode read
  * a file or variable into the model id it sends with every request.
+ *
+ * Without `hostedModels`, opencode's hosted provider is denied
+ * (`disabled_providers`, beside any the user's config disables) and nothing
+ * here names it: no provider entry of that id, no default or small model on
+ * it, no `enabled_providers` entry.
  */
 export function opencodeConfig(
   overrides: Record<string, { permissions: OcRule[] }> = {},
   providers?: Record<string, unknown>,
   carried: Record<string, unknown> = {},
-  opts: { model?: string } = {},
+  opts: { model?: string; hostedModels?: boolean } = {},
 ): Record<string, unknown> {
+  const hosted = opts.hostedModels === true;
   const models: Record<string, unknown> = {};
   for (const k of CARRIED_KEYS) if (carried[k] !== undefined) models[k] = carried[k];
-  const ours = providers ?? {};
+  const ours = { ...(providers ?? {}) };
+  if (!hosted) {
+    delete ours[HOSTED_PROVIDER_ID];
+    for (const k of ["provider", "providers"] as const) {
+      if (isRecord(models[k])) models[k] = Object.fromEntries(Object.entries(models[k]).filter(([id]) => id !== HOSTED_PROVIDER_ID));
+    }
+    for (const k of ["model", "small_model"] as const) if (typeof models[k] === "string" && isHostedModel(models[k])) delete models[k];
+    if (Array.isArray(models.enabled_providers)) {
+      const rest = models.enabled_providers.filter((v) => v !== HOSTED_PROVIDER_ID);
+      if (rest.length > 0) models.enabled_providers = rest;
+      else delete models.enabled_providers;
+    }
+    const disabled = Array.isArray(models.disabled_providers) ? models.disabled_providers.filter((v) => v !== HOSTED_PROVIDER_ID) : [];
+    models.disabled_providers = [...disabled, HOSTED_PROVIDER_ID];
+  }
   const allProviders = { ...(isRecord(models.providers) ? models.providers : {}), ...ours };
   delete models.providers;
   if (isRecord(models.provider)) {
@@ -436,7 +506,7 @@ export function opencodeConfig(
     if (Object.keys(legacy).length > 0) models.provider = legacy;
     else delete models.provider;
   }
-  if (opts.model && OPENCODE_MODEL_ID.test(opts.model)) models.model = opts.model;
+  if (opts.model && OPENCODE_MODEL_ID.test(opts.model) && (hosted || !isHostedModel(opts.model))) models.model = opts.model;
   return {
     ...models,
     ...(Object.keys(allProviders).length > 0 ? { providers: allProviders } : {}),
@@ -709,7 +779,16 @@ export function absolutePath(path: string | undefined): string {
 }
 
 /** The server's own settings, set last over {@link buildOpencodeEnv}. */
-export function serverEnv(opts: { password: string; dbPath: string; configDir: string; dataDir: string; config: Record<string, unknown>; shell?: string; path?: string }): Record<string, string> {
+export function serverEnv(opts: {
+  password: string;
+  dbPath: string;
+  configDir: string;
+  dataDir: string;
+  config: Record<string, unknown>;
+  shell?: string;
+  path?: string;
+  hostedModels?: boolean;
+}): Record<string, string> {
   return {
     // What it runs on its own resolves to the same program wherever it runs it.
     ...(opts.path !== undefined ? { PATH: absolutePath(opts.path) } : {}),
@@ -736,7 +815,24 @@ export function serverEnv(opts: { password: string; dbPath: string; configDir: s
     ...gitOverrideEnv(),
     ...OPENCODE_GIT_ENV,
     ...OPENCODE_HG_ENV,
+    // opencode.ai only when the owner opted in: 2.2.5 fetches its model
+    // catalog from models.opencode.ai at every start (the catalog it bundles
+    // has every built-in provider's models), and offers its hosted free
+    // models with no key. The injected `disabled_providers` is what keeps the
+    // hosted provider out; this is the second lock on its free models.
+    ...(opts.hostedModels ? {} : { OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_FREE_MODELS: "1" }),
   };
+}
+
+/**
+ * Why a server offers opencode's hosted provider though codeoid turned it
+ * off (`providers` from `GET /api/provider`), or null. The injected deny
+ * should have removed it; a config document opencode ranks above the
+ * injected one (`/etc/opencode`) could allow it again. Fail closed: refused.
+ */
+export function hostedProviderProblem(providers: ReadonlyArray<{ id: string }>, hostedModels: boolean): string | null {
+  if (hostedModels || !providers.some((p) => p.id === HOSTED_PROVIDER_ID)) return null;
+  return "opencode offers its own hosted models (provider `opencode`, opencode.ai) though codeoid turned them off — refusing to use this opencode server. Remove what enables them from opencode's system configuration, or set providers.opencode.hostedModels to use them.";
 }
 
 /**

@@ -180,7 +180,17 @@
  * session's next prompt), FAKE_OPENCODE_SYSTEM_CONFIG / …_LATE (the JSON of a
  * system config document, `/etc/opencode/opencode.json`, which `GET
  * /api/config` lists above the injected config: from the start, or once a
- * prompt was posted).
+ * prompt was posted), FAKE_OPENCODE_NO_CREDENTIALS=1 (no built-in provider
+ * has a key: only opencode's hosted models are usable, when not denied).
+ *
+ * opencode's hosted provider (`opencode`, opencode.ai) is offered as real
+ * 2.2.5 offers it: its free models listed first and the default picked
+ * from them, unless the config's `disabled_providers` names it (a
+ * `provider.use` deny: gone from every listing and the default) or
+ * OPENCODE_DISABLE_FREE_MODELS is set with no key for it; FAKE_OPENCODE_HOSTED_ALLOWED=1
+ * offers it whatever the config says (a system config document allowing it).
+ * The default is the config's `model` when it is listed, else the first
+ * listed model, else none (`data: null`).
  *
  * A location first loaded under a repository has its version control run
  * unasked, with the server's environment, as real 2.2.5 does (`loadVcs`).
@@ -468,6 +478,27 @@ const MODELS = [
     limit: { context: 400_000, output: 128_000 },
     capabilities: { tools: true, input: ["text"], output: ["text"] },
   },
+  // Models a test picks for their price (or lack of one): usable, as a real server must list a model to run it.
+  {
+    id: "claude-sonnet-4-5",
+    providerID: "anthropic",
+    name: "Claude Sonnet 4.5",
+    variants: [],
+    enabled: true,
+    status: "active",
+    limit: { context: 200_000, output: 64_000 },
+    capabilities: { tools: true, input: ["text"], output: ["text"] },
+  },
+  {
+    id: "unpriced-1",
+    providerID: "nowhere",
+    name: "Unpriced",
+    variants: [],
+    enabled: true,
+    status: "active",
+    limit: { context: 32_000, output: 8_000 },
+    capabilities: { tools: true, input: ["text"], output: ["text"] },
+  },
   {
     id: "no-key",
     providerID: "mistral",
@@ -479,6 +510,43 @@ const MODELS = [
     capabilities: { tools: true, input: ["text"], output: ["text"] },
   },
 ];
+
+/** opencode's hosted free models (provider `opencode`), as 2.2.5 lists them with no key. */
+const HOSTED_MODELS = [
+  {
+    id: "big-pickle",
+    providerID: "opencode",
+    name: "Big Pickle",
+    variants: [],
+    enabled: true,
+    status: "active",
+    cost: [{ input: 0, output: 0 }],
+    limit: { context: 200_000, output: 32_000 },
+    capabilities: { tools: true, input: ["text"], output: ["text"] },
+  },
+];
+
+/** Whether the config's `disabled_providers` (a `provider.use` deny) names `id`; `enabled_providers` can't undo it. */
+function providerDenied(id: string): boolean {
+  if (id === "opencode" && process.env.FAKE_OPENCODE_HOSTED_ALLOWED === "1") return false;
+  const disabled = config.disabled_providers;
+  return Array.isArray(disabled) && disabled.includes(id);
+}
+
+/** The usable models the server lists: the hosted ones first, as real 2.2.5 orders them. */
+function listedModels(): Json[] {
+  const freeOff = ["1", "true"].includes((process.env.OPENCODE_DISABLE_FREE_MODELS ?? "").toLowerCase()) && process.env.FAKE_OPENCODE_HOSTED_ALLOWED !== "1";
+  const hosted = providerDenied("opencode") || freeOff ? [] : HOSTED_MODELS;
+  const own = process.env.FAKE_OPENCODE_NO_CREDENTIALS === "1" ? [] : MODELS.filter((m) => !providerDenied(m.providerID));
+  return [...hosted, ...own];
+}
+
+/** `GET /api/model/default`: the config's `model` when listed, else the first usable model, else none. */
+function defaultModelOf(): Json | null {
+  const listed = listedModels().filter((m) => m.enabled !== false);
+  const named = typeof config.model === "string" ? listed.find((m) => `${m.providerID}/${m.id}` === config.model) : undefined;
+  return named ?? listed[0] ?? null;
+}
 
 function agents(): Json[] {
   const global = (config.permissions as Json[] | undefined) ?? [];
@@ -1755,8 +1823,12 @@ const server = Bun.serve({
       const listed = knob === "1" || (knob === "late" && state.prompts.length > 0);
       return json({ location: { directory: directoryOf(req, url) }, data: listed ? [...builtin, foreign] : builtin });
     }
-    if (path === "/api/model") return json({ location: { directory: directoryOf(req, url) }, data: MODELS });
-    if (path === "/api/model/default") return json({ location: { directory: directoryOf(req, url) }, data: MODELS[0] });
+    if (path === "/api/model") return json({ location: { directory: directoryOf(req, url) }, data: listedModels() });
+    if (path === "/api/model/default") return json({ location: { directory: directoryOf(req, url) }, data: defaultModelOf() });
+    if (path === "/api/provider") {
+      const ids = [...new Set(listedModels().filter((m) => m.enabled !== false).map((m) => String(m.providerID)))];
+      return json({ location: { directory: directoryOf(req, url) }, data: ids.map((id) => ({ id, activation: "enabled" })) });
+    }
     if (path === "/api/command") {
       const dir = directoryOf(req, url);
       return json({ location: { directory: dir }, data: commandsAt(dir) });

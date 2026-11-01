@@ -466,7 +466,13 @@ export class OpencodeClient {
   }
 
   async defaultModel(directory?: string): Promise<OcModelInfo | undefined> {
-    return (await this.#request<{ data?: OcModelInfo }>("GET", "/api/model/default", { directory })).data;
+    // `data: null` when no provider has a usable model.
+    return (await this.#request<{ data?: OcModelInfo | null }>("GET", "/api/model/default", { directory })).data ?? undefined;
+  }
+
+  /** The providers the server offers (`GET /api/provider`): each with a usable credential or no need for one. */
+  async providers(directory?: string): Promise<Array<{ id: string; activation?: string }>> {
+    return (await this.#request<{ data: Array<{ id: string; activation?: string }> }>("GET", "/api/provider", { directory })).data ?? [];
   }
 
   async commands(directory?: string): Promise<OcCommandInfo[]> {

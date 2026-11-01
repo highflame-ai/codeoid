@@ -47,6 +47,8 @@ import {
   foreignPlugins,
   formatterProblem,
   gitOverrideEnv,
+  hostedProviderProblem,
+  isHostedModel,
   OPENCODE_GIT_ENV,
   opencodeConfig,
   opencodeServerDirs,
@@ -121,6 +123,12 @@ export interface OpencodeServerOptions {
   credentials?: () => OpencodeCredentialInputs | Promise<OpencodeCredentialInputs>;
   /** The default model (`providers.opencode.model`, `provider/model`); absent: opencode's. */
   defaultModel?: string;
+  /**
+   * Offer opencode's own hosted provider (`opencode`: opencode.ai / Zen, its
+   * free no-key models included) and let the server fetch its model catalog
+   * from opencode.ai (`providers.opencode.hostedModels`). Default: neither.
+   */
+  hostedModels?: boolean;
   startTimeoutMs?: number;
   /** Told once a server reports a version outside the supported range. */
   onIncompatible?: (hint: string) => void;
@@ -193,6 +201,11 @@ export class OpencodeServer {
 
   constructor(opts: OpencodeServerOptions) {
     this.#opts = opts;
+  }
+
+  /** Whether opencode's own hosted models are offered (`providers.opencode.hostedModels`). */
+  get hostedModels(): boolean {
+    return this.#opts.hostedModels === true;
   }
 
   /** The running server's pid, when one runs. */
@@ -355,6 +368,9 @@ export class OpencodeServer {
         // So do formatters a config document above codeoid's turns on.
         const formatters = formatterProblem(await launched.client.config());
         if (formatters) throw new OpencodeUntrustedError(formatters);
+        // And opencode's hosted provider, off unless the owner opted in.
+        const hosted = hostedProviderProblem(await launched.client.providers(), this.hostedModels);
+        if (hosted) throw new OpencodeUntrustedError(hosted);
         overtaken();
         return this.#adopt(launched);
       } catch (err) {
@@ -376,12 +392,18 @@ export class OpencodeServer {
     // The user's own providers too: what is written literally in them goes through files as well.
     const secrets = new Map(plan.secrets);
     const carriedSkipped: string[] = [];
+    const hostedModels = this.hostedModels;
     const carried = userDir
-      ? userModelConfig(userDir, carriedSkipped, (literal) => {
-          const name = `carried-${secrets.size}.value`;
-          secrets.set(name, literal);
-          return fileReference(this.credentialsDir, name);
-        })
+      ? userModelConfig(
+          userDir,
+          carriedSkipped,
+          (literal) => {
+            const name = `carried-${secrets.size}.value`;
+            secrets.set(name, literal);
+            return fileReference(this.credentialsDir, name);
+          },
+          { hostedModels },
+        )
       : {};
     for (const why of carriedSkipped) console.error(`[opencode-server] not taken from your opencode config: ${why}`);
     // Before anything is kept there: the location stays covered once the config moves away.
@@ -390,12 +412,14 @@ export class OpencodeServer {
     const defaultModel = this.#opts.defaultModel;
     if (defaultModel && !OPENCODE_MODEL_ID.test(defaultModel)) {
       console.error(`[opencode-server] providers.opencode.model isn't a \`provider/model\` id codeoid hands opencode (no \`{\`, \`}\`, quotes or spaces): opencode's own default is used`);
+    } else if (defaultModel && isHostedModel(defaultModel) && !hostedModels) {
+      console.error(`[opencode-server] providers.opencode.model (${defaultModel}) is one of opencode's hosted models, which are off: not handed to opencode (set providers.opencode.hostedModels to use them)`);
     }
-    const config = opencodeConfig(this.#overrides, { ...plan.providers, ...this.#opts.modelProviders }, carried, { model: this.#opts.defaultModel });
+    const config = opencodeConfig(this.#overrides, { ...plan.providers, ...this.#opts.modelProviders }, carried, { model: defaultModel, hostedModels });
     const base = this.#opts.env?.() ?? buildOpencodeEnv();
     const env = {
       ...base,
-      ...serverEnv({ password, dbPath: this.#opts.dbPath, configDir: this.configDir, dataDir: this.dataDir, config, shell: opencodeServerShell(base.PATH), path: base.PATH }),
+      ...serverEnv({ password, dbPath: this.#opts.dbPath, configDir: this.configDir, dataDir: this.dataDir, config, shell: opencodeServerShell(base.PATH), path: base.PATH, hostedModels }),
     };
     this.#home = homeOf(env);
     // Requests name their directory; the server's own cwd is only its default.

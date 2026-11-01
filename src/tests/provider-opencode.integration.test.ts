@@ -105,6 +105,11 @@
  *       overrides): a workdir in a git repository is refused, saying why, before opencode runs git there; a plain one works
  *   I63 (scripted only) a `formatter: true` in a config document below codeoid's injected one (its config dir) runs no
  *       formatter after an approved write (a marker gofmt on PATH stays silent): the injected `formatter: false` resets it
+ *   I64 (scripted only) a plugin written to the server's own config dir is refused before opencode can load it
+ *   I65 opencode's hosted provider (opencode.ai) isn't offered by default: not in opencode's own provider or model
+ *       listing, not its default, no catalog fetch from opencode.ai, and a turn with no other model fails saying what to
+ *       set; opted in (providers.opencode.hostedModels) it is listed and fetched. Every outbound request goes to a local
+ *       proxy that records its target and refuses it: nothing reaches opencode.ai
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -2706,6 +2711,72 @@ describe("opencode (real binary)", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 180_000);
+
+  maybe("I65 opencode's hosted provider is off unless opted in: its own listing, its default and its requests show it (nothing connects)", async () => {
+    // Every request a server makes outside this host reaches this proxy, which records its target and refuses it.
+    const targets: string[] = [];
+    const proxy = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        data(sock, data) {
+          targets.push(new TextDecoder().decode(data).split("\r\n")[0] ?? "");
+          sock.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+          sock.end();
+        },
+      },
+    });
+    const url = `http://127.0.0.1:${proxy.port}`;
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-hosted-")));
+    const work = join(root, "work");
+    mkdirSync(work);
+    const start = (name: string, hostedModels: boolean) =>
+      new OpencodeServer({
+        command: resolved!.command,
+        argsPrefix: resolved!.argsPrefix,
+        dbPath: join(root, name, "opencode.db"),
+        dataDir: join(root, name, "files"),
+        // No credential at all: what opencode offers on its own.
+        env: () => {
+          const env = buildOpencodeEnv();
+          for (const k of Object.keys(env)) if (/_API_KEY$/.test(k)) delete env[k];
+          return { ...env, HOME: join(root, "home"), HTTPS_PROXY: url, HTTP_PROXY: url, https_proxy: url, http_proxy: url, NO_PROXY: "127.0.0.1,localhost", no_proxy: "127.0.0.1,localhost" };
+        },
+        userConfigDir: null,
+        hostedModels,
+      });
+    const off = start("off", false);
+    const on = start("on", true);
+    try {
+      const conn = await off.ensure();
+      expect((await conn.client.providers(work)).map((p) => p.id)).not.toContain("opencode");
+      expect((await conn.client.models(work)).filter((m) => m.providerID === "opencode")).toEqual([]);
+      expect(await conn.client.defaultModel(work)).toBeUndefined();
+      // A turn has no model: it fails before anything is posted, saying what to set.
+      const p = new OpencodeProvider({ sessionId: `it-hosted-${Math.random().toString(36).slice(2)}`, initialBackingId: "it-hosted", server: off, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
+      const events = await collect(p.runTurn({ history: [], userMessage: "hi", workdir: work, canUseTool: async () => ({ behavior: "deny", message: "no" }) }));
+      expect(events.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("opencode has no model to run this turn") });
+      const ses = p.backingSessionId;
+      await p.teardown();
+      const posted = (await conn.client.messages(ses)).data.filter((m) => m.type === "user");
+      expect(posted).toEqual([]);
+      await Bun.sleep(1_500);
+      expect(targets.filter((t) => t.includes("opencode.ai"))).toEqual([]);
+
+      // Opted in: opencode's own listing has it (and its free models), and it asks opencode.ai for its catalog.
+      const onConn = await on.ensure();
+      expect((await onConn.client.providers(work)).map((p) => p.id)).toContain("opencode");
+      expect((await onConn.client.models(work)).some((m) => m.providerID === "opencode")).toBe(true);
+      expect((await onConn.client.defaultModel(work))?.providerID).toBe("opencode");
+      await Bun.sleep(1_500);
+      expect(targets.some((t) => /^CONNECT [a-z.]*opencode\.ai:443 /.test(t))).toBe(true);
+    } finally {
+      await off.stop();
+      await on.stop();
+      proxy.stop(true);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
 
   maybe("I32 the user's own opencode data, state, cache and temp dirs are untouched by the whole run", () => {
     expect(userOpencodeDirs()).toBe(USER_DIRS_BEFORE);

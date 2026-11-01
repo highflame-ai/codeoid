@@ -76,7 +76,17 @@ import {
   type OcSessionInfo,
   type OcTokenUsage,
 } from "./client.js";
-import { commandlessShellLine, fetchFence, fetchOrigin, mcpNamespace, opencodeShellEnv, ownMountPrefix, runnableCommand, sessionRules } from "./policy.js";
+import {
+  commandlessShellLine,
+  fetchFence,
+  fetchOrigin,
+  HOSTED_PROVIDER_ID,
+  mcpNamespace,
+  opencodeShellEnv,
+  ownMountPrefix,
+  runnableCommand,
+  sessionRules,
+} from "./policy.js";
 import { gitCheckout, mercurialCheckout, type OpencodeConnection, type OpencodeServer } from "./server.js";
 import {
   type OcToolCall,
@@ -96,6 +106,9 @@ export const OPENCODE_DISPLAY_NAME = "opencode";
 
 /** Key of the synthetic message that carries the session's instructions. */
 const INSTRUCTIONS_DESCRIPTION = "codeoid session instructions";
+/** What a turn with no usable model tells the user to set. */
+const NO_MODEL_HINT =
+  "Pick a model for the session, set providers.opencode.model (`provider/model`), or give codeoid a credential it hands opencode (ANTHROPIC_API_KEY, OPENAI_API_KEY, GOOGLE_API_KEY, the Qwen backend's key, an OpenAI-compatible endpoint) or a provider in your opencode config. opencode's own hosted models (opencode.ai) are off unless providers.opencode.hostedModels is true.";
 /** How long a permission request waits for the tool call it names to show up. */
 const CALL_WAIT_MS = 2_000;
 /** After an interrupt, how long to wait for opencode to report the execution ended. */
@@ -1410,8 +1423,9 @@ export class OpencodeProvider implements SessionProvider {
         conn.client.defaultModel(this.#workdir ?? undefined).catch(() => undefined),
       ]);
       // Chat models that are usable: opencode lists every catalog model, enabled = has a credential.
-      this.#models = models.filter((m) => m.enabled !== false && (m.type === undefined || m.type === "chat"));
-      return this.#modelInfos(this.#models, def);
+      // opencode's hosted ones only when the owner opted in (the server denies them anyway).
+      this.#models = models.filter((m) => m.enabled !== false && (m.type === undefined || m.type === "chat") && this.#offered(m));
+      return this.#modelInfos(this.#models, def && this.#offered(def) ? def : undefined);
     } catch {
       return this.#models.length > 0 ? this.#modelInfos(this.#models, undefined) : [];
     }
@@ -1447,6 +1461,40 @@ export class OpencodeProvider implements SessionProvider {
     );
   }
 
+  /** Whether codeoid offers a model of this provider: opencode's hosted one only when opted in. */
+  #offered(ref: { providerID: string }): boolean {
+    return ref.providerID !== HOSTED_PROVIDER_ID || this.#server.hostedModels;
+  }
+
+  /** Whether `ref` is one of the usable models opencode lists, read again once when it isn't in the cached list. */
+  async #listed(ref: { providerID: string; id: string }): Promise<boolean> {
+    if (this.#modelInfo(ref)) return true;
+    await this.listModels();
+    return this.#modelInfo(ref) !== undefined;
+  }
+
+  /**
+   * The model this turn runs is one opencode can use, checked before
+   * anything reaches it: the turn's own (`opts.model`) when it picks one,
+   * else the opencode session's, else opencode's default. Throws, naming
+   * what to set, when there is none (no credential, opencode's hosted models
+   * off) or the picked one can't be used. Returns the default to switch to
+   * when the session's own model can't run any more (a hosted model, a
+   * credential gone), else null.
+   */
+  async #checkModel(conn: OpencodeConnection, chosen: { providerID: string; id: string } | null): Promise<{ providerID: string; id: string } | null> {
+    if (chosen) {
+      if (!this.#offered(chosen)) throw new Error(`${modelValue(chosen)} is one of opencode's hosted models (opencode.ai), which codeoid doesn't offer. ${NO_MODEL_HINT}`);
+      if (!(await this.#listed(chosen))) throw new Error(`opencode can't use ${modelValue(chosen)}: it has no credential for it, or doesn't know it. ${NO_MODEL_HINT}`);
+      return null;
+    }
+    const current = this.#sessionModel;
+    if (current && this.#offered(current) && (await this.#listed(current))) return null;
+    const def = await conn.client.defaultModel(this.#workdir ?? undefined);
+    if (!def || !this.#offered(def)) throw new Error(`opencode has no model to run this turn. ${NO_MODEL_HINT}`);
+    return current ? { providerID: def.providerID, id: def.id } : null;
+  }
+
   #modelInfo(ref: { providerID: string; id: string } | null): OcModelInfo | undefined {
     return ref ? this.#models.find((m) => m.providerID === ref.providerID && m.id === ref.id) : undefined;
   }
@@ -1462,7 +1510,10 @@ export class OpencodeProvider implements SessionProvider {
       await conn.client.switchAgent(ses, this.#agent);
       this.#agentApplied = true;
     }
-    const chosen = opts.model ? parseModelValue(opts.model) : null;
+    const picked = opts.model ? parseModelValue(opts.model) : null;
+    // Before any prompt: a turn with no usable model fails here, saying what to set.
+    const fallback = await this.#checkModel(conn, picked);
+    const chosen = picked ?? fallback;
     if (!chosen && opts.effort === undefined && this.#appliedSelection === null) return;
     if (this.#models.length === 0) await this.listModels();
     let base: { providerID: string; id: string } | null = chosen ?? this.#sessionModel;

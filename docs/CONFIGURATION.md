@@ -197,7 +197,8 @@ The opencode backend (opencode 2.2.5 or a later 2.2.x) is on by default when an 
       "dbPath": "opencode/opencode.db",
       "dataDir": "opencode",
       "agent": "build",
-      "model": "qwen/qwen3.8-max"
+      "model": "qwen/qwen3.8-max",
+      "hostedModels": false
     }
   }
 }
@@ -206,7 +207,8 @@ The opencode backend (opencode 2.2.5 or a later 2.2.x) is on by default when an 
 - `dbPath` — opencode's database for codeoid's sessions. Default: an `opencode` folder beside codeoid's own database (`dbPath` / `CODEOID_DB_PATH`); a relative path resolves from codeoid's config dir. It is never your own opencode's database.
 - `dataDir` — opencode's logs, shell output, state, caches and temp files (its XDG data, state and cache dirs, as `data/`, `state/`, `cache/` under it, and its `TMPDIR`, as `tmp/`). Default: an `opencode` folder beside codeoid's transcript dir (`transcriptDir` / `CODEOID_TRANSCRIPT_DIR`); a relative path resolves from codeoid's config dir. Nothing goes to your own `~/.local/share/opencode` or `~/.cache/opencode`, nor to a shared `/tmp/opencode`.
 - `agent` — the opencode agent sessions run (`build`, `plan`, or your own); omit for opencode's default.
-- `model` — the default model, `provider/model`, for sessions that don't pick one; omit for opencode's default. Refused with `{`, `}`, quotes, backslashes or spaces in it (opencode would expand a `{file:…}` there).
+- `model` — the default model, `provider/model`, for sessions that don't pick one; omit for opencode's default among the models it has a credential for (with none, a turn fails, saying what to set). Refused with `{`, `}`, quotes, backslashes or spaces in it (opencode would expand a `{file:…}` there).
+- `hostedModels` (`CODEOID_OPENCODE_HOSTED_MODELS`) — offer opencode's own hosted models (provider `opencode`: opencode.ai / Zen, its free no-key models included) and let opencode fetch its model catalog from opencode.ai. Default `false`: they aren't offered, listed or picked as a default, your opencode config can't enable them, and a session's code only goes to providers codeoid or your opencode config gave a credential for (docs/opencode.md, *opencode's hosted models*).
 - Credentials are codeoid's own: its `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `GOOGLE_API_KEY` (or `GEMINI_API_KEY`), each sent to the gateway its `*_BASE_URL` names when one does, its Qwen backend on an API key or its default account (`providers.qwen`, as provider `qwen`), and its OpenAI-compatible endpoints (as `oai-<name>`). codeoid writes each to a file only it can read and names the file in opencode's config; the files are removed when the server stops, and a daemon that's gone has its files removed when another starts (each daemon keeps its own). The opencode server's environment carries no key, nor a proxy URL with credentials in it. Sign-ins stored in codeoid's opencode database (`OPENCODE_DB=<that path> opencode auth login`) work too. `codeoid account` doesn't apply to it.
 - Every setting here is read when the daemon starts; change one, then restart the daemon (the settings UI says so).
 
