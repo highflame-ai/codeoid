@@ -481,7 +481,11 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   an execution interrupted from outside codeoid (`#dropPushed`: the turn ends
   there, a steer's boundary paid), and a teardown, which keeps the session
   (it also waits, bounded, for a push still being posted: `#send` withdraws
-  one that lands after its turn closed). An
+  one that lands after its turn closed); every other end withdraws them too
+  (`#closeTurn`). opencode keeps its inbox in its database, across a server's
+  death and a daemon restart, so before every prompt (and as a session is
+  resumed, before a leftover's stop or a move) every user input left there
+  is withdrawn (`#sweepInbox`, fail-closed, after pushes still in flight). An
   interrupted execution whose end the feed doesn't show in 5s is read
   back (`#settleInterrupt`, bounded) before the turn ends, so its cards
   settle and its aborted step is billed to it.

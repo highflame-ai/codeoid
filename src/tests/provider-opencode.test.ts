@@ -2683,6 +2683,74 @@ describe("opencode mid-turn messages", () => {
     }
   });
 
+  it("what a turn the server's death ended left in opencode's inbox (kept in its database) is withdrawn before the next prompt, on this backend or a rebuilt one (round-22 audit)", async () => {
+    for (const [how, next] of [
+      ["kill", "same"],
+      ["stop", "rebuilt"],
+    ] as const) {
+      const { server } = makeServer({ FAKE_OPENCODE_PERSIST: "1" });
+      const p = makeProvider(server);
+      await collect(p.runTurn(opts("hi")));
+      const run = p.runTurn(opts("slow"));
+      const dead: ProviderEvent[] = [];
+      for await (const e of run.events) {
+        dead.push(e);
+        if (e.type === "llm_call" && dead.filter((x) => x.type === "llm_call").length === 1) {
+          run.pushMidTurn?.("stale steer", "now");
+          run.pushMidTurn?.("stale queued", "later");
+          await Bun.sleep(100);
+          if (how === "kill") process.kill(server.pid!, "SIGKILL");
+          else await server.stop("test stop");
+        }
+        if (e.type === "error" || e.type === "turn_done") break;
+      }
+      expect(dead.at(-1)?.type).toBe("error");
+      const ses = p.backingSessionId;
+      const backend = next === "same" ? p : makeProvider(server, { initialBackingId: ses });
+      const after = await collect(backend.runTurn(opts("echo-state")));
+      // The same opencode session, found again on the new server, answers only its own prompt.
+      expect(backend.backingSessionId).toBe(ses);
+      const seen = JSON.parse(texts(after, "text_done").at(-1)!) as { prompt: string };
+      expect(seen.prompt).toBe("echo-state");
+      expect(texts(after, "text_done").join(" ")).not.toContain("stale");
+      expect(after.some((e) => e.type === "custom_message" && e.metadata?.event === "opencode.stale_messages_withdrawn")).toBe(true);
+      const st = await fakeState(server);
+      expect(st.inboxCancels).toHaveLength(2);
+      await backend.teardown();
+      if (backend !== p) await p.teardown();
+    }
+  });
+
+  it("a message a turn left in the inbox whose withdrawal didn't arrive is withdrawn before the next prompt (round-22 audit)", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    const conn = await server.ensure();
+    const cancel = conn.client.cancelInput.bind(conn.client);
+    // The interrupt's withdrawal is lost (a request that failed): the input stays in opencode's inbox.
+    let failing = true;
+    conn.client.cancelInput = async (ses: string, id: string) => {
+      if (failing) throw new Error("connection reset");
+      return cancel(ses, id);
+    };
+    const run = p.runTurn(opts("slow"));
+    let pushed = false;
+    for await (const e of run.events) {
+      if (e.type === "llm_call" && !pushed) {
+        pushed = true;
+        run.pushMidTurn?.("stale queued", "later");
+        await Bun.sleep(100);
+        void run.interrupt();
+      }
+      if (e.type === "error" || e.type === "turn_done") break;
+    }
+    failing = false;
+    const next = await collect(p.runTurn(opts("echo-state")));
+    expect((JSON.parse(texts(next, "text_done").at(-1)!) as { prompt: string }).prompt).toBe("echo-state");
+    expect(texts(next, "text_done").join(" ")).not.toContain("stale");
+    expect((await fakeState(server)).inboxCancels).toHaveLength(1);
+    await p.teardown();
+  });
+
   it("an execution interrupted from outside codeoid while a pushed message waits: the turn ends, the message is withdrawn and its boundary paid (round-17 audit)", async () => {
     for (const priority of ["now", "later"] as const) {
       const { server } = makeServer();

@@ -406,6 +406,8 @@ export class OpencodeProvider implements SessionProvider {
   #epoch = 0;
   /** The attach in flight, which a teardown waits out (bounded) before it unmounts and revokes. */
   #attaching: Promise<unknown> | null = null;
+  /** Mid-turn messages whose request is still out, any turn's: the inbox sweep before a prompt waits for them (#sweepInbox). */
+  #pushing = new Set<Promise<void>>();
 
   // Turn state.
   #turn: Turn | null = null;
@@ -731,6 +733,7 @@ export class OpencodeProvider implements SessionProvider {
       // The execution's end waits for the request: whether opencode queued it decides whether the turn goes on.
       const queued = this.#send(turn, content, "queue");
       this.#settling(turn, queued);
+      this.#inFlight(queued);
       await queued;
       return;
     }
@@ -740,6 +743,7 @@ export class OpencodeProvider implements SessionProvider {
     turn.owed++;
     const sent = this.#send(turn, content, "steer");
     this.#settling(turn, sent);
+    this.#inFlight(sent);
     try {
       await sent;
     } catch (err) {
@@ -802,7 +806,55 @@ export class OpencodeProvider implements SessionProvider {
 
   #cancelInput(conn: OpencodeConnection, ses: string, id: string): Promise<void> {
     return conn.client.cancelInput(ses, id).catch((err: unknown) => {
-      console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] couldn't withdraw a message the interrupt dropped: ${err instanceof Error ? err.message : String(err)}`);
+      // Still in the inbox: the sweep before the next prompt withdraws it (#sweepInbox).
+      console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] couldn't withdraw a message the turn left: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+
+  /**
+   * Withdraw what was pushed into the turn and not delivered: opencode would
+   * hand an input still in its inbox to whatever runs next in the session
+   * (the next prompt, a wake), however much later. With no server to ask
+   * (it died), the sweep before the next prompt does it on the next one.
+   */
+  #withdrawPushed(turn: Turn): Promise<void>[] {
+    const ses = this.#ses;
+    const conn = this.#conn;
+    const ids = [...turn.steers, ...turn.queued];
+    turn.steers.clear();
+    turn.queued.clear();
+    return ses && conn ? ids.map((id) => this.#cancelInput(conn, ses, id)) : [];
+  }
+
+  #inFlight(push: Promise<void>): void {
+    const settled = push.catch(() => {});
+    this.#pushing.add(settled);
+    void settled.then(() => this.#pushing.delete(settled));
+  }
+
+  /**
+   * Before a prompt: withdraw every input an earlier turn left in the
+   * session's inbox — one pushed into a turn that ended before opencode
+   * took it (its server died or was stopped, a teardown, an interrupt, a
+   * budget stop, a withdrawal that didn't arrive), or a prompt it never
+   * delivered. opencode keeps its inbox in its database, across its
+   * server's death and codeoid's restart, and delivers what waits there
+   * with the next prompt, which would answer it (and bill it) there. No
+   * turn is open then, so nothing in it is anyone's; a push still on its
+   * way is waited for first (bounded: #send withdraws one that lands
+   * later). Only user inputs: synthetic ones are codeoid's instructions or
+   * opencode's own. A failure fails the turn — unchecked, it could run.
+   */
+  async #sweepInbox(conn: OpencodeConnection, ses: string): Promise<void> {
+    if (this.#pushing.size > 0) await Promise.race([Promise.all(this.#pushing), Bun.sleep(ATTACH_WAIT_MS)]);
+    const left = (await conn.client.inbox(ses)).filter((item) => item.type === "user");
+    if (left.length === 0) return;
+    await Promise.all(left.map((item) => conn.client.cancelInput(ses, item.id)));
+    console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] withdrew ${left.length} message(s) an earlier turn left in opencode session ${ses}'s inbox`);
+    this.#emit({
+      type: "custom_message",
+      content: "⚠️ A message sent mid-turn to an earlier turn that ended before opencode ran it was withdrawn, not run.",
+      metadata: { event: "opencode.stale_messages_withdrawn", count: left.length },
     });
   }
 
@@ -822,9 +874,7 @@ export class OpencodeProvider implements SessionProvider {
     // deliver an input still in its inbox with the next prompt, whoever
     // sends it and however much later.
     const dropped = turn.steers.size + turn.queued.size;
-    if (ses && conn) for (const id of [...turn.steers, ...turn.queued]) void this.#cancelInput(conn, ses, id);
-    turn.steers.clear();
-    turn.queued.clear();
+    this.#withdrawPushed(turn);
     if (opts.budget && dropped > 0) this.#budgetDropped(turn);
     if (!ses || !conn) {
       this.#finishTurn(turn, "interrupted");
@@ -890,6 +940,9 @@ export class OpencodeProvider implements SessionProvider {
 
   #closeTurn(turn: Turn, reason: string): void {
     if (turn.queue.closed) return;
+    // However it ends (failed, read back, replaced, timed out waiting for a
+    // queued message), nothing it left undelivered runs after it.
+    this.#withdrawPushed(turn);
     if (turn.adopted && reason === "superseded") {
       this.#emitTo(turn, { type: "turn_done", result: this.#result(turn, "superseded") });
     }
@@ -1128,6 +1181,8 @@ export class OpencodeProvider implements SessionProvider {
     // the session's rules, a saved "always", a plugin dropped into a config
     // dir opencode watches (#ensureMounts' requests loaded the location).
     if (!fresh) await conn.client.updateSession(ses, { permissions: this.#rulesFor(ses) });
+    // Before every prompt; a session resumed here was swept as it opened (#openSession).
+    if (!fresh) await this.#sweepInbox(conn, ses);
     // Its shell runs without the server's environment (its password, the
     // injected config): a line with no command in it runs unasked. Kept in
     // the server's memory only, so set on every turn; a failure fails it.
@@ -1168,6 +1223,10 @@ export class OpencodeProvider implements SessionProvider {
       try {
         let info = await conn.client.getSession(this.#backingSessionId);
         await conn.client.updateSession(info.id, { permissions: rules });
+        // Before a leftover's stop or a move, either of which runs the
+        // session: what an earlier turn left in its inbox would run with it
+        // (the server died, codeoid restarted, the backend was torn down).
+        await this.#sweepInbox(conn, info.id);
         if (sessionRunning(info) && (await this.#runsNow(conn, info.id))) info = await this.#stopLeftover(conn, info);
         info = await this.#moveInto(conn, info, workdir);
         this.#adoptModel(info.model);
@@ -1736,11 +1795,7 @@ export class OpencodeProvider implements SessionProvider {
 
   /** The execution was interrupted with mid-turn messages waiting: withdraw them, owe Session their boundaries, and say so. */
   #dropPushed(turn: Turn): void {
-    const ses = this.#ses;
-    const conn = this.#conn;
-    if (ses && conn) for (const id of [...turn.steers, ...turn.queued]) void this.#cancelInput(conn, ses, id);
-    turn.steers.clear();
-    turn.queued.clear();
+    this.#withdrawPushed(turn);
     turn.unpaid += turn.owed;
     turn.owed = 0;
     this.#emitTo(turn, {
@@ -2878,9 +2933,7 @@ export class OpencodeProvider implements SessionProvider {
     // The session stays (the next turn resumes it), and opencode would
     // deliver an input still in its inbox with whatever is prompted next, as
     // after an interrupt (#interrupt): withdrawn before this returns.
-    const withdrawn = turn && conn && ses ? [...turn.steers, ...turn.queued].map((id) => this.#cancelInput(conn, ses, id)) : [];
-    turn?.steers.clear();
-    turn?.queued.clear();
+    const withdrawn = turn ? this.#withdrawPushed(turn) : [];
     if (turn) this.#closeTurn(turn, "teardown");
     this.#turn = null;
     const pending = [...this.#pendingAsks.entries()];

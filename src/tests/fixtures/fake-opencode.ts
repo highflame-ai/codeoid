@@ -170,7 +170,12 @@
  * FAKE_OPENCODE_SLOW_START_MS (report the address, and answer `/api/info`,
  * that long late: a start a test can stop midway), FAKE_OPENCODE_SLOW_PROMPT_MS
  * (a prompt that starts an execution is admitted that long after it arrives,
- * as a loaded server stores one: an interrupt meanwhile finds nothing running).
+ * as a loaded server stores one: an interrupt meanwhile finds nothing running),
+ * FAKE_OPENCODE_PERSIST=1 (its sessions — their messages, rules and inbox —
+ * outlive the server, beside OPENCODE_DB, as real 2.2.5 keeps them in its
+ * database: a server started on the same database finds them, and an input
+ * still in a session's inbox when its server died is delivered with that
+ * session's next prompt).
  *
  * A location first loaded under a repository has its version control run
  * unasked, with the server's environment, as real 2.2.5 does (`loadVcs`).
@@ -184,7 +189,7 @@
  * mid-execution does (busy, never idle again, nothing running).
  */
 
-import { accessSync, appendFileSync, constants, existsSync, readFileSync } from "node:fs";
+import { accessSync, appendFileSync, constants, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
@@ -311,6 +316,8 @@ const state = {
 };
 
 const sessions = new Map<string, Ses>();
+/** FAKE_OPENCODE_PERSIST=1: where the sessions outlive the server, as real 2.2.5's database keeps them. */
+const PERSIST = process.env.FAKE_OPENCODE_PERSIST === "1" && process.env.OPENCODE_DB ? `${process.env.OPENCODE_DB}.fake-sessions.json` : null;
 /** Background shells still running: id → its session, and how to end it. */
 const shells = new Map<string, { sessionID: string; directory: string; command: string; finish: (state: string) => void }>();
 const mounts = new Map<string, Map<string, Json>>(); // directory → name → config
@@ -388,6 +395,27 @@ function durable(ses: Ses, type: string, data: Json): void {
   const e = { id: nextId("evt"), type, created: Date.now(), location: { directory: ses.directory }, data: { sessionID: ses.id, ...data }, durable: { aggregateID: ses.id, seq: ses.seq, version: 1 } };
   ses.log.push(e);
   publishLive(e);
+  persistSoon();
+}
+
+let persisting = false;
+/** Write the sessions out once the change being made is done (a server killed now keeps what it had stored). */
+function persistSoon(): void {
+  if (!PERSIST || persisting) return;
+  persisting = true;
+  queueMicrotask(() => {
+    persisting = false;
+    const keep = [...sessions.values()].map(({ cancel: _c, log: _l, executing: _e, cancelPending: _p, ...rest }) => rest);
+    writeFileSync(PERSIST, JSON.stringify({ counter, sessions: keep }));
+  });
+}
+
+/** The sessions an earlier server on this database stored (FAKE_OPENCODE_PERSIST=1). */
+function restoreSessions(): void {
+  if (!PERSIST || !existsSync(PERSIST)) return;
+  const saved = JSON.parse(readFileSync(PERSIST, "utf8")) as { counter: number; sessions: Ses[] };
+  counter = Math.max(counter, saved.counter);
+  for (const ses of saved.sessions) sessions.set(ses.id, { ...ses, log: [], executing: false, cancel: null });
 }
 
 /** Add to a session's running total and publish it, as opencode does after each step. */
@@ -1885,6 +1913,10 @@ const server = Bun.serve({
       }
       return json({ interrupted: running });
     }
+    if (rest === "/inbox" && method === "GET") {
+      // As real 2.2.5: what waits, oldest first (only user inputs here; it lists synthetic, compaction and move items too).
+      return json({ data: ses.inbox.map((x) => ({ id: x.id, sessionID: ses.id, time: { created: ses.created }, type: "user", payload: { text: x.text }, delivery: x.delivery })) });
+    }
     const ib = /^\/inbox\/([^/]+)$/.exec(rest);
     if (ib && method === "DELETE") {
       // An input not delivered yet is withdrawn; a delivered one is left as it is (no error).
@@ -1952,6 +1984,7 @@ const server = Bun.serve({
 });
 
 port = server.port ?? 0;
+restoreSessions();
 process.stdin.on("end", () => process.exit(0));
 process.stdin.on("close", () => process.exit(0));
 setTimeout(() => process.stdout.write(`${JSON.stringify({ url: `http://127.0.0.1:${port}` })}\n`), SLOW_START_MS);

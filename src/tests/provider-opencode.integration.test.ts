@@ -98,6 +98,9 @@
  *       an MCP refresh) is withdrawn: the next turn, on the session the teardown kept, answers only its own prompt
  *   I60 (scripted only) a feed gap from the moment the execution starts hides its step's start; interrupted at the call's
  *       approval after it, the aborted step still reports every token, so the turn's cost is opencode's, not unknown
+ *   I61 (scripted only) a message pushed mid-turn and still in opencode's inbox when its server dies (killed, or stopped by
+ *       codeoid) survives in its database, and is withdrawn before the next prompt: the next turn, on the same backend or a
+ *       rebuilt one (a daemon restart), answers only its own prompt
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -2517,6 +2520,48 @@ describe("opencode (real binary)", () => {
       await p.teardown();
     }
   }, 180_000);
+
+  maybeScripted("I61 a message still in opencode's inbox when its server dies (killed, or stopped by codeoid) is withdrawn: the next turn, on this backend or a rebuilt one, answers only its own prompt", async () => {
+    const cases = [
+      ["kill", "later", "same"],
+      ["kill", "now", "rebuilt"],
+      ["stop", "later", "rebuilt"],
+      ["stop", "now", "same"],
+    ] as const;
+    for (const [how, priority, next] of cases) {
+      const sessionId = `it-r22-${how}-${priority}-${Math.random().toString(36).slice(2)}`;
+      const p = provider({ sessionId });
+      await collect(p.runTurn(opts("[[text:warm]]")));
+      const run = p.runTurn(opts("[[slow:300]] [[text:a b c d e f g h i j k l m n o p q r s t]]"));
+      const dead: ProviderEvent[] = [];
+      for await (const e of run.events) {
+        dead.push(e);
+        if (e.type === "text_delta" && dead.filter((x) => x.type === "text_delta").length === 1) {
+          run.pushMidTurn?.(`R22-STALE-${priority} [[text:answered-stale]]`, priority);
+          await Bun.sleep(600);
+          const conn = await server!.ensure();
+          if (how === "kill") process.kill(conn.pid!, "SIGKILL");
+          else await server!.stop("I61 stop");
+        }
+        if (e.type === "error" || e.type === "turn_done") break;
+      }
+      expect(dead.some((e) => e.type === "error")).toBe(true);
+      const ses = p.backingSessionId;
+      const backend = next === "same" ? p : provider({ sessionId, initialBackingId: ses });
+      const after = await collect(backend.runTurn(opts("[[text:fresh-turn]]")));
+      expect(after.find((e) => e.type === "error")).toBeUndefined();
+      expect(texts(after)).toEqual(["fresh-turn"]);
+      expect(backend.backingSessionId).toBe(ses);
+      await Bun.sleep(1_000);
+      // Nothing answers it later either, nor does it ride in ahead of the prompt.
+      const conn = await server!.ensure();
+      const stored = JSON.stringify((await conn.client.messages(ses)).data);
+      expect(stored).not.toContain("answered-stale");
+      expect(stored).not.toContain("R22-STALE");
+      await backend.teardown();
+      if (backend !== p) await p.teardown();
+    }
+  }, 240_000);
 
   maybe("I32 the user's own opencode data, state, cache and temp dirs are untouched by the whole run", () => {
     expect(userOpencodeDirs()).toBe(USER_DIRS_BEFORE);

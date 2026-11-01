@@ -366,6 +366,11 @@ export class OpencodeClient {
     await this.#request("POST", `/api/session/${encodeURIComponent(sessionID)}/command`, { body });
   }
 
+  /** What waits in the session's inbox, not delivered yet, oldest first: user, synthetic, compaction and move items. */
+  async inbox(sessionID: string): Promise<Array<{ id: string; type: string }>> {
+    return (await this.#request<{ data?: Array<{ id: string; type: string }> }>("GET", `/api/session/${encodeURIComponent(sessionID)}/inbox`)).data ?? [];
+  }
+
   /** Withdraw an input not delivered yet (one already delivered is left as it is). */
   async cancelInput(sessionID: string, inboxID: string): Promise<void> {
     await this.#request("DELETE", `/api/session/${encodeURIComponent(sessionID)}/inbox/${encodeURIComponent(inboxID)}`);
