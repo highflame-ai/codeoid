@@ -1461,6 +1461,19 @@ describe("opencode cost and tokens", () => {
     expect(primary(free)).toBe(3);
   });
 
+  it("under maxBudgetUsd, a $0-billed step is priced only by a pricing.models entry for its provider/model id: the snapshot's bare ids don't match it (round-17 audit)", async () => {
+    const { server } = makeServer();
+    const primary = (events: ProviderEvent[]) => events.filter((e) => e.type === "llm_call" && e.isPrimary).length;
+    // The snapshot prices `claude-sonnet-4-5`, but not opencode's `anthropic/claude-sonnet-4-5`: as documented, it stops.
+    const model = "anthropic/claude-sonnet-4-5";
+    const bare = await collect(makeProvider(server).runTurn(opts("costly-free", { model, maxBudgetUsd: 100 })));
+    expect(done(bare)).toMatchObject({ isError: true, errorMessage: UNPRICED_STOP_MESSAGE });
+    expect(primary(bare)).toBe(1);
+    const priced = await collect(makeProvider(server, { sessionId: "sess-2", initialBackingId: "sess-2", modelPrices: () => ({ [model]: { input: 3, output: 15 } }) }).runTurn(opts("costly-free", { model, maxBudgetUsd: 100 })));
+    expect(done(priced)?.isError).toBeFalsy();
+    expect(primary(priced)).toBe(3);
+  });
+
   it("under maxBudgetUsd, a subagent's step opencode billed $0 is priced at the subagent's own model, not the parent's (round-17 audit)", async () => {
     const { server } = makeServer();
     const allow = allowing(() => {});
