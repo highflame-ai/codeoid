@@ -44,6 +44,7 @@ import {
   type CatalogEntry,
   isPlaceholderModel,
   BUDGET_STOP_MESSAGE,
+  UNPRICED_STOP_MESSAGE,
 } from "./providers/interface.js";
 import { createDefaultProviderRegistry, type ProviderRegistry } from "./providers/registry.js";
 import { selectContextStrategy, renderSessionMap, renderRotationSeed, type ContextStrategy } from "./providers/context-strategy.js";
@@ -8573,7 +8574,7 @@ export class Session {
               // The reply's final text block on its own (the notice after narration).
               last?.role === "assistant" ? (this.#accumulator.lastTextBlock ?? undefined) : undefined,
             ],
-            explained: tooLong || event.result.errorMessage === BUDGET_STOP_MESSAGE,
+            explained: tooLong || event.result.errorMessage === BUDGET_STOP_MESSAGE || event.result.errorMessage === UNPRICED_STOP_MESSAGE,
           });
           const hint = tooLong
             ? " — this session's context no longer fits the model. Send /rotate to continue in a fresh context (memory recall keeps the history reachable)."

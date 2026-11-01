@@ -71,7 +71,7 @@ beforeEach(() => {
   registry.register({
     id: "opencode",
     displayName: "opencode",
-    create: (init) => new OpencodeProvider({ sessionId: init.sessionId, initialBackingId: init.initialBackingId, server, store: init.store }),
+    create: (init) => new OpencodeProvider({ sessionId: init.sessionId, initialBackingId: init.initialBackingId, server, store: init.store, modelPrices: () => config.pricing?.models }),
   });
   config = {
     daemonUrl: "ws://127.0.0.1:7400",
@@ -116,6 +116,14 @@ describe("opencode under a routine's spend cap (#430)", () => {
     const run = await runOnce("oc-mixed", "zero-cost-mixed", { dailyCostUsd: 5 });
     expect(run.status).toBe("failed");
     expect(manager.routines!.store.getRun(run.id)!.costUnknown).toBe(true);
+  });
+
+  it("a --max-cost run on steps opencode billed $0 that nothing prices stops at the first one, not after the whole turn (round-16 audit)", async () => {
+    // The fake bills three such steps of 25 output tokens each (reasoning included), and a 6-token title.
+    const run = await runOnce("oc-free-none", "costly-free", { maxCostUsd: 1 });
+    expect(run.status).toBe("failed");
+    expect(manager.routines!.store.getRun(run.id)!.costUnknown).toBe(true);
+    expect(run.outputTokens).toBe(25 + 6);
   });
 
   it("an uncapped routine on the same turn runs to its end, the cost unknown on the record", async () => {

@@ -673,6 +673,7 @@ export function createDefaultProviderRegistry(
             mcpRegistry: init.mcpRegistry,
             onModels: init.onModels,
             agent: config?.providers?.opencode?.agent,
+            modelPrices: () => config?.pricing?.models,
           }),
       });
     } else {

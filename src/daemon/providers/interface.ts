@@ -116,6 +116,14 @@ export type UiRequestFn = (req: UiRequest) => Promise<UiResponse>;
  */
 export const BUDGET_STOP_MESSAGE = "Stopped at the spend ceiling for this run (maxBudgetUsd).";
 
+/**
+ * The turn error a backend reports when it stopped itself under a spend
+ * ceiling because a request's spend can't be counted: its backend put no
+ * price on tokens it used and codeoid has none either (#430). Not over
+ * budget: the run can't tell, so it fails, as a capped run of unknown cost does.
+ */
+export const UNPRICED_STOP_MESSAGE = "Stopped: this run has a spend ceiling, and a request's spend has no price (set one in pricing.models).";
+
 export interface TurnOpts {
   /**
    * Full canonical history up to and including the current user turn.

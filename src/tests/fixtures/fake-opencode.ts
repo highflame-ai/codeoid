@@ -85,7 +85,8 @@
  *                    "refused" (ECONNREFUSED: never connected), "reset"
  *                    (ECONNRESET), "refused-after-text" (the retry's attempt
  *                    streams some text first)
- *   "costly"       → three steps of $2 each
+ *   "costly"       → three steps of $2 each; "costly-free" → three steps
+ *                    that used tokens, each billed $0
  *   "zero-cost"    → a step that used tokens opencode billed $0 for (a
  *                    subscription sign-in, a model its catalog prices at $0);
  *                    "zero-cost-mixed" → a priced step, then such a step
@@ -1096,6 +1097,16 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     const m = ses.messages.find((x) => x.id === msg);
     if (m) Object.assign(m, { finish: "stop", time: { ...m.time, streamed: Date.now(), completed: Date.now() } });
     durable(ses, "session.step.ended", { assistantMessageID: msg, finish: "stop" });
+    return "succeeded";
+  }
+  if (text.includes("costly-free")) {
+    // Three steps that used tokens opencode billed $0 for (a model its catalog doesn't price).
+    for (let i = 0; i < 3; i++) {
+      const msg = step(ses);
+      await sleep(60);
+      check();
+      endStep(ses, msg, 0);
+    }
     return "succeeded";
   }
   if (text.includes("costly")) {

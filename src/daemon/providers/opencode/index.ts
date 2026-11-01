@@ -45,6 +45,7 @@ import type { EffortLevel, ProviderCommand } from "../../../protocol/types.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import {
   BUDGET_STOP_MESSAGE,
+  UNPRICED_STOP_MESSAGE,
   type BackgroundLifecycleEvent,
   type CatalogEntry,
   type ModelInfo,
@@ -60,6 +61,7 @@ import {
   isBackgroundLifecycleEvent,
 } from "../interface.js";
 import type { AuthContext } from "../../../protocol/types.js";
+import { estimateCost, type ModelPrice, priceFor } from "../../pricing/index.js";
 import {
   OpencodeHttpError,
   type OcError,
@@ -141,6 +143,8 @@ export interface OpencodeProviderInit {
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
   /** opencode agent the session runs (`providers.opencode.agent`); absent = opencode's default. */
   agent?: string;
+  /** `pricing.models`: what a step opencode put no price on costs, against a run's spend ceiling (#430). */
+  modelPrices?: () => Readonly<Record<string, ModelPrice>> | undefined;
 }
 
 interface Usage {
@@ -166,6 +170,11 @@ function emptyUsage(): Usage {
 
 function hasTokens(t: OcTokenUsage | undefined): boolean {
   return !!t && (t.input || 0) + (t.output || 0) + (t.reasoning || 0) + (t.cache?.read || 0) + (t.cache?.write || 0) > 0;
+}
+
+/** A step's tokens as codeoid prices a turn's: reasoning is billed as output. */
+function stepTokens(t: OcTokenUsage): { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number } {
+  return { inputTokens: t.input || 0, outputTokens: (t.output || 0) + (t.reasoning || 0), cacheReadTokens: t.cache?.read || 0, cacheCreationTokens: t.cache?.write || 0 };
 }
 
 /** Events that bound a step's attempt: none of them says the model answered. */
@@ -249,6 +258,8 @@ interface Turn {
   stepError?: OcError;
   finish?: string;
   budgetStopped: boolean;
+  /** Stopped under the ceiling because a step's spend has no price, not because it was reached. */
+  unpricedStop?: boolean;
   /** The budget stop's withdrawal of a mid-turn message was said. */
   budgetDroppedSaid?: boolean;
   interrupted: boolean;
@@ -314,6 +325,7 @@ export class OpencodeProvider implements SessionProvider {
   readonly #proxy: McpProxyLease;
   readonly #onModels: OpencodeProviderInit["onModels"];
   readonly #agent: string | undefined;
+  readonly #modelPrices: (() => Readonly<Record<string, ModelPrice>> | undefined) | undefined;
 
   #backingSessionId: string;
   #hasQueried = false;
@@ -444,6 +456,7 @@ export class OpencodeProvider implements SessionProvider {
     this.#mcpRegistry = init.mcpRegistry ?? null;
     this.#onModels = init.onModels;
     this.#agent = init.agent;
+    this.#modelPrices = init.modelPrices;
     this.#proxy = new McpProxyLease(
       init.mcpProxy,
       init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
@@ -880,7 +893,7 @@ export class OpencodeProvider implements SessionProvider {
     const result = this.#result(turn, turn.budgetStopped ? "budget" : outcome === "interrupted" ? "interrupted" : (turn.finish ?? "stop"));
     if (turn.budgetStopped) {
       result.isError = true;
-      result.errorMessage = BUDGET_STOP_MESSAGE;
+      result.errorMessage = turn.unpricedStop ? UNPRICED_STOP_MESSAGE : BUDGET_STOP_MESSAGE;
     } else if (outcome === "succeeded" && this.#ses && turn.lastAssistantMessageID) {
       // Where this turn ends in opencode's session, for a native fork there (#387).
       result.nativeRef = { backingId: this.#ses, ref: turn.lastAssistantMessageID };
@@ -1701,11 +1714,24 @@ export class OpencodeProvider implements SessionProvider {
     const turn = this.#turn;
     const into = this.#spendTarget();
     addTokens(into, tokens, cost);
-    if (hasTokens(tokens) && !(typeof cost === "number" && cost > 0)) into.unpriced++;
+    const unpriced = hasTokens(tokens) && !(typeof cost === "number" && cost > 0);
+    if (unpriced) into.unpriced++;
     if (typeof cost === "number" && Number.isFinite(cost)) this.#spentUsd += cost;
+    // Under a cap, a step opencode put no price on counts at the price
+    // Session puts on it (`pricing.models`, else the snapshot); with none,
+    // what the run spent can't be told, and it stops as Session would at
+    // the turn's end (#430).
+    let priceless = false;
+    if (unpriced && this.#maxBudgetUsd !== undefined) {
+      const price = priceFor(turn?.model ?? (this.#sessionModel ? modelValue(this.#sessionModel) : ""), this.#modelPrices?.());
+      const usd = price ? estimateCost(price, stepTokens(tokens!), (tokens!.input || 0) + (tokens!.cache?.read || 0) + (tokens!.cache?.write || 0)) : Number.NaN;
+      if (Number.isFinite(usd) && usd >= 0) this.#spentUsd += usd;
+      else priceless = true;
+    }
     // The routine's cap, enforced as the spend lands — not only between turns.
-    if (turn && !turn.budgetStopped && this.#maxBudgetUsd !== undefined && this.#spentUsd >= this.#maxBudgetUsd) {
+    if (turn && !turn.budgetStopped && this.#maxBudgetUsd !== undefined && (priceless || this.#spentUsd >= this.#maxBudgetUsd)) {
       turn.budgetStopped = true;
+      if (priceless && this.#spentUsd < this.#maxBudgetUsd) turn.unpricedStop = true;
       void this.#interrupt(turn, { budget: true });
     }
   }

@@ -39,7 +39,7 @@ import { OpencodeClient, parseSse } from "../daemon/providers/opencode/client.js
 import { clearStaleOpencodeCredentials } from "../daemon/providers/opencode/credentials.js";
 import { createDefaultProviderRegistry } from "../daemon/providers/registry.js";
 import { AccountStore } from "../daemon/accounts.js";
-import { BUDGET_STOP_MESSAGE, type ProviderEvent, type ToolApprovalFn, type TurnOpts, type TurnRun, type UiRequest, type UiResponse } from "../daemon/providers/interface.js";
+import { BUDGET_STOP_MESSAGE, UNPRICED_STOP_MESSAGE, type ProviderEvent, type ToolApprovalFn, type TurnOpts, type TurnRun, type UiRequest, type UiResponse } from "../daemon/providers/interface.js";
 import { MemoryMcpHttp } from "../daemon/memory/mcp-http.js";
 import { MemoryEngine } from "../daemon/memory/engine.js";
 import { SqliteEpisodeStore } from "../daemon/memory/store.js";
@@ -1370,6 +1370,24 @@ describe("opencode cost and tokens", () => {
     expect(events.filter((e) => e.type === "llm_call" && e.isPrimary).length).toBeLessThan(3);
     const st = await fakeState(server);
     expect(st.interrupts).toHaveLength(1);
+  });
+
+  it("under maxBudgetUsd, a step opencode billed $0 counts at codeoid's price for the model, and with none the run stops (round-16 audit)", async () => {
+    const { server } = makeServer();
+    const primary = (events: ProviderEvent[]) => events.filter((e) => e.type === "llm_call" && e.isPrimary).length;
+    // Priced in pricing.models: TOKENS is 100 in, 25 out (reasoning included), 30 cache read, 10 written = $0.00019 a step at $1/$2.
+    const prices = { "anthropic/claude-sonnet-4": { input: 1, output: 2 } };
+    const priced = await collect(makeProvider(server, { modelPrices: () => prices }).runTurn(opts("costly-free", { maxBudgetUsd: 0.0003 })));
+    expect(done(priced)).toMatchObject({ isError: true, errorMessage: BUDGET_STOP_MESSAGE });
+    expect(primary(priced)).toBe(2);
+    // No price anywhere: what the run spends can't be told, so it stops at the first such step — not over budget.
+    const none = await collect(makeProvider(server, { sessionId: "sess-2", initialBackingId: "sess-2" }).runTurn(opts("costly-free", { model: "nowhere/unpriced-1", maxBudgetUsd: 100 })));
+    expect(done(none)).toMatchObject({ isError: true, errorMessage: UNPRICED_STOP_MESSAGE });
+    expect(primary(none)).toBe(1);
+    // Without a ceiling nothing changes: the turn runs, and Session prices it.
+    const free = await collect(makeProvider(server, { sessionId: "sess-3", initialBackingId: "sess-3" }).runTurn(opts("costly-free", { model: "nowhere/unpriced-1" })));
+    expect(done(free)?.isError).toBeFalsy();
+    expect(primary(free)).toBe(3);
   });
 
   it("a budget stop with a steer pending pays the steer's boundary first, so Session reads the stop", async () => {
