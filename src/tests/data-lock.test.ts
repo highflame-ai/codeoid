@@ -19,7 +19,6 @@ import {
   judgeHolder,
   type LockHolder,
   type ProcessView,
-  processStartTime,
   refreshLock,
   selfHolder,
 } from "../daemon/data-lock.js";
