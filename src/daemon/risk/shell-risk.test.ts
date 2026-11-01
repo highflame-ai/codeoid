@@ -448,6 +448,137 @@ describe("shell command risk (#431)", () => {
     }
   });
 
+  it("refuses ps unless its options and the line's variables prove it shows no environment: PS_FORMAT, PS_PERSONALITY, an unknown option (#447 round-18 audit)", async () => {
+    for (const c of [
+      // $PS_FORMAT is ps's default format, in -o's syntax.
+      "PS_FORMAT=pid,environ ps -C opencode",
+      "export PS_FORMAT=environ; ps -C opencode",
+      "PS_FORMAT=environ; export PS_FORMAT; ps",
+      "env -i PS_FORMAT=environ ps",
+      "read PS_FORMAT <<< environ; export PS_FORMAT; ps",
+      "for PS_FORMAT in environ; do export PS_FORMAT; ps; done",
+      "getopts e PS_FORMAT; ps",
+      // Any other variable ps reads, or one whose name is only known at run time.
+      "PS_PERSONALITY=bsd ps",
+      "UNIX95=1 ps -o pid",
+      'declare -x "$n=environ"; ps',
+      'printf -v "$n" environ; ps',
+      // An option ps doesn't document as showing no environment, or a value that could split into options.
+      "ps -E",
+      "ps --env",
+      "ps -Q",
+      'x="1 e"; ps -p $x',
+      "ps -p $(pgrep opencode)",
+      "PID=$(pgrep opencode); ps -p $PID",
+    ]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret, r.level]).toEqual([c, { action: "deny", path: "/proc/<pid>/environ" }, "high"]);
+    }
+    for (const c of [
+      "PS_FORMAT=pid,cmd ps",
+      "COLUMNS=200 LC_ALL=C ps aux",
+      "ps -ww -p 1 -o args",
+      "ps aux --sort=-%mem",
+      "ps -eo pid,comm,%cpu --no-headers",
+      "ps faux",
+      "ps -eLf",
+      "ps -fp $$",
+      "ps -o pid,cmd -p $PPID",
+      "ps -u $USER",
+      'PID=$(pgrep opencode); ps -p "$PID"',
+      'ps -U "$(whoami)"',
+    ]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret, r.level]).toEqual([c, undefined, "medium"]);
+    }
+  });
+
+  it("refuses a command that could read another process's environment however /proc/<pid>/environ is written (#447 round-18 audit)", async () => {
+    for (const c of [
+      // A pid only known at run time: the opencode shell's $PPID is the server.
+      "cat /proc/$PPID/environ",
+      "tr '\\0' '\\n' < /proc/$PPID/environ",
+      "cat /proc/$$/environ",
+      'cat "/proc/${PPID}/environ"',
+      "cat /proc/$(pgrep opencode)/environ",
+      "cat /proc/$PPID/task/$PPID/environ",
+      "head -c 9999 /proc//$PPID/./environ",
+      "base64 /proc/$PPID/environ",
+      "cat /proc/$PPID/fd/1",
+      "ls -l /proc/$$/fd",
+      "p=/proc/$PPID/environ; cat $p",
+      // Globs, and paths relative to /proc.
+      "cat /proc/*/environ",
+      "grep -a PASS /proc/[0-9]*/environ",
+      "cat /proc/1/env*",
+      "cat /proc/1/e{nviron,x}",
+      "cat /pr?c/1/environ",
+      "cd /proc; cat */environ",
+      "cd /proc/$PPID && cat environ",
+      "for p in /proc/*/environ; do cat $p; done",
+      // A process's root link back to /.
+      "cat /proc/self/root/proc/4242/environ",
+      "cat /proc/4242/root/proc/4242/environ",
+      "cat /proc/$PPID/root/proc/1/environ",
+      `cat /proc/$PPID/root${configDir}/config.json`,
+      "dd if=/proc/1/environ",
+      // What find, xargs or a loop hands on from /proc.
+      "find /proc -name environ -exec cat {} +",
+      "find /proc -maxdepth 2 -name environ | xargs cat",
+      "find /proc -maxdepth 1 | xargs -I% cat %/environ",
+      "ls /proc | xargs -I{} cat /proc/{}/environ",
+      'find /proc -name environ | while read f; do cat "$f"; done',
+      "ls /proc/1 | xargs cat",
+      "find / -type f | xargs grep x",
+      "fd -x cat {}/environ",
+      // A recursive read of / or /proc.
+      "grep -r PASS /proc",
+      "grep -r foo /",
+      "rg foo /",
+      "tar cf /tmp/p.tar /proc/1",
+      // A debugger attached to another process, and top (its fields come from a config file).
+      "gdb -p 1",
+      "gdb ./a.out 1234",
+      "lldb -p 1",
+      "strace -p 1",
+      "gcore 1",
+      "top -bn1",
+      // Inline code naming one.
+      "python3 -c 'import os; print(open(\"/proc/%d/environ\" % os.getppid()).read())'",
+      "node -e 'require(\"fs\").readFileSync(\"/proc/\"+process.ppid+\"/environ\")'",
+      "sed 'r /proc/1/environ' f",
+    ]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret?.action, r.level]).toEqual([c, "deny", "high"]);
+    }
+    // What doesn't reach one stays as it was.
+    for (const [c, l] of [
+      ["cat /proc/$PPID/status", "medium"],
+      ["cat /proc/$PPID/cmdline", "medium"],
+      ["cat /proc/self/status", "medium"],
+      ["cat environ", "low"],
+      ["cat src/env.ts", "low"],
+      ["cat $dir/environment.ts", "medium"],
+      ['cat "$file"', "medium"],
+      ["for f in *.ts; do cat $f; done", "medium"],
+      ["find . -name '*.ts' | xargs grep foo", "medium"],
+      ["grep -r foo /etc", "medium"],
+      ["grep -rn foo src", "low"],
+      ["rg TODO", "low"],
+      ["gdb -batch -ex run -ex bt ./a.out", "medium"],
+      ["python3 -c 'import os; print(os.environ)'", "medium"],
+      ["git commit -m 'refuse /proc/<pid>/environ reads'", "medium"],
+      ["export PATH=/tmp:$PATH; ls", "medium"],
+    ] as const) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret, r.level]).toEqual([c, undefined, l]);
+    }
+    // A search of /proc that can't yield one still asks, as a search of a directory holding credentials does.
+    for (const c of ["find /proc -name status -exec cat {} +", "find / -name '*.log' -exec grep ERROR {} +"]) {
+      expect((await assessShellCommand(c, ctx)).secret?.action).toBe("ask");
+    }
+  });
+
   it("refuses a credential file named through $HOME, or after a cd (round-1 audit)", async () => {
     for (const c of ['cat "$HOME/.codeoid/config.json"', "cat ${HOME}/.codeoid/.env", "cat < $HOME/.codeoid/config.json", "cd ~/.codeoid && cat config.json"]) {
       const r = await assessShellCommand(c, ctx);

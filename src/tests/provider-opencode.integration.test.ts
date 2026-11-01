@@ -72,7 +72,8 @@
  *   I47 (scripted only) a provider error opencode retries: the first retry is attempt 1, and the failed request bills nothing
  *   I48 (scripted only) a model opencode prices at $0: the turn's $0 isn't a price (no cost source: Session prices the tokens), as on Claude
  *   I49 (scripted only) through a Session, a shell call is judged by risk as Claude's Bash: `rm -rf ~` asks in autonomous mode,
- *       `git status` runs unasked in guarded mode with autoAllowLowRisk, a credential read is refused
+ *       `git status` runs unasked in guarded mode with autoAllowLowRisk, a credential read is refused; the shell's `$PPID`
+ *       is the server, and a line that could read its environment (`/proc/$PPID/environ`, `PS_FORMAT=environ ps`) is refused
  *   I50 (scripted only) the daemon user's `$SHELL` isn't the shell opencode runs a line with: it's bash, the shell codeoid judges
  *       lines as; the session's own commands still see the user's `$SHELL`
  *   I51 (scripted only) a declaration builtin with no operand or only options (`export -p`, `declare -p`, `unset -v X`), which opencode
@@ -1854,7 +1855,8 @@ describe("opencode (real binary)", () => {
     // Defense in depth: whatever the Session decides, opencode is told `once`
     // only for the one harmless line this case means to run. Every other
     // command is data, and is refused here before it could reach a shell.
-    const RUNNABLE = new Set(["git status"]);
+    // `cat /proc/$PPID/comm` only prints the shell's parent's name: it shows whose environment `$PPID`'s is.
+    const RUNNABLE = new Set(["git status", "cat /proc/$PPID/comm"]);
     // And the session's shell (its environment is codeoid's, set before each turn) has a throwaway home.
     const realHome = process.env.HOME;
     process.env.HOME = join(root, "home");
@@ -1920,6 +1922,17 @@ describe("opencode (real binary)", () => {
       expect(secret.verdict?.behavior).toBe("deny");
       // The scripted model echoes the call's result: the gate's reason.
       expect(secret.said).toContain("holds credentials");
+      // An opencode shell's parent is the server, whose environment holds its password (round-18 audit)...
+      const parent = await run("cat /proc/$PPID/comm", "autonomous");
+      expect(parent.verdict?.behavior).toBe("allow");
+      expect(parent.said).toContain("opencode");
+      // ...so a line that could read it, or any process's environment, is refused, never asked, never run.
+      for (const line of ["cat /proc/$PPID/environ", "tr '\\0' '\\n' < /proc/$PPID/environ", "PS_FORMAT=pid,environ ps -C opencode", "export PS_FORMAT=environ; ps -C opencode", "cat /proc/self/root/proc/1/environ"]) {
+        const r = await run(line, "autonomous");
+        expect([line, r.pending.length, r.verdict?.behavior]).toEqual([line, 0, "deny"]);
+        expect(r.said).toContain("holds credentials");
+        expect(r.said).not.toContain("OPENCODE_PASSWORD");
+      }
     } finally {
       process.env.HOME = realHome;
       await transcriptStore.flush().catch(() => {});

@@ -230,6 +230,7 @@ levels are guidance, not a sandbox: high and not-understood commands ask in ever
 mode and a recognised credential path is refused, as a best effort. Low is a strict
 allow-list (`notLow` in shell-risk.ts); keep it one, never widen it by rules.
 On Claude the PreToolUse hook routes high and not-understood ones to the gate past any allow rule.
+A command that could read another process's environment (a `/proc/<pid>/environ` however written, what a search of /proc hands on, `ps` unless its options and the line's variables prove it shows none) is refused as a credential read on every backend, failing closed (`refuseEnvironRead`, shell-risk.ts); a word's possible values are its `shape` (parse.ts).
 
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
 or an API call. `RoutineService` owns the scheduler and runs; it reaches

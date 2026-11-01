@@ -25,8 +25,20 @@
  */
 import { homedir, userInfo } from "node:os";
 import { isAbsolute, join, normalize, resolve, sep } from "node:path";
-import { secretDirsOf, secretPathVerdict } from "../secret-paths.js";
-import { loadShellParser, type ParsedShell, parseShellSync, type ShellAssignment, type ShellRedirect, type ShellWord, type SimpleCommand } from "../shell/parse.js";
+import { isProcSecretPath, secretDirsOf, secretPathVerdict } from "../secret-paths.js";
+import {
+  loadShellParser,
+  type ParsedShell,
+  parseShellSync,
+  SHAPE_ANY,
+  SHAPE_ONE,
+  SHAPE_STAR,
+  type ShellAssignment,
+  type ShellRedirect,
+  type ShellWord,
+  type SimpleCommand,
+  wordShape,
+} from "../shell/parse.js";
 
 export type RiskLevel = "low" | "medium" | "high" | "unknown";
 
@@ -327,6 +339,12 @@ export const UNREADABLE_SHELL_CALL: ShellRisk = { level: "unknown", reasons: ["t
 function judgeLine(parsed: ParsedShell, start: string | null, ctx: Ctx, v: Verdict): void {
   for (const p of parsed.problems) v.add("unknown", p);
   for (const a of parsed.assignments) judgeAssignment(a, v);
+  // A value the line sets can be a path a command reads later (`p=/proc/$PPID/environ; cat $p`).
+  for (const a of parsed.assignments) {
+    const why = procSecretWord(a.value, start, ctx);
+    if (why) refuseEnvironRead(v, `it sets ${a.name || "a variable"} to ${why}`);
+  }
+  procListedAndRead(parsed, start, ctx, v);
   // Arithmetic evaluates a variable's value as an expression, and runs a
   // `$(…)` in a subscript there: not understood when the line itself sets a
   // variable to text that could hold one (`x='a[$(cmd)]'; echo $((x))`).
@@ -371,7 +389,7 @@ const PLAIN_PROGRAM = /(PAGER|EDITOR)$/;
  * (notLow).
  */
 function judgeAssignment(a: ShellAssignment, v: Verdict): void {
-  if (PLAIN_VARS.test(a.name)) return;
+  if (a.name === "" || PLAIN_VARS.test(a.name)) return; // "": a name only known at run time, already a problem
   if (PLAIN_PROGRAM.test(a.name) && ["", "cat", "true", ":"].includes(a.value.value ?? "-")) return;
   if (TOOL_VARS.test(a.name)) v.add("medium", `it sets ${a.name}, which changes ${a.name === "IFS" ? "how words are split" : "which programs run or where paths point"}`);
   else if (CODE_VARS.test(a.name)) v.add("unknown", `it sets ${a.name}, which can make programs load or run other code`);
@@ -584,7 +602,12 @@ function checkSecrets(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdi
   // A wrapper's own words name files too: `xargs -a FILE`, `time -o FILE`.
   const words = [...cmd.argv.slice(1), ...(cmd.wrapped ?? []), ...cmd.redirects.map((r) => r.target).filter((t): t is ShellWord => t !== null)];
   for (const w of words) {
-    for (const p of fileWords(w)) {
+    // A path known in full is the secret-path check's, below.
+    const proc = SHAPE_MARK.test(wordShape(w)) || cwd === null ? procSecretWord(w, cwd, ctx) : null;
+    if (proc) refuseEnvironRead(v, `it names ${proc}`);
+    // `dd if=F`, `of=F`: the value after `=` is a file too.
+    const assigned = w.value !== null && /^[A-Za-z_][\w.-]*=[\s\S]/.test(w.value) ? [{ ...w, value: w.value.slice(w.value.indexOf("=") + 1), shape: undefined }] : [];
+    for (const p of [...fileWords(w), ...assigned.flatMap(fileWords)]) {
       const abs = resolvePath(p, cwd, ctx);
       if (abs === null) {
         if (cwd === null) checkSecretsAnywhere(p, ctx, v);
@@ -656,6 +679,7 @@ const positionals = (cmd: SimpleCommand): ShellWord[] => {
 
 function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | null, ctx: Ctx, v: Verdict): void {
   checkSecrets(cmd, cwd, ctx, v);
+  checkProcReads(cmd, parsed, cwd, ctx, v);
   if (cmd.via.some((w) => ELEVATE.has(w))) v.add("high", `runs as another user (${cmd.via.find((w) => ELEVATE.has(w))})`);
   judgeRedirects(cmd, cwd, ctx, v);
   const prog = programOf(cmd);
@@ -745,7 +769,12 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
       judgeKill(cmd, prog, v);
       return;
     case "ps":
-      judgePs(cmd, v);
+      judgePs(cmd, parsed, v);
+      return;
+    case "top":
+      // Its fields come from a configuration file (toprc, found through
+      // HOME / XDG_CONFIG_HOME), which can name the environment field.
+      refuseEnvironRead(v, "top shows the fields its configuration file names, processes' environments among them");
       return;
     case "env":
     case "printenv":
@@ -1154,45 +1183,288 @@ function judgeSsh(cmd: SimpleCommand, v: Verdict): void {
   else v.add("medium", "ssh connects to another machine");
 }
 
-/** ps options that take an argument: Unix (`-o FMT`, `-oFMT`), long (`--format FMT`, `--format=FMT`), BSD (`o FMT`). */
-const PS_UNIX_ARG = new Set("CGgOopqstUuk");
-const PS_BSD_ARG = new Set("oOpqtUk");
-const PS_LONG_ARG = new Set(["--format", "--cols", "--columns", "--width", "--lines", "--rows", "--group", "--Group", "--pid", "--ppid", "--quick-pid", "--sid", "--sort", "--tty", "--user", "--User", "--context"]);
-const PS_FORMAT = new Set(["o", "O", "--format"]);
+/**
+ * Another process's environment is a credential: the daemon's keys, a backend
+ * server's password (opencode's `OPENCODE_PASSWORD` is in the environ of the
+ * shell's parent). A command that could read one is refused, as reading
+ * /proc/<pid>/environ with a file tool is, in every mode and on every
+ * backend. The rule fails closed: a word, a `ps`, a search is refused unless
+ * what the line shows proves it can't reach one (see docs/approvals.md).
+ */
+function refuseEnvironRead(v: Verdict, why: string): void {
+  const path = "/proc/<pid>/environ";
+  if (v.secret?.action !== "deny") v.secret = { action: "deny", path };
+  v.add("high", `${why}: a process's environment holds credentials (it reads ${path})`);
+}
+
+/** The files of /proc/<pid> that hand over a process's environment, memory or open files (secret-paths.ts PROC_SECRET). */
+const PROC_SECRET_NAMES = ["environ", "mem", "fd", "fdinfo", "map_files"];
+const SHAPE_MARK = new RegExp(`[${SHAPE_ANY}${SHAPE_STAR}${SHAPE_ONE}]`);
+
+/** A shape (or one component of it) as a regular expression over the values it could take. */
+function shapeRegex(shape: string): RegExp {
+  let src = "";
+  for (const c of shape) src += c === SHAPE_ANY ? "[\\s\\S]*" : c === SHAPE_STAR ? "[^/]*" : c === SHAPE_ONE ? "[^/]" : c.replace(/[.*+?^${}()|[\]\\/-]/g, "\\$&");
+  return new RegExp(`^${src}$`);
+}
+
+/** A last component that is fixed text and none of the secret files, nor an entry of their directories (`fd/3`, `map_files/7f…-7f…`). */
+function safeProcLeaf(leaf: string): boolean {
+  return !SHAPE_MARK.test(leaf) && !PROC_SECRET_NAMES.includes(leaf) && !/^\d+$/.test(leaf) && !/^[0-9a-f]+-[0-9a-f]+$/i.test(leaf);
+}
 
 /**
- * `ps` with the environment shown (BSD `e`, as in `ps eww` or `ps auxe`;
- * macOS's `-E`; an `env`/`environ` field) prints every same-user process's
- * environment: it reads `/proc/<pid>/environ` itself, so the line names no
- * file the secret check sees. It hands over what any of them holds — the
- * daemon's keys, a backend server's password — and is refused as reading
- * that file is. A word it can't read might be one of those.
+ * The components of a word's shape as an absolute path: `~` is the home,
+ * a relative one is under cwd (or under any directory, when that isn't
+ * known). Null when the word starts with `~user`.
  */
-function judgePs(cmd: SimpleCommand, v: Verdict): void {
+function shapeComponents(w: ShellWord, cwd: string | null, ctx: Ctx): string[] | null {
+  let shape = wordShape(w);
+  if (shape === "~" || shape.startsWith("~/")) shape = ctx.home + shape.slice(1);
+  else if (shape.startsWith("~")) return null;
+  else if (!shape.startsWith("/") && !shape.startsWith(SHAPE_ANY)) shape = `${cwd ?? SHAPE_ANY}/${shape}`;
+  return shape
+    .replace(new RegExp(`${SHAPE_ANY}+`, "g"), SHAPE_ANY)
+    .split("/")
+    .filter((c) => c !== "" && c !== ".");
+}
+
+/**
+ * Why a word could name a file that hands over a process's environment (or
+ * memory, or open files), or null when its fixed text proves it can't:
+ * /proc/<pid>/environ however the pid or the name is written (`$PPID`,
+ * `$$`, `self`, `$(pgrep …)`, a glob, an xargs or find argument), relative
+ * to /proc, or through a `/proc/<pid>/root` link back to `/`. A word only
+ * known at run time with no fixed text at all (`$f`) proves nothing either
+ * way; what the line does with it is judged elsewhere (procListedAndRead).
+ */
+function procSecretWord(w: ShellWord, cwd: string | null, ctx: Ctx): string | null {
+  // A path known in full is judged as it is: `cat environ` in the workspace is a file there.
+  if (!SHAPE_MARK.test(wordShape(w)) && (cwd !== null || wordShape(w).startsWith("/"))) {
+    const abs = w.value === null ? null : resolvePath(w, cwd, ctx);
+    return abs !== null && isProcSecretPath(abs) ? abs : null;
+  }
+  const comps = shapeComponents(w, cwd, ctx);
+  if (comps === null || comps.length === 0) return null;
+  const leaf = comps.at(-1)!;
+  // The last component could be environ or mem, and the word says so in fixed text: `$d/environ`, `env*`, `"$x"iron`.
+  const tail = leaf.includes(SHAPE_ANY) ? leaf.slice(leaf.lastIndexOf(SHAPE_ANY)) : leaf;
+  if (tail.replace(new RegExp(SHAPE_MARK.source, "g"), "") !== "") {
+    const name = ["environ", "mem"].find((n) => shapeRegex(tail).test(n));
+    if (name) return `${w.raw}, which could be /proc/<pid>/${name}`;
+  }
+  // Under a `proc` component (`/proc`, `/pr?c`, a cwd in /proc): only a fixed last component that is none of them is safe.
+  const at = comps.findIndex((c, i) => i < comps.length - 1 && !c.includes(SHAPE_ANY) && shapeRegex(c).test("proc"));
+  if (at < 0) return null;
+  // `/proc/<x>/root/…` is the process's `/`: what follows is judged from there.
+  const root = comps.findIndex((c, i) => i > at && c === "root");
+  if (root >= 0 && root < comps.length - 1) {
+    const rest = comps.slice(root + 1).join("/");
+    const inner = procSecretWord({ value: SHAPE_MARK.test(rest) ? null : `/${rest}`, raw: w.raw, glob: false, shape: `/${rest}` }, "/", ctx);
+    if (inner) return inner;
+    if (!SHAPE_MARK.test(rest) && secretPathVerdict("Grep", { path: `/${rest}` }, { workdir: ctx.workdir, configDir: ctx.configDir })?.action === "deny") return `${w.raw}, which is /${rest} through a process's root`;
+  }
+  if (comps.slice(at + 1).some((c) => SHAPE_MARK.test(c)) || cwd === null || SHAPE_MARK.test(comps.slice(0, at).join("/"))) {
+    if (!safeProcLeaf(leaf)) return `${w.raw}, a path under /proc only known at run time`;
+  }
+  return null;
+}
+
+/** A directory listing it holds /proc/<pid> entries: /proc, /proc/<pid>, its task dirs, and a process's root or cwd link. */
+function isProcDir(abs: string | null): boolean {
+  return abs !== null && (/^\/proc(?:\/[^/]+(?:\/task(?:\/[^/]+)?)?)?$/.test(abs) || /^\/proc\/[^/]+(?:\/task\/[^/]+)?\/(?:root|cwd)(?:\/|$)/.test(abs));
+}
+
+/** A word that is, or could be, such a directory, or `/` (where a recursive read reaches /proc). */
+function reachesProc(w: ShellWord, cwd: string | null, ctx: Ctx): boolean {
+  if (w.value !== null && !w.glob) {
+    const abs = resolvePath(w, cwd, ctx);
+    return abs === "/" || isProcDir(abs);
+  }
+  const comps = shapeComponents(w, cwd, ctx);
+  return comps?.some((c) => !c.includes(SHAPE_ANY) && shapeRegex(c).test("proc")) ?? false;
+}
+
+/**
+ * A find whose results could be a process's environment: a root that reaches
+ * /proc (`/`, `/proc`, `/proc/$PPID`), unless its expression is a plain
+ * conjunction with a `-name` / `-iname` pattern none of the secret files'
+ * names match.
+ */
+function findYieldsProcSecret(find: SimpleCommand, cwd: string | null, ctx: Ctx): boolean {
+  if (!findRoots(find).some((r) => reachesProc(r, cwd, ctx))) return false;
+  const args = find.argv.slice(1);
+  if (args.some((w) => w.value === null || ["-o", "-or", ",", "!", "-not", "(", ")"].includes(w.value))) return true;
+  for (let i = 0; i < args.length - 1; i++) {
+    const opt = args[i]!.value;
+    if (opt !== "-name" && opt !== "-iname") continue;
+    const re = shapeRegex(wordShape(args[i + 1]!).replace(/\\(.)/g, "$1"));
+    const fold = opt === "-iname";
+    if (![...PROC_SECRET_NAMES, "3", "12", "7f00-7f01"].some((n) => (fold ? new RegExp(re.source, "i") : re).test(n))) return false;
+  }
+  return true;
+}
+
+/**
+ * The line lists entries of /proc (a find there, `ls /proc/$PPID`, `echo
+ * /proc`) and some command reads a path only known at run time — what a
+ * pipe, a loop or xargs hands on (`find /proc -name environ | while read f;
+ * do cat "$f"; done`): refused, as that path could be a process's environment.
+ */
+function procListedAndRead(parsed: ParsedShell, cwd: string | null, ctx: Ctx, v: Verdict): void {
+  const lists = parsed.commands.some((c) =>
+    programOf(c) === "find" ? findYieldsProcSecret(c, cwd, ctx) : [...c.argv.slice(1), ...c.redirects.map((r) => r.target).filter((t): t is ShellWord => t !== null)].some((w) => w.value !== null && !w.glob && isProcDir(resolvePath(w, cwd, ctx))),
+  );
+  if (!lists) return;
+  const reads = parsed.commands.find((c) => !NOT_FILES.has(programOf(c) ?? "") && programOf(c) !== "find" && [...c.argv.slice(1), ...(c.wrapped ?? [])].some((w) => w.value === null && w.home === undefined && !safeProcLeaf(wordShape(w).split("/").at(-1) ?? "")));
+  if (reads) refuseEnvironRead(v, `${programOf(reads)} reads a path only known at run time, on a line that lists /proc, so it could read processes' environments`);
+}
+
+/** Programs that read every file under a directory they're given, and the options that make them. */
+function recursesInto(cmd: SimpleCommand, prog: string): boolean {
+  const f = flags(cmd);
+  switch (prog) {
+    case "grep":
+    case "egrep":
+    case "fgrep":
+    case "ugrep":
+      return hasFlag(cmd, "r", "--recursive") || hasFlag(cmd, "R", "--dereference-recursive") || f.some((x) => x === "-drecurse" || x === "--directories=recurse") || cmd.argv.some((w, i) => (w.value === "-d" || w.value === "--directories") && cmd.argv[i + 1]?.value === "recurse");
+    case "rg":
+    case "ag":
+    case "ack":
+    case "tar":
+    case "bsdtar":
+      return true;
+    case "diff":
+      return hasFlag(cmd, "r", "--recursive");
+    case "cp":
+    case "scp":
+      return hasFlag(cmd, "r", "--recursive") || hasFlag(cmd, "R") || hasFlag(cmd, "a", "--archive");
+    case "rsync":
+      return hasFlag(cmd, "r", "--recursive") || hasFlag(cmd, "a", "--archive");
+    case "zip":
+      return hasFlag(cmd, "r", "--recurse-paths");
+  }
+  return false;
+}
+
+/** Debuggers attached to a process read its memory, its environment included. */
+const ATTACH_ALWAYS = new Set(["gcore", "gstack", "pstack", "eu-stack"]);
+
+/** gdb / lldb / strace / ltrace told to attach to a running process. */
+function attaches(cmd: SimpleCommand, prog: string): boolean {
+  const args = cmd.argv.slice(1).map((w) => w.value ?? "");
+  switch (prog) {
+    case "strace":
+    case "ltrace":
+      return args.some((a) => /^-[a-zA-Z]*p/.test(a) || /^--attach(=|$)/.test(a));
+    case "gdb":
+    case "lldb": {
+      if (args.some((a) => /^(-p|-pid|--pid|-p=|--pid=|--attach-pid|--attach-name|-n|-w|--wait-for)/.test(a) && !/^--?(nx|nh|nw)$/.test(a))) return true;
+      // A command it runs that attaches: `-ex 'attach 123'`, `-o 'process attach -p 1'`.
+      if (args.some((a) => /(^|\s)(attach|process\s+attach)\b/.test(a))) return true;
+      // `gdb PROG PID`: a number after the program is a process to attach to.
+      return prog === "gdb" && positionals(cmd).length >= 2 && /^\d+$/.test(positionals(cmd)[1]!.value ?? "");
+    }
+  }
+  return false;
+}
+
+/** Interpreters whose inline code isn't parsed as shell (shells are: their `-c` line is judged command by command). */
+const CODE_TEXT = /\/proc\b[\s\S]*\benviron\b/;
+
+/**
+ * Reads of other processes' environments a command makes itself: what find
+ * or xargs hands it from /proc, a recursive read of `/` or /proc, a debugger
+ * attached to a process, and inline code that names /proc/…/environ.
+ */
+function checkProcReads(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | null, ctx: Ctx, v: Verdict): void {
+  const prog = programOf(cmd);
+  if (prog === null) return;
+  // `find /proc -name environ -exec cat {} +`, `find / | xargs cat`: what it's handed comes from there.
+  if (cmd.argv.slice(1).some((w) => w.input && wordShape(w) === SHAPE_ANY)) {
+    const sources = cmd.inputFrom !== undefined ? [parsed.commands[cmd.inputFrom]!] : parsed.commands.filter((c) => c.pipeline === cmd.pipeline && c.stage < cmd.stage);
+    if (sources.some((c) => programOf(c) === "find" && findYieldsProcSecret(c, cwd, ctx))) refuseEnvironRead(v, `${prog} reads what a search of /proc finds, processes' environments among them`);
+  }
+  if (recursesInto(cmd, prog)) {
+    const operands = positionals(cmd);
+    const at = operands.find((w) => reachesProc(w, cwd, ctx)) ?? (operands.length === 0 && /^(rg|ag|ack|grep|egrep|fgrep|ugrep)$/.test(prog) && (cwd === null || cwd === "/" || isProcDir(cwd)) ? { value: cwd, raw: cwd ?? "the current directory", glob: false } : undefined);
+    if (at) refuseEnvironRead(v, `${prog} reads every file under ${at.raw}, processes' environments in /proc included`);
+  }
+  if (ATTACH_ALWAYS.has(prog) || attaches(cmd, prog)) refuseEnvironRead(v, `${prog} attaches to another process, whose memory holds its environment`);
+  if (INTERPRETERS.has(prog) || ["awk", "gawk", "mawk", "nawk", "sed", "gdb", "lldb"].includes(prog)) {
+    const texts = [...cmd.argv.slice(1).map((w) => w.value ?? w.raw), ...cmd.redirects.flatMap((r) => [r.body ?? "", r.op === "<<<" ? (r.target?.value ?? r.target?.raw ?? "") : ""])];
+    if (texts.some((t) => CODE_TEXT.test(t))) refuseEnvironRead(v, `${prog}'s code names /proc/…/environ, a process's environment`);
+  }
+}
+
+/** ps options that take an argument: Unix (`-o FMT`, `-oFMT`), long (`--format FMT`, `--format=FMT`), BSD (`o FMT`). */
+const PS_UNIX_ARG = new Set("CGgnOopqstUuk");
+const PS_BSD_ARG = new Set("oOpqtUk");
+/** Every other option ps takes that shows no environment: procps' and macOS's Unix (`-ef`, `-AH`) and BSD (`aux`, `axjf`) ones. */
+const PS_UNIX_PLAIN = new Set("AacdeFfHhjLlMmNPrSTVvwXxyZ");
+const PS_BSD_PLAIN = new Set("acfghjLlMmnrSsTuVvwXxZH");
+const PS_LONG_ARG = new Set(["--format", "--cols", "--columns", "--width", "--lines", "--rows", "--group", "--Group", "--pid", "--ppid", "--quick-pid", "--sid", "--sort", "--tty", "--user", "--User"]);
+const PS_LONG_PLAIN = new Set(["--context", "--cumulative", "--deselect", "--forest", "--headers", "--no-headers", "--info", "--version", "--help"]);
+const PS_FORMAT_OPTS = new Set(["o", "O", "--format"]);
+/** Variables ps reads: the default format, how options are read (personality), and the rest procps documents. */
+const PS_VARS = /^(PS_\w+|PROCPS_\w+|CMD_ENV|I_WANT_A_BROKEN_PS|POSIXLY_CORRECT|POSIX2|UNIX95|_XPG)$/;
+
+/**
+ * A word only known at run time that can't become more than one argument:
+ * fully double-quoted (`"$pid"`), or one variable the line doesn't set
+ * (inherited, as the rest of ps's environment is) or a pid bash sets (`$$`).
+ */
+function oneArgument(w: ShellWord, parsed: ParsedShell): boolean {
+  if (/^"(?:[^"\\]|\\.)*"$/.test(w.raw)) return true;
+  const name = /^\$(?:\{(\w+|[$!])\}|(\w+|[$!]))$/.exec(w.raw);
+  const v = name?.[1] ?? name?.[2];
+  return v !== undefined && (["$", "!", "PPID", "BASHPID"].includes(v) || !parsed.assignments.some((a) => a.name === v || a.name === ""));
+}
+
+/**
+ * `ps` prints every same-user process's environment when told to (BSD `e`,
+ * as in `ps eww` or `ps auxe`; macOS's `-E`; an `environ` field, in `-o` or in
+ * `$PS_FORMAT`), reading /proc/<pid>/environ itself, so the line names no file
+ * the secret check sees. It is judged an environment reader unless its
+ * options and the variables the line sets prove it can't show one: every
+ * option is one ps documents as showing none, every format names no
+ * environment field, every word is known (or a single option value), and the
+ * line sets no variable ps reads (`PS_PERSONALITY` changes how options are
+ * read) but a `PS_FORMAT` of that kind.
+ */
+function judgePs(cmd: SimpleCommand, parsed: ParsedShell, v: Verdict): void {
   let env: string | null = null;
   let pending: string | null = null;
   const format = (value: string) => {
     if (value.split(/[\s,]+/).some((f) => /^(env|environ)(=|:|$)/i.test(f))) env ??= "an environment field";
   };
+  for (const a of parsed.assignments) {
+    if (a.name === "") env ??= "a variable whose name is only known at run time";
+    else if (a.name === "PS_FORMAT") {
+      if (a.value.value === null) env ??= "a PS_FORMAT only known at run time";
+      else format(a.value.value);
+    } else if (PS_VARS.test(a.name)) env ??= `${a.name}, which changes what ps shows`;
+  }
   for (const w of cmd.argv.slice(1)) {
     const word = w.value;
     if (pending !== null) {
-      if (PS_FORMAT.has(pending)) {
-        if (word === null) env ??= "a format only known at run time";
-        else format(word);
-      }
+      if (word === null && (PS_FORMAT_OPTS.has(pending) || !oneArgument(w, parsed))) env ??= PS_FORMAT_OPTS.has(pending) ? "a format only known at run time" : `${w.raw}, which could split into options`;
+      else if (word !== null && PS_FORMAT_OPTS.has(pending)) format(word);
       pending = null;
       continue;
     }
     if (word === null) {
-      env ??= "an option only known at run time";
+      env ??= `an option only known at run time (${w.raw})`;
       continue;
     }
     if (word.startsWith("--")) {
       const eq = word.indexOf("=");
       const name = eq < 0 ? word : word.slice(0, eq);
-      if (eq >= 0 && PS_FORMAT.has(name)) format(word.slice(eq + 1));
-      else if (eq < 0 && PS_LONG_ARG.has(name)) pending = name;
+      if (PS_LONG_ARG.has(name)) {
+        if (eq < 0) pending = name;
+        else if (PS_FORMAT_OPTS.has(name)) format(word.slice(eq + 1));
+      } else if (!PS_LONG_PLAIN.has(name) && word !== "--") env ??= `an option ps may read as one (${word})`;
       continue;
     }
     if (/^\d[\d,]*$/.test(word)) continue; // pids
@@ -1200,12 +1472,15 @@ function judgePs(cmd: SimpleCommand, v: Verdict): void {
     const group = unix ? word.slice(1) : word;
     for (let i = 0; i < group.length; i++) {
       const c = group[i]!;
-      if ((unix && c === "E") || (!unix && c === "e")) env ??= unix ? "-E" : "e";
       if ((unix ? PS_UNIX_ARG : PS_BSD_ARG).has(c)) {
         const rest = group.slice(i + 1);
         if (rest) {
           if (c === "o" || c === "O") format(rest);
         } else pending = c;
+        break;
+      }
+      if (!(unix ? PS_UNIX_PLAIN : PS_BSD_PLAIN).has(c)) {
+        env ??= (unix && c === "E") || (!unix && c === "e") ? (unix ? "-E" : "e") : `${unix ? "-" : ""}${c}, an option ps may read as one`;
         break;
       }
     }
@@ -1214,9 +1489,7 @@ function judgePs(cmd: SimpleCommand, v: Verdict): void {
     v.add("medium", "runs ps");
     return;
   }
-  const path = "/proc/<pid>/environ";
-  v.secret = { action: "deny", path };
-  v.add("high", `ps shows processes' environments (${env}), which hold credentials: it reads ${path}`);
+  refuseEnvironRead(v, `ps shows processes' environments (${env})`);
 }
 
 function judgeKill(cmd: SimpleCommand, prog: string, v: Verdict): void {

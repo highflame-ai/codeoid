@@ -174,6 +174,28 @@ describe("an opencode shell call is judged by risk as a Claude Bash call is (#43
     expect((await opencodeCall({ command: "ps aux" }, "autonomous")).reply).toBe("ran it");
   });
 
+  test("a line that could read another process's environment ($PPID's is the server's, password included) is refused in any mode on both backends: PS_FORMAT, a pid only known at run time, a root link, a search of /proc (round-18 audit)", async () => {
+    for (const line of [
+      "PS_FORMAT=pid,environ ps -C opencode",
+      "export PS_FORMAT=environ; ps -C opencode",
+      "cat /proc/$PPID/environ",
+      "tr '\\0' '\\n' < /proc/$PPID/environ",
+      "cat /proc/self/root/proc/4242/environ",
+      "cat /proc/*/environ",
+      "find /proc -name environ -exec cat {} +",
+    ]) {
+      for (const mode of ["autonomous", "guarded"] as const) {
+        const oc = await opencodeCall({ command: line }, mode);
+        expect([line, mode, oc.asked, /\/proc\/.*environ holds credentials/.test(oc.reply) ? "refused" : oc.reply]).toEqual([line, mode, false, "refused"]);
+        expect([line, mode, (await claudeCall({ command: line }, mode)).behavior]).toEqual([line, mode, "deny"]);
+      }
+    }
+    // What can't reach one still runs in autonomous mode.
+    for (const line of ["PS_FORMAT=pid,cmd ps -C opencode", "cat /proc/$PPID/status"]) {
+      expect([line, (await opencodeCall({ command: line }, "autonomous")).reply]).toEqual([line, "ran it"]);
+    }
+  });
+
   test("the directory opencode runs it in is the one judged: a bare name in codeoid's config dir is a credential read", async () => {
     const oc = await opencodeCall({ command: "cat config.json", workdir: getConfigDir() }, "autonomous");
     expect(oc.asked).toBe(false);
