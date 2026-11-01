@@ -34,10 +34,10 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, rmdirSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { OPENCODE_MODEL_ID } from "../../../config.js";
+import { dirname, join, resolve, sep } from "node:path";
+import { getConfigDir, OPENCODE_MODEL_ID } from "../../../config.js";
 import { OpencodeClient, OpencodeHttpError, type OcEvent, type OcRule } from "./client.js";
 import { clearOpencodeCredentials, type OpencodeCredentialInputs, planOpencodeCredentials, writeOpencodeCredentials } from "./credentials.js";
 import {
@@ -124,6 +124,10 @@ export interface OpencodeServerOptions {
   modelProviders?: Record<string, unknown>;
   /** The user's own opencode global config dir, whose provider and model keys are carried over; null: none. Default: as opencode finds it. */
   userConfigDir?: string | null;
+  /** codeoid's own places besides the server's (its database, transcripts): the server's cwd leads to none of them (`opencodeServerCwd`). */
+  codeoidPaths?: readonly string[];
+  /** Where the server's cwd may be made, in order (`SERVER_CWD_BASES`; tests). */
+  cwdBases?: readonly string[];
 }
 
 /** A server running a plugin codeoid doesn't know: refused. */
@@ -151,8 +155,9 @@ interface Launched {
   client: OpencodeClient;
   exited: Promise<void>;
   stderrTail: () => string;
-  /** The empty directory it runs in (`opencodeServerCwd`). */
+  /** The empty directory it runs in, and the fresh root holding it alone (`opencodeServerCwd`). */
   cwd: string;
+  cwdRoot: string;
 }
 
 /** Every server started in this process, so the daemon can stop them on shutdown. */
@@ -370,9 +375,13 @@ export class OpencodeServer {
     this.#home = homeOf(env);
     // Requests name their directory; the server's own cwd is only its default.
     // A shell reaches it as `/proc/$PPID/cwd`, which the gate can't follow, so
-    // it holds nothing and leads nowhere: never the database's folder, beside
-    // the credential files and the config.
-    const cwd = opencodeServerCwd();
+    // it holds nothing and leads nowhere, `..` included: never the database's
+    // folder, beside the credential files and the config, nor the temp dir
+    // codeoid's sign-in homes are made in.
+    const { cwd, root: cwdRoot } = opencodeServerCwd(
+      [this.#opts.dbPath, this.configDir, this.credentialsDir, this.dataDir, ...(this.#opts.locationsFile ? [this.#opts.locationsFile] : []), getConfigDir(), ...(this.#opts.codeoidPaths ?? [])],
+      this.#opts.cwdBases,
+    );
     let proc: ChildProcessWithoutNullStreams;
     try {
       proc = spawn(this.#opts.command, [...(this.#opts.argsPrefix ?? []), "serve", "--stdio", "--port", "0", "--hostname", "127.0.0.1"], {
@@ -381,7 +390,7 @@ export class OpencodeServer {
         env,
       });
     } catch (err) {
-      removeServerCwd(cwd);
+      removeServerCwd(cwd, cwdRoot);
       throw err;
     }
     this.#launching = proc;
@@ -395,7 +404,7 @@ export class OpencodeServer {
     const exited = new Promise<void>((resolve) => {
       proc.once("exit", () => resolve());
       proc.once("error", () => resolve());
-    }).then(() => removeServerCwd(cwd));
+    }).then(() => removeServerCwd(cwd, cwdRoot));
     const url = await new Promise<string>((resolve, reject) => {
       let buf = "";
       const timer = setTimeout(() => fail(new Error(`opencode didn't report its address within ${this.#opts.startTimeoutMs ?? START_TIMEOUT_MS}ms`)), this.#opts.startTimeoutMs ?? START_TIMEOUT_MS);
@@ -439,7 +448,7 @@ export class OpencodeServer {
       });
     });
     const client = new OpencodeClient({ baseUrl: url, password });
-    return { proc, client, exited, stderrTail: () => stderrTail, cwd };
+    return { proc, client, exited, stderrTail: () => stderrTail, cwd, cwdRoot };
   }
 
   #adopt(launched: Launched): OpencodeConnection {
@@ -536,22 +545,116 @@ function untrustedPlugins(names: readonly string[]): string {
 }
 
 /**
- * A fresh, empty directory for a server to run in: made by `mkdtemp` (0700, so
- * no other user can have planted it), then made read-only so nothing lands in
- * it. Its parent is the system's temp dir, so `..` from it reaches nothing of
- * codeoid's either. Removed when the server exits.
+ * Where a server's cwd may be made, in order: shared temp dirs codeoid makes
+ * nothing else in. The daemon's own temp dir is never one (`leadsToCodeoid`):
+ * codeoid's sign-in homes, evidence and bridges are made there.
  */
-export function opencodeServerCwd(base: string = tmpdir()): string {
-  const dir = mkdtempSync(join(base, "codeoid-opencode-cwd-"));
-  chmodSync(dir, 0o500);
-  return dir;
+export const SERVER_CWD_BASES: readonly string[] = ["/var/tmp", "/dev/shm", "/tmp"];
+
+/** The fresh root a server's cwd is made in; nothing of codeoid's but such roots is named with it. */
+export const SERVER_CWD_PREFIX = "codeoid-ocserver-";
+
+/**
+ * A fresh, empty directory for a server to run in, alone in a fresh root:
+ * both made by `mkdtemp`/`mkdir` (0700, so no other user can have planted
+ * them), then made read-only so nothing lands in them. A shell reaches the
+ * cwd as `/proc/$PPID/cwd`, and any number of `..` after it, so the root is
+ * made in the first of `bases` where no directory from it up to `/` holds
+ * anything of codeoid's (`leadsToCodeoid`: `codeoidPaths`, the daemon's
+ * temp dir, anything named codeoid). None: refused, never made where it would
+ * lead somewhere. Both are removed when the server exits.
+ */
+export function opencodeServerCwd(
+  codeoidPaths: readonly string[],
+  bases: readonly string[] = SERVER_CWD_BASES,
+  tempDir: string = tmpdir(),
+): { root: string; cwd: string } {
+  const tried: string[] = [];
+  for (const base of bases) {
+    const why = leadsToCodeoid(base, codeoidPaths, tempDir);
+    if (why) {
+      tried.push(`${base}: ${why}`);
+      continue;
+    }
+    let root: string;
+    try {
+      root = mkdtempSync(join(base, SERVER_CWD_PREFIX));
+    } catch (err) {
+      tried.push(`${base}: ${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    const cwd = join(root, "cwd");
+    try {
+      mkdirSync(cwd, { mode: 0o700 });
+      chmodSync(cwd, 0o500);
+      chmodSync(root, 0o500);
+    } catch (err) {
+      removeServerCwd(cwd, root);
+      throw err;
+    }
+    return { root, cwd };
+  }
+  throw new Error(
+    `no directory to run opencode's server in that leads to nothing of codeoid's (a shell reaches it as /proc/$PPID/cwd): ${tried.join("; ")}`,
+  );
 }
 
-function removeServerCwd(dir: string): void {
+/**
+ * Why `/proc/$PPID/cwd` and its `..`s would reach something of codeoid's
+ * from a root made in `base`, or null: some directory from `base` up to `/`
+ * is one of `codeoidPaths`, inside one, or holds one; is the daemon's temp
+ * dir; or holds an entry named codeoid (another daemon's temp dirs, a
+ * `.codeoid`) other than a server cwd root. One that can't be read or
+ * resolved fails closed.
+ */
+export function leadsToCodeoid(base: string, codeoidPaths: readonly string[], tempDir: string = tmpdir()): string | null {
+  let dir: string;
   try {
-    // Never recursive: it is only codeoid's while it is empty.
-    rmdirSync(dir);
+    dir = realpathSync(base);
+  } catch {
+    return "doesn't exist";
+  }
+  const real = (p: string) => {
+    const abs = resolve(p);
+    try {
+      return realpathSync(abs);
+    } catch {
+      return abs;
+    }
+  };
+  const places = codeoidPaths.map(real);
+  const temp = real(tempDir);
+  for (;;) {
+    if (dir === temp) return `${dir} is the daemon's temp dir`;
+    for (const p of places) {
+      if (p === dir || dirname(p) === dir) return `${dir} holds ${p}`;
+      if (dir.startsWith(`${p}${sep}`)) return `${dir} is inside ${p}`;
+    }
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return `${dir} can't be listed`;
+    }
+    const named = names.find((n) => /^\.?codeoid/i.test(n) && !n.startsWith(SERVER_CWD_PREFIX));
+    if (named) return `${dir} holds ${join(dir, named)}`;
+    const up = dirname(dir);
+    if (up === dir) return null;
+    dir = up;
+  }
+}
+
+function removeServerCwd(cwd: string, root: string): void {
+  // Never recursive: they are only codeoid's while they are empty. The root is
+  // made writable again for the cwd to go (an rmdir writes its parent).
+  try {
+    chmodSync(root, 0o700);
   } catch {}
+  for (const dir of [cwd, root]) {
+    try {
+      rmdirSync(dir);
+    } catch {}
+  }
 }
 
 /** opencode's home in an environment: `OPENCODE_TEST_HOME`, else `os.homedir()` (which reads `HOME`). */

@@ -639,6 +639,8 @@ export function createDefaultProviderRegistry(
           dbPath,
           locationsFile: opencodeLocationsFile(config),
           dataDir: opencodeDataDir(config),
+          // The server's cwd leads to none of these (opencodeServerCwd).
+          codeoidPaths: [config?.dbPath, config?.transcriptDir].filter((p): p is string => typeof p === "string"),
           defaultModel: config?.providers?.opencode?.model,
           // codeoid's keys reach opencode through its config, from files; read at each server start.
           credentials: () =>

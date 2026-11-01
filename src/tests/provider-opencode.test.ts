@@ -26,11 +26,11 @@
  */
 
 import { afterAll, describe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
-import { OpencodeServer, OpencodeIncompatibleError, stopOpencodeServers } from "../daemon/providers/opencode/server.js";
+import { leadsToCodeoid, OpencodeServer, OpencodeIncompatibleError, SERVER_CWD_BASES, SERVER_CWD_PREFIX, stopOpencodeServers } from "../daemon/providers/opencode/server.js";
 import { secretPathVerdict } from "../daemon/secret-paths.js";
 import { buildOpencodeEnv, commandlessShellLine, opencodeConfig, opencodeShellEnv, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents, userModelConfig } from "../daemon/providers/opencode/policy.js";
 import { OPENCODE_CREDENTIALS_PROCESS_DIR, OPENCODE_INSTALL_HINT, opencodeCredentialsDir, opencodeDbPath, opencodeSecretLocations, opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
@@ -171,7 +171,7 @@ describe("opencode server lifecycle", () => {
     expect(existsSync(st.env.OPENCODE_CONFIG_DIR)).toBe(true);
   });
 
-  it("runs the server in an empty, read-only directory of its own, outside codeoid's data, removed when it stops", async () => {
+  it("runs the server in an empty, read-only directory alone in a fresh root, removed when it stops", async () => {
     // A shell reaches the server's cwd as /proc/$PPID/cwd, which the gate can't follow (round-19 audit).
     const { server, dir } = makeServer();
     await server.ensure();
@@ -179,17 +179,83 @@ describe("opencode server lifecycle", () => {
     const cwd = server.cwd!;
     expect(realpathSync(st.cwd)).toBe(realpathSync(cwd));
     expect(cwd.startsWith(dir)).toBe(false);
-    expect(dirname(cwd)).toBe(tmpdir());
     expect(readdirSync(cwd)).toEqual([]);
     expect(statSync(cwd).mode & 0o777).toBe(0o500);
+    const root = dirname(cwd);
+    expect(basename(root).startsWith(SERVER_CWD_PREFIX)).toBe(true);
+    expect(readdirSync(root)).toEqual(["cwd"]);
+    expect(statSync(root).mode & 0o777).toBe(0o500);
     // The database's folder, with the credential files and the config, is somewhere else.
     expect(realpathSync(st.cwd)).not.toBe(realpathSync(join(dir, "data", "opencode")));
     await server.stop();
     expect(existsSync(cwd)).toBe(false);
+    expect(existsSync(root)).toBe(false);
     // A restart gets a fresh one.
     await server.ensure();
     expect(server.cwd).not.toBe(cwd);
     expect(readdirSync(server.cwd!)).toEqual([]);
+  });
+
+  it("walking up from the server's cwd to / reaches nothing of codeoid's: not the temp dir its sign-in homes are made in (round-20 audit)", async () => {
+    // An isolated sign-in's home, as backend-login makes it.
+    const login = mkdtempSync(join(tmpdir(), "codeoid-login-"));
+    mkdirSync(join(login, ".claude"));
+    writeFileSync(join(login, ".claude", ".credentials.json"), "{}");
+    const transcripts = join(tmp(), "transcripts");
+    mkdirSync(transcripts);
+    const { server, dir } = makeServer({}, { codeoidPaths: [join(dirname(transcripts), "codeoid.db"), transcripts] });
+    try {
+      await server.ensure();
+      const st = await fakeState(server);
+      const codeoids = [dir, dirname(transcripts), login, join(dir, "data", "opencode", "codeoid-credentials")].map((p) => realpathSync(p));
+      const temp = realpathSync(tmpdir());
+      let at = realpathSync(st.cwd);
+      const seen: string[] = [];
+      for (;;) {
+        seen.push(at);
+        expect(at).not.toBe(temp);
+        for (const c of codeoids) expect(at === c || at.startsWith(`${c}/`) ? `${at} is in ${c}` : "").toBe("");
+        for (const name of readdirSync(at)) {
+          expect(codeoids).not.toContain(join(at, name));
+          // Nothing named codeoid but the server's own root.
+          if (/^\.?codeoid/i.test(name)) expect(name.startsWith(SERVER_CWD_PREFIX)).toBe(true);
+        }
+        if (at === "/") break;
+        at = dirname(at);
+      }
+      expect(seen.length).toBeGreaterThan(2);
+    } finally {
+      rmSync(login, { recursive: true, force: true });
+    }
+  });
+
+  it("makes the server's cwd only where no directory up to / holds codeoid's, else refuses to start", async () => {
+    // The daemon's temp dir holds codeoid's sign-in homes: never a base.
+    expect(leadsToCodeoid(tmpdir(), [])).toContain("the daemon's temp dir");
+    const fakeTemp = tmp();
+    const a = realpathSync(tmp());
+    mkdirSync(join(a, ".codeoid"));
+    expect(leadsToCodeoid(a, [], fakeTemp)).toBe(`${a} holds ${join(a, ".codeoid")}`);
+    const c = realpathSync(tmp());
+    expect(leadsToCodeoid(c, [join(c, "codeoid.db")], fakeTemp)).toBe(`${c} holds ${join(c, "codeoid.db")}`);
+    const b = realpathSync(tmp());
+    mkdirSync(join(b, "x"));
+    expect(leadsToCodeoid(join(b, "x"), [b], fakeTemp)).toBe(`${join(b, "x")} is inside ${b}`);
+    expect(leadsToCodeoid(join(b, "nope"), [], fakeTemp)).toBe("doesn't exist");
+    // Another server's root is no bar: the walk goes on up (to the temp dir, which holds these tests' codeoid-oc-…).
+    const clean = realpathSync(tmp());
+    mkdirSync(join(clean, `${SERVER_CWD_PREFIX}other`));
+    expect(leadsToCodeoid(clean, [], fakeTemp)?.startsWith(`${clean} `)).toBe(false);
+    // Every base leads to codeoid's: the server isn't started.
+    const refused = makeServer({}, { cwdBases: [a, join(b, "nope"), tmpdir(), clean] });
+    await expect(refused.server.ensure()).rejects.toThrow(/no directory to run opencode's server in that leads to nothing of codeoid's/);
+    expect(existsSync(refused.starts)).toBe(false);
+    expect(readdirSync(a)).toEqual([".codeoid"]);
+    // A later base that leads nowhere is taken.
+    const { server } = makeServer({}, { cwdBases: [a, ...SERVER_CWD_BASES] });
+    await server.ensure();
+    expect(server.cwd!.startsWith(a)).toBe(false);
+    expect(leadsToCodeoid(dirname(dirname(server.cwd!)), [])).toBeNull();
   });
 
   it("takes only the provider and model keys of the user's own global opencode config", async () => {

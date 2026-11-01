@@ -84,8 +84,8 @@
  *       `provider.transport` error and no status; nothing was sent, so the failed turn is opencode's $0, not unknown (~90s)
  *   I54 (scripted only) a response that broke off after part of an answer (a stream ended without finish_reason, a reset mid-body):
  *       opencode fails the step with the response's 200 and retries; that request was served, so the turn's cost is unknown
- *   I55 (scripted only) the server runs in an empty, read-only directory of its own, outside codeoid's data: a shell's
- *       `/proc/$PPID/cwd` lists nothing, not the credential files, database or config beside the database
+ *   I55 (scripted only) the server runs in an empty, read-only directory alone in a fresh root, outside codeoid's data and
+ *       temp dir: a shell's `/proc/$PPID/cwd` lists nothing, and no directory above it up to / holds anything of codeoid's
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -2132,11 +2132,15 @@ describe("opencode (real binary)", () => {
     }
   }, 240_000);
 
-  maybeScripted("I55 the server runs in an empty directory of its own: a shell's /proc/$PPID/cwd leads to nothing of codeoid's", async () => {
-    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-cwd-it-")));
+  maybeScripted("I55 the server runs in an empty directory alone in a fresh root: walking up from a shell's /proc/$PPID/cwd to / reaches nothing of codeoid's", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-walk-it-")));
     const dbDir = join(root, "data", "opencode");
     const work = join(root, "work");
     mkdirSync(work);
+    // An isolated sign-in's home, in the daemon's temp dir as backend-login makes it (round-20 audit).
+    const login = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-login-")));
+    mkdirSync(join(login, ".claude"));
+    writeFileSync(join(login, ".claude", ".credentials.json"), "{}");
     const own = new OpencodeServer({
       command: resolved!.command,
       argsPrefix: resolved!.argsPrefix,
@@ -2148,30 +2152,48 @@ describe("opencode (real binary)", () => {
       credentials: () => ({ env: { ANTHROPIC_API_KEY: "sk-ant-it-cwd" } }),
     });
     try {
+      await own.ensure();
+      const cwd = own.cwd!;
+      const depth = cwd.split("/").filter(Boolean).length;
       const p = new OpencodeProvider({ sessionId: "it-cwd", initialBackingId: "it-cwd", server: own, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
-      // Only reads where the link leads and lists it.
-      const command = 'readlink /proc/$PPID/cwd; echo "--"; ls -A /proc/$PPID/cwd; echo "--"';
+      // Only reads where the link leads and lists it, then each directory above it up to /.
+      const levels = Array.from({ length: depth + 1 }, (_, i) => `ls -A /proc/$PPID/cwd${"/..".repeat(i)}; echo "--"`);
+      const command = ['readlink /proc/$PPID/cwd; echo "--"', ...levels].join("; ");
       const events = await collect(p.runTurn(opts(`[[tool:shell ${JSON.stringify({ command, description: "x" })}]]`, { workdir: work })));
       expect(events.find((e) => e.type === "error")).toBeUndefined();
       const out = (events.find((e) => e.type === "tool_complete") as Extract<ProviderEvent, { type: "tool_complete" }> | undefined)?.output ?? "";
-      const [target, listing] = out.split("--\n");
-      const cwd = own.cwd!;
+      const [target, ...listings] = out.split("--\n");
       expect(target?.trim()).toBe(cwd);
-      // Not the database's folder, nor anywhere under the run's data...
+      // Not the database's folder, nor anywhere under the run's data, nor the temp dir.
       expect(cwd.startsWith(root)).toBe(false);
-      expect(dirname(cwd)).toBe(realpathSync(tmpdir()));
-      // ...and it holds nothing, though the credential files and the database exist beside the database.
-      expect(listing?.trim()).toBe("");
+      expect(dirname(cwd).startsWith(realpathSync(tmpdir()))).toBe(false);
+      // It holds nothing, its root only it, though the credential files and the database exist beside the database...
+      expect(listings[0]?.trim()).toBe("");
+      expect(listings[1]?.trim()).toBe("cwd");
       expect(readdirSync(dbDir)).toEqual(expect.arrayContaining(["codeoid-credentials", "config", "opencode.db"]));
-      expect(readdirSync(cwd)).toEqual([]);
+      // ...and no directory above holds anything of codeoid's: not the run's data, not the sign-in home.
+      expect(listings.length).toBe(depth + 2);
+      let at = cwd;
+      for (const listing of listings.slice(0, depth + 1)) {
+        expect(at).not.toBe(realpathSync(tmpdir()));
+        const names = listing.split("\n").filter(Boolean);
+        expect([...names].sort()).toEqual(readdirSync(at).sort());
+        for (const name of names) {
+          expect([root, login, getConfigDir()]).not.toContain(join(at, name));
+          if (/^\.?codeoid/i.test(name)) expect(name.startsWith("codeoid-ocserver-")).toBe(true);
+        }
+        at = dirname(at);
+      }
       expect(statSync(cwd).mode & 0o777).toBe(0o500);
       await p.teardown();
       await own.stop();
-      // Gone with the server.
+      // Gone with the server, root and all.
       expect(existsSync(cwd)).toBe(false);
+      expect(existsSync(dirname(cwd))).toBe(false);
     } finally {
       await own.stop();
       rmSync(root, { recursive: true, force: true });
+      rmSync(login, { recursive: true, force: true });
     }
   }, 180_000);
 
