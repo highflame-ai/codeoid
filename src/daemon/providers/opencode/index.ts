@@ -77,7 +77,7 @@ import {
   type OcTokenUsage,
 } from "./client.js";
 import { commandlessShellLine, fetchFence, fetchOrigin, mcpNamespace, opencodeShellEnv, ownMountPrefix, runnableCommand, sessionRules } from "./policy.js";
-import type { OpencodeConnection, OpencodeServer } from "./server.js";
+import { mercurialCheckout, type OpencodeConnection, type OpencodeServer } from "./server.js";
 import {
   type OcToolCall,
   callInput,
@@ -1083,6 +1083,12 @@ export class OpencodeProvider implements SessionProvider {
       this.#detachSession();
       if (this.#pendingHistorySeed === null) this.onHistoryLost?.();
     }
+    // opencode runs hg unasked in a location under a `.hg`, as its first
+    // request naming it is served: an hg that would read the repository's
+    // `.hg/hgrc` (hooks, extensions) never gets that far.
+    const hg = this.#server.mercurial;
+    const checkout = hg ? mercurialCheckout(workdir) : null;
+    if (hg && checkout) throw new Error(`opencode would run Mercurial in ${checkout} without asking, and ${hg} — refusing this workdir on the opencode backend`);
     // A session opened here got its rules as it opened (#openSession).
     const fresh = !this.#ses;
     if (fresh) {

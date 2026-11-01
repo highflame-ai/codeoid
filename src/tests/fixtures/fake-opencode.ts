@@ -165,6 +165,9 @@
  * (a prompt that starts an execution is admitted that long after it arrives,
  * as a loaded server stores one: an interrupt meanwhile finds nothing running).
  *
+ * A location first loaded under a repository has its version control run
+ * unasked, with the server's environment, as real 2.2.5 does (`loadVcs`).
+ *
  * A fork keeps its source's directory, as real 2.2.5's does; `POST
  * …/move` rebinds a session to another (one that exists).
  * `GET /__fake/state` (test-only, no auth) returns everything recorded;
@@ -176,7 +179,7 @@
 
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 const password = process.env.OPENCODE_PASSWORD ?? "";
 const version = process.env.FAKE_OPENCODE_VERSION ?? "2.2.5";
@@ -1426,8 +1429,40 @@ async function startExecution(ses: Ses, text: string, inboxID?: string): Promise
 const TAIL_UP_MS = 100;
 const TAIL_NEXT_START_MS = 1_000;
 
+/** Locations whose version control was looked at (once each, as 2.2.5 caches a project). */
+const vcsLoaded = new Set<string>();
+
+/**
+ * What real 2.2.5 runs, unasked, in a location it loads under a repository
+ * (`Project.root`: the first directory up holding a `.git` or `.hg`): git's
+ * repo discovery, or hg's project id and — unless `opencode.vcs.hg` is
+ * disabled — the hg plugin's branch. The `git`/`hg` on the server's PATH,
+ * with its environment (`extendEnv`), hg's with `HGPLAIN=1` over it.
+ */
+function loadVcs(directory: string): void {
+  if (vcsLoaded.has(directory)) return;
+  vcsLoaded.add(directory);
+  const run = (cmd: string, args: string[], cwd: string, extra: Record<string, string> = {}) => {
+    const bin = Bun.which(cmd, { PATH: process.env.PATH ?? "" });
+    if (bin) Bun.spawnSync([bin, ...args], { cwd, env: { ...process.env, ...extra }, stdin: "ignore", timeout: 10_000 });
+  };
+  for (let at = directory; ; at = dirname(at)) {
+    if (existsSync(join(at, ".git"))) {
+      run("git", ["rev-parse", "--git-dir", "--git-common-dir", "--show-toplevel"], at);
+      return;
+    }
+    if (existsSync(join(at, ".hg"))) {
+      run("hg", ["log", "-r", "roots(all())", "-T", "{node}\n"], at, { HGPLAIN: "1" });
+      if (!((config.plugins as string[] | undefined) ?? []).includes("-opencode.vcs.hg")) run("hg", ["branch"], at, { HGPLAIN: "1" });
+      return;
+    }
+    if (dirname(at) === at) return;
+  }
+}
+
 function createSession(input: { directory: string; permissions?: Json[]; agent?: string; model?: Json; parentID?: string; title?: string }): Ses {
   if (!(input.directory in state.providersAt)) state.providersAt[input.directory] = readConfig(input.directory).providers ?? null;
+  loadVcs(input.directory);
   const parent = input.parentID ? sessions.get(input.parentID) : undefined;
   const ses: Ses = {
     id: nextId("ses"),

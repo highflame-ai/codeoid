@@ -350,7 +350,7 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
 - **One private server per daemon** (`OpencodeServer`, server.ts): started by
   the first opencode session's first turn, shared, restarted on next use if it
   died, stopped by the `opencode` shutdown step (a start in flight gives up, its
-  key files removed) and by opencode itself when codeoid's stdin pipe closes. Loopback, fresh password per start, run in an empty read-only dir alone in a fresh root, made where no dir up to `/` holds anything of codeoid's (`opencodeServerCwd`, `leadsToCodeoid`: never the daemon's temp dir, which holds sign-in homes, or a dir holding it at any depth but `/`, nor beside the database; none such: not started), since `/proc/$PPID/cwd/..…` reaches each of them, database
+  key files removed) and by opencode itself when codeoid's stdin pipe closes. Loopback, fresh password per start, run in an empty read-only dir alone in a fresh root, made where no dir up to `/` holds anything of codeoid's (`opencodeServerCwd`, `leadsToCodeoid`: never the daemon's temp dir, which holds sign-in homes, or a dir holding it at any depth but `/`, nor below a `.git`/`.hg`, nor beside the database; none such: not started), since `/proc/$PPID/cwd/..…` reaches each of them, database
   `providers.opencode.dbPath` (default beside codeoid's `dbPath`), logs, state,
   caches and temp files in `providers.opencode.dataDir` (its XDG dirs and
   `TMPDIR`; default beside `transcriptDir`). The version
@@ -407,6 +407,15 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   model keys and injected config never reach it. The server's own `SHELL`,
   which opencode runs every line with (any but fish and nu), is pinned to
   bash (`opencodeServerShell`: absolute `PATH` entries only), the shell #431 judges lines as.
+- **Version control** opencode runs unasked (repo discovery, snapshots,
+  `hg log` for a project id) runs none of a repository's code: the server's
+  environment gives every git `OPENCODE_GIT_OVERRIDES` through
+  `GIT_CONFIG_COUNT` plus `OPENCODE_GIT_ENV` (no transport, no lazy fetch),
+  and every hg `OPENCODE_HG_ENV` (`HGRCSKIPREPO`, empty `HGRCPATH`); the hg
+  plugin is disabled. A workdir under a `.hg` is refused when the server's
+  hg is older than 5.4 or won't say (`mercurialProblem`, `mercurialCheckout`).
+  Filter/textconv drivers can't be overridden by name; 2.2.5 applies none
+  unasked. A session's shell has its own environment, so none of it.
 - **Paths** (translate.ts): every path a call names (cards, the secret-path
   gate's input, a shell's workdir, directory cards) is judged by one rule,
   `realTarget`: resolved as the kernel does in opencode's process, one

@@ -52,7 +52,7 @@ import { OPENCODE_MODEL_ID } from "../../../config.js";
 import type { OcAgentInfo, OcPluginInfo, OcRule } from "./client.js";
 
 /** Plugins whose tools act without asking — disabled (`-<id>`, opencode's plugin control). */
-export const DISABLED_PLUGINS = ["-opencode.tools", "-opencode.tool.schedule"] as const;
+export const DISABLED_PLUGINS = ["-opencode.tools", "-opencode.tool.schedule", "-opencode.vcs.hg"] as const;
 
 /** Prefix of every MCP server codeoid mounts on opencode (`coid<session>_<name>`). */
 export const MCP_MOUNT_PREFIX = "coid";
@@ -636,6 +636,64 @@ export function opencodeServerShell(path: string | undefined = process.env.PATH)
   return found && isAbsolute(found) ? found : "/bin/sh";
 }
 
+/**
+ * git config every git opencode runs on its own gets (`GIT_CONFIG_COUNT`,
+ * which outranks the repository's config): opencode reads a workspace's repo
+ * unasked (`rev-parse`, `remote get-url`, `rev-list`, `check-ignore`, …) and
+ * snapshots it into a gitdir of its own, and a repo's config can make git run
+ * a command. Hooks, fsmonitor and an external diff are off, nothing is
+ * signed or shows a signature, no submodule is recursed into, and a bare
+ * repository is used only when named. With {@link OPENCODE_GIT_ENV}: no
+ * transport at all, so no `core.sshCommand`, `ext::` remote, credential
+ * helper or promisor fetch is reached. Filter and textconv drivers are
+ * defined by name, so can't be shut off here: opencode 2.2.5 runs no command
+ * on a workspace's own repo that applies them.
+ */
+export const OPENCODE_GIT_OVERRIDES: ReadonlyArray<readonly [string, string]> = [
+  ["core.hooksPath", "/dev/null"],
+  ["core.fsmonitor", "false"],
+  ["core.untrackedCache", "false"],
+  ["diff.external", ""],
+  ["commit.gpgSign", "false"],
+  ["tag.gpgSign", "false"],
+  ["log.showSignature", "false"],
+  ["submodule.recurse", "false"],
+  ["safe.bareRepository", "explicit"],
+];
+
+/** The rest of what git opencode runs on its own gets: no transport, no lazy fetch, no prompt, no pager. */
+export const OPENCODE_GIT_ENV: Readonly<Record<string, string>> = {
+  GIT_ALLOW_PROTOCOL: "none",
+  GIT_NO_LAZY_FETCH: "1",
+  GIT_TERMINAL_PROMPT: "0",
+  GIT_PAGER: "cat",
+};
+
+/**
+ * What Mercurial opencode runs on its own gets: opencode 2.2.5 runs
+ * `hg log -r roots(all())` in every location under a `.hg` (its project id;
+ * its `opencode.vcs.hg` plugin, which runs more, is disabled), and hg reads
+ * the repository's `.hg/hgrc` for every command, whose `[hooks]` and
+ * `[extensions]` run code. No repository hgrc (`HGRCSKIPREPO`, Mercurial
+ * 5.4+: an older one is refused, server.ts `mercurialProblem`), no user or
+ * system one either (`HGRCPATH` empty), plain output.
+ */
+export const OPENCODE_HG_ENV: Readonly<Record<string, string>> = {
+  HGRCSKIPREPO: "1",
+  HGRCPATH: "",
+  HGPLAIN: "1",
+};
+
+/** {@link OPENCODE_GIT_OVERRIDES} as git's environment keys. */
+export function gitOverrideEnv(overrides: ReadonlyArray<readonly [string, string]> = OPENCODE_GIT_OVERRIDES): Record<string, string> {
+  const env: Record<string, string> = { GIT_CONFIG_COUNT: String(overrides.length) };
+  overrides.forEach(([k, v], i) => {
+    env[`GIT_CONFIG_KEY_${i}`] = k;
+    env[`GIT_CONFIG_VALUE_${i}`] = v;
+  });
+  return env;
+}
+
 /** The server's own settings, set last over {@link buildOpencodeEnv}. */
 export function serverEnv(opts: { password: string; dbPath: string; configDir: string; dataDir: string; config: Record<string, unknown>; shell?: string }): Record<string, string> {
   return {
@@ -656,6 +714,12 @@ export function serverEnv(opts: { password: string; dbPath: string; configDir: s
     // never sees; codeoid's own Claude-side settings aren't opencode's.
     OPENCODE_DISABLE_PROJECT_CONFIG: "1",
     OPENCODE_DISABLE_CLAUDE_CODE: "1",
+    // The version control opencode runs unasked in a workspace runs none of
+    // the repository's code. A session's shell has its own environment
+    // (opencodeShellEnv): git and hg the user approves there behave as theirs.
+    ...gitOverrideEnv(),
+    ...OPENCODE_GIT_ENV,
+    ...OPENCODE_HG_ENV,
   };
 }
 

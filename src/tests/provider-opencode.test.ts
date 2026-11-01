@@ -30,14 +30,15 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
-import { leadsToCodeoid, OpencodeServer, OpencodeIncompatibleError, SERVER_CWD_BASES, SERVER_CWD_PREFIX, stopOpencodeServers } from "../daemon/providers/opencode/server.js";
+import { leadsToCodeoid, MERCURIAL_FLOOR, mercurialCheckout, mercurialProblem, OpencodeServer, OpencodeIncompatibleError, SERVER_CWD_BASES, SERVER_CWD_PREFIX, stopOpencodeServers } from "../daemon/providers/opencode/server.js";
 import { secretPathVerdict } from "../daemon/secret-paths.js";
-import { buildOpencodeEnv, commandlessShellLine, opencodeConfig, opencodeShellEnv, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents, userModelConfig } from "../daemon/providers/opencode/policy.js";
+import { buildOpencodeEnv, commandlessShellLine, serverEnv, opencodeConfig, opencodeShellEnv, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents, userModelConfig } from "../daemon/providers/opencode/policy.js";
 import { OPENCODE_CREDENTIALS_PROCESS_DIR, OPENCODE_INSTALL_HINT, opencodeCredentialsDir, opencodeDbPath, opencodeSecretLocations, opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
 import { effortOfVariant, gateCallFor, parseModelValue, realTarget } from "../daemon/providers/opencode/translate.js";
 import { OpencodeClient, parseSse } from "../daemon/providers/opencode/client.js";
 import { clearStaleOpencodeCredentials } from "../daemon/providers/opencode/credentials.js";
 import { createDefaultProviderRegistry } from "../daemon/providers/registry.js";
+import { GIT_BIN } from "../daemon/git-env.js";
 import { AccountStore } from "../daemon/accounts.js";
 import { BUDGET_STOP_MESSAGE, UNPRICED_STOP_MESSAGE, type ProviderEvent, type ToolApprovalFn, type TurnOpts, type TurnRun, type UiRequest, type UiResponse } from "../daemon/providers/interface.js";
 import { MemoryMcpHttp } from "../daemon/memory/mcp-http.js";
@@ -164,7 +165,7 @@ describe("opencode server lifecycle", () => {
       { action: "execute", resource: "*", effect: "deny" },
       { action: "browser", resource: "*", effect: "deny" },
     ]);
-    expect(st.config.plugins).toEqual(["-opencode.tools", "-opencode.tool.schedule"]);
+    expect(st.config.plugins).toEqual(["-opencode.tools", "-opencode.tool.schedule", "-opencode.vcs.hg"]);
     expect(st.config.update).toBe("disable");
     // Its global config dir is codeoid's, not the user's ~/.config/opencode.
     expect(st.env.OPENCODE_CONFIG_DIR).toBe(join(dir, "data", "opencode", "config"));
@@ -265,6 +266,146 @@ describe("opencode server lifecycle", () => {
     expect(leadsToCodeoid(dirname(dirname(server.cwd!)), [])).toBeNull();
   });
 
+  it("never makes the server's cwd where a directory above it holds a repository: opencode runs its version control there", () => {
+    const fakeTemp = tmp();
+    for (const repo of [".git", ".hg"]) {
+      const base = realpathSync(tmp());
+      mkdirSync(join(base, repo));
+      mkdirSync(join(base, "below"));
+      expect(leadsToCodeoid(join(base, "below"), [], fakeTemp)).toBe(`${base} holds a repository, ${join(base, repo)}`);
+    }
+  });
+
+  /** A marker `git`/`hg` first on the server's PATH: logs `name|cwd|args|env` (its GIT_ and HG variables), then git runs the real one; hg says `version` (if given) or nothing, and fails otherwise. */
+  function vcsMarkers(hgVersion?: string): { bin: string; log: string; calls: () => string[] } {
+    const bin = tmp();
+    const log = join(bin, "calls.log");
+    // One write per line: gits opencode runs side by side append at once.
+    const record = `line="$(basename "$0")|$PWD|$(printf '%s ' "$@" | tr '\\n' ' ')|$(env | grep -E '^(GIT_|HG)' | sort | tr '\\n' ' ')"; printf '%s\\n' "$line" >> '${log}'\n`;
+    writeFileSync(join(bin, "git"), `#!/bin/sh\n${record}exec '${GIT_BIN}' "$@"\n`, { mode: 0o755 });
+    const version = hgVersion ? `if [ "$1" = --version ]; then echo 'Mercurial Distributed SCM (version ${hgVersion})'; exit 0; fi\n` : "";
+    writeFileSync(join(bin, "hg"), `#!/bin/sh\n${record}${version}exit 1\n`, { mode: 0o755 });
+    return { bin, log, calls: () => (existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : []) };
+  }
+
+  it("the git opencode runs on its own in a workspace gets overrides that keep the repository's config from running anything", async () => {
+    const m = vcsMarkers();
+    const { server } = makeServer({}, { env: () => ({ ...buildOpencodeEnv(), PATH: `${m.bin}:${process.env.PATH}`, FAKE_OPENCODE_STARTS: "/dev/null" }) });
+    const ws = realpathSync(tmp());
+    mkdirSync(join(ws, ".git"));
+    const events = await collect(makeProvider(server).runTurn(opts("hi", { workdir: ws })));
+    expect(done(events)).toBeTruthy();
+    const git = m.calls().filter((l) => l.startsWith("git|"));
+    expect(git.length).toBeGreaterThan(0);
+    for (const line of git) {
+      const env = line.split("|")[3]!;
+      for (const want of [
+        "GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_VALUE_0=/dev/null", "GIT_CONFIG_KEY_1=core.fsmonitor", "GIT_CONFIG_VALUE_1=false",
+        "GIT_ALLOW_PROTOCOL=none", "GIT_NO_LAZY_FETCH=1", "GIT_TERMINAL_PROMPT=0",
+      ]) {
+        expect(env).toContain(want);
+      }
+    }
+  });
+
+  it("hg opencode runs on its own skips the repository's hgrc, and opencode's hg plugin is off", async () => {
+    const m = vcsMarkers("6.8.1");
+    const { server } = makeServer({}, { env: () => ({ ...buildOpencodeEnv(), PATH: `${m.bin}:${process.env.PATH}` }) });
+    const ws = realpathSync(tmp());
+    mkdirSync(join(ws, ".hg"));
+    const events = await collect(makeProvider(server).runTurn(opts("hi", { workdir: ws })));
+    expect(done(events)).toBeTruthy();
+    const inWs = m.calls().filter((l) => l.startsWith(`hg|${ws}|`));
+    // The project id's `hg log` only: the plugin's `hg branch` doesn't run.
+    expect(inWs.map((l) => l.split("|")[2]!.split(" ")[0])).toEqual(["log"]);
+    expect(inWs[0]).toContain("HGRCSKIPREPO=1");
+    expect(inWs[0]).toContain("HGRCPATH= ");
+    expect(inWs[0]).toContain("HGPLAIN=1");
+  });
+
+  it("refuses a workdir under a .hg when the server's hg can't skip a repository's hgrc, before opencode runs hg there", async () => {
+    for (const version of ["5.3.1", undefined]) {
+      const m = vcsMarkers(version);
+      const { server } = makeServer({}, { env: () => ({ ...buildOpencodeEnv(), PATH: `${m.bin}:${process.env.PATH}` }) });
+      const ws = realpathSync(tmp());
+      mkdirSync(join(ws, ".hg"));
+      mkdirSync(join(ws, "sub"));
+      const events = await collect(makeProvider(server).runTurn(opts("hi", { workdir: join(ws, "sub") })));
+      expect(events.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining(`opencode would run Mercurial in ${ws} without asking`) });
+      // Only codeoid's own `hg --version`, in the server's empty cwd: nothing in the checkout.
+      expect(m.calls().map((l) => l.split("|").slice(0, 3).join("|"))).toEqual([`hg|${server.cwd}|--version --quiet `]);
+      // A workdir outside any checkout still works on that server.
+      const plain = realpathSync(tmp());
+      expect(done(await collect(makeProvider(server, { sessionId: "sess-2" }).runTurn(opts("hi", { workdir: plain }))))).toBeTruthy();
+    }
+  });
+
+  it("judges the server's hg by its own version, failing closed", async () => {
+    const cwd = tmp();
+    expect(await mercurialProblem("/nonexistent-dir", cwd)).toBeNull();
+    expect(await mercurialProblem(vcsMarkers("6.8.1").bin, cwd)).toBeNull();
+    expect(await mercurialProblem(vcsMarkers(MERCURIAL_FLOOR.join(".")).bin, cwd)).toBeNull();
+    expect(await mercurialProblem(vcsMarkers("5.3.1").bin, cwd)).toContain("is 5.3: before 5.4");
+    expect(await mercurialProblem(vcsMarkers("4.9").bin, cwd)).toContain("is 4.9");
+    expect(await mercurialProblem(vcsMarkers().bin, cwd)).toContain("didn't say its version");
+    const ws = realpathSync(tmp());
+    mkdirSync(join(ws, ".hg"));
+    mkdirSync(join(ws, "a", "b"), { recursive: true });
+    expect(mercurialCheckout(join(ws, "a", "b"))).toBe(ws);
+    expect(mercurialCheckout(tmp())).toBeNull();
+    // Through a link: opencode looks up from the path as written too.
+    const link = join(tmp(), "link");
+    symlinkSync(join(ws, "a"), link);
+    expect(mercurialCheckout(link)).toBe(ws);
+  });
+
+  it("the server's git overrides keep a hostile repository's config from running anything, on the real git", () => {
+    const home = tmp();
+    const marks = join(home, "marks.log");
+    const mark = join(home, "mark");
+    writeFileSync(mark, `#!/bin/sh\nprintf '%s %s\\n' "$(basename "$0")" "$1" >> '${marks}'\nexit 0\n`, { mode: 0o755 });
+    const repo = tmp();
+    const git = (env: Record<string, string>, ...args: string[]) => Bun.spawnSync([GIT_BIN, ...args], { cwd: repo, env: { PATH: process.env.PATH ?? "", HOME: home, GIT_CONFIG_NOSYSTEM: "1", ...env }, stdin: "ignore", timeout: 10_000 });
+    git({}, "init", "-q", "-b", "main");
+    git({}, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "init");
+    writeFileSync(join(repo, "a.txt"), "one\n");
+    git({}, "add", "a.txt");
+    git({}, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "a");
+    const hooks = join(repo, ".git", "evil-hooks");
+    mkdirSync(hooks);
+    // gpg.program is run as a file, not a shell line.
+    symlinkSync(mark, join(home, "gpg-mark"));
+    for (const h of ["pre-commit", "commit-msg", "post-commit", "post-index-change", "reference-transaction"]) symlinkSync(mark, join(hooks, h));
+    writeFileSync(
+      join(repo, ".git", "config"),
+      readFileSync(join(repo, ".git", "config"), "utf8") +
+        [
+          "[core]", `\tfsmonitor = ${mark} fsmonitor`, `\thooksPath = ${hooks}`, `\tsshCommand = ${mark} ssh`,
+          "[diff]", `\texternal = ${mark} diff.external`,
+          "[commit]", "\tgpgSign = true", "[gpg]", `\tprogram = ${join(home, "gpg-mark")}`,
+          "[protocol]", "\tallow = always", '[remote "origin"]', `\turl = ext::${mark} ext-transport`, "",
+        ].join("\n"),
+    );
+    const ran = () => (existsSync(marks) ? readFileSync(marks, "utf8").trim().split("\n").map((l) => l.trim()) : []);
+    const exercise = (env: Record<string, string>) => {
+      writeFileSync(join(repo, "a.txt"), `${Math.random()}\n`);
+      git(env, "status");
+      git(env, "diff");
+      git(env, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "x");
+      git(env, "fetch", "-q", "origin");
+    };
+    // The repository's config runs its commands for plain git.
+    exercise({});
+    const control = ran();
+    for (const tag of ["fsmonitor", "diff.external", "ext-transport"]) expect(control).toContain(`mark ${tag}`);
+    for (const ran of ["pre-commit", "commit-msg", "post-index-change", "gpg-mark"]) expect(control.some((l) => l.startsWith(`${ran} `) || l === ran)).toBe(true);
+    rmSync(marks);
+    // With what the server's environment gives every git opencode runs: nothing.
+    const env = serverEnv({ password: "x", dbPath: "/x/db", configDir: "/x/c", dataDir: "/x/d", config: {} });
+    exercise(Object.fromEntries(Object.entries(env).filter(([k]) => k.startsWith("GIT_"))));
+    expect(ran()).toEqual([]);
+  });
+
   it("takes only the provider and model keys of the user's own global opencode config", async () => {
     const user = tmp();
     writeFileSync(
@@ -294,7 +435,7 @@ describe("opencode server lifecycle", () => {
     // `{file:…}` works instead).
     expect(st.configText).not.toContain("{env:");
     expect(st.config.providers).toEqual({ scripted: { name: "codeoid's" } });
-    expect(st.config.plugins).toEqual(["-opencode.tools", "-opencode.tool.schedule"]);
+    expect(st.config.plugins).toEqual(["-opencode.tools", "-opencode.tool.schedule", "-opencode.vcs.hg"]);
     expect(st.config.permissions).toEqual(opencodeConfig().permissions);
     expect(st.config.agents).toBeUndefined();
     expect(st.config.mcp).toBeUndefined();

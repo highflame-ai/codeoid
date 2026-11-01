@@ -90,6 +90,10 @@
  *       through the server's environment (which every process opencode starts inherits)
  *   I57 (scripted only) an interrupt that lands as the prompt is stored: opencode sends the step's request but shows only
  *       the execution's start and interruption, no step; the turn's cost is unknown, never a known $0
+ *   I58 (scripted only) the version control opencode runs unasked in a workspace runs none of the repository's code: every git
+ *       it runs gets codeoid's overrides (a hostile .git/config's fsmonitor, hooks, diff, filter, signing and ext:: remote run
+ *       nothing), hg skips the repository's hgrc and its plugin is off, a workdir under a .hg is refused when the hg can't
+ *       skip it, and a session's own shell has none of it
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -97,6 +101,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpath
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { type CodeoidConfig, getConfigDir, loadConfig } from "../config.js";
+import { GIT_BIN } from "../daemon/git-env.js";
 import { opencodeCredentialInputs } from "../daemon/providers/opencode/credentials.js";
 import { OpencodeClient } from "../daemon/providers/opencode/client.js";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
@@ -2325,6 +2330,113 @@ describe("opencode (real binary)", () => {
       OpencodeClient.prototype.prompt = prompt;
       await own.stop();
       logged.kill();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 240_000);
+
+  maybeScripted("I58 the version control opencode runs unasked in a workspace runs none of the repository's code", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-vcs-")));
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const calls = join(root, "calls.log");
+    const marks = join(root, "marks.log");
+    // Marker tools: they only record. git then runs the real one; hg says the version in hg-version, else fails.
+    // One write per line: gits opencode runs side by side append at once.
+    const record = `line="$(basename "$0")|$PWD|$(printf '%s ' "$@" | tr '\\n' ' ')|$(env | grep -E '^(GIT_|HG)' | sort | tr '\\n' ' ')"; printf '%s\\n' "$line" >> '${calls}'\n`;
+    writeFileSync(join(bin, "git"), `#!/bin/sh\n${record}exec '${GIT_BIN}' "$@"\n`, { mode: 0o755 });
+    writeFileSync(join(bin, "hg"), `#!/bin/sh\n${record}v="$(cat '${join(bin, "hg-version")}' 2>/dev/null)"\nif [ "$1" = --version ] && [ -n "$v" ]; then echo "Mercurial Distributed SCM (version $v)"; exit 0; fi\nexit 1\n`, { mode: 0o755 });
+    const mark = join(bin, "mark");
+    writeFileSync(mark, `#!/bin/sh\nprintf '%s %s\\n' "$(basename "$0")" "$1" >> '${marks}'\nexit 0\n`, { mode: 0o755 });
+    symlinkSync(mark, join(bin, "gpg-mark"));
+    // A git checkout whose own config would run `mark` every way it can.
+    const ws = join(root, "ws-git");
+    mkdirSync(ws);
+    const git = (...args: string[]) => Bun.spawnSync([GIT_BIN, ...args], { cwd: ws, env: { PATH: process.env.PATH ?? "", HOME: root, GIT_CONFIG_NOSYSTEM: "1" }, stdin: "ignore", timeout: 10_000 });
+    git("init", "-q", "-b", "main");
+    writeFileSync(join(ws, "a.txt"), "hello\n");
+    writeFileSync(join(ws, ".gitattributes"), "* filter=evil diff=evil\n");
+    git("add", "-A");
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init");
+    const hooks = join(ws, ".git", "evil-hooks");
+    mkdirSync(hooks);
+    for (const h of ["pre-commit", "post-commit", "post-checkout", "post-index-change", "reference-transaction", "pre-auto-gc"]) symlinkSync(mark, join(hooks, h));
+    writeFileSync(join(ws, ".git", "info", "attributes"), "* filter=evil diff=evil\n");
+    writeFileSync(
+      join(ws, ".git", "config"),
+      readFileSync(join(ws, ".git", "config"), "utf8") +
+        [
+          "[core]", `\tfsmonitor = ${mark} fsmonitor`, `\thooksPath = ${hooks}`, `\tsshCommand = ${mark} ssh`, `\tpager = ${mark} pager`,
+          "[diff]", `\texternal = ${mark} diff.external`, '[diff "evil"]', `\ttextconv = ${mark} textconv`,
+          '[filter "evil"]', `\tclean = ${mark} clean`, `\tsmudge = ${mark} smudge`,
+          "[commit]", "\tgpgSign = true", "[log]", "\tshowSignature = true", "[gpg]", `\tprogram = ${join(bin, "gpg-mark")}`,
+          "[protocol]", "\tallow = always", '[remote "origin"]', `\turl = ext::${mark} ext-transport`, "",
+        ].join("\n"),
+    );
+    const lines = () => (existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : []);
+    const own = new OpencodeServer({
+      command: resolved!.command,
+      argsPrefix: resolved!.argsPrefix,
+      dbPath: join(root, "data", "opencode", "opencode.db"),
+      env: () => ({ ...buildOpencodeEnv(), HOME: join(root, "home"), PATH: `${bin}:${process.env.PATH}` }),
+      userConfigDir: null,
+      defaultModel: "scripted/scripted-1",
+      modelProviders,
+    });
+    const make = (id: string) => new OpencodeProvider({ sessionId: id, initialBackingId: id, server: own, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
+    try {
+      const p = make("it-vcs-git");
+      for (const msg of [
+        "[[text:hello]]",
+        `[[tool:write ${JSON.stringify({ path: "new.txt", content: "new\n" })}]]`,
+        `[[tool:edit ${JSON.stringify({ path: "a.txt", oldString: "hello", newString: "bye" })}]]`,
+      ]) {
+        expect(done(await collect(p.runTurn(opts(msg, { workdir: ws }))))).toBeTruthy();
+      }
+      // The session's own shell has none of the server's version-control settings.
+      const shell = await collect(p.runTurn(opts(`[[tool:shell ${JSON.stringify({ command: 'echo "vcs-env[$GIT_CONFIG_COUNT][$GIT_ALLOW_PROTOCOL][$HGRCSKIPREPO]"' })}]]`, { workdir: ws })));
+      expect((shell.find((e) => e.type === "tool_complete") as Extract<ProviderEvent, { type: "tool_complete" }>).output).toContain("vcs-env[][][]");
+      await Bun.sleep(1_000);
+      await p.teardown();
+      const gits = lines().filter((l) => l.startsWith("git|"));
+      // It looked at the workspace's own repo, and snapshotted it.
+      expect(gits.some((l) => l.includes(`|${ws}|rev-parse`))).toBe(true);
+      expect(gits.some((l) => l.includes("--work-tree"))).toBe(true);
+      for (const l of gits) {
+        const env = l.split("|")[3]!;
+        for (const want of ["GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_KEY_1=core.fsmonitor", "GIT_ALLOW_PROTOCOL=none", "GIT_NO_LAZY_FETCH=1"]) expect(env).toContain(want);
+      }
+      expect(existsSync(marks) ? readFileSync(marks, "utf8") : "").toBe("");
+
+      // A Mercurial checkout, with an hg that can skip its hgrc: only the project id's log, with the repository's hgrc skipped.
+      writeFileSync(join(bin, "hg-version"), "6.8.1");
+      await own.stop();
+      const hgWs = join(root, "ws-hg");
+      mkdirSync(join(hgWs, ".hg"), { recursive: true });
+      writeFileSync(join(hgWs, ".hg", "hgrc"), `[hooks]\npre-log = ${mark} hg-pre-log\n`);
+      const ph = make("it-vcs-hg");
+      expect(done(await collect(ph.runTurn(opts("[[text:hello]]", { workdir: hgWs }))))).toBeTruthy();
+      await ph.teardown();
+      const hgs = lines().filter((l) => l.startsWith(`hg|${hgWs}|`));
+      expect(hgs.length).toBeGreaterThan(0);
+      for (const l of hgs) {
+        expect(l.split("|")[2]!.startsWith("log ")).toBe(true);
+        expect(l).toContain("HGRCSKIPREPO=1");
+        expect(l).toContain("HGRCPATH= ");
+      }
+
+      // An hg that doesn't say it can: the workdir is refused before opencode runs hg there.
+      rmSync(join(bin, "hg-version"));
+      await own.stop();
+      const hgWs2 = join(root, "ws-hg2");
+      mkdirSync(join(hgWs2, ".hg"), { recursive: true });
+      const pr = make("it-vcs-hg2");
+      const refused = await collect(pr.runTurn(opts("[[text:hello]]", { workdir: hgWs2 })));
+      expect(refused.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("would run Mercurial") });
+      await pr.teardown();
+      expect(lines().filter((l) => l.startsWith(`hg|${hgWs2}|`))).toEqual([]);
+      expect(existsSync(marks) ? readFileSync(marks, "utf8") : "").toBe("");
+    } finally {
+      await own.stop();
       rmSync(root, { recursive: true, force: true });
     }
   }, 240_000);

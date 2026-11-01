@@ -34,7 +34,7 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmdirSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { getConfigDir, OPENCODE_MODEL_ID } from "../../../config.js";
@@ -47,6 +47,7 @@ import {
   foreignPlugins,
   opencodeConfig,
   opencodeServerDirs,
+  OPENCODE_HG_ENV,
   opencodeServerShell,
   serverEnv,
   unsafeAgents,
@@ -184,6 +185,7 @@ export class OpencodeServer {
   #feedAbort: AbortController | null = null;
   #feedReady: Promise<void> | null = null;
   #home: string | undefined;
+  #mercurial: string | null = null;
 
   constructor(opts: OpencodeServerOptions) {
     this.#opts = opts;
@@ -197,6 +199,11 @@ export class OpencodeServer {
   /** The empty directory the running server was started in. */
   get cwd(): string | undefined {
     return this.#launched?.cwd;
+  }
+
+  /** Why the running server's hg could run a repository's code (`mercurialProblem`), or null. */
+  get mercurial(): string | null {
+    return this.#mercurial;
   }
 
   get running(): boolean {
@@ -388,6 +395,8 @@ export class OpencodeServer {
     );
     let proc: ChildProcessWithoutNullStreams;
     try {
+      // The hg opencode would run in a Mercurial checkout, judged before it can run one.
+      this.#mercurial = await mercurialProblem(env.PATH, cwd);
       proc = spawn(this.#opts.command, [...(this.#opts.argsPrefix ?? []), "serve", "--stdio", "--port", "0", "--hostname", "127.0.0.1"], {
         cwd,
         stdio: ["pipe", "pipe", "pipe"],
@@ -607,8 +616,9 @@ export function opencodeServerCwd(
  * Why `/proc/$PPID/cwd` and its `..`s would reach something of codeoid's
  * from a root made in `base`, or null: some directory from `base` up to `/`
  * is one of `codeoidPaths`, inside one, or holds one; is, is inside or
- * holds (at any depth) the daemon's temp dir; or holds an entry named codeoid (another daemon's temp dirs, a
- * `.codeoid`) other than a server cwd root. One that can't be read or
+ * holds (at any depth) the daemon's temp dir; holds an entry named codeoid (another daemon's temp dirs, a
+ * `.codeoid`) other than a server cwd root; or holds a `.git` or `.hg`
+ * (opencode runs version control in a repository above its cwd). One that can't be read or
  * resolved fails closed.
  */
 export function leadsToCodeoid(base: string, codeoidPaths: readonly string[], tempDir: string = tmpdir()): string | null {
@@ -647,10 +657,65 @@ export function leadsToCodeoid(base: string, codeoidPaths: readonly string[], te
     }
     const named = names.find((n) => /^\.?codeoid/i.test(n) && !n.startsWith(SERVER_CWD_PREFIX));
     if (named) return `${dir} holds ${join(dir, named)}`;
+    // opencode looks up from its own cwd for a repository and runs its
+    // version control there unasked: never in one someone else could make.
+    const repo = names.find((n) => n === ".git" || n === ".hg");
+    if (repo) return `${dir} holds a repository, ${join(dir, repo)}`;
     const up = dirname(dir);
     if (up === dir) return null;
     dir = up;
   }
+}
+
+/** The Mercurial from which a repository's `.hg/hgrc` can be skipped (`HGRCSKIPREPO`, policy.ts `OPENCODE_HG_ENV`). */
+export const MERCURIAL_FLOOR: readonly [number, number] = [5, 4];
+
+/**
+ * Why the `hg` opencode would run (the first on the server's `PATH`) could
+ * still read a repository's `.hg/hgrc`, whose hooks and extensions run code,
+ * or null: none on `PATH`, or one from {@link MERCURIAL_FLOOR} on. Asked of hg
+ * itself (`hg --version`) in the server's empty cwd, reading no config; one
+ * that doesn't say fails closed. A session under a `.hg` is refused on a
+ * server with a problem (index.ts): opencode runs hg there unasked.
+ */
+export async function mercurialProblem(path: string | undefined, cwd: string, timeoutMs = 10_000): Promise<string | null> {
+  const hg = Bun.which("hg", { PATH: path ?? "", cwd });
+  if (!hg) return null;
+  let out = "";
+  try {
+    const proc = Bun.spawn([hg, "--version", "--quiet"], {
+      cwd,
+      env: { PATH: path ?? "", HOME: cwd, ...OPENCODE_HG_ENV },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+      timeout: timeoutMs,
+    });
+    out = await new Response(proc.stdout).text();
+    await proc.exited;
+  } catch {}
+  const m = /version (\d+)\.(\d+)/.exec(out);
+  const [major, minor] = MERCURIAL_FLOOR;
+  if (!m) return `the Mercurial on opencode's PATH (${hg}) didn't say its version, so codeoid can't be sure it skips a repository's .hg/hgrc`;
+  const v = [Number(m[1]), Number(m[2])] as const;
+  if (v[0] > major || (v[0] === major && v[1] >= minor)) return null;
+  return `the Mercurial on opencode's PATH (${hg}) is ${v.join(".")}: before ${major}.${minor} it can't skip a repository's .hg/hgrc, whose hooks would run unasked`;
+}
+
+/** The first directory from `dir` up to `/` holding a `.hg` (where opencode 2.2.5 runs hg unasked), or null. */
+export function mercurialCheckout(dir: string): string | null {
+  let real = resolve(dir);
+  try {
+    real = realpathSync(dir);
+  } catch {}
+  // As written and as resolved: opencode looks up from the one it was given.
+  for (const start of new Set([resolve(dir), real])) {
+    for (let at = start; ; at = dirname(at)) {
+      if (existsSync(join(at, ".hg"))) return at;
+      if (dirname(at) === at) break;
+    }
+  }
+  return null;
 }
 
 function removeServerCwd(cwd: string, root: string): void {
