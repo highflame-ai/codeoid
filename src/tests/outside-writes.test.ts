@@ -618,6 +618,16 @@ describe("autonomous mode asks before a write outside the working directory, at 
     }
   });
 
+  test("round 26: Monitor's command is judged as a shell's; PowerShell's always asks", async () => {
+    const monitor = await gateCall("Monitor", { description: "d", timeout_ms: 1000, command: `echo x >> ${join(elsewhere, "n")}` }, "autonomous");
+    expect(monitor.asked).toBe(true);
+    expect(monitor.card?.risk?.reasons).toContain(`writes outside the working directory: ${join(elsewhere, "n")}`);
+    const watch = await gateCall("Monitor", { description: "d", timeout_ms: 1000, ws: { url: "wss://example.test/feed" } }, "autonomous");
+    expect([watch.asked, watch.behavior]).toEqual([false, "allow"]);
+    const pwsh = await gateCall("PowerShell", { command: "Remove-Item -Recurse C:\\Users" }, "autonomous");
+    expect([pwsh.asked, pwsh.card?.risk?.level]).toEqual([true, "unknown"]);
+  });
+
   test("round 26: a Grep's relative path is judged from the cwd the backend reports, at the session's gate", async () => {
     const moved = join(getConfigDir(), "moved-into");
     const r = await gateCall("Grep", { pattern: "apiKey", path: "../config.json" }, "autonomous", { shellCwd: moved });

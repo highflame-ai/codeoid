@@ -2871,6 +2871,23 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
     await p.teardown();
   });
 
+  it("Monitor's command is a shell command: judged by risk, credential paths and where it writes; a WebSocket watch isn't (round 26)", async () => {
+    await loadShellParser();
+    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => "autonomous" });
+    turnOn(p);
+    const call = (tool_input: unknown) => preToolUseOf()({ hook_event_name: "PreToolUse", tool_name: "Monitor", tool_input, tool_use_id: `tu-${Math.random()}`, cwd: "/tmp" });
+    const outside = join(homedir(), "codeoid-r26-elsewhere", "notes.txt");
+    expect(await call({ description: "d", timeout_ms: 1000, command: `echo pwned >> ${outside}` })).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "ask", permissionDecisionReason: `writes outside the working directory: ${outside}` },
+    });
+    expect(await call({ description: "d", timeout_ms: 1000, command: "echo pwned >> /etc/profile" })).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask", permissionDecisionReason: expect.stringContaining("high risk") } });
+    expect(await call({ description: "d", timeout_ms: 1000, command: `tail -f ${join(getConfigDir(), "config.json")}` })).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(await call({ description: "d", timeout_ms: 1000, command: "tail -f log.txt" })).toEqual({});
+    expect(await call({ description: "d", timeout_ms: 1000, ws: { url: "wss://example.test/feed" } })).toEqual({});
+    openGate();
+    await p.teardown();
+  });
+
   it("a teammate of another team is the parent's on a fork; its own team's are the fork's (L-4)", async () => {
     const { provider } = makeForeignAwareProvider();
     turnOn(provider);

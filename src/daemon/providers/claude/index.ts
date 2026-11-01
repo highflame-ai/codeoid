@@ -51,7 +51,7 @@ import { assessShellCommandSync } from "../../risk/shell-risk.js";
 import { outsideWriteOf, outsideWriteReason } from "../../outside-writes.js";
 import { secretPathVerdict } from "../../secret-paths.js";
 import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "../../fork-isolation.js";
-import { isShellTool, shellCallOf } from "../../shell/tool-call.js";
+import { isShellTool, runsNoCommand, shellCallOf } from "../../shell/tool-call.js";
 import { type AuthContext, EFFORT_LEVELS, type EffortLevel, type SessionMode, SYSTEM_IDENTITY } from "../../../protocol/types.js";
 import type {
   BackendMcpServerState,
@@ -664,7 +664,7 @@ export class ClaudeProvider implements SessionProvider {
     let reason: string;
     try {
       const shell = shellCallOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>);
-      if (!shell && isShellTool(input.tool_name)) {
+      if (!shell && isShellTool(input.tool_name) && !runsNoCommand(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>)) {
         return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: "unknown risk: the shell command in the request can't be read" } };
       }
       if (!shell) return null;

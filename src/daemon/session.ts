@@ -197,7 +197,7 @@ import { type OutsideWrite, outsideWriteOf, outsideWriteReason } from "./outside
 import { outsideEffects } from "./risk/effects.js";
 import { assessShellCommandSync, type ShellRisk, UNREADABLE_SHELL_CALL } from "./risk/shell-risk.js";
 import { loadShellParser, shellParserReady } from "./shell/parse.js";
-import { isShellTool, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
+import { isShellTool, runsNoCommand, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -7395,7 +7395,7 @@ export class Session {
   #shellRisk(toolName: string, input: Record<string, unknown>, shellCwd?: string | null): ShellRisk | null {
     if (isUnresolvedPathTool(toolName)) return this.#unresolvedShellRisk(input);
     const call = shellCallOf(toolName, input);
-    if (!call) return isShellTool(toolName) ? UNREADABLE_SHELL_CALL : null;
+    if (!call) return isShellTool(toolName) && !runsNoCommand(toolName, input) ? UNREADABLE_SHELL_CALL : null;
     // Where the backend reports its shell is (Claude's Bash keeps a `cd`), else the workdir.
     const base = typeof shellCwd === "string" && isAbsolute(shellCwd) ? shellCwd : this.workdir;
     const cwd = call.cwd ? resolvePath(base, call.cwd) : base;
