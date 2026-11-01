@@ -250,6 +250,14 @@ describe("opencode server lifecycle", () => {
     expect(leadsToCodeoid(holder, [], userTmp)).toBe(`${holder} holds the daemon's temp dir ${userTmp}`);
     expect(leadsToCodeoid(join(holder, "a"), [], userTmp)).toBe(`${join(holder, "a")} holds the daemon's temp dir ${userTmp}`);
     expect(leadsToCodeoid(join(userTmp, "codeoid-login-x"), [], userTmp)).toContain("is inside the daemon's temp dir");
+    // So does one holding codeoid's own paths at any depth (dbPath=/var/tmp/<user>/data/codeoid.db), round-22 audit.
+    const deep = realpathSync(tmp());
+    const db = join(deep, "alice", "data", "codeoid.db");
+    const keys = join(deep, "alice", "data", "codeoid-credentials");
+    mkdirSync(keys, { recursive: true });
+    expect(leadsToCodeoid(deep, [db, keys], fakeTemp)).toBe(`${deep} holds ${db}`);
+    expect(leadsToCodeoid(deep, [keys], fakeTemp)).toBe(`${deep} holds ${keys}`);
+    expect(leadsToCodeoid(join(deep, "alice"), [db], fakeTemp)).toBe(`${join(deep, "alice")} holds ${db}`);
     // Another server's root is no bar: the walk goes on up (to the temp dir, which holds these tests' codeoid-oc-…).
     const clean = realpathSync(tmp());
     mkdirSync(join(clean, `${SERVER_CWD_PREFIX}other`));

@@ -615,7 +615,7 @@ export function opencodeServerCwd(
 /**
  * Why `/proc/$PPID/cwd` and its `..`s would reach something of codeoid's
  * from a root made in `base`, or null: some directory from `base` up to `/`
- * is one of `codeoidPaths`, inside one, or holds one; is, is inside or
+ * is one of `codeoidPaths`, inside one, or holds one at any depth; is, is inside or
  * holds (at any depth) the daemon's temp dir; holds an entry named codeoid (another daemon's temp dirs, a
  * `.codeoid`) other than a server cwd root; or holds a `.git` or `.hg`
  * (opencode runs version control in a repository above its cwd). One that can't be read or
@@ -646,7 +646,8 @@ export function leadsToCodeoid(base: string, codeoidPaths: readonly string[], te
     if (dir !== sep && temp.startsWith(`${dir}${sep}`)) return `${dir} holds the daemon's temp dir ${temp}`;
     if (dir.startsWith(`${temp}${sep}`)) return `${dir} is inside the daemon's temp dir ${temp}`;
     for (const p of places) {
-      if (p === dir || dirname(p) === dir) return `${dir} holds ${p}`;
+      // At any depth, as the temp dir (but from `/`, only its own entries).
+      if (p === dir || (dir === sep ? dirname(p) === dir : p.startsWith(`${dir}${sep}`))) return `${dir} holds ${p}`;
       if (dir.startsWith(`${p}${sep}`)) return `${dir} is inside ${p}`;
     }
     let names: string[];
