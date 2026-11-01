@@ -350,7 +350,7 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
 - **One private server per daemon** (`OpencodeServer`, server.ts): started by
   the first opencode session's first turn, shared, restarted on next use if it
   died, stopped by the `opencode` shutdown step (a start in flight gives up, its
-  key files removed) and by opencode itself when codeoid's stdin pipe closes. Loopback, fresh password per start, database
+  key files removed) and by opencode itself when codeoid's stdin pipe closes. Loopback, fresh password per start, run in an empty read-only dir of its own in the daemon's temp dir (`opencodeServerCwd`; never beside the database, which `/proc/$PPID/cwd` would reach), database
   `providers.opencode.dbPath` (default beside codeoid's `dbPath`), logs, state,
   caches and temp files in `providers.opencode.dataDir` (its XDG dirs and
   `TMPDIR`; default beside `transcriptDir`). The version

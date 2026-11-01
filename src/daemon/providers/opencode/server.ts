@@ -34,8 +34,8 @@
 
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { homedir } from "node:os";
+import { chmodSync, mkdirSync, mkdtempSync, rmdirSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { OPENCODE_MODEL_ID } from "../../../config.js";
 import { OpencodeClient, OpencodeHttpError, type OcEvent, type OcRule } from "./client.js";
@@ -151,6 +151,8 @@ interface Launched {
   client: OpencodeClient;
   exited: Promise<void>;
   stderrTail: () => string;
+  /** The empty directory it runs in (`opencodeServerCwd`). */
+  cwd: string;
 }
 
 /** Every server started in this process, so the daemon can stop them on shutdown. */
@@ -185,6 +187,11 @@ export class OpencodeServer {
   /** The running server's pid, when one runs. */
   get pid(): number | undefined {
     return this.#launched?.proc.pid;
+  }
+
+  /** The empty directory the running server was started in. */
+  get cwd(): string | undefined {
+    return this.#launched?.cwd;
   }
 
   get running(): boolean {
@@ -361,12 +368,22 @@ export class OpencodeServer {
       ...serverEnv({ password, dbPath: this.#opts.dbPath, configDir: this.configDir, dataDir: this.dataDir, config, shell: opencodeServerShell(base.PATH) }),
     };
     this.#home = homeOf(env);
-    const proc = spawn(
-      this.#opts.command,
-      [...(this.#opts.argsPrefix ?? []), "serve", "--stdio", "--port", "0", "--hostname", "127.0.0.1"],
-      // Requests name their directory; the server's own cwd is only its default.
-      { cwd: dirname(this.#opts.dbPath), stdio: ["pipe", "pipe", "pipe"], env },
-    );
+    // Requests name their directory; the server's own cwd is only its default.
+    // A shell reaches it as `/proc/$PPID/cwd`, which the gate can't follow, so
+    // it holds nothing and leads nowhere: never the database's folder, beside
+    // the credential files and the config.
+    const cwd = opencodeServerCwd();
+    let proc: ChildProcessWithoutNullStreams;
+    try {
+      proc = spawn(this.#opts.command, [...(this.#opts.argsPrefix ?? []), "serve", "--stdio", "--port", "0", "--hostname", "127.0.0.1"], {
+        cwd,
+        stdio: ["pipe", "pipe", "pipe"],
+        env,
+      });
+    } catch (err) {
+      removeServerCwd(cwd);
+      throw err;
+    }
     this.#launching = proc;
     // A child that dies mid-write must not crash the daemon.
     proc.stdin.on("error", () => {});
@@ -378,7 +395,7 @@ export class OpencodeServer {
     const exited = new Promise<void>((resolve) => {
       proc.once("exit", () => resolve());
       proc.once("error", () => resolve());
-    });
+    }).then(() => removeServerCwd(cwd));
     const url = await new Promise<string>((resolve, reject) => {
       let buf = "";
       const timer = setTimeout(() => fail(new Error(`opencode didn't report its address within ${this.#opts.startTimeoutMs ?? START_TIMEOUT_MS}ms`)), this.#opts.startTimeoutMs ?? START_TIMEOUT_MS);
@@ -422,7 +439,7 @@ export class OpencodeServer {
       });
     });
     const client = new OpencodeClient({ baseUrl: url, password });
-    return { proc, client, exited, stderrTail: () => stderrTail };
+    return { proc, client, exited, stderrTail: () => stderrTail, cwd };
   }
 
   #adopt(launched: Launched): OpencodeConnection {
@@ -516,6 +533,25 @@ async function shutdown(launched: Launched): Promise<void> {
 
 function untrustedPlugins(names: readonly string[]): string {
   return `opencode runs plugins codeoid doesn't know (${names.join(", ")}), which can settle permission requests without asking codeoid — refusing to use this opencode server. Remove them from opencode's system configuration, or from codeoid's own opencode config dir.`;
+}
+
+/**
+ * A fresh, empty directory for a server to run in: made by `mkdtemp` (0700, so
+ * no other user can have planted it), then made read-only so nothing lands in
+ * it. Its parent is the system's temp dir, so `..` from it reaches nothing of
+ * codeoid's either. Removed when the server exits.
+ */
+export function opencodeServerCwd(base: string = tmpdir()): string {
+  const dir = mkdtempSync(join(base, "codeoid-opencode-cwd-"));
+  chmodSync(dir, 0o500);
+  return dir;
+}
+
+function removeServerCwd(dir: string): void {
+  try {
+    // Never recursive: it is only codeoid's while it is empty.
+    rmdirSync(dir);
+  } catch {}
 }
 
 /** opencode's home in an environment: `OPENCODE_TEST_HOME`, else `os.homedir()` (which reads `HOME`). */

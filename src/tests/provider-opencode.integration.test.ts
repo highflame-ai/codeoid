@@ -84,6 +84,8 @@
  *       `provider.transport` error and no status; nothing was sent, so the failed turn is opencode's $0, not unknown (~90s)
  *   I54 (scripted only) a response that broke off after part of an answer (a stream ended without finish_reason, a reset mid-body):
  *       opencode fails the step with the response's 200 and retries; that request was served, so the turn's cost is unknown
+ *   I55 (scripted only) the server runs in an empty, read-only directory of its own, outside codeoid's data: a shell's
+ *       `/proc/$PPID/cwd` lists nothing, not the credential files, database or config beside the database
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -1690,7 +1692,7 @@ describe("opencode (real binary)", () => {
   }, 180_000);
 
   maybeScripted("I44 a workspace symlink to /proc/self/cwd, codeoid started inside the workdir: a read, search or write through it is refused, never a Read on the server's files", async () => {
-    // In codeoid's process the link leads into the workdir; in opencode's, to its own cwd (beside the database).
+    // In codeoid's process the link leads into the workdir; in opencode's, to its own cwd (once beside the database; I55).
     const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-procself-")));
     const work = join(root, "work");
     const decoy = join(dirname(DB), "codeoid-i44-decoy.key");
@@ -1701,7 +1703,7 @@ describe("opencode (real binary)", () => {
     // Round 15: `..` in a link's target is taken physically, after the link (/proc/sys, up to /proc, then self/cwd) …
     symlinkSync("/proc/sys", join(work, "sub"));
     symlinkSync("sub/../self/cwd", join(work, "x"));
-    // … and up out of a link into the server's cwd (its config dir is always there).
+    // … and up out of a link into the server's cwd (refused before opencode follows it, wherever that cwd is).
     mkdirSync(join(dirname(DB), "config"), { recursive: true });
     symlinkSync("/proc/self/cwd/config", join(work, "a"));
     symlinkSync("a/..", join(work, "l"));
@@ -2129,6 +2131,49 @@ describe("opencode (real binary)", () => {
       rmSync(root, { recursive: true, force: true });
     }
   }, 240_000);
+
+  maybeScripted("I55 the server runs in an empty directory of its own: a shell's /proc/$PPID/cwd leads to nothing of codeoid's", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-cwd-it-")));
+    const dbDir = join(root, "data", "opencode");
+    const work = join(root, "work");
+    mkdirSync(work);
+    const own = new OpencodeServer({
+      command: resolved!.command,
+      argsPrefix: resolved!.argsPrefix,
+      dbPath: join(dbDir, "opencode.db"),
+      env: () => ({ ...buildOpencodeEnv(), HOME: join(root, "home") }),
+      userConfigDir: null,
+      modelProviders,
+      defaultModel: "scripted/scripted-1",
+      credentials: () => ({ env: { ANTHROPIC_API_KEY: "sk-ant-it-cwd" } }),
+    });
+    try {
+      const p = new OpencodeProvider({ sessionId: "it-cwd", initialBackingId: "it-cwd", server: own, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
+      // Only reads where the link leads and lists it.
+      const command = 'readlink /proc/$PPID/cwd; echo "--"; ls -A /proc/$PPID/cwd; echo "--"';
+      const events = await collect(p.runTurn(opts(`[[tool:shell ${JSON.stringify({ command, description: "x" })}]]`, { workdir: work })));
+      expect(events.find((e) => e.type === "error")).toBeUndefined();
+      const out = (events.find((e) => e.type === "tool_complete") as Extract<ProviderEvent, { type: "tool_complete" }> | undefined)?.output ?? "";
+      const [target, listing] = out.split("--\n");
+      const cwd = own.cwd!;
+      expect(target?.trim()).toBe(cwd);
+      // Not the database's folder, nor anywhere under the run's data...
+      expect(cwd.startsWith(root)).toBe(false);
+      expect(dirname(cwd)).toBe(realpathSync(tmpdir()));
+      // ...and it holds nothing, though the credential files and the database exist beside the database.
+      expect(listing?.trim()).toBe("");
+      expect(readdirSync(dbDir)).toEqual(expect.arrayContaining(["codeoid-credentials", "config", "opencode.db"]));
+      expect(readdirSync(cwd)).toEqual([]);
+      expect(statSync(cwd).mode & 0o777).toBe(0o500);
+      await p.teardown();
+      await own.stop();
+      // Gone with the server.
+      expect(existsSync(cwd)).toBe(false);
+    } finally {
+      await own.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 180_000);
 
   maybe("I32 the user's own opencode data, state, cache and temp dirs are untouched by the whole run", () => {
     expect(userOpencodeDirs()).toBe(USER_DIRS_BEFORE);

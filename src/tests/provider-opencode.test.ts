@@ -26,9 +26,9 @@
  */
 
 import { afterAll, describe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
 import { OpencodeServer, OpencodeIncompatibleError, stopOpencodeServers } from "../daemon/providers/opencode/server.js";
 import { secretPathVerdict } from "../daemon/secret-paths.js";
@@ -169,6 +169,27 @@ describe("opencode server lifecycle", () => {
     // Its global config dir is codeoid's, not the user's ~/.config/opencode.
     expect(st.env.OPENCODE_CONFIG_DIR).toBe(join(dir, "data", "opencode", "config"));
     expect(existsSync(st.env.OPENCODE_CONFIG_DIR)).toBe(true);
+  });
+
+  it("runs the server in an empty, read-only directory of its own, outside codeoid's data, removed when it stops", async () => {
+    // A shell reaches the server's cwd as /proc/$PPID/cwd, which the gate can't follow (round-19 audit).
+    const { server, dir } = makeServer();
+    await server.ensure();
+    const st = await fakeState(server);
+    const cwd = server.cwd!;
+    expect(realpathSync(st.cwd)).toBe(realpathSync(cwd));
+    expect(cwd.startsWith(dir)).toBe(false);
+    expect(dirname(cwd)).toBe(tmpdir());
+    expect(readdirSync(cwd)).toEqual([]);
+    expect(statSync(cwd).mode & 0o777).toBe(0o500);
+    // The database's folder, with the credential files and the config, is somewhere else.
+    expect(realpathSync(st.cwd)).not.toBe(realpathSync(join(dir, "data", "opencode")));
+    await server.stop();
+    expect(existsSync(cwd)).toBe(false);
+    // A restart gets a fresh one.
+    await server.ensure();
+    expect(server.cwd).not.toBe(cwd);
+    expect(readdirSync(server.cwd!)).toEqual([]);
   });
 
   it("takes only the provider and model keys of the user's own global opencode config", async () => {

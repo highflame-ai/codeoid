@@ -264,6 +264,8 @@ const state = {
   /** Each location's providers, as its config was read when the location was first used. */
   providersAt: {} as Record<string, unknown>,
   argv: process.argv.slice(2),
+  /** The directory it was started in. */
+  cwd: process.cwd(),
   requests: [] as string[],
   replies: [] as Json[],
   formReplies: [] as Json[],
