@@ -333,6 +333,18 @@ describe("round 24: the lock's judgement and its file", () => {
     expect(() => acquireDaemonLocks([dir], { log: quiet, heartbeat: false })).toThrow(/too big/);
   });
 
+  it("round 24: a directory the lock can't be written in refuses the start with a DataDirLockError, not a raw error", () => {
+    const dir = join(root, "readonly");
+    mkdirSync(dir);
+    chmodSync(dir, 0o500);
+    try {
+      expect(() => acquireDaemonLocks([dir], { log: quiet, heartbeat: false })).toThrow(DataDirLockError);
+      expect(() => acquireDaemonLocks([dir], { log: quiet, heartbeat: false })).toThrow(/couldn't write a lock in/);
+    } finally {
+      chmodSync(dir, 0o700);
+    }
+  });
+
   it("round 24: a temp file a dead start left is swept once old", () => {
     const dir = join(root, "data");
     mkdirSync(dir);

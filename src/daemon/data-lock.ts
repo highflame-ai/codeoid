@@ -269,13 +269,22 @@ function describeHolder(h: LockHolder): string {
 /** Create `path` holding `content`, atomically: whole or not at all. False when it exists. */
 function createExclusive(path: string, content: string): boolean {
   const tmp = `${path}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
-  const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
   try {
-    writeSync(fd, content);
-    // On disk before it's named: a power loss can't leave an empty lock.
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
+    const fd = openSync(tmp, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o644);
+    try {
+      writeSync(fd, content);
+      // On disk before it's named: a power loss can't leave an empty lock.
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // never made
+    }
+    throw new DataDirLockError(`couldn't write a lock in ${dirname(path)}: ${(err as Error).message}`);
   }
   try {
     linkSync(tmp, path);
