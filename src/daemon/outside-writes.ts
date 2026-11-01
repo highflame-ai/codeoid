@@ -37,12 +37,14 @@
  * Shell commands: the targets #431's parser can name (redirects, `rm`, `mv`,
  * `cp`, `tee`, `touch`, `dd of=`, `sed -i`, `find -delete`, …, and `ln`'s
  * link and what it leads to: `shellWriteTargets`) are judged the same way,
- * `..` kept for the kernel's reading. A relative one after a `cd` the reader
- * can't be sure moved the shell (in a subshell or pipeline, on a condition,
- * into a directory that may not exist), and every other target of a line
- * that makes a link, can't be placed for certain and asks. A word the parser
- * can't know (a variable) isn't judged: shell levels are guidance, not a
- * sandbox (#448).
+ * `..` kept for the kernel's reading; a removal or rename by its name (a
+ * link that goes, not what it leads to). The reader fails closed: a word
+ * that expands, a writing program's option it isn't sure of, a relative
+ * target after a `cd` it can't be sure moved the shell, and every other
+ * target of a line that makes or moves a link, can't be placed for certain
+ * and asks. Relative targets are judged from the shell's real cwd, as the
+ * backend reports it (`shellCwd`). A program the reader doesn't model as a
+ * writer isn't judged: shell levels are guidance, not a sandbox (#448).
  */
 
 import { lstatSync } from "node:fs";
@@ -146,9 +148,21 @@ function within(child: string, parent: string): boolean {
 
 const underProc = (p: string) => p === "/proc" || p.startsWith("/proc/");
 
-/** `p` (absolute) where the kernel resolves it; null when that can't be told for certain. */
-function landing(p: string): string | null {
+/**
+ * `p` (absolute) where the kernel resolves it; null when that can't be told
+ * for certain. `name`: the call removes or renames the name itself (`rm`,
+ * `mv`'s source), so its last component is kept as it is — a link there is
+ * what goes, not what it leads to, and another hard link of it is untouched.
+ */
+function landing(p: string, name = false): string | null {
   try {
+    const slash = p.lastIndexOf("/");
+    const last = p.slice(slash + 1);
+    if (name && slash >= 0 && last !== "" && last !== "." && last !== "..") {
+      const dir = physicalPath(p.slice(0, slash) || "/");
+      const at = dir === "/" ? `/${last}` : `${dir}/${last}`;
+      return underProc(dir) ? null : at;
+    }
     const at = physicalPath(p);
     if (underProc(at)) return null;
     // A file with another name may be anywhere: writing it here writes it there.
@@ -168,14 +182,14 @@ function landing(p: string): string | null {
  * told for certain: another user's `~name`, `/proc`, `..` past a missing
  * directory, a loop, a file with several hard links.
  */
-export function writeLandings(raw: string, workdir: string): string[] | null {
+export function writeLandings(raw: string, workdir: string, name = false): string[] | null {
   const home = raw === "~" || raw.startsWith("~/") ? `${homedir()}${raw.slice(1)}` : raw;
   if (home.startsWith("~")) return null;
   const abs = isAbsolute(home) ? home : `${resolve(workdir)}/${home}`;
   if (underProc(resolve(abs)) || underProc(abs)) return null;
   const out: string[] = [];
   for (const p of abs.split("/").includes("..") ? [abs, resolve(abs)] : [abs]) {
-    const at = landing(p);
+    const at = landing(p, name);
     if (at === null) return null;
     if (!out.includes(at)) out.push(at);
   }
@@ -207,19 +221,29 @@ export interface OutsideWrite {
   path: string;
   /** False: the target couldn't be resolved for certain (or the call names none). */
   resolved: boolean;
+  /** Why it couldn't be, when the shell reader says (an expansion, an option it isn't sure of, an unknown cwd). */
+  why?: string;
 }
 
 /**
  * The first write of `toolName` whose target provably resolves outside the
  * working directory, or can't be resolved for certain; null when every
  * target is inside it, or the call writes no file (a read, a search, a
- * command whose targets the parser can't name). `cwd`: where a shell call
- * runs, when it names a directory.
+ * command whose targets the parser can't name).
+ *
+ * A shell call's relative targets are judged from where it runs: the
+ * directory its input names (`cwd`, `workdir`, …), else `shellCwd`, the
+ * directory the backend reports its shell is in for this call (Claude's
+ * Bash keeps a `cd` between calls: its hook input's `cwd`), else the
+ * workdir (a backend whose shell starts there each call). `shellCwd` null:
+ * the backend's shell may have moved and it didn't say where, so a relative
+ * target is unplaced. A cwd outside the workdir makes every relative target
+ * outside.
  */
-export function outsideWriteOf(toolName: string, input: Record<string, unknown>, workdir: string): OutsideWrite | null {
+export function outsideWriteOf(toolName: string, input: Record<string, unknown>, workdir: string, shellCwd?: string | null): OutsideWrite | null {
   const isInside = insideOf(workdir);
-  const judge = (raw: string): OutsideWrite | null => {
-    const at = writeLandings(raw, workdir);
+  const judge = (raw: string, name = false): OutsideWrite | null => {
+    const at = writeLandings(raw, workdir, name);
     if (at === null) return { path: raw, resolved: false };
     const out = at.find((p) => !isInside(p));
     return out === undefined ? null : { path: out, resolved: true };
@@ -235,10 +259,11 @@ export function outsideWriteOf(toolName: string, input: Record<string, unknown>,
   }
   const call = shellCallOf(toolName, input);
   if (!call) return null;
-  const cwd = call.cwd ? (isAbsolute(call.cwd) ? call.cwd : `${resolve(workdir)}/${call.cwd}`) : resolve(workdir);
+  const reported = shellCwd === undefined ? resolve(workdir) : shellCwd !== null && isAbsolute(shellCwd) ? shellCwd : null;
+  const cwd = call.cwd ? (isAbsolute(call.cwd) ? call.cwd : reported === null ? null : `${reported}/${call.cwd}`) : reported;
   for (const target of shellWriteTargets(call.command, { workdir: resolve(workdir), cwd })) {
-    if (target.unplaced) return { path: target.path, resolved: false };
-    const w = judge(target.path);
+    if (target.unplaced) return { path: target.path, resolved: false, why: target.unplaced };
+    const w = judge(target.path, target.name);
     if (w) return w;
   }
   return null;
@@ -246,7 +271,6 @@ export function outsideWriteOf(toolName: string, input: Record<string, unknown>,
 
 /** The approval card's reason for an outside write. */
 export function outsideWriteReason(w: OutsideWrite): string {
-  return w.resolved
-    ? `writes outside the working directory: ${w.path}`
-    : `writes outside the working directory: ${w.path} (where it leads can't be resolved for certain)`;
+  if (w.resolved) return `writes outside the working directory: ${w.path}`;
+  return `writes outside the working directory: ${w.path} (where it leads can't be resolved for certain${w.why ? `: ${w.why}` : ""})`;
 }

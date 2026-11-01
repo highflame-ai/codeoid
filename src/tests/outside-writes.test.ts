@@ -25,7 +25,7 @@ import { MockSessionProvider } from "../daemon/providers/mock/session-provider.j
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
 import { buildOpencodeEnv } from "../daemon/providers/opencode/policy.js";
 import { OpencodeServer } from "../daemon/providers/opencode/server.js";
-import { shellWriteTargets } from "../daemon/risk/effects.js";
+import { sedScriptWrites, shellWriteTargets } from "../daemon/risk/effects.js";
 import { Session, type SessionCreateOptions } from "../daemon/session.js";
 import { loadShellParser } from "../daemon/shell/parse.js";
 import { Store } from "../daemon/store.js";
@@ -134,7 +134,7 @@ describe("whether a write leads outside the working directory", () => {
     }
   });
 
-  test("a shell command: a target the parser names outside is outside; one it can't place is left as today", () => {
+  test("a shell command: a target the parser names outside is outside; one it can't place asks", () => {
     const bash = (command: string, cwd?: string) => outsideWriteOf("Bash", { command, ...(cwd ? { cwd } : {}) }, workdir);
     expect(bash(`echo hi > ${elsewhere}/x`)?.path).toBe(join(elsewhere, "x"));
     expect(bash("echo hi > out-link/x")?.path).toBe(join(elsewhere, "x"));
@@ -151,11 +151,11 @@ describe("whether a write leads outside the working directory", () => {
     expect(bash("make 2>&1 >/dev/null")).toBeNull();
     // Reads outside: not writes.
     expect(bash(`cat ${elsewhere}/a > src/copy`)).toBeNull();
-    // A word the parser can't know: today's behaviour (not asked for this).
-    expect(bash('echo hi > "$OUT"')).toBeNull();
-    expect(shellWriteTargets('echo hi > "$OUT"', { workdir })).toEqual([]);
+    // A word the parser can't know can't be placed: it asks (round 25).
+    expect(bash('echo hi > "$OUT"')).toMatchObject({ path: '"$OUT"', resolved: false });
+    expect(shellWriteTargets('echo hi > "$OUT"', { workdir })).toEqual([{ path: '"$OUT"', unplaced: '"$OUT" is only known at run time' }]);
     // A relative path after a `cd` it can't follow can't be placed: it asks.
-    expect(bash("cd $DIR && touch x")).toEqual({ path: "x", resolved: false });
+    expect(bash("cd $DIR && touch x")).toMatchObject({ path: "x", resolved: false });
   });
 });
 
@@ -198,7 +198,7 @@ describe("round 24: a target is judged where the kernel writes it", () => {
     expect(bash(`ln ${elsewhere}/victim ./hard`)?.path).toBe(join(elsewhere, "victim"));
     expect(bash(`ln -s ${elsewhere}/missing ./k`)?.path).toBe(join(elsewhere, "missing"));
     expect(bash("ln -sf ../../elsewhere/x src/k")?.path).toBe(join(elsewhere, "x"));
-    expect(bash("ln -s ../elsewhere/y -t src")).toBeNull();
+    expect(bash("ln -s -t src ../elsewhere/y")).toBeNull();
     expect(bash("ln -s a.ts src/b.ts")).toBeNull();
     expect(bash("ln -sr src/a.ts src/c.ts")).toBeNull();
   });
@@ -206,7 +206,7 @@ describe("round 24: a target is judged where the kernel writes it", () => {
   test("a link the line makes, then a write: the write can't be placed", () => {
     expect(bash(`ln -s ${elsewhere} newl && echo x > newl/pwn`)).not.toBeNull();
     // The link's own target looks inside; what's written through it can't be placed.
-    expect(bash("ln -s src newl && echo x > newl/pwn")).toEqual({ path: join(workdir, "newl", "pwn"), resolved: false });
+    expect(bash("ln -s src newl && echo x > newl/pwn")).toMatchObject({ path: join(workdir, "newl", "pwn"), resolved: false });
     expect(bash("ln -s src newl; ln -s x newl/y")).toMatchObject({ resolved: false });
     expect(bash("cp -s src/a src/b; echo x > src/c")).toMatchObject({ resolved: false });
   });
@@ -216,14 +216,14 @@ describe("round 24: a target is judged where the kernel writes it", () => {
     symlinkSync(join(elsewhere, "inner"), join(workdir, "deep-link"));
     expect(bash("echo x > deep-link/../escaped.txt")?.path).toBe(join(elsewhere, "escaped.txt"));
     expect(bash("rm deep-link/../f")?.path).toBe(join(elsewhere, "f"));
-    expect(bash("cd deep-link && rm ../victim")?.path).toBe(join(elsewhere, "victim"));
+    expect(bash("cd ./deep-link && rm ../victim")?.path).toBe(join(elsewhere, "victim"));
     // A `..` with no link before it stays inside.
     expect(bash("echo x > src/../ok.txt")).toBeNull();
   });
 
   test("`/proc` and `~name` shell targets ask, as file tools' do", () => {
     expect(bash("echo x > /proc/self/cwd/../pwn")).toEqual({ path: "/proc/self/cwd/../pwn", resolved: false });
-    expect(bash("echo x >> ~someone/.bashrc")).toEqual({ path: "~someone/.bashrc", resolved: false });
+    expect(bash("echo x >> ~someone/.bashrc")).toMatchObject({ path: "~someone/.bashrc", resolved: false });
   });
 
   test("a `cd` that may not move the shell leaves the cwd unknown: a relative target after it asks", () => {
@@ -231,18 +231,18 @@ describe("round 24: a target is judged where the kernel writes it", () => {
     for (const line of [
       "cd nosuchdir/deeper; echo x > ../../b.txt",
       "cd nosuchdir 2>/dev/null || :; touch ../c.txt",
-      "true && (cd sub/deeper && :) ; touch ../../f.txt",
-      "(cd sub/deeper); echo x > ../../elsewhere/d.txt",
-      "cd sub/deeper | true; touch ../../g.txt",
-      "cd sub/deeper & touch ../../h.txt",
-      "false && cd sub/deeper; touch ../../i.txt",
-      "if true; then cd sub/deeper; fi; touch ../../j.txt",
+      "true && (cd ./sub/deeper && :) ; touch ../../f.txt",
+      "(cd ./sub/deeper); echo x > ../../elsewhere/d.txt",
+      "cd ./sub/deeper | true; touch ../../g.txt",
+      "cd ./sub/deeper & touch ../../h.txt",
+      "false && cd ./sub/deeper; touch ../../i.txt",
+      "if true; then cd ./sub/deeper; fi; touch ../../j.txt",
     ]) {
       expect([line, bash(line)?.resolved]).toEqual([line, false]);
     }
     // One that surely moves it is followed.
-    expect(bash("cd sub/deeper && touch ../x.txt")).toBeNull();
-    expect(bash("cd sub/deeper; touch ../../../elsewhere/x")?.path).toBe(join(elsewhere, "x"));
+    expect(bash("cd ./sub/deeper && touch ../x.txt")).toBeNull();
+    expect(bash("cd ./sub/deeper; touch ../../../elsewhere/x")?.path).toBe(join(elsewhere, "x"));
   });
 
   test("pi: every path key is judged", () => {
@@ -268,6 +268,147 @@ describe("round 24: a target is judged where the kernel writes it", () => {
     expect(outsideWriteOf("acp_edit", { locations: [{ path: join(workdir, "src", "a.ts"), line: 3 }] }, workdir)).toBeNull();
     expect(outsideWriteOf("acp_edit", { locations: [join(workdir, "a"), join(elsewhere, "b")] }, workdir)?.path).toBe(join(elsewhere, "b"));
     expect(outsideWriteOf("acp_edit", { title: "Edit", locations: [] }, workdir)).toMatchObject({ resolved: false });
+  });
+});
+
+describe("round 25: a shell target is placed only when the reader is sure of it", () => {
+  const bash = (command: string, shellCwd?: string | null) => outsideWriteOf("Bash", { command }, workdir, shellCwd);
+  const asks = (lines: string[], shellCwd?: string | null) => {
+    for (const line of lines) expect([line, bash(line, shellCwd) !== null]).toEqual([line, true]);
+  };
+  const runs = (lines: string[], shellCwd?: string | null) => {
+    for (const line of lines) expect([line, bash(line, shellCwd)]).toEqual([line, null]);
+  };
+  beforeEach(() => {
+    mkdirSync(join(workdir, "sub"));
+    mkdirSync(join(workdir, "outside"));
+    mkdirSync(join(elsewhere, "outside"));
+    writeFileSync(join(workdir, "inside.txt"), "i");
+    writeFileSync(join(elsewhere, "f"), "f");
+    symlinkSync(join(elsewhere, "f"), join(workdir, "sub", "notes"));
+  });
+
+  test("a word that expands — a brace, a pattern, a variable, a substitution, `~` mid-word — asks", () => {
+    asks([
+      "touch {..,zz}/escaped",
+      `touch {${elsewhere},zz}/escaped`,
+      "echo x | tee {..,zz}/escaped",
+      "touch s*/../../escaped",
+      "mv inside.txt [o]ut-link/b",
+      "sed -i s/a/b/ {..,zz}/victim",
+      "chmod 600 {..,zz}/victim",
+      "touch ./{x,..}/pwn",
+      "touch .[.]/pwn",
+      "touch a{-../}b",
+      "echo x > ou?-link/victim",
+      "echo x > /tmp/codeoid-login-*/f",
+      "cp inside.txt /tmp/codeoid-*/x",
+      "echo x > $F",
+      "touch $(cat list)",
+      "echo x | tee >(cat)",
+      "dd if=inside.txt of=~/x",
+    ]);
+    expect(bash("touch {..,zz}/escaped")).toEqual({ path: "{..,zz}/escaped", resolved: false, why: "{..,zz}/escaped is a pattern that may expand to other names" });
+  });
+
+  test("a writing program's options are an allow-list: any other form asks", () => {
+    asks([
+      `cp -at ${elsewhere} inside.txt`,
+      `cp -t${elsewhere}x inside.txt`,
+      `install -Dt ${elsewhere} inside.txt`,
+      `mv --target=${elsewhere} inside.txt`,
+      "cp -T inside.txt sub",
+      "mv -b -S x inside.txt sub/y",
+      "cp inside.txt -t sub copy",
+      "sed -i'../*' s/a/b/ inside.txt",
+      "sed -f script.sed -i inside.txt",
+      "sed -n 's/a/b/w out' inside.txt",
+      "sed '1e true' inside.txt",
+      "find -L . -name x -delete",
+      `find . -fprint ${elsewhere}/list`,
+    ]);
+    // Forms it knows for certain are judged: `-t DIR` attached or bundled, `--target-directory=`.
+    expect(bash(`cp -vt ${elsewhere} inside.txt`)?.path).toBe(elsewhere);
+    expect(bash(`mv --target-directory=${elsewhere} inside.txt`)?.path).toBe(elsewhere);
+    expect(bash(`mv -t${elsewhere} inside.txt`)?.path).toBe(elsewhere);
+  });
+
+  test("a `cp` that may copy a link, or an `mv` of anything but a plain file, leaves the line's other targets unplaced", () => {
+    symlinkSync(elsewhere, join(workdir, "shipped-link"));
+    asks([
+      "cp -P sub/notes copied; echo x >> copied",
+      "cp -a shipped-link r; echo x >> r/f",
+      "cp -r shipped-link r; touch r/f",
+      "mv shipped-link r; echo x >> r/f",
+      "mv sub r; echo x >> r/notes",
+    ]);
+    // A plain file moved, then written: placed.
+    runs(["mv inside.txt moved.txt; echo x >> moved.txt"]);
+  });
+
+  test("a `cd` by a bare name may go where CDPATH says: a relative target after it asks", () => {
+    asks(["cd outside && touch planted", "pushd sub && touch x"]);
+    runs(["cd ./outside && touch planted", `cd ${workdir}/sub && touch x`]);
+  });
+
+  test("removing or renaming a link judges the link, not what it leads to; writing through it still asks", () => {
+    symlinkSync(elsewhere, join(workdir, "lnk"));
+    writeFileSync(join(workdir, "hard1"), "h");
+    linkSync(join(workdir, "hard1"), join(workdir, "sub", "hard2"));
+    runs(["rm lnk", "rm -f sub/notes", "unlink lnk", "mv lnk lnk2", "rm hard1", "rmdir sub/notes"]);
+    asks(["rm -r lnk/", "rm -r lnk/.", "echo x > hard1", "echo x >> sub/notes", "mv inside.txt lnk", "rm lnk/f"]);
+    expect(bash("rm lnk/../f")?.path).toBe(join(root, "f"));
+  });
+
+  test("relative targets are judged from the shell's reported cwd; an unknown one asks; one outside makes them outside", () => {
+    expect(bash("echo x >> notes", join(workdir, "sub"))).toEqual({ path: join(elsewhere, "f"), resolved: true });
+    expect(bash("echo planted > my-skill/NOTE.md", elsewhere)).toEqual({ path: join(elsewhere, "my-skill", "NOTE.md"), resolved: true });
+    expect(bash("echo x > notes.txt", null)).toMatchObject({ path: "notes.txt", resolved: false });
+    // An absolute target doesn't depend on it; the input's own cwd key wins over the reported one.
+    expect(bash(`echo x > ${workdir}/a.txt`, null)).toBeNull();
+    expect(outsideWriteOf("Bash", { command: "touch x", cwd: workdir }, workdir, elsewhere)).toBeNull();
+    runs(["touch x"], join(workdir, "sub"));
+  });
+
+  test("ordinary writes inside the workdir still run unasked", () => {
+    runs([
+      "touch inside.txt",
+      "echo hi > out.txt",
+      'echo hi >> "my file.txt"',
+      "mkdir -p build/out",
+      "rm -rf build dist",
+      "cp inside.txt copy.txt",
+      "cp -f inside.txt sub/",
+      "mv inside.txt renamed.txt",
+      "mv -t sub inside.txt",
+      "sed -i 's/a/b/g' inside.txt",
+      "sed -i.bak -e 's/a/b/' -e '/^$/d' inside.txt",
+      "sed -n '1,20p' inside.txt > head.txt",
+      "echo x | tee -a log.txt",
+      "chmod +x run.sh",
+      "chmod -R 755 sub",
+      "truncate -s 0 log.txt",
+      "touch /tmp/scratch.txt",
+      "git status > status.txt 2>&1",
+      "npm test > /dev/null 2>&1",
+      "install -m 755 inside.txt bin/tool",
+      "ln -s inside.txt alias.txt",
+      "find build -name '*.o' -delete",
+      "dd if=/dev/zero of=blob.bin bs=1k count=1",
+      "rm -f /tmp/x.txt",
+    ]);
+  });
+
+});
+
+describe("round 25: sed scripts", () => {
+  test("only a script that surely writes no file and runs no command is read as safe", () => {
+    for (const s of ["s/a/b/", "s/a/b/g; s|c|d|2", "1,20p", "/foo/d", "/start/,/end/d", "$d", "y/abc/xyz/", "/x/{p;d}", "1!G;h;$!d", "s/w/e/gI", "a appended text", "#n"]) {
+      expect([s, sedScriptWrites(s)]).toEqual([s, null]);
+    }
+    for (const s of ["w out", "s/a/b/w out", "s/a/b/e", "1e date", "/x/W out", "s/a/b", "v", "/a[/]b/d"]) {
+      expect([s, sedScriptWrites(s) === null]).toEqual([s, false]);
+    }
   });
 });
 
@@ -365,7 +506,6 @@ describe("autonomous mode asks before a write outside the working directory, at 
       ["Read", { file_path: join(elsewhere, "a.ts") }],
       ["Grep", { pattern: "x", path: elsewhere }],
       ["Bash", { command: "echo hi > src/x" }],
-      ["Bash", { command: 'echo hi > "$OUT"' }],
     ] as Array<[string, Record<string, unknown>]>) {
       const r = await gateCall(name, input, "autonomous");
       expect([name, r.asked, r.behavior]).toEqual([name, false, "allow"]);

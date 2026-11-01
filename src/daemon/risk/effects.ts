@@ -3,10 +3,10 @@
  * (#355, #431): the rewind warning. Read from the parsed command — wrappers,
  * quoting and `bash -c` seen through — not a pattern over its text.
  */
-import { accessSync, constants, statSync } from "node:fs";
+import { accessSync, constants, lstatSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, normalize, resolve, sep } from "node:path";
-import { parseShellSync, type ShellWord, type SimpleCommand } from "../shell/parse.js";
+import { parseShellSync, type ShellWord, type SimpleCommand, wordShape } from "../shell/parse.js";
 import { findRoots } from "./shell-risk.js";
 
 /** Git subcommands whose effect lives in git's own state or on a remote. */
@@ -39,8 +39,8 @@ const PACKAGE_VERBS: Record<string, Set<string>> = {
 
 export interface EffectContext {
   workdir: string;
-  /** The directory the command ran in, absolute; the workdir when absent. */
-  cwd?: string;
+  /** The directory the command runs in, absolute; the workdir when absent; null when it isn't known. */
+  cwd?: string | null;
   home?: string;
 }
 
@@ -53,8 +53,8 @@ export function outsideEffects(command: string, ctx: EffectContext): boolean {
   if (parsed.problems.length > 0) return true;
   const home = ctx.home ?? homedir();
   // Outside the workspace, a relative path's target is as unknown as after a `cd` there.
-  const start = ctx.cwd ?? ctx.workdir;
-  let cwd: string | null = inside(start, ctx.workdir) ? start : null;
+  const start = ctx.cwd === undefined ? ctx.workdir : ctx.cwd;
+  let cwd: string | null = start !== null && inside(start, ctx.workdir) ? start : null;
   for (const cmd of parsed.commands) {
     const prog = programOf(cmd);
     if (prog === null) return true;
@@ -114,10 +114,6 @@ export function outsideEffects(command: string, ctx: EffectContext): boolean {
   return false;
 }
 
-/** Programs whose every operand is a file they change, create or remove. */
-const WRITES_EVERY_OPERAND = new Set(["rm", "rmdir", "mkdir", "touch", "chmod", "chown", "chgrp", "truncate", "shred", "tee", "mv", "unlink"]);
-/** Programs whose last operand (or `-t DIR`) is what they write: `cp a b`, `install a /usr/bin/a` (`ln` is read on its own). */
-const WRITES_LAST_OPERAND = new Set(["cp", "install"]);
 /** Files a redirect may name without writing a file: discarding, the terminal, the process's own descriptors. */
 const NOT_A_FILE = /^\/dev\/(?:null|zero|tty|stdout|stderr|stdin|fd\/\d+)$/;
 
@@ -129,92 +125,294 @@ export interface ShellWriteTarget {
    * the word as written.
    */
   path: string;
-  /** Why the reader can't place it for certain: a `~name`, a relative path where the cwd isn't known, a path the line's own link may redirect. */
+  /**
+   * Why the reader can't place it for certain: a word that expands (a
+   * pattern, a brace, a variable, a substitution, `~name`), a relative path
+   * where the cwd isn't known, a path the line's own link may redirect, a
+   * command whose options the reader doesn't know for certain.
+   */
   unplaced?: string;
+  /**
+   * The command removes or renames the name itself (`rm`, `unlink`,
+   * `rmdir`, `mv`'s sources): only the directory it is in is resolved, so a
+   * link there is what goes, not what it leads to.
+   */
+  name?: true;
 }
 
 /**
- * The files `command` writes, edits, creates, removes or moves that the
- * parse can name: redirects, what `rm`/`mv`/`cp`/`tee`/`touch`/… write, what
- * `ln` links (the link, and what it leads to: writing through it writes
- * that), `dd of=`, `sed -i`'s files, `find -delete`'s roots. Each is
- * absolute, unnormalized (the caller resolves links and `..` as the kernel
- * does). A `cd` is followed only where it surely moves what follows — run
- * unconditionally, in the line's own shell, into a directory that exists —
- * anything else leaves the cwd unknown, and a relative target after it is
- * `unplaced`; so is every other target of a line that makes a link. A word
- * the reader can't know (a variable) is left out: this lists what is
- * provably written, it isn't a sandbox (#448). A command that can't be
- * parsed has none.
+ * The options a writing program is read with, as an allow-list: any other
+ * option, and the reader isn't sure what the command writes. `flags`: short
+ * options that take no value; `values`: short ones that take one (the rest
+ * of the word, or the next word); `long`: `name` takes no value, `name=` one
+ * (`--name=v` or `--name v`), `name?` an optional `=v`. Long options are
+ * matched whole: an abbreviation getopt would accept isn't known.
+ */
+interface Options {
+  flags: string;
+  values?: string;
+  long?: string[];
+}
+
+const OWNER_OPTIONS: Options = { flags: "Rvcfh", long: ["recursive", "verbose", "changes", "silent", "quiet", "no-dereference", "reference=", "from=", "preserve-root", "no-preserve-root"] };
+
+/**
+ * The writing programs the reader knows, and the options it is sure of for
+ * each. Left out on purpose: whatever may copy or move a link as a link
+ * (`cp -P/-d/-a/-r/-R`, `-l`/`-s`), `-T`, backups (`-b`, `-S`), and
+ * `chown -H/-L` (which follow links while recursing).
+ */
+const OPTIONS: Record<string, Options> = {
+  rm: { flags: "fiIrRdv", long: ["force", "interactive?", "recursive", "dir", "verbose", "one-file-system", "preserve-root?", "no-preserve-root"] },
+  rmdir: { flags: "pv", long: ["parents", "verbose", "ignore-fail-on-non-empty"] },
+  unlink: { flags: "" },
+  mkdir: { flags: "pv", values: "m", long: ["parents", "verbose", "mode="] },
+  touch: { flags: "acmfh", values: "drt", long: ["no-create", "no-dereference", "date=", "reference=", "time="] },
+  chmod: { flags: "Rvcf", long: ["recursive", "verbose", "changes", "silent", "quiet", "reference=", "preserve-root", "no-preserve-root"] },
+  chown: OWNER_OPTIONS,
+  chgrp: OWNER_OPTIONS,
+  truncate: { flags: "co", values: "sr", long: ["no-create", "io-blocks", "size=", "reference="] },
+  shred: { flags: "fuvxz", values: "ns", long: ["force", "iterations=", "random-source=", "size=", "remove?", "verbose", "exact", "zero"] },
+  tee: { flags: "aip", long: ["append", "ignore-interrupts", "output-error?"] },
+  mv: { flags: "finvu", values: "t", long: ["force", "interactive", "no-clobber", "verbose", "update?", "strip-trailing-slashes", "target-directory="] },
+  cp: { flags: "finvupL", values: "t", long: ["force", "interactive", "no-clobber", "verbose", "update?", "dereference", "strip-trailing-slashes", "target-directory="] },
+  install: { flags: "vcpsCDd", values: "mogt", long: ["verbose", "compare", "preserve-timestamps", "strip", "directory", "mode=", "owner=", "group=", "target-directory="] },
+  ln: { flags: "sfnvri", values: "t", long: ["symbolic", "force", "no-dereference", "verbose", "relative", "interactive", "target-directory="] },
+  link: { flags: "" },
+};
+
+/** A writing program's arguments, read with its {@link Options}. */
+interface Reading {
+  operands: ShellWord[];
+  /** Options given: a short one by its letter, a long one by its name; the value one took. */
+  given: Map<string, ShellWord | true>;
+  /** Why the reader can't be sure what the command writes; null when it can. */
+  unsure: string | null;
+}
+
+/** Words a value was cut from (`-tDIR`, `of=x`): bash expands no `~` there that the reader would see. */
+const CUT = new WeakSet<ShellWord>();
+
+/** The value part of `w` after its option text `prefix`: null when the option text isn't written plainly. */
+function cut(w: ShellWord, prefix: string): ShellWord | null {
+  if (w.value === null || !w.raw.startsWith(prefix) || !w.value.startsWith(prefix)) return null;
+  const v: ShellWord = { value: w.value.slice(prefix.length), raw: w.raw.slice(prefix.length), glob: w.glob };
+  CUT.add(v);
+  return v;
+}
+
+function readOptions(prog: string, args: ShellWord[], spec: Options): Reading {
+  const r: Reading = { operands: [], given: new Map(), unsure: null };
+  const unsure = (why: string): Reading => ({ ...r, unsure: why });
+  let ended = false;
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i]!;
+    const v = w.value;
+    if (ended || (v !== null && (!v.startsWith("-") || v === "-"))) {
+      r.operands.push(w);
+      continue;
+    }
+    if (v === null) return unsure(`${w.raw} may be an option of ${prog}'s`);
+    // `chmod -w f`: a mode, not an option.
+    if (prog === "chmod" && /^-[rwxXst]+$/.test(v)) {
+      r.operands.push(w);
+      continue;
+    }
+    // After an operand, getopt reads an option as one only without POSIXLY_CORRECT.
+    if (r.operands.length > 0) return unsure(`${prog} has an option (${w.raw}) after its operands`);
+    if (v === "--") {
+      ended = true;
+      continue;
+    }
+    const long = spec.long ?? [];
+    if (v.startsWith("--")) {
+      const eq = v.indexOf("=");
+      const name = eq < 0 ? v.slice(2) : v.slice(2, eq);
+      if (long.includes(`${name}?`) || (eq < 0 && long.includes(name))) {
+        r.given.set(name, true);
+        continue;
+      }
+      if (long.includes(`${name}=`)) {
+        const value = eq >= 0 ? cut(w, v.slice(0, eq + 1)) : args[++i];
+        if (!value) return unsure(`${prog} ${w.raw}'s value isn't plain`);
+        r.given.set(name, value);
+        continue;
+      }
+      return unsure(`${prog} ${w.raw} isn't an option the reader is sure of`);
+    }
+    for (let k = 1; k < v.length; k++) {
+      const c = v[k]!;
+      if (spec.flags.includes(c)) {
+        r.given.set(c, true);
+        continue;
+      }
+      if (spec.values?.includes(c)) {
+        const value = k + 1 < v.length ? cut(w, v.slice(0, k + 1)) : args[++i];
+        if (!value) return unsure(`${prog} ${w.raw}'s value isn't plain`);
+        r.given.set(c, value);
+        break;
+      }
+      return unsure(`${prog} -${c} isn't an option the reader is sure of`);
+    }
+  }
+  return r;
+}
+
+/** The value an option took, by any of its names. */
+function optionValue(r: Reading, ...names: string[]): ShellWord | undefined {
+  for (const n of names) {
+    const v = r.given.get(n);
+    if (v && v !== true) return v;
+  }
+  return undefined;
+}
+
+/**
+ * The files `command` writes, edits, creates, removes or moves: redirects,
+ * what `rm`/`mv`/`cp`/`tee`/`touch`/… write, what `ln` links (the link, and
+ * what it leads to: writing through it writes that), `dd of=`, `sed -i`'s
+ * files, `find -delete`'s roots and `-fprint`'s files. Each is absolute,
+ * unnormalized (the caller resolves links and `..` as the kernel does).
+ *
+ * It fails closed: a target is placed only when it is a plain literal word
+ * (any expansion — a pattern, a brace, `$`, a substitution, `~name`, a `~`
+ * mid-word — is `unplaced`); a writing program is read only with the
+ * options it is sure of (OPTIONS), any other form is `unplaced`; a `cd` is
+ * followed only where it surely moves what follows (run unconditionally, in
+ * the line's own shell, by a path `CDPATH` doesn't apply to, into a
+ * directory that exists), anything else leaves the cwd unknown and a
+ * relative target after it `unplaced`; so is every other target of a line
+ * that makes or moves a link (`ln`, a `cp` that may copy one, an `mv` of
+ * anything but a plain file). A line that can't be parsed has none (the
+ * risk gate asks about it as not understood).
+ * Programs the reader doesn't know aren't judged: it lists what is provably
+ * written, it isn't a sandbox (#448).
  */
 export function shellWriteTargets(command: string, ctx: EffectContext): ShellWriteTarget[] {
   const parsed = parseShellSync(command);
+  // A line that can't be read is the risk gate's: not understood, it asks unless the config lets such lines run (`askOnUnknown`).
   if (parsed.problems.length > 0) return [];
   const home = ctx.home ?? homedir();
-  let cwd: string | null = ctx.cwd ?? ctx.workdir;
-  const linking = parsed.commands.map(makesLink);
+  // Where each command runs, as far as the reader can follow it.
+  const cwds: Array<string | null> = [];
+  let cwd: string | null = ctx.cwd === undefined ? ctx.workdir : ctx.cwd;
+  for (const cmd of parsed.commands) {
+    cwds.push(cwd);
+    const prog = programOf(cmd);
+    if (prog === "cd" || prog === "pushd") cwd = cdTarget(cmd, cwd, home);
+    else if (prog === "popd") cwd = null;
+  }
+  const linking = parsed.commands.map((cmd, i) => makesLink(cmd, cwds[i]!, home));
   const out: ShellWriteTarget[] = [];
   for (const [i, cmd] of parsed.commands.entries()) {
     const others = linking.some((l, j) => l && j !== i);
-    const add = (w: ShellWord | undefined, from: string | null = cwd) => {
+    const here = cwds[i]!;
+    const add = (w: ShellWord | undefined, opts: { from?: string | null; name?: true } = {}) => {
       if (!w) return;
-      const t = rawTargetOf(w, from, home);
+      const t = rawTargetOf(w, opts.from === undefined ? here : opts.from, home);
       if (t === null || NOT_A_FILE.test(t.path)) return;
-      out.push(others && !t.unplaced ? { ...t, unplaced: "the line makes a link that may lead it elsewhere" } : t);
+      const named = opts.name ? { ...t, name: true as const } : t;
+      out.push(others && !t.unplaced ? { ...named, unplaced: "the line makes or moves a link that may lead it elsewhere" } : named);
     };
+    const unsure = (why: string) => out.push({ path: cmd.argv.map((w) => w.raw).join(" "), unplaced: why });
     const prog = programOf(cmd);
     for (const r of cmd.redirects) {
       if (!r.target || r.op === "<" || r.op === "<<" || r.op === "<<<" || r.op === "<<-" || r.op === "<&") continue;
       if (r.op === ">&" && /^\d+$|^-$/.test(r.target.value ?? "")) continue;
       add(r.target);
     }
-    if (prog === null) continue;
-    if (prog === "cd" || prog === "pushd") {
-      cwd = cdTarget(cmd, cwd, home);
-      continue;
-    }
-    if (prog === "popd") {
-      cwd = null;
-      continue;
-    }
+    if (prog === null || prog === "cd" || prog === "pushd" || prog === "popd") continue;
     const args = cmd.argv.slice(1);
-    const operands = args.filter((w) => w.value === null || !w.value.startsWith("-"));
-    if (WRITES_EVERY_OPERAND.has(prog)) for (const w of operands) add(w);
-    if (WRITES_LAST_OPERAND.has(prog)) {
-      const dir = targetDirectory(args);
-      if (dir) add(dir);
-      else if (operands.length >= 2) add(operands.at(-1));
-      // `cp -l` / `cp -s`: a hard or symbolic link to each source, which a write through it changes.
-      if (linking[i]) for (const w of dir ? operands : operands.slice(0, -1)) add(w);
-    }
-    if (prog === "ln" || prog === "link") lnTargets(cmd, cwd, home, add);
     if (prog === "dd") {
-      const of = args.find((w) => w.value?.startsWith("of="));
-      if (of?.value) add({ value: of.value.slice(3), raw: of.raw, glob: false });
+      for (const w of args) {
+        if (w.value === null || !/^[a-z]+=/.test(w.value)) {
+          unsure(`dd ${w.raw} isn't an operand the reader is sure of`);
+          break;
+        }
+        if (w.value.startsWith("of=")) add(cut(w, "of=") ?? { value: null, raw: w.raw, glob: false });
+      }
+      continue;
     }
-    const values = args.map((w) => w.value);
-    if (prog === "sed" && values.some((x) => x !== null && (/^-[a-zA-Z]*i/.test(x) || x.startsWith("--in-place")))) {
-      const scripted = values.some((x) => x !== null && /^(-[a-zA-Z]*[ef]|--expression|--file)/.test(x));
-      for (const w of scripted ? operands : operands.slice(1)) add(w);
+    if (prog === "sed" || prog === "find") {
+      const files = prog === "sed" ? sedTargets(args) : findTargets(cmd);
+      if (typeof files === "string") unsure(files);
+      else for (const w of files) add(w);
+      continue;
     }
-    if (prog === "find" && values.some((x) => x === "-delete")) for (const w of findRoots(cmd)) add(w);
+    const spec = OPTIONS[prog];
+    if (!spec) continue;
+    const r = readOptions(prog, args, spec);
+    if (r.unsure) {
+      unsure(r.unsure);
+      continue;
+    }
+    const ops = r.operands;
+    switch (prog) {
+      case "rm":
+      case "rmdir":
+      case "unlink":
+        for (const w of ops) add(w, { name: true });
+        break;
+      case "mkdir":
+      case "touch":
+      case "truncate":
+      case "shred":
+      case "tee":
+        for (const w of ops) add(w);
+        break;
+      case "chmod":
+      case "chown":
+      case "chgrp":
+        // The mode or owner comes first, unless --reference gives it.
+        for (const w of r.given.has("reference") ? ops : ops.slice(1)) add(w);
+        break;
+      case "mv": {
+        const dir = optionValue(r, "t", "target-directory");
+        if (dir) add(dir);
+        else if (ops.length >= 2) add(ops.at(-1));
+        for (const w of dir ? ops : ops.slice(0, -1)) add(w, { name: true });
+        break;
+      }
+      case "cp":
+      case "install": {
+        const dir = optionValue(r, "t", "target-directory");
+        if (dir) add(dir);
+        else if (prog === "install" && (r.given.has("d") || r.given.has("directory"))) for (const w of ops) add(w);
+        else if (ops.length >= 2) add(ops.at(-1));
+        break;
+      }
+      case "ln":
+      case "link":
+        lnTargets(r, here, home, add);
+        break;
+    }
   }
   return out;
 }
 
-/** `-t DIR` / `--target-directory[=]DIR`: the directory `cp`, `install` or `ln` writes into. */
-function targetDirectory(args: ShellWord[]): ShellWord | undefined {
-  const t = args.findIndex((w) => w.value === "-t" || w.value === "--target-directory");
-  if (t >= 0) return args[t + 1];
-  const eq = args.find((w) => w.value?.startsWith("--target-directory="));
-  return eq?.value ? { value: eq.value.slice("--target-directory=".length), raw: eq.raw, glob: false } : undefined;
-}
-
-/** A command that makes a hard or symbolic link: `ln`, `link`, `cp -l` / `cp -s`. */
-function makesLink(cmd: SimpleCommand): boolean {
+/**
+ * Whether `cmd` makes a link, or moves one into a name the line may write
+ * through next: `ln`, `link`; a `cp` read with anything but the options
+ * that copy a file's content (OPTIONS: `-P`, `-a`, `-r`, `-l`, `-s` may copy
+ * or make a link); an `mv` of anything but an existing plain file.
+ */
+function makesLink(cmd: SimpleCommand, cwd: string | null, home: string): boolean {
   const prog = programOf(cmd);
   if (prog === "ln" || prog === "link") return true;
-  return prog === "cp" && cmd.argv.slice(1).some((w) => w.value !== null && (/^-[a-zA-Z]*[ls]/.test(w.value) || w.value === "--link" || w.value === "--symbolic-link"));
+  if (prog !== "cp" && prog !== "mv") return false;
+  const r = readOptions(prog, cmd.argv.slice(1), OPTIONS[prog]!);
+  if (r.unsure) return true;
+  if (prog === "cp") return false;
+  const sources = optionValue(r, "t", "target-directory") ? r.operands : r.operands.slice(0, -1);
+  return sources.some((w) => {
+    const at = rawTargetOf(w, cwd, home);
+    if (at === null || at.unplaced) return true;
+    try {
+      return !lstatSync(at.path).isFile();
+    } catch {
+      return true;
+    }
+  });
 }
 
 /**
@@ -223,19 +421,11 @@ function makesLink(cmd: SimpleCommand): boolean {
  * a symlink's target (relative to the link's directory unless `-r`) is where
  * a write through it lands.
  */
-function lnTargets(cmd: SimpleCommand, cwd: string | null, home: string, add: (w: ShellWord | undefined, from?: string | null) => void): void {
-  const args = cmd.argv.slice(1);
-  const flags = args.filter((w) => w.value?.startsWith("-")).map((w) => w.value!);
-  const symbolic = flags.some((f) => /^-[a-zA-Z]*s/.test(f) || f === "--symbolic");
-  const relativeToCwd = flags.some((f) => /^-[a-zA-Z]*r/.test(f) || f === "--relative");
-  // Operands, less the values `-t DIR` and `-S SUFFIX` take.
-  const operands: ShellWord[] = [];
-  for (let i = 0; i < args.length; i++) {
-    const v = args[i]!.value;
-    if (v === "-t" || v === "-S" || v === "--target-directory" || v === "--suffix") i++;
-    else if (v === null || !v.startsWith("-")) operands.push(args[i]!);
-  }
-  const dir = targetDirectory(args);
+function lnTargets(r: Reading, cwd: string | null, home: string, add: (w: ShellWord | undefined, opts?: { from?: string | null }) => void): void {
+  const symbolic = r.given.has("s") || r.given.has("symbolic");
+  const relativeToCwd = r.given.has("r") || r.given.has("relative");
+  const operands = r.operands;
+  const dir = optionValue(r, "t", "target-directory");
   let sources = operands;
   let linkDir: ShellWord | null = null;
   if (dir) {
@@ -256,18 +446,227 @@ function lnTargets(cmd: SimpleCommand, cwd: string | null, home: string, add: (w
       continue;
     }
     const base = linkDir ? rawTargetOf(linkDir, cwd, home) : cwd === null ? null : { path: cwd };
-    if (base === null || base.unplaced) add(s, null);
-    else add(s, base.path);
+    if (base === null || base.unplaced) add(s, { from: null });
+    else add(s, { from: base.path });
   }
 }
 
-/** Where a `cd` leaves the shell: its directory, when the line surely runs there next; null otherwise. */
+/**
+ * What `sed` writes: with `-i`, its files; and any file its script writes
+ * (`w`, `W`, an `s///w`) or a command it runs (`e`), which can't be placed.
+ * Its files, or why the reader isn't sure. Read as sed reads its options: `-e S`, `-eS`, `--expression=S`, `-f F`,
+ * `-l N`, `-i[SUFFIX]`, `--in-place[=SUFFIX]`; anything else is unsure.
+ */
+function sedTargets(args: ShellWord[]): ShellWord[] | string {
+  const scripts: ShellWord[] = [];
+  const operands: ShellWord[] = [];
+  let suffix: string | null = null;
+  let inPlace = false;
+  let ended = false;
+  for (let i = 0; i < args.length; i++) {
+    const w = args[i]!;
+    const x = w.value;
+    if (ended || (x !== null && (!x.startsWith("-") || x === "-"))) {
+      operands.push(w);
+      continue;
+    }
+    if (x === null) return (`${w.raw} may be an option of sed's`);
+    if (operands.length > 0) return (`sed has an option (${w.raw}) after its operands`);
+    if (x === "--") {
+      ended = true;
+      continue;
+    }
+    if (x.startsWith("--")) {
+      const eq = x.indexOf("=");
+      const name = eq < 0 ? x : x.slice(0, eq);
+      const value = () => (eq < 0 ? args[++i] : (cut(w, x.slice(0, eq + 1)) ?? undefined));
+      if (name === "--expression") {
+        const s = value();
+        if (!s) return ("sed's script isn't plain");
+        scripts.push(s);
+      } else if (name === "--file") return ("sed runs a script from a file");
+      else if (name === "--line-length") value();
+      else if (name === "--in-place") {
+        inPlace = true;
+        suffix = eq < 0 ? "" : x.slice(eq + 1);
+      } else if (!SED_LONG.has(x)) return (`sed ${w.raw} isn't an option the reader is sure of`);
+      continue;
+    }
+    for (let k = 1; k < x.length; k++) {
+      const c = x[k]!;
+      if ("nErsuz".includes(c)) continue;
+      if (c === "i") {
+        inPlace = true;
+        suffix = x.slice(k + 1); // the rest is a backup suffix
+        break;
+      }
+      if (c === "e" || c === "f" || c === "l") {
+        const s = x.length > k + 1 ? (cut(w, x.slice(0, k + 1)) ?? undefined) : args[++i];
+        if (c === "f") return ("sed runs a script from a file");
+        if (c === "e") {
+          if (!s) return ("sed's script isn't plain");
+          scripts.push(s);
+        }
+        break;
+      }
+      return (`sed -${c} isn't an option the reader is sure of`);
+    }
+  }
+  // Without -e / -f, the first operand is the script; the rest are files.
+  if (scripts.length === 0) {
+    const s = operands.shift();
+    if (s) scripts.push(s);
+  }
+  for (const s of scripts) {
+    if (s.value === null) return ("sed's script is only known at run time");
+    const why = sedScriptWrites(s.value);
+    if (why) return (why);
+  }
+  if (!inPlace) return [];
+  // A suffix with `/` or `*` puts the backup in another directory (GNU sed).
+  if (suffix !== null && /[/*]/.test(suffix)) return (`sed's backup suffix ${suffix} names another place`);
+  return operands;
+}
+
+const SED_LONG = new Set(["--quiet", "--silent", "--regexp-extended", "--separate", "--null-data", "--zero-terminated", "--posix", "--debug", "--sandbox", "--unbuffered", "--follow-symlinks"]);
+
+/**
+ * Why a sed script may write a file or run a command (`w`, `W`, an `s`
+ * flag `w` or `e`, `e`), or isn't read for certain; null when it surely
+ * does neither. A small reader of sed's own syntax: addresses, then one
+ * command each, separated by `;`, a newline or braces.
+ */
+export function sedScriptWrites(script: string): string | null {
+  let i = 0;
+  const n = script.length;
+  const ws = () => {
+    while (i < n && /[ \t]/.test(script[i]!)) i++;
+  };
+  /** Past a delimited part (`/re/`, `s`'s pattern or replacement); false when it doesn't end. */
+  const delimited = (d: string): boolean => {
+    while (i < n && script[i] !== d) {
+      if (script[i] === "\\") {
+        i += 2;
+        continue;
+      }
+      if (script[i] === "\n") return false;
+      i++;
+    }
+    if (i >= n) return false;
+    i++;
+    return true;
+  };
+  const toEol = () => {
+    while (i < n && script[i] !== "\n") i++;
+  };
+  const address = (): boolean => {
+    const c = script[i];
+    if (c === undefined) return true;
+    if (/[0-9]/.test(c)) {
+      while (i < n && /[0-9~]/.test(script[i]!)) i++;
+    } else if (c === "$") i++;
+    else if (c === "/") {
+      i++;
+      if (!delimited("/")) return false;
+      while (i < n && /[IM]/.test(script[i]!)) i++;
+    } else if (c === "\\") {
+      const d = script[i + 1];
+      if (d === undefined) return false;
+      i += 2;
+      if (!delimited(d)) return false;
+      while (i < n && /[IM]/.test(script[i]!)) i++;
+    } else if (c === "+" || c === "~") {
+      i++;
+      while (i < n && /[0-9]/.test(script[i]!)) i++;
+    }
+    return true;
+  };
+  const unsure = "sed's script isn't one the reader is sure of";
+  while (i < n) {
+    while (i < n && /[ \t\n;]/.test(script[i]!)) i++;
+    if (i >= n) break;
+    if (!address()) return unsure;
+    ws();
+    if (script[i] === ",") {
+      i++;
+      ws();
+      if (!address()) return unsure;
+      ws();
+    }
+    while (script[i] === "!") {
+      i++;
+      ws();
+    }
+    const c = script[i++];
+    if (c === undefined) return unsure;
+    if (c === "{") continue;
+    if ("}=dDgGhHnNpPxzF".includes(c)) {
+      // no argument
+    } else if ("qQlL".includes(c)) {
+      ws();
+      while (i < n && /[0-9]/.test(script[i]!)) i++;
+    } else if (":btT".includes(c)) {
+      while (i < n && script[i] !== ";" && script[i] !== "\n") i++;
+    } else if ("aicrR#".includes(c)) {
+      // Text or a file to read, to the end of the line.
+      toEol();
+    } else if (c === "s" || c === "y") {
+      const d = script[i++];
+      if (d === undefined || d === "\n" || d === "\\") return unsure;
+      if (!delimited(d) || !delimited(d)) return unsure;
+      if (c === "s") {
+        while (i < n && /[gpiImM0-9we]/.test(script[i]!)) {
+          if (script[i] === "w") return "sed's script writes a file (s///w)";
+          if (script[i] === "e") return "sed's script runs a command (s///e)";
+          i++;
+        }
+      }
+    } else if (c === "w" || c === "W") return `sed's script writes a file (${c})`;
+    else if (c === "e") return "sed's script runs a command (e)";
+    else return unsure;
+    ws();
+    if (i < n && !/[;\n}]/.test(script[i]!)) return unsure;
+  }
+  return null;
+}
+
+/**
+ * What `find` writes: with `-delete`, its roots (the matches are under
+ * them; with `-L`/`-H` it follows links out of them, so unsure); and the
+ * file each of `-fprint`, `-fprint0`, `-fls`, `-fprintf` names; or why the
+ * reader isn't sure.
+ */
+function findTargets(cmd: SimpleCommand): ShellWord[] | string {
+  const args = cmd.argv.slice(1);
+  const out: ShellWord[] = [];
+  const values = args.map((w) => w.value);
+  if (values.includes("-delete")) {
+    let follows = false;
+    for (const x of values) {
+      if (x === null || !/^-([HLP]|D|O\d*)$/.test(x)) break;
+      if (x === "-L" || x === "-H") follows = true;
+    }
+    if (follows || values.includes("-follow")) return ("find -delete follows links");
+    out.push(...findRoots(cmd));
+  }
+  for (const [i, x] of values.entries()) {
+    if (x === "-fprint" || x === "-fprint0" || x === "-fls" || x === "-fprintf") out.push(args[i + 1] ?? { value: null, raw: x, glob: false });
+  }
+  return out;
+}
+
+/**
+ * Where a `cd` leaves the shell: its directory, when the line surely runs
+ * there next; null otherwise. A relative name not starting `./` or `../`
+ * is looked up in `CDPATH` first, which the reader doesn't know.
+ */
 function cdTarget(cmd: SimpleCommand, cwd: string | null, home: string): string | null {
   // In a subshell, a pipeline, the background, a nested shell or a substitution it moves nothing after it; on a condition it may not run.
   if (cmd.subshell || cmd.conditional || cmd.via.length > 0 || cmd.substitution !== null) return null;
   const to = cmd.argv[1];
   // `cd -` and options (`cd -P dir`) aren't followed: where they lead isn't told here.
-  if (to && (to.value === null || to.value.startsWith("-") || to.glob || cmd.argv.length > 2)) return null;
+  if (to && (to.value === null || to.value.startsWith("-") || cmd.argv.length > 2)) return null;
+  if (to && !/^(\/|~|\.\.?(\/|$))/.test(to.value!)) return null;
   const at = to ? rawTargetOf(to, cwd, home) : { path: home };
   // One that fails leaves the shell where it was: followed only into a directory it can enter.
   return at !== null && !at.unplaced && directoryAt(at.path) ? at.path : null;
@@ -286,19 +685,60 @@ function directoryAt(p: string): boolean {
   }
 }
 
+/** A word's text outside its quotes, each quoted or escaped character a placeholder; null when a quote doesn't end. */
+function unquotedText(raw: string): string | null {
+  let out = "";
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]!;
+    if (c === "\\") {
+      i++;
+      out += "\u0001";
+    } else if (c === "'" || (c === "$" && raw[i + 1] === "'")) {
+      if (c === "$") i++;
+      const ansi = c === "$";
+      let j = i + 1;
+      while (j < raw.length && raw[j] !== "'") j += ansi && raw[j] === "\\" ? 2 : 1;
+      if (j >= raw.length) return null;
+      out += "\u0001";
+      i = j;
+    } else if (c === '"' || (c === "$" && raw[i + 1] === '"')) {
+      if (c === "$") i++;
+      let j = i + 1;
+      while (j < raw.length && raw[j] !== '"') j += raw[j] === "\\" ? 2 : 1;
+      if (j >= raw.length) return null;
+      out += "\u0001";
+      i = j;
+    } else out += c;
+  }
+  return out;
+}
+
+/**
+ * Why `w` isn't a plain literal word the reader knows for certain: a value
+ * known only at run time, a pattern or a brace, anything unquoted that may
+ * expand (`$`, a backquote, `{`, `*`, `?`, `[`, an extglob's `(`, `~` past
+ * the start); null for a plain word.
+ */
+export function expansionIn(w: ShellWord): string | null {
+  if (w.value === null || w.input) return `${w.raw || "a word"} is only known at run time`;
+  if (w.glob || /[-]/.test(wordShape(w))) return `${w.raw} is a pattern that may expand to other names`;
+  const bare = unquotedText(w.raw);
+  if (bare === null || /[{}*?[$`()<>]/.test(bare)) return `${w.raw} may expand to other names`;
+  const tilde = bare.indexOf("~");
+  if (tilde > 0 || (tilde === 0 && CUT.has(w))) return `${w.raw} may expand ~`;
+  return null;
+}
+
 /**
  * A write target's path as written, made absolute without collapsing `..`:
- * `~` expanded, a relative path joined to `cwd`. Unplaced for `~name`, and
- * for a relative path when `cwd` isn't known; null for a word with no value.
+ * `~` expanded, a relative path joined to `cwd`. Unplaced for a word that
+ * isn't plain ({@link expansionIn}), `~name`, and for a relative path when
+ * `cwd` isn't known.
  */
 function rawTargetOf(w: ShellWord, cwd: string | null, home: string): ShellWriteTarget | null {
-  const v = w.value;
-  if (v === null) return null;
-  if (w.glob) {
-    const cut = v.search(/[*?[{]/);
-    const dir = v.slice(0, Math.max(0, v.lastIndexOf("/", cut)));
-    return rawTargetOf({ value: dir || (v.startsWith("/") ? "/" : "."), raw: dir, glob: false }, cwd, home);
-  }
+  const why = expansionIn(w);
+  if (why) return { path: w.raw || "(a word only known at run time)", unplaced: why };
+  const v = w.value!;
   if (v === "~" || v.startsWith("~/")) return { path: home + v.slice(1) };
   if (v.startsWith("~")) return { path: v, unplaced: "another user's home" };
   if (isAbsolute(v)) return { path: v };
@@ -346,7 +786,10 @@ function pathOf(w: ShellWord, cwd: string | null, home: string): string | null {
   const v = w.value;
   if (v === null) return null;
   if (w.glob) {
-    const cut = v.search(/[*?[{]/);
+    // A pattern stays under its fixed directory only without a brace, a bracket, `..` or `~`, and with its wildcards in its last component.
+    if (/[{[(~]/.test(w.raw) || /(^|\/)\.\.(\/|$)/.test(v)) return null;
+    const cut = v.search(/[*?]/);
+    if (v.indexOf("/", cut) >= 0) return null;
     const dir = v.slice(0, Math.max(0, v.lastIndexOf("/", cut)));
     return pathOf({ value: dir || (v.startsWith("/") ? "/" : "."), raw: dir, glob: false }, cwd, home);
   }
