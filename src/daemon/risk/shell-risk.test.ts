@@ -127,6 +127,12 @@ const TABLE: Array<[string, RiskLevel]> = [
   ["rm -rf $HOME", "high"],
   ['rm -rf "$HOME/x"', "high"],
   ["rm -rf *", "high"],
+  // Round 26: a pattern with a name in it deletes what matches, not the workspace.
+  ["rm -f *.log", "medium"],
+  ["rm -rf ./*.tmp", "medium"],
+  ["rm -rf ./*", "high"],
+  ["rm -rf .*", "high"],
+  ["rm -rf .git/*.pack", "high"],
   ["rm -rf .git", "high"],
   ["cd /tmp && rm -rf x", "high"],
   ["xargs rm -rf < list", "high"],

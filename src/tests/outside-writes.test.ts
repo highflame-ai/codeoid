@@ -606,6 +606,27 @@ describe("autonomous mode asks before a write outside the working directory, at 
     }
   });
 
+  test("round 26: common in-workdir shell work runs unasked through the whole gate (risk level and outside writes); clear outside writes ask", async () => {
+    for (const d of ["src", "sub", "build"]) mkdirSync(join(workdir, d), { recursive: true });
+    for (const command of [
+      "cd src && sed -i 's/foo/bar/g' index.ts",
+      "cd sub && touch x",
+      "mkdir -p a/b && cd a/b && touch x",
+      "cp -r src dist",
+      "cp --preserve=mode a b",
+      "rm -rf dist/*",
+      "rm -f *.log",
+      "find src -name '*.ts' -exec sed -i 's/a/b/' {} \\;",
+      "cd build && make > log 2>&1",
+    ]) {
+      const r = await gateCall("Bash", { command }, "autonomous", { cdpathUnset: true });
+      expect([command, r.asked, r.behavior]).toEqual([command, false, "allow"]);
+    }
+    for (const command of ["echo x > /etc/x", "cp a ~/x", "rm ../x", "cd /tmp/../home && touch x"]) {
+      expect([command, (await gateCall("Bash", { command }, "autonomous")).asked]).toEqual([command, true]);
+    }
+  });
+
   test("round 26: a backend whose shell has CDPATH unset has a bare `cd` followed", async () => {
     mkdirSync(join(workdir, "sub"));
     symlinkSync(elsewhere, join(workdir, "away"));
