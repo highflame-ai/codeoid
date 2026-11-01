@@ -442,6 +442,10 @@ export function opencodeConfig(
     ...(Object.keys(allProviders).length > 0 ? { providers: allProviders } : {}),
     permissions: [{ action: "*", resource: "*", effect: "ask" }, ...HIDDEN_TOOL_RULES],
     plugins: [...DISABLED_PLUGINS],
+    // No formatter runs a workspace's code after an approved edit (prettier
+    // loads its config, `mix format` its project): a boolean resets every
+    // document below this one, and one above it is refused (formatterProblem).
+    formatter: false,
     // codeoid pins the version it speaks; opencode must not replace itself.
     update: "disable",
     share: "disabled",
@@ -733,6 +737,34 @@ export function serverEnv(opts: { password: string; dbPath: string; configDir: s
     ...OPENCODE_GIT_ENV,
     ...OPENCODE_HG_ENV,
   };
+}
+
+/**
+ * Why opencode would run formatters for a location whose config documents
+ * are `entries` (`GET /api/config`, lowest priority first), or null. opencode
+ * resolves `formatter` across them as its formatter plugin does: a boolean
+ * resets everything before it, an object merges over what's before; it
+ * registers its built-ins (prettier, gofmt, `mix format`, rubocop, …) for
+ * anything but undefined or false, and runs one after each edit, unasked
+ * (the card showed only the edit): several run the workspace's own code.
+ * codeoid's injected `false` resets every document below it; one above it
+ * (opencode's system config dir, `/etc/opencode`, outranks the injected
+ * config) that turns them back on is named. Fail closed: any value but
+ * false counts, an object whose entries are all disabled too.
+ */
+export function formatterProblem(entries: ReadonlyArray<{ type: string; path?: string; info?: Record<string, unknown> }>): string | null {
+  let effective: unknown;
+  let from: string[] = [];
+  for (const e of entries) {
+    if (e.type !== "document" || e.info?.formatter === undefined) continue;
+    const value = e.info.formatter;
+    const where = e.path ?? "codeoid's injected config";
+    if (typeof value === "boolean" || typeof effective !== "object" || effective === null) from = [where];
+    else from.push(where);
+    effective = value;
+  }
+  if (effective === undefined || effective === false) return null;
+  return `opencode's configuration turns its formatters on (\`formatter\` in ${from.join(", ")}), which run programs in the workspace after an edit without asking codeoid — refusing to use this opencode server. Remove the \`formatter\` key from opencode's system configuration.`;
 }
 
 /**

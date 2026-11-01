@@ -394,7 +394,10 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   made the user's config dir's, its literal strings handed over from
   `carried-<n>.value` files beside codeoid's keys: `userModelConfig`), a server listing a
   plugin that isn't a built-in is refused at start and before every turn
-  (`checkPlugins`), and a call that succeeded without asking stops the server
+  (`checkPlugins`), as is one whose config documents above the injected
+  config (`/etc/opencode` outranks it) turn formatters back on (the injected
+  `formatter: false` resets those below; `formatterProblem` over
+  `GET /api/config`: a formatter runs after an edit unasked), and a call that succeeded without asking stops the server
   (its own turn says why; the server's other sessions get a neutral reason;
   a call read back after a feed gap is judged the same, `#settleReadBack`) —
   except a shell line with no command in it (`commandlessShellLine`), which

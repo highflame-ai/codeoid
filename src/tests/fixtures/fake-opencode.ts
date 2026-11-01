@@ -175,7 +175,10 @@
  * outlive the server, beside OPENCODE_DB, as real 2.2.5 keeps them in its
  * database: a server started on the same database finds them, and an input
  * still in a session's inbox when its server died is delivered with that
- * session's next prompt).
+ * session's next prompt), FAKE_OPENCODE_SYSTEM_CONFIG / …_LATE (the JSON of a
+ * system config document, `/etc/opencode/opencode.json`, which `GET
+ * /api/config` lists above the injected config: from the start, or once a
+ * prompt was posted).
  *
  * A location first loaded under a repository has its version control run
  * unasked, with the server's environment, as real 2.2.5 does (`loadVcs`).
@@ -1712,6 +1715,25 @@ const server = Bun.serve({
       });
     }
     if (path === "/api/agent") return json({ location: { directory: directoryOf(req, url) }, data: agents() });
+    if (path === "/api/config" && method === "GET") {
+      // As real 2.2.5, lowest priority first: codeoid's config dir (OPENCODE_CONFIG_DIR), the injected
+      // config, then the system dir's documents (`/etc/opencode`), which outrank it.
+      // FAKE_OPENCODE_SYSTEM_CONFIG: that document's JSON from the start; …_LATE: once a prompt was posted.
+      const entries: Json[] = [];
+      const dir = process.env.OPENCODE_CONFIG_DIR;
+      if (dir && existsSync(join(dir, "opencode.json"))) {
+        let info: Json = {};
+        try {
+          info = JSON.parse(readFileSync(join(dir, "opencode.json"), "utf8")) as Json;
+        } catch {}
+        entries.push({ type: "document", path: join(dir, "opencode.json"), info });
+      }
+      if (dir) entries.push({ type: "directory", path: dir });
+      entries.push({ type: "document", info: readConfig(directoryOf(req, url)) });
+      const system = process.env.FAKE_OPENCODE_SYSTEM_CONFIG ?? (state.prompts.length > 0 ? process.env.FAKE_OPENCODE_SYSTEM_CONFIG_LATE : undefined);
+      if (system) entries.push({ type: "document", path: "/etc/opencode/opencode.json", info: JSON.parse(system) as Json }, { type: "directory", path: "/etc/opencode" });
+      return json(entries);
+    }
     if (path === "/api/plugin") {
       const builtin = ["opencode.tool.input.repair", "opencode.config.mcp"].map((id) => ({ id, source: { type: "builtin" }, features: { server: true }, state: { status: "active" } }));
       const foreign = { id: "user.autoallow", source: { type: "local", path: "/home/u/.config/opencode/plugins/autoallow.js" }, features: { server: true }, state: { status: "active" } };

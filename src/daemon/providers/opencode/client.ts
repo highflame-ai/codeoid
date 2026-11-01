@@ -142,6 +142,13 @@ export interface OcPluginInfo {
   state?: { status: string; error?: string };
 }
 
+/** `Config.Entry` (subset): a config document opencode read (`info` is its content), or a config dir. */
+export interface OcConfigEntry {
+  type: "document" | "directory" | string;
+  path?: string;
+  info?: Record<string, unknown>;
+}
+
 /** `Command.Info`. */
 export interface OcCommandInfo {
   name: string;
@@ -285,6 +292,12 @@ export class OpencodeClient {
 
   async agents(directory?: string): Promise<OcAgentInfo[]> {
     return (await this.#request<{ data: OcAgentInfo[] }>("GET", "/api/agent", { directory })).data ?? [];
+  }
+
+  /** The config documents (and dirs) the server reads for `directory`'s location, lowest priority first. */
+  async config(directory?: string): Promise<OcConfigEntry[]> {
+    const res = await this.#request<OcConfigEntry[] | { data?: OcConfigEntry[] }>("GET", "/api/config", { directory });
+    return (Array.isArray(res) ? res : res.data) ?? [];
   }
 
   /** The plugins the server runs for `directory`'s location (empty until the location has been used). */

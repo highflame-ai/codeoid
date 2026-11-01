@@ -32,7 +32,7 @@ import { basename, dirname, join } from "node:path";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
 import { GIT_FLOOR, gitCheckout, gitProblem, leadsToCodeoid, MERCURIAL_FLOOR, mercurialCheckout, mercurialProblem, OpencodeServer, OpencodeIncompatibleError, SERVER_CWD_BASES, SERVER_CWD_PREFIX, stopOpencodeServers } from "../daemon/providers/opencode/server.js";
 import { secretPathVerdict } from "../daemon/secret-paths.js";
-import { buildOpencodeEnv, commandlessShellLine, serverEnv, opencodeConfig, opencodeShellEnv, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents, userModelConfig } from "../daemon/providers/opencode/policy.js";
+import { buildOpencodeEnv, commandlessShellLine, formatterProblem, serverEnv, opencodeConfig, opencodeShellEnv, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents, userModelConfig } from "../daemon/providers/opencode/policy.js";
 import { OPENCODE_CREDENTIALS_PROCESS_DIR, OPENCODE_INSTALL_HINT, opencodeCredentialsDir, opencodeDbPath, opencodeSecretLocations, opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
 import { effortOfVariant, gateCallFor, parseModelValue, realTarget } from "../daemon/providers/opencode/translate.js";
 import { OpencodeClient, parseSse } from "../daemon/providers/opencode/client.js";
@@ -784,6 +784,51 @@ describe("opencode server lifecycle", () => {
     const { server } = makeServer({ FAKE_OPENCODE_PLUGIN: "1" });
     await expect(server.ensure()).rejects.toThrow(/plugins codeoid doesn't know \(user\.autoallow/);
     expect(server.running).toBe(false);
+  });
+
+  it("pins opencode's formatters off, and refuses a server whose system config turns them back on, at start and before every turn (round-22 audit)", async () => {
+    // Below the injected config (codeoid's own config dir): reset by its `formatter: false`.
+    const below = makeServer();
+    mkdirSync(below.server.configDir, { recursive: true });
+    writeFileSync(join(below.server.configDir, "opencode.json"), JSON.stringify({ formatter: true }));
+    const st = await fakeState(below.server);
+    expect(JSON.parse(st.configText).formatter).toBe(false);
+    expect(texts(await collect(makeProvider(below.server).runTurn(opts("hi"))), "text_done")).toEqual(["Hello, world"]);
+    // Above it (`/etc/opencode`, which outranks the injected config): refused.
+    for (const value of [true, { prettier: { disabled: true } }]) {
+      const { server } = makeServer({ FAKE_OPENCODE_SYSTEM_CONFIG: JSON.stringify({ formatter: value }) });
+      await expect(server.ensure()).rejects.toThrow(/turns its formatters on \(`formatter` in \/etc\/opencode\/opencode\.json\)/);
+      expect(server.running).toBe(false);
+    }
+    // Turned off there too: fine.
+    const off = makeServer({ FAKE_OPENCODE_SYSTEM_CONFIG: JSON.stringify({ formatter: false }) });
+    await off.server.ensure();
+    // Turned on while the server runs (opencode watches its config dirs): the next turn stops it.
+    const { server } = makeServer({ FAKE_OPENCODE_SYSTEM_CONFIG_LATE: JSON.stringify({ formatter: true }) });
+    const p = makeProvider(server);
+    expect(texts(await collect(p.runTurn(opts("hi"))), "text_done")).toEqual(["Hello, world"]);
+    const events = await collect(p.runTurn(opts("use-shell")));
+    expect(events.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("turns its formatters on") });
+    expect(events.some((e) => e.type === "tool_start")).toBe(false);
+    expect(server.running).toBe(false);
+    await p.teardown();
+  });
+
+  it("resolves opencode's formatter setting across its config documents as opencode does, failing closed (round-22 audit)", () => {
+    const doc = (formatter: unknown, path?: string) => ({ type: "document", ...(path ? { path } : {}), info: formatter === undefined ? {} : { formatter } });
+    expect(formatterProblem([])).toBeNull();
+    expect(formatterProblem([doc(undefined), { type: "directory", path: "/x" }])).toBeNull();
+    expect(formatterProblem([doc(true, "/c/opencode.json"), doc(false)])).toBeNull();
+    expect(formatterProblem([doc({ gofmt: {} }, "/c/opencode.json"), doc(false), doc(false, "/etc/opencode/opencode.json")])).toBeNull();
+    expect(formatterProblem([doc(false), doc(true, "/etc/opencode/opencode.json")])).toContain("`formatter` in /etc/opencode/opencode.json");
+    // An object merges over an object before it: both are named.
+    expect(formatterProblem([doc(false), doc({ a: {} }, "/etc/opencode/opencode.json"), doc({ b: {} }, "/etc/opencode/opencode.jsonc")])).toContain(
+      "/etc/opencode/opencode.json, /etc/opencode/opencode.jsonc",
+    );
+    // Any value but false counts: every entry disabled still registers the built-ins it doesn't name.
+    expect(formatterProblem([doc({ prettier: { disabled: true } }, "/etc/opencode/opencode.json")])).not.toBeNull();
+    expect(formatterProblem([doc("yes")])).toContain("codeoid's injected config");
+    expect(opencodeConfig().formatter).toBe(false);
   });
 
   it("checks the plugins before every turn: one that appears later stops the server", async () => {

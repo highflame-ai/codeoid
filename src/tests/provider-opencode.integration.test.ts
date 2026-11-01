@@ -103,6 +103,8 @@
  *       rebuilt one (a daemon restart), answers only its own prompt
  *   I62 (scripted only) a git older than 2.31 first on opencode's PATH (it ignores GIT_CONFIG_COUNT, so none of codeoid's git
  *       overrides): a workdir in a git repository is refused, saying why, before opencode runs git there; a plain one works
+ *   I63 (scripted only) a `formatter: true` in a config document below codeoid's injected one (its config dir) runs no
+ *       formatter after an approved write (a marker gofmt on PATH stays silent): the injected `formatter: false` resets it
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -2600,6 +2602,51 @@ describe("opencode (real binary)", () => {
       expect(ran).toContain(`${own.cwd ?? ""}|--version`);
       expect(ran.filter((l) => l.startsWith(ws))).toEqual([]);
     } finally {
+      await own.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  maybeScripted("I63 a formatter a config document turns on doesn't run after an approved write: codeoid's injected config pins them off, and the server's own config says so", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-fmt-")));
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const marks = join(root, "marks.log");
+    // opencode's gofmt built-in is on wherever a gofmt is on its PATH, once formatters are.
+    writeFileSync(join(bin, "gofmt"), `#!/bin/sh\necho "gofmt $*" >> '${marks}'\n`, { mode: 0o755 });
+    const ws = join(root, "ws");
+    mkdirSync(ws);
+    const own = new OpencodeServer({
+      command: resolved!.command,
+      argsPrefix: resolved!.argsPrefix,
+      dbPath: join(root, "data", "opencode", "opencode.db"),
+      env: () => ({ ...buildOpencodeEnv(), HOME: join(root, "home"), PATH: `${bin}:${process.env.PATH}` }),
+      userConfigDir: null,
+      defaultModel: "scripted/scripted-1",
+      modelProviders,
+    });
+    // A document below the injected config (the system dir's, above it, is refused: unit-tested on the fake).
+    mkdirSync(own.configDir, { recursive: true });
+    writeFileSync(join(own.configDir, "opencode.json"), JSON.stringify({ formatter: true }));
+    const p = new OpencodeProvider({ sessionId: "it-fmt", initialBackingId: "it-fmt", server: own, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
+    try {
+      const asked: string[] = [];
+      const gate: ToolApprovalFn = async (_t, _a, name) => {
+        asked.push(name);
+        return { behavior: "allow" };
+      };
+      const events = await collect(p.runTurn(opts(`[[tool:write ${JSON.stringify({ path: "a.go", content: "package main\n" })}]]`, { workdir: ws, canUseTool: gate })));
+      expect(events.find((e) => e.type === "error")).toBeUndefined();
+      expect(asked).toEqual(["Write"]);
+      expect(existsSync(join(ws, "a.go"))).toBe(true);
+      await Bun.sleep(1_000);
+      expect(existsSync(marks) ? readFileSync(marks, "utf8") : "").toBe("");
+      // As the real server lists its documents, lowest first: the config dir's `true`, then codeoid's `false`.
+      const conn = await own.ensure();
+      const docs = (await conn.client.config(ws)).filter((e) => e.type === "document" && e.info?.formatter !== undefined);
+      expect(docs.map((e) => e.info!.formatter)).toEqual([true, false]);
+    } finally {
+      await p.teardown();
       await own.stop();
       rmSync(root, { recursive: true, force: true });
     }

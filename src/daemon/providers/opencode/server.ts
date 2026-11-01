@@ -45,6 +45,7 @@ import {
   buildOpencodeEnv,
   describePlugin,
   foreignPlugins,
+  formatterProblem,
   gitOverrideEnv,
   OPENCODE_GIT_ENV,
   opencodeConfig,
@@ -254,15 +255,17 @@ export class OpencodeServer {
   /**
    * Refuse a server that runs a plugin opencode doesn't ship, for
    * `directory`'s location (the server's own when omitted): a plugin can
-   * settle permission requests itself, so codeoid would never see them.
+   * settle permission requests itself, so codeoid would never see them. Or
+   * one whose config turns formatters on: they run unasked after an edit.
    * The server is stopped (the next turn starts a new one, which is checked
    * again). The location must have been used (a request naming it) for its
    * plugins to be listed.
    */
   async checkPlugins(conn: OpencodeConnection, directory?: string): Promise<void> {
     const foreign = foreignPlugins(await conn.client.plugins(directory));
-    if (foreign.length === 0) return;
-    const reason = untrustedPlugins(foreign.map(describePlugin));
+    // A config document that turns formatters on (`formatterProblem`) is refused the same way.
+    const reason = foreign.length > 0 ? untrustedPlugins(foreign.map(describePlugin)) : formatterProblem(await conn.client.config(directory));
+    if (!reason) return;
     console.error(`[opencode-server] ${reason}`);
     if (this.#conn === conn) await this.stop(reason);
     throw new OpencodeUntrustedError(reason);
@@ -349,6 +352,9 @@ export class OpencodeServer {
         // Global plugins (the system config dir's, codeoid's own config dir's) show in every location.
         const foreign = foreignPlugins(await launched.client.plugins());
         if (foreign.length > 0) throw new OpencodeUntrustedError(untrustedPlugins(foreign.map(describePlugin)));
+        // So do formatters a config document above codeoid's turns on.
+        const formatters = formatterProblem(await launched.client.config());
+        if (formatters) throw new OpencodeUntrustedError(formatters);
         overtaken();
         return this.#adopt(launched);
       } catch (err) {
