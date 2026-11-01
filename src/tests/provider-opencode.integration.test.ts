@@ -1529,15 +1529,22 @@ describe("opencode (real binary)", () => {
         },
       }),
     );
-    const own = new OpencodeServer({
-      command: resolved!.command,
-      argsPrefix: resolved!.argsPrefix,
-      dbPath: join(root, "data", "opencode", "opencode.db"),
-      dataDir: join(root, "oc-files"),
-      userConfigDir: user,
-    });
-    const turn = async (model: string) => {
-      const p = new OpencodeProvider({ sessionId: `it-usercfg-${Math.random().toString(36).slice(2)}`, initialBackingId: "it-usercfg", server: own, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
+    // A base URL through {file:} is carried only with hosted models on (round 25: off, it can't be checked for
+    // opencode.ai); the catalog fetch and free models stay off through the environment, so nothing reaches opencode.ai.
+    const make = (hostedModels: boolean) =>
+      new OpencodeServer({
+        command: resolved!.command,
+        argsPrefix: resolved!.argsPrefix,
+        dbPath: join(root, hostedModels ? "data" : "data-off", "opencode", "opencode.db"),
+        dataDir: join(root, hostedModels ? "oc-files" : "oc-files-off"),
+        userConfigDir: user,
+        hostedModels,
+        env: () => ({ ...buildOpencodeEnv(), OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_FREE_MODELS: "1" }),
+      });
+    const own = make(true);
+    const off = make(false);
+    const turn = async (model: string, server = own) => {
+      const p = new OpencodeProvider({ sessionId: `it-usercfg-${Math.random().toString(36).slice(2)}`, initialBackingId: "it-usercfg", server, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
       const events = await collect(p.runTurn(opts("[[text:from the user's gateway]]", { workdir: work, model })));
       await p.teardown();
       return [texts(events), events.find((e) => e.type === "error") !== undefined];
@@ -1546,8 +1553,10 @@ describe("opencode (real binary)", () => {
       expect(await turn("gw/scripted-1")).toEqual([["from the user's gateway"], false]);
       expect((await turn("local/scripted-1"))[1]).toBe(true);
       expect(existsSync(marker)).toBe(false);
+      expect(await turn("gw/scripted-1", off)).toEqual([[], true]);
     } finally {
       await own.stop();
+      await off.stop();
       rmSync(root, { recursive: true, force: true });
     }
   }, 180_000);
