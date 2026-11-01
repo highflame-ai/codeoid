@@ -7449,7 +7449,7 @@ export class Session {
   #outsideWrite(toolName: string, input: Record<string, unknown>, shellCwd?: string | null): OutsideWrite | null {
     if (this.#mode !== "autonomous") return null;
     try {
-      return outsideWriteOf(toolName, input, this.workdir, shellCwd);
+      return outsideWriteOf(toolName, input, this.workdir, shellCwd, { cdpathUnset: this.#provider.shellCdpathUnset === true });
     } catch (err) {
       console.error(`[codeoid/session ${this.id}] judging where ${toolName} writes failed, asking: ${err instanceof Error ? err.message : String(err)}`);
       return { path: "(couldn't be judged)", resolved: false };

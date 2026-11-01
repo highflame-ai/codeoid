@@ -2822,6 +2822,35 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
     await p.teardown();
   });
 
+  it("the CLI's shell runs with CDPATH empty, over the daemon's, so a `cd` by a bare name is followed where it leads (round 26)", async () => {
+    await loadShellParser();
+    const saved = { CDPATH: process.env.CDPATH, ALLOW: process.env.CODEOID_AGENT_ENV_ALLOW };
+    process.env.CDPATH = "/";
+    process.env.CODEOID_AGENT_ENV_ALLOW = "CDPATH";
+    try {
+      const root = realpathSync(mkdtempSync(join(homedir(), ".codeoid-r26-cdpath-")));
+      const workdir = join(root, "w");
+      mkdirSync(join(workdir, "sub"), { recursive: true });
+      mkdirSync(join(root, "elsewhere"));
+      symlinkSync(join(root, "elsewhere"), join(workdir, "away"));
+      const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => "autonomous" });
+      void p.runTurn({ history: [], userMessage: "go", workdir, canUseTool: async () => ({ behavior: "allow" as const }) });
+      expect(envOf().CDPATH).toBe("");
+      expect(p.shellCdpathUnset).toBe(true);
+      const hook = (command: string) => preToolUseOf()({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command }, tool_use_id: `tu-${Math.random()}`, cwd: workdir });
+      expect(await hook("cd away && touch planted")).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask", permissionDecisionReason: `writes outside the working directory: ${join(root, "elsewhere", "planted")}` } });
+      expect(await hook("cd sub && touch x")).toEqual({});
+      openGate();
+      await p.teardown();
+      rmSync(root, { recursive: true, force: true });
+    } finally {
+      for (const [k, v] of [["CDPATH", saved.CDPATH], ["CODEOID_AGENT_ENV_ALLOW", saved.ALLOW]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
   it("a teammate of another team is the parent's on a fork; its own team's are the fork's (L-4)", async () => {
     const { provider } = makeForeignAwareProvider();
     turnOn(provider);

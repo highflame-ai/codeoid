@@ -17,7 +17,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { randomUUID } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import { outsideWriteOf, writeTargets } from "../daemon/outside-writes.js";
 import type { ProviderEvent, SessionProvider } from "../daemon/providers/interface.js";
@@ -153,7 +153,7 @@ describe("whether a write leads outside the working directory", () => {
     expect(bash(`cat ${elsewhere}/a > src/copy`)).toBeNull();
     // A word the parser can't know can't be placed: it asks (round 25).
     expect(bash('echo hi > "$OUT"')).toMatchObject({ path: '"$OUT"', resolved: false });
-    expect(shellWriteTargets('echo hi > "$OUT"', { workdir })).toEqual([{ path: '"$OUT"', unplaced: '"$OUT" is only known at run time' }]);
+    expect(shellWriteTargets('echo hi > "$OUT"', { workdir })).toEqual([{ path: '"$OUT"', unplaced: '"$OUT" is only known at run time', leaves: true }]);
     // A relative path after a `cd` it can't follow can't be placed: it asks.
     expect(bash("cd $DIR && touch x")).toMatchObject({ path: "x", resolved: false });
   });
@@ -205,10 +205,14 @@ describe("round 24: a target is judged where the kernel writes it", () => {
 
   test("a link the line makes, then a write: the write can't be placed", () => {
     expect(bash(`ln -s ${elsewhere} newl && echo x > newl/pwn`)).not.toBeNull();
-    // The link's own target looks inside; what's written through it can't be placed.
-    expect(bash("ln -s src newl && echo x > newl/pwn")).toMatchObject({ path: join(workdir, "newl", "pwn"), resolved: false });
-    expect(bash("ln -s src newl; ln -s x newl/y")).toMatchObject({ resolved: false });
-    expect(bash("cp -s src/a src/b; echo x > src/c")).toMatchObject({ resolved: false });
+    expect(bash("ln -s ../../x newl && echo x > newl/pwn")).not.toBeNull();
+    // The link's own target looks inside: what's written through it can't be placed, but its text stays inside (round 26: best effort).
+    expect(shellWriteTargets("ln -s src newl && echo x > newl/pwn", { workdir })).toContainEqual({ path: join(workdir, "newl", "pwn"), unplaced: "the line makes or moves a link that may lead it elsewhere" });
+    expect(bash("ln -s src newl && echo x > newl/pwn")).toBeNull();
+    expect(bash("ln -s src newl; ln -s x newl/y")).toBeNull();
+    expect(bash("cp -s src/a src/b; echo x > src/c")).toBeNull();
+    // One whose text leads outside still asks.
+    expect(bash("ln -s src newl && echo x > newl/../../pwn")).toMatchObject({ resolved: false });
   });
 
   test("`..` after a link in a shell target is the link's parent, not the text's", () => {
@@ -288,19 +292,17 @@ describe("round 25: a shell target is placed only when the reader is sure of it"
     symlinkSync(join(elsewhere, "f"), join(workdir, "sub", "notes"));
   });
 
-  test("a word that expands — a brace, a pattern, a variable, a substitution, `~` mid-word — asks", () => {
+  test("a word that expands into what could lead outside — a `..`, an absolute alternative, a variable, a substitution, `~` mid-word — asks", () => {
     asks([
       "touch {..,zz}/escaped",
       `touch {${elsewhere},zz}/escaped`,
       "echo x | tee {..,zz}/escaped",
       "touch s*/../../escaped",
-      "mv inside.txt [o]ut-link/b",
       "sed -i s/a/b/ {..,zz}/victim",
       "chmod 600 {..,zz}/victim",
       "touch ./{x,..}/pwn",
       "touch .[.]/pwn",
       "touch a{-../}b",
-      "echo x > ou?-link/victim",
       "echo x > /tmp/codeoid-login-*/f",
       "cp inside.txt /tmp/codeoid-*/x",
       "echo x > $F",
@@ -309,46 +311,48 @@ describe("round 25: a shell target is placed only when the reader is sure of it"
       "dd if=inside.txt of=~/x",
     ]);
     expect(bash("touch {..,zz}/escaped")).toEqual({ path: "{..,zz}/escaped", resolved: false, why: "{..,zz}/escaped is a pattern that may expand to other names" });
+    // A relative pattern with no `..` isn't judged (round 26: best effort), even one through a link (docs/approvals.md's known limits).
+    runs(["mv inside.txt [o]ut-link/b", "echo x > ou?-link/victim"]);
   });
 
-  test("a writing program's options are an allow-list: any other form asks", () => {
+  test("a writing program's options are an allow-list: any other form asks when its words could lead outside", () => {
     asks([
       `cp -at ${elsewhere} inside.txt`,
       `cp -t${elsewhere}x inside.txt`,
       `install -Dt ${elsewhere} inside.txt`,
       `mv --target=${elsewhere} inside.txt`,
-      "cp -T inside.txt sub",
-      "mv -b -S x inside.txt sub/y",
-      "cp inside.txt -t sub copy",
       "sed -i'../*' s/a/b/ inside.txt",
-      "sed -f script.sed -i inside.txt",
-      "sed -n 's/a/b/w out' inside.txt",
-      "sed '1e true' inside.txt",
+      "sed -n 's/a/b/w /etc/out' inside.txt",
       "find -L . -name x -delete",
       `find . -fprint ${elsewhere}/list`,
     ]);
+    // Round 26: one whose words all stay relative, with no `..` or expansion, runs.
+    runs(["cp -T inside.txt sub", "mv -b -S x inside.txt sub/y", "cp inside.txt -t sub copy", "sed -f script.sed -i inside.txt", "sed -n 's/a/b/w out' inside.txt", "sed '1e true' inside.txt"]);
     // Forms it knows for certain are judged: `-t DIR` attached or bundled, `--target-directory=`.
     expect(bash(`cp -vt ${elsewhere} inside.txt`)?.path).toBe(elsewhere);
     expect(bash(`mv --target-directory=${elsewhere} inside.txt`)?.path).toBe(elsewhere);
     expect(bash(`mv -t${elsewhere} inside.txt`)?.path).toBe(elsewhere);
   });
 
-  test("a `cp` that may copy a link, or an `mv` of anything but a plain file, leaves the line's other targets unplaced", () => {
+  test("a `cp` that may copy a link, or an `mv` of anything but a plain file, leaves the line's other targets unplaced: asked when their text could lead outside", () => {
     symlinkSync(elsewhere, join(workdir, "shipped-link"));
-    asks([
-      "cp -P sub/notes copied; echo x >> copied",
-      "cp -a shipped-link r; echo x >> r/f",
-      "cp -r shipped-link r; touch r/f",
-      "mv shipped-link r; echo x >> r/f",
-      "mv sub r; echo x >> r/notes",
-    ]);
-    // A plain file moved, then written: placed.
-    runs(["mv inside.txt moved.txt; echo x >> moved.txt"]);
+    expect(shellWriteTargets("cp -a shipped-link r; echo x >> r/f", { workdir })).toContainEqual({ path: join(workdir, "r", "f"), unplaced: "the line makes or moves a link that may lead it elsewhere" });
+    asks(["cp -a shipped-link r; echo x >> r/../../f", "mv shipped-link r; echo x >> $R/f"]);
+    // Round 26: best effort, a write through a link the line copies or moves isn't judged (docs/approvals.md's known limits).
+    runs(["cp -P sub/notes copied; echo x >> copied", "cp -a shipped-link r; echo x >> r/f", "mv shipped-link r; echo x >> r/f", "mv inside.txt moved.txt; echo x >> moved.txt"]);
   });
 
-  test("a `cd` by a bare name may go where CDPATH says: a relative target after it asks", () => {
-    asks(["cd outside && touch planted", "pushd sub && touch x"]);
-    runs(["cd ./outside && touch planted", `cd ${workdir}/sub && touch x`]);
+  test("a `cd` by a bare name is followed when CDPATH is known unset; a line that sets CDPATH asks", () => {
+    symlinkSync(elsewhere, join(workdir, "away"));
+    const cdpathUnset = (line: string) => outsideWriteOf("Bash", { command: line }, workdir, undefined, { cdpathUnset: true });
+    // Unset: followed, so where it really leads is judged.
+    expect(cdpathUnset("cd away && touch planted")).toEqual({ path: join(elsewhere, "planted"), resolved: true });
+    expect(cdpathUnset("cd outside && touch planted")).toBeNull();
+    // Not known: not followed, but a plain relative target after it doesn't ask.
+    runs(["cd outside && touch planted", "pushd sub && touch x", "cd ./outside && touch planted", `cd ${workdir}/sub && touch x`]);
+    // The line's own CDPATH may send it anywhere.
+    asks(["CDPATH=/; cd outside && touch planted", "export CDPATH=..; cd sub && touch x"]);
+    expect(cdpathUnset("CDPATH=/; cd outside && touch planted")).not.toBeNull();
   });
 
   test("removing or renaming a link judges the link, not what it leads to; writing through it still asks", () => {
@@ -401,6 +405,76 @@ describe("round 25: a shell target is placed only when the reader is sure of it"
 
 });
 
+describe("round 26: shell is best-effort guidance — only a target that could plausibly leave asks", () => {
+  const bash = (command: string, opts: { cdpathUnset?: boolean } = {}) => outsideWriteOf("Bash", { command }, workdir, undefined, opts);
+  beforeEach(() => {
+    for (const d of ["src", "sub", "build"]) mkdirSync(join(workdir, d), { recursive: true });
+  });
+
+  test("common in-workdir work never asks, whether CDPATH is known unset or not", () => {
+    const lines = [
+      "cd src && sed -i 's/foo/bar/g' index.ts",
+      "cd sub && touch x",
+      "mkdir -p a/b && cd a/b && touch x",
+      "cp -r src dist",
+      "cp -R src dist",
+      "cp -a src dist",
+      "cp --preserve=mode a b",
+      "rm -rf dist/*",
+      "rm -f *.log",
+      "find src -name '*.ts' -exec sed -i 's/a/b/' {} \\;",
+      "find src -name '*.ts' -exec sed -i 's/a$/b/' {} +",
+      "cd build && make > log 2>&1",
+      "touch {a,b}.txt",
+      "echo hi > sub/new && mv sub/new sub/n2",
+    ];
+    for (const cdpathUnset of [false, true]) for (const line of lines) expect([line, cdpathUnset, bash(line, { cdpathUnset })]).toEqual([line, cdpathUnset, null]);
+  });
+
+  test("clear outside writes still ask", () => {
+    for (const cdpathUnset of [false, true]) {
+      for (const line of ["echo x > /etc/x", "cp a ~/x", "rm ../x", "cd /tmp/../home && touch x", `cd ${elsewhere} && touch x`]) {
+        expect([line, bash(line, { cdpathUnset }) !== null]).toEqual([line, true]);
+      }
+    }
+    expect(bash("cp a ~/x")).toEqual({ path: join(homedir(), "x"), resolved: true });
+  });
+
+  test("a line that sets HOME moves `~`: a `~` target, and a bare `cd`, ask", () => {
+    for (const line of [
+      "HOME=/somewhere; echo pwn > ~/f",
+      `HOME=${elsewhere} bash -c 'mkdir -p ~/w && echo x > ~/w/hz'`,
+      "export HOME=/x; cd; touch f",
+      "unset HOME; echo x > ~/f",
+      `HOME=${elsewhere}; cd ~/w && touch f`,
+    ]) {
+      expect([line, bash(line) !== null]).toEqual([line, true]);
+    }
+    // Without it, `~` is the daemon's home: placed, and judged.
+    expect(bash(`echo x > ~/${relative(homedir(), workdir)}/f`)).toBeNull();
+    expect(bash(`HOME=/x; echo x > ~/${relative(homedir(), workdir)}/f`)).toMatchObject({ resolved: false, why: "the line sets HOME, which moves ~" });
+  });
+
+  test("a word only known at run time, a `cd` to one, `cd -`, input of unknown origin, and a find that follows links or reads its roots from a file ask", () => {
+    for (const line of [
+      'echo x > "$OUT"',
+      "touch `cat list`",
+      'cd "$DIR" && touch x',
+      "cd - && touch x",
+      "popd && touch x",
+      "ls | xargs rm",
+      "find .. -name '*.o' -exec rm {} \\;",
+      "find -L . -name x -delete",
+      "find -D tree -L . -name victim -delete",
+      "find -files0-from LIST -delete",
+      "touch .[.]/pwn",
+      "cp -r src ~/dist",
+    ]) {
+      expect([line, bash(line) !== null]).toEqual([line, true]);
+    }
+  });
+});
+
 describe("round 25: sed scripts", () => {
   test("only a script that surely writes no file and runs no command is read as safe", () => {
     for (const s of ["s/a/b/", "s/a/b/g; s|c|d|2", "1,20p", "/foo/d", "/start/,/end/d", "$d", "y/abc/xyz/", "/x/{p;d}", "1!G;h;$!d", "s/w/e/gI", "a appended text", "#n"]) {
@@ -441,12 +515,13 @@ async function until(cond: () => boolean, ms = 5_000): Promise<void> {
 type Card = { phase: string; risk?: { level: string; reasons: string[] } };
 
 /** One call of `name`/`input` through a real Session's gate: whether it asked, its card, the budget after. */
-async function gateCall(name: string, input: Record<string, unknown>, mode: SessionMode, opts: { unattended?: boolean; shellCwd?: string | null } = {}) {
+async function gateCall(name: string, input: Record<string, unknown>, mode: SessionMode, opts: { unattended?: boolean; shellCwd?: string | null; cdpathUnset?: boolean } = {}) {
   const events: ProviderEvent[] = [
     { type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name, input, approvalId: "ap-1", ...(opts.shellCwd !== undefined ? { shellCwd: opts.shellCwd } : {}) },
     { type: "turn_done", result: { providerId: "mock", model: "m", inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0, durationMs: 1 } },
   ];
   const provider = new MockSessionProvider("mock", [events]);
+  if (opts.cdpathUnset) Object.assign(provider, { shellCdpathUnset: true });
   const { session, cards } = makeSession(provider, mode);
   const release = opts.unattended ? session.beginUnattended() : null;
   void session.send("go", AUTH);
@@ -528,6 +603,18 @@ describe("autonomous mode asks before a write outside the working directory, at 
     for (const shellCwd of [workdir, undefined]) {
       const r = await gateCall("Bash", { command: "echo x > notes.txt" }, "autonomous", { shellCwd });
       expect([shellCwd, r.asked, r.behavior]).toEqual([shellCwd, false, "allow"]);
+    }
+  });
+
+  test("round 26: a backend whose shell has CDPATH unset has a bare `cd` followed", async () => {
+    mkdirSync(join(workdir, "sub"));
+    symlinkSync(elsewhere, join(workdir, "away"));
+    const followed = await gateCall("Bash", { command: "cd away && touch planted" }, "autonomous", { cdpathUnset: true });
+    expect(followed.asked).toBe(true);
+    expect(followed.card?.risk?.reasons).toContain(`writes outside the working directory: ${join(elsewhere, "planted")}`);
+    for (const cdpathUnset of [false, true]) {
+      const inside = await gateCall("Bash", { command: "cd sub && touch x" }, "autonomous", { cdpathUnset });
+      expect([cdpathUnset, inside.asked, inside.behavior]).toEqual([cdpathUnset, false, "allow"]);
     }
   });
 

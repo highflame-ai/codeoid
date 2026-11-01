@@ -34,17 +34,25 @@
  * or too many links, and an existing file with more than one hard link
  * (another name of it may be anywhere on the filesystem).
  *
- * Shell commands: the targets #431's parser can name (redirects, `rm`, `mv`,
- * `cp`, `tee`, `touch`, `dd of=`, `sed -i`, `find -delete`, …, and `ln`'s
- * link and what it leads to: `shellWriteTargets`) are judged the same way,
- * `..` kept for the kernel's reading; a removal or rename by its name (a
- * link that goes, not what it leads to). The reader fails closed: a word
- * that expands, a writing program's option it isn't sure of, a relative
- * target after a `cd` it can't be sure moved the shell, and every other
- * target of a line that makes or moves a link, can't be placed for certain
- * and asks. Relative targets are judged from the shell's real cwd, as the
- * backend reports it (`shellCwd`). A program the reader doesn't model as a
- * writer isn't judged: shell levels are guidance, not a sandbox (#448).
+ * That is a hard rule for the file tools. For shell commands it is best
+ * effort, guidance like #431's levels and not a boundary: the real boundary
+ * for a shell is the OS sandbox (#448). The targets #431's parser can name
+ * (redirects, `rm`, `mv`, `cp`, `tee`, `touch`, `dd of=`, `sed -i`,
+ * `find -delete`, …, and `ln`'s link and what it leads to:
+ * `shellWriteTargets`) are judged the same way, `..` kept for the kernel's
+ * reading; a removal or rename by its name (a link that goes, not what it
+ * leads to). A target the reader can't place for certain (a word that
+ * expands, a writing program's option it isn't sure of, a relative target
+ * after a `cd` it can't follow, every other target of a line that makes or
+ * moves a link) asks only when its text could plausibly leave the workdir:
+ * absolute, `~`, a `..`, a variable or substitution, a line that sets HOME,
+ * a cwd that may be anywhere (`leaves`). `rm -f *.log`, `cp -r src dist`,
+ * `cd sub && touch x` run unasked. Relative targets are judged from the
+ * shell's real cwd, as the backend reports it (`shellCwd`); a `cd` by a bare
+ * name is followed when the backend's shell runs with `CDPATH` unset
+ * (`cdpathUnset`). What the reader doesn't model (a program it doesn't know
+ * as a writer, function bodies, traps and loops run later, `find -execdir`,
+ * a reopened `/dev/stdout`, …) isn't judged: docs/approvals.md lists them.
  */
 
 import { lstatSync } from "node:fs";
@@ -237,10 +245,17 @@ export interface OutsideWrite {
  * Bash keeps a `cd` between calls: its hook input's `cwd`), else the
  * workdir (a backend whose shell starts there each call). `shellCwd` null:
  * the backend's shell may have moved and it didn't say where, so a relative
- * target is unplaced. A cwd outside the workdir makes every relative target
- * outside.
+ * target is unplaced and asks. A cwd outside the workdir makes every
+ * relative target outside. `cdpathUnset`: the backend's shell runs with
+ * `CDPATH` unset (`SessionProvider.shellCdpathUnset`).
  */
-export function outsideWriteOf(toolName: string, input: Record<string, unknown>, workdir: string, shellCwd?: string | null): OutsideWrite | null {
+export function outsideWriteOf(
+  toolName: string,
+  input: Record<string, unknown>,
+  workdir: string,
+  shellCwd?: string | null,
+  opts: { cdpathUnset?: boolean } = {},
+): OutsideWrite | null {
   const isInside = insideOf(workdir);
   const judge = (raw: string, name = false): OutsideWrite | null => {
     const at = writeLandings(raw, workdir, name);
@@ -261,7 +276,9 @@ export function outsideWriteOf(toolName: string, input: Record<string, unknown>,
   if (!call) return null;
   const reported = shellCwd === undefined ? resolve(workdir) : shellCwd !== null && isAbsolute(shellCwd) ? shellCwd : null;
   const cwd = call.cwd ? (isAbsolute(call.cwd) ? call.cwd : reported === null ? null : `${reported}/${call.cwd}`) : reported;
-  for (const target of shellWriteTargets(call.command, { workdir: resolve(workdir), cwd })) {
+  for (const target of shellWriteTargets(call.command, { workdir: resolve(workdir), cwd, cdpathUnset: opts.cdpathUnset === true })) {
+    // Best effort (#448): one the reader can't place asks only when what it sees of it could lead outside.
+    if (target.unplaced && !target.leaves) continue;
     if (target.unplaced) return { path: target.path, resolved: false, why: target.unplaced };
     const w = judge(target.path, target.name);
     if (w) return w;

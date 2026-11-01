@@ -253,6 +253,8 @@ export const MAX_CARRYOVER_EVENTS = 100;
 export class ClaudeProvider implements SessionProvider {
   /** The Agent SDK runs the permission result's `updatedInput` (see AgentProvider.appliesToolInputRewrite). */
   readonly appliesToolInputRewrite = true;
+  /** The CLI's env has `CDPATH=` (withShellBasics), and its shell snapshot carries no variables. */
+  readonly shellCdpathUnset = true;
   readonly id = "claude";
   /** The CLI runs the main agent itself when background work settles (#adoptTurn). */
   readonly continuesAfterBackgroundWork = true;
@@ -640,7 +642,7 @@ export class ClaudeProvider implements SessionProvider {
     let reason: string;
     try {
       if (this.#init.sessionMode?.() !== "autonomous") return null;
-      const outside = outsideWriteOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, workdir, hookShellCwd(input));
+      const outside = outsideWriteOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, workdir, hookShellCwd(input), { cdpathUnset: this.shellCdpathUnset });
       if (!outside) return null;
       reason = outsideWriteReason(outside);
     } catch (err) {
@@ -1173,14 +1175,14 @@ export class ClaudeProvider implements SessionProvider {
         //
         // A fork's boundary goes on after all of it (withForkBoundary).
         env: withForkBoundary(
-          withExtraEnv(
+          withShellBasics(withExtraEnv(
             account
               ? account.apply(buildAgentEnv(process.env))
               : buildAgentEnv(process.env, {
                   gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
                 }),
             init.extraEnv,
-          ),
+          )),
           init.forkBoundary?.(),
         ),
         allowedTools: [
@@ -2649,6 +2651,18 @@ export function buildAgentEnv(
   // CODEOID_AGENT_ENV_ALLOW come from buildSubprocessEnv.
   const env = buildSubprocessEnv({ prefixes: ["ANTHROPIC_", "CLAUDE_", "LC_"] }, base);
   return withGatewayCredential(env, opts.gatewayCredential);
+}
+
+/**
+ * `CDPATH=` (empty: bash then looks a bare name up in the cwd only) on the
+ * CLI's env, after everything else: its Bash tool inherits it, and the shell
+ * snapshot it sources carries functions, options and aliases, not
+ * variables. So the outside-write check follows `cd src && …` where it
+ * really leads (`shellCdpathUnset`). A project's `.claude/settings.json`
+ * `env` can still set one: shell judgement is best effort (#448).
+ */
+export function withShellBasics(env: Record<string, string>): Record<string, string> {
+  return { ...env, CDPATH: "" };
 }
 
 /**

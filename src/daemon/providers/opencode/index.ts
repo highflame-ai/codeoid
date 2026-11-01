@@ -330,6 +330,8 @@ export class OpencodeProvider implements SessionProvider {
   readonly displayName = OPENCODE_DISPLAY_NAME;
   /** opencode's reply carries only a decision: it runs the input it proposed (#367). */
   readonly appliesToolInputRewrite = false;
+  /** Every shell runs `bash -c` with opencodeShellEnv, which has no `CDPATH`. */
+  readonly shellCdpathUnset = true;
   /** A background subagent's result is handed to the model by opencode, which then runs the main agent itself. */
   readonly continuesAfterBackgroundWork = true;
   readonly effortChange = "turn" as const;

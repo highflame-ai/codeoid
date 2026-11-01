@@ -770,6 +770,14 @@ export interface AgentProvider {
    */
   readonly enforcesToolBudget?: boolean;
   /**
+   * True when the backend's shell runs with `CDPATH` unset or empty, because
+   * codeoid gives it its environment (Claude's CLI: `CDPATH=` in its env;
+   * opencode: a bare `PUT …/environment`, run non-login). The outside-write
+   * check then follows a `cd` by a bare name (`cd src && …`) to where it
+   * really leads. Absent = not known: such a `cd` isn't followed.
+   */
+  readonly shellCdpathUnset?: boolean;
+  /**
    * Pids of the processes this backend spawned itself (its CLI / app-server)
    * that are alive now. Session.terminateBackend snapshots their whole tree
    * before the teardown and kills what outlives it (process-tree.ts). Absent

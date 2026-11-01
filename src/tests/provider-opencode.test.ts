@@ -1009,6 +1009,12 @@ describe("opencode server lifecycle", () => {
     expect(env).toEqual({ PATH: "/bin", HOME: "/home/u" });
   });
 
+  it("a session's shell has no CDPATH, so the outside-write check may follow a bare `cd` (round 26)", () => {
+    expect(opencodeShellEnv({ PATH: "/bin", HOME: "/home/u", CDPATH: "/", CODEOID_AGENT_ENV_ALLOW: "CDPATH" }).CDPATH).toBeUndefined();
+    const { server } = makeServer();
+    expect(makeProvider(server).shellCdpathUnset).toBe(true);
+  });
+
   it("a session's shell gets basics only: no model key, no injected config, no proxy credentials", () => {
     const env = opencodeShellEnv({
       PATH: "/bin",
