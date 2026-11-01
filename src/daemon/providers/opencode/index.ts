@@ -150,10 +150,22 @@ interface Usage {
   cacheRead: number;
   cacheWrite: number;
   cost: number;
+  /** Steps that used tokens opencode billed nothing for: a $0 there isn't a price (#430). */
+  unpriced: number;
+  /**
+   * Requests whose spend nobody reported (#430): stopped while the model
+   * answered (opencode bills such a step nothing), never ended, or lost in a
+   * feed gap that couldn't be read back.
+   */
+  lost: number;
 }
 
 function emptyUsage(): Usage {
-  return { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0 };
+  return { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, cost: 0, unpriced: 0, lost: 0 };
+}
+
+function hasTokens(t: OcTokenUsage | undefined): boolean {
+  return !!t && (t.input || 0) + (t.output || 0) + (t.reasoning || 0) + (t.cache?.read || 0) + (t.cache?.write || 0) > 0;
 }
 
 function addTokens(u: Usage, t: OcTokenUsage | undefined, cost: number | undefined): void {
@@ -165,10 +177,6 @@ function addTokens(u: Usage, t: OcTokenUsage | undefined, cost: number | undefin
     u.cacheWrite += t.cache?.write || 0;
   }
   if (typeof cost === "number" && Number.isFinite(cost)) u.cost += cost;
-}
-
-function addUsage(into: Usage, from: Usage): void {
-  for (const k of Object.keys(into) as Array<keyof Usage>) into[k] += from[k];
 }
 
 interface Gate {
@@ -386,6 +394,8 @@ export class OpencodeProvider implements SessionProvider {
    * across turns (a background child's steps land in later ones), bounded.
    */
   #countedSteps = new Set<string>();
+  /** Steps started and not ended yet, this session's and its children's: message id → opencode session (#430). */
+  #openSteps = new Map<string, string>();
   /** Assistant messages read back after a gap while still being written: read again when their step ends. */
   #streamingReadBack = new Set<string>();
   #blockIndex = new Map<string, number>();
@@ -793,20 +803,31 @@ export class OpencodeProvider implements SessionProvider {
     if (turn.adopted && reason === "superseded") {
       this.#emitTo(turn, { type: "turn_done", result: this.#result(turn, "superseded") });
     }
-    // Spend no turn_done reported (an error, a replaced or torn-down turn —
-    // Session records no cost for those) counts on the next one.
-    addUsage(this.#carry, turn.usage);
+    // A turn closed with no result (replaced, torn down) is recorded by
+    // Session from the llm_calls it read (#430): carried too, it would count
+    // twice. Spend landing after this, with no turn open, is carried (#recordStep).
     turn.usage = emptyUsage();
     turn.queue.close();
     if (this.#turn === turn) this.#turn = null;
   }
 
-  /** The turn's spend so far (and what was carried into it) as a result; reported once. */
+  /**
+   * The turn's spend so far (and what was carried into it) as a result;
+   * reported once. Its cost is opencode's own figure (#430) — unless a
+   * request's spend went unreported, or a step used tokens opencode put no
+   * price on (a subscription sign-in, a model its catalog prices at $0, a
+   * custom provider without a cost): a $0 with tokens isn't a price, as on
+   * Claude. Every step that way, Session prices the tokens (under
+   * `pricing.models`, else unknown); mixed with priced ones, nobody can.
+   */
   #result(turn: Turn, stopReason: string): NormalizedTurnResult {
     const u = turn.usage;
     const c = this.#carry;
     turn.usage = emptyUsage();
     this.#carry = emptyUsage();
+    const cost = u.cost + c.cost;
+    const unpriced = u.unpriced + c.unpriced;
+    const costSource = u.lost + c.lost > 0 || (unpriced > 0 && cost > 0) ? ("unknown" as const) : unpriced > 0 ? undefined : ("backend" as const);
     return {
       providerId: this.id,
       model: turn.model,
@@ -815,7 +836,8 @@ export class OpencodeProvider implements SessionProvider {
       outputTokens: u.output + u.reasoning + c.output + c.reasoning,
       cacheReadTokens: u.cacheRead + c.cacheRead,
       cacheCreationTokens: u.cacheWrite + c.cacheWrite,
-      totalCostUsd: u.cost + c.cost,
+      totalCostUsd: cost,
+      ...(costSource ? { costSource } : {}),
       durationMs: Date.now() - turn.startedAt,
       ...(turn.contextWindow ? { contextWindow: turn.contextWindow } : {}),
       stopReason,
@@ -826,17 +848,16 @@ export class OpencodeProvider implements SessionProvider {
   #finishTurn(turn: Turn, outcome: "succeeded" | "interrupted" | "failed", error?: OcError): void {
     if (turn.queue.closed) return;
     if (outcome === "failed" && !turn.budgetStopped) {
-      // The structured error is what the usage-limit classifier reads; the
-      // spend so far still counts, on the next turn (#closeTurn).
+      // The structured error is what the usage-limit classifier reads.
       const detail = errorDetail(error ?? turn.stepError);
-      this.#emitTo(turn, { type: "error", message: `opencode: ${describeError(error ?? turn.stepError)}`, ...(detail ? { detail } : {}) });
-      this.#closeTurn(turn, "failed");
+      this.#failTurn(turn, `opencode: ${describeError(error ?? turn.stepError)}`, detail);
       return;
     }
     // Steers the budget stop left unanswered, and ones opencode never took:
     // Session absorbs one turn_done for each, then reads the turn's end.
     if (turn.budgetStopped) while (turn.owed > 0) this.#payBoundary(turn);
     for (; turn.unpaid > 0; turn.unpaid--) this.#emitTo(turn, { type: "turn_done", result: this.#result(turn, "steered") });
+    this.#settleOpenSteps(turn);
     const result = this.#result(turn, turn.budgetStopped ? "budget" : outcome === "interrupted" ? "interrupted" : (turn.finish ?? "stop"));
     if (turn.budgetStopped) {
       result.isError = true;
@@ -849,9 +870,60 @@ export class OpencodeProvider implements SessionProvider {
     this.#closeTurn(turn, outcome);
   }
 
-  #failTurn(turn: Turn, message: string): void {
-    this.#emitTo(turn, { type: "error", message });
+  /** The turn failed: it says why, with what it spent so far (#430) — never carried into the next one, which Session would count again. */
+  #failTurn(turn: Turn, message: string, detail?: Record<string, unknown>): void {
+    if (turn.queue.closed) return;
+    this.#settleOpenSteps(turn);
+    const result = this.#result(turn, "error");
+    result.isError = true;
+    result.errorMessage = message;
+    this.#emitTo(turn, { type: "error", message, ...(detail ? { detail } : {}), result });
     this.#closeTurn(turn, "failed");
+  }
+
+  /**
+   * Steps of the turn's own agents (the session's, a foreground subagent's)
+   * still open as it ends: opencode will report their spend to nobody — the
+   * request was stopped, or the server went away (#430). A background
+   * subagent's go on, billed to a later turn as they end.
+   */
+  #settleOpenSteps(turn: Turn): void {
+    for (const [id, sid] of this.#openSteps) {
+      if (sid !== this.#ses && this.#children.get(sid)?.background !== false) continue;
+      this.#openSteps.delete(id);
+      turn.usage.lost++;
+    }
+  }
+
+  /** Where spend lands now: the open turn, else the next turn_done (#carry). */
+  #spendTarget(): Usage {
+    const turn = this.#turn;
+    return turn && !turn.queue.closed ? turn.usage : this.#carry;
+  }
+
+  /**
+   * A step ended, on the feed or read back: it's no longer open, and one
+   * with no usage spent what nobody reported (opencode bills a step stopped
+   * while the model answered nothing) — unless the provider refused its
+   * request, which bills nothing (an error with a status, after opencode's
+   * own retries) (#430).
+   */
+  #stepSettled(id: string | undefined, tokens: OcTokenUsage | undefined, cost: number | undefined, error: OcError | undefined): void {
+    if (id) this.#openSteps.delete(id);
+    if (hasTokens(tokens) || (typeof cost === "number" && cost > 0) || typeof error?.status === "number") return;
+    this.#spendTarget().lost++;
+  }
+
+  /** Steps still open when the session or its server goes: nothing will ever report what they spent (#430). */
+  #dropOpenSteps(): void {
+    if (this.#openSteps.size === 0) return;
+    this.#openSteps.clear();
+    this.#spendTarget().lost++;
+  }
+
+  /** A read-back after a feed gap failed: what the gap held may never be counted (#430). */
+  #gapUnread(turn: Turn | null): void {
+    (turn && !turn.queue.closed ? turn.usage : this.#carry).lost++;
   }
 
   // ── Session attach, resume, fork ───────────────────────────────────
@@ -1068,6 +1140,7 @@ export class OpencodeProvider implements SessionProvider {
   }
 
   #detachSession(): void {
+    this.#dropOpenSteps();
     const ses = this.#ses;
     const conn = this.#conn;
     const dir = this.#workdir;
@@ -1086,6 +1159,7 @@ export class OpencodeProvider implements SessionProvider {
   }
 
   #detachServer(): void {
+    this.#dropOpenSteps();
     this.#unlisten?.();
     this.#unlisten = null;
     this.#conn = null;
@@ -1331,6 +1405,7 @@ export class OpencodeProvider implements SessionProvider {
         return;
       }
       case "session.step.started": {
+        if (typeof d.assistantMessageID === "string" && this.#ses && !this.#countedSteps.has(d.assistantMessageID)) this.#openSteps.set(d.assistantMessageID, this.#ses);
         const turn = this.#turn;
         const model = d.model as OcModelRef | undefined;
         if (model) this.#sessionModel = { providerID: model.providerID, id: model.id };
@@ -1394,10 +1469,13 @@ export class OpencodeProvider implements SessionProvider {
           remember(this.#countedSteps, d.assistantMessageID);
         }
         addTokens(this.#counted, tokens, cost);
+        this.#stepSettled(typeof d.assistantMessageID === "string" ? d.assistantMessageID : undefined, tokens, cost, ev.type === "session.step.failed" ? (d.error as OcError) : undefined);
         this.#recordStep(tokens, cost, true);
         return;
       }
       case "session.retry.scheduled": {
+        // The attempt was refused (it bills nothing); a retry starts the step again.
+        if (typeof d.assistantMessageID === "string") this.#openSteps.delete(d.assistantMessageID);
         const error = d.error as OcError | undefined;
         this.#emit({
           type: "api_retry",
@@ -1573,7 +1651,9 @@ export class OpencodeProvider implements SessionProvider {
       });
     }
     const turn = this.#turn;
-    addTokens(turn && !turn.queue.closed ? turn.usage : this.#carry, tokens, cost);
+    const into = this.#spendTarget();
+    addTokens(into, tokens, cost);
+    if (hasTokens(tokens) && !(typeof cost === "number" && cost > 0)) into.unpriced++;
     if (typeof cost === "number" && Number.isFinite(cost)) this.#spentUsd += cost;
     // The routine's cap, enforced as the spend lands — not only between turns.
     if (turn && !turn.budgetStopped && this.#maxBudgetUsd !== undefined && this.#spentUsd >= this.#maxBudgetUsd) {
@@ -1710,15 +1790,25 @@ export class OpencodeProvider implements SessionProvider {
           if (child.background) this.#emitBackgroundLevel();
         }
         return;
+      case "session.step.started":
+        if (typeof d.assistantMessageID === "string" && !this.#countedSteps.has(d.assistantMessageID)) this.#openSteps.set(d.assistantMessageID, sid);
+        return;
+      case "session.retry.scheduled":
+        if (typeof d.assistantMessageID === "string") this.#openSteps.delete(d.assistantMessageID);
+        return;
       // A failed step is billed too (interrupted after the model answered).
       case "session.step.ended":
-      case "session.step.failed":
+      case "session.step.failed": {
         if (typeof d.assistantMessageID === "string") {
           if (this.#countedSteps.has(d.assistantMessageID)) return; // already read back after a gap
           remember(this.#countedSteps, d.assistantMessageID);
         }
-        this.#recordStep(d.tokens as OcTokenUsage | undefined, typeof d.cost === "number" ? d.cost : undefined, false);
+        const tokens = d.tokens as OcTokenUsage | undefined;
+        const cost = typeof d.cost === "number" ? d.cost : undefined;
+        this.#stepSettled(typeof d.assistantMessageID === "string" ? d.assistantMessageID : undefined, tokens, cost, ev.type === "session.step.failed" ? (d.error as OcError) : undefined);
+        this.#recordStep(tokens, cost, false);
         return;
+      }
       case "session.tool.success":
       case "session.tool.failed":
         this.#toolSettled(sid, d, ev.type === "session.tool.success");
@@ -2191,6 +2281,7 @@ export class OpencodeProvider implements SessionProvider {
     const turn = open && !open.queue.closed ? open : null;
     const work = this.#afterGap(conn, ses, turn).catch((err: unknown) => {
       console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] reading back after a feed gap failed: ${err instanceof Error ? err.message : String(err)}`);
+      this.#gapUnread(turn);
     });
     // The turn's end waits for it: what the gap swallowed comes first.
     if (turn) this.#settling(turn, work);
@@ -2202,7 +2293,14 @@ export class OpencodeProvider implements SessionProvider {
     // its requests and forms ignored, a foreground one blocking the turn.
     // Running is what the server runs now, not the stored times: a child a
     // dead server left behind stays `busy` for good.
-    const [listed, active] = await Promise.all([conn.client.childSessions(ses).catch(() => [] as OcSessionInfo[]), conn.client.activeSessions().catch(() => ({}))]);
+    const [listed, active] = await Promise.all([
+      conn.client.childSessions(ses).catch(() => {
+        // A child the gap created would go uncounted.
+        this.#gapUnread(turn);
+        return [] as OcSessionInfo[];
+      }),
+      conn.client.activeSessions().catch(() => ({})),
+    ]);
     if (!live()) return;
     for (const info of listed) {
       if (this.#children.has(info.id) || info.parentID !== ses) continue;
@@ -2216,6 +2314,7 @@ export class OpencodeProvider implements SessionProvider {
         .map(([id, c]) =>
           this.#readBackChild(conn, id, c).catch((err: unknown) => {
             console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] reading back subagent ${id} after a feed gap failed: ${err instanceof Error ? err.message : String(err)}`);
+            this.#gapUnread(turn);
           }),
         ),
     );
@@ -2262,6 +2361,7 @@ export class OpencodeProvider implements SessionProvider {
       for (const block of m.content ?? []) if (block.type === "tool") this.#settleReadBack(id, m, block);
       if (!this.#countedSteps.has(m.id) && stepEnded(m)) {
         remember(this.#countedSteps, m.id);
+        this.#stepSettled(m.id, m.tokens, m.cost, m.error);
         this.#recordStep(m.tokens, m.cost, false);
       }
     }
@@ -2303,6 +2403,7 @@ export class OpencodeProvider implements SessionProvider {
       info = await conn.client.getSession(ses);
     } catch (err) {
       if (err instanceof OpencodeHttpError && err.status === 404 && this.#turn === turn) this.#failTurn(turn, `opencode: session ${ses} no longer exists`);
+      else this.#gapUnread(turn);
       return;
     }
     if (this.#turn !== turn || turn.queue.closed || this.#ses !== ses) return;
@@ -2404,6 +2505,7 @@ export class OpencodeProvider implements SessionProvider {
     if (!this.#countedSteps.has(m.id) && stepEnded(m)) {
       remember(this.#countedSteps, m.id);
       addTokens(this.#counted, m.tokens, m.cost);
+      this.#stepSettled(m.id, m.tokens, m.cost, m.error);
       this.#recordStep(m.tokens, m.cost, true);
     }
     return open !== undefined;

@@ -66,6 +66,11 @@
  *   I41 (scripted only) an execution that fails while a `later` message waits says why; opencode answers the message next, still in the turn
  *   I42 (scripted only) arguments sent as a JSON string: a search through a workspace symlink is asked as an external directory; a write's card shows its content
  *   I43 (scripted only) a background subagent's question is withdrawn when the subagent is stopped: opencode settled it, no dialog is left
+ *   I44 (scripted only) a workspace symlink to /proc/self/cwd, codeoid started inside the workdir: a read, search or write through it is refused
+ *   I45 (scripted only) a write through a link whose target goes up out of another link's target: the card names the file opencode really creates
+ *   I46 (scripted only) an interrupt in a feed gap longer than the interrupt's settle wait: the turn is read back, its card settled and its step billed to it
+ *   I47 (scripted only) a provider error opencode retries: the first retry is attempt 1, and the failed request bills nothing
+ *   I48 (scripted only) a model opencode prices at $0: the turn's $0 isn't a price (no cost source: Session prices the tokens), as on Claude
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -225,6 +230,13 @@ beforeAll(async () => {
             cost: { input: 1, output: 2 },
             limit: { context: 64_000, output: 4_096 },
           },
+          // Priced at $0 in its catalog, as a subscription sign-in or a free hosted model is (I44).
+          "scripted-free": {
+            name: "Scripted free",
+            capabilities: { tools: true },
+            cost: { input: 0, output: 0 },
+            limit: { context: 64_000, output: 4_096 },
+          },
         },
       },
     };
@@ -379,6 +391,8 @@ describe("opencode (real binary)", () => {
     expect(r!.inputTokens + r!.cacheReadTokens).toBeGreaterThan(0);
     if (UNPRICED) expect(r!.totalCostUsd).toBe(0);
     else expect(r!.totalCostUsd).toBeGreaterThan(0);
+    // opencode's own figure (#430); a $0 with tokens isn't one, and Session prices those tokens.
+    expect(r!.costSource).toBe(UNPRICED ? undefined : "backend");
     expect(r!.nativeRef?.ref).toMatch(/^msg_/);
     expect(p.backingSessionId).toMatch(/^ses/);
     // No waiting on opencode's durable log (it never answers).
@@ -551,6 +565,8 @@ describe("opencode (real binary)", () => {
     }
     expect(done(events)?.stopReason).toBe("interrupted");
     expect(Date.now() - at).toBeLessThan(4_000);
+    // Stopped while the model answered: opencode bills that step nothing, so the turn's cost is unknown (#430).
+    if (SCRIPTED) expect(done(events)?.costSource).toBe("unknown");
     await p.teardown();
   }, 180_000);
 
@@ -598,6 +614,8 @@ describe("opencode (real binary)", () => {
     const events = await collect(p.runTurn(opts("[[fail:400]]")));
     const error = events.find((e) => e.type === "error") as Extract<ProviderEvent, { type: "error" }> | undefined;
     expect(error?.detail).toMatchObject({ type: "provider.invalid-request", status: 400 });
+    // The failed turn's own spend rides its error (#430): the refused request billed nothing, and that is known.
+    expect(error?.result).toMatchObject({ isError: true, costSource: "backend" });
     expect(Date.now() - started).toBeLessThan(8_000);
     // The session is usable after it.
     expect(texts(await collect(p.runTurn(opts("[[text:recovered]]"))))).toEqual(["recovered"]);
@@ -607,7 +625,11 @@ describe("opencode (real binary)", () => {
   maybeScripted("I14 the title opencode generates is billed, once", async () => {
     const p = provider();
     const turns: number[] = [];
-    for (const text of ["[[text:one]]", "[[text:two]]", "[[text:three]]"]) turns.push(done(await collect(p.runTurn(opts(text))))!.totalCostUsd);
+    for (const text of ["[[text:one]]", "[[text:two]]", "[[text:three]]"]) {
+      const r = done(await collect(p.runTurn(opts(text))))!;
+      expect(r.costSource).toBe("backend");
+      turns.push(r.totalCostUsd);
+    }
     const conn = await server!.ensure();
     const info = await conn.client.getSession(p.backingSessionId);
     // Everything opencode billed this session, counted exactly once across the turns.
@@ -1782,6 +1804,19 @@ describe("opencode (real binary)", () => {
     expect(events.find((e) => e.type === "api_retry")).toMatchObject({ attempt: 1, errorStatus: 503 });
     expect(done(events)?.totalCostUsd ?? 0).toBe(0);
     expect(((await conn.client.getSession(p.backingSessionId)).cost ?? 0) - before).toBe(0);
+    await p.teardown();
+  }, 180_000);
+
+  maybeScripted("I48 a model opencode prices at $0: its $0 isn't a price — Session prices the tokens (#430)", async () => {
+    const p = provider();
+    const model = "scripted/scripted-free";
+    await collect(p.runTurn(opts("[[text:first]]", { model })));
+    // Past the first prompt's title: every step of the turn is on the $0 model.
+    const r = done(await collect(p.runTurn(opts("[[text:second]]", { model }))))!;
+    expect(r.model).toBe(model);
+    expect(r.totalCostUsd).toBe(0);
+    expect(r.inputTokens).toBeGreaterThan(0);
+    expect(r.costSource).toBeUndefined();
     await p.teardown();
   }, 180_000);
 

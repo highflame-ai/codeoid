@@ -78,6 +78,10 @@
  *   "fail"         → a 429 retried once, then execution.failed with a structured
  *                    rate-limit error; the failed step bills nothing
  *   "costly"       → three steps of $2 each
+ *   "zero-cost"    → a step that used tokens opencode billed $0 for (a
+ *                    subscription sign-in, a model its catalog prices at $0);
+ *                    "zero-cost-mixed" → a priced step, then such a step
+ *   "no-usage"     → a step that ends reporting no usage at all
  *   "compact"      → a step, an auto compaction of two requests ($0.002 +
  *                    $0.001, billed in the running total), another step
  *   "echo-state"   → reports model/agent/synthetic/prompt text it received
@@ -663,9 +667,13 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
   if (text.includes("use-shell")) {
     const msg = step(ses);
     const r = await toolCall(ses, msg, "shell", { command: "ls -la /tmp", description: "list tmp" }, { action: "shell", resources: ["ls -la /tmp"], save: ["ls *"] });
-    // A bare reject (no feedback) aborts the step, and the execution ends interrupted.
+    // A bare reject (no feedback) aborts the step, and the execution ends
+    // interrupted. As on real 2.2.5 the model had answered: the step is billed.
     if (!r.ok && !r.message) {
-      durable(ses, "session.step.failed", { assistantMessageID: msg, error: { type: "aborted", message: "Step interrupted" } });
+      const m = ses.messages.find((x) => x.id === msg);
+      if (m) Object.assign(m, { cost: 0.0123, tokens: TOKENS, error: { type: "aborted", message: "Step interrupted" }, time: { ...m.time, completed: Date.now() } });
+      durable(ses, "session.step.failed", { assistantMessageID: msg, error: { type: "aborted", message: "Step interrupted" }, cost: 0.0123, tokens: TOKENS });
+      bill(ses, 0.0123, TOKENS);
       return "interrupted";
     }
     endStep(ses, msg);
@@ -1021,6 +1029,25 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     endStep(ses, msg2);
     return "succeeded";
   }
+  if (text.includes("zero-cost")) {
+    if (text.includes("mixed")) {
+      const priced = step(ses);
+      await say(ses, priced, "priced");
+      endStep(ses, priced);
+    }
+    const msg = step(ses);
+    await say(ses, msg, "free to opencode");
+    endStep(ses, msg, 0);
+    return "succeeded";
+  }
+  if (text.includes("no-usage")) {
+    const msg = step(ses);
+    await say(ses, msg, "no usage");
+    const m = ses.messages.find((x) => x.id === msg);
+    if (m) Object.assign(m, { finish: "stop", time: { ...m.time, streamed: Date.now(), completed: Date.now() } });
+    durable(ses, "session.step.ended", { assistantMessageID: msg, finish: "stop" });
+    return "succeeded";
+  }
   if (text.includes("costly")) {
     for (let i = 0; i < 3; i++) {
       const msg = step(ses);
@@ -1220,6 +1247,14 @@ async function startExecution(ses: Ses, text: string, inboxID?: string): Promise
     }
   } catch (err) {
     if (!(err instanceof Cancelled)) throw err;
+    // As real 2.2.5 stops a step while the model still answers: it fails
+    // with no usage (the response's usage never came), billed nothing.
+    for (const m of ses.messages) {
+      if (m.type !== "assistant" || m.time?.completed) continue;
+      const error = { type: "aborted", message: "Step interrupted" };
+      Object.assign(m, { error, time: { ...m.time, completed: Date.now() } });
+      durable(ses, "session.step.failed", { assistantMessageID: m.id, error });
+    }
     outcome = "interrupted";
   }
   // As real 2.2.x: the last step has ended, the execution hasn't yet. An

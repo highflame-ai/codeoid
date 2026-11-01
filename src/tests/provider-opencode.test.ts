@@ -1184,6 +1184,104 @@ describe("opencode cost and tokens", () => {
     expect(r.nativeRef?.ref.startsWith("msg_")).toBe(true);
   });
 
+  describe("where a turn's cost comes from (#430)", () => {
+    it("opencode's own figure: Session never prices its tokens again", async () => {
+      const { server } = makeServer();
+      const p = makeProvider(server);
+      expect(done(await collect(p.runTurn(opts("use-shell"))))!.costSource).toBe("backend");
+      // A refused request (a 429 retried, then refused) bills nothing, and that is known.
+      expect(done(await collect(p.runTurn(opts("retry"))))!.costSource).toBe("backend");
+      await p.teardown();
+    });
+
+    it("a failed turn reports its own spend on its error, never carried into the next turn", async () => {
+      const { server } = makeServer();
+      const p = makeProvider(server);
+      await collect(p.runTurn(opts("hi")));
+      const failed = (await collect(p.runTurn(opts("fail")))).at(-1) as Extract<ProviderEvent, { type: "error" }>;
+      expect(failed.type).toBe("error");
+      // The 429 was refused: nothing spent, and that is known.
+      expect(failed.result).toMatchObject({ isError: true, totalCostUsd: 0, costSource: "backend" });
+      expect(failed.result!.errorMessage).toContain("Rate limit reached");
+      const next = done(await collect(p.runTurn(opts("hi"))))!;
+      expect(next.totalCostUsd).toBeCloseTo(0.0123, 6);
+      await p.teardown();
+    });
+
+    it("a turn stopped while the model answers is unknown: opencode bills that step nothing", async () => {
+      const { server } = makeServer();
+      const p = makeProvider(server);
+      const run = p.runTurn(opts("slow"));
+      const events: ProviderEvent[] = [];
+      let stopped = false;
+      for await (const e of run.events) {
+        events.push(e);
+        if (!stopped && e.type === "llm_call") {
+          stopped = true;
+          void run.interrupt();
+        }
+        if (e.type === "turn_done" || e.type === "error") break;
+      }
+      const r = done(events)!;
+      expect(r.stopReason).toBe("interrupted");
+      expect(r.costSource).toBe("unknown");
+      // What the ended steps cost is still reported.
+      expect(r.totalCostUsd).toBeGreaterThanOrEqual(0.0123);
+      // Only that turn: the next one is known again.
+      expect(done(await collect(p.runTurn(opts("hi"))))!.costSource).toBe("backend");
+      await p.teardown();
+    });
+
+    it("a budget stop mid-step is unknown too: the stopped step's spend never came", async () => {
+      const { server } = makeServer();
+      const r = done(await collect(makeProvider(server).runTurn(opts("costly", { maxBudgetUsd: 3 }))))!;
+      expect(r).toMatchObject({ stopReason: "budget", costSource: "unknown" });
+      expect(r.totalCostUsd).toBeGreaterThanOrEqual(4);
+    });
+
+    it("a $0 with tokens isn't a price: alone, Session prices the tokens; mixed with priced steps, nobody can", async () => {
+      const { server } = makeServer();
+      const p = makeProvider(server);
+      // The first turn's title is priced; the zero-cost turns come after it.
+      await collect(p.runTurn(opts("hi")));
+      const free = done(await collect(p.runTurn(opts("zero-cost"))))!;
+      expect(free.costSource).toBeUndefined();
+      expect(free.totalCostUsd).toBe(0);
+      expect(free.inputTokens).toBeGreaterThan(0);
+      const mixed = done(await collect(p.runTurn(opts("zero-cost-mixed"))))!;
+      expect(mixed.costSource).toBe("unknown");
+      expect(mixed.totalCostUsd).toBeCloseTo(0.0123, 6);
+      await p.teardown();
+    });
+
+    it("a step that reports no usage at all is unknown", async () => {
+      const { server } = makeServer();
+      const p = makeProvider(server);
+      await collect(p.runTurn(opts("hi")));
+      expect(done(await collect(p.runTurn(opts("no-usage"))))!.costSource).toBe("unknown");
+      await p.teardown();
+    });
+
+    it("a feed gap whose read-back fails is unknown: what the gap held may never be counted", async () => {
+      const { server } = makeServer();
+      const p = makeProvider(server);
+      await collect(p.runTurn(opts("hi")));
+      const conn = await server.ensure();
+      // Listing the children the gap may have created fails: one's spend would go uncounted.
+      const children = conn.client.childSessions.bind(conn.client);
+      conn.client.childSessions = async () => {
+        throw new Error("read refused");
+      };
+      const r = done(await collect(p.runTurn(opts("gap"))))!;
+      conn.client.childSessions = children;
+      expect(r.costSource).toBe("unknown");
+      // The turn's own steps were read back all the same.
+      expect(r.totalCostUsd).toBeCloseTo(0.0123 + 0.5, 6);
+      expect(done(await collect(p.runTurn(opts("hi"))))!.costSource).toBe("backend");
+      await p.teardown();
+    }, 20_000);
+  });
+
   it("bills the title opencode generates, which only its running total reports", async () => {
     const { server } = makeServer();
     const p = makeProvider(server);
@@ -1274,7 +1372,7 @@ describe("opencode cost and tokens", () => {
     });
   }
 
-  it("a turn the server's death ended still reports its spend, on the next turn", async () => {
+  it("a turn the server's death ended still reports its spend, on its own error — not again on the next turn (#430)", async () => {
     const { server } = makeServer();
     const p = makeProvider(server);
     const run = p.runTurn(opts("costly"));
@@ -1285,12 +1383,19 @@ describe("opencode cost and tokens", () => {
       if (e.type === "llm_call" && ++calls === 2) process.kill(server.pid!, "SIGKILL");
       if (e.type === "turn_done" || e.type === "error") break;
     }
-    expect(events.at(-1)?.type).toBe("error");
+    const err = events.at(-1) as Extract<ProviderEvent, { type: "error" }>;
+    expect(err.type).toBe("error");
     expect(calls).toBe(2);
-    // Two $2 steps ran before the death; Session records no cost for an error.
-    // The new server's session bills its own first prompt's title.
+    // Two $2 steps ran before the death: the error carries them, opencode's
+    // figure, which Session records (carried as well, it would count twice).
+    // A third step under way when it died spent what nobody will report.
+    expect(err.result).toMatchObject({ providerId: "opencode", isError: true });
+    expect(err.result!.totalCostUsd).toBeCloseTo(4, 6);
+    expect(["backend", "unknown"]).toContain(err.result!.costSource!);
+    // The new server's session bills its own reply and first prompt's title only.
     const next = await collect(p.runTurn(opts("hi")));
-    expect(done(next)!.totalCostUsd).toBeCloseTo(4 + 0.0123 + 0.0007, 6);
+    expect(done(next)!.totalCostUsd).toBeCloseTo(0.0123 + 0.0007, 6);
+    expect(done(next)!.costSource).toBe("backend");
     await p.teardown();
   });
 });

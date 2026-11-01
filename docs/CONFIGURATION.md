@@ -229,7 +229,8 @@ TELEGRAM_ALLOWED_USER_IDS=6714605885
 
 ## Model prices
 
-Some backends report what each turn cost (Claude, pi); the others report tokens only (Codex, OpenAI and OpenAI-compatible endpoints, Gemini, Qwen).
+Some backends report what each turn cost (Claude, pi, opencode); the others report tokens only (Codex, OpenAI and OpenAI-compatible endpoints, Gemini, Qwen).
+A $0 with tokens from a backend that reports cost isn't a price (a gateway, a subscription sign-in, a model the backend's catalog prices at $0): its tokens are priced as below, under the backend's model id (`provider/model` on opencode).
 For those, codeoid prices the tokens at the model's list price, so session totals, routine spend caps and the fleet board count them; the UI marks such a total as an estimate (`~$0.42`).
 A model on your own machine costs nothing: llama.cpp on a loopback host (`127.0.0.1`, `localhost`) that answers `/props` as llama-server (a proxy on a loopback port doesn't, so it isn't free unless you say so).
 For your own server elsewhere on your network, set `providers.llamacpp.free: true`; anything else (it could be a gateway forwarding to a paid API) is priced like any other backend, and a price in `pricing.models` always wins.
@@ -253,7 +254,7 @@ Your own prices win, per model, in USD per million tokens:
 Each request is billed at its own tier when the backend reported every request's tokens; otherwise the whole turn is billed at its largest request's tier.
 The snapshot never lists a model as free (a provider's free tier isn't the model's price elsewhere); only `pricing.models` can.
 A model with no price (here or in the snapshot) has an **unknown** cost, shown as `$?` (or `$0.42+` when some turns were priced), never as $0; a routine with a spend cap stops on such a turn (docs/routines.md).
-The Gemini CLI reports no token counts, so its turns are always of unknown cost; so is a turn whose usage never arrived (a server that leaves it out of the stream), a turn that ended mid-way (an error, a stop) without saying what it spent, or while a request was still streaming (its usage comes only when it ends), a Qwen turn that used more than one model, and a Qwen turn that ran a sub-agent (qwen-code reports no usage for its requests).
+The Gemini CLI reports no token counts, so its turns are always of unknown cost; so is a turn whose usage never arrived (a server that leaves it out of the stream), a turn that ended mid-way (an error, a stop) without saying what it spent, or while a request was still streaming (its usage comes only when it ends), a Qwen turn that used more than one model, a Qwen turn that ran a sub-agent (qwen-code reports no usage for its requests), and an opencode turn part of whose spend went unreported (docs/opencode.md, Cost).
 A turn that failed before reaching the model spent nothing.
 Qwen doesn't report thinking tokens separately, so a Qwen estimate leaves them out.
 

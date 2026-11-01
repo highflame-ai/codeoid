@@ -430,8 +430,11 @@ export type ProviderEvent =
    * The turn failed. `detail` is the backend's STRUCTURED error, when it gave
    * one (codex's `codexErrorInfo` + reset instant — codexErrorDetail): read by
    * the usage-limit classifier, never shown. `message` stays the display text.
+   * `result`: what the failed turn spent, for a backend that counts it itself
+   * (opencode): recorded as the turn's cost, instead of an estimate from the
+   * `llm_call`s Session saw (#430).
    */
-  | { type: "error"; message: string; detail?: Record<string, unknown> };
+  | { type: "error"; message: string; detail?: Record<string, unknown>; result?: NormalizedTurnResult };
 
 /**
  * True when a text/thinking ProviderEvent was produced by a subagent

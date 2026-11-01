@@ -7872,6 +7872,11 @@ export class Session {
           continue;
         }
 
+        // A failed turn the backend costed itself: its figure, not an estimate at exit (#430).
+        if (event.type === "error" && event.result && !resultRecorded) {
+          this.#recordTurnFromResult(event.result);
+          resultRecorded = true;
+        }
         await this.#handleProviderEvent(event);
         if (event.type === "turn_done") resultRecorded = true;
         if (event.type === "turn_done" || event.type === "error") break;
