@@ -425,7 +425,10 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   (`GET`/`DELETE /api/shell`: a stopped shell still wakes its session), and the
   wake. An attach it overtakes mounts nothing more and adopts no session
   (`#epoch`); one already mounting is waited out (bounded), so its mounts and
-  token go with the rest. A fresh attach to a session found running stops that leftover
+  token go with the rest. A prompt still being posted is waited out (bounded):
+  one that lands after the teardown (or after an interrupt) is stopped by
+  `#post` (`#stopLanded`), and after a teardown waited until it has stopped,
+  so a turn after it never joins it. A fresh attach to a session found running stops that leftover
   execution before prompting (`#stopLeftover`). Running means listed in
   `GET /api/session/active`, for a child as for the session: a server that
   died mid-execution never wrote their `idle`, so a stored `busy` is stale

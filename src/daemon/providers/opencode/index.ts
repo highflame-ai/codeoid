@@ -651,6 +651,10 @@ export class OpencodeProvider implements SessionProvider {
 
   /** Attach, switch what changed, and post the turn's prompt (or command). */
   async #post(conn: OpencodeConnection, turn: Turn, opts: TurnOpts, stale: () => boolean): Promise<void> {
+    // Stopped while its prompt was on its way in: interrupted, or closed by a
+    // teardown (which stops only an execution that has started) before its
+    // execution was seen. What the prompt starts would run on unobserved.
+    const unwatched = () => turn.interrupted || ((turn.queue.closed || this.#turn !== turn) && !turn.started);
     const ses = await this.#attach(conn, opts.workdir);
     if (stale()) return;
     await this.#applySelection(conn, ses, opts);
@@ -673,7 +677,7 @@ export class OpencodeProvider implements SessionProvider {
       if (command && runnableCommand(this.#sessionId, command, this.#mounts.keys(), args)) {
         turn.sending = true;
         await conn.client.command(ses, { name: name!, text: args });
-        if (turn.interrupted) await this.#stopLanded(conn, ses);
+        if (unwatched()) await this.#stopLanded(conn, ses, undefined, turn);
         turn.markPosted();
         // A command may run the agent (most do: they submit a prompt) or
         // only act. Give it a moment to start an execution; one that didn't
@@ -689,7 +693,7 @@ export class OpencodeProvider implements SessionProvider {
       if (skill) {
         turn.sending = true;
         turn.promptId = (await conn.client.prompt(ses, { text: args || `/${name}`, skills: [{ id: skill }] })).id;
-        if (turn.interrupted) await this.#stopLanded(conn, ses, turn.promptId);
+        if (unwatched()) await this.#stopLanded(conn, ses, turn.promptId, turn);
         return;
       }
     }
@@ -697,18 +701,23 @@ export class OpencodeProvider implements SessionProvider {
     this.#pendingHistorySeed = null;
     turn.sending = true;
     turn.promptId = (await conn.client.prompt(ses, { text: seed ? `${seed}\n\n${message}` : message })).id;
-    if (turn.interrupted) await this.#stopLanded(conn, ses, turn.promptId);
+    if (unwatched()) await this.#stopLanded(conn, ses, turn.promptId, turn);
   }
 
   /**
    * The turn was stopped while its prompt was on its way in: the stop found
    * nothing running, and opencode stored the prompt after it. What it starts
    * is stopped now, and ends this turn (#settleInterrupt waits for it), so
-   * its spend is this turn's, never run on unobserved.
+   * its spend is this turn's, never run on unobserved. After a teardown it
+   * is stopped on `conn` though the provider has let the server go, while
+   * the teardown waits for it (#teardown).
    */
-  async #stopLanded(conn: OpencodeConnection, ses: string, id?: string): Promise<void> {
+  async #stopLanded(conn: OpencodeConnection, ses: string, id?: string, turn?: Turn): Promise<void> {
     if (id) this.#cancelInput(conn, ses, id);
     await conn.client.interrupt(ses).catch(() => {});
+    // Torn down: nothing settles it here, and a turn after the teardown would
+    // join it: the teardown waits until it has stopped (bounded).
+    if (turn && !turn.interrupted) await this.#stoppedWithin(conn, ses).catch(() => {});
   }
 
   /** A message sent while the turn runs: steer it now (`now`/`next`), or queue it behind (`later`). */
@@ -1182,14 +1191,19 @@ export class OpencodeProvider implements SessionProvider {
   async #stopLeftover(conn: OpencodeConnection, info: OcSessionInfo): Promise<OcSessionInfo> {
     console.warn(`[opencode-provider ${this.#sessionId.slice(0, 8)}] opencode session ${info.id} runs an execution started after its backend was torn down — stopping it`);
     await conn.client.interrupt(info.id).catch(() => {});
+    if (!(await this.#stoppedWithin(conn, info.id))) throw new Error(`opencode session ${info.id} is still running something codeoid didn't start, and didn't stop — try again`);
+    return conn.client.getSession(info.id);
+  }
+
+  /** Whether the server stops running the session within `INTERRUPT_SETTLE_MS`. */
+  async #stoppedWithin(conn: OpencodeConnection, id: string): Promise<boolean> {
     const until = Date.now() + INTERRUPT_SETTLE_MS;
-    let running = await this.#runsNow(conn, info.id);
+    let running = await this.#runsNow(conn, id);
     while (running && Date.now() < until) {
       await Bun.sleep(50);
-      running = await this.#runsNow(conn, info.id);
+      running = await this.#runsNow(conn, id);
     }
-    if (running) throw new Error(`opencode session ${info.id} is still running something codeoid didn't start, and didn't stop — try again`);
-    return conn.client.getSession(info.id);
+    return !running;
   }
 
   /**
@@ -2870,6 +2884,10 @@ export class OpencodeProvider implements SessionProvider {
     // already mounting is waited out, so what it mounted is unmounted here
     // and its token revoked below.
     if (this.#attaching) await Promise.race([this.#attaching.catch(() => {}), Bun.sleep(ATTACH_WAIT_MS)]);
+    // A prompt still being posted is waited out too (bounded): one that lands
+    // after this is stopped by #post, here, before a turn that follows the
+    // teardown can prompt the same opencode session.
+    if (turn) await Promise.race([turn.posted, Bun.sleep(ATTACH_WAIT_MS)]);
     const dir = this.#workdir;
     if (conn && dir) await Promise.race([this.#unmount(conn, dir), Bun.sleep(2_000)]);
     // The opencode session stays: the next turn resumes it by id.

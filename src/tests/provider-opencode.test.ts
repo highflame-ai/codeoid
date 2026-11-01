@@ -1235,6 +1235,49 @@ describe("opencode interrupt", () => {
     await p.teardown();
   });
 
+  it("a teardown while the turn's prompt is still being stored stops the execution it starts: nothing runs on unobserved (round-20 audit)", async () => {
+    // Session.destroy, a hard stop and a backend switch tear down without an
+    // interrupt first; with nothing running yet the teardown found nothing to
+    // stop, and the prompt that landed after it ran on with nobody listening.
+    const { server } = makeServer({ FAKE_OPENCODE_SLOW_PROMPT_MS: "600" });
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hi")));
+    const ses = p.backingSessionId!;
+    const conn = await server.ensure();
+    const assistants = async () => (await conn.client.messages(ses)).data.filter((m) => m.type === "assistant").length;
+    const before = { replies: await assistants(), cost: (await conn.client.getSession(ses)).cost };
+    const run = p.runTurn(opts("slow"));
+    const collected = collect(run);
+    while ((await fakeState(server)).prompts.length < 2) await Bun.sleep(10);
+    await p.teardown();
+    await collected;
+    // The prompt lands (600 ms), then its execution would run its step.
+    await Bun.sleep(1_000);
+    expect((await fakeState(server)).interrupts).toContain(ses);
+    expect(ses in (await conn.client.activeSessions())).toBe(false);
+    expect(await assistants()).toBe(before.replies);
+    expect((await conn.client.getSession(ses)).cost).toBe(before.cost);
+  });
+
+  it("a turn right after such a teardown runs to its end: the landed prompt is stopped before the teardown returns", async () => {
+    const { server } = makeServer({ FAKE_OPENCODE_SLOW_PROMPT_MS: "600" });
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hi")));
+    const run = p.runTurn(opts("slow"));
+    const collected = collect(run);
+    while ((await fakeState(server)).prompts.length < 2) await Bun.sleep(10);
+    await p.teardown();
+    await collected;
+    const stops = (await fakeState(server)).interrupts.length;
+    expect(stops).toBeGreaterThan(0);
+    // The same opencode session, prompted again at once: nothing stops it.
+    const next = await collect(p.runTurn(opts("hi")));
+    expect(done(next)?.stopReason).toBe("stop");
+    expect(texts(next, "text_done").length).toBeGreaterThan(0);
+    expect((await fakeState(server)).interrupts.length).toBe(stops);
+    await p.teardown();
+  });
+
   /** A gate that holds `who`'s requests open until they're withdrawn; `reached` resolves at the first. */
   function holding(who: "main" | "child") {
     let reach = () => {};
