@@ -110,6 +110,9 @@
  *       listing, not its default, no catalog fetch from opencode.ai, and a turn with no other model fails saying what to
  *       set; opted in (providers.opencode.hostedModels) it is listed and fetched. Every outbound request goes to a local
  *       proxy that records its target and refuses it: nothing reaches opencode.ai
+ *   I66 (round 24) the user's own opencode config can't reach opencode.ai under another id while hosted models are off:
+ *       an `opencode-go` key, a provider whose `canonical` copies `opencode`, one whose base URL is on opencode.ai, and a
+ *       `small_model` on one are dropped; opencode's own listing has none of them, no default, and nothing connects
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -2773,6 +2776,65 @@ describe("opencode (real binary)", () => {
     } finally {
       await off.stop();
       await on.stop();
+      proxy.stop(true);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  maybe("I66 a carried opencode-go key, canonical copy or opencode.ai base URL offers nothing while hosted models are off (nothing connects)", async () => {
+    const targets: string[] = [];
+    const proxy = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        data(sock, data) {
+          targets.push(new TextDecoder().decode(data).split("\r\n")[0] ?? "");
+          sock.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+          sock.end();
+        },
+      },
+    });
+    const url = `http://127.0.0.1:${proxy.port}`;
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-hosted2-")));
+    const work = join(root, "work");
+    const user = join(root, "user-config");
+    mkdirSync(work);
+    mkdirSync(user);
+    // As the round-24 audit's scenarios wrote it, against real 2.2.5.
+    writeFileSync(
+      join(user, "opencode.json"),
+      JSON.stringify({
+        small_model: "opencode-go/kimi-k3.1-pro",
+        provider: { "opencode-go": { options: { apiKey: "go-key" } } },
+        providers: {
+          z: { canonical: "opencode", settings: { apiKey: "public" }, models: { "big-pickle": {} } },
+          zen: { package: "@ai-sdk/openai-compatible", settings: { baseURL: "https://opencode.ai/zen/v1", apiKey: "public" }, models: { "big-pickle": {} } },
+        },
+      }),
+    );
+    const server = new OpencodeServer({
+      command: resolved!.command,
+      argsPrefix: resolved!.argsPrefix,
+      dbPath: join(root, "db", "opencode.db"),
+      dataDir: join(root, "files"),
+      env: () => {
+        const env = buildOpencodeEnv();
+        for (const k of Object.keys(env)) if (/_API_KEY$/.test(k)) delete env[k];
+        return { ...env, HOME: join(root, "home"), HTTPS_PROXY: url, HTTP_PROXY: url, https_proxy: url, http_proxy: url, NO_PROXY: "127.0.0.1,localhost", no_proxy: "127.0.0.1,localhost" };
+      },
+      userConfigDir: user,
+      hostedModels: false,
+    });
+    try {
+      const conn = await server.ensure();
+      const ids = (await conn.client.providers(work)).map((p) => p.id);
+      for (const id of ["opencode", "opencode-go", "z", "zen"]) expect(ids).not.toContain(id);
+      expect((await conn.client.models(work)).filter((m) => ["opencode", "opencode-go", "z", "zen"].includes(m.providerID))).toEqual([]);
+      expect(await conn.client.defaultModel(work)).toBeUndefined();
+      await Bun.sleep(1_500);
+      expect(targets.filter((t) => t.includes("opencode.ai"))).toEqual([]);
+    } finally {
+      await server.stop();
       proxy.stop(true);
       rmSync(root, { recursive: true, force: true });
     }
