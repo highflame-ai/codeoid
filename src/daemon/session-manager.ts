@@ -16,6 +16,7 @@ import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
 import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, DEFAULT_ACCOUNT, type AccountKind, type ClaudeAccountKind } from "../protocol/types.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
+import { isHostedModel } from "./providers/opencode/policy.js";
 import {
   createDefaultProviderRegistry,
   DefaultProviderError,
@@ -2093,7 +2094,7 @@ mcpHub: this.#mcpHub,
     const persisted = this.#persistedModels(providerId);
     // A catalog an earlier daemon saved may list opencode's hosted models, off unless opted in (docs/opencode.md).
     if (persisted && providerId === "opencode" && this.#config?.providers?.opencode?.hostedModels !== true) {
-      return { models: persisted.filter((m) => !m.value.startsWith("opencode/")), live: false };
+      return { models: persisted.filter((m) => !isHostedModel(m.value)), live: false };
     }
     if (persisted) return { models: persisted, live: false };
     return {

@@ -32,7 +32,7 @@ import { basename, dirname, join } from "node:path";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
 import { GIT_FLOOR, gitCheckout, gitProblem, leadsToCodeoid, MERCURIAL_FLOOR, mercurialCheckout, mercurialProblem, OpencodeServer, OpencodeIncompatibleError, SERVER_CWD_BASES, SERVER_CWD_PREFIX, stopOpencodeServers } from "../daemon/providers/opencode/server.js";
 import { secretPathVerdict } from "../daemon/secret-paths.js";
-import { buildOpencodeEnv, commandlessShellLine, formatterProblem, serverEnv, opencodeConfig, opencodeShellEnv, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents, userModelConfig } from "../daemon/providers/opencode/policy.js";
+import { buildOpencodeEnv, commandlessShellLine, formatterProblem, hostedProviderProblem, serverEnv, opencodeConfig, opencodeShellEnv, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents, userModelConfig } from "../daemon/providers/opencode/policy.js";
 import { OPENCODE_CREDENTIALS_PROCESS_DIR, OPENCODE_INSTALL_HINT, opencodeCredentialsDir, opencodeDbPath, opencodeSecretLocations, opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
 import { effortOfVariant, gateCallFor, parseModelValue, realTarget } from "../daemon/providers/opencode/translate.js";
 import { OpencodeClient, parseSse } from "../daemon/providers/opencode/client.js";
@@ -508,7 +508,7 @@ describe("opencode server lifecycle", () => {
     const st = await fakeState(server);
     expect(st.config.model).toBe("openrouter/some-model");
     expect(st.config.small_model).toBe("openrouter/small");
-    expect(st.config.disabled_providers).toEqual(["opencode"]);
+    expect(st.config.disabled_providers).toEqual(["opencode", "opencode-go"]);
     // codeoid's own providers win over the user's of the same name. A
     // user's provider with an `{env:…}` isn't carried: on codeoid's server
     // it would read the server's environment, which has no key (a
@@ -1651,7 +1651,7 @@ describe("opencode's hosted models (opencode.ai)", () => {
     const p = makeProvider(server);
     await collect(p.runTurn(opts("hi")));
     const st = await fakeState(server);
-    expect(JSON.parse(st.configText).disabled_providers).toEqual(["opencode"]);
+    expect(JSON.parse(st.configText).disabled_providers).toEqual(["opencode", "opencode-go"]);
     expect(st.env.names).toContain("OPENCODE_DISABLE_MODELS_FETCH");
     expect(st.env.names).toContain("OPENCODE_DISABLE_FREE_MODELS");
     const models = (await p.listModels()).map((m) => m.id);
@@ -1761,13 +1761,14 @@ describe("opencode's hosted models (opencode.ai)", () => {
     for (const why of skipped) expect(why).toContain("providers.opencode.hostedModels");
     // What the server is given: the user's own deny kept, opencode's added after it.
     const config = opencodeConfig({}, undefined, carried);
-    expect(config.disabled_providers).toEqual(["mistral", "opencode"]);
+    expect(config.disabled_providers).toEqual(["mistral", "opencode", "opencode-go"]);
     expect(config.enabled_providers).toEqual(["gw"]);
-    // Only opencode named: the list goes whole (empty, it would deny every provider).
+    // Only opencode named: still a restriction, now to none of the user's own providers.
     writeFileSync(join(user, "opencode.json"), JSON.stringify({ enabled_providers: ["opencode"] }));
     const only: string[] = [];
-    expect(userModelConfig(user, only, (l) => l).enabled_providers).toBeUndefined();
+    expect(userModelConfig(user, only, (l) => l).enabled_providers).toEqual([]);
     expect(only).toHaveLength(1);
+    expect(only[0]).toContain("none of your own providers is enabled");
     // Opted in: carried as written.
     writeFileSync(join(user, "opencode.json"), JSON.stringify({ model: "opencode/big-pickle", enabled_providers: ["opencode"], providers: { opencode: { settings: {} } } }));
     const none: string[] = [];
@@ -1781,11 +1782,106 @@ describe("opencode's hosted models (opencode.ai)", () => {
     const config = opencodeConfig({}, { opencode: { settings: { apiKey: "x" } }, anthropic: { settings: {} } }, { model: "opencode/big-pickle", enabled_providers: ["opencode"] }, { model: "opencode/big-pickle" });
     expect(Object.keys(config.providers as object)).toEqual(["anthropic"]);
     expect(config.model).toBeUndefined();
-    expect(config.enabled_providers).toBeUndefined();
-    expect(config.disabled_providers).toEqual(["opencode"]);
+    // A restriction stays one; codeoid's own provider is added to it.
+    expect(config.enabled_providers).toEqual(["anthropic"]);
+    expect(config.disabled_providers).toEqual(["opencode", "opencode-go"]);
     const env = serverEnv({ password: "p", dbPath: "/d/db", configDir: "/d/c", dataDir: "/d/data", config });
     expect(env.OPENCODE_DISABLE_MODELS_FETCH).toBe("1");
     expect(serverEnv({ password: "p", dbPath: "/d/db", configDir: "/d/c", dataDir: "/d/data", config, hostedModels: true }).OPENCODE_DISABLE_MODELS_FETCH).toBeUndefined();
+  });
+});
+
+describe("round 24: everything that reaches opencode.ai is hosted", () => {
+  const carriedFrom = (doc: Record<string, unknown>, opts: { hostedModels?: boolean } = {}) => {
+    const user = realpathSync(tmp());
+    writeFileSync(join(user, "opencode.json"), JSON.stringify(doc));
+    const skipped: string[] = [];
+    return { carried: userModelConfig(user, skipped, (l) => l, opts), skipped, user };
+  };
+
+  it("opencode-go, an entry whose canonical copies a hosted provider (or one that does), and an entry on opencode.ai are dropped, with their models", () => {
+    const { carried, skipped } = carriedFrom({
+      model: "z/big-pickle",
+      small_model: "opencode-go/kimi-k3.1-pro",
+      enabled_providers: ["z", "zen", "gw", "opencode-go"],
+      providers: {
+        "opencode-go": { settings: { apiKey: "k" } },
+        z: { canonical: "opencode", settings: { apiKey: "public" } },
+        y: { canonical: "z" },
+        zen: { package: "@ai-sdk/openai-compatible", settings: { baseURL: "https://opencode.ai/zen/v1" } },
+        gw: { package: "@ai-sdk/openai-compatible", settings: { baseURL: "http://gw.example/v1" } },
+        lookalike: { package: "@ai-sdk/openai-compatible", settings: { baseURL: "https://notopencode.ai/v1" } },
+      },
+      provider: { sub: { options: { baseURL: "https://api.opencode.ai/v1" } } },
+    });
+    expect(Object.keys(carried.providers as object).sort()).toEqual(["gw", "lookalike"]);
+    expect(carried.provider).toEqual({});
+    expect(carried.model).toBeUndefined();
+    expect(carried.small_model).toBeUndefined();
+    expect(carried.enabled_providers).toEqual(["gw"]);
+    expect(skipped.filter((w) => w.includes("hostedModels"))).toHaveLength(8);
+    // Opted in: carried as written.
+    const opted = carriedFrom({ model: "z/big-pickle", providers: { "opencode-go": { settings: { apiKey: "k" } }, z: { canonical: "opencode" } } }, { hostedModels: true });
+    expect(opted.skipped).toEqual([]);
+    expect(Object.keys(opted.carried.providers as object).sort()).toEqual(["opencode-go", "z"]);
+  });
+
+  it("codeoid's own entries and default model are held to the same rule", () => {
+    const config = opencodeConfig({}, { anthropic: { settings: {} }, alias: { canonical: "opencode-go" }, "opencode-go": { settings: {} } }, {}, { model: "opencode-go/kimi-k3.1-pro" });
+    expect(Object.keys(config.providers as object)).toEqual(["anthropic"]);
+    expect(config.model).toBeUndefined();
+    expect(config.disabled_providers).toEqual(expect.arrayContaining(["opencode", "opencode-go", "alias"]));
+  });
+
+  it("a carried enabled_providers keeps its meaning and doesn't shut out codeoid's own providers", () => {
+    const { carried } = carriedFrom({ enabled_providers: ["gw"] });
+    expect(opencodeConfig({}, { anthropic: { settings: {} } }, carried).enabled_providers).toEqual(["gw", "anthropic"]);
+    const onlyHosted = carriedFrom({ enabled_providers: ["opencode"] }).carried;
+    expect(opencodeConfig({}, undefined, onlyHosted).enabled_providers).toEqual([]);
+    expect(opencodeConfig({}, { anthropic: {} }, onlyHosted).enabled_providers).toEqual(["anthropic"]);
+  });
+
+  it("a server offering opencode-go, or a provider copying a hosted one, is refused", () => {
+    expect(hostedProviderProblem([{ id: "anthropic" }, { id: "opencode-go" }], false)).toContain("`opencode-go`");
+    expect(hostedProviderProblem([{ id: "z", canonical: "opencode" }], false)).toContain("`z`");
+    expect(hostedProviderProblem([{ id: "anthropic" }, { id: "opencode-go" }], true)).toBeNull();
+    expect(hostedProviderProblem([{ id: "anthropic" }], false)).toBeNull();
+  });
+
+  it("end to end: the user's opencode-go key and canonical alias offer nothing, and the turn runs on codeoid's default", async () => {
+    const user = realpathSync(tmp());
+    writeFileSync(
+      join(user, "opencode.json"),
+      JSON.stringify({ small_model: "opencode-go/kimi-k3.1-pro", providers: { "opencode-go": { settings: { apiKey: "k" } }, z: { canonical: "opencode", settings: { apiKey: "public" } } } }),
+    );
+    const { server } = makeServer({}, { userConfigDir: user });
+    const p = makeProvider(server);
+    const events = await collect(p.runTurn(opts("echo-state")));
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    const listed = await p.listModels();
+    expect(listed.map((m) => m.id).filter((m) => m.startsWith("opencode-go/") || m.startsWith("z/"))).toEqual([]);
+    // opencode's default (what the turn ran on, no model picked) is codeoid's, not opencode.ai's.
+    expect(listed.find((m) => m.isDefault)?.id).toBe("anthropic/claude-sonnet-4");
+  });
+
+  it("end to end: a carried enabled_providers that named only opencode enables none of the user's providers, so the turn fails saying what to set", async () => {
+    const user = realpathSync(tmp());
+    writeFileSync(join(user, "opencode.json"), JSON.stringify({ enabled_providers: ["opencode"] }));
+    const { server } = makeServer({}, { userConfigDir: user });
+    const events = await collect(makeProvider(server).runTurn(opts("hi")));
+    expect(events.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("opencode has no model to run this turn") });
+    expect((await fakeState(server)).prompts).toHaveLength(0);
+  });
+
+  it("end to end: a carried enabled_providers keeps codeoid's own provider usable", async () => {
+    const user = realpathSync(tmp());
+    writeFileSync(join(user, "opencode.json"), JSON.stringify({ enabled_providers: ["openai"] }));
+    const { server } = makeServer({}, { userConfigDir: user, modelProviders: { anthropic: { name: "codeoid's" } } });
+    const p = makeProvider(server);
+    const events = await collect(p.runTurn(opts("hi")));
+    expect(done(events)?.isError).toBeFalsy();
+    const providers = new Set((await p.listModels()).map((m) => m.id.split("/")[0]));
+    expect([...providers].sort()).toEqual(["anthropic", "openai"]);
   });
 });
 

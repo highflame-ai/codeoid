@@ -471,8 +471,8 @@ export class OpencodeClient {
   }
 
   /** The providers the server offers (`GET /api/provider`): each with a usable credential or no need for one. */
-  async providers(directory?: string): Promise<Array<{ id: string; activation?: string }>> {
-    return (await this.#request<{ data: Array<{ id: string; activation?: string }> }>("GET", "/api/provider", { directory })).data ?? [];
+  async providers(directory?: string): Promise<Array<{ id: string; activation?: string; canonical?: string }>> {
+    return (await this.#request<{ data: Array<{ id: string; activation?: string; canonical?: string }> }>("GET", "/api/provider", { directory })).data ?? [];
   }
 
   async commands(directory?: string): Promise<OcCommandInfo[]> {

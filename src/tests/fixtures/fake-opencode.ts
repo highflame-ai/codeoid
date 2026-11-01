@@ -191,6 +191,11 @@
  * `provider.use` deny: gone from every listing and the default) or
  * OPENCODE_DISABLE_FREE_MODELS is set with no key for it; FAKE_OPENCODE_HOSTED_ALLOWED=1
  * offers it whatever the config says (a system config document allowing it).
+ * `opencode-go` (opencode.ai's Go plan) is listed when the config has an
+ * entry (a key) for it. An entry with `canonical` gets a copy of that
+ * provider's catalog under its own id (2.2.5's `overlayProvider`), and
+ * `enabled_providers` denies every provider it doesn't list, as
+ * `disabled_providers` denies those it does (deny wins).
  * The default is the config's `model` when it is listed, else the first
  * listed model, else none (`data: null`).
  *
@@ -528,19 +533,68 @@ const HOSTED_MODELS = [
   },
 ];
 
-/** Whether the config's `disabled_providers` (a `provider.use` deny) names `id`; `enabled_providers` can't undo it. */
+/** opencode-go's models (opencode.ai's Go plan): listed only with a key for it, as 2.2.5 does. */
+const GO_MODELS = [
+  {
+    id: "kimi-k3.1-pro",
+    providerID: "opencode-go",
+    name: "Kimi K3.1 Pro",
+    variants: [],
+    enabled: true,
+    status: "active",
+    cost: [{ input: 1, output: 4 }],
+    limit: { context: 200_000, output: 32_000 },
+    capabilities: { tools: true, input: ["text"], output: ["text"] },
+  },
+];
+
+const HOSTED_IDS = ["opencode", "opencode-go"];
+
+/** The config's provider entries (`providers`, and the older `provider`), by id. */
+function configuredProviders(): Record<string, Json> {
+  const out: Record<string, Json> = {};
+  for (const k of ["provider", "providers"]) {
+    const v = config[k];
+    if (v && typeof v === "object" && !Array.isArray(v)) Object.assign(out, v as Record<string, Json>);
+  }
+  return out;
+}
+
+/**
+ * Whether `id` is denied: a `provider.use` deny from `disabled_providers`, or
+ * from an `enabled_providers` list that doesn't name it (2.2.5's
+ * `normalizePolicies`: deny `*`, then allow each listed; an empty list denies
+ * every provider). A later deny wins: listing a disabled one doesn't undo it.
+ */
 function providerDenied(id: string): boolean {
-  if (id === "opencode" && process.env.FAKE_OPENCODE_HOSTED_ALLOWED === "1") return false;
+  if (HOSTED_IDS.includes(id) && process.env.FAKE_OPENCODE_HOSTED_ALLOWED === "1") return false;
   const disabled = config.disabled_providers;
-  return Array.isArray(disabled) && disabled.includes(id);
+  if (Array.isArray(disabled) && disabled.includes(id)) return true;
+  const enabled = config.enabled_providers;
+  return Array.isArray(enabled) && !enabled.includes(id);
+}
+
+/** A catalog provider's models: what an entry's `canonical` copies (2.2.5's `overlayProvider`). */
+function catalogOf(id: string): Json[] {
+  if (id === "opencode") return HOSTED_MODELS;
+  if (id === "opencode-go") return GO_MODELS;
+  return MODELS.filter((m) => m.providerID === id);
 }
 
 /** The usable models the server lists: the hosted ones first, as real 2.2.5 orders them. */
 function listedModels(): Json[] {
   const freeOff = ["1", "true"].includes((process.env.OPENCODE_DISABLE_FREE_MODELS ?? "").toLowerCase()) && process.env.FAKE_OPENCODE_HOSTED_ALLOWED !== "1";
+  const configured = configuredProviders();
   const hosted = providerDenied("opencode") || freeOff ? [] : HOSTED_MODELS;
+  const go = configured["opencode-go"] && !providerDenied("opencode-go") ? GO_MODELS : [];
+  // An entry with `canonical` gets a copy of that provider's catalog under its own id, not filtered as free.
+  const copies = Object.entries(configured).flatMap(([id, entry]) => {
+    const canonical = (entry as { canonical?: unknown } | null)?.canonical;
+    if (typeof canonical !== "string" || providerDenied(id)) return [];
+    return catalogOf(canonical).map((m) => ({ ...m, providerID: id }));
+  });
   const own = process.env.FAKE_OPENCODE_NO_CREDENTIALS === "1" ? [] : MODELS.filter((m) => !providerDenied(m.providerID));
-  return [...hosted, ...own];
+  return [...hosted, ...go, ...copies, ...own];
 }
 
 /** `GET /api/model/default`: the config's `model` when listed, else the first usable model, else none. */

@@ -80,7 +80,7 @@ import {
   commandlessShellLine,
   fetchFence,
   fetchOrigin,
-  HOSTED_PROVIDER_ID,
+  isHostedProvider,
   mcpNamespace,
   opencodeShellEnv,
   ownMountPrefix,
@@ -1461,9 +1461,9 @@ export class OpencodeProvider implements SessionProvider {
     );
   }
 
-  /** Whether codeoid offers a model of this provider: opencode's hosted one only when opted in. */
+  /** Whether codeoid offers a model of this provider: opencode's hosted ones (`opencode`, `opencode-go`) only when opted in. */
   #offered(ref: { providerID: string }): boolean {
-    return ref.providerID !== HOSTED_PROVIDER_ID || this.#server.hostedModels;
+    return !isHostedProvider(ref.providerID) || this.#server.hostedModels;
   }
 
   /** Whether `ref` is one of the usable models opencode lists, read again once when it isn't in the cached list. */
