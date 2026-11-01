@@ -169,8 +169,17 @@ describe("opencode turn costs as Session records them (#430)", () => {
     const { s, send } = await session();
     await send("hi");
     void s.send("slow", OWNER);
-    for (let i = 0; i < 200 && s.status !== "thinking"; i++) await Bun.sleep(10);
-    await Bun.sleep(200);
+    // Stop once opencode has the prompt and is stepping, not after a fixed
+    // delay: on a slow machine a Stop before the prompt is sent keeps it from
+    // being sent at all, and there is no turn to cost.
+    const conn = await server.ensure();
+    const end = Date.now() + 10_000;
+    while (Date.now() < end) {
+      const st = (await (await fetch(`${conn.client.baseUrl}/__fake/state`)).json()) as { prompts: { text?: string }[] };
+      if (st.prompts.some((x) => x.text === "slow")) break;
+      await Bun.sleep(10);
+    }
+    await Bun.sleep(100);
     await s.interrupt(OWNER);
     for (let i = 0; i < 500 && s.status !== "idle"; i++) await Bun.sleep(10);
     await Bun.sleep(50);
