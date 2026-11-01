@@ -1470,7 +1470,14 @@ describe("opencode interrupt", () => {
     const { server } = makeServer({ FAKE_OPENCODE_SLOW_PROMPT_MS: "800" });
     const p = makeProvider(server);
     const run = p.runTurn(opts("slow"));
-    setTimeout(() => void run.interrupt(), 100);
+    // Interrupt once the prompt has reached opencode and is being stored, not
+    // after a fixed delay: on a slow machine starting the server alone can take
+    // longer, and an interrupt before the prompt is sent is another case.
+    void (async () => {
+      const end = Date.now() + 10_000;
+      while (Date.now() < end && !(await fakeState(server)).prompts.some((x: { text?: string }) => x.text === "slow")) await Bun.sleep(10);
+      void run.interrupt();
+    })();
     const events = await collect(run);
     expect(done(events)?.stopReason).toBe("interrupted");
     // Stopped by the time the turn ended, not left running to its end.

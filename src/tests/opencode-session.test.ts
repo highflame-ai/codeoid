@@ -174,7 +174,16 @@ describe("opencode through a Session", () => {
     const s = manager._sessionForTest(id)!;
     await s.send("slow", AUTH);
     await until(() => s.status === "thinking");
-    await Bun.sleep(150);
+    // Stop once opencode has the prompt, not after a fixed delay: on a slow
+    // machine the prompt may not be sent yet, and a Stop before it is sent
+    // keeps it from being sent at all (another case).
+    const conn0 = await server.ensure();
+    const end = Date.now() + 10_000;
+    while (Date.now() < end) {
+      const st = (await (await fetch(`${conn0.client.baseUrl}/__fake/state`)).json()) as { prompts: { text?: string }[] };
+      if (st.prompts.some((x) => x.text === "slow")) break;
+      await Bun.sleep(10);
+    }
     const stopped = s.interrupt(AUTH);
     // The user's Stop is still on its way to opencode: Session still shows the turn working.
     expect(s.status).toBe("thinking");
