@@ -3612,6 +3612,45 @@ describe("opencode as real 2.2.x servers behave", () => {
     await p.teardown();
   }, 30_000);
 
+  it("an interrupt after a feed gap that hid the step's start: every token was reported, so the cost is known (round-21 audit)", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hello")));
+    let run: TurnRun | null = null;
+    const gate: ToolApprovalFn = () => {
+      setTimeout(() => void run?.interrupt(), 100);
+      return new Promise(() => {});
+    };
+    run = p.runTurn(opts("startgap-ask", { canUseTool: gate }));
+    const result = done(await collect(run))!;
+    expect(result.stopReason).toBe("interrupted");
+    // The aborted step reported its tokens: opencode's price, not unknown.
+    expect(result.costSource).toBe("backend");
+    expect(result.totalCostUsd).toBeCloseTo(0.0123, 9);
+    expect(done(await collect(p.runTurn(opts("hello"))))!.costSource).toBe("backend");
+    await p.teardown();
+  });
+
+  it("an interrupt after a feed gap that held a whole step, read back: the cost is known (round-21 audit)", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hello")));
+    const run = p.runTurn(opts("startgap-idle"));
+    const events: ProviderEvent[] = [];
+    for await (const e of run.events) {
+      events.push(e);
+      // The read-back after the gap found the step: no step is open now.
+      if (e.type === "text_done") setTimeout(() => void run.interrupt(), 300);
+      if (e.type === "turn_done" || e.type === "error") break;
+    }
+    expect(texts(events, "text_done")).toEqual(["said in the gap"]);
+    const result = done(events)!;
+    expect(result.stopReason).toBe("interrupted");
+    expect(result.costSource).toBe("backend");
+    expect(result.totalCostUsd).toBeCloseTo(0.0123, 9);
+    await p.teardown();
+  });
+
   it("a permission asked in a gap is judged on the call opencode stored, not refused", async () => {
     const { server } = makeServer();
     const asked: Array<[string, Record<string, unknown>]> = [];

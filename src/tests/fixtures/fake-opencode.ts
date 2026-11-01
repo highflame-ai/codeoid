@@ -121,6 +121,13 @@
  *                    step still runs (a call follows in the same message)
  *   "interrupt-gap" → a shell call asks, the feed drops and stays down 7s:
  *                    an interrupt meanwhile ends the execution in the gap
+ *   "startgap-ask" → the feed drops just after the execution's start, so the
+ *                    step's start falls in the gap; its response is complete
+ *                    (a shell call that asks, with usage), so an interrupt
+ *                    fails the step with its tokens, as real 2.2.5 does
+ *   "startgap-idle" → the feed drops just after the execution's start, a
+ *                    whole step runs in the gap, then the execution waits,
+ *                    no step open, until it is interrupted
  *   "gap-ask"      → a shell call and its permission request fall in the gap
  *   "gap-reason-ask" → reasoning starts on the feed; its end, then two
  *                    parallel shell calls and their requests, fall in the gap
@@ -1307,6 +1314,25 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
     endStep(ses, msg);
     return "succeeded";
   }
+  if (text.includes("startgap-idle")) {
+    const up = dropFeed();
+    const msg = step(ses);
+    await say(ses, msg, "said in the gap");
+    endStep(ses, msg);
+    setTimeout(up, 200);
+    while (!signal.cancelled) await sleep(20);
+    throw new Cancelled();
+  }
+  if (text.includes("startgap-ask")) {
+    const up = dropFeed();
+    setTimeout(up, 400);
+    const msg = step(ses);
+    const m = ses.messages.find((x) => x.id === msg) as (Json & { answered?: { cost: number; tokens: Json } }) | undefined;
+    if (m) m.answered = { cost: 0.0123, tokens: TOKENS };
+    await toolCall(ses, msg, "shell", { command: "echo startgap", description: "x" }, { action: "shell", resources: ["echo startgap"] });
+    endStep(ses, msg);
+    return "succeeded";
+  }
   if (text.includes("gap-ask")) {
     // The call and its permission request fall in the gap; the request is
     // re-offered once the feed is back.
@@ -1378,12 +1404,16 @@ async function startExecution(ses: Ses, text: string, inboxID?: string): Promise
   } catch (err) {
     if (!(err instanceof Cancelled)) throw err;
     // As real 2.2.5 stops a step while the model still answers: it fails
-    // with no usage (the response's usage never came), billed nothing.
+    // with no usage (the response's usage never came), billed nothing. One
+    // whose response had ended (`answered`: a call waiting on its request)
+    // fails with what it used, billed.
     for (const m of ses.messages) {
       if (m.type !== "assistant" || m.time?.completed) continue;
       const error = { type: "aborted", message: "Step interrupted" };
-      Object.assign(m, { error, time: { ...m.time, completed: Date.now() } });
-      durable(ses, "session.step.failed", { assistantMessageID: m.id, error });
+      const answered = (m as { answered?: { cost: number; tokens: Json } }).answered;
+      Object.assign(m, { error, time: { ...m.time, completed: Date.now() }, ...(answered ?? {}) });
+      durable(ses, "session.step.failed", { assistantMessageID: m.id, error, ...(answered ?? {}) });
+      if (answered) bill(ses, answered.cost, answered.tokens);
     }
     outcome = "interrupted";
   }

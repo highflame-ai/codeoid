@@ -96,6 +96,8 @@
  *       skip it, and a session's own shell has none of it
  *   I59 (scripted only) a message pushed mid-turn and still in opencode's inbox when the backend is torn down (a model switch,
  *       an MCP refresh) is withdrawn: the next turn, on the session the teardown kept, answers only its own prompt
+ *   I60 (scripted only) a feed gap from the moment the execution starts hides its step's start; interrupted at the call's
+ *       approval after it, the aborted step still reports every token, so the turn's cost is opencode's, not unknown
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -2463,6 +2465,50 @@ describe("opencode (real binary)", () => {
       const conn = await server!.ensure();
       const stored = JSON.stringify((await conn.client.messages(p.backingSessionId)).data);
       expect(stored).not.toContain("answered-stale");
+      await p.teardown();
+    }
+  }, 180_000);
+
+  maybeScripted("I60 a feed gap that hid the step's start: interrupted at the approval after it, the turn's cost is still opencode's", async () => {
+    const p = provider();
+    await collect(p.runTurn(opts("[[text:warm]]")));
+    const conn = await server!.ensure();
+    const ses = p.backingSessionId;
+    const before = (await conn.client.getSession(ses)).cost ?? 0;
+    // Cut as the execution's start arrives, so its step's start falls in the gap.
+    let armed = true;
+    const seen: string[] = [];
+    const off = server!.listen({
+      onEvent: (e) => {
+        if (e.durable?.aggregateID !== ses) return;
+        seen.push(e.type);
+        if (armed && e.type === "session.execution.started") {
+          armed = false;
+          cutFeed();
+          setTimeout(restoreFeed, 2_500);
+        }
+      },
+    });
+    let run: TurnRun | null = null;
+    const gate: ToolApprovalFn = () => {
+      setTimeout(() => void run?.interrupt(), 100);
+      return new Promise(() => {});
+    };
+    try {
+      run = p.runTurn(opts(`[[tool:shell ${JSON.stringify({ command: "echo r21-gap", description: "x" })}]]`, { canUseTool: gate }));
+      const result = done(await collect(run))!;
+      expect(result.stopReason).toBe("interrupted");
+      // The gap hid the step's start; its end was seen, with its tokens.
+      expect(seen).not.toContain("session.step.started");
+      expect(seen).toContain("session.step.failed");
+      expect(result.costSource).toBe("backend");
+      const after = (await conn.client.getSession(ses)).cost ?? 0;
+      expect(after - before).toBeGreaterThan(0);
+      expect(result.totalCostUsd).toBeCloseTo(after - before, 9);
+      expect(done(await collect(p.runTurn(opts("[[text:after]]"))))?.costSource).toBe("backend");
+    } finally {
+      off();
+      restoreFeed();
       await p.teardown();
     }
   }, 180_000);

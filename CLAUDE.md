@@ -523,7 +523,7 @@ opencode's turns carry its own figure (`costSource: "backend"`), `unknown` when
 part of the spend went unreported (`Usage.lost`: a step aborted with no usage,
 still open when its turn ended or its server went, an attempt that broke off after part of an answer (real 2.2.5 fails it with the response's 200, then retries: only a status ≥400 with nothing streamed is a refusal), a gap read-back that failed,
 a compaction ended `compaction.interrupted`: real 2.2.5 announces no start;
-an execution interrupted before it announced a step, `#noStepInterrupted`: real 2.2.5 has often sent the step's request;
+an execution interrupted before it announced a step, `#noStepInterrupted`: real 2.2.5 has often sent the step's request (a step whose start fell in a feed gap is known from its blocks, calls or end, or the gap's read-back: `STEP_EVIDENCE`);
 not a step whose connection was never made with nothing streamed, `neverConnected`),
 and no source for a $0 with tokens (`Usage.unpriced`: Session prices those, as
 Claude's); a failed turn's result rides its `error` event (`error.result`), never

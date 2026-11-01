@@ -179,6 +179,9 @@ function stepTokens(t: OcTokenUsage): { inputTokens: number; outputTokens: numbe
   return { inputTokens: t.input || 0, outputTokens: (t.output || 0) + (t.reasoning || 0), cacheReadTokens: t.cache?.read || 0, cacheCreationTokens: t.cache?.write || 0 };
 }
 
+/** Events only a step that started emits: its blocks, its calls, its end (whose spend #stepSettled judges). */
+const STEP_EVIDENCE = /^session\.(step\.(ended|failed)|text\.|reasoning\.|tool\.)/;
+
 /** Events that bound a step's attempt: none of them says the model answered. */
 const STEP_BOUNDARIES = new Set(["session.step.started", "session.step.ended", "session.step.failed", "session.retry.scheduled"]);
 
@@ -366,7 +369,9 @@ export class OpencodeProvider implements SessionProvider {
   /**
    * Whether the session's execution the feed showed starting has started a
    * step yet (null: none seen starting). One interrupted before its first
-   * step may still have sent the step's request (#noStepInterrupted).
+   * step may still have sent the step's request (#noStepInterrupted). A
+   * step's start lost in a feed gap is known from its other events, or from
+   * the step the gap's read-back finds (#reconcile).
    */
   #stepSeen: boolean | null = null;
   /**
@@ -1524,6 +1529,9 @@ export class OpencodeProvider implements SessionProvider {
   /** One of this session's durable events. */
   #onDurable(ev: OcEvent): void {
     const d = (ev.data ?? {}) as Record<string, unknown>;
+    // Only a started step has blocks, calls or an end: its start fell in a
+    // feed gap, and what it spent is reported as it ends (#stepSettled).
+    if (this.#stepSeen === false && STEP_EVIDENCE.test(ev.type)) this.#stepSeen = true;
     switch (ev.type) {
       case "session.execution.started": {
         this.#executing = true;
@@ -2690,6 +2698,8 @@ export class OpencodeProvider implements SessionProvider {
         continue;
       }
       if (m.type !== "assistant") continue;
+      // A step the running execution stored: its start fell in the gap.
+      if (this.#stepSeen === false && (m.time?.created ?? 0) >= busy) this.#stepSeen = true;
       if (ended) {
         turn.lastAssistantMessageID = m.id;
         // The last step's finish is the turn's (the feed may have shown only an earlier one).
