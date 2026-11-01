@@ -288,6 +288,7 @@ class Walker {
         const body = n.childForFieldName("body");
         const index = this.out.commands.length;
         if (body) this.node(body, { ...ctx, redirects, heredoc });
+        else if (ctx.substitution === "command") this.#substitutedRead(redirects, ctx);
         for (const c of this.out.commands) if (c.feeds === owner) c.feeds = body?.type === "command" ? index : null;
         return;
       }
@@ -358,6 +359,25 @@ class Walker {
         // command inside may run, in the stage of the pipeline they're in.
         for (const c of n.namedChildren) if (c) this.node(c, ctx);
     }
+  }
+
+  /**
+   * `$(< FILE)`, a substitution of only redirects: bash reads FILE as its
+   * output. Recorded as the `cat < FILE` it is, so what reads a command's
+   * redirects judges FILE too.
+   */
+  #substitutedRead(redirects: ShellRedirect[], ctx: Ctx): void {
+    this.out.commands.push({
+      argv: [{ value: "cat", raw: "cat", glob: false, shape: "cat" }],
+      redirects: [...ctx.redirects, ...redirects],
+      via: ctx.via,
+      pipeline: ctx.pipeline,
+      stage: ctx.stage,
+      feeds: ctx.feeds,
+      substitution: ctx.substitution,
+      heredoc: false,
+      delegates: false,
+    });
   }
 
   command(n: Node, ctx: Ctx): void {
@@ -593,9 +613,16 @@ class Walker {
       case "command_substitution":
       case "process_substitution": {
         const kind = n.type === "command_substitution" ? "command" : raw.startsWith(">") ? "process-out" : "process-in";
+        const inner = this.#fresh(ctx.via, ctx.depth, { feeds: owner, substitution: kind });
+        const bare: ShellRedirect[] = [];
         for (const c of n.namedChildren) {
-          if (c) this.node(c, this.#fresh(ctx.via, ctx.depth, { feeds: owner, substitution: kind }));
+          if (!c) continue;
+          if (c.type === "file_redirect" && kind === "command") {
+            this.out.constructs.push(constructName(c));
+            bare.push(...this.redirect(c, inner, owner));
+          } else this.node(c, inner);
         }
+        if (bare.length > 0) this.#substitutedRead(bare, inner);
         return { value: null, raw, glob: false };
       }
       default:

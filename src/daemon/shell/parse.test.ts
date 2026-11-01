@@ -180,6 +180,20 @@ describe("shell parsing (#431)", () => {
     expect(commands[by("wget").feeds!]!.argv[0]!.value).toBe("bash");
   });
 
+  it("records `$(< FILE)` as the `cat < FILE` bash runs for it (#447 round-19 audit)", async () => {
+    for (const line of ["echo $(< f)", "echo `< f`", "x=$(<f)", 'echo "$(< f)"', "echo $(< f 2>/dev/null)"]) {
+      const { commands } = await parseShell(line);
+      const read = commands.find((c) => c.argv[0]?.value === "cat");
+      expect([line, read?.substitution, read?.redirects.find((r) => r.op === "<")?.target?.value]).toEqual([line, "command", "f"]);
+    }
+    // The command whose word holds it is what its output feeds.
+    const { commands } = await parseShell("echo $(< f)");
+    expect(commands[commands[1]!.feeds!]!.argv[0]!.value).toBe("echo");
+    // A process substitution or a statement of only a redirect reads nothing out.
+    expect(await argvs("cat <(< f)")).toEqual([["cat", null]]);
+    expect(await argvs("< f")).toEqual([]);
+  });
+
   it("marks a shell that runs its input, and what a statement's redirect substitution feeds (round-1 audit)", async () => {
     const stdin = async (c: string) => (await parseShell(c)).commands.filter((x) => x.stdinScript).map((x) => x.argv[0]!.value);
     expect(await stdin("x | sh")).toEqual(["sh"]);

@@ -35,6 +35,7 @@ So `approvals.autoAllowLowRisk` can't be talked into running something unusual: 
 
 The parser looks through pipelines, `&&` / `||` / `;` chains, subshells, loops and conditionals, `$(…)`, `` `…` `` and `<(…)` (in an unquoted here-document too), here-documents, and wrappers that run another command: `sudo`, `env`, `nice`, `nohup`, `timeout`, `xargs`, `find -exec`, `fd -x`, `watch`, `flock`, `eval`, `trap`, `script -c`, `coproc`, `time`, `busybox`, `alias`, and `bash -c '…'` (and the same for `sh`, `zsh` and the other shells, whatever options come before or after `-c`).
 `sudo bash -c 'rm -rf /'` is judged as the `rm` it runs, and as running as another user.
+`$(< FILE)` (and `` `< FILE` ``) is judged as the `cat < FILE` bash runs for it: `echo $(< ~/.codeoid/config.json)` is refused as `cat` of that file is.
 A shell that runs its input (`echo '…' | sh`, `bash /dev/stdin <<< '…'`, `cat <<EOF | bash`) is judged as the script when the line holds it, and is not understood when it doesn't (`… | base64 -d | sh`, `sh < <(…)`).
 `time` or `coproc` in front of a compound command (`time { …; }`) is not understood, and what's inside is judged too.
 

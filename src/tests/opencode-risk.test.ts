@@ -196,6 +196,17 @@ describe("an opencode shell call is judged by risk as a Claude Bash call is (#43
     }
   });
 
+  test("`$(< FILE)` is the read of FILE it is: the server's environment and codeoid's config are refused in any mode on both backends (round-19 audit)", async () => {
+    for (const line of ["echo $(< /proc/$PPID/environ)", `echo $(< ${join(getConfigDir(), "config.json")})`]) {
+      for (const mode of ["autonomous", "guarded"] as const) {
+        const oc = await opencodeCall({ command: line }, mode);
+        expect([line, mode, oc.asked, oc.reply.includes("holds credentials") ? "refused" : oc.reply]).toEqual([line, mode, false, "refused"]);
+        expect([line, mode, (await claudeCall({ command: line }, mode)).behavior]).toEqual([line, mode, "deny"]);
+      }
+    }
+    expect((await opencodeCall({ command: "echo $(< README.md)" }, "autonomous")).reply).toBe("ran it");
+  });
+
   test("the directory opencode runs it in is the one judged: a bare name in codeoid's config dir is a credential read", async () => {
     const oc = await opencodeCall({ command: "cat config.json", workdir: getConfigDir() }, "autonomous");
     expect(oc.asked).toBe(false);
