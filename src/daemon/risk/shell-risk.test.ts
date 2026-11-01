@@ -422,6 +422,32 @@ describe("shell command risk (#431)", () => {
     }
   });
 
+  it("refuses ps showing processes' environments, as reading /proc/<pid>/environ is; a plain ps stays medium (#447 round-17 audit)", async () => {
+    // procps reads every same-user process's environ itself (the daemon's keys, a backend server's password).
+    for (const c of [
+      "ps e",
+      "ps eww -C opencode",
+      "ps auxe",
+      "ps aux e",
+      "ps -o pid=,command= eww -C opencode",
+      "ps -AE",
+      "ps axo pid,env",
+      "ps -o environ -p 1",
+      "ps --format=pid,environ",
+      "env ps eww",
+      "timeout 5 ps auxe",
+      "ps $OPTS",
+    ]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret?.action, r.level]).toEqual([c, "deny", "high"]);
+    }
+    // `-e` is every process, and an option's own argument isn't an option (`-C opencode`, `o user`).
+    for (const c of ["ps", "ps aux", "ps -ef", "ps -e", "ps -C opencode -o pid,cmd", "ps o user,pid", "ps -o user=", "ps -p 1234", "ps 1234", "ps --sort=-pcpu", "ps U someone", "ps -p $PID"]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret, r.level]).toEqual([c, undefined, "medium"]);
+    }
+  });
+
   it("refuses a credential file named through $HOME, or after a cd (round-1 audit)", async () => {
     for (const c of ['cat "$HOME/.codeoid/config.json"', "cat ${HOME}/.codeoid/.env", "cat < $HOME/.codeoid/config.json", "cd ~/.codeoid && cat config.json"]) {
       const r = await assessShellCommand(c, ctx);

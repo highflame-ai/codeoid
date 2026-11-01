@@ -744,6 +744,9 @@ function judgeCommand(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | nul
     case "killall":
       judgeKill(cmd, prog, v);
       return;
+    case "ps":
+      judgePs(cmd, v);
+      return;
     case "env":
     case "printenv":
     case "set":
@@ -1149,6 +1152,71 @@ function judgeSsh(cmd: SimpleCommand, v: Verdict): void {
   }
   if (operands.length > 1) v.add("unknown", "ssh runs a command on another machine");
   else v.add("medium", "ssh connects to another machine");
+}
+
+/** ps options that take an argument: Unix (`-o FMT`, `-oFMT`), long (`--format FMT`, `--format=FMT`), BSD (`o FMT`). */
+const PS_UNIX_ARG = new Set("CGgOopqstUuk");
+const PS_BSD_ARG = new Set("oOpqtUk");
+const PS_LONG_ARG = new Set(["--format", "--cols", "--columns", "--width", "--lines", "--rows", "--group", "--Group", "--pid", "--ppid", "--quick-pid", "--sid", "--sort", "--tty", "--user", "--User", "--context"]);
+const PS_FORMAT = new Set(["o", "O", "--format"]);
+
+/**
+ * `ps` with the environment shown (BSD `e`, as in `ps eww` or `ps auxe`;
+ * macOS's `-E`; an `env`/`environ` field) prints every same-user process's
+ * environment: it reads `/proc/<pid>/environ` itself, so the line names no
+ * file the secret check sees. It hands over what any of them holds — the
+ * daemon's keys, a backend server's password — and is refused as reading
+ * that file is. A word it can't read might be one of those.
+ */
+function judgePs(cmd: SimpleCommand, v: Verdict): void {
+  let env: string | null = null;
+  let pending: string | null = null;
+  const format = (value: string) => {
+    if (value.split(/[\s,]+/).some((f) => /^(env|environ)(=|:|$)/i.test(f))) env ??= "an environment field";
+  };
+  for (const w of cmd.argv.slice(1)) {
+    const word = w.value;
+    if (pending !== null) {
+      if (PS_FORMAT.has(pending)) {
+        if (word === null) env ??= "a format only known at run time";
+        else format(word);
+      }
+      pending = null;
+      continue;
+    }
+    if (word === null) {
+      env ??= "an option only known at run time";
+      continue;
+    }
+    if (word.startsWith("--")) {
+      const eq = word.indexOf("=");
+      const name = eq < 0 ? word : word.slice(0, eq);
+      if (eq >= 0 && PS_FORMAT.has(name)) format(word.slice(eq + 1));
+      else if (eq < 0 && PS_LONG_ARG.has(name)) pending = name;
+      continue;
+    }
+    if (/^\d[\d,]*$/.test(word)) continue; // pids
+    const unix = word.startsWith("-");
+    const group = unix ? word.slice(1) : word;
+    for (let i = 0; i < group.length; i++) {
+      const c = group[i]!;
+      if ((unix && c === "E") || (!unix && c === "e")) env ??= unix ? "-E" : "e";
+      if ((unix ? PS_UNIX_ARG : PS_BSD_ARG).has(c)) {
+        const rest = group.slice(i + 1);
+        if (rest) {
+          if (c === "o" || c === "O") format(rest);
+        } else pending = c;
+        break;
+      }
+    }
+  }
+  if (env === null) {
+    v.add("medium", "runs ps");
+    return;
+  }
+  const path = "/proc/<pid>/environ";
+  v.secret = { action: "deny", path };
+  v.add("high", `ps shows processes' environments (${env}), which hold credentials: it reads ${path}`);
 }
 
 function judgeKill(cmd: SimpleCommand, prog: string, v: Verdict): void {

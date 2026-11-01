@@ -162,6 +162,18 @@ describe("an opencode shell call is judged by risk as a Claude Bash call is (#43
     expect((await claudeCall({ command: line }, "autonomous")).behavior).toBe("deny");
   });
 
+  test("ps showing processes' environments (the server's password, the daemon's keys) is refused in any mode, as a read of /proc/<pid>/environ (round-17 audit)", async () => {
+    for (const line of ["ps eww -C opencode", "ps auxe"]) {
+      const oc = await opencodeCall({ command: line }, "autonomous");
+      expect(oc.asked).toBe(false);
+      expect(oc.reply).toContain("/proc/<pid>/environ");
+      expect(oc.reply).not.toBe("ran it");
+      expect((await claudeCall({ command: line }, "autonomous")).behavior).toBe("deny");
+    }
+    // A plain listing still runs in autonomous mode.
+    expect((await opencodeCall({ command: "ps aux" }, "autonomous")).reply).toBe("ran it");
+  });
+
   test("the directory opencode runs it in is the one judged: a bare name in codeoid's config dir is a credential read", async () => {
     const oc = await opencodeCall({ command: "cat config.json", workdir: getConfigDir() }, "autonomous");
     expect(oc.asked).toBe(false);

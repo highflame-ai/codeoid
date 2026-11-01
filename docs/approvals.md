@@ -56,7 +56,7 @@ Within what it recognises, the reader over-states rather than under-states:
 - Otherwise each mode does what it always did: guarded asks about every shell command, autonomous runs them within its budget. Medium runs unasked in autonomous mode, and on Claude a `permissions.allow` rule in your Claude settings runs it unasked too.
 
 A command that names one of codeoid's own credential files, or another agent's login (`~/.codeoid/config.json`, `~/.claude/.credentials.json`, `~/.codex/auth.json`, …), in a way the reader recognises, is refused, in any mode, as reading the file with a file tool is.
-That includes a file a wrapper reads itself (`xargs -a FILE`).
+That includes a file a wrapper reads itself (`xargs -a FILE`), and `ps` showing processes' environments (`ps eww`, `ps auxe`, macOS's `ps -E`, an `env` field), which reads every same-user process's `/proc/<pid>/environ` itself: the daemon's keys, a backend server's password. A plain `ps` (`ps aux`, `ps -ef`) stays medium.
 One that searches a directory holding them (`grep -r token ~`) asks.
 Spellings the reader doesn't follow are medium instead (see Limits).
 
