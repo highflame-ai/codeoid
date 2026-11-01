@@ -9,7 +9,8 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **Autonomous mode asks before writing outside the working directory** (#447).
-  A write, edit, delete or move whose target resolves outside the session's working directory (resolved as the kernel does, through dangling links too, `..` after a link taken physically; the temp dir counts as inside, less codeoid's own files there) asks in autonomous mode, on every backend's file tools and on shell commands whose write targets the risk parser can name (`ln` counts what it links to), with the card saying where it lands; a path that can't be resolved for certain counts as outside (a file with several hard links, a relative target after a `cd` that may not have moved the shell, a target in a line that makes a link). The Gemini CLI's edits are judged by the files its approval request names.
+  A write, edit, delete or move whose target resolves outside the session's working directory (resolved as the kernel does, through dangling links too, `..` after a link taken physically; the temp dir counts as inside, less codeoid's own files there) asks in autonomous mode, on every backend, with the card saying where it lands.
+  For every backend's file tools this is a hard rule: a path that can't be resolved for certain counts as outside (none given, a file with several hard links, a link loop). For shell commands it is best-effort guidance, like the risk levels: a target the parser can name and place is judged the same way (`ln` counts what it links to), and one it can't place asks only when its text could plausibly leave the working directory (absolute, `~`, `..`, a variable or substitution, a line that sets `HOME`, a `cd` that may lead anywhere), so `rm -f *.log`, `cp -r src dist`, `cd src && sed -i … index.ts` and `find src -exec sed -i … {} \;` run unasked. The real boundary for a shell command is the OS sandbox (#448); docs/approvals.md lists what the shell reader doesn't see. On Claude and opencode, whose shells run with no `CDPATH`, `cd src && …` is followed to where it leads; Claude's `Monitor` command is judged as a shell command. The Gemini CLI's edits are judged by the files its approval request names.
   Reads and searches outside it, and guarded and interactive mode, are unchanged; an unattended run parks on such a write for your approval, as on a high-risk command.
   See [docs/approvals.md](docs/approvals.md#writes-outside-the-working-directory).
 
@@ -27,7 +28,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `providers.opencode.agent` picks the opencode agent (`plan` for read-only planning).
   A turn part of whose spend opencode didn't report (a step stopped while the model answered, a dropped connection that couldn't be read back) is of unknown cost, as is one opencode prices at $0 (a subscription sign-in, a free model) unless `pricing.models` prices it (#430).
   docs/opencode.md has setup and limits.
-  opencode's own hosted models (opencode.ai's Zen, free ones included, which opencode would otherwise pick as the default with no credential, and Go: providers `opencode` and `opencode-go`) are off unless `providers.opencode.hostedModels` (`CODEOID_OPENCODE_HOSTED_MODELS`) is set: not offered, not listed, not re-enabled by your opencode config (under their ids, a `canonical` copy, or a provider pointed at opencode.ai), and opencode doesn't fetch its catalog from opencode.ai. A carried `enabled_providers` stays a restriction, and codeoid's own providers are added to it. A turn with no usable model fails before anything is sent, saying what to set.
+  opencode's own hosted models (opencode.ai's Zen, free ones included, which opencode would otherwise pick as the default with no credential, and Go: providers `opencode` and `opencode-go`) are off unless `providers.opencode.hostedModels` (`CODEOID_OPENCODE_HOSTED_MODELS`) is set: not offered, not listed, not re-enabled by your opencode config (under their ids, a `canonical` copy, a provider pointed at opencode.ai, or one whose host setting (`region`, `resourceName`, …) isn't a plain name; a credential your config keeps in a `{file:…}` is still carried), and opencode doesn't fetch its catalog from opencode.ai. A carried `enabled_providers` stays a restriction, and codeoid's own providers are added to it. A turn with no usable model fails before anything is sent, saying what to set.
 
 - **Approvals judge what a shell command does** (#431).
   Every shell command an agent wants to run is parsed (pipelines, chains, subshells, `bash -c`, `sudo`, `xargs`, `find -exec` and other wrappers seen through) and given a risk level: low, medium, high, or not understood.
@@ -230,6 +231,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   require a pack; an explicit-`phases` plan cannot declare one.
 
 ### Fixed
+
+- **On Claude, a Grep or Glob relative path is judged where the CLI resolves it** (#447).
+  After the agent's Bash `cd`s, the CLI resolves a search's relative `path` (and a missing one) from there, but codeoid judged it from the working directory, so `../../.codeoid/config.json` could read codeoid's own key; it is now judged from the directory the CLI reports, and a relative path is asked about when it reports none.
 
 - **Spend caps work on every backend, and costs are never shown as $0 when they aren't known** (#430).
   Codex, OpenAI-compatible endpoints, Gemini, Qwen and the Gemini CLI recorded every turn as costing $0, so a routine's `--max-cost` and `--daily-cost` never stopped anything there.
