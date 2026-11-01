@@ -1082,6 +1082,28 @@ describe("opencode interrupt", () => {
     await p.teardown();
   });
 
+  it("an interrupt while the turn's prompt is still being stored stops the execution it starts, which ends this turn and bills it", async () => {
+    // Round-19 audit: the interrupt finds nothing running (a no-op), the
+    // prompt lands after it and its execution ran on unobserved, its spend
+    // carried into the next turn.
+    const { server } = makeServer({ FAKE_OPENCODE_SLOW_PROMPT_MS: "800" });
+    const p = makeProvider(server);
+    const run = p.runTurn(opts("slow"));
+    setTimeout(() => void run.interrupt(), 100);
+    const events = await collect(run);
+    expect(done(events)?.stopReason).toBe("interrupted");
+    // Stopped by the time the turn ended, not left running to its end.
+    const conn = await server.ensure();
+    expect(p.backingSessionId! in (await conn.client.activeSessions())).toBe(false);
+    expect((await fakeState(server)).interrupts.length).toBeGreaterThanOrEqual(2);
+    // What it spent is this turn's (the first prompt's title included), not the next one's.
+    const spent = done(events)!.totalCostUsd;
+    expect(spent).toBeGreaterThan(0);
+    const next = await collect(p.runTurn(opts("hi")));
+    expect(done(next)!.totalCostUsd).toBeCloseTo(0.0123, 6);
+    await p.teardown();
+  });
+
   /** A gate that holds `who`'s requests open until they're withdrawn; `reached` resolves at the first. */
   function holding(who: "main" | "child") {
     let reach = () => {};

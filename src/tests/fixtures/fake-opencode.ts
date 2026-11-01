@@ -161,7 +161,9 @@
  * where it was), FAKE_OPENCODE_FORM_CANCEL_UNSEEN=1 (a form an interrupt
  * cancels isn't announced, as if the feed dropped `form.cancelled`),
  * FAKE_OPENCODE_SLOW_START_MS (report the address, and answer `/api/info`,
- * that long late: a start a test can stop midway).
+ * that long late: a start a test can stop midway), FAKE_OPENCODE_SLOW_PROMPT_MS
+ * (a prompt that starts an execution is admitted that long after it arrives,
+ * as a loaded server stores one: an interrupt meanwhile finds nothing running).
  *
  * A fork keeps its source's directory, as real 2.2.5's does; `POST
  * …/move` rebinds a session to another (one that exists).
@@ -225,6 +227,8 @@ interface Ses {
   seq: number;
   executing: boolean;
   cancel: (() => void) | null;
+  /** Interrupted after its prompt was admitted, before its execution started: as real 2.2.5, that execution is stopped. */
+  cancelPending?: boolean;
   inbox: Array<{ id: string; text: string; delivery: string }>;
   title?: string;
   fork?: Json;
@@ -1343,7 +1347,8 @@ const END_WINDOW_MS = 30;
 async function startExecution(ses: Ses, text: string, inboxID?: string): Promise<void> {
   ses.executing = true;
   ses.busy = Date.now();
-  const signal = { cancelled: false };
+  const signal = { cancelled: ses.cancelPending === true };
+  ses.cancelPending = false;
   ses.cancel = () => {
     signal.cancelled = true;
   };
@@ -1746,6 +1751,7 @@ const server = Bun.serve({
       state.prompts.push({ sessionID: ses.id, id, ...body });
       durable(ses, "session.inbox.enqueued", { inboxID: id, item: { type: "user", payload: { text }, delivery } });
       // As real 2.2.x: an input becomes a user message (under its inbox id) when it is delivered.
+      if (!ses.executing && process.env.FAKE_OPENCODE_SLOW_PROMPT_MS) await sleep(Number(process.env.FAKE_OPENCODE_SLOW_PROMPT_MS));
       if (ses.executing) {
         ses.inbox.push({ id, text, delivery });
         // The reply can lag the steer's delivery (FAKE_OPENCODE_STEER_REPLY_MS): opencode takes it at the next step boundary.
@@ -1781,7 +1787,8 @@ const server = Bun.serve({
     if (rest === "/interrupt" && method === "POST") {
       state.interrupts.push(ses.id);
       const running = ses.executing;
-      ses.cancel?.();
+      if (ses.cancel) ses.cancel();
+      else if (running) ses.cancelPending = true;
       dropAsks(ses.id);
       dropForms(ses.id);
       for (const child of sessions.values()) {

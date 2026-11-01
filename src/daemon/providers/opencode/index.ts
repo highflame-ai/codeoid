@@ -661,6 +661,7 @@ export class OpencodeProvider implements SessionProvider {
       if (command && runnableCommand(this.#sessionId, command, this.#mounts.keys(), args)) {
         turn.sending = true;
         await conn.client.command(ses, { name: name!, text: args });
+        if (turn.interrupted) await this.#stopLanded(conn, ses);
         turn.markPosted();
         // A command may run the agent (most do: they submit a prompt) or
         // only act. Give it a moment to start an execution; one that didn't
@@ -676,6 +677,7 @@ export class OpencodeProvider implements SessionProvider {
       if (skill) {
         turn.sending = true;
         turn.promptId = (await conn.client.prompt(ses, { text: args || `/${name}`, skills: [{ id: skill }] })).id;
+        if (turn.interrupted) await this.#stopLanded(conn, ses, turn.promptId);
         return;
       }
     }
@@ -683,6 +685,18 @@ export class OpencodeProvider implements SessionProvider {
     this.#pendingHistorySeed = null;
     turn.sending = true;
     turn.promptId = (await conn.client.prompt(ses, { text: seed ? `${seed}\n\n${message}` : message })).id;
+    if (turn.interrupted) await this.#stopLanded(conn, ses, turn.promptId);
+  }
+
+  /**
+   * The turn was stopped while its prompt was on its way in: the stop found
+   * nothing running, and opencode stored the prompt after it. What it starts
+   * is stopped now, and ends this turn (#settleInterrupt waits for it), so
+   * its spend is this turn's, never run on unobserved.
+   */
+  async #stopLanded(conn: OpencodeConnection, ses: string, id?: string): Promise<void> {
+    if (id) this.#cancelInput(conn, ses, id);
+    await conn.client.interrupt(ses).catch(() => {});
   }
 
   /** A message sent while the turn runs: steer it now (`now`/`next`), or queue it behind (`later`). */
@@ -809,6 +823,11 @@ export class OpencodeProvider implements SessionProvider {
    * read in time leaves the turn ending interrupted here, as before.
    */
   async #settleInterrupt(turn: Turn): Promise<void> {
+    // A prompt still on its way is stopped as it lands (#stopLanded): what it
+    // started ends here, its end and spend this turn's.
+    await Promise.race([turn.posted, Bun.sleep(INTERRUPT_SETTLE_MS)]);
+    for (const until = Date.now() + INTERRUPT_SETTLE_MS; this.#turn === turn && !turn.queue.closed && this.#executing && Date.now() < until; ) await Bun.sleep(25);
+    if (this.#turn !== turn || turn.queue.closed) return;
     const conn = this.#conn;
     if (conn) await Promise.race([this.#reconcile(conn, turn).catch(() => {}), Bun.sleep(INTERRUPT_READ_MS)]);
     // Read back as ended, it ends once opencode's total is read (#finishCounted, bounded).
