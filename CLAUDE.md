@@ -396,7 +396,9 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   (its own turn says why; the server's other sessions get a neutral reason;
   a call read back after a feed gap is judged the same, `#settleReadBack`) —
   except a shell line with no command in it (`commandlessShellLine`), which
-  opencode 2.2.5 runs unasked by its own rule. Such a line can still expand a
+  opencode 2.2.5 runs unasked by its own rule (a declaration builtin listing
+  the shell's state, `export -p`, counts only in the session's own shell:
+  a gap child's may still be the server's). Such a line can still expand a
   variable, so every session's and child's shell runs with a bare environment
   (`opencodeShellEnv`, `PUT …/environment` before every turn and as a child is
   learned; a child's requests are allowed only once it's set): the server's

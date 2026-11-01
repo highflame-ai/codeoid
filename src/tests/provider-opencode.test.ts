@@ -422,7 +422,7 @@ describe("opencode server lifecycle", () => {
   it("a shell line with no command in it, which opencode runs unasked by its own rule, keeps the server", async () => {
     const { server } = makeServer();
     const generation = (await server.ensure()).generation;
-    for (const line of ["cd .", "export FOO=bar", "X=1", "# just a comment", "cd src && X=1"]) {
+    for (const line of ["cd .", "export FOO=bar", "X=1", "# just a comment", "cd src && X=1", "export -p", "declare -p", "unset -v X", "local"]) {
       const p = makeProvider(server, { sessionId: `sess-${line.length}`, initialBackingId: `sess-${line.length}` });
       const events = await collect(p.runTurn(opts(`unasked-shell:${line}`)));
       expect(events.find((e) => e.type === "error")).toBeUndefined();
@@ -597,6 +597,13 @@ describe("opencode server lifecycle", () => {
       "X=1#$(id)", "X='a'#$(id)", "X=\"# $(id)\"", "X='#' $(id)", "# ok\nX=$(id)", "# ok\nls",
     ];
     for (const line of acting) expect([line, commandlessShellLine(line)]).toEqual([line, false]);
+    // A listing of the shell's state (real 2.2.5 runs these unasked), where the shell's environment is codeoid's (round-16 audit).
+    const listing = ["export", "export -p", "export -f", "readonly -p", "declare -p", "declare", "typeset -x A=1", "unset -v X", "local", "declare -p X Y", "cd . && export -p"];
+    for (const line of listing) expect([line, commandlessShellLine(line, { listing: true })]).toEqual([line, true]);
+    // Without `listing` (a subagent's shell), they still count as acting, as the table above has it.
+    for (const line of ["export -p", "declare -p", "unset -v X", "local", "typeset -x A=1"]) expect([line, commandlessShellLine(line)]).toEqual([line, false]);
+    const stillActing = ["export -p > f", "declare -p | grep A", "declare -p $X", "declare +x A", "export --", "ls -p", "declare -p; ls", "export -p &", "command export -p", "declare -p `id`", "unset -v X\\ Y"];
+    for (const line of stillActing) expect([line, commandlessShellLine(line, { listing: true })]).toEqual([line, false]);
   });
 });
 
@@ -3026,6 +3033,18 @@ describe("opencode as real 2.2.x servers behave", () => {
     expect((last as Extract<ProviderEvent, { type: "error" }>).message).toContain("without asking codeoid");
     expect(JSON.stringify(events)).not.toContain(secret);
     // Stopped: the next turn starts a new server.
+    expect(texts(await collect(p.runTurn(opts("hi"))), "text_done")).toEqual(["Hello, world"]);
+    expect(readFileSync(starts, "utf8").trim().split("\n")).toHaveLength(2);
+    await p.teardown();
+  });
+
+  it("a listing (`export -p`) a subagent created in a feed gap ran unasked still stops the server: its shell may have held the server's environment (round-16 audit)", async () => {
+    const { server, starts } = makeServer();
+    const p = makeProvider(server);
+    const asks: string[] = [];
+    const events = await Promise.race([collect(p.runTurn(opts("subagent-gapunasked:export -p", { canUseTool: allowing((name) => asks.push(name)) }))), Bun.sleep(8_000).then(() => [] as ProviderEvent[])]);
+    expect(asks).toEqual(["Task"]);
+    expect(events.at(-1)).toMatchObject({ type: "error", message: expect.stringContaining("without asking codeoid") });
     expect(texts(await collect(p.runTurn(opts("hi"))), "text_done")).toEqual(["Hello, world"]);
     expect(readFileSync(starts, "utf8").trim().split("\n")).toHaveLength(2);
     await p.teardown();

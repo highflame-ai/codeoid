@@ -255,6 +255,12 @@ describe("a line opencode runs unasked by its own rule (no command in it) and th
       const r = assessShellCommandSync(line, { cwd: workdir, workdir, configDir: getConfigDir() });
       expect([line, r.level === "high" || r.level === "unknown" || !!r.unreadable || !!r.secret]).toEqual([line, false]);
     }
+    // ...nor a listing of the shell's state, which the session's own shell runs unasked too (round-16 audit).
+    for (const line of ["export -p", "declare -p", "readonly -p", "unset -v X", "export", "declare", "typeset -x A=1", "export -f", "local"]) {
+      expect([line, commandlessShellLine(line, { listing: true })]).toEqual([line, true]);
+      const r = assessShellCommandSync(line, { cwd: workdir, workdir, configDir: getConfigDir() });
+      expect([line, r.level === "high" || r.level === "unknown" || !!r.unreadable || !!r.secret]).toEqual([line, false]);
+    }
   });
 
   test("through a Session: its card is shown and settled, the server is kept; an acting line that ran unasked still stops it", async () => {
@@ -274,6 +280,11 @@ describe("a line opencode runs unasked by its own rule (no command in it) and th
     expect(card?.input).toMatchObject({ command: "cd src && X=1" });
     const reply = kept.session.canonicalHistory.at(-1) as { toolCalls?: Array<{ originalName: string; success?: boolean }> };
     expect(reply.toolCalls?.[0]).toMatchObject({ originalName: "Bash", success: true });
+    expect((await server.ensure()).pid).toBe(pid);
+    // A listing of the session's own (bare) shell state too.
+    const listed = await run("export -p");
+    expect(listed.session.status).toBe("idle");
+    expect(listed.cards.at(-1)?.tool?.input).toMatchObject({ command: "export -p" });
     expect((await server.ensure()).pid).toBe(pid);
     // Judged after the fact as before: a line with a command in it that ran unasked means something settled its request.
     const stopped = await run("ls");

@@ -2029,7 +2029,8 @@ export class OpencodeProvider implements SessionProvider {
     // one that succeeded unasked otherwise means something settled its
     // request itself — a plugin, a rule codeoid didn't set.
     const unasked = !this.#announced.has(key);
-    const ownRule = call?.name === "shell" && typeof call.input.command === "string" && commandlessShellLine(call.input.command);
+    // A listing (`export -p`) only in the session's own shell: a child's environment may not be codeoid's yet.
+    const ownRule = call?.name === "shell" && typeof call.input.command === "string" && commandlessShellLine(call.input.command, { listing: !child });
     if (unasked) {
       // A child's calls are shown only when they asked; the main agent's
       // are always recorded (one refused unasked, e.g. a hidden tool).

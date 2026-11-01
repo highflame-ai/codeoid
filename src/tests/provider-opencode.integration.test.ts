@@ -75,6 +75,8 @@
  *       `git status` runs unasked in guarded mode with autoAllowLowRisk, a credential read is refused
  *   I50 (scripted only) the daemon user's `$SHELL` isn't the shell opencode runs a line with: it's bash, the shell codeoid judges
  *       lines as; the session's own commands still see the user's `$SHELL`
+ *   I51 (scripted only) a declaration builtin with no operand or only options (`export -p`, `declare -p`, `unset -v X`), which opencode
+ *       runs unasked, keeps the server: it lists the session's bare shell state, nothing outside the call
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -1955,6 +1957,30 @@ describe("opencode (real binary)", () => {
       await own.stop();
       rmSync(root, { recursive: true, force: true });
     }
+  }, 180_000);
+
+  maybeScripted("I51 a declaration builtin listing the shell's state runs unasked by opencode's own rule: the server stays", async () => {
+    // 2.2.5's scanner finds no command in a declaration builtin, flags or none.
+    const generation = (await server!.ensure()).generation;
+    for (const command of ["export -p", "declare -p", "readonly -p", "unset -v X", "export", "declare", "typeset -x A=1", "export -f", "local"]) {
+      const asked: string[] = [];
+      const p = provider();
+      const deny: ToolApprovalFn = async (_t, _a, name) => {
+        asked.push(name);
+        return { behavior: "deny", message: "not approved" };
+      };
+      const events = await collect(p.runTurn(opts(`[[tool:shell ${JSON.stringify({ command })}]]`, { canUseTool: deny })));
+      expect([command, asked]).toEqual([command, []]);
+      expect([command, events.find((e) => e.type === "error")]).toEqual([command, undefined]);
+      expect(events.find((e) => e.type === "tool_start")).toMatchObject({ name: "Bash", input: { command } });
+      // What it lists is the session's bare environment: no key, not the server's password.
+      const result = events.find((e) => e.type === "tool_complete") as Extract<ProviderEvent, { type: "tool_complete" }> | undefined;
+      expect(result?.output ?? "").not.toContain("OPENCODE_PASSWORD");
+      expect(result?.output ?? "").not.toContain(PROBE_VALUE);
+      expect(done(events)?.stopReason).toBe("stop");
+      await p.teardown();
+    }
+    expect((await server!.ensure()).generation).toBe(generation);
   }, 180_000);
 
   maybe("I32 the user's own opencode data, state, cache and temp dirs are untouched by the whole run", () => {

@@ -436,6 +436,9 @@ const SHELL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const SHELL_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*\+?=/;
 /** Builtins that only change the shell's own state (it ends with the call), given names or assignments. */
 const SHELL_STATE_BUILTINS = new Set(["export", "unset", "readonly"]);
+/** Declaration builtins 2.2.5's scanner finds no command in, whatever their words: with options or none, they list the shell's state. */
+const SHELL_DECLARATION_BUILTINS = new Set(["export", "unset", "readonly", "declare", "typeset", "local"]);
+const SHELL_OPTION = /^-[A-Za-z]+$/;
 
 /**
  * A shell line opencode runs without asking, as 2.2.5 does a line its
@@ -447,8 +450,16 @@ const SHELL_STATE_BUILTINS = new Set(["export", "unset", "readonly"]);
  * call succeeding unasked is opencode's own rule, not something settling
  * requests behind codeoid's back. Conservative: any other line that ran
  * unasked still stops the server.
+ *
+ * With `listing`, a declaration builtin given options or nothing
+ * (`export -p`, `declare -p`, `unset -v X`, `local`) counts too: it prints
+ * the shell's variables or functions. Only for a shell whose environment
+ * is known to be codeoid's bare one (the session's, set before its turn):
+ * a subagent's may still be the server's, password and all, when a feed
+ * gap hid its start, and such a listing stopping the server is what
+ * changes that password.
  */
-export function commandlessShellLine(line: string): boolean {
+export function commandlessShellLine(line: string, opts: { listing?: boolean } = {}): boolean {
   // A comment runs nothing, whatever it holds (`# $(…)`): judged without them.
   const command = withoutComments(line);
   if (command === null || SHELL_ACTIVE.test(command)) return false;
@@ -484,8 +495,10 @@ export function commandlessShellLine(line: string): boolean {
   return segments.every(([first, ...rest]) => {
     if (first === undefined) return true;
     if (first === "cd") return rest.length <= 2;
+    const declaration = (w: string) => SHELL_NAME.test(w) || SHELL_ASSIGNMENT.test(w);
     // With no name, or an option (`export -p`), they print variables instead.
-    if (SHELL_STATE_BUILTINS.has(first)) return rest.length > 0 && rest.every((w) => SHELL_NAME.test(w) || SHELL_ASSIGNMENT.test(w));
+    if (opts.listing && SHELL_DECLARATION_BUILTINS.has(first)) return rest.every((w) => declaration(w) || SHELL_OPTION.test(w));
+    if (SHELL_STATE_BUILTINS.has(first)) return rest.length > 0 && rest.every(declaration);
     return [first, ...rest].every((w) => SHELL_ASSIGNMENT.test(w));
   });
 }
