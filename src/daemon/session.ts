@@ -182,6 +182,12 @@ const RESEED_AFTER_TEARDOWN = new Set(["gemini-cli"]);
  * The rest re-read their account every turn (accounts.ts).
  */
 const PROCESS_BACKENDS: ReadonlySet<string> = new Set(["claude", "codex", "gemini-cli", "qwen", "pi"]);
+
+/** Statuses the idle countdown (#451) runs in: nothing in flight until the next message. */
+const AT_REST: ReadonlySet<SessionStatus> = new Set(["idle", "error"]);
+
+/** The longest delay setTimeout honours; a longer one fires after 1 ms. */
+const MAX_TIMER_MS = 2_147_483_647;
 import { adoptableName, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, shellArg } from "./mcp/adopt.js";
 import { cleanMcpError, redactMcpUrl } from "./mcp/redact.js";
 import type { McpHub } from "./mcp/hub.js";
@@ -1880,22 +1886,48 @@ export class Session {
    *
    * HTTP backends re-read their account every turn and hold no process, so
    * there is nothing to release.
+   *
+   * `idle` is the idle countdown's release (#451): a session that turns out
+   * to be busy by the time it runs keeps its backend, and the next idle
+   * starts a fresh countdown, instead of being released the moment that work
+   * ends.
    */
-  releaseIdleProvider(): void {
+  releaseIdleProvider(opts: { idle?: boolean } = {}): void {
     if (!PROCESS_BACKENDS.has(this.#provider.id)) return;
     const backend = this.#provider.id;
     this.#sendChain = this.#sendChain
       .catch(() => {})
       .then(async () => {
         if (this.#provider.id !== backend) return;
-        if (this.#switchBusyReason() || this.#backgroundTasks.size > 0) {
+        if (opts.idle) {
+          if (this.#switchBusyReason() || this.#hasAgentBackgroundWork() || this.#pendingApprovals.size > 0) return;
+        } else if (this.#switchBusyReason() || this.#backgroundTasks.size > 0) {
           // Busy: release once the turn and its background work are done, so
           // background work can't carry on indefinitely on a removed account.
           this.#releaseProviderWhenIdle = true;
           return;
         }
         this.#releaseProviderWhenIdle = false;
+        // Before the teardown, as terminateBackend does: codex and the Gemini
+        // CLI are stopped with a bare SIGKILL, and what they started (MCP
+        // servers, commands) would otherwise be left running, out of reach.
+        let tree: ProcessEntry[] = [];
+        try {
+          const roots = (await withTimeout(this.#provider.backendProcessIds?.() ?? Promise.resolve([]), 3_000)) ?? [];
+          tree = await withTimeout(snapshotTree(roots), 3_000);
+        } catch (e) {
+          console.error(`[codeoid/session ${this.id}] could not snapshot the ${backend} backend's processes: ${e instanceof Error ? e.message : String(e)}`);
+        }
         await this.#teardownProvider();
+        try {
+          const killed = await killSurvivors(tree);
+          if (killed.length > 0) {
+            this.#store.audit(opts.idle ? "system:idle-release" : "system:account-release", "session.release_backend.reaped", this.id, `pids=${killed.join(",")}`);
+            console.warn(`[codeoid/session ${this.id}] killed ${killed.length} process(es) the released ${backend} backend left running: ${killed.join(", ")}`);
+          }
+        } catch (e) {
+          console.error(`[codeoid/session ${this.id}] killing the released backend's leftover processes failed: ${e instanceof Error ? e.message : String(e)}`);
+        }
         // A backend that can't resume its own conversation (the Gemini CLI
         // starts a new ACP session) is handed the history, as after an MCP
         // rebuild — an account switch must never start the conversation over.
@@ -1913,24 +1945,42 @@ export class Session {
    * backend process, and the MCP servers it started, stopped. Re-armed each
    * time the session goes idle; any activity clears it. The next message
    * starts the backend again and resumes the conversation, as after an
-   * account change.
+   * account change. A session whose last turn failed (`error`) is at rest
+   * too: it keeps that status until the next message.
    */
   #armIdleRelease(): void {
     this.#clearIdleRelease();
     if (this.#destroyed || !PROCESS_BACKENDS.has(this.#provider.id)) return;
     const minutes = this.#config?.session?.idleReleaseMinutes ?? 30;
     if (!(minutes > 0)) return;
-    this.#idleReleaseTimer = setTimeout(() => {
+    const deadline = Date.now() + minutes * 60_000;
+    const wait = () => {
+      // setTimeout can't wait longer than 2^31-1 ms (it fires after 1 ms
+      // instead), so a longer limit is waited out in steps.
+      this.#idleReleaseTimer = setTimeout(fire, Math.min(Math.max(deadline - Date.now(), 0), MAX_TIMER_MS));
+      this.#idleReleaseTimer.unref?.();
+    };
+    const fire = () => {
       this.#idleReleaseTimer = null;
+      if (Date.now() < deadline) return wait();
       // Only a session with nothing in flight: no turn, no background work, no
       // approval waiting, and a backend that actually started.
-      if (this.#destroyed || this.#status !== "idle" || this.#turnActive()) return;
-      if (this.#backgroundTasks.size > 0 || this.#pendingApprovals.size > 0) return;
+      if (this.#destroyed || !AT_REST.has(this.#status) || this.#turnActive()) return;
+      if (this.#hasAgentBackgroundWork() || this.#pendingApprovals.size > 0) return;
       if (!this.#provider.hasQueried) return;
       console.log(`[codeoid/session ${this.id.slice(0, 8)}] idle ${minutes} min: stopping its ${this.#provider.id} backend until the next message`);
-      this.releaseIdleProvider();
-    }, minutes * 60_000);
-    this.#idleReleaseTimer.unref?.();
+      this.releaseIdleProvider({ idle: true });
+    };
+    wait();
+  }
+
+  /**
+   * Background work that holds the backend: anything but the watchers a
+   * backend starts for itself (`ambient`), which are its own and stop with it.
+   */
+  #hasAgentBackgroundWork(): boolean {
+    for (const t of this.#backgroundTasks.values()) if (t.ambient !== true) return true;
+    return false;
   }
 
   #clearIdleRelease(): void {
@@ -3961,6 +4011,7 @@ export class Session {
             return !prev || prev.status !== t.status || prev.description !== t.description;
           });
         const drained = next.size === 0 && this.#backgroundTasks.size > 0;
+        const hadAgentWork = this.#hasAgentBackgroundWork();
         this.#backgroundTasks = next;
         this.#rememberOwnTasks(tasks);
         if (changed) this.#broadcastInfoUpdate();
@@ -3968,6 +4019,8 @@ export class Session {
         // may BE that work). Once it drains, anything still registered with no
         // turn in flight really is stale — reconcile it here instead.
         if (drained && !this.#turnActive()) this.#reconcileDrainedBackground();
+        // Only the backend's own watchers left: the idle countdown starts now (#451).
+        else if (hadAgentWork && !this.#hasAgentBackgroundWork() && AT_REST.has(this.#status) && !this.#turnActive()) this.#armIdleRelease();
         // Whoever watches this session hears of new and finished tasks, not only of status (#430).
         if (changed) this.#announceTurn();
         break;
@@ -8715,8 +8768,8 @@ export class Session {
     this.#denyPendingApprovals({ keepBackground: false });
     this.#settleBetweenTurns();
     if (this.#releaseProviderWhenIdle) this.releaseIdleProvider();
-    // Background work done while already idle: the idle countdown starts now (#451).
-    if (this.#status === "idle") this.#armIdleRelease();
+    // Background work done while already at rest: the idle countdown starts now (#451).
+    if (AT_REST.has(this.#status)) this.#armIdleRelease();
   }
 
   /** The provider reports background work still running. */
@@ -9790,9 +9843,9 @@ export class Session {
     if (status === this.#status) return;
     this.#status = status;
     // Idle: count down to stopping the backend; anything else: it's in use (#451).
-    if (status === "idle") this.#armIdleRelease();
+    if (AT_REST.has(status)) this.#armIdleRelease();
     else this.#clearIdleRelease();
-    if (status === "idle" && this.#releaseProviderWhenIdle && this.#backgroundTasks.size === 0) {
+    if (AT_REST.has(status) && this.#releaseProviderWhenIdle && this.#backgroundTasks.size === 0) {
       this.releaseIdleProvider();
     }
 

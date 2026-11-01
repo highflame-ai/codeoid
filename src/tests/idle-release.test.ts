@@ -92,10 +92,50 @@ describe("idle backends are released (#451)", () => {
     const after = provider.teardownCount;
     await Bun.sleep(200);
     expect(provider.teardownCount).toBe(after);
-    // The next message gets an answer on the same session.
+    // The next message starts it again on the same conversation.
+    const backing = provider.backingSessionId;
     await s.send("again", AUTH);
+    await until(() => provider.capturedOpts.length === 2 && s.toInfo().status === "idle");
+    expect(provider.backingSessionId).toBe(backing);
+  });
+
+  test("a session whose last turn failed is released too", async () => {
+    const { s, provider } = session({ script: [[{ type: "error", message: "boom" }, { type: "turn_done", result: mockResult() }]] });
+    await s.send("hello", AUTH);
+    await until(() => s.toInfo().status === "error" && provider.teardownCount >= 1);
+  });
+
+  test("a limit too long for one timer is not mistaken for 1 ms", async () => {
+    const { s, provider } = session({ minutes: 100_000 });
+    await s.send("hello", AUTH);
     await until(() => s.toInfo().status === "idle");
-    expect(provider.hasQueried || provider.teardownCount > after).toBe(true);
+    await Bun.sleep(200);
+    expect(provider.teardownCount).toBe(0);
+  });
+
+  test("a watcher the backend started for itself doesn't hold it", async () => {
+    const { s, provider } = session();
+    await s.send("hello", AUTH);
+    await until(() => s.toInfo().status === "idle");
+    provider.onSessionEvent?.({ type: "background_tasks", tasks: [{ id: "w1", kind: "local_bash", description: "watcher", status: "running", ambient: true }] });
+    await until(() => provider.teardownCount >= 1);
+  });
+
+  test("what the backend left running is stopped with it", async () => {
+    // A stand-in backend whose teardown (like codex's bare SIGKILL) leaves its child running.
+    const backend = Bun.spawn(["sh", "-c", "sleep 30 & wait"], { stdout: "ignore", stderr: "ignore" });
+    try {
+      const { s, provider } = session({ minutes: 1 });
+      Object.assign(provider, { backendProcessIds: async () => [backend.pid] });
+      await s.send("hello", AUTH);
+      await until(() => s.toInfo().status === "idle");
+      s.releaseIdleProvider({ idle: true });
+      await until(() => provider.teardownCount >= 1);
+      await Promise.race([backend.exited, Bun.sleep(3000)]);
+      expect(backend.exitCode !== null || backend.signalCode !== null).toBe(true);
+    } finally {
+      backend.kill("SIGKILL");
+    }
   });
 
   test("0 keeps the backend running", async () => {

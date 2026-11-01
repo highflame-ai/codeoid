@@ -62,7 +62,7 @@ const general: SettingsTab = {
         cfg("session.fallbackModel", "Fallback model", "Retried automatically on a 429/529 from the primary model (Claude only). Alias or full id.", {
           envVar: "CODEOID_FALLBACK_MODEL",
         }),
-        cfg("session.idleReleaseMinutes", "Stop idle backends after (minutes)", "A session idle this long has its backend process (the Claude CLI, codex, pi, …) and the MCP servers it started stopped, freeing their memory; the next message starts it again and resumes the conversation. Never while a turn, background work or an approval is pending. 0 keeps them running.", {
+        cfg("session.idleReleaseMinutes", "Stop idle backends after (minutes)", "A session idle this long has its backend process (the Claude CLI, codex, pi, …) and everything it started (MCP servers, commands still running) stopped, freeing their memory; the next message starts it again and resumes the conversation. Never while a turn, background work or an approval is pending. 0 keeps them running.", {
           kind: "float",
           envVar: "CODEOID_IDLE_RELEASE_MINUTES",
           min: 0,
