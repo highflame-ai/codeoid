@@ -235,10 +235,11 @@ export function uncheckedReference(entry: unknown, key?: string): string | null 
 /**
  * Whether a model opencode lists (`GET /api/model`, its `settings` with
  * every `{file:}` substituted) is served by opencode's hosted service: a
- * hosted provider's, or one whose settings carry an opencode.ai URL.
+ * hosted provider's, or one whose settings — its own, a variant's, its
+ * headers or body — name opencode.ai or splice a host ({@link hostedEntry}).
  */
-export function hostedModelInfo(m: { providerID: string; settings?: unknown }): boolean {
-  return isHostedProvider(m.providerID) || hostedEntry({ settings: m.settings });
+export function hostedModelInfo(m: { providerID: string; settings?: unknown; variants?: unknown; headers?: unknown; body?: unknown }): boolean {
+  return isHostedProvider(m.providerID) || hostedEntry({ settings: m.settings, variants: m.variants, headers: m.headers, body: m.body });
 }
 
 /**
@@ -1053,7 +1054,7 @@ export function serverEnv(opts: {
 export function hostedProviderProblem(
   providers: ReadonlyArray<{ id: string; canonical?: string }>,
   hostedModels: boolean,
-  more: { models?: ReadonlyArray<{ providerID: string; settings?: unknown }>; config?: ReadonlyArray<{ info?: Record<string, unknown> }> } = {},
+  more: { models?: ReadonlyArray<Parameters<typeof hostedModelInfo>[0]>; config?: ReadonlyArray<{ info?: Record<string, unknown> }> } = {},
 ): string | null {
   if (hostedModels) return null;
   const configured = hostedIdsOf(...(more.config ?? []).flatMap((e) => [e.info?.provider, e.info?.providers]));

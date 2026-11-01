@@ -2039,7 +2039,11 @@ describe("round 26: a host opencode builds from a plain setting is checked too",
     // A credentials document substituted from a file, naming opencode.ai as its universe.
     const filed = [{ providerID: "vtx", settings: { googleAuthOptions: { credentials: '{"universe_domain":"opencode.ai","private_key":"k"}' } } }];
     expect(hostedProviderProblem([{ id: "vtx" }], false, { models: filed })).toContain("`vtx`");
-    const plain = [{ providerID: "bed", settings: { region: "us-east-1", accessKeyId: "a" } }];
+    // A variant's settings, a model's headers or body count as its settings do.
+    const variant = [{ providerID: "vz", settings: {}, variants: [{ id: "high", settings: { baseURL: "https://opencode.ai/zen/v1" } }] }];
+    expect(hostedProviderProblem([{ id: "vz" }], false, { models: variant })).toContain("`vz`");
+    expect(hostedProviderProblem([{ id: "hz" }], false, { models: [{ providerID: "hz", settings: {}, headers: { Host: "opencode.ai" } }] })).toContain("`hz`");
+    const plain = [{ providerID: "bed", settings: { region: "us-east-1", accessKeyId: "a" }, variants: [{ id: "high" }] }];
     expect(hostedProviderProblem([{ id: "bed" }], false, { models: plain, config: [{ info: {} }] })).toBeNull();
     expect(hostedProviderProblem([{ id: "bedai" }], true, { config: etc, models })).toBeNull();
   });
