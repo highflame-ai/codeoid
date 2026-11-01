@@ -7623,7 +7623,7 @@ export class Session {
       // Secret-path gate (secret-paths.ts), every mode: a call naming one of the
       // daemon's credential files or a process environment is refused; one
       // searching a directory that holds them is asked about, never auto-run.
-      const secret = secretPathVerdict(toolName, effectiveInput, { workdir: this.workdir, configDir: getConfigDir() });
+      const secret = secretPathVerdict(toolName, effectiveInput, { workdir: this.workdir, configDir: getConfigDir(), cwd: shellCwd });
       // A shell command is judged by what it runs (#431): one naming a
       // credential file is refused like the file tools; a risky one asks.
       const risk = this.#shellRisk(toolName, effectiveInput, shellCwd);
@@ -8310,7 +8310,7 @@ export class Session {
         const risk = this.#shellRisk(event.name, event.input, event.shellCwd);
         const outside = this.#outsideWrite(event.name, event.input, event.shellCwd);
         const autoApprove =
-          secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir() }) === null &&
+          secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir(), cwd: event.shellCwd }) === null &&
           !risk?.secret &&
           !this.#riskAsks(risk) &&
           !outside &&

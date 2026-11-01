@@ -2811,12 +2811,13 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
     await gate("Bash", { command: "echo planted > my-skill/NOTE.md" }, { toolUseID: "tu-out", signal });
     await gate("Bash", { command: "echo x > notes.txt" }, { toolUseID: "tu-unseen", signal });
     await gate("Write", { file_path: "/tmp/a", content: "x" }, { toolUseID: "tu-w", signal });
+    // Round 26: every tool's call carries the cwd the hook reported (null when it reported none).
     expect(gated).toEqual([
       { name: "Bash", shellCwd: elsewhere },
       { name: "Bash", shellCwd: null },
-      { name: "Write", shellCwd: undefined },
+      { name: "Write", shellCwd: null },
     ]);
-    expect(events.flatMap((e) => (e.type === "tool_start" ? [e.shellCwd] : []))).toEqual([elsewhere, null, undefined]);
+    expect(events.flatMap((e) => (e.type === "tool_start" ? [e.shellCwd] : []))).toEqual([elsewhere, null, null]);
     openGate();
     await drain;
     await p.teardown();
@@ -2849,6 +2850,25 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
         else process.env[k] = v;
       }
     }
+  });
+
+  it("a Grep or Glob's relative path is judged from the cwd the CLI reports, which it resolves it from (round 26)", async () => {
+    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => "autonomous" });
+    turnOn(p);
+    // The CLI's Bash ran `cd` into a directory beside codeoid's config; a relative path from there reaches its key.
+    const moved = join(getConfigDir(), "moved-into");
+    const call = (tool_name: string, tool_input: unknown, cwd?: string) =>
+      preToolUseOf()({ hook_event_name: "PreToolUse", tool_name, tool_input, tool_use_id: `tu-${Math.random()}`, ...(cwd ? { cwd } : {}) });
+    expect(await call("Grep", { pattern: "apiKey", path: "../config.json" }, moved)).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(await call("Glob", { pattern: "*", path: ".." }, moved)).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask" } });
+    // No path: the search root is that cwd.
+    expect(await call("Grep", { pattern: "apiKey" }, getConfigDir())).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask" } });
+    // A relative path with no cwd reported can't be placed: asked.
+    expect(await call("Grep", { pattern: "x", path: "src" })).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask" } });
+    // From the workdir it would be elsewhere: as before.
+    expect(await call("Grep", { pattern: "x", path: "src" }, "/tmp")).toEqual({});
+    openGate();
+    await p.teardown();
   });
 
   it("a teammate of another team is the parent's on a fork; its own team's are the fork's (L-4)", async () => {

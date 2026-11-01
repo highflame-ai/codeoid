@@ -18,7 +18,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, relative } from "node:path";
-import type { CodeoidConfig } from "../config.js";
+import { type CodeoidConfig, getConfigDir } from "../config.js";
 import { outsideWriteOf, writeTargets } from "../daemon/outside-writes.js";
 import type { ProviderEvent, SessionProvider } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
@@ -616,6 +616,16 @@ describe("autonomous mode asks before a write outside the working directory, at 
       const inside = await gateCall("Bash", { command: "cd sub && touch x" }, "autonomous", { cdpathUnset });
       expect([cdpathUnset, inside.asked, inside.behavior]).toEqual([cdpathUnset, false, "allow"]);
     }
+  });
+
+  test("round 26: a Grep's relative path is judged from the cwd the backend reports, at the session's gate", async () => {
+    const moved = join(getConfigDir(), "moved-into");
+    const r = await gateCall("Grep", { pattern: "apiKey", path: "../config.json" }, "autonomous", { shellCwd: moved });
+    expect([r.asked, r.behavior]).toEqual([false, "deny"]);
+    const unknown = await gateCall("Grep", { pattern: "apiKey", path: "src" }, "autonomous", { shellCwd: null });
+    expect(unknown.asked).toBe(true);
+    const plain = await gateCall("Grep", { pattern: "apiKey", path: "src" }, "autonomous");
+    expect([plain.asked, plain.behavior]).toEqual([false, "allow"]);
   });
 
   test("guarded mode is unchanged: a write asks as it always did, with no outside-write reason", async () => {

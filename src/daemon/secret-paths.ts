@@ -175,11 +175,11 @@ const LOGIN_DIR = /(?:^|\/)codeoid-(?:claude-)?login-[^/]*(?:\/|$)/;
 const FOLD = process.platform === "darwin" || process.platform === "win32";
 const norm = (p: string) => (FOLD ? p.toLowerCase() : p);
 
-function expand(p: string, workdir: string): string {
+function expand(p: string, cwd: string): string {
   const home = p === "~" || p.startsWith("~/") ? `${homedir()}${p.slice(1)}` : p;
-  // The tool opens it from the workdir: that is its `/proc/self/cwd` too.
-  const abs = isAbsolute(home) ? home : `${resolve(workdir)}/${home}`;
-  return kernelPath(abs, resolve(workdir)) ?? resolve(abs);
+  // The tool opens it from its cwd (the workdir, or where the backend says it runs): that is its `/proc/self/cwd` too.
+  const abs = isAbsolute(home) ? home : `${resolve(cwd)}/${home}`;
+  return kernelPath(abs, resolve(cwd)) ?? resolve(abs);
 }
 
 /** A process's own cwd link (`self`, `thread-self`, a task's, or this process's own pid's): the cwd of whoever opens the path. */
@@ -262,7 +262,19 @@ export function secretDirsOf(configDir: string): string[] {
 export function secretPathVerdict(
   toolName: string,
   input: unknown,
-  opts: { workdir: string; configDir: string; /** false: a listing, which reads no file: a process's environment, memory or open files aren't refused (a credential file still is). */ procReads?: boolean },
+  opts: {
+    workdir: string;
+    configDir: string;
+    /** false: a listing, which reads no file: a process's environment, memory or open files aren't refused (a credential file still is). */
+    procReads?: boolean;
+    /**
+     * Where the backend reports the call runs, which a relative path is
+     * resolved from (Claude's Grep and Glob: the CLI's persisted Bash cwd);
+     * absent: the workdir. Null: it may have moved and the backend didn't
+     * say, so a relative path is asked about.
+     */
+    cwd?: string | null;
+  },
 ): SecretPathVerdict {
   const configDir = real(resolve(opts.configDir));
   const secretFiles = [
@@ -282,7 +294,13 @@ export function secretPathVerdict(
   const claudeJson = real(join(process.env.HOME ?? homedir(), ".claude.json"));
   let verdict: SecretPathVerdict = null;
   for (const raw of candidatePaths(toolName, input)) {
-    const literal = expand(raw, opts.workdir);
+    const relativePath = !isAbsolute(raw) && raw !== "~" && !raw.startsWith("~/");
+    if (relativePath && opts.cwd === null) {
+      verdict ??= { action: "ask", path: raw };
+      continue;
+    }
+    const base = typeof opts.cwd === "string" && isAbsolute(opts.cwd) ? opts.cwd : opts.workdir;
+    const literal = expand(raw, base);
     // Both forms: `/proc/self/fd/3` resolves to whatever the fd points at.
     // And through a process's root link: `/proc/4242/root/home/u/.codeoid/config.json`.
     const forms = [...new Set([literal, real(literal)].flatMap(throughProcRoots).flatMap((f) => [f, real(f)]))];

@@ -59,11 +59,12 @@ export type ToolApprovalFn = (
    */
   agentId?: string,
   /**
-   * For a shell call, the directory the backend reports its shell is in for
-   * this call (Claude's Bash keeps a `cd` between calls; its PreToolUse
-   * hook's `cwd`): relative write targets are judged from there
-   * (outside-writes.ts). Null: the backend's shell may have moved and it
-   * didn't say where. Absent: the backend's shell starts in the workdir.
+   * The directory the backend reports this call runs in (Claude's Bash keeps
+   * a `cd` between calls, and the CLI resolves a Grep or Glob's relative
+   * `path` from there too; its PreToolUse hook's `cwd`): a shell call's
+   * relative write targets and a tool's relative paths are judged from there
+   * (outside-writes.ts, secret-paths.ts). Null: the backend's cwd may have
+   * moved and it didn't say where. Absent: the backend runs in the workdir.
    */
   shellCwd?: string | null,
 ) => Promise<{

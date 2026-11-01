@@ -331,9 +331,11 @@ export class ClaudeProvider implements SessionProvider {
    */
   #autoApprovedTools = new Set<string>();
   /**
-   * The cwd the PreToolUse hook reported for each shell call, by tool_use_id,
-   * until canUseTool takes it: Claude's Bash keeps a `cd` between calls, so
-   * a call's relative write targets are judged from there (outside-writes.ts).
+   * The cwd the PreToolUse hook reported for each call, by tool_use_id,
+   * until canUseTool takes it: Claude's Bash keeps a `cd` between calls, and
+   * the CLI resolves a shell call's relative targets and a Grep or Glob's
+   * relative `path` (or its missing one, the search root) from there, so the
+   * gate judges them from there too (outside-writes.ts, secret-paths.ts).
    * Bounded: a call the CLI allows itself never reaches canUseTool.
    */
   #shellCwds = new Map<string, string>();
@@ -597,7 +599,8 @@ export class ClaudeProvider implements SessionProvider {
     let action: "deny" | "ask";
     let reason: string;
     try {
-      const secret = secretPathVerdict(input.tool_name, input.tool_input, { workdir, configDir: getConfigDir() });
+      // A relative path (a Grep or Glob's `path`, or none: the search root) is the CLI's persisted cwd's.
+      const secret = secretPathVerdict(input.tool_name, input.tool_input, { workdir, configDir: getConfigDir(), cwd: hookShellCwd(input) });
       if (!secret) return null;
       action = secret.action;
       reason =
@@ -626,10 +629,10 @@ export class ClaudeProvider implements SessionProvider {
    * handed to canUseTool (`ask`); one reading a credential file is refused.
    * Fail-closed, as #secretPathDecision is: a throw asks.
    */
-  /** Keep the cwd the hook reports for a shell call, for canUseTool (#shellCwds). */
+  /** Keep the cwd the hook reports for a call, for canUseTool (#shellCwds). */
   #rememberShellCwd(input: PreToolUseHookInput): void {
     const cwd = hookShellCwd(input);
-    if (!cwd || !input.tool_use_id || !isShellTool(input.tool_name)) return;
+    if (!cwd || !input.tool_use_id) return;
     this.#shellCwds.set(input.tool_use_id, cwd);
     if (this.#shellCwds.size > 256) this.#shellCwds.delete(this.#shellCwds.keys().next().value!);
   }
@@ -1286,8 +1289,9 @@ export class ClaudeProvider implements SessionProvider {
               // this hook sees every call.
               const foreign = this.#refuseForeignCall(input);
               if (foreign) return foreign;
-              // Where the CLI says this shell call runs, for the gate's own
-              // judgement in canUseTool (#shellCwds).
+              // Where the CLI says this call runs (its shell's persisted cwd,
+              // which a Grep or Glob's relative path is resolved from too), for
+              // the gate's own judgement in canUseTool (#shellCwds).
               this.#rememberShellCwd(input);
               // The secret-path rule (secret-paths.ts) is enforced HERE too,
               // not only in Session's canUseTool gate: the CLI allows some calls
@@ -1412,7 +1416,7 @@ export class ClaudeProvider implements SessionProvider {
 
           // A shell call is judged from where the CLI's Bash is now, as its
           // PreToolUse hook reported; not known (null) when it didn't.
-          const shellCwd = isShellTool(toolName) ? (this.#shellCwds.get(sdkToolUseId) ?? null) : undefined;
+          const shellCwd = this.#shellCwds.get(sdkToolUseId) ?? null;
           this.#shellCwds.delete(sdkToolUseId);
 
           // Emit tool_start — Session creates the SessionMessage.
