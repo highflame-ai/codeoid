@@ -7414,8 +7414,10 @@ export class Session {
     return risk.level === "unknown" && (this.#config?.approvals?.askOnUnknown ?? true);
   }
 
-  /** A low-risk shell call that guarded mode runs unasked, when the config says so (#431). */
-  #riskAllows(risk: ShellRisk | null): boolean {
+  /** A low-risk shell call that guarded mode runs unasked, when the config says so (#431);
+   *  never one the hard gates keep asked (an unresolved directory), whatever its rating. */
+  #riskAllows(toolName: string, risk: ShellRisk | null): boolean {
+    if (isUnresolvedPathTool(toolName)) return false;
     return risk?.level === "low" && !risk.secret && this.#mode === "guarded" && (this.#config?.approvals?.autoAllowLowRisk ?? false);
   }
 
@@ -7606,7 +7608,7 @@ export class Session {
       if (this.#budgetSpentFor(toolName)) return this.#endAttemptOnBudget(approvalId, toolName, sender);
       const riskAsks = this.#riskAsks(risk);
       const autoApprove =
-        !riskAsks && secret?.action !== "ask" && !settingsWrite && (this.#riskAllows(risk) || this.#shouldAutoApprove(toolName));
+        !riskAsks && secret?.action !== "ask" && !settingsWrite && (this.#riskAllows(toolName, risk) || this.#shouldAutoApprove(toolName));
       if (riskAsks && this.#mode === "autonomous") {
         this.#store.audit(sender.sub, "session.risk_ask", this.id, `tool=${toolName} risk=${risk?.level} ${risk?.reasons[0] ?? ""}`.trim());
       }
@@ -8255,7 +8257,7 @@ export class Session {
           secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir() }) === null &&
           !risk?.secret &&
           !this.#riskAsks(risk) &&
-          (this.#riskAllows(risk) || this.#peekAutoApprove(event.name));
+          (this.#riskAllows(event.name, risk) || this.#peekAutoApprove(event.name));
         // end_attempt: the gate will refuse this call outright — no approval card.
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
         const toolMsg = this.#makeMessage(

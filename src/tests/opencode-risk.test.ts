@@ -209,6 +209,15 @@ describe("an opencode shell call whose directory can't be resolved for certain (
     expect(rm.pending[0]?.risk?.level).toBe("high");
   });
 
+  test("a low command there is still asked in guarded mode with autoAllowLowRisk: the hard gate outranks a low rating", async () => {
+    const relaxed = { autoAllowLowRisk: true, askOnUnknown: true };
+    const ls = await opencodeCall({ command: "ls", workdir: unresolved }, "guarded", relaxed);
+    expect(ls.asked).toBe(true);
+    expect(ls.pending[0]?.toolName).toBe("opencode_unresolved_path");
+    expect(ls.card?.phase).toBe("waiting_confirmation");
+    expect(ls.card?.risk?.level).toBe("low");
+  });
+
   test("a credential read there is refused, as with a directory that resolves", async () => {
     const oc = await opencodeCall({ command: `cat ${join(getConfigDir(), "config.json")}`, workdir: unresolved }, "autonomous");
     expect(oc.asked).toBe(false);
