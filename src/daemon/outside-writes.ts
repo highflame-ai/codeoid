@@ -240,7 +240,8 @@ export interface OutsideWrite {
  * command whose targets the parser can't name).
  *
  * A shell call's relative targets are judged from where it runs: the
- * directory its input names (`cwd`, `workdir`, …), else `shellCwd`, the
+ * directory its input names (`cwd`, `workdir`, …; with a `shellCwd` too,
+ * from both, since the backend's own report is where its shell is), else `shellCwd`, the
  * directory the backend reports its shell is in for this call (Claude's
  * Bash keeps a `cd` between calls: its hook input's `cwd`), else the
  * workdir (a backend whose shell starts there each call). `shellCwd` null:
@@ -275,13 +276,17 @@ export function outsideWriteOf(
   const call = shellCallOf(toolName, input);
   if (!call) return null;
   const reported = shellCwd === undefined ? resolve(workdir) : shellCwd !== null && isAbsolute(shellCwd) ? shellCwd : null;
-  const cwd = call.cwd ? (isAbsolute(call.cwd) ? call.cwd : reported === null ? null : `${reported}/${call.cwd}`) : reported;
-  for (const target of shellWriteTargets(call.command, { workdir: resolve(workdir), cwd, cdpathUnset: opts.cdpathUnset === true })) {
-    // Best effort (#448): one the reader can't place asks only when what it sees of it could lead outside.
-    if (target.unplaced && !target.leaves) continue;
-    if (target.unplaced) return { path: target.path, resolved: false, why: target.unplaced };
-    const w = judge(target.path, target.name);
-    if (w) return w;
+  const named = call.cwd ? (isAbsolute(call.cwd) ? call.cwd : reported === null ? null : `${reported}/${call.cwd}`) : undefined;
+  // A backend that reports where its shell is, and an input naming another directory: judged from both (Claude's Bash has no such key).
+  const cwds = named === undefined ? [reported] : shellCwd !== undefined && named !== reported ? [named, reported] : [named];
+  for (const cwd of cwds) {
+    for (const target of shellWriteTargets(call.command, { workdir: resolve(workdir), cwd, cdpathUnset: opts.cdpathUnset === true })) {
+      // Best effort (#448): one the reader can't place asks only when what it sees of it could lead outside.
+      if (target.unplaced && !target.leaves) continue;
+      if (target.unplaced) return { path: target.path, resolved: false, why: target.unplaced };
+      const w = judge(target.path, target.name);
+      if (w) return w;
+    }
   }
   return null;
 }

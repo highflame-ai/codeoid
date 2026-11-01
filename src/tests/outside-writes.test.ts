@@ -368,9 +368,11 @@ describe("round 25: a shell target is placed only when the reader is sure of it"
     expect(bash("echo x >> notes", join(workdir, "sub"))).toEqual({ path: join(elsewhere, "f"), resolved: true });
     expect(bash("echo planted > my-skill/NOTE.md", elsewhere)).toEqual({ path: join(elsewhere, "my-skill", "NOTE.md"), resolved: true });
     expect(bash("echo x > notes.txt", null)).toMatchObject({ path: "notes.txt", resolved: false });
-    // An absolute target doesn't depend on it; the input's own cwd key wins over the reported one.
+    // An absolute target doesn't depend on it; an input's own cwd key doesn't override the reported one: both are judged (round 26).
     expect(bash(`echo x > ${workdir}/a.txt`, null)).toBeNull();
-    expect(outsideWriteOf("Bash", { command: "touch x", cwd: workdir }, workdir, elsewhere)).toBeNull();
+    expect(outsideWriteOf("Bash", { command: "touch x", cwd: workdir }, workdir, elsewhere)).toEqual({ path: join(elsewhere, "x"), resolved: true });
+    expect(outsideWriteOf("Bash", { command: "touch x", cwd: workdir }, workdir, workdir)).toBeNull();
+    expect(outsideWriteOf("Bash", { command: "touch x", cwd: workdir }, workdir)).toBeNull();
     runs(["touch x"], join(workdir, "sub"));
   });
 
