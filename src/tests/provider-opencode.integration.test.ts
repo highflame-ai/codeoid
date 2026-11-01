@@ -118,9 +118,9 @@ import { OpencodeClient } from "../daemon/providers/opencode/client.js";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
 import { OpencodeIncompatibleError, OpencodeServer } from "../daemon/providers/opencode/server.js";
 import { buildOpencodeEnv, sessionRules } from "../daemon/providers/opencode/policy.js";
-import { opencodeSecretLocations, opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
+import { opencodeRefusedPaths, opencodeSecretLocations, opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
 import type { ProviderEvent, ToolApprovalFn, TurnOpts, TurnRun, UiRequest } from "../daemon/providers/interface.js";
-import { secretPathVerdict } from "../daemon/secret-paths.js";
+import { registerSecretPaths, secretPathVerdict } from "../daemon/secret-paths.js";
 import { Session } from "../daemon/session.js";
 import { loadShellParser } from "../daemon/shell/parse.js";
 import { Store } from "../daemon/store.js";
@@ -2647,6 +2647,61 @@ describe("opencode (real binary)", () => {
       expect(docs.map((e) => e.info!.formatter)).toEqual([true, false]);
     } finally {
       await p.teardown();
+      await own.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 180_000);
+
+  maybeScripted("I64 a plugin written to the server's own config dir is refused before opencode can load it; the full output opencode saves for the model stays readable", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-cfgdir-")));
+    const work = join(root, "work");
+    mkdirSync(work);
+    const dbPath = join(root, "data", "opencode", "opencode.db");
+    const dataDir = join(root, "oc-files");
+    const own = new OpencodeServer({
+      command: resolved!.command,
+      argsPrefix: resolved!.argsPrefix,
+      dbPath,
+      dataDir,
+      env: () => ({ ...buildOpencodeEnv(), HOME: join(root, "home") }),
+      userConfigDir: null,
+      defaultModel: "scripted/scripted-1",
+      modelProviders,
+    });
+    // As the daemon's registry registers them.
+    const undo = registerSecretPaths(opencodeRefusedPaths({ dbPath: join(root, "codeoid.db"), transcriptDir: join(root, "transcripts"), providers: { opencode: { enabled: true, dbPath, dataDir } } } as unknown as CodeoidConfig));
+    // As an autonomous session's gate: the secret-path verdict, then allow.
+    const asked: Array<[string, string | undefined]> = [];
+    const gate: ToolApprovalFn = async (_t, _a, name, input) => {
+      const secret = secretPathVerdict(name, input, { workdir: work, configDir: join(root, "codeoid-config") })?.action;
+      asked.push([name, secret]);
+      return secret === "deny" ? { behavior: "deny", message: "codeoid's own" } : { behavior: "allow" };
+    };
+    const call = async (tool: string, input: Record<string, unknown>) => {
+      const p = new OpencodeProvider({ sessionId: `it-cfgdir-${Math.random().toString(36).slice(2)}`, initialBackingId: "it-cfgdir", server: own, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
+      asked.length = 0;
+      const events = await collect(p.runTurn(opts(`[[tool:${tool} ${JSON.stringify(input)}]]`, { workdir: work, canUseTool: gate })));
+      await p.teardown();
+      expect(events.find((e) => e.type === "error")).toBeUndefined();
+      return events.filter((e) => e.type === "tool_complete").map((e) => (e as Extract<ProviderEvent, { type: "tool_complete" }>).output).join("\n");
+    };
+    const marker = join(root, "plugin-loaded");
+    const plugin = join(own.configDir, "plugins", "x.js");
+    try {
+      await call("write", { path: plugin, content: `require("node:fs").appendFileSync(${JSON.stringify(marker)}, "loaded\\n");\nexport default {};\n` });
+      // Its directory card is refused already (the write's own is too: unit-tested).
+      expect(asked).toEqual([["opencode_external_directory", "deny"]]);
+      expect(existsSync(plugin)).toBe(false);
+      await Bun.sleep(1_000);
+      expect(existsSync(marker)).toBe(false);
+      // More lines than opencode shows: it saves the full output under its data dir and names the file.
+      const out = await call("shell", { command: "seq 1 3000", description: "count" });
+      const saved = /full output saved to (\S+?)\]/.exec(out)?.[1];
+      expect(saved?.startsWith(`${dataDir}/`)).toBe(true);
+      expect(await call("read", { path: saved })).toContain("3000");
+      expect(asked.every(([, secret]) => secret !== "deny")).toBe(true);
+    } finally {
+      undo();
       await own.stop();
       rmSync(root, { recursive: true, force: true });
     }

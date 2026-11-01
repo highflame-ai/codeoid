@@ -13,6 +13,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, readlinkSync } fro
 import { hostname } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { type CodeoidConfig, getConfigDir } from "../../../config.js";
+import { opencodeServerDirs } from "./policy.js";
 
 /**
  * Where codeoid's opencode keeps its database: `providers.opencode.dbPath`
@@ -39,10 +40,38 @@ function defaultOpencodeDbPath(config: CodeoidConfig | undefined): string {
  * a gone daemon's are cleared at the daemon's start
  * (`clearStaleOpencodeCredentials`), whether or not opencode is enabled or
  * found this time.
+ *
+ * `serverDirs` are refused the same way but never cleared: the server's
+ * config dir beside each database (opencode loads a plugin written there at
+ * once, inside the server) and its data, state and cache dirs in the
+ * configured and default `dataDir` (its logs, snapshots, the programs it
+ * fetches and runs). `open` are the dirs in them opencode hands the model
+ * a path into (a tool's or a shell's full output), which stay readable.
+ * Its temp dir, which it offers the model as scratch space, isn't refused.
  */
-export function opencodeSecretLocations(config: CodeoidConfig | undefined): { dirs: string[]; files: string[] } {
+export function opencodeSecretLocations(config: CodeoidConfig | undefined): { dirs: string[]; files: string[]; serverDirs: string[]; open: string[] } {
   const files = [...new Set([opencodeDbPath(config), defaultOpencodeDbPath(config), ...recordedOpencodeDbPaths(config)])];
-  return { dirs: files.map(opencodeCredentialsRoot), files };
+  const data = [...new Set([opencodeDataDir(config), defaultOpencodeDataDir(config)])].map(opencodeServerDirs);
+  return {
+    dirs: files.map(opencodeCredentialsRoot),
+    files,
+    serverDirs: [...files.map(opencodeConfigDir), ...data.flatMap((d) => [d.XDG_DATA_HOME, d.XDG_STATE_HOME, d.XDG_CACHE_HOME])],
+    open: data.flatMap((d) => OPENCODE_OUTPUT_DIRS.map((o) => join(d.XDG_DATA_HOME, "opencode", o))),
+  };
+}
+
+/** What the gate refuses of {@link opencodeSecretLocations}, as `registerSecretPaths` takes it. */
+export function opencodeRefusedPaths(config: CodeoidConfig | undefined): { dirs: string[]; files: string[]; open: string[] } {
+  const oc = opencodeSecretLocations(config);
+  return { dirs: [...oc.dirs, ...oc.serverDirs], files: oc.files, open: oc.open };
+}
+
+/** Where opencode 2.2.5 keeps a truncated tool output and a shell's output, under its data dir, named to the model in the call's result. */
+const OPENCODE_OUTPUT_DIRS = ["tool-output", "shell"];
+
+/** codeoid's own config dir for a server using the database `dbPath` (`OPENCODE_CONFIG_DIR`). */
+export function opencodeConfigDir(dbPath: string): string {
+  return join(dirname(dbPath), "config");
 }
 
 /**
@@ -103,6 +132,10 @@ export function recordOpencodeDbPath(file: string, dbPath: string): void {
 export function opencodeDataDir(config: CodeoidConfig | undefined): string {
   const configured = config?.providers?.opencode?.dataDir;
   if (configured) return isAbsolute(configured) ? configured : resolve(getConfigDir(), configured);
+  return defaultOpencodeDataDir(config);
+}
+
+function defaultOpencodeDataDir(config: CodeoidConfig | undefined): string {
   return config?.transcriptDir ? join(dirname(config.transcriptDir), "opencode") : join(getConfigDir(), "opencode");
 }
 

@@ -57,7 +57,7 @@ import {
   userModelConfig,
   userOpencodeConfigDir,
 } from "./policy.js";
-import { opencodeCredentialsDir, opencodeVersionProblem, recordOpencodeDbPath } from "./resolve.js";
+import { opencodeConfigDir, opencodeCredentialsDir, opencodeVersionProblem, recordOpencodeDbPath } from "./resolve.js";
 
 /**
  * Live-feed event types the providers read: every session's durable events
@@ -281,9 +281,9 @@ export class OpencodeServer {
     if (this.#conn === conn) await this.stop(told);
   }
 
-  /** codeoid's own config dir for the server (`OPENCODE_CONFIG_DIR`): nothing in it but what codeoid puts there. */
+  /** codeoid's own config dir for the server (`OPENCODE_CONFIG_DIR`): nothing in it but what codeoid puts there (a tool call naming it is refused: `opencodeSecretLocations`). */
   get configDir(): string {
-    return join(dirname(this.#opts.dbPath), "config");
+    return opencodeConfigDir(this.#opts.dbPath);
   }
 
   /** Where the credential files the injected config names live (0700; only codeoid's). */

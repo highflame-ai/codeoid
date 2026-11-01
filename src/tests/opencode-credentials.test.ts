@@ -7,7 +7,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CodeoidConfig, loadConfig, QWEN_BASE_URL_PRESETS } from "../config.js";
@@ -37,6 +37,7 @@ import {
   recordOpencodeDbPath,
 } from "../daemon/providers/opencode/resolve.js";
 import { registerSecretPaths, secretPathVerdict } from "../daemon/secret-paths.js";
+import { assessShellCommand } from "../daemon/risk/shell-risk.js";
 import { createDefaultProviderRegistry } from "../daemon/providers/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
@@ -681,6 +682,58 @@ describe("the gate refuses opencode's credential files and database", () => {
       handed.dispose();
       store.close();
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("the server's config dir and its data, state and cache dirs are refused in every form, at every location; the output opencode hands the model and its temp dir aren't", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-oc-gate-")));
+    const opts = { workdir: join(root, "work"), configDir: join(root, "codeoid-config") };
+    const config = {
+      dbPath: join(root, "codeoid.db"),
+      transcriptDir: join(root, "transcripts"),
+      providers: { opencode: { enabled: false, dbPath: join(root, "moved", "opencode.db"), dataDir: join(root, "oc-files") } },
+    } as unknown as CodeoidConfig;
+    // A database a server ran with before the config moved on.
+    recordOpencodeDbPath(opencodeLocationsFile(config), join(root, "earlier", "opencode.db"));
+    const verdict = (tool: string, input: Record<string, unknown>) => secretPathVerdict(tool, input, opts)?.action ?? null;
+    const registry = createDefaultProviderRegistry(config, {});
+    try {
+      // The config dir beside each database: the configured one, the default and the recorded one.
+      for (const db of [join(root, "moved"), join(root, "opencode"), join(root, "earlier")]) {
+        expect(verdict("write", { filePath: join(db, "config", "plugins", "x.js") })).toBe("deny");
+        expect(verdict("edit", { filePath: join(db, "config", "opencode.json") })).toBe("deny");
+        expect(verdict("opencode_external_directory", { directories: [join(db, "config", "plugins")], tool: "write" })).toBe("deny");
+      }
+      // The configured dataDir and the default one (beside the transcripts).
+      for (const data of [join(root, "oc-files"), join(root, "opencode")]) {
+        const dirs = opencodeServerDirs(data);
+        expect(verdict("Write", { file_path: join(dirs.XDG_DATA_HOME, "opencode", "log", "x.log") })).toBe("deny");
+        expect(verdict("Write", { file_path: join(dirs.XDG_CACHE_HOME, "opencode", "bin", "rg") })).toBe("deny");
+        expect(verdict("Write", { file_path: join(dirs.XDG_STATE_HOME, "opencode", "kv.json") })).toBe("deny");
+        expect(verdict("Grep", { pattern: "x", path: join(dirs.XDG_DATA_HOME, "opencode") })).toBe("deny");
+        // What opencode tells the model to read: a truncated tool output, a shell's output.
+        expect(verdict("Read", { file_path: join(dirs.XDG_DATA_HOME, "opencode", "tool-output", "tool_0123456789ab") })).toBeNull();
+        expect(verdict("Read", { file_path: join(dirs.XDG_DATA_HOME, "opencode", "shell", "proj", "1.out") })).toBeNull();
+        expect(verdict("opencode_external_directory", { directories: [join(dirs.XDG_DATA_HOME, "opencode", "tool-output")], tool: "read" })).toBeNull();
+        // Its temp dir, offered to the model as scratch space.
+        expect(verdict("Write", { file_path: join(dirs.TMPDIR, "opencode", "scratch.txt") })).toBeNull();
+      }
+      // A link in an open dir is judged where it leads.
+      const output = join(opencodeServerDirs(join(root, "oc-files")).XDG_DATA_HOME, "opencode", "tool-output");
+      mkdirSync(output, { recursive: true });
+      mkdirSync(join(root, "moved", "config", "plugins"), { recursive: true });
+      symlinkSync(join(root, "moved", "config"), join(output, "l"));
+      expect(verdict("write", { filePath: join(output, "l", "plugins", "x.js") })).toBe("deny");
+      // A shell line naming one.
+      const shell = await assessShellCommand(`cp payload.js ${join(root, "moved", "config", "plugins", "x.js")}`, { cwd: opts.workdir, ...opts, home: root });
+      expect(shell.secret?.action).toBe("deny");
+      // The credential roots stay the only dirs a daemon's start clears.
+      expect(opencodeSecretLocations(config).dirs.every((d) => d.endsWith("codeoid-credentials"))).toBe(true);
+      registry.dispose();
+      expect(verdict("write", { filePath: join(root, "moved", "config", "plugins", "x.js") })).toBeNull();
+    } finally {
+      registry.dispose();
       rmSync(root, { recursive: true, force: true });
     }
   });

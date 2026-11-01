@@ -37,7 +37,7 @@ import { GEMINI_CLI_INSTALL_HINT, resolveGeminiCliCommand } from "./acp/resolve.
 import { QwenProvider } from "./qwen/index.js";
 import { OPENCODE_DISPLAY_NAME, OPENCODE_PROVIDER_ID, OpencodeProvider } from "./opencode/index.js";
 import { opencodeCredentialInputs } from "./opencode/credentials.js";
-import { OPENCODE_INSTALL_HINT, opencodeDataDir, opencodeDbPath, opencodeLocationsFile, opencodeSecretLocations, resolveOpencodeCommand } from "./opencode/resolve.js";
+import { OPENCODE_INSTALL_HINT, opencodeDataDir, opencodeDbPath, opencodeLocationsFile, opencodeRefusedPaths, resolveOpencodeCommand } from "./opencode/resolve.js";
 import { OpencodeServer } from "./opencode/server.js";
 import { SCRIPTED_ENV, SCRIPTED_PROVIDER_ID, ScriptedProvider } from "./scripted/index.js";
 import { StatelessSessionProvider } from "./stateless.js";
@@ -620,8 +620,10 @@ export function createDefaultProviderRegistry(
   // every backend's file tools, as codeoid's own are: registered whether or
   // not opencode is enabled or found, since both outlive the daemon that
   // wrote them, and at the default and recorded locations too (a moved dbPath
-  // leaves them). Not for a preview: the live daemon's gate isn't its to change.
-  if (!options.preview) registry.onDispose(registerSecretPaths(opencodeSecretLocations(config)));
+  // leaves them). So are the server's config, data, state and cache dirs: a
+  // plugin written to its config dir runs in the server at once. Not for a
+  // preview: the live daemon's gate isn't its to change.
+  if (!options.preview) registry.onDispose(registerSecretPaths(opencodeRefusedPaths(config)));
   if (config?.providers?.opencode?.enabled !== false) {
     const configured = config?.providers?.opencode?.command;
     const resolution = resolveOpencodeCommand(configured === "opencode" ? undefined : configured, env);

@@ -104,9 +104,10 @@ function cliCredentialFiles(): string[] {
   ];
 }
 
-/** Credential locations a backend registered (`registerSecretPaths`): dirs whose contents are secret, files (and their SQLite sidecars). */
+/** Credential locations a backend registered (`registerSecretPaths`): dirs whose contents are secret, files (and their SQLite sidecars), and dirs in them that aren't. */
 const REGISTERED_DIRS = new Map<string, number>();
 const REGISTERED_FILES = new Map<string, number>();
+const REGISTERED_OPEN = new Map<string, number>();
 
 function bump(map: Map<string, number>, key: string, by: 1 | -1): void {
   const n = (map.get(key) ?? 0) + by;
@@ -117,21 +118,26 @@ function bump(map: Map<string, number>, key: string, by: 1 | -1): void {
 /**
  * Add credential locations codeoid chose for a backend: every file under one
  * of `dirs`, and each of `files` (with its `-wal` / `-shm` / `-journal`), is
- * refused like codeoid's own; a search rooted above one asks. opencode's
- * credential dir and database are registered with the registry
- * (registry.ts). Returns the undo (tests).
+ * refused like codeoid's own; a search rooted above one asks. A dir of
+ * `open` inside one of `dirs` isn't refused by it (only as written there: a
+ * link in it is judged where it leads). opencode's credential dir, database
+ * and server dirs are registered with the registry (registry.ts). Returns
+ * the undo (tests).
  */
-export function registerSecretPaths(paths: { dirs?: readonly string[]; files?: readonly string[] }): () => void {
+export function registerSecretPaths(paths: { dirs?: readonly string[]; files?: readonly string[]; open?: readonly string[] }): () => void {
   const dirs = (paths.dirs ?? []).map((d) => resolve(d));
   const files = (paths.files ?? []).map((f) => resolve(f));
+  const open = (paths.open ?? []).map((d) => resolve(d));
   for (const d of dirs) bump(REGISTERED_DIRS, d, 1);
   for (const f of files) bump(REGISTERED_FILES, f, 1);
+  for (const d of open) bump(REGISTERED_OPEN, d, 1);
   let undone = false;
   return () => {
     if (undone) return;
     undone = true;
     for (const d of dirs) bump(REGISTERED_DIRS, d, -1);
     for (const f of files) bump(REGISTERED_FILES, f, -1);
+    for (const d of open) bump(REGISTERED_OPEN, d, -1);
   };
 }
 
@@ -262,7 +268,14 @@ export function secretPathVerdict(
   const secretFiles = [
     ...cliCredentialFiles().map((f) => real(f)),
   ];
-  const registeredDirs = [...REGISTERED_DIRS.keys()].map((d) => real(d));
+  // Each with the open dirs inside it, at the same place below its real path:
+  // an open dir never opens another registered dir, nor where a link leads.
+  const open = [...REGISTERED_OPEN.keys()];
+  const refusedDirs = [...REGISTERED_DIRS.keys()].map((d) => {
+    const dir = real(d);
+    return { dir, open: open.filter((o) => o !== d && within(o, d)).map((o) => join(dir, relative(d, o))) };
+  });
+  const registeredDirs = refusedDirs.map((r) => r.dir);
   const registeredFiles = [...REGISTERED_FILES.keys()].map((f) => real(f));
   const secretDirs = [configDir, ...secretFiles.map((f) => dirname(f)), ...registeredDirs, ...registeredFiles.map((f) => dirname(f))];
   // Found as the MCP reader finds it (workdir-servers.ts): HOME first.
@@ -286,7 +299,7 @@ export function secretPathVerdict(
     let verdict: SecretPathVerdict = null;
     if (norm(dirname(p)) === norm(configDir) && isSecretConfigFile(norm(basename(p)))) return { action: "deny", path: raw };
     if (secretFiles.some((f) => norm(f) === norm(p))) return { action: "deny", path: raw };
-    if (registeredDirs.some((d) => within(p, d))) return { action: "deny", path: raw };
+    if (refusedDirs.some((r) => within(p, r.dir) && !r.open.some((o) => within(p, o)))) return { action: "deny", path: raw };
     if (registeredFiles.some((f) => SQLITE_SIDECARS.some((s) => norm(`${f}${s}`) === norm(p)))) return { action: "deny", path: raw };
     if (LOGIN_DIR.test(p)) return { action: "deny", path: raw };
     // An account's home (accounts.ts): its own files are its credential. The

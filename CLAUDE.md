@@ -376,7 +376,14 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   never recursively. The gate refuses every daemon's and the database at
   the configured and default locations and every one a server ran with
   (`opencode-locations.jsonl` beside codeoid's database, recorded before
-  a key is written), opencode enabled or not (`opencodeSecretLocations`). The default model is
+  a key is written), opencode enabled or not (`opencodeSecretLocations`),
+  and so the server's config dir beside each (opencode loads a plugin
+  written there at once, inside the server) and the `data/`, `state/` and
+  `cache/` of the configured and default `dataDir`, less the two dirs
+  opencode names to the model (`data/opencode/tool-output` and `…/shell`, a
+  truncated tool's and a shell's full output: `registerSecretPaths`'s
+  `open`, judged as written; a link in them where it leads); its `tmp/`
+  stays the model's (`opencodeRefusedPaths`). The default model is
   handed over only as a `provider/model` id (`OPENCODE_MODEL_ID`).
 - **Policy** (policy.ts): opencode asks about every action. Session rules end
   in ask-everything; the server's agents are checked at start and a subagent
