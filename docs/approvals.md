@@ -71,7 +71,7 @@ The approval prompt says the level and why, in the web UI, the terminal UI, Tele
 }
 ```
 
-Rewinding uses the same reading of a command for its "not undone by going back" list: it lists commands with effects outside the workspace's files (a push, an install, a write outside the workspace, `sudo`), not every command whose text mentions one.
+Rewinding uses the same reading of a command for its "not undone by going back" list: it lists commands with effects outside the workspace's files (a push, an install, a write outside the workspace, `sudo`), not every command whose text mentions one. A command is read in the directory it ran in, as the gate read it: one opencode ran with a `workdir` outside the workspace is listed when it writes there, and one in a directory opencode couldn't resolve for certain is judged in each place it may have run.
 
 ## Which backends
 

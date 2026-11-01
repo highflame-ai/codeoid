@@ -733,9 +733,21 @@ export function irreversibleEffects(turns: readonly CanonicalTurn[], ctx: { work
       if (tc.name.startsWith("mcp__") || tool.startsWith("mcp__")) {
         out.push({ tool, detail: shorten(JSON.stringify(tc.input)) });
       } else if (isShellTool(tc.name, tool)) {
-        const cmd = shellCommandOf(tc.input);
-        // Judged by what it runs (#431), from the workspace it ran in.
-        if (outsideEffects(cmd, ctx)) out.push({ tool, detail: shorten(cmd) });
+        const call = shellCallOf(tc.name, tc.input) ?? shellCallOf(tool, tc.input);
+        const cmd = call?.command ?? shellCommandOf(tc.input);
+        // Judged by what it runs (#431), in the directory it ran in, as the gate judged it.
+        const cwd = call?.cwd ? resolvePath(ctx.workdir, call.cwd) : ctx.workdir;
+        if (outsideEffects(cmd, { ...ctx, cwd })) out.push({ tool, detail: shorten(cmd) });
+      } else if (isUnresolvedPathTool(tc.name)) {
+        // opencode's shell call in a directory it couldn't resolve for certain:
+        // judged in each place it may have run, as the gate judged it.
+        const inner = typeof tc.input.tool === "string" ? tc.input.tool : "";
+        const call = tc.input.call && typeof tc.input.call === "object" ? shellCallOf(inner, tc.input.call as Record<string, unknown>) : null;
+        if (!call) continue;
+        const places = Array.isArray(tc.input.paths) ? tc.input.paths.filter((p): p is string => typeof p === "string" && p.length > 0) : [];
+        if ((places.length > 0 ? places : [ctx.workdir]).some((cwd) => outsideEffects(call.command, { ...ctx, cwd: resolvePath(ctx.workdir, cwd) }))) {
+          out.push({ tool: inner, detail: shorten(call.command) });
+        }
       }
     }
   }

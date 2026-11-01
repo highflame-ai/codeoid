@@ -38,6 +38,8 @@ const PACKAGE_VERBS: Record<string, Set<string>> = {
 
 export interface EffectContext {
   workdir: string;
+  /** The directory the command ran in, absolute; the workdir when absent. */
+  cwd?: string;
   home?: string;
 }
 
@@ -49,7 +51,9 @@ export function outsideEffects(command: string, ctx: EffectContext): boolean {
   const parsed = parseShellSync(command);
   if (parsed.problems.length > 0) return true;
   const home = ctx.home ?? homedir();
-  let cwd: string | null = ctx.workdir;
+  // Outside the workspace, a relative path's target is as unknown as after a `cd` there.
+  const start = ctx.cwd ?? ctx.workdir;
+  let cwd: string | null = inside(start, ctx.workdir) ? start : null;
   for (const cmd of parsed.commands) {
     const prog = programOf(cmd);
     if (prog === null) return true;

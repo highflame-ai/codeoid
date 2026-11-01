@@ -740,6 +740,37 @@ describe("irreversibleEffects", () => {
       "echo 'git push' | sh",
     ]);
   });
+
+  it("judges a shell call in the directory it names, as the gate does (round-16 audit)", () => {
+    const call = (id: string, input: Record<string, unknown>, name = "Bash") => ({ id, name, input, output: "", success: true });
+    const effects = irreversibleEffects(
+      [
+        { role: "user", content: "x" },
+        {
+          role: "assistant",
+          content: "",
+          providerId: "opencode",
+          model: "m",
+          toolCalls: [
+            call("in", { command: "touch out.txt" }),
+            call("sub", { command: "touch out.txt", cwd: "/w/proj/sub" }),
+            call("rel", { command: "touch out.txt", workdir: "sub" }),
+            call("out", { command: "touch out.txt", cwd: "/elsewhere" }), // opencode's workdir, outside
+            call("up", { command: "rm a", workdir: ".." }),
+            // A directory opencode couldn't resolve: judged in each place it may be.
+            call("unres-in", { tool: "shell", paths: ["/w/proj/docs"], call: { command: "touch a", workdir: "x/../docs" } }, "opencode_unresolved_path"),
+            call("unres-out", { tool: "shell", paths: ["/w/proj/docs", "/w/docs"], call: { command: "touch b", workdir: "x/../../docs" } }, "opencode_unresolved_path"),
+          ],
+        },
+      ],
+      { workdir: "/w/proj" },
+    );
+    expect(effects).toEqual([
+      { tool: "Bash", detail: "touch out.txt" },
+      { tool: "Bash", detail: "rm a" },
+      { tool: "shell", detail: "touch b" },
+    ]);
+  });
 });
 
 describe("applyRewinds", () => {
