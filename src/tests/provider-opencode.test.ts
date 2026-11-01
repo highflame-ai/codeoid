@@ -2863,6 +2863,22 @@ describe("opencode mid-turn messages", () => {
     await p.teardown();
   });
 
+  it("the inbox sweep before a prompt doesn't wait for a message pushed into that same turn, which waits for its prompt (round-22 audit)", async () => {
+    const { server } = makeServer();
+    const p = makeProvider(server);
+    await collect(p.runTurn(opts("hi")));
+    const started = Date.now();
+    const run = p.runTurn(opts("hi"));
+    run.pushMidTurn?.("right behind it", "later");
+    const events = await collect(run);
+    expect(done(events)).toBeTruthy();
+    // The sweep would wait out its bound (3s) for it.
+    expect(Date.now() - started).toBeLessThan(2_000);
+    // Not withdrawn: it's this turn's, delivered in it.
+    expect((await fakeState(server)).inboxCancels).toEqual([]);
+    await p.teardown();
+  });
+
   it("an execution interrupted from outside codeoid while a pushed message waits: the turn ends, the message is withdrawn and its boundary paid (round-17 audit)", async () => {
     for (const priority of ["now", "later"] as const) {
       const { server } = makeServer();

@@ -406,8 +406,8 @@ export class OpencodeProvider implements SessionProvider {
   #epoch = 0;
   /** The attach in flight, which a teardown waits out (bounded) before it unmounts and revokes. */
   #attaching: Promise<unknown> | null = null;
-  /** Mid-turn messages whose request is still out, any turn's: the inbox sweep before a prompt waits for them (#sweepInbox). */
-  #pushing = new Set<Promise<void>>();
+  /** Mid-turn messages whose request is still out, and their turn: the inbox sweep before a prompt waits for earlier turns' (#sweepInbox). */
+  #pushing = new Set<{ turn: Turn; done: Promise<void> }>();
 
   // Turn state.
   #turn: Turn | null = null;
@@ -733,7 +733,7 @@ export class OpencodeProvider implements SessionProvider {
       // The execution's end waits for the request: whether opencode queued it decides whether the turn goes on.
       const queued = this.#send(turn, content, "queue");
       this.#settling(turn, queued);
-      this.#inFlight(queued);
+      this.#inFlight(turn, queued);
       await queued;
       return;
     }
@@ -743,7 +743,7 @@ export class OpencodeProvider implements SessionProvider {
     turn.owed++;
     const sent = this.#send(turn, content, "steer");
     this.#settling(turn, sent);
-    this.#inFlight(sent);
+    this.#inFlight(turn, sent);
     try {
       await sent;
     } catch (err) {
@@ -826,10 +826,10 @@ export class OpencodeProvider implements SessionProvider {
     return ses && conn ? ids.map((id) => this.#cancelInput(conn, ses, id)) : [];
   }
 
-  #inFlight(push: Promise<void>): void {
-    const settled = push.catch(() => {});
-    this.#pushing.add(settled);
-    void settled.then(() => this.#pushing.delete(settled));
+  #inFlight(turn: Turn, push: Promise<void>): void {
+    const entry = { turn, done: push.catch(() => {}) };
+    this.#pushing.add(entry);
+    void entry.done.then(() => this.#pushing.delete(entry));
   }
 
   /**
@@ -840,13 +840,14 @@ export class OpencodeProvider implements SessionProvider {
    * delivered. opencode keeps its inbox in its database, across its
    * server's death and codeoid's restart, and delivers what waits there
    * with the next prompt, which would answer it (and bill it) there. No
-   * turn is open then, so nothing in it is anyone's; a push still on its
-   * way is waited for first (bounded: #send withdraws one that lands
-   * later). Only user inputs: synthetic ones are codeoid's instructions or
+   * turn but this one is open then, whose own pushes wait for its prompt,
+   * so nothing in it is anyone's; an earlier turn's push still on its way
+   * is waited for first (bounded: #send withdraws one that lands later). Only user inputs: synthetic ones are codeoid's instructions or
    * opencode's own. A failure fails the turn — unchecked, it could run.
    */
   async #sweepInbox(conn: OpencodeConnection, ses: string): Promise<void> {
-    if (this.#pushing.size > 0) await Promise.race([Promise.all(this.#pushing), Bun.sleep(ATTACH_WAIT_MS)]);
+    const earlier = [...this.#pushing].filter((p) => p.turn !== this.#turn).map((p) => p.done);
+    if (earlier.length > 0) await Promise.race([Promise.all(earlier), Bun.sleep(ATTACH_WAIT_MS)]);
     const left = (await conn.client.inbox(ses)).filter((item) => item.type === "user");
     if (left.length === 0) return;
     await Promise.all(left.map((item) => conn.client.cancelInput(ses, item.id)));
@@ -1208,6 +1209,8 @@ export class OpencodeProvider implements SessionProvider {
         let forked = await conn.client.forkSession(pending.source, before);
         // A fork may not carry the source's rules; this session's are set before anything runs.
         await conn.client.updateSession(forked.id, { permissions: rules });
+        // Nor anything an earlier turn left in an inbox, before its move runs it.
+        await this.#sweepInbox(conn, forked.id);
         // A fork stays where its source is: one into a worktree of its own runs there, or not at all.
         forked = await this.#moveInto(conn, forked, workdir);
         this.#freshSession();
