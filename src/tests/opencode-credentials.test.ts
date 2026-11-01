@@ -37,6 +37,10 @@ import {
   recordOpencodeDbPath,
 } from "../daemon/providers/opencode/resolve.js";
 import { registerSecretPaths, secretPathVerdict } from "../daemon/secret-paths.js";
+import { createDefaultProviderRegistry } from "../daemon/providers/registry.js";
+import { SessionManager } from "../daemon/session-manager.js";
+import { Store } from "../daemon/store.js";
+import { TranscriptStore } from "../daemon/transcript.js";
 
 const DIR = "/srv/codeoid/opencode/codeoid-credentials/4242-0123456789ab";
 const NO_OAUTH = "/nonexistent/.qwen/oauth_creds.json";
@@ -613,5 +617,36 @@ describe("the gate refuses opencode's credential files and database", () => {
       rmSync(root, { recursive: true, force: true });
     }
     expect(secretPathVerdict("Read", { file_path: join(creds, "qwen.key") }, opts)).toBeNull();
+  });
+
+  it("a registry registers them for as long as it lives: disposed (a manager that built it drained), they're dropped", async () => {
+    const root = mkdtempSync(join(tmpdir(), "codeoid-oc-gate-"));
+    const db = join(root, "opencode", "opencode.db");
+    const key = join(opencodeCredentialsDir(db), "qwen.key");
+    const opts = { workdir: join(root, "work"), configDir: join(root, "codeoid-config") };
+    const config = {
+      dbPath: join(root, "codeoid.db"),
+      transcriptDir: join(root, "transcripts"),
+      providers: { opencode: { enabled: false, dbPath: db } },
+    } as unknown as CodeoidConfig;
+    try {
+      const registry = createDefaultProviderRegistry(config, {});
+      expect(secretPathVerdict("Read", { file_path: key }, opts)?.action).toBe("deny");
+      registry.dispose();
+      expect(secretPathVerdict("Read", { file_path: key }, opts)).toBeNull();
+      // A manager's own registry lives until the manager drains; one handed to it stays the caller's.
+      const store = new Store(join(root, "codeoid.db"));
+      const manager = new SessionManager(store, new TranscriptStore(join(root, "transcripts")), undefined, undefined, undefined, { config });
+      expect(secretPathVerdict("Read", { file_path: key }, opts)?.action).toBe("deny");
+      await manager.drain(100);
+      expect(secretPathVerdict("Read", { file_path: key }, opts)).toBeNull();
+      const handed = createDefaultProviderRegistry(config, {});
+      await new SessionManager(store, new TranscriptStore(join(root, "transcripts")), undefined, undefined, undefined, { config, providers: handed }).drain(100);
+      expect(secretPathVerdict("Read", { file_path: key }, opts)?.action).toBe("deny");
+      handed.dispose();
+      store.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

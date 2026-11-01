@@ -505,6 +505,8 @@ export class SessionManager {
   #packs: PackService;
   /** The daemon's provider catalog — one registry, shared by every session. */
   #providers: ProviderRegistry;
+  /** The registry is this manager's own (not handed in): let go when it drains. */
+  #ownsProviders = false;
   /** The daemon's hook bus — one instance, shared by every session. */
   #hooks?: HookBus;
   #testProviderFactory?: () => SessionProvider;
@@ -625,6 +627,7 @@ export class SessionManager {
     this.#claudeAccounts = opts?.claudeAccounts ?? new ClaudeAccountStore(opts?.accounts);
     this.#accounts = this.#claudeAccounts.store;
     this.#providers = opts?.providers ?? createDefaultProviderRegistry(opts?.config, process.env, endpoints, this.#accounts);
+    this.#ownsProviders = !opts?.providers;
     // An injected registry (tests) gets the endpoints too; startup's already has them.
     // Like startup, an unreadable endpoints file costs the endpoints, not the daemon.
     if (opts?.providers) {
@@ -3909,6 +3912,15 @@ mcpHub: this.#mcpHub,
    * idle or deadline.
    */
   async drain(timeoutMs = 10_000): Promise<void> {
+    try {
+      await this.#drain(timeoutMs);
+    } finally {
+      // Last: the gate keeps refusing opencode's credential files while sessions stop.
+      if (this.#ownsProviders) this.#providers.dispose();
+    }
+  }
+
+  async #drain(timeoutMs: number): Promise<void> {
     // An abandoned login is a live pty holding an open OAuth attempt. Kill
     // those first, and unconditionally — they are not work worth draining.
     this.#backendLogin.dispose();

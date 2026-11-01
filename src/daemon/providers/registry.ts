@@ -169,6 +169,22 @@ export class ProviderRegistry {
    * created on an id that isn't registered.
    */
   #prefixResolver: ((id: string) => ProviderFactory | undefined) | null = null;
+  /** What building this registry changed outside it (the gate's credential paths), undone by {@link dispose}. */
+  readonly #cleanups: Array<() => void> = [];
+
+  /** Undo, when the registry is let go, what building it changed elsewhere. */
+  onDispose(cleanup: () => void): void {
+    this.#cleanups.push(cleanup);
+  }
+
+  /**
+   * Let the registry go: the credential paths it registered for the gate are
+   * dropped (a test's daemon built under /tmp would otherwise leave every
+   * later session judging /tmp to hold credentials). Idempotent.
+   */
+  dispose(): void {
+    for (const cleanup of this.#cleanups.splice(0)) cleanup();
+  }
 
   register(factory: ProviderFactory): void {
     if (this.#factories.has(factory.id)) {
@@ -605,7 +621,7 @@ export function createDefaultProviderRegistry(
   // not opencode is enabled or found, since both outlive the daemon that
   // wrote them, and at the default and recorded locations too (a moved dbPath
   // leaves them). Not for a preview: the live daemon's gate isn't its to change.
-  if (!options.preview) registerSecretPaths(opencodeSecretLocations(config));
+  if (!options.preview) registry.onDispose(registerSecretPaths(opencodeSecretLocations(config)));
   if (config?.providers?.opencode?.enabled !== false) {
     const configured = config?.providers?.opencode?.command;
     const resolution = resolveOpencodeCommand(configured === "opencode" ? undefined : configured, env);
