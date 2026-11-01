@@ -199,7 +199,7 @@ export interface DaemonConfig {
    * released on shutdown, after everything else. Absent for an embedder or a
    * test, which takes none.
    */
-  dataLock?: { release(): void };
+  dataLock?: { release(): void; signalsHandled?(): void };
   /**
    * Outward control-plane MCP endpoint (`/mcp/control`, docs/mcp-control.md).
    * Absent or `enabled: false` = not mounted (the path 404s).
@@ -468,6 +468,8 @@ export class DaemonServer {
   async start(): Promise<void> {
     // Install signal handlers
     this.#shutdown.install();
+    // The daemon's handlers release the lock now (the `data-lock` step): the lock's interim ones step aside.
+    this.#config.dataLock?.signalsHandled?.();
 
     // The approval gate judges shell commands as it decides (#431): load the
     // parser before any session runs. A failure leaves every command

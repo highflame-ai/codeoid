@@ -214,7 +214,7 @@ The opencode backend (opencode 2.2.5 or a later 2.2.x) is on by default when an 
 
 ### One daemon per data directory
 
-A daemon owns its data: the directory of its database (`dbPath`, `~/.codeoid/` by default), its transcripts and checkpoints (`transcriptDir`), opencode's database and data dirs (`providers.opencode.dbPath`, `providers.opencode.dataDir`) and memory's database dir. Two daemons on the same data would corrupt each other's state, so `codeoid start` takes a lock on each of those directories (a `codeoid-daemon.lock` file in it, recording the daemon's pid, host and process start time) before it opens or cleans up anything, and a second start on any of them is refused, naming the daemon that holds it:
+A daemon owns its data: the directory of its database (`dbPath`, `~/.codeoid/` by default), its transcripts and checkpoints (`transcriptDir`), opencode's database and data dirs (`providers.opencode.dbPath`, `providers.opencode.dataDir`) and memory's database dir. Two daemons on the same data would corrupt each other's state, so `codeoid start` takes a lock on each of those directories (a `codeoid-daemon.lock` file in it, recording the daemon's pid, host, machine id and process start time) before it opens or cleans up anything, and a second start on any of them is refused, naming the daemon that holds it:
 
 ```
 [codeoid] the daemon couldn't start: another codeoid daemon (pid 4242 on laptop, port 7400, since …) uses /home/u/.codeoid: process 4242 still runs. …
@@ -222,8 +222,13 @@ A daemon owns its data: the directory of its database (`dbPath`, `~/.codeoid/` b
 
 Stop that daemon first, or give the second one data of its own (`CODEOID_DB_PATH`, `CODEOID_TRANSCRIPT_DIR`, or another config dir with `XDG_CONFIG_HOME`).
 
-- The lock goes when the daemon stops, however it stops (a signal, a failed start). A daemon killed outright (`kill -9`, a crash, power loss) leaves it; the next start takes it over, with a line in its log, when the process that took it is gone: on the same host, its pid no longer runs, or now runs another process (a different start time), or the machine has restarted since.
-- A lock taken on another host (data on a shared or network home), or in another pid namespace (a container), can't be checked from here, so it is never taken over: the start is refused, naming the holder. If that daemon is gone, remove the lock file the message names and start again. Nothing else is ever removed or changed while deciding.
+- The lock goes when the daemon stops, however it stops (a signal, a signal while it is still starting, a failed start). A daemon killed outright (`kill -9`, a crash, power loss) leaves it; the next start takes it over, with a line in its log, when the process that took it is gone: on the same machine, its pid no longer runs, or now runs another process (a different start time, read the same whatever time zone or locale the start runs under), or the machine has restarted since.
+- The machine is told by its machine id (`/etc/machine-id` on Linux, the hardware UUID on macOS) where the lock and the start both have one, and by hostname otherwise: a renamed machine still knows its own lock, and two machines that share a hostname don't take each other's.
+- A lock taken on another machine (data on a shared or network home) can't be checked from here, so it is never taken over: the start is refused, naming the holder. If that daemon is gone, remove the lock file the message names and start again.
+- In a container: a daemon refreshes its lock every minute. A container restarted after its daemon was killed (an OOM kill, or `docker stop` whose 10-second default is shorter than the daemon's 30-second shutdown grace; give it `docker stop -t 40`) runs in a new pid namespace, where the old pid can't be checked, so the start is refused until the old lock hasn't been refreshed for 10 minutes, then takes it over. A restart policy's retries get there on their own; remove the lock file to start sooner. (A daemon in a container whose processes are frozen for 10 minutes, `docker pause`, would have its lock taken over.)
+- A start that dies while it takes over a stale lock leaves a `.takeover` guard beside it; the next start judges the guard as it judges a lock, and removes it when that start is gone.
+- The lock file is read only as a small regular file, never through a symlink; anything else at its path refuses the start, saying so. A directory the lock has to create is made private (0700); an existing one is left as it is.
+- Nothing of a live daemon's is ever removed or changed while deciding.
 - Only `codeoid start` takes it. Every other command (`codeoid ls`, `send`, `attach`, `settings`, …) talks to the running daemon and needs no lock.
 
 ### `~/.codeoid/.env` — env-only secrets

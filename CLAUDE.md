@@ -168,10 +168,14 @@ frontends stopped. 30-second grace period before forced exit.
 dirs, memory's) before anything is opened (`acquireDaemonLocks`, data-lock.ts:
 a `codeoid-daemon.lock` made by hard-linking a fully written file, with pid,
 host, boot, pid namespace and start time). A live holder, or one on another
-host or pid namespace, refuses the start; a gone one (pid not running, pid
-reused: start time differs, rebooted) is taken over under a guard file, with
-a log line. Released by the `data-lock` shutdown step (registered first, runs
-last) and an `exit` handler. Only the daemon takes it: tests and embedders
+machine (machine id, else hostname), refuses the start; a gone one (pid not
+running, pid reused: start time differs, macOS `ps` under fixed TZ/locale,
+rebooted; another pid namespace whose mtime heartbeat is 10 min old) is
+taken over under a guard file (a dead start's guard is judged and cleared
+too), moved aside and checked, with a log line. Read with O_NOFOLLOW, as a
+small regular file; dirs it makes are 0700. Released by the `data-lock`
+shutdown step (registered first, runs last), an `exit` handler, and interim
+signal handlers until the daemon's own are installed (`signalsHandled`). Only the daemon takes it: tests and embedders
 constructing `DaemonServer` pass none.
 
 **Session limits**: none by default — parallel sessions are the point, so
