@@ -637,7 +637,8 @@ export function opencodeServerShell(path: string | undefined = process.env.PATH)
 
 /**
  * git config every git opencode runs on its own gets (`GIT_CONFIG_COUNT`,
- * which outranks the repository's config): opencode reads a workspace's repo
+ * which outranks the repository's config; git 2.31+, an older one ignores it
+ * and a repository's workdir is refused, server.ts `gitProblem`): opencode reads a workspace's repo
  * unasked (`rev-parse`, `remote get-url`, `rev-list`, `check-ignore`, …) and
  * snapshots it into a gitdir of its own, and a repo's config can make git run
  * a command. Hooks, fsmonitor and an external diff are off, nothing is

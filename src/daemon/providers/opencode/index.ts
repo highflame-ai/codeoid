@@ -77,7 +77,7 @@ import {
   type OcTokenUsage,
 } from "./client.js";
 import { commandlessShellLine, fetchFence, fetchOrigin, mcpNamespace, opencodeShellEnv, ownMountPrefix, runnableCommand, sessionRules } from "./policy.js";
-import { mercurialCheckout, type OpencodeConnection, type OpencodeServer } from "./server.js";
+import { gitCheckout, mercurialCheckout, type OpencodeConnection, type OpencodeServer } from "./server.js";
 import {
   type OcToolCall,
   callInput,
@@ -1153,6 +1153,10 @@ export class OpencodeProvider implements SessionProvider {
     const hg = this.#server.mercurial;
     const checkout = hg ? mercurialCheckout(workdir) : null;
     if (hg && checkout) throw new Error(`opencode would run Mercurial in ${checkout} without asking, and ${hg} — refusing this workdir on the opencode backend`);
+    // So does git in a git repository, which takes none of codeoid's overrides before 2.31.
+    const git = this.#server.git;
+    const repo = git ? gitCheckout(workdir) : null;
+    if (git && repo) throw new Error(`opencode would run git in ${repo} without asking, and ${git} — refusing this workdir on the opencode backend`);
     // A session opened here got its rules as it opened (#openSession).
     const fresh = !this.#ses;
     if (fresh) {

@@ -414,7 +414,9 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   and every hg `OPENCODE_HG_ENV` (`HGRCSKIPREPO`, empty `HGRCPATH`); the hg
   plugin is disabled; the server's `PATH` is only the daemon's absolute
   entries (`absolutePath`: a `.` would run a repo's `./git`). A workdir under a `.hg` is refused when the server's
-  hg is older than 5.4 or won't say (`mercurialProblem`, `mercurialCheckout`).
+  hg is older than 5.4 or won't say (`mercurialProblem`, `mercurialCheckout`), and one
+  in a git repository when its git is older than 2.31, which ignores
+  `GIT_CONFIG_COUNT`, or won't say (`gitProblem`, `gitCheckout`).
   Filter/textconv drivers can't be overridden by name; 2.2.5 applies none
   unasked. A session's shell has its own environment, so none of it.
 - **Paths** (translate.ts): every path a call names (cards, the secret-path

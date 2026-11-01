@@ -101,6 +101,8 @@
  *   I61 (scripted only) a message pushed mid-turn and still in opencode's inbox when its server dies (killed, or stopped by
  *       codeoid) survives in its database, and is withdrawn before the next prompt: the next turn, on the same backend or a
  *       rebuilt one (a daemon restart), answers only its own prompt
+ *   I62 (scripted only) a git older than 2.31 first on opencode's PATH (it ignores GIT_CONFIG_COUNT, so none of codeoid's git
+ *       overrides): a workdir in a git repository is refused, saying why, before opencode runs git there; a plain one works
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -2562,6 +2564,46 @@ describe("opencode (real binary)", () => {
       if (backend !== p) await p.teardown();
     }
   }, 240_000);
+
+  maybeScripted("I62 a git older than 2.31 on opencode's PATH, which ignores codeoid's overrides: a workdir in a git repository is refused before opencode runs git there; a plain one works", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-oldgit-")));
+    const bin = join(root, "bin");
+    mkdirSync(bin);
+    const calls = join(root, "calls.log");
+    // Says it's 2.30.2, as Debian 11's does; otherwise the real git, recording each call.
+    writeFileSync(join(bin, "git"), `#!/bin/sh\nprintf '%s|%s\\n' "$PWD" "$*" >> '${calls}'\nif [ "$1" = --version ]; then echo 'git version 2.30.2'; exit 0; fi\nexec '${GIT_BIN}' "$@"\n`, { mode: 0o755 });
+    const ws = join(root, "ws-git");
+    mkdirSync(join(ws, "sub"), { recursive: true });
+    Bun.spawnSync([GIT_BIN, "init", "-q", "-b", "main"], { cwd: ws, env: { PATH: process.env.PATH ?? "", HOME: root, GIT_CONFIG_NOSYSTEM: "1" }, stdin: "ignore" });
+    const plain = join(root, "plain");
+    mkdirSync(plain);
+    const own = new OpencodeServer({
+      command: resolved!.command,
+      argsPrefix: resolved!.argsPrefix,
+      dbPath: join(root, "data", "opencode", "opencode.db"),
+      env: () => ({ ...buildOpencodeEnv(), HOME: join(root, "home"), PATH: `${bin}:${process.env.PATH}` }),
+      userConfigDir: null,
+      defaultModel: "scripted/scripted-1",
+      modelProviders,
+    });
+    const make = (id: string) => new OpencodeProvider({ sessionId: id, initialBackingId: id, server: own, store: { setClaudeCodeSessionId: () => {} } as unknown as Store });
+    try {
+      const refused = await collect(make("it-oldgit-ws").runTurn(opts("[[text:hello]]", { workdir: join(ws, "sub") })));
+      const err = refused.find((e) => e.type === "error") as Extract<ProviderEvent, { type: "error" }> | undefined;
+      expect(err?.message).toContain(`opencode would run git in ${ws} without asking`);
+      expect(err?.message).toContain("is 2.30: before 2.31 it ignores the overrides codeoid gives it");
+      const fine = await collect(make("it-oldgit-plain").runTurn(opts("[[text:plain]]", { workdir: plain })));
+      expect(texts(fine)).toEqual(["plain"]);
+      await Bun.sleep(500);
+      const ran = readFileSync(calls, "utf8").trim().split("\n");
+      // codeoid's own `git --version` in the server's empty cwd; nothing in the repository.
+      expect(ran).toContain(`${own.cwd ?? ""}|--version`);
+      expect(ran.filter((l) => l.startsWith(ws))).toEqual([]);
+    } finally {
+      await own.stop();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 180_000);
 
   maybe("I32 the user's own opencode data, state, cache and temp dirs are untouched by the whole run", () => {
     expect(userOpencodeDirs()).toBe(USER_DIRS_BEFORE);

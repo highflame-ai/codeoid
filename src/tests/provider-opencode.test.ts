@@ -30,7 +30,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
-import { leadsToCodeoid, MERCURIAL_FLOOR, mercurialCheckout, mercurialProblem, OpencodeServer, OpencodeIncompatibleError, SERVER_CWD_BASES, SERVER_CWD_PREFIX, stopOpencodeServers } from "../daemon/providers/opencode/server.js";
+import { GIT_FLOOR, gitCheckout, gitProblem, leadsToCodeoid, MERCURIAL_FLOOR, mercurialCheckout, mercurialProblem, OpencodeServer, OpencodeIncompatibleError, SERVER_CWD_BASES, SERVER_CWD_PREFIX, stopOpencodeServers } from "../daemon/providers/opencode/server.js";
 import { secretPathVerdict } from "../daemon/secret-paths.js";
 import { buildOpencodeEnv, commandlessShellLine, serverEnv, opencodeConfig, opencodeShellEnv, ownMountPrefix, sessionRules, survivingAllows, unsafeAgents, userModelConfig } from "../daemon/providers/opencode/policy.js";
 import { OPENCODE_CREDENTIALS_PROCESS_DIR, OPENCODE_INSTALL_HINT, opencodeCredentialsDir, opencodeDbPath, opencodeSecretLocations, opencodeVersionProblem, resolveOpencodeCommand } from "../daemon/providers/opencode/resolve.js";
@@ -285,12 +285,14 @@ describe("opencode server lifecycle", () => {
   });
 
   /** A marker `git`/`hg` first on the server's PATH: logs `name|cwd|args|env` (its GIT_ and HG variables), then git runs the real one; hg says `version` (if given) or nothing, and fails otherwise. */
-  function vcsMarkers(hgVersion?: string): { bin: string; log: string; calls: () => string[] } {
+  /** `gitVersion`: what the marker git answers `--version` with (`""`: nothing); unset, the real git's. */
+  function vcsMarkers(hgVersion?: string, gitVersion?: string): { bin: string; log: string; calls: () => string[] } {
     const bin = tmp();
     const log = join(bin, "calls.log");
     // One write per line: gits opencode runs side by side append at once.
     const record = `line="$(basename "$0")|$PWD|$(printf '%s ' "$@" | tr '\\n' ' ')|$(env | grep -E '^(GIT_|HG)' | sort | tr '\\n' ' ')"; printf '%s\\n' "$line" >> '${log}'\n`;
-    writeFileSync(join(bin, "git"), `#!/bin/sh\n${record}exec '${GIT_BIN}' "$@"\n`, { mode: 0o755 });
+    const gitSays = gitVersion === undefined ? "" : `if [ "$1" = --version ]; then ${gitVersion ? `echo 'git version ${gitVersion}'` : "true"}; exit 0; fi\n`;
+    writeFileSync(join(bin, "git"), `#!/bin/sh\n${record}${gitSays}exec '${GIT_BIN}' "$@"\n`, { mode: 0o755 });
     const version = hgVersion ? `if [ "$1" = --version ]; then echo 'Mercurial Distributed SCM (version ${hgVersion})'; exit 0; fi\n` : "";
     writeFileSync(join(bin, "hg"), `#!/bin/sh\n${record}${version}exit 1\n`, { mode: 0o755 });
     return { bin, log, calls: () => (existsSync(log) ? readFileSync(log, "utf8").trim().split("\n") : []) };
@@ -354,11 +356,68 @@ describe("opencode server lifecycle", () => {
       const events = await collect(makeProvider(server).runTurn(opts("hi", { workdir: join(ws, "sub") })));
       expect(events.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining(`opencode would run Mercurial in ${ws} without asking`) });
       // Only codeoid's own `hg --version`, in the server's empty cwd: nothing in the checkout.
-      expect(m.calls().map((l) => l.split("|").slice(0, 3).join("|"))).toEqual([`hg|${server.cwd}|--version --quiet `]);
+      expect(m.calls().filter((l) => l.startsWith("hg|")).map((l) => l.split("|").slice(0, 3).join("|"))).toEqual([`hg|${server.cwd}|--version --quiet `]);
       // A workdir outside any checkout still works on that server.
       const plain = realpathSync(tmp());
       expect(done(await collect(makeProvider(server, { sessionId: "sess-2" }).runTurn(opts("hi", { workdir: plain }))))).toBeTruthy();
     }
+  });
+
+  it("refuses a workdir in a git repository when the server's git is older than 2.31, which ignores codeoid's overrides, before opencode runs git there (round-22 audit)", async () => {
+    for (const version of ["2.30.2", ""]) {
+      const m = vcsMarkers(undefined, version);
+      const { server } = makeServer({}, { env: () => ({ ...buildOpencodeEnv(), PATH: `${m.bin}:${process.env.PATH}` }) });
+      const ws = realpathSync(tmp());
+      mkdirSync(join(ws, ".git"));
+      mkdirSync(join(ws, "sub"));
+      const events = await collect(makeProvider(server).runTurn(opts("hi", { workdir: join(ws, "sub") })));
+      const err = events.find((e) => e.type === "error") as Extract<ProviderEvent, { type: "error" }> | undefined;
+      expect(err?.message).toContain(`opencode would run git in ${ws} without asking`);
+      expect(err?.message).toContain(version ? "is 2.30: before 2.31 it ignores the overrides" : "didn't say its version");
+      // Only codeoid's own `git --version`, in the server's empty cwd: nothing in the repository.
+      expect(m.calls().filter((l) => l.startsWith("git|")).map((l) => l.split("|").slice(0, 3).join("|"))).toEqual([`git|${server.cwd}|--version `]);
+      // A workdir outside any repository still works on that server.
+      const plain = realpathSync(tmp());
+      expect(done(await collect(makeProvider(server, { sessionId: "sess-2" }).runTurn(opts("hi", { workdir: plain }))))).toBeTruthy();
+    }
+    // A git that takes the overrides runs there as before.
+    const m = vcsMarkers(undefined, "2.31.0");
+    const { server } = makeServer({}, { env: () => ({ ...buildOpencodeEnv(), PATH: `${m.bin}:${process.env.PATH}` }) });
+    const ws = realpathSync(tmp());
+    mkdirSync(join(ws, ".git"));
+    expect(done(await collect(makeProvider(server).runTurn(opts("hi", { workdir: ws }))))).toBeTruthy();
+    expect(m.calls().some((l) => l.startsWith(`git|${ws}|rev-parse`))).toBe(true);
+  });
+
+  it("judges the server's git by its own version, failing closed, and finds the repository git would take (round-22 audit)", async () => {
+    const cwd = tmp();
+    expect(await gitProblem("/nonexistent-dir", cwd)).toBeNull();
+    expect(await gitProblem(dirname(GIT_BIN), cwd)).toBeNull();
+    expect(await gitProblem(vcsMarkers(undefined, GIT_FLOOR.join(".")).bin, cwd)).toBeNull();
+    expect(await gitProblem(vcsMarkers(undefined, "3.0.0").bin, cwd)).toBeNull();
+    expect(await gitProblem(vcsMarkers(undefined, "2.30.2").bin, cwd)).toContain("is 2.30: before 2.31");
+    expect(await gitProblem(vcsMarkers(undefined, "1.9.5").bin, cwd)).toContain("is 1.9");
+    expect(await gitProblem(vcsMarkers(undefined, "").bin, cwd)).toContain("didn't say its version");
+    const ws = realpathSync(tmp());
+    mkdirSync(join(ws, ".git"));
+    mkdirSync(join(ws, "a", "b"), { recursive: true });
+    expect(gitCheckout(join(ws, "a", "b"))).toBe(ws);
+    expect(gitCheckout(tmp())).toBeNull();
+    // A worktree's or submodule's `.git` is a file.
+    const wt = realpathSync(tmp());
+    writeFileSync(join(wt, ".git"), "gitdir: /elsewhere\n");
+    expect(gitCheckout(wt)).toBe(wt);
+    // A bare repository is one itself, and git takes it from below too.
+    const bare = realpathSync(tmp());
+    writeFileSync(join(bare, "HEAD"), "ref: refs/heads/main\n");
+    mkdirSync(join(bare, "objects"));
+    mkdirSync(join(bare, "refs"));
+    mkdirSync(join(bare, "objects", "x"));
+    expect(gitCheckout(join(bare, "objects", "x"))).toBe(bare);
+    // Through a link: opencode looks up from the path as written too.
+    const link = join(tmp(), "link");
+    symlinkSync(join(ws, "a"), link);
+    expect(gitCheckout(link)).toBe(ws);
   });
 
   it("judges the server's hg by its own version, failing closed", async () => {

@@ -45,6 +45,8 @@ import {
   buildOpencodeEnv,
   describePlugin,
   foreignPlugins,
+  gitOverrideEnv,
+  OPENCODE_GIT_ENV,
   opencodeConfig,
   opencodeServerDirs,
   OPENCODE_HG_ENV,
@@ -186,6 +188,7 @@ export class OpencodeServer {
   #feedReady: Promise<void> | null = null;
   #home: string | undefined;
   #mercurial: string | null = null;
+  #git: string | null = null;
 
   constructor(opts: OpencodeServerOptions) {
     this.#opts = opts;
@@ -204,6 +207,11 @@ export class OpencodeServer {
   /** Why the running server's hg could run a repository's code (`mercurialProblem`), or null. */
   get mercurial(): string | null {
     return this.#mercurial;
+  }
+
+  /** Why the running server's git could run a repository's code (`gitProblem`), or null. */
+  get git(): string | null {
+    return this.#git;
   }
 
   get running(): boolean {
@@ -397,6 +405,8 @@ export class OpencodeServer {
     try {
       // The hg opencode would run in a Mercurial checkout, judged before it can run one.
       this.#mercurial = await mercurialProblem(env.PATH, cwd);
+      // So is the git it runs in a git repository.
+      this.#git = await gitProblem(env.PATH, cwd);
       proc = spawn(this.#opts.command, [...(this.#opts.argsPrefix ?? []), "serve", "--stdio", "--port", "0", "--hostname", "127.0.0.1"], {
         cwd,
         stdio: ["pipe", "pipe", "pipe"],
@@ -682,25 +692,72 @@ export const MERCURIAL_FLOOR: readonly [number, number] = [5, 4];
 export async function mercurialProblem(path: string | undefined, cwd: string, timeoutMs = 10_000): Promise<string | null> {
   const hg = Bun.which("hg", { PATH: path ?? "", cwd });
   if (!hg) return null;
-  let out = "";
-  try {
-    const proc = Bun.spawn([hg, "--version", "--quiet"], {
-      cwd,
-      env: { PATH: path ?? "", HOME: cwd, ...OPENCODE_HG_ENV },
-      stdin: "ignore",
-      stdout: "pipe",
-      stderr: "ignore",
-      timeout: timeoutMs,
-    });
-    out = await new Response(proc.stdout).text();
-    await proc.exited;
-  } catch {}
+  const out = await versionOutput([hg, "--version", "--quiet"], cwd, { PATH: path ?? "", HOME: cwd, ...OPENCODE_HG_ENV }, timeoutMs);
   const m = /version (\d+)\.(\d+)/.exec(out);
   const [major, minor] = MERCURIAL_FLOOR;
   if (!m) return `the Mercurial on opencode's PATH (${hg}) didn't say its version, so codeoid can't be sure it skips a repository's .hg/hgrc`;
   const v = [Number(m[1]), Number(m[2])] as const;
   if (v[0] > major || (v[0] === major && v[1] >= minor)) return null;
   return `the Mercurial on opencode's PATH (${hg}) is ${v.join(".")}: before ${major}.${minor} it can't skip a repository's .hg/hgrc, whose hooks would run unasked`;
+}
+
+/** The git from which every override codeoid gives it reaches it (`GIT_CONFIG_COUNT`, policy.ts `gitOverrideEnv`). */
+export const GIT_FLOOR: readonly [number, number] = [2, 31];
+
+/**
+ * Why the `git` opencode would run (the first on the server's `PATH`) could
+ * still apply a repository's config, whose hooks, fsmonitor and external
+ * diff run code, or null: none on `PATH`, or one from {@link GIT_FLOOR} on.
+ * An older git ignores `GIT_CONFIG_COUNT`, so none of codeoid's overrides
+ * (policy.ts `OPENCODE_GIT_OVERRIDES`) reach it, silently. Asked of git
+ * itself (`git --version`) in the server's empty cwd, reading no config; one
+ * that doesn't say fails closed. A session in a git repository is refused on
+ * a server with a problem (index.ts): opencode runs git there unasked.
+ */
+export async function gitProblem(path: string | undefined, cwd: string, timeoutMs = 10_000): Promise<string | null> {
+  const git = Bun.which("git", { PATH: path ?? "", cwd });
+  if (!git) return null;
+  const env = { PATH: path ?? "", HOME: cwd, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", ...gitOverrideEnv(), ...OPENCODE_GIT_ENV };
+  const out = await versionOutput([git, "--version"], cwd, env, timeoutMs);
+  const m = /^git version (\d+)\.(\d+)/m.exec(out);
+  const [major, minor] = GIT_FLOOR;
+  if (!m) return `the git on opencode's PATH (${git}) didn't say its version, so codeoid can't be sure it takes the overrides that keep a repository's config from running anything`;
+  const v = [Number(m[1]), Number(m[2])] as const;
+  if (v[0] > major || (v[0] === major && v[1] >= minor)) return null;
+  return `the git on opencode's PATH (${git}) is ${v.join(".")}: before ${major}.${minor} it ignores the overrides codeoid gives it (GIT_CONFIG_COUNT), so a repository's hooks or fsmonitor would run unasked — install git ${major}.${minor} or later`;
+}
+
+/** What `argv` prints on stdout, or "" (it failed, or took longer than `timeoutMs`). */
+async function versionOutput(argv: string[], cwd: string, env: Record<string, string>, timeoutMs: number): Promise<string> {
+  try {
+    const proc = Bun.spawn(argv, { cwd, env, stdin: "ignore", stdout: "pipe", stderr: "ignore", timeout: timeoutMs });
+    const out = await new Response(proc.stdout).text();
+    await proc.exited;
+    return out;
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * The first directory from `dir` up to `/` that git would take for a
+ * repository (where opencode runs git unasked): one holding a `.git` (a
+ * directory, or a file as in a worktree or submodule), or one that is a
+ * bare repository itself (`HEAD`, `objects`, `refs`). Null if none.
+ */
+export function gitCheckout(dir: string): string | null {
+  let real = resolve(dir);
+  try {
+    real = realpathSync(dir);
+  } catch {}
+  const bare = (at: string) => existsSync(join(at, "HEAD")) && existsSync(join(at, "objects")) && existsSync(join(at, "refs"));
+  for (const start of new Set([resolve(dir), real])) {
+    for (let at = start; ; at = dirname(at)) {
+      if (existsSync(join(at, ".git")) || bare(at)) return at;
+      if (dirname(at) === at) break;
+    }
+  }
+  return null;
 }
 
 /** The first directory from `dir` up to `/` holding a `.hg` (where opencode 2.2.5 runs hg unasked), or null. */
