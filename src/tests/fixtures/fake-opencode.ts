@@ -62,6 +62,8 @@
  *                    feed drops over the rest of its run and the parent's
  *                    follow-up execution, and is back after both ended
  *   "background"   → background subagent; opencode resumes the parent itself
+ *   "… free-child" (with "subagent") → the child runs on a model of its
+ *                    own ("free/m-1"), whose step opencode bills $0
  *   "… continue:<ses_id>" (with "subagent" or "background") → the call
  *                    continues that existing child session: reused, no
  *                    `session.created` (as opencode's `sessionID` input)
@@ -537,8 +539,10 @@ async function say(ses: Ses, msg: string, text: string, ordinal = 0): Promise<vo
 
 function step(ses: Ses): string {
   const msg = nextId("msg");
-  ses.messages.push({ id: msg, type: "assistant", content: [], time: { created: Date.now() } });
-  durable(ses, "session.step.started", { assistantMessageID: msg, agent: ses.agent ?? "build", model: ses.model ?? { providerID: "anthropic", id: "claude-sonnet-4" }, started: Date.now() });
+  const model = ses.model ?? { providerID: "anthropic", id: "claude-sonnet-4" };
+  // As stored by real 2.2.5: each assistant message names its model.
+  ses.messages.push({ id: msg, type: "assistant", model, content: [], time: { created: Date.now() } });
+  durable(ses, "session.step.started", { assistantMessageID: msg, agent: ses.agent ?? "build", model, started: Date.now() });
   return msg;
 }
 
@@ -888,6 +892,8 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
         child.executing = false;
       }
     };
+    // "… free-child": the subagent runs on a model of its own (the `subagent` tool's `model`), which opencode bills $0.
+    if (text.includes("free-child")) child.model = { providerID: "free", id: "m-1" };
     const childTurn = async (afterReply?: () => void) => {
       const cm = step(child);
       if (text.includes("subagent-fail")) {
@@ -924,7 +930,7 @@ async function runScenario(ses: Ses, text: string, signal: { cancelled: boolean 
       }
       // The child asks too, under its own session id.
       const cr = await toolCall(child, cm, "shell", { command: "grep -r auth ." }, { action: "shell", resources: ["grep -r auth ."] }, afterReply);
-      endStep(child, cm, 0.5);
+      endStep(child, cm, text.includes("free-child") ? 0 : 0.5);
       child.idle = Date.now();
       child.outcome = "succeeded";
       durable(child, "session.execution.succeeded", {});

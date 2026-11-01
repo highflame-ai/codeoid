@@ -1461,6 +1461,19 @@ describe("opencode cost and tokens", () => {
     expect(primary(free)).toBe(3);
   });
 
+  it("under maxBudgetUsd, a subagent's step opencode billed $0 is priced at the subagent's own model, not the parent's (round-17 audit)", async () => {
+    const { server } = makeServer();
+    const allow = allowing(() => {});
+    // The parent's model is priced; the subagent's isn't, anywhere: the run stops at its step.
+    const prices = { "anthropic/claude-sonnet-4": { input: 1, output: 2 } };
+    const unpriced = await collect(makeProvider(server, { modelPrices: () => prices }).runTurn(opts("subagent free-child", { maxBudgetUsd: 100, canUseTool: allow })));
+    expect(done(unpriced)).toMatchObject({ isError: true, errorMessage: UNPRICED_STOP_MESSAGE });
+    // Priced under its own id, it counts at that price and the turn runs on.
+    const both = { ...prices, "free/m-1": { input: 1, output: 2 } };
+    const priced = await collect(makeProvider(server, { sessionId: "sess-2", initialBackingId: "sess-2", modelPrices: () => both }).runTurn(opts("subagent free-child", { maxBudgetUsd: 100, canUseTool: allow })));
+    expect(done(priced)?.isError).toBeFalsy();
+  });
+
   it("a budget stop with a steer pending pays the steer's boundary first, so Session reads the stop", async () => {
     const { server } = makeServer();
     const run = makeProvider(server).runTurn(opts("costly", { maxBudgetUsd: 3 }));

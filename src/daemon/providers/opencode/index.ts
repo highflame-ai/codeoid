@@ -432,6 +432,8 @@ export class OpencodeProvider implements SessionProvider {
   #openSteps = new Map<string, string>();
   /** Open steps whose current attempt carried anything past its start: the model answered something (#430). */
   #answeredSteps = new Set<string>();
+  /** The model each open step runs on (its `step.started`): a subagent's may be another than the turn's. */
+  #stepModels = new Map<string, string>();
   /** Assistant messages read back after a gap while still being written: read again when their step ends. */
   #streamingReadBack = new Set<string>();
   #blockIndex = new Map<string, number>();
@@ -1480,6 +1482,7 @@ export class OpencodeProvider implements SessionProvider {
         // A retry starts the step again: its new attempt has carried nothing yet.
         if (typeof d.assistantMessageID === "string") this.#answeredSteps.delete(d.assistantMessageID);
         if (typeof d.assistantMessageID === "string" && this.#ses && !this.#countedSteps.has(d.assistantMessageID)) this.#openSteps.set(d.assistantMessageID, this.#ses);
+        this.#stepStarted(d);
         const turn = this.#turn;
         const model = d.model as OcModelRef | undefined;
         if (model) this.#sessionModel = { providerID: model.providerID, id: model.id };
@@ -1544,7 +1547,7 @@ export class OpencodeProvider implements SessionProvider {
         }
         addTokens(this.#counted, tokens, cost);
         this.#stepSettled(typeof d.assistantMessageID === "string" ? d.assistantMessageID : undefined, tokens, cost, ev.type === "session.step.failed" ? (d.error as OcError) : undefined);
-        this.#recordStep(tokens, cost, true);
+        this.#recordStep(tokens, cost, true, this.#stepModel(d.assistantMessageID));
         return;
       }
       case "session.compaction.failed":
@@ -1738,7 +1741,24 @@ export class OpencodeProvider implements SessionProvider {
   }
 
   /** One step's usage: an `llm_call`, and spend for the turn (or the next one). */
-  #recordStep(tokens: OcTokenUsage | undefined, cost: number | undefined, isPrimary: boolean): void {
+  /** A step started: the model it runs on prices it if opencode bills it $0 (#recordStep). */
+  #stepStarted(d: Record<string, unknown>): void {
+    const model = d.model as OcModelRef | undefined;
+    if (typeof d.assistantMessageID !== "string" || !model) return;
+    this.#stepModels.set(d.assistantMessageID, modelValue(model));
+    if (this.#stepModels.size > REMEMBERED) this.#stepModels.delete(this.#stepModels.keys().next().value!);
+  }
+
+  /** The model step `id` ran on, as its start said, else as its stored message says (a read-back). */
+  #stepModel(id: unknown, stored?: OcModelRef): string | undefined {
+    if (typeof id !== "string") return stored ? modelValue(stored) : undefined;
+    const started = this.#stepModels.get(id);
+    this.#stepModels.delete(id);
+    return started ?? (stored ? modelValue(stored) : undefined);
+  }
+
+  /** `model`: the step's own, when known; else the turn's, or the session's last. */
+  #recordStep(tokens: OcTokenUsage | undefined, cost: number | undefined, isPrimary: boolean, model?: string): void {
     if (tokens) {
       this.#emit({
         type: "llm_call",
@@ -1763,7 +1783,7 @@ export class OpencodeProvider implements SessionProvider {
     // the turn's end (#430).
     let priceless = false;
     if (unpriced && this.#maxBudgetUsd !== undefined) {
-      const price = priceFor(turn?.model ?? (this.#sessionModel ? modelValue(this.#sessionModel) : ""), this.#modelPrices?.());
+      const price = priceFor(model ?? turn?.model ?? (this.#sessionModel ? modelValue(this.#sessionModel) : ""), this.#modelPrices?.());
       const usd = price ? estimateCost(price, stepTokens(tokens!), (tokens!.input || 0) + (tokens!.cache?.read || 0) + (tokens!.cache?.write || 0)) : Number.NaN;
       if (Number.isFinite(usd) && usd >= 0) this.#spentUsd += usd;
       else priceless = true;
@@ -1911,6 +1931,7 @@ export class OpencodeProvider implements SessionProvider {
       case "session.step.started":
         if (typeof d.assistantMessageID === "string") this.#answeredSteps.delete(d.assistantMessageID);
         if (typeof d.assistantMessageID === "string" && !this.#countedSteps.has(d.assistantMessageID)) this.#openSteps.set(d.assistantMessageID, sid);
+        this.#stepStarted(d);
         return;
       case "session.retry.scheduled":
         this.#retryScheduled(d.assistantMessageID);
@@ -1928,7 +1949,7 @@ export class OpencodeProvider implements SessionProvider {
         const tokens = d.tokens as OcTokenUsage | undefined;
         const cost = typeof d.cost === "number" ? d.cost : undefined;
         this.#stepSettled(typeof d.assistantMessageID === "string" ? d.assistantMessageID : undefined, tokens, cost, ev.type === "session.step.failed" ? (d.error as OcError) : undefined);
-        this.#recordStep(tokens, cost, false);
+        this.#recordStep(tokens, cost, false, this.#stepModel(d.assistantMessageID));
         return;
       }
       case "session.tool.success":
@@ -2486,7 +2507,7 @@ export class OpencodeProvider implements SessionProvider {
       if (!this.#countedSteps.has(m.id) && stepEnded(m) && (m.time?.completed ?? m.time?.created ?? 0) >= this.#attachedAt) {
         remember(this.#countedSteps, m.id);
         this.#stepSettled(m.id, m.tokens, m.cost, m.error, answeredMessage(m));
-        this.#recordStep(m.tokens, m.cost, false);
+        this.#recordStep(m.tokens, m.cost, false, this.#stepModel(m.id, m.model));
       }
     }
     if (!running && info.time?.busy !== undefined) this.#childEnded(id, child, info.outcome ?? "succeeded");
@@ -2630,7 +2651,7 @@ export class OpencodeProvider implements SessionProvider {
       remember(this.#countedSteps, m.id);
       addTokens(this.#counted, m.tokens, m.cost);
       this.#stepSettled(m.id, m.tokens, m.cost, m.error, answeredMessage(m));
-      this.#recordStep(m.tokens, m.cost, true);
+      this.#recordStep(m.tokens, m.cost, true, this.#stepModel(m.id, m.model));
     }
     return open !== undefined;
   }

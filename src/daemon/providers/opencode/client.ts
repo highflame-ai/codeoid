@@ -174,6 +174,8 @@ export interface OcMessage {
   tokens?: OcTokenUsage;
   error?: OcError;
   finish?: string;
+  /** An assistant message's model: a subagent's may be another than its parent's. */
+  model?: OcModelRef;
   /** `streamed`: the model's response ended (every text and reasoning block is final); `completed`: the step ended. */
   time?: { created?: number; streamed?: number; completed?: number };
 }
