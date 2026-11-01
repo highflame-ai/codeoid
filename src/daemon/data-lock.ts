@@ -427,8 +427,13 @@ function putBackInPlace(aside: string, path: string): boolean {
   }
 }
 
-/** Remove temp files (`<lock>.<pid>.<hex>.tmp` / `.gone`) a start that died left behind, once old. */
-function sweepTemps(dir: string): void {
+/**
+ * Remove temp files (`<lock>.<pid>.<hex>.tmp` / `.gone`) a start that died
+ * left behind, once old. A `.gone` file that still holds the lock of a holder
+ * not judged gone stays: it is another start's lock that couldn't be put
+ * back, which the refusal names (a rename keeps its old mtime).
+ */
+function sweepTemps(dir: string, view: ProcessView): void {
   let names: string[];
   try {
     names = readdirSync(dir);
@@ -441,7 +446,12 @@ function sweepTemps(dir: string): void {
     const p = join(dir, name);
     try {
       const st = lstatSync(p);
-      if (st.isFile() && Date.now() - st.mtimeMs > STALE_TEMP_MS) unlinkSync(p);
+      if (!st.isFile() || Date.now() - st.mtimeMs <= STALE_TEMP_MS) continue;
+      if (name.endsWith(".gone")) {
+        const holder = readLock(p)?.holder;
+        if (holder && !judgeHolder(holder, view).gone) continue;
+      }
+      unlinkSync(p);
     } catch {
       // gone, or not ours to judge
     }
@@ -549,7 +559,7 @@ export function acquireDaemonLocks(dirs: ReadonlyArray<string | OwnedDir>, opts:
       const { dir, uses } = typeof d === "string" ? { dir: d, uses: [] } : d;
       try {
         makeDataDir(dir);
-        sweepTemps(dir);
+        sweepTemps(dir, view);
         const path = join(dir, DAEMON_LOCK_FILE);
         lockOne(path, content, holder, view, log, uses);
         taken.push(path);

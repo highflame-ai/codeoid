@@ -22,6 +22,7 @@ import {
   selfHolder,
 } from "../daemon/data-lock.js";
 import type { CodeoidConfig } from "../config.js";
+import { DaemonServer } from "../daemon/server.js";
 
 let root: string;
 beforeEach(() => {
@@ -442,6 +443,56 @@ describe("round 24: the lock's judgement and its file", () => {
     acquireDaemonLocks([dir], { log: quiet, watch: false }).release();
     expect(existsSync(old)).toBe(false);
     expect(existsSync(fresh)).toBe(true);
+  });
+
+  it("round 26: a lock lost while a shutdown is already draining doesn't cut that shutdown short; one lost otherwise stops the daemon", async () => {
+    const exits: unknown[] = [];
+    const realExit = process.exit;
+    process.exit = ((code?: number) => {
+      exits.push(code);
+    }) as typeof process.exit;
+    try {
+      const make = () => {
+        let lost: ((path: string) => void) | undefined;
+        const daemon = new DaemonServer({
+          port: 0,
+          host: "127.0.0.1",
+          dbPath: join(mkdtempSync(join(root, "db-")), "codeoid.db"),
+          transcriptDir: join(root, `tr-${Math.random()}`),
+          auth: { baseUrl: "http://127.0.0.1:1/unreachable-issuer" },
+          localMode: { token: "t", tokenFile: join(root, `token-${Math.random()}`) },
+          dataLock: { release: () => {}, onLost: (fn) => { lost = fn; } },
+        });
+        return { daemon, lose: () => lost?.("/x/codeoid-daemon.lock") };
+      };
+      const draining = make();
+      const stopping = draining.daemon.stop();
+      draining.lose();
+      await stopping;
+      await Bun.sleep(10);
+      expect(exits).toEqual([]);
+      const idle = make();
+      idle.lose();
+      await Bun.sleep(200);
+      expect(exits).toEqual([1]);
+    } finally {
+      process.exit = realExit;
+    }
+  });
+
+  it("round 26: an old `.gone` file holding a live holder's lock (one that couldn't be put back) stays; a dead holder's is swept", () => {
+    const dir = join(root, "data");
+    mkdirSync(dir);
+    const live = join(dir, `${DAEMON_LOCK_FILE}.${DEAD_PID}.0123456789ab.gone`);
+    const dead = join(dir, `${DAEMON_LOCK_FILE}.${DEAD_PID}.ba9876543210.gone`);
+    writeFileSync(live, `${JSON.stringify({ ...selfHolder(), nonce: "other-daemon" }, null, 2)}\n`);
+    writeFileSync(dead, `${JSON.stringify({ ...selfHolder(), pid: DEAD_PID, nonce: "gone-daemon" }, null, 2)}\n`);
+    const t = new Date(Date.now() - 2 * 3_600_000);
+    utimesSync(live, t, t);
+    utimesSync(dead, t, t);
+    acquireDaemonLocks([dir], { log: quiet, watch: false }).release();
+    expect(existsSync(live)).toBe(true);
+    expect(existsSync(dead)).toBe(false);
   });
 
   it("round 24: a signal before the daemon's handlers are in releases the lock", async () => {

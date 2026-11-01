@@ -397,6 +397,8 @@ export class DaemonServer {
     if (dataLock) this.#shutdown.register("data-lock", () => dataLock.release());
     // A lock removed or taken over under this daemon: it stops, rather than share the data with another.
     dataLock?.onLost?.(() => {
+      // A shutdown already under way drains and exits on its own: cutting it short loses what it was flushing.
+      if (this.#shutdown.isShuttingDown) return;
       this.#shutdown.shutdown("data-lock-lost").then(
         () => process.exit(1),
         () => process.exit(1),
