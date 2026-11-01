@@ -6,7 +6,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,12 +14,11 @@ import {
   DAEMON_LOCK_FILE,
   DataDirLockError,
   daemonOwnedDirs,
-  HEARTBEAT_STALE_MS,
   hostView,
   judgeHolder,
   type LockHolder,
   type ProcessView,
-  refreshLock,
+  removeIfStill,
   selfHolder,
 } from "../daemon/data-lock.js";
 import type { CodeoidConfig } from "../config.js";
@@ -126,12 +125,13 @@ describe("daemon data-dir lock", () => {
 
   it("judges a holder from what this host can check", () => {
     const self = selfHolder();
-    const view = (over: Partial<ProcessView> = {}): ProcessView => ({ hostname: self.hostname, boot: "b1", pidNamespace: "ns1", alive: () => true, startTime: () => "100", ...over });
+    const view = (over: Partial<ProcessView> = {}): ProcessView => ({ hostname: self.hostname, machine: self.machine, boot: "b1", pidNamespace: "ns1", alive: () => true, startTime: () => "100", ...over });
     const h = { ...self, boot: "b1", pidNamespace: "ns1", start: "100" };
     expect(judgeHolder(h, view()).gone).toBe(false);
     expect(judgeHolder(h, view({ alive: () => false })).gone).toBe(true);
     expect(judgeHolder(h, view({ startTime: () => "200" })).gone).toBe(true);
-    expect(judgeHolder(h, view({ boot: "b2" }))).toMatchObject({ gone: true, why: "the machine has restarted since" });
+    // Another boot can't be told from a twin machine with the same name and id: never taken over (round 25).
+    expect(judgeHolder(h, view({ boot: "b2", alive: () => false })).gone).toBe(false);
     // Another pid namespace or host: can't be checked, so never taken over.
     expect(judgeHolder(h, view({ pidNamespace: "ns2", alive: () => false })).gone).toBe(false);
     expect(judgeHolder({ ...h, hostname: "other" }, view({ alive: () => false })).gone).toBe(false);
@@ -155,16 +155,21 @@ describe("daemon data-dir lock", () => {
       providers: { opencode: { enabled: true, command: "opencode", dbPath: join(root, "c", "opencode", "opencode.db"), dataDir: join(root, "c", "opencode") } },
       memory: { enabled: true, dbPath: join(root, "m", "memory.db") },
     } as unknown as CodeoidConfig;
-    expect(daemonOwnedDirs(cfg)).toEqual([join(root, "c"), join(root, "c", "transcripts"), join(root, "c", "opencode"), join(root, "m")]);
+    expect(daemonOwnedDirs(cfg).map((d) => d.dir)).toEqual([join(root, "c"), join(root, "c", "transcripts"), join(root, "c", "opencode"), join(root, "m")]);
+    // Each says what the settings put there, merged where they share a dir.
+    expect(daemonOwnedDirs({ ...cfg, memory: { enabled: true, dbPath: join(root, "c", "memory.db") } } as CodeoidConfig)[0]!.uses).toEqual([
+      "the database (dbPath, CODEOID_DB_PATH)",
+      "memory's database (memory.dbPath, CODEOID_MEMORY_DB_PATH)",
+    ]);
   });
 });
 
 describe("codeoid start on data another daemon uses", () => {
   const cli = join(import.meta.dir, "..", "cli.ts");
   /** `codeoid start --local` on `port`, on this test's data. */
-  function start(port: number, cfgName = "cfg") {
+  function start(port: number, cfgName = "cfg", env: Record<string, string> = {}) {
     return Bun.spawn([process.execPath, cli, "start", "--local", "--no-telegram", "--no-web", "--port", String(port)], {
-      env: { PATH: process.env.PATH ?? "", HOME: join(root, "home"), XDG_CONFIG_HOME: join(root, cfgName), CODEOID_TRANSCRIPT_DIR: join(root, cfgName, "t") },
+      env: { PATH: process.env.PATH ?? "", HOME: join(root, "home"), XDG_CONFIG_HOME: join(root, cfgName), CODEOID_TRANSCRIPT_DIR: join(root, cfgName, "t"), ...env },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -228,6 +233,21 @@ describe("codeoid start on data another daemon uses", () => {
       first.kill("SIGKILL");
     }
   }, 180_000);
+
+  it("round 25: a daemon whose lock is removed under it shuts down", async () => {
+    const port = freePort();
+    const daemon = start(port, "cfg", { CODEOID_DATA_LOCK_CHECK_MS: "100" });
+    try {
+      await up(port);
+      rmSync(join(root, "cfg", "codeoid", DAEMON_LOCK_FILE));
+      expect(await daemon.exited).toBe(1);
+      const out = await new Response(daemon.stdout).text();
+      expect(out).toContain("is no longer this daemon's");
+      expect(out).toContain("shutdown complete (data-lock-lost)");
+    } finally {
+      daemon.kill("SIGKILL");
+    }
+  }, 120_000);
 });
 
 describe("round 24: the lock's judgement and its file", () => {
@@ -242,47 +262,112 @@ describe("round 24: the lock's judgement and its file", () => {
     expect(read({ TZ: "PST8PDT" })).toBe(utc);
   });
 
-  it("round 24: the machine is told by its machine id where both have one, the hostname otherwise", () => {
+  it("round 25: a holder is on this machine only when hostname, machine id and boot all match; anything else refuses, never taken over", () => {
     const self = selfHolder();
     const view = (over: Partial<ProcessView> = {}): ProcessView => ({ hostname: "box", machine: "m1", boot: "b1", alive: () => false, startTime: () => undefined, ...over });
     const h = { ...self, hostname: "box", machine: "m1", boot: "b1", pidNamespace: undefined, pid: DEAD_PID };
-    // Same hostname, another machine (a cloned name): a live holder there is never taken over, even with another boot.
-    expect(judgeHolder({ ...h, machine: "m2", boot: "b2" }, view())).toMatchObject({ gone: false });
-    // Same machine renamed after a crash: its dead holder is taken over.
-    expect(judgeHolder({ ...h, hostname: "old-name" }, view()).gone).toBe(true);
-    // No machine id on one side: the hostname decides.
-    expect(judgeHolder({ ...h, machine: undefined, hostname: "other" }, view()).gone).toBe(false);
+    expect(judgeHolder(h, view()).gone).toBe(true);
+    // A shared machine id (a cloned VM, a baked-in image) on another host, of any boot: refused.
+    expect(judgeHolder({ ...h, hostname: "host-a", boot: "boot-a" }, view({ hostname: "host-b", boot: "boot-b" }))).toMatchObject({ gone: false, why: expect.stringContaining("another machine (host-a)") });
+    // Same name, another machine id: refused.
+    expect(judgeHolder({ ...h, machine: "m2" }, view()).gone).toBe(false);
+    // A machine id on one side only: refused.
+    expect(judgeHolder({ ...h, machine: undefined }, view()).gone).toBe(false);
+    expect(judgeHolder(h, view({ machine: undefined })).gone).toBe(false);
+    // Another boot: this machine restarted, or a twin; refused.
+    expect(judgeHolder(h, view({ boot: "b2" }))).toMatchObject({ gone: false, why: expect.stringContaining("before this machine last started") });
+    // Neither side has a machine id or boot (nothing to compare): the hostname and the pid decide.
+    expect(judgeHolder({ ...h, machine: undefined, boot: undefined }, view({ machine: undefined, boot: undefined })).gone).toBe(true);
   });
 
-  it("round 24: a lock from another pid namespace (a container restarted after a crash) is taken over once not refreshed for a while", () => {
-    const self = selfHolder();
-    const view: ProcessView = { hostname: self.hostname, boot: "b1", pidNamespace: "ns-new", alive: () => true, startTime: () => "1" };
-    const h = { ...self, boot: "b1", pidNamespace: "ns-old" };
-    expect(judgeHolder(h, view, 30_000).gone).toBe(false);
-    expect(judgeHolder(h, view).gone).toBe(false);
-    expect(judgeHolder(h, view, HEARTBEAT_STALE_MS + 1).gone).toBe(true);
+  it("round 25: a lock from another pid namespace is never taken over, however old; the refusal names the file to remove", () => {
     const dir = join(root, "data");
     const path = plant(dir, { pidNamespace: "pid:[1]", pid: DEAD_PID });
-    const v = { ...hostView(), pidNamespace: "pid:[2]" };
-    expect(() => acquireDaemonLocks([dir], { view: v, log: quiet, heartbeat: false })).toThrow(/refreshed for 10 minutes/);
-    const old = new Date(Date.now() - HEARTBEAT_STALE_MS - 60_000);
+    const old = new Date(Date.now() - 24 * 3_600_000);
     utimesSync(path, old, old);
-    const lines: string[] = [];
-    const took = acquireDaemonLocks([dir], { view: v, log: (l) => lines.push(l), heartbeat: false });
-    expect(lines.join("\n")).toMatch(/hasn't been refreshed/);
-    took.release();
+    const v = { ...hostView(), pidNamespace: "pid:[2]" };
+    expect(() => acquireDaemonLocks([dir], { view: v, log: quiet, watch: false })).toThrow(/another pid namespace \(a container\)/);
+    expect(() => acquireDaemonLocks([dir], { view: v, log: quiet, watch: false })).toThrow(`remove ${path} and start again`);
+    expect(JSON.parse(readFileSync(path, "utf8")).nonce).toBe("other-daemon");
   });
 
-  it("round 24: a holder refreshes its own lock's mtime, never another's", () => {
+  it("round 25: a daemon whose lock is removed or taken over stops; release then leaves the new holder's lock", async () => {
     const dir = join(root, "data");
-    const held = acquireDaemonLocks([dir], { log: quiet, heartbeat: false });
     const path = join(dir, DAEMON_LOCK_FILE);
-    const old = new Date(Date.now() - 3_600_000);
-    utimesSync(path, old, old);
-    expect(refreshLock(path, "someone-else")).toBe(false);
-    expect(Date.now() - statSync(path).mtimeMs).toBeGreaterThan(3_000_000);
-    expect(refreshLock(path, held.holder.nonce)).toBe(true);
-    expect(Date.now() - statSync(path).mtimeMs).toBeLessThan(60_000);
+    const lost: string[] = [];
+    const lines: string[] = [];
+    const held = acquireDaemonLocks([dir], { log: (l) => lines.push(l), checkMs: 20 });
+    held.onLost((p) => lost.push(p));
+    await Bun.sleep(80);
+    expect(lost).toEqual([]);
+    writeFileSync(path, JSON.stringify({ ...selfHolder(), nonce: "the-next-daemon" }));
+    for (let i = 0; i < 50 && lost.length === 0; i++) await Bun.sleep(20);
+    expect(lost).toEqual([path]);
+    expect(lines.join("\n")).toContain("is no longer this daemon's");
+    held.release();
+    expect(JSON.parse(readFileSync(path, "utf8")).nonce).toBe("the-next-daemon");
+    // Removed outright: the same.
+    rmSync(path);
+    const again = acquireDaemonLocks([dir], { log: quiet, checkMs: 20 });
+    const lost2: string[] = [];
+    again.onLost((p) => lost2.push(p));
+    rmSync(path);
+    for (let i = 0; i < 50 && lost2.length === 0; i++) await Bun.sleep(20);
+    expect(lost2).toEqual([path]);
+    again.release();
+  });
+
+  it("round 25: on a filesystem without hard links, another start's lock read by mistake is written back in place, never deleted", () => {
+    const dir = join(root, "data");
+    const path = plant(dir, { pid: DEAD_PID, nonce: "fresh-winner" });
+    const before = readFileSync(path, "utf8");
+    const noLinks = () => {
+      throw Object.assign(new Error("operation not permitted"), { code: "EPERM" });
+    };
+    expect(removeIfStill(path, statSync(path).ino, "the-stale-one", noLinks)).toBe(false);
+    expect(readFileSync(path, "utf8")).toBe(before);
+    expect(readdirSync(dir).filter((n) => n.endsWith(".gone"))).toEqual([]);
+    // The name taken again meanwhile: whoever took it holds it.
+    const taken = () => {
+      throw Object.assign(new Error("exists"), { code: "EEXIST" });
+    };
+    expect(removeIfStill(path, statSync(path).ino, "the-stale-one", taken)).toBe(false);
+    // Can't be put back any way: it stays aside, named, never deleted.
+    const broken = () => {
+      throw Object.assign(new Error("i/o error"), { code: "EIO" });
+    };
+    plant(dir, { pid: DEAD_PID, nonce: "fresh-winner" });
+    expect(() => removeIfStill(path, statSync(path).ino, "the-stale-one", broken)).toThrow(/couldn't put back/);
+    expect(readdirSync(dir).filter((n) => n.endsWith(".gone"))).toHaveLength(1);
+  });
+
+  it("round 25: a data dir that can't be created refuses with a named reason", () => {
+    const ro = join(root, "ro");
+    mkdirSync(ro);
+    chmodSync(ro, 0o500);
+    const file = join(root, "a-file");
+    writeFileSync(file, "x");
+    try {
+      if (process.getuid?.() !== 0) expect(() => acquireDaemonLocks([join(ro, "new")], { log: quiet, watch: false })).toThrow(/couldn't create the data directory .*: permission denied/);
+      expect(() => acquireDaemonLocks([join(file, "sub")], { log: quiet, watch: false })).toThrow(/couldn't create the data directory .*: a part of that path is a file/);
+      expect(() => acquireDaemonLocks([file], { log: quiet, watch: false })).toThrow(DataDirLockError);
+    } finally {
+      chmodSync(ro, 0o700);
+    }
+  });
+
+  it("round 25: a refusal names what lives in the dir and the settings that really separate a second daemon", () => {
+    const dir = join(root, "data");
+    const held = acquireDaemonLocks([{ dir, uses: ["the database (dbPath, CODEOID_DB_PATH)", "memory's database (memory.dbPath, CODEOID_MEMORY_DB_PATH)"] }], { log: quiet, watch: false });
+    let msg = "";
+    try {
+      acquireDaemonLocks([{ dir, uses: ["the database (dbPath, CODEOID_DB_PATH)"] }], { log: quiet, watch: false });
+    } catch (e) {
+      msg = (e as Error).message;
+    }
+    expect(msg).toContain("It holds the database (dbPath, CODEOID_DB_PATH)");
+    expect(msg).toContain("XDG_CONFIG_HOME");
+    expect(msg).toContain(`remove ${join(dir, DAEMON_LOCK_FILE)}`);
     held.release();
   });
 
@@ -291,26 +376,26 @@ describe("round 24: the lock's judgement and its file", () => {
     const path = plant(dir, { pid: DEAD_PID });
     writeFileSync(`${path}.takeover`, JSON.stringify({ ...selfHolder(), pid: DEAD_PID + 1, nonce: "crashed-start" }));
     const lines: string[] = [];
-    const took = acquireDaemonLocks([dir], { log: (l) => lines.push(l), heartbeat: false });
+    const took = acquireDaemonLocks([dir], { log: (l) => lines.push(l), watch: false });
     expect(lines.join("\n")).toMatch(/removed the takeover guard/);
     expect(existsSync(`${path}.takeover`)).toBe(false);
     took.release();
     // A guard whose start still runs is still waited for, then refused.
     plant(dir, { pid: DEAD_PID });
     writeFileSync(`${path}.takeover`, JSON.stringify({ ...selfHolder(), nonce: "running-start" }));
-    expect(() => acquireDaemonLocks([dir], { log: quiet, heartbeat: false })).toThrow(/is taking over the stale lock/);
+    expect(() => acquireDaemonLocks([dir], { log: quiet, watch: false })).toThrow(/is taking over the stale lock/);
   });
 
   it("round 24: directories the lock makes are 0700; an existing one isn't changed", () => {
     const made = join(root, "new", "nested");
-    const held = acquireDaemonLocks([made], { log: quiet, heartbeat: false });
+    const held = acquireDaemonLocks([made], { log: quiet, watch: false });
     expect(statSync(made).mode & 0o777).toBe(0o700);
     expect(statSync(join(root, "new")).mode & 0o777).toBe(0o700);
     held.release();
     const existing = join(root, "open");
     mkdirSync(existing);
     chmodSync(existing, 0o750);
-    acquireDaemonLocks([existing], { log: quiet, heartbeat: false }).release();
+    acquireDaemonLocks([existing], { log: quiet, watch: false }).release();
     expect(statSync(existing).mode & 0o777).toBe(0o750);
   });
 
@@ -321,16 +406,16 @@ describe("round 24: the lock's judgement and its file", () => {
     const target = join(root, "planted.json");
     writeFileSync(target, JSON.stringify({ ...selfHolder(), nonce: "x" }));
     symlinkSync(target, path);
-    expect(() => acquireDaemonLocks([dir], { log: quiet, heartbeat: false })).toThrow(/symbolic link/);
+    expect(() => acquireDaemonLocks([dir], { log: quiet, watch: false })).toThrow(/symbolic link/);
     rmSync(path);
     const mk = Bun.spawnSync(["mkfifo", path]);
     expect(mk.exitCode).toBe(0);
     const t0 = Date.now();
-    expect(() => acquireDaemonLocks([dir], { log: quiet, heartbeat: false })).toThrow(/isn't a regular file/);
+    expect(() => acquireDaemonLocks([dir], { log: quiet, watch: false })).toThrow(/isn't a regular file/);
     expect(Date.now() - t0).toBeLessThan(2_000);
     rmSync(path);
     writeFileSync(path, "x".repeat(100_000));
-    expect(() => acquireDaemonLocks([dir], { log: quiet, heartbeat: false })).toThrow(/too big/);
+    expect(() => acquireDaemonLocks([dir], { log: quiet, watch: false })).toThrow(/too big/);
   });
 
   it("round 24: a directory the lock can't be written in refuses the start with a DataDirLockError, not a raw error", () => {
@@ -338,8 +423,8 @@ describe("round 24: the lock's judgement and its file", () => {
     mkdirSync(dir);
     chmodSync(dir, 0o500);
     try {
-      expect(() => acquireDaemonLocks([dir], { log: quiet, heartbeat: false })).toThrow(DataDirLockError);
-      expect(() => acquireDaemonLocks([dir], { log: quiet, heartbeat: false })).toThrow(/couldn't write a lock in/);
+      expect(() => acquireDaemonLocks([dir], { log: quiet, watch: false })).toThrow(DataDirLockError);
+      expect(() => acquireDaemonLocks([dir], { log: quiet, watch: false })).toThrow(/couldn't write a lock in/);
     } finally {
       chmodSync(dir, 0o700);
     }
@@ -354,7 +439,7 @@ describe("round 24: the lock's judgement and its file", () => {
     writeFileSync(fresh, "{}");
     const t = new Date(Date.now() - 2 * 3_600_000);
     utimesSync(old, t, t);
-    acquireDaemonLocks([dir], { log: quiet, heartbeat: false }).release();
+    acquireDaemonLocks([dir], { log: quiet, watch: false }).release();
     expect(existsSync(old)).toBe(false);
     expect(existsSync(fresh)).toBe(true);
   });

@@ -136,7 +136,9 @@ program
     // this daemon owns, or say who holds it and stop (data-lock.ts).
     let dataLock: DaemonLocks;
     try {
-      dataLock = acquireDaemonLocks(daemonOwnedDirs(config), { port: bindPort });
+      // CODEOID_DATA_LOCK_CHECK_MS: how often the daemon checks its locks are still its own (tests; default a minute).
+      const checkMs = Number(process.env.CODEOID_DATA_LOCK_CHECK_MS) || undefined;
+      dataLock = acquireDaemonLocks(daemonOwnedDirs(config), { port: bindPort, ...(checkMs ? { checkMs } : {}) });
     } catch (err) {
       if (!(err instanceof DataDirLockError)) throw err;
       console.error(`\n[codeoid] the daemon couldn't start: ${err.message}\n`);

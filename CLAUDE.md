@@ -165,15 +165,21 @@ frontends stopped. 30-second grace period before forced exit.
 
 **One daemon per data dir**: `codeoid start` locks each dir the daemon owns
 (`daemonOwnedDirs`: the database's, transcripts, opencode's database and data
-dirs, memory's) before anything is opened (`acquireDaemonLocks`, data-lock.ts:
-a `codeoid-daemon.lock` made by hard-linking a fully written file, with pid,
-host, boot, pid namespace and start time). A live holder, or one on another
-machine (machine id, else hostname), refuses the start; a gone one (pid not
-running, pid reused: start time differs, macOS `ps` under fixed TZ/locale,
-rebooted; another pid namespace whose mtime heartbeat is 10 min old) is
-taken over under a guard file (a dead start's guard is judged and cleared
-too), moved aside and checked, with a log line. Read with O_NOFOLLOW, as a
-small regular file; dirs it makes are 0700. Released by the `data-lock`
+dirs, memory's; each with what the settings put there) before anything is
+opened (`acquireDaemonLocks`, data-lock.ts: a `codeoid-daemon.lock` made by
+hard-linking a fully written file, with pid, host, machine id, boot, pid
+namespace and start time). It is taken over only when its holder is provably
+gone: hostname, machine id and boot id all the same where either side has one
+(a machine id alone is shared by clones), the same pid namespace, and the pid
+not running or reused (start time differs, macOS `ps` under fixed TZ/locale);
+under a guard file (a dead start's guard is judged and cleared too), moved
+aside and checked (put back, in place without hard links), with a log line.
+Anything else refuses, naming the dir, the settings placing data there
+(`XDG_CONFIG_HOME` separates a second daemon) and the lock file to remove.
+The daemon checks every minute (`LOCK_CHECK_MS`) that its locks are still its
+own and shuts down when one isn't (`onLost`). Read with O_NOFOLLOW, as a
+small regular file; dirs it makes are 0700; every failure to create or write
+one is a `DataDirLockError` with a named reason. Released by the `data-lock`
 shutdown step (registered first, runs last), an `exit` handler, and interim
 signal handlers until the daemon's own are installed (`signalsHandled`). Only the daemon takes it: tests and embedders
 constructing `DaemonServer` pass none.

@@ -199,7 +199,7 @@ export interface DaemonConfig {
    * released on shutdown, after everything else. Absent for an embedder or a
    * test, which takes none.
    */
-  dataLock?: { release(): void; signalsHandled?(): void };
+  dataLock?: { release(): void; signalsHandled?(): void; onLost?(fn: (path: string) => void): void };
   /**
    * Outward control-plane MCP endpoint (`/mcp/control`, docs/mcp-control.md).
    * Absent or `enabled: false` = not mounted (the path 404s).
@@ -395,6 +395,13 @@ export class DaemonServer {
     // nothing of this daemon's writes to it any more.
     const dataLock = config.dataLock;
     if (dataLock) this.#shutdown.register("data-lock", () => dataLock.release());
+    // A lock removed or taken over under this daemon: it stops, rather than share the data with another.
+    dataLock?.onLost?.(() => {
+      this.#shutdown.shutdown("data-lock-lost").then(
+        () => process.exit(1),
+        () => process.exit(1),
+      );
+    });
     this.#shutdown.register("memory", async () => {
       if (this.#memory) await this.#memory.close();
     });
