@@ -62,6 +62,7 @@ src/
 │   ├── transcript.ts             # JSONL persistence for session resume
 │   ├── rate-limit.ts             # Per-user session creation + concurrency limits
 │   ├── shutdown.ts               # Cleanup registry, signal handlers, grace period
+│   ├── data-lock.ts              # One daemon per data dir: lock files taken at `codeoid start`
 │   └── index.ts
 ├── protocol/                     # re-export shims for @highflame/codeoid-protocol (packages/protocol)
 │   ├── types.ts                  # Client<->Daemon message protocol
@@ -160,6 +161,17 @@ retry manager.
 **Graceful shutdown**: cleanup registry runs in LIFO order on SIGTERM/SIGINT/SIGHUP.
 Sessions drained (in-flight work interrupted), store flushed, WebSockets closed,
 frontends stopped. 30-second grace period before forced exit.
+
+**One daemon per data dir**: `codeoid start` locks each dir the daemon owns
+(`daemonOwnedDirs`: the database's, transcripts, opencode's database and data
+dirs, memory's) before anything is opened (`acquireDaemonLocks`, data-lock.ts:
+a `codeoid-daemon.lock` made by hard-linking a fully written file, with pid,
+host, boot, pid namespace and start time). A live holder, or one on another
+host or pid namespace, refuses the start; a gone one (pid not running, pid
+reused: start time differs, rebooted) is taken over under a guard file, with
+a log line. Released by the `data-lock` shutdown step (registered first, runs
+last) and an `exit` handler. Only the daemon takes it: tests and embedders
+constructing `DaemonServer` pass none.
 
 **Session limits**: none by default — parallel sessions are the point, so
 `rateLimit.maxSessionsPerUser` and `rateLimit.maxCreationsPerHour` both default

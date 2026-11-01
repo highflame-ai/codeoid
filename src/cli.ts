@@ -25,6 +25,7 @@ import { type Command, program } from "commander";
 // so `codeoid --version` always matches the published package (no hand-synced
 // string to drift). release-smoke asserts these two stay equal.
 import pkg from "../package.json" with { type: "json" };
+import { acquireDaemonLocks, type DaemonLocks, DataDirLockError, daemonOwnedDirs } from "./daemon/data-lock.js";
 import { DaemonServer } from "./daemon/server.js";
 import { DefaultProviderError } from "./daemon/providers/registry.js";
 import { clearStaleOpencodeCredentials } from "./daemon/providers/opencode/credentials.js";
@@ -130,9 +131,22 @@ program
       };
     }
 
+    // One daemon per data directory: before anything is opened or cleaned
+    // up (the store, boot recovery, opencode's key files), lock each one
+    // this daemon owns, or say who holds it and stop (data-lock.ts).
+    let dataLock: DaemonLocks;
+    try {
+      dataLock = acquireDaemonLocks(daemonOwnedDirs(config), { port: bindPort });
+    } catch (err) {
+      if (!(err instanceof DataDirLockError)) throw err;
+      console.error(`\n[codeoid] the daemon couldn't start: ${err.message}\n`);
+      process.exit(1);
+    }
+
     let daemon: DaemonServer;
     try {
       daemon = new DaemonServer({
+        dataLock,
         port: bindPort,
         host: bindHost,
         dbPath: config.dbPath,

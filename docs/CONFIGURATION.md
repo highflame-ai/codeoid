@@ -212,6 +212,20 @@ The opencode backend (opencode 2.2.5 or a later 2.2.x) is on by default when an 
 - Credentials are codeoid's own: its `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `GOOGLE_API_KEY` (or `GEMINI_API_KEY`), each sent to the gateway its `*_BASE_URL` names when one does, its Qwen backend on an API key or its default account (`providers.qwen`, as provider `qwen`), and its OpenAI-compatible endpoints (as `oai-<name>`). codeoid writes each to a file only it can read and names the file in opencode's config; the files are removed when the server stops, and a daemon that's gone has its files removed when another starts (each daemon keeps its own). The opencode server's environment carries no key, nor a proxy URL with credentials in it. Sign-ins stored in codeoid's opencode database (`OPENCODE_DB=<that path> opencode auth login`) work too. `codeoid account` doesn't apply to it.
 - Every setting here is read when the daemon starts; change one, then restart the daemon (the settings UI says so).
 
+### One daemon per data directory
+
+A daemon owns its data: the directory of its database (`dbPath`, `~/.codeoid/` by default), its transcripts and checkpoints (`transcriptDir`), opencode's database and data dirs (`providers.opencode.dbPath`, `providers.opencode.dataDir`) and memory's database dir. Two daemons on the same data would corrupt each other's state, so `codeoid start` takes a lock on each of those directories (a `codeoid-daemon.lock` file in it, recording the daemon's pid, host and process start time) before it opens or cleans up anything, and a second start on any of them is refused, naming the daemon that holds it:
+
+```
+[codeoid] the daemon couldn't start: another codeoid daemon (pid 4242 on laptop, port 7400, since …) uses /home/u/.codeoid: process 4242 still runs. …
+```
+
+Stop that daemon first, or give the second one data of its own (`CODEOID_DB_PATH`, `CODEOID_TRANSCRIPT_DIR`, or another config dir with `XDG_CONFIG_HOME`).
+
+- The lock goes when the daemon stops, however it stops (a signal, a failed start). A daemon killed outright (`kill -9`, a crash, power loss) leaves it; the next start takes it over, with a line in its log, when the process that took it is gone: on the same host, its pid no longer runs, or now runs another process (a different start time), or the machine has restarted since.
+- A lock taken on another host (data on a shared or network home), or in another pid namespace (a container), can't be checked from here, so it is never taken over: the start is refused, naming the holder. If that daemon is gone, remove the lock file the message names and start again. Nothing else is ever removed or changed while deciding.
+- Only `codeoid start` takes it. Every other command (`codeoid ls`, `send`, `attach`, `settings`, …) talks to the running daemon and needs no lock.
+
 ### `~/.codeoid/.env` — env-only secrets
 
 Some daemon settings are env-only (notably the Telegram frontend). Rather than

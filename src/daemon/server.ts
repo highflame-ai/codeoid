@@ -195,6 +195,12 @@ export interface DaemonConfig {
    */
   fullConfig?: CodeoidConfig;
   /**
+   * The data-dir locks `codeoid start` took for this daemon (data-lock.ts),
+   * released on shutdown, after everything else. Absent for an embedder or a
+   * test, which takes none.
+   */
+  dataLock?: { release(): void };
+  /**
    * Outward control-plane MCP endpoint (`/mcp/control`, docs/mcp-control.md).
    * Absent or `enabled: false` = not mounted (the path 404s).
    */
@@ -385,6 +391,10 @@ export class DaemonServer {
     // final audit/usage writes land in store + memory) BEFORE store/memory
     // close — hence store/memory are registered first (they close last) and
     // sessions is registered after them (drains first).
+    // LIFO: registered first, so it runs last — the data is let go once
+    // nothing of this daemon's writes to it any more.
+    const dataLock = config.dataLock;
+    if (dataLock) this.#shutdown.register("data-lock", () => dataLock.release());
     this.#shutdown.register("memory", async () => {
       if (this.#memory) await this.#memory.close();
     });

@@ -8,6 +8,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A second daemon on the same data is refused** (#447).
+  `codeoid start` locks each directory the daemon owns (its database's, transcripts and checkpoints, opencode's database and data dirs, memory's) before it opens anything, and a start on data another live daemon uses exits, naming that daemon (pid, host, port) and how to clear a stale lock, instead of running alongside it and corrupting both.
+  A lock left by a daemon that's gone (killed outright: its pid no longer runs, or now belongs to another process) is taken over with a log line; one from another host or container is never guessed at.
+  See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#one-daemon-per-data-directory).
+
 - **opencode as a backend** (#447).
   opencode 2.2 opens its 75+ model providers (GitHub Copilot, OpenRouter, Bedrock, Vertex, Azure, local Ollama, …) to sessions, routines and loops, with codeoid's approvals, spend caps and memory on top.
   codeoid runs one private opencode server per daemon — started by the first opencode session, loopback-only with a fresh password, its own database beside codeoid's (`providers.opencode.dbPath`), restarted if it dies and stopped with the daemon — so codeoid's sessions never mix with your own opencode.
