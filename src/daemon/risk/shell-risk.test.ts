@@ -468,7 +468,7 @@ describe("shell command risk (#431)", () => {
       "ps --env",
       "ps -Q",
       'x="1 e"; ps -p $x',
-      "ps -p $(pgrep opencode)",
+      "ps -p $(pgrep -l opencode)",
       "PID=$(pgrep opencode); ps -p $PID",
     ]) {
       const r = await assessShellCommand(c, ctx);
@@ -640,6 +640,19 @@ describe("shell command risk (#431)", () => {
     }
     // top stays refused: its columns come from a file the line doesn't show.
     expect((await assessShellCommand("top -bn1", ctx)).secret?.action).toBe("deny");
+  });
+
+  it("ps fed plain pgrep or pidof isn't refused: it prints pids only (#447 round-19 audit)", async () => {
+    // Plain pgrep and pidof print pids only, which can't split into an option.
+    for (const c of ["ps -p $(pgrep node) -o rss=", "ps -o pid,cmd -p $(pgrep -f vite)", "ps -p $(pgrep -fu root node)", "ps -p $(pidof node) -o rss=", "ps $(pgrep node)"]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret, r.level]).toEqual([c, undefined, "medium"]);
+    }
+    // Options that shape the output, a pattern only known at run time, or more inside, could.
+    for (const c of ["ps -p $(pgrep -l node)", "ps -p $(pgrep -a node)", 'ps -p $(pgrep -d " e " node)', 'ps -p $(pgrep "-l" node)', "ps -p $(pidof -S e node)", "ps -p $(pgrep $X)", "ps -p $(pgrep node; echo e)"]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret?.action, r.level]).toEqual([c, "deny", "high"]);
+    }
   });
 
   it("refuses a credential file named through $HOME, or after a cd (round-1 audit)", async () => {

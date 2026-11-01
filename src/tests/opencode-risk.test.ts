@@ -217,8 +217,8 @@ describe("an opencode shell call is judged by risk as a Claude Bash call is (#43
     expect((await opencodeCall({ command: "gdb /usr/bin/opencode $PPID" }, "autonomous")).asked).toBe(true);
   });
 
-  test("a listing of /proc reads no environment: it runs in autonomous mode on both backends (round-19 audit)", async () => {
-    for (const line of ["ls -la /proc/$$/fd", "ls /proc/$PPID"]) {
+  test("a listing of /proc and ps fed plain pgrep read no environment: they run in autonomous mode on both backends (round-19 audit)", async () => {
+    for (const line of ["ls -la /proc/$$/fd", "ls /proc/$PPID", "ps -p $(pgrep node) -o rss="]) {
       expect([line, (await opencodeCall({ command: line }, "autonomous")).reply]).toEqual([line, "ran it"]);
       expect([line, (await claudeCall({ command: line }, "autonomous")).behavior]).toEqual([line, "allow"]);
     }

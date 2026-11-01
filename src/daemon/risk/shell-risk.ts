@@ -1449,10 +1449,48 @@ const PS_VARS = /^(PS_\w+|PROCPS_\w+|CMD_ENV|I_WANT_A_BROKEN_PS|POSIXLY_CORRECT|
  * (inherited, as the rest of ps's environment is) or a pid bash sets (`$$`).
  */
 function oneArgument(w: ShellWord, parsed: ParsedShell): boolean {
-  if (/^"(?:[^"\\]|\\.)*"$/.test(w.raw)) return true;
+  if (/^"(?:[^"\\]|\\.)*"$/.test(w.raw) || pidList(w)) return true;
   const name = /^\$(?:\{(\w+|[$!])\}|(\w+|[$!]))$/.exec(w.raw);
   const v = name?.[1] ?? name?.[2];
   return v !== undefined && (["$", "!", "PPID", "BASHPID"].includes(v) || !parsed.assignments.some((a) => a.name === v || a.name === ""));
+}
+
+/** pgrep and pidof options that leave their output pids and whitespace (`-d`, `-l`, `-a`, pidof's `-S` change it); `=` marks one taking a value. */
+const PID_LIST_OPTS: Record<string, ReadonlySet<string>> = {
+  pgrep: new Set(["-f", "-x", "-n", "-o", "-i", "-v", "-c", "-r=", "-u=", "-U=", "-P=", "-g=", "-G=", "-s=", "-t=", "--full", "--exact", "--newest", "--oldest", "--ignore-case", "--inverse", "--count", "--euid=", "--uid=", "--parent=", "--pgroup=", "--group=", "--session=", "--terminal=", "--runstates="]),
+  pidof: new Set(["-s", "-c", "-n", "-x", "-q", "-o="]),
+};
+
+/**
+ * `$(pgrep node)`, `$(pidof node)` unquoted: their output is pids and
+ * whitespace, so it splits into pids only, never an option. Only in fixed
+ * text (nothing inside expands), and only with options that keep it so.
+ */
+function pidList(w: ShellWord): boolean {
+  const inner = /^\$\(\s*((?:pgrep|pidof)\b[^$`()|&;<>\\]*)\)$/.exec(w.raw)?.[1];
+  if (inner === undefined) return false;
+  // Each word as the program gets it, quotes removed: `"-l"` is `-l`.
+  const words = (inner.match(/(?:"[^"]*"|'[^']*'|[^\s"']+)+/g) ?? []).map((x) => x.replace(/["']/g, ""));
+  const allowed = PID_LIST_OPTS[words[0]!];
+  if (!allowed) return false;
+  for (let i = 1; i < words.length; i++) {
+    const x = words[i]!;
+    if (!x.startsWith("-")) continue; // a pattern, or an option's value
+    const eq = x.indexOf("=");
+    const name = eq < 0 ? x : x.slice(0, eq);
+    if (allowed.has(name) && eq < 0) continue;
+    if (allowed.has(`${name}=`)) {
+      if (eq < 0) i++;
+      continue;
+    }
+    // Short options together (`-fx`), the last of them may take a value (`-fu root`).
+    if (/^-[a-zA-Z]{2,}$/.test(x) && [...x.slice(1)].every((c, j, all) => allowed.has(`-${c}`) || (j === all.length - 1 && allowed.has(`-${c}=`)))) {
+      if (allowed.has(`-${x.at(-1)}=`)) i++;
+      continue;
+    }
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -1488,7 +1526,7 @@ function judgePs(cmd: SimpleCommand, parsed: ParsedShell, v: Verdict): void {
       continue;
     }
     if (word === null) {
-      env ??= `an option only known at run time (${w.raw})`;
+      if (!pidList(w)) env ??= `an option only known at run time (${w.raw})`;
       continue;
     }
     if (word.startsWith("--")) {
