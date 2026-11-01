@@ -89,6 +89,18 @@ describe("secretPathVerdict", () => {
     expect(verdict({ file_path: "/proc/4242/root/etc/hostname" })).toBeNull();
   });
 
+  test("takes `..` after a link as the kernel does: /dev/fd/../.. is /proc, and /proc/self/cwd is the workdir the tool opens it from (#447 round-19 audit)", () => {
+    for (const p of ["/dev/fd/../../4242/environ", "/dev/fd/../environ", "/proc/self/cwd/../../.codeoid/config.json", "/dev/fd/../cwd/../../.codeoid/config.json"]) {
+      expect([p, verdict({ file_path: p })?.action]).toEqual([p, "deny"]);
+    }
+    // A link inside the workdir pointing out of it: `..` after it is the parent of its target.
+    symlinkSync(join(configDir, "accounts"), join(workdir, "acc"));
+    mkdirSync(join(configDir, "accounts"));
+    expect(verdict({ file_path: "acc/../config.json" })?.action).toBe("deny");
+    // What resolves the same either way is as before.
+    expect(verdict({ file_path: "src/../README.md" })).toBeNull();
+  });
+
   test("asks — never auto-runs — a search rooted above the credential files", () => {
     expect(verdict({ pattern: "sk-ant", path: join(root, "home") }, "Grep")?.action).toBe("ask");
     expect(verdict({ pattern: "sk-ant", path: configDir }, "Grep")?.action).toBe("ask");

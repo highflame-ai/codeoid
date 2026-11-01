@@ -42,6 +42,7 @@ A shell that runs its input (`echo '…' | sh`, `bash /dev/stdin <<< '…'`, `ca
 Within what it recognises, the reader over-states rather than under-states:
 
 - A path written with `$HOME`, `~`, or your own `~user` is read as the home directory; `~+` as the current directory.
+- `..` is taken as the kernel takes it, after following the links before it, as opencode's paths are (the round-15 rule): `/dev/fd/../..` is `/proc`, and `/proc/self/cwd/..` is the parent of the directory the line runs in (a file tool's is the workdir). A path that resolves to the same file either way is judged as written.
 - A path only known at run time (`cat "$f"`, `cat $(…)`, what `xargs` hands a command) counts as outside the workspace, so a read of it is medium. So does a path relative to a directory outside it, and a `cd` is followed to where it goes.
 - A recursive delete of anything that isn't plainly inside the workspace is high, and so is a delete `find` or `xargs` runs on what a search outside the workspace finds.
 - Writes to start-up and agent files (`~/.bashrc`, `~/.bash_aliases`, `~/.claude`, `~/.codeoid`, …) and system paths are high when written with a redirect, `cp`/`mv`/`install` (`-t` too), `curl -o`/`wget -O`, `truncate`, `touch`, `tee`, `dd of=`, `sed -i`, `xxd` or `tree -o`, even in a session whose workspace is `~` or `/`. So are `git config --global`, `crontab` and `systemctl enable`.

@@ -44,7 +44,7 @@
 
 import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, normalize, relative, resolve, sep } from "node:path";
 import { defaultCodexHome, defaultGeminiCliRoot, piAgentDirOf } from "./account-apply.js";
 
 export type SecretPathVerdict = { action: "deny" | "ask"; path: string } | null;
@@ -171,7 +171,42 @@ const norm = (p: string) => (FOLD ? p.toLowerCase() : p);
 
 function expand(p: string, workdir: string): string {
   const home = p === "~" || p.startsWith("~/") ? `${homedir()}${p.slice(1)}` : p;
-  return isAbsolute(home) ? resolve(home) : resolve(workdir, home);
+  // The tool opens it from the workdir: that is its `/proc/self/cwd` too.
+  const abs = isAbsolute(home) ? home : `${resolve(workdir)}/${home}`;
+  return kernelPath(abs, resolve(workdir)) ?? resolve(abs);
+}
+
+/** A process's own cwd link (`self`, `thread-self`, a task's, or this process's own pid's): the cwd of whoever opens the path. */
+const SELF_CWD = new RegExp(`^/proc/(?:self|thread-self|${process.pid})(?:/task/[^/]+)?/cwd(?=/|$)`);
+
+/**
+ * `p` (absolute) as the kernel resolves it for a process whose cwd is
+ * `cwd`: `..` is the parent of what the path so far really is, a symlink
+ * followed first, never a lexical collapse — the round-15 path rule
+ * (opencode's `realTarget`). So `/dev/fd/../../1/environ` is
+ * `/proc/1/environ`, and `/proc/self/cwd/../x` is `x` beside `cwd`. The
+ * lexical answer when both readings name the same file (a path through a
+ * symlinked `/tmp` stays as written); null when it goes up out of the
+ * process's own cwd link and `cwd` isn't known.
+ */
+export function kernelPath(p: string, cwd: string | null): string | null {
+  const lexical = normalize(p);
+  if (!p.split("/").includes("..")) return lexical;
+  let at = "/";
+  for (const name of p.split("/")) {
+    if (name === "" || name === ".") continue;
+    if (name !== "..") {
+      at = join(at, name);
+      continue;
+    }
+    const self = SELF_CWD.exec(at);
+    if (self) {
+      if (cwd === null) return null;
+      at = cwd + at.slice(self[0].length);
+    }
+    at = dirname(real(at));
+  }
+  return at === lexical || real(at) === real(lexical) ? lexical : at;
 }
 
 /** The real path when it exists — a symlink in the workdir must not launder a secret. */

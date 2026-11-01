@@ -24,8 +24,8 @@
  * tools are.
  */
 import { homedir, userInfo } from "node:os";
-import { isAbsolute, join, normalize, resolve, sep } from "node:path";
-import { isProcSecretPath, secretDirsOf, secretPathVerdict } from "../secret-paths.js";
+import { isAbsolute, join, resolve, sep } from "node:path";
+import { isProcSecretPath, kernelPath, secretDirsOf, secretPathVerdict } from "../secret-paths.js";
 import {
   loadShellParser,
   type ParsedShell,
@@ -461,14 +461,20 @@ function resolvePath(w: ShellWord, cwd: string | null, ctx: Ctx): string | null 
     v = cut < 0 ? v : v.slice(0, Math.max(0, v.lastIndexOf("/", cut)) || (v.startsWith("/") ? 1 : 0));
     if (v === "") v = ".";
   }
-  if (v === "~" || v.startsWith("~/")) return normalize(join(ctx.home, v.slice(1)));
+  // `..` is taken as the kernel takes it, after following what came before
+  // (`/dev/fd/../..` is `/proc`); the program opening it runs in `cwd`.
+  const at = (p: string) => kernelPath(p, cwd);
+  if (v === "~" || v.startsWith("~/")) return at(`${ctx.home}/${v.slice(1)}`);
   // `~me/x` is `~/x`; `~+` is the directory it runs in.
   const tilde = /^~([^/]*)(\/[\s\S]*)?$/.exec(v);
-  if (tilde?.[1] === ownUser() && ownUser() !== "") return normalize(join(ctx.home, tilde[2] ?? ""));
-  if (tilde?.[1] === "+" && cwd !== null) return normalize(join(cwd, tilde[2] ?? ""));
+  if (tilde?.[1] === ownUser() && ownUser() !== "") return at(`${ctx.home}/${tilde[2] ?? ""}`);
+  if (tilde?.[1] === "+" && cwd !== null) return at(`${cwd}/${tilde[2] ?? ""}`);
   if (v.startsWith("~")) return null; // another user's home, or `~-`
-  if (isAbsolute(v)) return normalize(v);
-  return cwd === null ? null : resolve(cwd, v);
+  if (isAbsolute(v)) return at(v);
+  if (cwd === null) return null;
+  // As `resolve` gives it: no trailing `/`.
+  const r = at(`${cwd}/${v}`);
+  return r !== null && r.length > 1 && r.endsWith("/") ? r.slice(0, -1) : r;
 }
 
 let user: string | undefined;

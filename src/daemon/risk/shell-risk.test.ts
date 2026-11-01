@@ -614,6 +614,20 @@ describe("shell command risk (#431)", () => {
     }
   });
 
+  it("takes `..` after a link as the kernel does: /dev/fd/../.. is /proc, /proc/self/cwd is where the line runs (#447 round-19 audit)", async () => {
+    for (const c of ["cat /dev/fd/../../4242/environ", "cd /dev/fd/../.. && cat 1/environ", "cat /dev/fd/../environ"]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret?.action, r.level]).toEqual([c, "deny", "high"]);
+    }
+    const inHome = { ...ctx, cwd: join(home, "proj"), workdir: join(home, "proj") };
+    for (const c of ["cat /proc/self/cwd/../.codeoid/config.json", "cat /dev/fd/../cwd/../.codeoid/config.json", "cd sub && cat /proc/self/cwd/../../.codeoid/config.json"]) {
+      const r = await assessShellCommand(c, inHome);
+      expect([c, r.secret?.action, r.level]).toEqual([c, "deny", "high"]);
+    }
+    // What resolves the same either way is as before.
+    expect(await level("cat src/../README.md")).toBe("low");
+  });
+
   it("refuses a credential file named through $HOME, or after a cd (round-1 audit)", async () => {
     for (const c of ['cat "$HOME/.codeoid/config.json"', "cat ${HOME}/.codeoid/.env", "cat < $HOME/.codeoid/config.json", "cd ~/.codeoid && cat config.json"]) {
       const r = await assessShellCommand(c, ctx);
