@@ -210,6 +210,10 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Idle sessions no longer keep their backend running forever** (#451).
+  A session left idle for `session.idleReleaseMinutes` (default 30; `CODEOID_IDLE_RELEASE_MINUTES`, also in Settings) has its backend process (the Claude CLI, codex, pi, the Gemini CLI, Qwen) and the MCP servers it started stopped; the next message starts it again and resumes the same conversation.
+  Before, every session that had run a turn kept them for the daemon's lifetime, so memory grew with the number of sessions ever used: enough on a busy machine to exhaust RAM and swap.
+  A running turn, background work or a pending approval is never cut off. `0` keeps the old behaviour.
 - **Spend caps work on every backend, and costs are never shown as $0 when they aren't known** (#430).
   Codex, OpenAI-compatible endpoints, Gemini, Qwen and the Gemini CLI recorded every turn as costing $0, so a routine's `--max-cost` and `--daily-cost` never stopped anything there.
   Now a backend that reports tokens but no cost has them priced at the model's list price (a snapshot of LiteLLM's table, overridable per model in `pricing.models`), shown as an estimate (`~$0.42`); a model on your own machine costs nothing (llama-server on a loopback address; a proxy there to a paid API isn't free unless you say so); and a turn whose cost can't be known shows as `$?`, and stops a capped routine run instead of letting it run uncapped.

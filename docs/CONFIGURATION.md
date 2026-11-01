@@ -87,6 +87,9 @@ CODEOID_RESUME_MAX_SESSIONS=200          # sessions restored from disk at startu
                                         #   Resume is also time-boxed, so raising this costs
                                         #   startup time; the remainder stays on disk and loads
                                         #   on a later restart.
+CODEOID_IDLE_RELEASE_MINUTES=30         # minutes idle before a session's backend process and the
+                                        #   MCP servers it started are stopped; the next message
+                                        #   resumes it (#451). 0 = keep them running.
 CODEOID_DEFAULT_PROVIDER=claude         # backend for sessions created without --provider
                                         #   (claude | codex | pi | qwen | gemini-cli | openai | gemini |
                                         #    llamacpp — see docs/local-models.md).

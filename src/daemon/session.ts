@@ -873,6 +873,8 @@ export class Session {
   #accountChoices: Record<string, string> = {};
   /** An account change arrived while busy: release the provider once idle. */
   #releaseProviderWhenIdle = false;
+  /** Stops an idle backend process after `session.idleReleaseMinutes` (#451); armed while idle. */
+  #idleReleaseTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * The credential the current backend was built on: its account's
    * fingerprint, "" for the daemon's own, or "missing:<why>" — what
@@ -1904,6 +1906,38 @@ export class Session {
       .catch((e) => {
         console.error(`[codeoid/session ${this.id}] releasing the idle ${backend} backend failed: ${e instanceof Error ? e.message : String(e)}`);
       });
+  }
+
+  /**
+   * Arm the idle release (#451): a session left idle this long has its
+   * backend process, and the MCP servers it started, stopped. Re-armed each
+   * time the session goes idle; any activity clears it. The next message
+   * starts the backend again and resumes the conversation, as after an
+   * account change.
+   */
+  #armIdleRelease(): void {
+    this.#clearIdleRelease();
+    if (this.#destroyed || !PROCESS_BACKENDS.has(this.#provider.id)) return;
+    const minutes = this.#config?.session?.idleReleaseMinutes ?? 30;
+    if (!(minutes > 0)) return;
+    this.#idleReleaseTimer = setTimeout(() => {
+      this.#idleReleaseTimer = null;
+      // Only a session with nothing in flight: no turn, no background work, no
+      // approval waiting, and a backend that actually started.
+      if (this.#destroyed || this.#status !== "idle" || this.#turnActive()) return;
+      if (this.#backgroundTasks.size > 0 || this.#pendingApprovals.size > 0) return;
+      if (!this.#provider.hasQueried) return;
+      console.log(`[codeoid/session ${this.id.slice(0, 8)}] idle ${minutes} min: stopping its ${this.#provider.id} backend until the next message`);
+      this.releaseIdleProvider();
+    }, minutes * 60_000);
+    this.#idleReleaseTimer.unref?.();
+  }
+
+  #clearIdleRelease(): void {
+    if (this.#idleReleaseTimer) {
+      clearTimeout(this.#idleReleaseTimer);
+      this.#idleReleaseTimer = null;
+    }
   }
 
   /** #392's name for {@link releaseIdleProvider}. */
@@ -4938,6 +4972,7 @@ export class Session {
       clearTimeout(this.#backgroundWakeFallback);
       this.#backgroundWakeFallback = null;
     }
+    this.#clearIdleRelease();
     this.#store.audit(sender.sub, "session.destroy", this.id);
     // Hook seam: observe-only lifecycle notification.
     this.#hookBus?.emit("session_end", this.#hookContext(), {});
@@ -8680,6 +8715,8 @@ export class Session {
     this.#denyPendingApprovals({ keepBackground: false });
     this.#settleBetweenTurns();
     if (this.#releaseProviderWhenIdle) this.releaseIdleProvider();
+    // Background work done while already idle: the idle countdown starts now (#451).
+    if (this.#status === "idle") this.#armIdleRelease();
   }
 
   /** The provider reports background work still running. */
@@ -9752,6 +9789,9 @@ export class Session {
     // for clients or for resume — skip the persistence AND the broadcast.
     if (status === this.#status) return;
     this.#status = status;
+    // Idle: count down to stopping the backend; anything else: it's in use (#451).
+    if (status === "idle") this.#armIdleRelease();
+    else this.#clearIdleRelease();
     if (status === "idle" && this.#releaseProviderWhenIdle && this.#backgroundTasks.size === 0) {
       this.releaseIdleProvider();
     }
