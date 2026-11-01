@@ -1700,6 +1700,24 @@ describe("opencode's hosted models (opencode.ai)", () => {
     expect(JSON.parse(st.configText).model).toBeUndefined();
   });
 
+  it("a session resumed on a hosted model (from before they were turned off) is switched to the default before its prompt", async () => {
+    const on = makeServer({ FAKE_OPENCODE_PERSIST: "1" }, { hostedModels: true });
+    const a = makeProvider(on.server);
+    await collect(a.runTurn(opts("hi", { model: "opencode/big-pickle" })));
+    const ses = a.backingSessionId;
+    await a.teardown();
+    await on.server.stop();
+    const off = makeServer({ FAKE_OPENCODE_PERSIST: "1" }, { dbPath: join(on.dir, "data", "opencode", "opencode.db") });
+    const b = makeProvider(off.server, { initialBackingId: ses });
+    const events = await collect(b.runTurn(opts("echo-state")));
+    expect(events.find((e) => e.type === "error")).toBeUndefined();
+    expect(b.backingSessionId).toBe(ses);
+    const seen = JSON.parse(texts(events, "text_done").at(-1)!) as { model: { providerID: string; id: string } };
+    expect(seen.model).toMatchObject({ providerID: "anthropic", id: "claude-sonnet-4" });
+    expect((await fakeState(off.server)).modelSwitches.map((x: { model: unknown }) => x.model)).toEqual([{ providerID: "anthropic", id: "claude-sonnet-4" }]);
+    await b.teardown();
+  });
+
   it("a server that offers them anyway (a system config allowing them) is refused", async () => {
     const { server } = makeServer({ FAKE_OPENCODE_HOSTED_ALLOWED: "1" });
     const events = await collect(makeProvider(server).runTurn(opts("hi")));
