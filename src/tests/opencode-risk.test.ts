@@ -207,6 +207,16 @@ describe("an opencode shell call is judged by risk as a Claude Bash call is (#43
     expect((await opencodeCall({ command: "echo $(< README.md)" }, "autonomous")).reply).toBe("ran it");
   });
 
+  test("a debugger attaching to the server with its pid only known at run time is refused in any mode on both backends (round-19 audit)", async () => {
+    for (const line of ["gdb --batch --pid=$PPID", 'gdb -batch -ex "attach $PPID"']) {
+      const oc = await opencodeCall({ command: line }, "autonomous");
+      expect([line, oc.asked, oc.reply.includes("holds credentials") ? "refused" : oc.reply]).toEqual([line, false, "refused"]);
+      expect([line, (await claudeCall({ command: line }, "autonomous")).behavior]).toEqual([line, "deny"]);
+    }
+    // One whose words could attach is asked, autonomous mode included.
+    expect((await opencodeCall({ command: "gdb /usr/bin/opencode $PPID" }, "autonomous")).asked).toBe(true);
+  });
+
   test("the directory opencode runs it in is the one judged: a bare name in codeoid's config dir is a credential read", async () => {
     const oc = await opencodeCall({ command: "cat config.json", workdir: getConfigDir() }, "autonomous");
     expect(oc.asked).toBe(false);

@@ -600,6 +600,20 @@ describe("shell command risk (#431)", () => {
     expect([r.secret, r.level]).toEqual([undefined, "medium"]);
   });
 
+  it("a debugger attaching with a pid only known at run time is refused, and one whose words could attach is not understood (#447 round-19 audit)", async () => {
+    for (const c of ["gdb --batch --pid=$PPID", "gdb -batch -p$PPID", "lldb -p$PPID", 'gdb -batch -ex "attach $PPID"', "lldb -o 'process attach -p $PPID'", "strace -p$PPID"]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret?.action, r.level]).toEqual([c, "deny", "high"]);
+    }
+    for (const c of ["gdb /usr/bin/opencode $PPID", 'gdb -batch -ex "$CMD"', "gdb $OPTS ./a.out", "lldb $OPTS"]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret, r.level]).toEqual([c, undefined, "unknown"]);
+    }
+    for (const c of ["gdb ./a.out", "gdb -batch -ex run -ex bt ./a.out", 'gdb -batch -ex "frame $N" ./a.out', "lldb ./a.out"]) {
+      expect([c, await level(c)]).toEqual([c, "medium"]);
+    }
+  });
+
   it("refuses a credential file named through $HOME, or after a cd (round-1 audit)", async () => {
     for (const c of ['cat "$HOME/.codeoid/config.json"', "cat ${HOME}/.codeoid/.env", "cat < $HOME/.codeoid/config.json", "cd ~/.codeoid && cat config.json"]) {
       const r = await assessShellCommand(c, ctx);

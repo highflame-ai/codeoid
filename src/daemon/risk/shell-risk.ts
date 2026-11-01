@@ -1353,7 +1353,8 @@ const ATTACH_ALWAYS = new Set(["gcore", "gstack", "pstack", "eu-stack"]);
 
 /** gdb / lldb / strace / ltrace told to attach to a running process. */
 function attaches(cmd: SimpleCommand, prog: string): boolean {
-  const args = cmd.argv.slice(1).map((w) => w.value ?? "");
+  // Each word's fixed text, run-time parts marked: `--pid=$PPID` and `-ex "attach $PPID"` show what they do.
+  const args = cmd.argv.slice(1).map(wordShape);
   switch (prog) {
     case "strace":
     case "ltrace":
@@ -1368,6 +1369,18 @@ function attaches(cmd: SimpleCommand, prog: string): boolean {
     }
   }
   return false;
+}
+
+/**
+ * A debugger or tracer whose words could attach to a process though their
+ * fixed text doesn't show it: a word that starts with what's only known at
+ * run time (`gdb $OPTS`, `gdb -ex "$CMD"`), or a pid after gdb's program
+ * that is (`gdb PROG $PID`).
+ */
+function mayAttach(cmd: SimpleCommand, prog: string): boolean {
+  if (!["gdb", "lldb", "strace", "ltrace"].includes(prog)) return false;
+  if (cmd.argv.slice(1).some((w) => wordShape(w).startsWith(SHAPE_ANY))) return true;
+  return prog === "gdb" && positionals(cmd)[1]?.value === null;
 }
 
 /** Interpreters whose inline code isn't parsed as shell (shells are: their `-c` line is judged command by command). */
@@ -1392,6 +1405,7 @@ function checkProcReads(cmd: SimpleCommand, parsed: ParsedShell, cwd: string | n
     if (at) refuseEnvironRead(v, `${prog} reads every file under ${at.raw}, processes' environments in /proc included`);
   }
   if (ATTACH_ALWAYS.has(prog) || attaches(cmd, prog)) refuseEnvironRead(v, `${prog} attaches to another process, whose memory holds its environment`);
+  else if (mayAttach(cmd, prog)) v.add("unknown", `${prog}'s arguments are only known at run time: it may attach to another process, whose memory holds its environment`);
   if (INTERPRETERS.has(prog) || ["awk", "gawk", "mawk", "nawk", "sed", "gdb", "lldb"].includes(prog)) {
     const texts = [...cmd.argv.slice(1).map((w) => w.value ?? w.raw), ...cmd.redirects.flatMap((r) => [r.body ?? "", r.op === "<<<" ? (r.target?.value ?? r.target?.raw ?? "") : ""])];
     if (texts.some((t) => CODE_TEXT.test(t))) refuseEnvironRead(v, `${prog}'s code names /proc/…/environ, a process's environment`);
