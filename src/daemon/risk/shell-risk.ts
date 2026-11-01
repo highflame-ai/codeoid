@@ -979,9 +979,10 @@ function judgeRm(cmd: SimpleCommand, prog: string, parsed: ParsedShell, cwd: str
     }
     const abs = resolvePath(t, cwd, ctx);
     const at = where(abs, ctx);
-    // A pattern with a name in it (`*.log`) deletes what matches in the workspace, not the workspace itself (`*`, `.*`).
+    // A pattern anchored on a literal name (`*.log`, `build-*`) deletes what matches in the workspace, not the
+    // workspace itself; `*`, `.*`, `*a*` and `[a-z]*` match nearly everything, so they count as the workspace.
     const last = t.value?.slice(t.value.lastIndexOf("/") + 1) ?? "";
-    const matchesSome = t.glob && /[A-Za-z0-9_]/.test(last) && !/[{}]/.test(last);
+    const matchesSome = t.glob && /[A-Za-z0-9_]/.test(last) && !/[[\]{}]/.test(last) && (/^[^*?]/.test(last) || /[^*?]$/.test(last));
     const precious = abs !== null && ((abs === ctx.workdir && !matchesSome) || abs === join(ctx.workdir, ".git") || insideOf(abs, join(ctx.workdir, ".git")));
     if (at === "root" || at === "system" || at === "home" || at === "home-sensitive") {
       v.add("high", `${prog} deletes ${abs}${recursive ? " and everything under it" : ""}`);
