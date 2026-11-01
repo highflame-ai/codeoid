@@ -12,32 +12,44 @@
  *
  * "Inside" is the session's workdir (a worktree session's workdir is its
  * worktree; codeoid gives a session no other directories) and the system
- * temp dir (`os.tmpdir()`, and `/tmp`), where scratch files are routine.
+ * temp dir (`os.tmpdir()`, and `/tmp`), where scratch files are routine —
+ * less codeoid's own entries there (`codeoid-*`: sign-in homes, the pi
+ * bridge, loop indexes), which are outside.
  *
  * Each backend names its file tools its own way ({@link writeTargets}):
  * Claude's Write/Edit/MultiEdit/NotebookEdit, opencode's Write/Edit (a
  * patch's every file, moves included, in `files`), Codex's
  * `codex_file_change` (`changes[].path`, and a move's destination), pi's
  * `write`/`edit`, Qwen Code's `write_file`/`edit`/`notebook_edit`, the Gemini
- * CLI's `acp_edit`/`acp_delete`/`acp_move`. A path is resolved as the
- * secret-path gate resolves it: against the workdir, `~` expanded, `..` as the
- * kernel takes it, then through every symlink of its longest existing prefix
- * (a link in the workdir that leads out is outside). A write whose target
- * can't be resolved for certain (none given, `..` past a missing directory,
- * anything under `/proc`) counts as outside.
+ * CLI's `acp_edit`/`acp_delete`/`acp_move` (the `locations` its permission
+ * request names). Every path key a call carries is judged. A path is
+ * resolved where the kernel would really write it (`physicalPath`, the
+ * resolver opencode's `realTarget` uses): against the workdir, `~`
+ * expanded, one component at a time, a symlink's target spliced in (a
+ * dangling one leads to its target), `..` the parent of what the path so far
+ * really is; and also with `..` collapsed first, as a tool that normalizes
+ * its path reads it. Either reading outside is outside. A write whose target
+ * can't be resolved for certain counts as outside: none given, `..` past a
+ * missing directory, anything under `/proc`, another user's `~name`, a loop
+ * or too many links, and an existing file with more than one hard link
+ * (another name of it may be anywhere on the filesystem).
  *
  * Shell commands: the targets #431's parser can name (redirects, `rm`, `mv`,
- * `cp`, `tee`, `ln`, `touch`, `dd of=`, `sed -i`, `find -delete`, …,
- * `shellWriteTargets`) are judged the same way. One the parser can't place
- * (a variable, a path after a `cd` it can't follow) isn't: shell levels are
- * guidance, not a sandbox (#448).
+ * `cp`, `tee`, `touch`, `dd of=`, `sed -i`, `find -delete`, …, and `ln`'s
+ * link and what it leads to: `shellWriteTargets`) are judged the same way,
+ * `..` kept for the kernel's reading. A relative one after a `cd` the reader
+ * can't be sure moved the shell (in a subshell or pipeline, on a condition,
+ * into a directory that may not exist), and every other target of a line
+ * that makes a link, can't be placed for certain and asks. A word the parser
+ * can't know (a variable) isn't judged: shell levels are guidance, not a
+ * sandbox (#448).
  */
 
-import { existsSync, realpathSync } from "node:fs";
+import { lstatSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { isAbsolute, relative, resolve, sep } from "node:path";
+import { physicalPath } from "./physical-path.js";
 import { shellWriteTargets } from "./risk/effects.js";
-import { kernelPath } from "./secret-paths.js";
 import { shellCallOf } from "./shell/tool-call.js";
 
 /** What a file-writing tool call targets: each a raw path, or null where the call names none. */
@@ -63,10 +75,23 @@ function codexChangeTargets(changes: unknown): Targets {
   return out;
 }
 
-/** Path keys an ACP (Gemini CLI) call may carry; the real CLI sends none (its `rawInput` is absent). */
-function acpTargets(input: Record<string, unknown>): Targets {
-  const found = [str(input.file_path), str(input.path), str(input.absolute_path), str(input.destination), str(input.source), ...strs(input.paths), ...strs(input.locations)].filter((p) => p !== null);
+/** `{path}` objects or strings: an ACP call's `locations`. */
+const locationPaths = (v: unknown): string[] =>
+  Array.isArray(v) ? v.map((l) => (l && typeof l === "object" ? (l as { path?: unknown }).path : l)).filter((p): p is string => typeof p === "string" && p.length > 0) : [];
+
+/** Every path among `values`; `[null]` (names none) when there's none. */
+function present(...values: Array<string | null | string[]>): Targets {
+  const found = values.flat().filter((p): p is string => p !== null);
   return found.length > 0 ? found : [null];
+}
+
+/**
+ * Path keys an ACP (Gemini CLI) call may carry. The real CLI sends no
+ * `rawInput`; the provider adds the request's `locations` (acp/index.ts
+ * `acpToolInput`).
+ */
+function acpTargets(input: Record<string, unknown>): Targets {
+  return present(str(input.file_path), str(input.path), str(input.absolute_path), str(input.destination), str(input.source), strs(input.paths), locationPaths(input.locations));
 }
 
 /**
@@ -82,17 +107,18 @@ export function writeTargets(toolName: string, input: Record<string, unknown>): 
     case "Edit":
       return [str(input.file_path), ...strs(input.files)];
     case "NotebookEdit":
-      return [str(input.notebook_path) ?? str(input.file_path)];
-    // Qwen Code (absolute paths); `edit` is pi's too, which names it `path`.
+      return present(str(input.notebook_path), str(input.file_path));
+    // Qwen Code (absolute paths); `edit` is pi's too, which writes `path`.
+    // Every key is judged: a call carrying both is judged by both.
     case "write_file":
-      return [str(input.file_path) ?? str(input.path)];
+      return present(str(input.file_path), str(input.path));
     case "edit":
-      return [str(input.file_path) ?? piPath(input.path)];
+      return present(str(input.file_path), piPath(input.path));
     case "notebook_edit":
-      return [str(input.notebook_path)];
+      return present(str(input.notebook_path), str(input.file_path));
     // pi: relative to its cwd (the workdir), a leading `@` dropped as pi drops it.
     case "write":
-      return [piPath(input.path)];
+      return present(piPath(input.path), str(input.file_path));
     case "codex_file_change":
       return codexChangeTargets(input.changes);
     case "acp_edit":
@@ -112,49 +138,68 @@ function piPath(v: unknown): string | null {
 const FOLD = process.platform === "darwin" || process.platform === "win32";
 const norm = (p: string) => (FOLD ? p.toLowerCase() : p);
 
+/** `child` is `parent` or under it (a name like `..foo` is under it). */
 function within(child: string, parent: string): boolean {
   const rel = relative(norm(parent), norm(child));
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+  return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
 }
 
-/** `p` through every symlink of its longest existing prefix: where a write to it lands. */
-function realOfLongestExisting(p: string): string {
-  let at = p;
-  const rest: string[] = [];
-  for (;;) {
-    try {
-      if (existsSync(at)) return join(realpathSync(at), ...rest.reverse());
-    } catch {
-      // unreadable: keep walking up
-    }
-    const parent = dirname(at);
-    if (parent === at) return p;
-    rest.push(basename(at));
-    at = parent;
+const underProc = (p: string) => p === "/proc" || p.startsWith("/proc/");
+
+/** `p` (absolute) where the kernel resolves it; null when that can't be told for certain. */
+function landing(p: string): string | null {
+  try {
+    const at = physicalPath(p);
+    if (underProc(at)) return null;
+    // A file with another name may be anywhere: writing it here writes it there.
+    const st = lstatSync(at, { throwIfNoEntry: false });
+    if (st && !st.isDirectory() && st.nlink > 1) return null;
+    return at;
+  } catch {
+    return null;
   }
 }
 
 /**
- * Where a tool's path leads, resolved as the secret-path gate resolves it
- * (against the workdir, `~` expanded, `..` as the kernel takes it), then
- * through the links of its longest existing prefix. Null when that can't be
- * told for certain: a path through `/proc` (a process's own links), a `..`
- * the kernel reading can't settle.
+ * Where a write to `raw` may land: the path (against the workdir, `~`
+ * expanded) resolved as the kernel resolves it, component by component
+ * through every link, and, when it has a `..`, also with that collapsed
+ * first, as a tool normalizing its path reads it. Null when either can't be
+ * told for certain: another user's `~name`, `/proc`, `..` past a missing
+ * directory, a loop, a file with several hard links.
  */
-export function resolveWritePath(raw: string, workdir: string): string | null {
+export function writeLandings(raw: string, workdir: string): string[] | null {
   const home = raw === "~" || raw.startsWith("~/") ? `${homedir()}${raw.slice(1)}` : raw;
   if (home.startsWith("~")) return null;
   const abs = isAbsolute(home) ? home : `${resolve(workdir)}/${home}`;
-  const k = kernelPath(abs, resolve(workdir));
-  if (k === null || k === "/proc" || k.startsWith("/proc/")) return null;
-  const real = realOfLongestExisting(k);
-  return real === "/proc" || real.startsWith("/proc/") ? null : real;
+  if (underProc(resolve(abs)) || underProc(abs)) return null;
+  const out: string[] = [];
+  for (const p of abs.split("/").includes("..") ? [abs, resolve(abs)] : [abs]) {
+    const at = landing(p);
+    if (at === null) return null;
+    if (!out.includes(at)) out.push(at);
+  }
+  return out;
 }
 
-/** The directories a session's writes stay inside: its workdir, and the system temp dir. */
-export function insideDirs(workdir: string): string[] {
-  return [...new Set([workdir, tmpdir(), "/tmp"].map((d) => realOfLongestExisting(resolve(d))))];
+/** Where a write to `raw` lands, for a path with one reading; the first reading otherwise (see {@link writeLandings}). */
+export function resolveWritePath(raw: string, workdir: string): string | null {
+  return writeLandings(raw, workdir)?.[0] ?? null;
 }
+
+/** Whether a resolved path is inside: the workdir, or the temp dir less codeoid's own entries there. */
+function insideOf(workdir: string): (p: string) => boolean {
+  const real = (d: string) => landing(resolve(d)) ?? resolve(d);
+  const work = real(workdir);
+  const temps = [...new Set([tmpdir(), "/tmp"].map(real))];
+  return (p) => {
+    if (within(p, work)) return true;
+    return temps.some((t) => within(p, t) && !codeoidOwn(relative(norm(t), norm(p))));
+  };
+}
+
+/** A temp-dir entry codeoid itself made (`codeoid-login-*`, `codeoid-pi-bridge-*`, …), or a path under one. */
+const codeoidOwn = (rel: string) => rel.split(sep)[0]!.startsWith("codeoid");
 
 /** Why a call asks: the first of its targets outside the working directory, as resolved; null when none is. */
 export interface OutsideWrite {
@@ -172,25 +217,29 @@ export interface OutsideWrite {
  * runs, when it names a directory.
  */
 export function outsideWriteOf(toolName: string, input: Record<string, unknown>, workdir: string): OutsideWrite | null {
-  const inside = insideDirs(workdir);
-  const isInside = (p: string) => inside.some((d) => within(p, d));
+  const isInside = insideOf(workdir);
+  const judge = (raw: string): OutsideWrite | null => {
+    const at = writeLandings(raw, workdir);
+    if (at === null) return { path: raw, resolved: false };
+    const out = at.find((p) => !isInside(p));
+    return out === undefined ? null : { path: out, resolved: true };
+  };
   const targets = writeTargets(toolName, input);
   if (targets) {
     for (const raw of targets) {
       if (raw === null) return { path: "(the call names no path)", resolved: false };
-      const at = resolveWritePath(raw, workdir);
-      if (at === null) return { path: raw, resolved: false };
-      if (!isInside(at)) return { path: at, resolved: true };
+      const w = judge(raw);
+      if (w) return w;
     }
     return null;
   }
   const call = shellCallOf(toolName, input);
   if (!call) return null;
-  const cwd = call.cwd ? resolve(workdir, call.cwd) : workdir;
-  for (const target of shellWriteTargets(call.command, { workdir, cwd })) {
-    const at = resolveWritePath(target, workdir);
-    // A target the reader named but that can't be settled (under /proc): not provably outside, as the parser's misses aren't.
-    if (at !== null && !isInside(at)) return { path: at, resolved: true };
+  const cwd = call.cwd ? (isAbsolute(call.cwd) ? call.cwd : `${resolve(workdir)}/${call.cwd}`) : resolve(workdir);
+  for (const target of shellWriteTargets(call.command, { workdir: resolve(workdir), cwd })) {
+    if (target.unplaced) return { path: target.path, resolved: false };
+    const w = judge(target.path);
+    if (w) return w;
   }
   return null;
 }

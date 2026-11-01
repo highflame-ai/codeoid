@@ -114,6 +114,15 @@ export interface SimpleCommand {
   inputFrom?: number;
   /** Words its wrappers took for themselves (`xargs -a FILE`, `time -o FILE`): not part of argv, but still files. */
   wrapped?: ShellWord[];
+  /**
+   * It runs in a subshell of the line — inside `( … )`, as a stage of a
+   * pipeline of more than one, in the background (`&`) — so a `cd` there
+   * doesn't move what follows. (A substitution's inside, and a nested
+   * shell's script, are told by `substitution` and `via`.)
+   */
+  subshell?: true;
+  /** It may not run: right of `&&` / `||`, or inside `if`, a loop, `case` or a function. */
+  conditional?: true;
 }
 
 /** A variable the line sets. */
@@ -222,7 +231,12 @@ interface Ctx {
   substitution: SimpleCommand["substitution"];
   redirects: ShellRedirect[];
   heredoc: boolean;
+  subshell?: boolean;
+  conditional?: boolean;
 }
+
+/** Nodes whose commands each run when the node does (the rest of the walk's default nodes run theirs only on a condition). */
+const UNCONDITIONAL_NODES = new Set(["subshell", "negated_command", "list"]);
 
 class Walker {
   #nextPipeline = 0;
@@ -265,9 +279,10 @@ class Walker {
       case "pipeline": {
         const pipeline = this.#nextPipeline++;
         let stage = 0;
+        const stages = n.namedChildren.filter((c) => c && c.type !== "comment").length;
         for (const c of n.namedChildren) {
           if (!c || c.type === "comment") continue;
-          this.node(c, { ...ctx, pipeline, stage: stage++ });
+          this.node(c, { ...ctx, pipeline, stage: stage++, ...(stages > 1 ? { subshell: true } : {}) });
         }
         return;
       }
@@ -324,7 +339,7 @@ class Walker {
           const value = this.word(c, ctx, null);
           if (name) this.out.assignments.push({ name: name.text, value, exported: false });
         }
-        for (const c of n.namedChildren) if (c && c !== name && !values.some((x) => x.id === c.id)) this.node(c, ctx);
+        for (const c of n.namedChildren) if (c && c !== name && !values.some((x) => x.id === c.id)) this.node(c, { ...ctx, conditional: true });
         return;
       }
       case "unset_command":
@@ -348,16 +363,34 @@ class Walker {
         if (n.type === "c_style_for_statement" || n.text.startsWith("((")) {
           for (const c of n.namedChildren) if (c && c.type !== "do_group" && c.type !== "compound_statement") this.#arithmetic(c);
         }
-        for (const c of n.namedChildren) if (c) this.node(c, ctx);
+        this.#statements(n, ctx);
         return;
       case "program":
         // Each statement is a pipeline of its own.
-        for (const c of n.namedChildren) if (c) this.node(c, { ...ctx, pipeline: this.#nextPipeline++, stage: 0 });
+        this.#statements(n, ctx, true);
         return;
-      default:
+      default: {
         // Lists, subshells, braces, if/while/for/case and functions: every
         // command inside may run, in the stage of the pipeline they're in.
-        for (const c of n.namedChildren) if (c) this.node(c, ctx);
+        // Right of `&&` / `||`, and inside if/while/case/a function, only on a condition.
+        const inner = { ...ctx, ...(n.type === "subshell" ? { subshell: true } : {}), ...(UNCONDITIONAL_NODES.has(n.type) ? {} : { conditional: true }) };
+        let first = true;
+        this.#statements(n, inner, false, () => {
+          const right = n.type === "list" && !first;
+          first = false;
+          return right ? { conditional: true } : {};
+        });
+      }
+    }
+  }
+
+  /** `n`'s statements, each followed by `&` run in the background: a subshell. */
+  #statements(n: Node, ctx: Ctx, ownPipelines = false, over: () => Partial<Ctx> = () => ({})): void {
+    for (let i = 0; i < n.childCount; i++) {
+      const c = n.child(i);
+      if (!c?.isNamed) continue;
+      const background = n.child(i + 1)?.type === "&";
+      this.node(c, { ...ctx, ...(ownPipelines ? { pipeline: this.#nextPipeline++, stage: 0 } : {}), ...over(), ...(background ? { subshell: true } : {}) });
     }
   }
 
@@ -396,6 +429,8 @@ class Walker {
       substitution: ctx.substitution,
       heredoc,
       delegates: false,
+      ...(ctx.subshell ? { subshell: true as const } : {}),
+      ...(ctx.conditional ? { conditional: true as const } : {}),
     };
     this.out.commands.push(cmd);
     let end = -1;

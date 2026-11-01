@@ -30,12 +30,15 @@
  * makes the call an `opencode_unresolved_path` card, asked in every mode.
  */
 
-import { lstatSync, readlinkSync, statSync, statfsSync } from "node:fs";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, resolve } from "node:path";
 import { EFFORT_LEVELS, type EffortLevel } from "../../../protocol/types.js";
 import type { OcError, OcModelInfo, OcModelRef, OcPermissionRequest } from "./client.js";
+import { components, PerProcessPath, physicalPath, UnresolvedPath, within } from "../../physical-path.js";
 import { MCP_MOUNT_PREFIX } from "./policy.js";
+
+export { PerProcessPath, UnresolvedPath };
 
 /** The tool call a permission request is about, as the session log announced it. */
 export interface OcToolCall {
@@ -144,104 +147,11 @@ function repaired(raw: unknown): { input: Record<string, unknown>; bad?: string 
   return { input: out };
 }
 
-/** procfs's `f_type` (`PROC_SUPER_MAGIC`). */
-const PROC_SUPER_MAGIC = 0x9fa0;
-
-/** Paths that are per-process wherever procfs is or isn't (macOS's `/dev/fd` is fdesc). */
-const PER_PROCESS = ["/proc/self", "/proc/thread-self", "/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr"];
-
-/** The kernel's limit on symlinks followed in one lookup (`ELOOP` past it). */
-const MAX_LINKS = 40;
-
-/** Thrown by `realTarget` for a path whose target depends on the process that follows it. */
-export class PerProcessPath extends Error {
-  constructor(readonly path: string) {
-    super(`${path} leads through a link that goes somewhere else in opencode's process`);
-  }
-}
-
-/**
- * Thrown by `realTarget` for a path codeoid can't resolve for certain. Its
- * call is asked as `opencode_unresolved_path`, in every mode; `candidates`
- * are where it might lead, judged by the secret-path gate.
- */
-export class UnresolvedPath extends Error {
-  constructor(
-    readonly path: string,
-    readonly why: string,
-    readonly candidates: readonly string[] = [],
-  ) {
-    super(`codeoid can't tell for certain where ${path} leads: ${why}`);
-  }
-}
-
 /** The card a request with a per-process path gets, by action. */
 const PER_PROCESS_CARD: Record<string, string> = { shell: "Bash", edit: "Edit", read: "Read", glob: "Glob", grep: "Grep" };
 
 /** A call whose path codeoid couldn't resolve for certain: never auto-approved (tool-safety.ts). */
 export const UNRESOLVED_PATH_CARD = "opencode_unresolved_path";
-
-function onProcfs(dir: string): boolean {
-  try {
-    return statfsSync(dir).type === PROC_SUPER_MAGIC;
-  } catch {
-    return false;
-  }
-}
-
-const components = (p: string) => p.split("/").filter((c) => c !== "" && c !== ".");
-
-/**
- * `p` (absolute) resolved the way the kernel resolves it, one component at
- * a time from `/`: `..` is the parent of the physical prefix so far, and a
- * symlink's target is spliced in as written (a relative one from the link's
- * directory), never normalized first. A component that doesn't exist ends
- * what's followed: the rest is appended as written (what a create makes).
- * Throws `PerProcessPath` at any per-process link — one of `PER_PROCESS`,
- * or any symlink on procfs — and `UnresolvedPath` at any step it can't be
- * sure of: `..` after a missing component, a component under a file, one
- * codeoid can't look at, or too many links.
- */
-function physical(p: string): string {
-  const parts = components(p);
-  let at = "/";
-  let missing = false;
-  for (let links = 0; parts.length > 0; ) {
-    const name = parts.shift()!;
-    if (name === "..") {
-      if (missing) throw new UnresolvedPath(p, `".." follows ${at}, which doesn't exist`);
-      at = dirname(at);
-      continue;
-    }
-    const next = join(at, name);
-    if (PER_PROCESS.some((pp) => within(pp, next))) throw new PerProcessPath(p);
-    if (missing) {
-      at = next;
-      continue;
-    }
-    let link: string | undefined;
-    try {
-      const st = lstatSync(next);
-      if (st.isSymbolicLink()) link = readlinkSync(next);
-      else if (parts.length > 0 && !st.isDirectory()) throw new UnresolvedPath(p, `${next} isn't a directory`);
-    } catch (err) {
-      if (err instanceof UnresolvedPath) throw err;
-      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw new UnresolvedPath(p, `codeoid can't look at ${next}`);
-      missing = true;
-      at = next;
-      continue;
-    }
-    if (link === undefined) {
-      at = next;
-      continue;
-    }
-    if (onProcfs(at)) throw new PerProcessPath(p);
-    if (++links > MAX_LINKS) throw new UnresolvedPath(p, "it goes through too many links");
-    parts.unshift(...components(link));
-    if (isAbsolute(link)) at = "/";
-  }
-  return at;
-}
 
 /**
  * Where a path from an opencode call really leads in opencode's process.
@@ -249,15 +159,15 @@ function physical(p: string): string {
  * `..`) and the kernel then follows that physically; the path as written
  * is followed too, and where the two readings differ the call can't be
  * shown for certain. `p` is absolute, as written (not normalized). Throws
- * `PerProcessPath` or `UnresolvedPath` (see `physical`).
+ * `PerProcessPath` or `UnresolvedPath` (see `physicalPath`).
  */
 export function realTarget(p: string): string {
   const lexical = resolve(p);
-  const target = physical(lexical);
+  const target = physicalPath(lexical);
   if (!components(p).includes("..")) return target;
   let written: string;
   try {
-    written = physical(p);
+    written = physicalPath(p);
   } catch (err) {
     if (err instanceof UnresolvedPath) throw new UnresolvedPath(p, err.why, [target]);
     throw err;
@@ -266,11 +176,6 @@ export function realTarget(p: string): string {
   return target;
 }
 
-/** `p` is `root` or under it. */
-function within(root: string, p: string): boolean {
-  const rel = relative(root, p);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
 
 /**
  * A read or search of `requested` that really reaches `target` outside the

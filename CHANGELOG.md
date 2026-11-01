@@ -9,7 +9,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **Autonomous mode asks before writing outside the working directory** (#447).
-  A write, edit, delete or move whose target resolves outside the session's working directory (symlinks and `..` followed; the temp dir counts as inside) asks in autonomous mode, on every backend's file tools and on shell commands whose write targets the risk parser can name, with the card saying where it lands; a path that can't be resolved for certain counts as outside.
+  A write, edit, delete or move whose target resolves outside the session's working directory (resolved as the kernel does, through dangling links too, `..` after a link taken physically; the temp dir counts as inside, less codeoid's own files there) asks in autonomous mode, on every backend's file tools and on shell commands whose write targets the risk parser can name (`ln` counts what it links to), with the card saying where it lands; a path that can't be resolved for certain counts as outside (a file with several hard links, a relative target after a `cd` that may not have moved the shell, a target in a line that makes a link). The Gemini CLI's edits are judged by the files its approval request names.
   Reads and searches outside it, and guarded and interactive mode, are unchanged; an unattended run parks on such a write for your approval, as on a high-risk command.
   See [docs/approvals.md](docs/approvals.md#writes-outside-the-working-directory).
 

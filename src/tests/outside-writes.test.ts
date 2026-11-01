@@ -15,7 +15,7 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
@@ -151,10 +151,123 @@ describe("whether a write leads outside the working directory", () => {
     expect(bash("make 2>&1 >/dev/null")).toBeNull();
     // Reads outside: not writes.
     expect(bash(`cat ${elsewhere}/a > src/copy`)).toBeNull();
-    // Targets the parser can't place: today's behaviour (not asked for this).
+    // A word the parser can't know: today's behaviour (not asked for this).
     expect(bash('echo hi > "$OUT"')).toBeNull();
-    expect(bash("cd $DIR && touch x")).toBeNull();
     expect(shellWriteTargets('echo hi > "$OUT"', { workdir })).toEqual([]);
+    // A relative path after a `cd` it can't follow can't be placed: it asks.
+    expect(bash("cd $DIR && touch x")).toEqual({ path: "x", resolved: false });
+  });
+});
+
+describe("round 24: a target is judged where the kernel writes it", () => {
+  const bash = (command: string) => outsideWriteOf("Bash", { command }, workdir);
+
+  test("a dangling symlink leads to its target, in the workdir and in the temp dir", () => {
+    symlinkSync(join(elsewhere, "made-later"), join(workdir, "dangling"));
+    expect(outsideWriteOf("Write", { file_path: join(workdir, "dangling") }, workdir)).toEqual({ path: join(elsewhere, "made-later"), resolved: true });
+    expect(bash("echo x > dangling")?.path).toBe(join(elsewhere, "made-later"));
+    const planted = join(tmpdir(), `ow-dangle-${randomUUID()}`);
+    symlinkSync(join(elsewhere, "from-tmp"), planted);
+    try {
+      expect(outsideWriteOf("Write", { file_path: planted }, workdir)?.path).toBe(join(elsewhere, "from-tmp"));
+      expect(bash(`echo x > ${planted}`)?.path).toBe(join(elsewhere, "from-tmp"));
+    } finally {
+      rmSync(planted, { force: true });
+    }
+    expect(existsSync(join(elsewhere, "made-later"))).toBe(false);
+  });
+
+  test("a link loop can't be resolved: it asks", () => {
+    symlinkSync(join(workdir, "loop-b"), join(workdir, "loop-a"));
+    symlinkSync(join(workdir, "loop-a"), join(workdir, "loop-b"));
+    expect(outsideWriteOf("Write", { file_path: join(workdir, "loop-a") }, workdir)).toEqual({ path: join(workdir, "loop-a"), resolved: false });
+  });
+
+  test("an existing file with another hard link can't be placed: it asks", () => {
+    writeFileSync(join(elsewhere, "victim"), "orig");
+    linkSync(join(elsewhere, "victim"), join(workdir, "hard"));
+    expect(outsideWriteOf("Write", { file_path: join(workdir, "hard") }, workdir)).toEqual({ path: join(workdir, "hard"), resolved: false });
+    expect(bash("echo x >> hard")).toMatchObject({ resolved: false });
+    // A plain file inside is still inside.
+    writeFileSync(join(workdir, "plain"), "x");
+    expect(outsideWriteOf("Write", { file_path: join(workdir, "plain") }, workdir)).toBeNull();
+  });
+
+  test("`ln` writes what it links to: a hard link's source, a symlink's target (from the link's directory)", () => {
+    writeFileSync(join(elsewhere, "victim"), "orig");
+    expect(bash(`ln ${elsewhere}/victim ./hard`)?.path).toBe(join(elsewhere, "victim"));
+    expect(bash(`ln -s ${elsewhere}/missing ./k`)?.path).toBe(join(elsewhere, "missing"));
+    expect(bash("ln -sf ../../elsewhere/x src/k")?.path).toBe(join(elsewhere, "x"));
+    expect(bash("ln -s ../elsewhere/y -t src")).toBeNull();
+    expect(bash("ln -s a.ts src/b.ts")).toBeNull();
+    expect(bash("ln -sr src/a.ts src/c.ts")).toBeNull();
+  });
+
+  test("a link the line makes, then a write: the write can't be placed", () => {
+    expect(bash(`ln -s ${elsewhere} newl && echo x > newl/pwn`)).not.toBeNull();
+    // The link's own target looks inside; what's written through it can't be placed.
+    expect(bash("ln -s src newl && echo x > newl/pwn")).toEqual({ path: join(workdir, "newl", "pwn"), resolved: false });
+    expect(bash("ln -s src newl; ln -s x newl/y")).toMatchObject({ resolved: false });
+    expect(bash("cp -s src/a src/b; echo x > src/c")).toMatchObject({ resolved: false });
+  });
+
+  test("`..` after a link in a shell target is the link's parent, not the text's", () => {
+    mkdirSync(join(elsewhere, "inner"));
+    symlinkSync(join(elsewhere, "inner"), join(workdir, "deep-link"));
+    expect(bash("echo x > deep-link/../escaped.txt")?.path).toBe(join(elsewhere, "escaped.txt"));
+    expect(bash("rm deep-link/../f")?.path).toBe(join(elsewhere, "f"));
+    expect(bash("cd deep-link && rm ../victim")?.path).toBe(join(elsewhere, "victim"));
+    // A `..` with no link before it stays inside.
+    expect(bash("echo x > src/../ok.txt")).toBeNull();
+  });
+
+  test("`/proc` and `~name` shell targets ask, as file tools' do", () => {
+    expect(bash("echo x > /proc/self/cwd/../pwn")).toEqual({ path: "/proc/self/cwd/../pwn", resolved: false });
+    expect(bash("echo x >> ~someone/.bashrc")).toEqual({ path: "~someone/.bashrc", resolved: false });
+  });
+
+  test("a `cd` that may not move the shell leaves the cwd unknown: a relative target after it asks", () => {
+    mkdirSync(join(workdir, "sub", "deeper"), { recursive: true });
+    for (const line of [
+      "cd nosuchdir/deeper; echo x > ../../b.txt",
+      "cd nosuchdir 2>/dev/null || :; touch ../c.txt",
+      "true && (cd sub/deeper && :) ; touch ../../f.txt",
+      "(cd sub/deeper); echo x > ../../elsewhere/d.txt",
+      "cd sub/deeper | true; touch ../../g.txt",
+      "cd sub/deeper & touch ../../h.txt",
+      "false && cd sub/deeper; touch ../../i.txt",
+      "if true; then cd sub/deeper; fi; touch ../../j.txt",
+    ]) {
+      expect([line, bash(line)?.resolved]).toEqual([line, false]);
+    }
+    // One that surely moves it is followed.
+    expect(bash("cd sub/deeper && touch ../x.txt")).toBeNull();
+    expect(bash("cd sub/deeper; touch ../../../elsewhere/x")?.path).toBe(join(elsewhere, "x"));
+  });
+
+  test("pi: every path key is judged", () => {
+    expect(outsideWriteOf("edit", { path: "../elsewhere/x", file_path: join(workdir, "a"), edits: [] }, workdir)?.path).toBe(join(elsewhere, "x"));
+    expect(outsideWriteOf("write", { path: "a", file_path: join(elsewhere, "x") }, workdir)?.path).toBe(join(elsewhere, "x"));
+    expect(outsideWriteOf("write_file", { file_path: join(workdir, "a"), path: join(elsewhere, "x") }, workdir)?.path).toBe(join(elsewhere, "x"));
+    expect(outsideWriteOf("NotebookEdit", { notebook_path: join(workdir, "a"), file_path: join(elsewhere, "x") }, workdir)?.path).toBe(join(elsewhere, "x"));
+  });
+
+  test("a name starting with `..` is inside", () => {
+    expect(outsideWriteOf("Write", { file_path: join(workdir, "..foo") }, workdir)).toBeNull();
+    expect(bash("touch ./..foo && echo hi > ..bar")).toBeNull();
+  });
+
+  test("the temp dir's exemption doesn't cover codeoid's own entries there", () => {
+    expect(outsideWriteOf("Write", { file_path: join(tmpdir(), "codeoid-login-abc", ".claude", ".credentials.json") }, workdir)).toMatchObject({ resolved: true });
+    expect(bash(`echo x > ${tmpdir()}/codeoid-pi-bridge-x/codeoid-bridge.js`)).toMatchObject({ resolved: true });
+    expect(outsideWriteOf("Write", { file_path: join(tmpdir(), "scratch-codeoid.txt") }, workdir)).toBeNull();
+  });
+
+  test("the Gemini CLI: an edit is judged by the locations its request names", () => {
+    expect(outsideWriteOf("acp_edit", { locations: [join(workdir, "src", "a.ts")] }, workdir)).toBeNull();
+    expect(outsideWriteOf("acp_edit", { locations: [{ path: join(workdir, "src", "a.ts"), line: 3 }] }, workdir)).toBeNull();
+    expect(outsideWriteOf("acp_edit", { locations: [join(workdir, "a"), join(elsewhere, "b")] }, workdir)?.path).toBe(join(elsewhere, "b"));
+    expect(outsideWriteOf("acp_edit", { title: "Edit", locations: [] }, workdir)).toMatchObject({ resolved: false });
   });
 });
 
@@ -248,7 +361,7 @@ describe("autonomous mode asks before a write outside the working directory, at 
     for (const [name, input] of [
       ["Write", { file_path: join(workdir, "src", "a.ts"), content: "x" }],
       ["write", { path: "src/b.ts", content: "x" }],
-      ["Write", { file_path: join(tmpdir(), `codeoid-ow-${randomUUID()}.txt`), content: "x" }],
+      ["Write", { file_path: join(tmpdir(), `ow-scratch-${randomUUID()}.txt`), content: "x" }],
       ["Read", { file_path: join(elsewhere, "a.ts") }],
       ["Grep", { pattern: "x", path: elsewhere }],
       ["Bash", { command: "echo hi > src/x" }],
