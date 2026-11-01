@@ -24,6 +24,58 @@ export interface ShellWord {
   input?: true;
   /** When the word is unknown only for a leading `$HOME` / `${HOME}`: its value with that written `~` (`"$HOME/.ssh"` is `~/.ssh`). */
   home?: string;
+  /**
+   * Every value the word could take, as a pattern (see {@link wordShape}):
+   * its fixed text, with SHAPE_ANY for a part only known at run time (which
+   * may hold `/`) and SHAPE_STAR / SHAPE_ONE for an unquoted `*` / `?` or
+   * `[…]` (within one path component). Absent: the value, or SHAPE_ANY.
+   */
+  shape?: string;
+}
+
+/** In a word's shape: any text at all, `/` included (`$X`, `$(…)`, `{a,b}`). */
+export const SHAPE_ANY = "\uE000";
+/** In a word's shape: an unquoted `*`, any text within one path component. */
+export const SHAPE_STAR = "\uE001";
+/** In a word's shape: an unquoted `?` or `[…]`, one character within a path component. */
+export const SHAPE_ONE = "\uE002";
+const SHAPE_MARKS = /[\uE000-\uE002]/;
+
+/** A word's shape: the patterns of every value it could take ({@link ShellWord.shape}). */
+export function wordShape(w: ShellWord): string {
+  if (w.shape !== undefined) return w.shape;
+  return w.value === null ? SHAPE_ANY : fixedShape(w.value);
+}
+
+/** Fixed text as a shape: a character that is a mark itself is read as any text (it can't be told apart). */
+function fixedShape(text: string): string {
+  return SHAPE_MARKS.test(text) ? text.replace(new RegExp(SHAPE_MARKS.source, "g"), SHAPE_ANY) : text;
+}
+
+/** An unquoted word's shape: `\x` is x, `*` / `?` / `[…]` match within a component, `{a,b}` could be anything. */
+function unquotedShape(raw: string): string {
+  let out = "";
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i]!;
+    if (c === "\\") {
+      if (raw[i + 1] !== "\n") out += fixedShape(raw[i + 1] ?? "");
+      i++;
+    } else if (c === "*") out += SHAPE_STAR;
+    else if (c === "?") out += SHAPE_ONE;
+    else if (c === "[" && raw.indexOf("]", i + 2) > 0) {
+      out += SHAPE_ONE;
+      i = raw.indexOf("]", i + 2);
+    } else if (c === "{" && /^\{[^}]*,/.test(raw.slice(i)) && raw.indexOf("}", i) > 0) {
+      out += SHAPE_ANY;
+      i = raw.indexOf("}", i);
+    } else out += fixedShape(c);
+  }
+  return out;
+}
+
+/** A word whose every occurrence of `mark` is replaced by a run-time argument (`xargs -I {}`, find's `{}`, fd's `{/.}`). */
+function withArgument(w: ShellWord, mark: string | RegExp): ShellWord {
+  return { ...DYNAMIC_ARG, raw: w.raw, shape: w.value === null ? SHAPE_ANY : fixedShape(w.value).split(mark).join(SHAPE_ANY) };
 }
 
 export interface ShellRedirect {
@@ -250,9 +302,28 @@ class Walker {
         const exported = n.child(0)?.text === "export" || n.namedChildren.some((c) => c?.type === "word" && /^-[a-zA-Z]*x/.test(c.text));
         for (const c of n.namedChildren) {
           if (c?.type === "variable_assignment") this.#assignment(c, ctx, null, exported);
-          // `declare 'a[$(cmd)]=1'`: a quoted name's subscript runs as arithmetic.
-          else if (c) this.#subscriptName(this.word(c, ctx, null), n.child(0)?.text ?? "declare");
+          else if (c && c.type !== "variable_name") {
+            const w = this.word(c, ctx, null);
+            // `declare 'a[$(cmd)]=1'`: a quoted name's subscript runs as arithmetic.
+            this.#subscriptName(w, n.child(0)?.text ?? "declare");
+            // `export "X=1"`, `declare -x "$n=1"`: a quoted assignment sets X as the plain one does.
+            if (w.value?.startsWith("-") || w.value?.startsWith("+")) continue;
+            const set = w.value === null ? null : /^([A-Za-z_]\w*)(?:\[[\s\S]*?\])?(?:\+?=([\s\S]*))?$/.exec(w.value);
+            if (w.value === null) this.#unknownName(w, n.child(0)?.text ?? "declare", exported);
+            else if (set?.[2] !== undefined) this.out.assignments.push({ name: set[1]!, value: lit(set[2]), exported });
+          }
         }
+        return;
+      }
+      case "for_statement": {
+        // `for X in …`, `select X in …`: X is set to each value in turn.
+        const name = n.childForFieldName("variable");
+        const values = n.childrenForFieldName("value").filter((c): c is Node => c !== null);
+        for (const c of values) {
+          const value = this.word(c, ctx, null);
+          if (name) this.out.assignments.push({ name: name.text, value, exported: false });
+        }
+        for (const c of n.namedChildren) if (c && c !== name && !values.some((x) => x.id === c.id)) this.node(c, ctx);
         return;
       }
       case "unset_command":
@@ -307,8 +378,19 @@ class Walker {
       delegates: false,
     };
     this.out.commands.push(cmd);
+    let end = -1;
     for (const c of n.namedChildren) {
       if (!c) continue;
+      // The grammar can split one word in two (`/proc/$A/task/$B/environ`):
+      // nothing between them, so bash reads them as one.
+      const joined = c.startIndex === end && words.length > 0 && c.type !== "comment" && !c.type.endsWith("redirect");
+      end = c.endIndex;
+      if (joined) {
+        const a = words.pop()!;
+        const b = this.word(c, ctx, index);
+        words.push({ value: a.value === null || b.value === null ? null : a.value + b.value, raw: a.raw + b.raw, glob: a.glob || b.glob, shape: wordShape(a) + wordShape(b) });
+        continue;
+      }
       if (c.type === "variable_assignment") {
         this.#assignment(c, ctx, index, true);
       } else if (c.type === "command_name") {
@@ -339,7 +421,8 @@ class Walker {
     const set = (name: ShellWord | undefined, value: ShellWord = DYNAMIC_VALUE) => {
       if (!name) return;
       this.#subscriptName(name, prog);
-      if (name.value !== null && /^[A-Za-z_]\w*(\[|$)/.test(name.value)) this.out.assignments.push({ name: name.value.replace(/\[[\s\S]*$/, ""), value, exported: false });
+      if (name.value === null) this.#unknownName(name, prog, false);
+      else if (/^[A-Za-z_]\w*(\[|$)/.test(name.value)) this.out.assignments.push({ name: name.value.replace(/\[[\s\S]*$/, ""), value, exported: false });
     };
     if (prog === "printf") {
       const v = args.findIndex((w) => w.value?.startsWith("-v"));
@@ -349,6 +432,9 @@ class Walker {
       // What it sets is the format applied to the rest: their text is what could hold code.
       const rest = args.slice(v + (attached ? 1 : 2));
       set(name, { value: null, raw: rest.map((w) => w.raw).join(" "), glob: false });
+    } else if (prog === "getopts") {
+      // `getopts OPTSTRING NAME [ARG…]`: NAME is set to each option found.
+      set(args[1]);
     } else if (prog === "test" || prog === "[") {
       args.forEach((w, i) => (w.value === "-v" || w.value === "-R") && args[i + 1] && this.#subscriptName(args[i + 1]!, prog));
     } else if (prog === "read" || prog === "mapfile" || prog === "readarray" || prog === "wait") {
@@ -366,6 +452,17 @@ class Walker {
         if (prog !== "wait") set(args[i]);
       }
     }
+  }
+
+  /**
+   * A variable whose name is only known at run time is set (`declare -x
+   * "$n=…"`, `printf -v "$n"`, `read "$n"`): it could be any one, `LD_PRELOAD`
+   * or `PS_FORMAT` included. Not understood, and recorded under the name ""
+   * for what reads the line's variables.
+   */
+  #unknownName(w: ShellWord, what: string, exported: boolean): void {
+    this.out.problems.push(`${what} sets a variable whose name is only known at run time (${w.raw})`);
+    this.out.assignments.push({ name: "", value: DYNAMIC_VALUE, exported });
   }
 
   /** A variable name given as an argument: a subscript in it is arithmetic, and code when it holds `$(…)` or `…` as text. */
@@ -423,33 +520,37 @@ class Walker {
       case "word":
       case "number": {
         const value = unescapeUnquoted(raw);
-        return { value, raw, glob: /(^|[^\\])[*?[]/.test(raw) || /(^|[^\\])\{[^}]*,/.test(raw) };
+        return { value, raw, glob: /(^|[^\\])[*?[]/.test(raw) || /(^|[^\\])\{[^}]*,/.test(raw), shape: unquotedShape(raw) };
       }
       case "raw_string":
-        return { value: raw.slice(1, -1), raw, glob: false };
+        return { value: raw.slice(1, -1), raw, glob: false, shape: fixedShape(raw.slice(1, -1)) };
       case "ansi_c_string": {
         const value = decodeAnsiC(raw.slice(2, -1));
-        return { value, raw, glob: false };
+        return { value, raw, glob: false, shape: value === null ? SHAPE_ANY : fixedShape(value) };
       }
       case "string":
       case "translated_string": {
         let value: string | null = "";
         let home: string | undefined = "";
+        let shape = "";
         for (const c of n.namedChildren) {
           if (!c) continue;
           if (c.type === "string_content") {
             value = value === null ? null : value + unescapeDouble(c.text);
             home = home === undefined ? undefined : home + unescapeDouble(c.text);
+            shape += fixedShape(unescapeDouble(c.text));
           } else {
             // `$X`, `$(…)` inside the quotes: known at run time, and a substitution runs.
             const w = this.word(c, ctx, owner);
             home = home === "" && w.home !== undefined ? w.home : undefined;
             value = null;
+            shape += SHAPE_ANY;
           }
         }
         // The grammar leaves a string of nothing but quotes without content nodes.
         if (value === "" && n.namedChildCount === 0) value = unescapeDouble(raw.replace(/^\$?"|"$/g, ""));
-        return { value, raw, glob: false, ...(value === null && home ? { home } : {}) };
+        if (value !== null) shape = fixedShape(value);
+        return { value, raw, glob: false, shape, ...(value === null && home ? { home } : {}) };
       }
       case "concatenation": {
         let value: string | null = "";
@@ -457,16 +558,37 @@ class Walker {
         // The grammar splits `b{1,2}` into pieces none of which looks like a brace expansion.
         let glob = /(^|[^\\])\{[^}]*,/.test(raw);
         let first = true;
-        for (const c of n.namedChildren) {
+        let shape = "";
+        // Where an unquoted `[` the grammar split off starts (`e?v[ab]` is `e?v`, `[`, `ab`, `]`): with its `]`, one character.
+        let bracket = -1;
+        for (const c of n.children) {
           if (!c) continue;
+          // A `$` the grammar leaves bare (`/x/$` before a word it split off): an expansion bash reads with what follows.
+          if (!c.isNamed) {
+            if (c.text === "$") {
+              value = null;
+              home = undefined;
+              shape += SHAPE_ANY;
+            }
+            continue;
+          }
           const w = this.word(c, ctx, owner);
           glob ||= w.glob;
           if (first) home = w.home;
           else home = home === undefined || w.value === null ? undefined : home + w.value;
           first = false;
           value = value === null || w.value === null ? null : value + w.value;
+          if (c.type === "word" && c.text === "[") bracket = shape.length;
+          if (c.type === "word" && c.text.startsWith("]") && bracket >= 0) {
+            shape = shape.slice(0, bracket) + SHAPE_ONE + unquotedShape(c.text.slice(1));
+            bracket = -1;
+          } else shape += wordShape(w);
         }
-        return { value, raw, glob, ...(value === null && home !== undefined ? { home } : {}) };
+        // A brace expansion the grammar split into pieces (`b{1,2}`): what's between the braces could be anything.
+        if (/(^|[^\\])\{[^}]*,/.test(raw) && shape.includes("{") && shape.lastIndexOf("}") > shape.indexOf("{")) {
+          shape = shape.slice(0, shape.indexOf("{")) + SHAPE_ANY + shape.slice(shape.lastIndexOf("}") + 1);
+        }
+        return { value, raw, glob, shape, ...(value === null && home !== undefined ? { home } : {}) };
       }
       case "command_substitution":
       case "process_substitution": {
@@ -801,7 +923,7 @@ const WRAPPERS: Record<string, (args: ShellWord[]) => Unwrapped | null | undefin
     // `-I R` / `-i` / `--replace`: R in an argument is replaced by an input line.
     const replace = xargsReplace(a.slice(0, a.length - rest.length));
     if (replace === null) return run([...rest, DYNAMIC_ARG]);
-    return run(rest.map((w) => (w.value?.includes(replace) ? { ...DYNAMIC_ARG, raw: w.raw } : w)));
+    return run(rest.map((w) => (w.value?.includes(replace) ? withArgument(w, replace) : w)));
   },
   eval: (a) => ({ kind: "eval", argv: a }),
   // `alias ll='…'`: the line runs wherever the name is used (aliases expand where expand_aliases is on).
@@ -818,7 +940,7 @@ const WRAPPERS: Record<string, (args: ShellWord[]) => Unwrapped | null | undefin
       if (v === null || v === "--") return v === null ? null : undefined;
       if (!(v === "--exec" || v === "--exec-batch" || /^-[a-zA-Z]*[xX]$/.test(v))) continue;
       const argv: ShellWord[] = [];
-      for (i++; i < a.length && a[i]!.value !== ";"; i++) argv.push(a[i]!.value?.includes("{") ? { ...DYNAMIC_ARG, raw: a[i]!.raw } : a[i]!);
+      for (i++; i < a.length && a[i]!.value !== ";"; i++) argv.push(a[i]!.value?.includes("{") ? withArgument(a[i]!, /\{[/.]*\}/) : a[i]!);
       if (!argv.slice(1).some((w) => w.input)) argv.push(DYNAMIC_ARG);
       return { kind: "exec", runs: [argv], rooted: false };
     }
@@ -832,7 +954,7 @@ const WRAPPERS: Record<string, (args: ShellWord[]) => Unwrapped | null | undefin
         const argv: ShellWord[] = [];
         // GNU find replaces `{}` anywhere in an argument: `{}/`, `sh -c 'rm {}'`.
         for (i++; i < a.length && a[i]!.value !== ";" && a[i]!.value !== "+"; i++) {
-          argv.push(a[i]!.value?.includes("{}") ? { ...DYNAMIC_ARG, raw: a[i]!.raw } : a[i]!);
+          argv.push(a[i]!.value?.includes("{}") ? withArgument(a[i]!, "{}") : a[i]!);
         }
         runs.push(argv);
       }
