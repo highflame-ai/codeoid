@@ -116,6 +116,9 @@
  *   I67 (round 25) a provider whose base URL only opencode's `{file:}` substitution shows: the user's is dropped while
  *       hosted models are off; one that still reaches the server (codeoid's own here, standing in for `/etc/opencode`)
  *       is listed by real 2.2.5 with its substituted opencode.ai URL, and the server is refused at start
+ *   I68 (round 26) a host spliced into a Bedrock `region` (`x@opencode.ai/zen/v1?`): the user's provider is dropped while
+ *       hosted models are off, one whose region only `{file:}` shows is refused at start from real 2.2.5's substituted
+ *       listing, and a Bedrock provider whose keys come from `{file:}` is carried; nothing connects to opencode.ai
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
@@ -2898,6 +2901,67 @@ describe("opencode (real binary)", () => {
       expect((await conn.client.providers(work)).map((p) => p.id)).not.toContain("zenf");
       expect(await conn.client.defaultModel(work)).toBeUndefined();
       await expect(refused.ensure()).rejects.toThrow("`zen9`");
+      await Bun.sleep(1_500);
+      expect(targets.filter((t) => t.includes("opencode.ai"))).toEqual([]);
+    } finally {
+      await dropped.stop();
+      await refused.stop();
+      proxy.stop(true);
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  maybe("I68 a host spliced into a Bedrock region is dropped from the user's config and refused at start where it still reaches the server; a Bedrock key kept in a file is carried", async () => {
+    const targets: string[] = [];
+    const proxy = Bun.listen({
+      hostname: "127.0.0.1",
+      port: 0,
+      socket: {
+        data(sock, data) {
+          targets.push(new TextDecoder().decode(data).split("\r\n")[0] ?? "");
+          sock.write("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+          sock.end();
+        },
+      },
+    });
+    const url = `http://127.0.0.1:${proxy.port}`;
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-opencode-hosted4-")));
+    const work = join(root, "work");
+    const user = join(root, "user-config");
+    mkdirSync(work);
+    mkdirSync(user);
+    writeFileSync(join(user, "ak"), "AKIDEXAMPLE");
+    writeFileSync(join(user, "region"), "x@opencode.ai/zen/v1?");
+    const bedrock = (settings: Record<string, unknown>) => ({ package: "@ai-sdk/amazon-bedrock", settings, models: { "anthropic.claude-x": {} } });
+    writeFileSync(
+      join(user, "opencode.json"),
+      JSON.stringify({ model: "bedai/anthropic.claude-x", providers: { bedai: bedrock({ region: "x@opencode.ai/zen/v1?" }), bedk: bedrock({ region: "us-east-1", accessKeyId: "{file:./ak}", secretAccessKey: "{file:./ak}" }) } }),
+    );
+    const make = (own: boolean) =>
+      new OpencodeServer({
+        command: resolved!.command,
+        argsPrefix: resolved!.argsPrefix,
+        dbPath: join(root, own ? "db2" : "db", "opencode.db"),
+        dataDir: join(root, own ? "files2" : "files"),
+        env: () => {
+          const env = buildOpencodeEnv();
+          for (const k of Object.keys(env)) if (/_API_KEY$/.test(k)) delete env[k];
+          return { ...env, HOME: join(root, "home"), HTTPS_PROXY: url, HTTP_PROXY: url, https_proxy: url, http_proxy: url, NO_PROXY: "127.0.0.1,localhost", no_proxy: "127.0.0.1,localhost" };
+        },
+        userConfigDir: user,
+        hostedModels: false,
+        // codeoid's own providers are filtered as the user's are; one whose region only opencode's substitution shows stands in for `/etc/opencode`.
+        ...(own ? { modelProviders: { bed9: bedrock({ region: `{file:${join(user, "region")}}` }) } } : {}),
+      });
+    const dropped = make(false);
+    const refused = make(true);
+    try {
+      const conn = await dropped.ensure();
+      const ids = (await conn.client.providers(work)).map((p) => p.id);
+      expect(ids).not.toContain("bedai");
+      expect(ids).toContain("bedk");
+      expect(await conn.client.defaultModel(work)).not.toStartWith("bedai/");
+      await expect(refused.ensure()).rejects.toThrow("`bed9`");
       await Bun.sleep(1_500);
       expect(targets.filter((t) => t.includes("opencode.ai"))).toEqual([]);
     } finally {

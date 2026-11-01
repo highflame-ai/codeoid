@@ -1976,6 +1976,82 @@ describe("round 25: a URL opencode.ai can't be checked for, or that only opencod
   });
 });
 
+describe("round 26: a host opencode builds from a plain setting is checked too", () => {
+  const userDir = (doc: Record<string, unknown>, files: Record<string, string> = {}) => {
+    const user = realpathSync(tmp());
+    for (const [name, text] of Object.entries(files)) writeFileSync(join(user, name), text);
+    writeFileSync(join(user, "opencode.json"), JSON.stringify(doc));
+    return user;
+  };
+  const bedrock = (settings: Record<string, unknown>) => ({ package: "@ai-sdk/amazon-bedrock", settings, models: { m: {} } });
+
+  it("while they're off, a provider whose host-building setting isn't a plain name, or any setting naming opencode.ai, isn't carried", () => {
+    const user = userDir({
+      model: "bedai/m",
+      providers: {
+        bedai: bedrock({ region: "x@opencode.ai/zen/v1?" }),
+        azai: { package: "@ai-sdk/azure", settings: { resourceName: "x.opencode.ai/v1?" }, models: { m: {} } },
+        vtx: { package: "@ai-sdk/google-vertex", settings: { location: "x@evil.example/", project: "p" }, models: { m: {} } },
+        enc: { package: "@ai-sdk/openai-compatible", settings: { baseURL: "http://gw.example/v1", note: "opencode%2Eai" }, models: { m: {} } },
+        wide: { package: "@ai-sdk/openai-compatible", settings: { baseURL: "http://gw.example/v1", label: "ＯＰＥＮＣＯＤＥ．ＡＩ" }, models: { m: {} } },
+        gauth: { package: "@ai-sdk/google-vertex", settings: { location: "us-central1", project: "p", googleAuthOptions: { credentials: { universe_domain: "opencode.ai" } } }, models: { m: {} } },
+        bed: bedrock({ region: "us-east-1" }),
+        snow: { package: "@ai-sdk/openai-compatible", settings: { baseURL: "http://gw.example/v1", account: "xy12345.us-east-2.aws" }, models: { m: {} } },
+        near: { package: "@ai-sdk/openai-compatible", settings: { baseURL: "https://notopencode.ai/v1" }, models: { m: {} } },
+      },
+    });
+    const skipped: string[] = [];
+    const carried = userModelConfig(user, skipped, (l) => l);
+    expect(Object.keys(carried.providers as object).sort()).toEqual(["bed", "near", "snow"]);
+    expect(carried.model).toBeUndefined();
+    expect(skipped.find((w) => w.startsWith("providers.bedai:"))).toContain("region");
+    expect(skipped.find((w) => w.startsWith("providers.vtx:"))).toContain("isn't a plain name");
+    // Opted in: carried as written.
+    expect(Object.keys(userModelConfig(user, [], (l) => l, { hostedModels: true }).providers as object)).toHaveLength(9);
+  });
+
+  it("a credential kept in a file is carried; only a setting that builds a URL or host can't come from one, and the advice says which", () => {
+    const user = userDir(
+      {
+        providers: {
+          bed: bedrock({ region: "us-east-1", accessKeyId: "{file:./ak}", secretAccessKey: "{file:./sk}", sessionToken: "{file:./st}" }),
+          vtx: { package: "@ai-sdk/google-vertex", settings: { location: "us-central1", project: "p", googleAuthOptions: { credentials: { private_key: "{file:./pk}", client_email: "a@b.iam" } } }, models: { m: {} } },
+          oai: { package: "@ai-sdk/openai", settings: { organization: "{file:./org}", apiKey: "{file:./ak}" }, models: { m: {} } },
+          filed: bedrock({ region: "{file:./region}" }),
+          hosty: { package: "@ai-sdk/openai-compatible", settings: { baseURL: "http://gw.example/v1", headers: { Host: "{file:./host}" } }, models: { m: {} } },
+        },
+      },
+      { ak: "a", sk: "s", st: "t", pk: "k", org: "o", region: "us-east-1", host: "h" },
+    );
+    const skipped: string[] = [];
+    const carried = userModelConfig(user, skipped, (l) => l);
+    expect(Object.keys(carried.providers as object).sort()).toEqual(["bed", "oai", "vtx"]);
+    expect(skipped.find((w) => w.startsWith("providers.filed:"))).toContain("write the region itself");
+    expect(skipped.find((w) => w.startsWith("providers.hosty:"))).toContain("write the Host itself");
+    expect(skipped.join("\n")).not.toContain("write the URL itself");
+  });
+
+  it("a server listing a provider by a spliced host — in a config document or a model's resolved settings — is refused; a plain one isn't", () => {
+    const etc = [{ info: { providers: { bedai: { package: "@ai-sdk/amazon-bedrock", options: { region: "x@opencode.ai/zen/v1?" } } } } }];
+    expect(hostedProviderProblem([{ id: "anthropic" }, { id: "bedai" }], false, { config: etc })).toContain("`bedai`");
+    const models = [{ providerID: "azai", settings: { resourceName: "x.opencode.ai/v1?" } }];
+    expect(hostedProviderProblem([{ id: "azai" }], false, { models })).toContain("`azai`");
+    // A credentials document substituted from a file, naming opencode.ai as its universe.
+    const filed = [{ providerID: "vtx", settings: { googleAuthOptions: { credentials: '{"universe_domain":"opencode.ai","private_key":"k"}' } } }];
+    expect(hostedProviderProblem([{ id: "vtx" }], false, { models: filed })).toContain("`vtx`");
+    const plain = [{ providerID: "bed", settings: { region: "us-east-1", accessKeyId: "a" } }];
+    expect(hostedProviderProblem([{ id: "bed" }], false, { models: plain, config: [{ info: {} }] })).toBeNull();
+    expect(hostedProviderProblem([{ id: "bedai" }], true, { config: etc, models })).toBeNull();
+  });
+
+  it("end to end: a system config document splicing opencode.ai into a Bedrock region refuses the server", async () => {
+    const system = JSON.stringify({ providers: { bedai: { package: "@ai-sdk/amazon-bedrock", options: { region: "x@opencode.ai/zen/v1?" }, models: { m: {} } } } });
+    const { server } = makeServer({ FAKE_OPENCODE_SYSTEM_CONFIG: system });
+    const events = await collect(makeProvider(server).runTurn(opts("hi")));
+    expect(events.find((e) => e.type === "error")).toMatchObject({ message: expect.stringContaining("`bedai`") });
+  });
+});
+
 /** A turn that ended without an error. */
 function events_ok(events: ProviderEvent[]): boolean {
   return events.every((e) => e.type !== "error") && events.some((e) => e.type === "turn_done");

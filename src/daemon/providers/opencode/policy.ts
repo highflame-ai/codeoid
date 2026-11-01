@@ -91,31 +91,145 @@ function onOpencodeAi(v: string): boolean {
   }
 }
 
+/** `opencode.ai` as a whole host name (or its subdomain's end) anywhere in a text. */
+const OPENCODE_AI = /(?<![a-z0-9-])opencode\.ai(?!\.?[a-z0-9-])/;
+/** Characters a host parser drops (UTS #46 maps them to nothing). */
+const IGNORED = /\p{Default_Ignorable_Code_Point}/gu;
+
+/**
+ * Whether a setting's text names opencode.ai, after what a URL's host
+ * parsing would undo: percent-encoding (repeatedly), compatibility forms
+ * (fullwidth letters and dots, `。`), case, ignored characters. Any
+ * setting, not only a URL: opencode's bundled SDKs build hosts from plain
+ * settings ({@link HOST_SETTINGS}), and `x@opencode.ai/v1?` spliced into
+ * one makes opencode.ai the host.
+ */
+export function mentionsOpencodeAi(v: string): boolean {
+  let text = v;
+  for (let i = 0; i < 4; i++) {
+    const next = text
+      .replace(/%([0-9a-f]{2})/gi, (_m, h: string) => String.fromCharCode(Number.parseInt(h, 16)))
+      .normalize("NFKC")
+      .replace(IGNORED, "")
+      .replace(/[\u3002\uff0e\uff61]/g, ".")
+      .toLowerCase();
+    if (next === text) break;
+    text = next;
+  }
+  // Percent-decoded bytes may be UTF-8 of a lookalike dot or letter.
+  try {
+    text += ` ${decodeURIComponent(v).normalize("NFKC").replace(IGNORED, "").replace(/[\u3002\uff0e\uff61]/g, ".").toLowerCase()}`;
+  } catch {
+    // not decodable as a whole: the byte-wise reading above stands
+  }
+  return OPENCODE_AI.test(text) || onOpencodeAi(v) || onOpencodeAi(`https://${v}`);
+}
+
+/** One DNS label: a host part opencode's SDKs splice in (`bedrock-runtime.${region}.amazonaws.com`). */
+const LABEL = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
+/** Dot-separated labels (a Google universe domain, `googleapis.com`). */
+const DOMAIN = /^[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)*$/;
+
+/**
+ * The settings opencode 2.2.5's bundled SDKs build a request's host (or
+ * path) from, rather than taking a URL, and the form each must have: a
+ * value with `@`, `/`, `?`, `#` or `:` in it moves the host (`x@opencode.ai/v1?`
+ * makes opencode.ai the host, the vendor's suffix a query). Read from the
+ * binary's templates: Bedrock and Bedrock Mantle `region`
+ * (`bedrock-runtime.${region}.amazonaws.com`), Alibaba `region` and
+ * `workspaceID` (`${workspaceID}.${region}.maas.aliyuncs.com`), Azure
+ * `resourceName` (`${resourceName}.openai.azure.com`), Vertex `location`
+ * (`${location}-aiplatform.googleapis.com`) and `project` (the path),
+ * Snowflake `account` (`${account}.snowflakecomputing.com`; its locator form
+ * has dots and underscores), Cloudflare `accountId` and `gateway`, Google
+ * auth's `universeDomain` (`iamcredentials.${universeDomain}`).
+ */
+const HOST_SETTINGS: Record<string, RegExp> = {
+  region: LABEL,
+  workspaceID: LABEL,
+  workspaceId: LABEL,
+  resourceName: LABEL,
+  location: LABEL,
+  project: /^[A-Za-z0-9][A-Za-z0-9.:-]*$/,
+  account: /^[A-Za-z0-9][A-Za-z0-9_.-]*$/,
+  accountId: LABEL,
+  gateway: /^[A-Za-z0-9][A-Za-z0-9_-]*$/,
+  universeDomain: DOMAIN,
+  universe_domain: DOMAIN,
+};
+
+/**
+ * Why a provider entry (or a listed model's settings) could reach a host
+ * codeoid can't check, or opencode.ai: a host-building setting that isn't
+ * in its plain form ({@link HOST_SETTINGS}), at any depth, or any setting
+ * whose text names opencode.ai ({@link mentionsOpencodeAi}); null when none.
+ */
+export function hostSettingProblem(entry: unknown, key?: string): string | null {
+  if (typeof entry === "string") {
+    if (mentionsOpencodeAi(entry)) return `${key ?? "a setting"} names opencode.ai`;
+    const form = key === undefined ? undefined : HOST_SETTINGS[key];
+    if (form && !form.test(entry) && !SUBSTITUTION.test(entry)) return `${key} (${JSON.stringify(entry)}) isn't a plain name, and opencode builds a host from it`;
+    return null;
+  }
+  if (Array.isArray(entry)) {
+    for (const v of entry) {
+      const why = hostSettingProblem(v, key);
+      if (why) return why;
+    }
+    return null;
+  }
+  if (!isRecord(entry)) return null;
+  for (const [k, v] of Object.entries(entry)) {
+    if (mentionsOpencodeAi(k)) return `a setting's name names opencode.ai`;
+    const why = hostSettingProblem(v, k);
+    if (why) return why;
+  }
+  return null;
+}
+
 /**
  * Whether a provider entry reaches opencode's hosted service under another
  * id: its `canonical` copies a hosted provider (2.2.5's `overlayProvider`
  * takes the source's URL and catalog), or one in `hosted` (another entry
- * already dropped), or a URL in it is on opencode.ai.
+ * already dropped), or a URL in it is on opencode.ai, or a setting names
+ * it or would move the host opencode builds ({@link hostSettingProblem}).
  */
 export function hostedEntry(entry: unknown, hosted: ReadonlySet<string> = new Set(HOSTED_PROVIDER_IDS)): boolean {
   if (!isRecord(entry)) return false;
   if (typeof entry.canonical === "string" && (hosted.has(entry.canonical) || isHostedProvider(entry.canonical))) return true;
   const urls = (v: unknown): boolean => (typeof v === "string" ? onOpencodeAi(v) : Array.isArray(v) ? v.some(urls) : isRecord(v) ? Object.values(v).some(urls) : false);
-  return urls(entry);
+  return urls(entry) || hostSettingProblem(entry) !== null;
+}
+
+/** A setting that opencode builds a request's URL or host from: a URL, a host or domain, an endpoint, a proxy, `api`, `canonical`, or one of {@link HOST_SETTINGS}. */
+function buildsAddress(key: string): boolean {
+  return /url|uri|endpoint|host|domain|origin|proxy|server|^api$|^canonical$/i.test(key) || key in HOST_SETTINGS;
 }
 
 /**
- * Whether a provider entry has a `{file:…}` (or other substitution) whose
- * text can't be checked for opencode.ai before opencode reads it: anywhere
- * but a credential (`apiKey`, a header's value). A URL written that way
- * (`baseURL`, `api`, `url`, `canonical`, …) may name opencode's hosted
- * service, which is only seen once opencode substitutes it.
+ * The setting of a provider entry that holds a `{file:…}` (or other
+ * substitution) whose text can't be checked for opencode.ai before opencode
+ * reads it: one that builds a URL or host ({@link buildsAddress}: `baseURL`,
+ * `api`, `url`, `canonical`, `region`, a `Host` header, …), or a header's
+ * name; null when none. A credential through a file (`apiKey`, Bedrock's
+ * keys, a Vertex private key, an OpenAI organization) is carried: the
+ * server-start check sees what opencode substituted.
  */
-export function uncheckedReference(entry: unknown, key?: string): boolean {
-  if (typeof entry === "string") return key !== "apiKey" && SUBSTITUTION.test(entry);
-  if (Array.isArray(entry)) return entry.some((v) => uncheckedReference(v));
-  if (!isRecord(entry)) return false;
-  return Object.entries(entry).some(([k, v]) => (k === "headers" && isRecord(v) ? Object.keys(v).some((h) => SUBSTITUTION.test(h)) : uncheckedReference(v, k)));
+export function uncheckedReference(entry: unknown, key?: string): string | null {
+  if (typeof entry === "string") return key !== undefined && buildsAddress(key) && SUBSTITUTION.test(entry) ? key : null;
+  if (Array.isArray(entry)) {
+    for (const v of entry) {
+      const k = uncheckedReference(v, key);
+      if (k) return k;
+    }
+    return null;
+  }
+  if (!isRecord(entry)) return null;
+  for (const [k, v] of Object.entries(entry)) {
+    const found = k === "headers" && isRecord(v) ? (Object.keys(v).find((h) => SUBSTITUTION.test(h)) ?? uncheckedReference(v)) : uncheckedReference(v, k);
+    if (found) return found;
+  }
+  return null;
 }
 
 /**
@@ -441,6 +555,12 @@ function carriedValue(
     if (!isRecord(value)) return undefined;
     const kept: Record<string, unknown> = {};
     for (const [id, entry] of Object.entries(value)) {
+      // Off, a host opencode would build from a setting must be one codeoid can read.
+      const spliced = hosted && !isHostedProvider(id) ? hostSettingProblem(entry) : null;
+      if (spliced) {
+        skipped.push(`${key}.${id}: ${spliced}, which may reach opencode's hosted service (opencode.ai), which is off (set providers.opencode.hostedModels to use it)`);
+        continue;
+      }
       if (hosted?.has(id)) {
         skipped.push(
           isHostedProvider(id)
@@ -450,8 +570,9 @@ function carriedValue(
         continue;
       }
       // Off, a URL that only opencode's substitution shows can't be checked for opencode.ai.
-      if (hosted && uncheckedReference(entry)) {
-        skipped.push(`${key}.${id}: a {file:…} reference in it (outside its apiKey and headers) may name opencode's hosted service, which is off and can't be checked there (write the URL itself, or set providers.opencode.hostedModels)`);
+      const unchecked = hosted ? uncheckedReference(entry) : null;
+      if (unchecked) {
+        skipped.push(`${key}.${id}: its ${unchecked} comes from a {file:…} reference, and opencode builds a URL or host from it, which may be opencode's hosted service: that is off and can't be checked there (write the ${unchecked} itself, or set providers.opencode.hostedModels)`);
         continue;
       }
       const pkg = foreignPackage(entry);
@@ -940,7 +1061,7 @@ export function hostedProviderProblem(
   const listed = [...providers, ...[...byModel].filter((id) => !providers.some((p) => p.id === id)).map((id) => ({ id }))];
   const found = listed.filter((p: { id: string; canonical?: string }) => configured.has(p.id) || byModel.has(p.id) || (typeof p.canonical === "string" && isHostedProvider(p.canonical)));
   if (found.length === 0) return null;
-  return `opencode offers its own hosted models (provider ${found.map((p) => `\`${p.id}\``).join(", ")}, opencode.ai) though codeoid turned them off — refusing to use this opencode server. Remove what enables them from opencode's system configuration, or set providers.opencode.hostedModels to use them.`;
+  return `opencode offers its own hosted models (provider ${found.map((p) => `\`${p.id}\``).join(", ")}, opencode.ai) though codeoid turned them off — refusing to use this opencode server. Remove what enables them from opencode's configuration (its system configuration, or a file your own configuration names through {file:…}), or set providers.opencode.hostedModels to use them.`;
 }
 
 /**
