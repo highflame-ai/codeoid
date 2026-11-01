@@ -607,9 +607,12 @@ function fileWords(w: ShellWord): ShellWord[] {
 function checkSecrets(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdict): void {
   // A wrapper's own words name files too: `xargs -a FILE`, `time -o FILE`.
   const words = [...cmd.argv.slice(1), ...(cmd.wrapped ?? []), ...cmd.redirects.map((r) => r.target).filter((t): t is ShellWord => t !== null)];
+  const lists = listsOnly(cmd);
   for (const w of words) {
+    // `ls -l /proc/$$/fd` reads no file: only what reads one can read an environment.
+    const procReads = !(lists && cmd.argv.includes(w));
     // A path known in full is the secret-path check's, below.
-    const proc = SHAPE_MARK.test(wordShape(w)) || cwd === null ? procSecretWord(w, cwd, ctx) : null;
+    const proc = procReads && (SHAPE_MARK.test(wordShape(w)) || cwd === null) ? procSecretWord(w, cwd, ctx) : null;
     if (proc) refuseEnvironRead(v, `it names ${proc}`);
     // `dd if=F`, `of=F`: the value after `=` is a file too.
     const assigned = w.value !== null && /^[A-Za-z_][\w.-]*=[\s\S]/.test(w.value) ? [{ ...w, value: w.value.slice(w.value.indexOf("=") + 1), shape: undefined }] : [];
@@ -619,13 +622,23 @@ function checkSecrets(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdi
         if (cwd === null) checkSecretsAnywhere(p, ctx, v);
         continue;
       }
-      const s = secretPathVerdict("Grep", { path: abs }, { workdir: ctx.workdir, configDir: ctx.configDir });
+      const s = secretPathVerdict("Grep", { path: abs }, { workdir: ctx.workdir, configDir: ctx.configDir, procReads });
       if (!s) continue;
       if (s.action === "deny" || !v.secret) v.secret = s;
       if (s.action === "deny") v.add("high", `touches ${s.path}, which holds credentials`);
       else v.add("medium", `reaches ${s.path}, which contains credential files`);
     }
   }
+}
+
+/** Programs that only list or stat what they're given, never reading a file's contents. */
+const LISTERS = new Set(["ls", "stat", "readlink", "realpath"]);
+
+/** `ls`, `stat`, `readlink`, `realpath`, not recursing: they read no file, so no process's environment either. */
+function listsOnly(cmd: SimpleCommand): boolean {
+  const prog = programOf(cmd);
+  if (prog === null || !LISTERS.has(prog)) return false;
+  return !cmd.argv.slice(1).some((w) => w.value === null ? false : w.value === "--recursive" || /^-[a-zA-Z]*R/.test(w.value));
 }
 
 /**
@@ -1319,10 +1332,10 @@ function findYieldsProcSecret(find: SimpleCommand, cwd: string | null, ctx: Ctx)
  */
 function procListedAndRead(parsed: ParsedShell, cwd: string | null, ctx: Ctx, v: Verdict): void {
   const lists = parsed.commands.some((c) =>
-    programOf(c) === "find" ? findYieldsProcSecret(c, cwd, ctx) : [...c.argv.slice(1), ...c.redirects.map((r) => r.target).filter((t): t is ShellWord => t !== null)].some((w) => w.value !== null && !w.glob && isProcDir(resolvePath(w, cwd, ctx))),
+    programOf(c) === "find" ? findYieldsProcSecret(c, cwd, ctx) : [...c.argv.slice(1), ...c.redirects.map((r) => r.target).filter((t): t is ShellWord => t !== null)].some((w) => (w.value !== null ? !w.glob && isProcDir(resolvePath(w, cwd, ctx)) : reachesProc(w, cwd, ctx))),
   );
   if (!lists) return;
-  const reads = parsed.commands.find((c) => !NOT_FILES.has(programOf(c) ?? "") && programOf(c) !== "find" && [...c.argv.slice(1), ...(c.wrapped ?? [])].some((w) => w.value === null && w.home === undefined && !safeProcLeaf(wordShape(w).split("/").at(-1) ?? "")));
+  const reads = parsed.commands.find((c) => !NOT_FILES.has(programOf(c) ?? "") && programOf(c) !== "find" && !listsOnly(c) && [...c.argv.slice(1), ...(c.wrapped ?? [])].some((w) => w.value === null && w.home === undefined && !safeProcLeaf(wordShape(w).split("/").at(-1) ?? "")));
   if (reads) refuseEnvironRead(v, `${programOf(reads)} reads a path only known at run time, on a line that lists /proc, so it could read processes' environments`);
 }
 

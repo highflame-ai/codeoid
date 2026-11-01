@@ -256,7 +256,7 @@ export function secretDirsOf(configDir: string): string[] {
 export function secretPathVerdict(
   toolName: string,
   input: unknown,
-  opts: { workdir: string; configDir: string },
+  opts: { workdir: string; configDir: string; /** false: a listing, which reads no file: a process's environment, memory or open files aren't refused (a credential file still is). */ procReads?: boolean },
 ): SecretPathVerdict {
   const configDir = real(resolve(opts.configDir));
   const secretFiles = [
@@ -273,7 +273,7 @@ export function secretPathVerdict(
     // Both forms: `/proc/self/fd/3` resolves to whatever the fd points at.
     // And through a process's root link: `/proc/4242/root/home/u/.codeoid/config.json`.
     const forms = [...new Set([literal, real(literal)].flatMap(throughProcRoots).flatMap((f) => [f, real(f)]))];
-    if (forms.some((f) => PROC_SECRET.test(f))) return { action: "deny", path: raw };
+    if (opts.procReads !== false && forms.some((f) => PROC_SECRET.test(f))) return { action: "deny", path: raw };
     for (const p of forms) {
       const v = verdictOf(p, raw);
       if (v?.action === "deny") return v;

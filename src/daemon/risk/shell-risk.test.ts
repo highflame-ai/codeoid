@@ -505,7 +505,7 @@ describe("shell command risk (#431)", () => {
       "head -c 9999 /proc//$PPID/./environ",
       "base64 /proc/$PPID/environ",
       "cat /proc/$PPID/fd/1",
-      "ls -l /proc/$$/fd",
+      "ls -lR /proc/$$/fd",
       "p=/proc/$PPID/environ; cat $p",
       // Globs, and paths relative to /proc.
       "cat /proc/*/environ",
@@ -626,6 +626,20 @@ describe("shell command risk (#431)", () => {
     }
     // What resolves the same either way is as before.
     expect(await level("cat src/../README.md")).toBe("low");
+  });
+
+  it("a listing of /proc reads no file, so it isn't refused (#447 round-19 audit)", async () => {
+    for (const c of ["ls -la /proc/$$/fd", "ls /proc/$$/fd | wc -l", "ls /proc/self/fd", "ls /proc/$PPID", "stat /proc/$$/fd/0", "readlink /proc/$$/fd/1", "realpath /proc/self/cwd"]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret, r.level]).toEqual([c, undefined, "medium"]);
+    }
+    // A listing that recurses, or reads what it lists, or a credential file, still is.
+    for (const c of ["ls -R /proc/$PPID", "ls /proc/$PPID | xargs cat", "cat /proc/$$/fd/0", "ls < /proc/$PPID/environ", `ls /proc/self/root${configDir}/config.json`, `stat ${configDir}/config.json`]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret?.action, r.level]).toEqual([c, "deny", "high"]);
+    }
+    // top stays refused: its columns come from a file the line doesn't show.
+    expect((await assessShellCommand("top -bn1", ctx)).secret?.action).toBe("deny");
   });
 
   it("refuses a credential file named through $HOME, or after a cd (round-1 audit)", async () => {
