@@ -443,7 +443,7 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   message. A session the feed names that the provider doesn't know (a
   subagent continued by its id after a rebuild: opencode reuses it silently)
   is looked up when it starts or asks, and adopted if it's a child, what
-  came meanwhile replayed (`#whenChild`). Settled calls and counted steps are remembered across turns, so a
+  came meanwhile replayed (`#whenChild`); its steps that ended before codeoid attached aren't billed again when it is read back. Settled calls and counted steps are remembered across turns, so a
   late feed repeats nothing. Spend past the steps in `usage.updated` (the
   title opencode generates, a compaction's requests) is billed as a side
   call, and the running total is read as a turn ends (`#finishCounted`: the

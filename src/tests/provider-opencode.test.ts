@@ -1694,6 +1694,22 @@ describe("opencode subagents", () => {
     expect(done(events)!.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.5, 6);
   });
 
+  it("a subagent continued after a rebuild and read back after a feed gap: only its new steps are billed, not the earlier turn's again (round-17 audit)", async () => {
+    const { server } = makeServer();
+    const first = makeProvider(server);
+    const events1 = await collect(first.runTurn(opts("subagent")));
+    const child = (events1.find((e) => e.type === "subagent_start") as Extract<ProviderEvent, { type: "subagent_start" }>).agentId;
+    await first.teardown();
+    const p = makeProvider(server, { initialBackingId: first.backingSessionId });
+    const events = await bounded(p.runTurn(opts(`subagent-gapend continue:${child}`)));
+    const r = done(events)!;
+    expect(r.stopReason).toBe("stop");
+    // The parent's two steps and the child's one step of this turn.
+    expect(r.totalCostUsd).toBeCloseTo(0.0123 * 2 + 0.5, 6);
+    expect(events.filter((e) => e.type === "llm_call")).toHaveLength(3);
+    await p.teardown();
+  });
+
   it("a background subagent continued after a rebuild is background work again, and settles", async () => {
     const { server } = makeServer();
     const first = makeProvider(server);

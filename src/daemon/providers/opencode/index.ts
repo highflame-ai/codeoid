@@ -2457,7 +2457,8 @@ export class OpencodeProvider implements SessionProvider {
     for (const m of messages.reverse()) {
       if (m.type !== "assistant") continue;
       for (const block of m.content ?? []) if (block.type === "tool") this.#settleReadBack(id, m, block);
-      if (!this.#countedSteps.has(m.id) && stepEnded(m)) {
+      // A step that ended before codeoid attached was billed then, or to nobody here: a child continued by its id carries its earlier turns'.
+      if (!this.#countedSteps.has(m.id) && stepEnded(m) && (m.time?.completed ?? m.time?.created ?? 0) >= this.#attachedAt) {
         remember(this.#countedSteps, m.id);
         this.#stepSettled(m.id, m.tokens, m.cost, m.error, answeredMessage(m));
         this.#recordStep(m.tokens, m.cost, false);
