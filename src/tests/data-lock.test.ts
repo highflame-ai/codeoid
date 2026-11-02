@@ -180,8 +180,18 @@ describe("codeoid start on data another daemon uses", () => {
     });
     return Object.assign(proc, { out: new Response(proc.stdout).text(), err: new Response(proc.stderr).text() });
   }
-  async function up(port: number): Promise<void> {
+  /** What a daemon printed, to show when it didn't do what the test expects. */
+  async function said(proc: ReturnType<typeof start>, why: string): Promise<string> {
+    const [out, err] = await Promise.all([proc.out, proc.err]);
+    return `daemon ${proc.pid} ${why}\n--- stdout ---\n${out.slice(-6000)}\n--- stderr ---\n${err.slice(-6000)}`;
+  }
+  async function up(proc: ReturnType<typeof start>, port: number): Promise<void> {
+    let exited: number | null = null;
+    void proc.exited.then((c) => {
+      exited = c;
+    });
     for (let i = 0; i < 300; i++) {
+      if (exited !== null) throw new Error(await said(proc, `exited ${exited} before it served on ${port}`));
       try {
         if ((await fetch(`http://127.0.0.1:${port}/health`)).status < 500) return;
       } catch {
@@ -189,16 +199,17 @@ describe("codeoid start on data another daemon uses", () => {
       }
       await Bun.sleep(100);
     }
-    throw new Error(`no daemon on ${port}`);
+    proc.kill("SIGKILL");
+    await proc.exited;
+    throw new Error(await said(proc, `didn't serve on ${port} within 30 s`));
   }
   /** SIGTERM `proc` and expect a clean exit; on anything else, show what the daemon said. */
   async function stop(proc: ReturnType<typeof start>): Promise<string> {
     const started = Date.now();
     proc.kill("SIGTERM");
     const code = await proc.exited;
-    const [out, err] = await Promise.all([proc.out, proc.err]);
-    if (code !== 0) throw new Error(`daemon ${proc.pid} exited ${code} after ${Date.now() - started} ms\n--- stdout ---\n${out.slice(-6000)}\n--- stderr ---\n${err.slice(-6000)}`);
-    return out;
+    if (code !== 0) throw new Error(await said(proc, `exited ${code} after ${Date.now() - started} ms`));
+    return proc.out;
   }
   const freePort = () => {
     const s = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
@@ -211,7 +222,7 @@ describe("codeoid start on data another daemon uses", () => {
     const p1 = freePort();
     const first = start(p1);
     try {
-      await up(p1);
+      await up(first, p1);
       const lock = join(root, "cfg", "codeoid", DAEMON_LOCK_FILE);
       expect((JSON.parse(readFileSync(lock, "utf8")) as LockHolder).pid).toBe(first.pid);
       const second = start(freePort());
@@ -223,7 +234,7 @@ describe("codeoid start on data another daemon uses", () => {
       // A daemon on other data starts alongside.
       const p3 = freePort();
       const other = start(p3, "cfg-other");
-      await up(p3);
+      await up(other, p3);
       await stop(other);
 
       await stop(first);
@@ -232,13 +243,13 @@ describe("codeoid start on data another daemon uses", () => {
       // A daemon killed outright leaves its lock: the next start takes it over.
       const p4 = freePort();
       const killed = start(p4);
-      await up(p4);
+      await up(killed, p4);
       killed.kill("SIGKILL");
       await killed.exited;
       expect(existsSync(lock)).toBe(true);
       const p5 = freePort();
       const next = start(p5);
-      await up(p5);
+      await up(next, p5);
       expect(await stop(next)).toContain(`took over the lock ${lock}`);
     } finally {
       first.kill("SIGKILL");
@@ -249,9 +260,10 @@ describe("codeoid start on data another daemon uses", () => {
     const port = freePort();
     const daemon = start(port, "cfg", { CODEOID_DATA_LOCK_CHECK_MS: "100" });
     try {
-      await up(port);
+      await up(daemon, port);
       rmSync(join(root, "cfg", "codeoid", DAEMON_LOCK_FILE));
-      expect(await daemon.exited).toBe(1);
+      const code = await daemon.exited;
+      if (code !== 1) throw new Error(await said(daemon, `exited ${code}, not 1, after its lock was removed`));
       const out = await daemon.out;
       expect(out).toContain("is no longer this daemon's");
       expect(out).toContain("shutdown complete (data-lock-lost)");
