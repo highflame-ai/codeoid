@@ -232,6 +232,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Stopping the daemon with memory on no longer crashes Bun.**
+  Shutdown terminated the embedding model's worker thread, and doing that while onnxruntime held it (loading the model, running a batch, or with its native finalizers still pending) made Bun panic (`NAPI FATAL ERROR`, the daemon dying with SIGILL) before memory's store was closed and the data-dir lock released.
+  The worker now stops itself: it finishes what it is running, lets the native finalizers run, and exits; it is never terminated from outside.
 - **On Claude, a Grep or Glob relative path is judged where the CLI resolves it** (#447).
   After the agent's Bash `cd`s, the CLI resolves a search's relative `path` (and a missing one) from there, but codeoid judged it from the working directory, so `../../.codeoid/config.json` could read codeoid's own key; it is now judged from the directory the CLI reports, and a relative path is asked about when it reports none.
 

@@ -174,7 +174,9 @@ describe("codeoid start on data another daemon uses", () => {
    */
   function start(port: number, cfgName = "cfg", env: Record<string, string> = {}) {
     const proc = Bun.spawn([process.execPath, cli, "start", "--local", "--no-telegram", "--no-web", "--port", String(port)], {
-      env: { PATH: process.env.PATH ?? "", HOME: join(root, "home"), XDG_CONFIG_HOME: join(root, cfgName), CODEOID_TRANSCRIPT_DIR: join(root, cfgName, "t"), ...env },
+      // No embedding model: with a fresh HOME each daemon would download it
+      // (~34 MB) before it listens, which is what these tests aren't about.
+      env: { PATH: process.env.PATH ?? "", HOME: join(root, "home"), XDG_CONFIG_HOME: join(root, cfgName), CODEOID_TRANSCRIPT_DIR: join(root, cfgName, "t"), CODEOID_MEMORY_EMBEDDINGS: "false", ...env },
       stdout: "pipe",
       stderr: "pipe",
     });
