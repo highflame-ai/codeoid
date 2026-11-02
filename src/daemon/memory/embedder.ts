@@ -38,6 +38,9 @@ export async function createEmbedder(config: EmbedderConfig = {}): Promise<Embed
   return new WorkerEmbedder(config.model ?? DEFAULT_EMBEDDING_MODEL, config.cacheDir);
 }
 
+/** How long close() waits for the worker to finish its batch and exit. */
+const WORKER_STOP_MS = 5_000;
+
 /** Main-thread proxy for the model hosted in embedder-worker.ts. */
 export class WorkerEmbedder implements Embedder {
   readonly modelName: string;
@@ -115,14 +118,47 @@ export class WorkerEmbedder implements Embedder {
     });
   }
 
+  /**
+   * Stop the worker. It is asked to exit once what it is running is done
+   * (embedder-worker.ts); never terminated, which crashes Bun while
+   * onnxruntime holds the thread. One that doesn't exit within the bound is
+   * left to end with the process, unref'd so it doesn't keep it alive.
+   */
   async close(): Promise<void> {
     this.#initPromise = null;
-    this.#teardown(new Error("embedder closed"));
+    const worker = this.#worker;
+    this.#worker = null;
+    this.#rejectPending(new Error("embedder closed"));
+    if (!worker) return;
+    const exited = new Promise<boolean>((resolve) => {
+      worker.addEventListener("close", () => resolve(true), { once: true });
+      setTimeout(() => resolve(false), WORKER_STOP_MS).unref?.();
+    });
+    try {
+      worker.postMessage({ type: "stop" } satisfies EmbedderWorkerRequest);
+    } catch {
+      // Already gone.
+    }
+    if (!(await exited)) worker.unref();
   }
 
   #teardown(reason: Error): void {
-    this.#worker?.terminate();
+    // A worker that crashed or failed to load the model: nothing native is
+    // running in it any more, so it is stopped as close() stops it.
+    const worker = this.#worker;
     this.#worker = null;
+    this.#rejectPending(reason);
+    if (worker) {
+      try {
+        worker.postMessage({ type: "stop" } satisfies EmbedderWorkerRequest);
+      } catch {
+        // Already gone.
+      }
+      worker.unref();
+    }
+  }
+
+  #rejectPending(reason: Error): void {
     for (const p of this.#pending.values()) p.reject(reason);
     this.#pending.clear();
   }

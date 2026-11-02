@@ -10,6 +10,13 @@
  * Protocol (structured-clone messages):
  *   in:  { type: "init", model, cacheDir? }           → out: { type: "ready", dimensions } | { type: "init_error", message }
  *   in:  { type: "embed", id, texts }                  → out: { type: "embedded", id, vectors } | { type: "embed_error", id, message }
+ *   in:  { type: "stop" }                               → the worker exits once what it is running is done
+ *
+ * The worker stops itself: `Worker.terminate()` while onnxruntime (a native
+ * addon) is loading the model or running a batch makes Bun panic ("NAPI
+ * FATAL ERROR", the whole daemon dies with SIGILL), so the main thread never
+ * terminates a worker that loaded the model. Requests run one at a time, so
+ * a stop waits for the one running and never cuts into native code.
  */
 
 import { TransformersJsEmbedder } from "./embedder-transformersjs.js";
@@ -18,7 +25,8 @@ declare const self: Worker;
 
 export type EmbedderWorkerRequest =
   | { type: "init"; model: string; cacheDir?: string }
-  | { type: "embed"; id: number; texts: string[] };
+  | { type: "embed"; id: number; texts: string[] }
+  | { type: "stop" };
 
 export type EmbedderWorkerResponse =
   | { type: "ready"; dimensions: number }
@@ -32,8 +40,37 @@ const errText = (err: unknown): string => (err instanceof Error ? err.message : 
 const reply = (msg: EmbedderWorkerResponse, transfer: ArrayBuffer[] = []): void =>
   self.postMessage(msg, transfer);
 
-self.onmessage = async (event: MessageEvent<EmbedderWorkerRequest>) => {
+/** Requests in arrival order, one at a time: a stop never lands inside a native call. */
+let queue: Promise<void> = Promise.resolve();
+let stopping = false;
+
+self.onmessage = (event: MessageEvent<EmbedderWorkerRequest>) => {
   const msg = event.data;
+  if (stopping) return;
+  if (msg.type === "stop") stopping = true;
+  queue = queue.then(() => handle(msg)).catch(() => {});
+};
+
+async function handle(msg: EmbedderWorkerRequest): Promise<void> {
+  if (msg.type === "stop") {
+    try {
+      await embedder?.close();
+    } catch {
+      // Best-effort: the process is going anyway.
+    }
+    embedder = null;
+    // Let the native finalizers of the model and the last batch run while the
+    // thread's environment is still whole: exiting with them pending panics
+    // Bun 1.3 the same way. Collect, let the queued finalizers run, collect
+    // what they released.
+    Bun.gc(true);
+    await Bun.sleep(50);
+    Bun.gc(true);
+    await Bun.sleep(10);
+    // Exiting from inside is clean (the main thread gets its `close` event);
+    // a terminate() from outside, with the model loaded, crashes Bun.
+    process.exit(0);
+  }
   if (msg.type === "init") {
     try {
       embedder = new TransformersJsEmbedder(msg.model, msg.cacheDir);
@@ -56,4 +93,4 @@ self.onmessage = async (event: MessageEvent<EmbedderWorkerRequest>) => {
       reply({ type: "embed_error", id: msg.id, message: errText(err) });
     }
   }
-};
+}
