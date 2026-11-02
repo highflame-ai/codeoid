@@ -167,13 +167,18 @@ describe("daemon data-dir lock", () => {
 
 describe("codeoid start on data another daemon uses", () => {
   const cli = join(import.meta.dir, "..", "cli.ts");
-  /** `codeoid start --local` on `port`, on this test's data. */
+  /**
+   * `codeoid start --local` on `port`, on this test's data. Its output is
+   * read from the start (`out`, `err`): a pipe nobody reads fills up, and a
+   * daemon that logs enough then blocks on its next write, its shutdown too.
+   */
   function start(port: number, cfgName = "cfg", env: Record<string, string> = {}) {
-    return Bun.spawn([process.execPath, cli, "start", "--local", "--no-telegram", "--no-web", "--port", String(port)], {
+    const proc = Bun.spawn([process.execPath, cli, "start", "--local", "--no-telegram", "--no-web", "--port", String(port)], {
       env: { PATH: process.env.PATH ?? "", HOME: join(root, "home"), XDG_CONFIG_HOME: join(root, cfgName), CODEOID_TRANSCRIPT_DIR: join(root, cfgName, "t"), ...env },
       stdout: "pipe",
       stderr: "pipe",
     });
+    return Object.assign(proc, { out: new Response(proc.stdout).text(), err: new Response(proc.stderr).text() });
   }
   async function up(port: number): Promise<void> {
     for (let i = 0; i < 300; i++) {
@@ -185,6 +190,15 @@ describe("codeoid start on data another daemon uses", () => {
       await Bun.sleep(100);
     }
     throw new Error(`no daemon on ${port}`);
+  }
+  /** SIGTERM `proc` and expect a clean exit; on anything else, show what the daemon said. */
+  async function stop(proc: ReturnType<typeof start>): Promise<string> {
+    const started = Date.now();
+    proc.kill("SIGTERM");
+    const code = await proc.exited;
+    const [out, err] = await Promise.all([proc.out, proc.err]);
+    if (code !== 0) throw new Error(`daemon ${proc.pid} exited ${code} after ${Date.now() - started} ms\n--- stdout ---\n${out.slice(-6000)}\n--- stderr ---\n${err.slice(-6000)}`);
+    return out;
   }
   const freePort = () => {
     const s = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response("") });
@@ -202,7 +216,7 @@ describe("codeoid start on data another daemon uses", () => {
       expect((JSON.parse(readFileSync(lock, "utf8")) as LockHolder).pid).toBe(first.pid);
       const second = start(freePort());
       expect(await second.exited).toBe(1);
-      const stderr = await new Response(second.stderr).text();
+      const stderr = await second.err;
       expect(stderr).toContain("the daemon couldn't start: another codeoid daemon");
       expect(stderr).toContain(`pid ${first.pid}`);
       expect(stderr).toContain(`port ${p1}`);
@@ -210,11 +224,9 @@ describe("codeoid start on data another daemon uses", () => {
       const p3 = freePort();
       const other = start(p3, "cfg-other");
       await up(p3);
-      other.kill("SIGTERM");
-      expect(await other.exited).toBe(0);
+      await stop(other);
 
-      first.kill("SIGTERM");
-      expect(await first.exited).toBe(0);
+      await stop(first);
       expect(existsSync(lock)).toBe(false);
       expect(existsSync(join(root, "cfg", "t", DAEMON_LOCK_FILE))).toBe(false);
       // A daemon killed outright leaves its lock: the next start takes it over.
@@ -227,9 +239,7 @@ describe("codeoid start on data another daemon uses", () => {
       const p5 = freePort();
       const next = start(p5);
       await up(p5);
-      next.kill("SIGTERM");
-      expect(await next.exited).toBe(0);
-      expect(await new Response(next.stdout).text()).toContain(`took over the lock ${lock}`);
+      expect(await stop(next)).toContain(`took over the lock ${lock}`);
     } finally {
       first.kill("SIGKILL");
     }
@@ -242,7 +252,7 @@ describe("codeoid start on data another daemon uses", () => {
       await up(port);
       rmSync(join(root, "cfg", "codeoid", DAEMON_LOCK_FILE));
       expect(await daemon.exited).toBe(1);
-      const out = await new Response(daemon.stdout).text();
+      const out = await daemon.out;
       expect(out).toContain("is no longer this daemon's");
       expect(out).toContain("shutdown complete (data-lock-lost)");
     } finally {
