@@ -36,6 +36,11 @@ describe("roleDeniesTool", () => {
   const implementer: ToolRole = { write: true, network: "read-only", envelope: "all" };
   const noNet: ToolRole = { write: true, network: false, envelope: "all" };
 
+  test("read-only role denies a call whose path can't be resolved for certain (it may be a write); others may ask", () => {
+    expect(roleDeniesTool(reviewer, "opencode_unresolved_path")).toMatch(/read-only/);
+    expect(roleDeniesTool(implementer, "opencode_unresolved_path")).toBeNull();
+  });
+
   test("read-only role denies write tools, allows reads + bash", () => {
     expect(roleDeniesTool(reviewer, "Write")).toMatch(/read-only/);
     expect(roleDeniesTool(reviewer, "Edit")).toMatch(/read-only/);

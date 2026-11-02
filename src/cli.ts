@@ -25,8 +25,11 @@ import { type Command, program } from "commander";
 // so `codeoid --version` always matches the published package (no hand-synced
 // string to drift). release-smoke asserts these two stay equal.
 import pkg from "../package.json" with { type: "json" };
+import { acquireDaemonLocks, type DaemonLocks, DataDirLockError, daemonOwnedDirs } from "./daemon/data-lock.js";
 import { DaemonServer } from "./daemon/server.js";
 import { DefaultProviderError } from "./daemon/providers/registry.js";
+import { clearStaleOpencodeCredentials } from "./daemon/providers/opencode/credentials.js";
+import { opencodeSecretLocations } from "./daemon/providers/opencode/resolve.js";
 import { parseRoleSpec } from "./daemon/collaboration.js";
 import { type ModelBinding, roleBindingsFromSpecs } from "./daemon/pipeline/binding.js";
 import {
@@ -128,9 +131,24 @@ program
       };
     }
 
+    // One daemon per data directory: before anything is opened or cleaned
+    // up (the store, boot recovery, opencode's key files), lock each one
+    // this daemon owns, or say who holds it and stop (data-lock.ts).
+    let dataLock: DaemonLocks;
+    try {
+      // CODEOID_DATA_LOCK_CHECK_MS: how often the daemon checks its locks are still its own (tests; default a minute).
+      const checkMs = Number(process.env.CODEOID_DATA_LOCK_CHECK_MS) || undefined;
+      dataLock = acquireDaemonLocks(daemonOwnedDirs(config), { port: bindPort, ...(checkMs ? { checkMs } : {}) });
+    } catch (err) {
+      if (!(err instanceof DataDirLockError)) throw err;
+      console.error(`\n[codeoid] the daemon couldn't start: ${err.message}\n`);
+      process.exit(1);
+    }
+
     let daemon: DaemonServer;
     try {
       daemon = new DaemonServer({
+        dataLock,
         port: bindPort,
         host: bindHost,
         dbPath: config.dbPath,
@@ -161,7 +179,6 @@ program
       console.error(`\n[codeoid] ${err.message}\n`);
       process.exit(1);
     }
-
     // ── Register frontends ────────────────────────────────────────
 
     // Web UI (always enabled unless --no-web) — the SolidJS app at /ui,
@@ -204,7 +221,13 @@ program
       }
     }
 
-    await daemon.start();
+    try {
+      await daemon.start();
+    } catch (err) {
+      // Its port taken (another daemon runs there), or anything else: not started.
+      console.error(`\n[codeoid] the daemon couldn't start: ${err instanceof Error ? err.message : String(err)}\n`);
+      process.exit(1);
+    }
 
     // ZeroID mode: sweep a stale local-mode token for THIS port. Reaching here
     // means we successfully bound it, so no local-mode daemon can be listening
@@ -216,6 +239,11 @@ program
     if (!localMode) {
       removeLocalTokenFile(getLocalTokenPath(bindPort));
     }
+    // opencode key files a daemon that's gone left — with opencode since
+    // disabled or gone, or its dbPath moved — don't stay on disk. A running
+    // daemon's (another port, or the one whose port we'd have taken) are
+    // its own: its server reads them again as it loads each new location.
+    clearStaleOpencodeCredentials(opencodeSecretLocations(config).dirs);
 
     const displayHost = bindHost === "0.0.0.0" || bindHost === "::" ? "localhost" : bindHost;
     if (opts.web !== false) {

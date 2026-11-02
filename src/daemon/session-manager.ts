@@ -16,6 +16,7 @@ import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
 import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, DEFAULT_ACCOUNT, type AccountKind, type ClaudeAccountKind } from "../protocol/types.js";
 import { type CatalogEntry, isPlaceholderModel, type SessionProvider } from "./providers/interface.js";
+import { isHostedModel } from "./providers/opencode/policy.js";
 import {
   createDefaultProviderRegistry,
   DefaultProviderError,
@@ -505,6 +506,8 @@ export class SessionManager {
   #packs: PackService;
   /** The daemon's provider catalog — one registry, shared by every session. */
   #providers: ProviderRegistry;
+  /** The registry is this manager's own (not handed in): let go when it drains. */
+  #ownsProviders = false;
   /** The daemon's hook bus — one instance, shared by every session. */
   #hooks?: HookBus;
   #testProviderFactory?: () => SessionProvider;
@@ -625,6 +628,7 @@ export class SessionManager {
     this.#claudeAccounts = opts?.claudeAccounts ?? new ClaudeAccountStore(opts?.accounts);
     this.#accounts = this.#claudeAccounts.store;
     this.#providers = opts?.providers ?? createDefaultProviderRegistry(opts?.config, process.env, endpoints, this.#accounts);
+    this.#ownsProviders = !opts?.providers;
     // An injected registry (tests) gets the endpoints too; startup's already has them.
     // Like startup, an unreadable endpoints file costs the endpoints, not the daemon.
     if (opts?.providers) {
@@ -2088,6 +2092,10 @@ mcpHub: this.#mcpHub,
     const liveModels = this.#modelsCache.get(providerId);
     if (liveModels) return { models: liveModels, live: true };
     const persisted = this.#persistedModels(providerId);
+    // A catalog an earlier daemon saved may list opencode's hosted models, off unless opted in (docs/opencode.md).
+    if (persisted && providerId === "opencode" && this.#config?.providers?.opencode?.hostedModels !== true) {
+      return { models: persisted.filter((m) => !isHostedModel(m.value)), live: false };
+    }
     if (persisted) return { models: persisted, live: false };
     return {
       // The built-in fallback is Claude's catalog, whatever the default is.
@@ -2407,7 +2415,7 @@ mcpHub: this.#mcpHub,
     const id = config.session.defaultProvider;
     if (!id || id === CLAUDE_PROVIDER_ID) return undefined;
     try {
-      createDefaultProviderRegistry(config, next.env, { store: this.#endpoints, catalog: this.#endpointCatalog });
+      createDefaultProviderRegistry(config, next.env, { store: this.#endpoints, catalog: this.#endpointCatalog }, undefined, { preview: true });
       return undefined;
     } catch (err) {
       if (err instanceof DefaultProviderError) return { kind: "provider", message: err.message };
@@ -3909,6 +3917,15 @@ mcpHub: this.#mcpHub,
    * idle or deadline.
    */
   async drain(timeoutMs = 10_000): Promise<void> {
+    try {
+      await this.#drain(timeoutMs);
+    } finally {
+      // Last: the gate keeps refusing opencode's credential files while sessions stop.
+      if (this.#ownsProviders) this.#providers.dispose();
+    }
+  }
+
+  async #drain(timeoutMs: number): Promise<void> {
     // An abandoned login is a live pty holding an open OAuth attempt. Kill
     // those first, and unconditionally — they are not work worth draining.
     this.#backendLogin.dispose();

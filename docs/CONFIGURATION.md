@@ -92,8 +92,8 @@ CODEOID_IDLE_RELEASE_MINUTES=30         # minutes idle before a session's backen
                                         #   running) are stopped; the next message resumes it
                                         #   and re-reads project MCP/hook files (#451). 0 = keep.
 CODEOID_DEFAULT_PROVIDER=claude         # backend for sessions created without --provider
-                                        #   (claude | codex | pi | qwen | gemini-cli | openai | gemini |
-                                        #    llamacpp — see docs/local-models.md).
+                                        #   (claude | codex | pi | qwen | gemini-cli | opencode | openai |
+                                        #    gemini | llamacpp — see docs/local-models.md, docs/opencode.md).
                                         #   An unknown, disabled or uninstalled backend stops the
                                         #   daemon at startup. Resumed sessions and the conductor
                                         #   keep their own backend.
@@ -188,6 +188,52 @@ How shell commands are approved by risk (`approvals.*`) is in [approvals.md](app
 }
 ```
 
+### opencode
+
+The opencode backend (opencode 2.2.5 or a later 2.2.x) is on by default when an `opencode` binary resolves. codeoid runs one private `opencode serve` per daemon, with its own database; docs/opencode.md has setup, credentials, and what it supports.
+
+```json
+{
+  "providers": {
+    "opencode": {
+      "enabled": true,
+      "command": "opencode",
+      "dbPath": "opencode/opencode.db",
+      "dataDir": "opencode",
+      "agent": "build",
+      "model": "qwen/qwen3.8-max",
+      "hostedModels": false
+    }
+  }
+}
+```
+
+- `dbPath` — opencode's database for codeoid's sessions. Default: an `opencode` folder beside codeoid's own database (`dbPath` / `CODEOID_DB_PATH`); a relative path resolves from codeoid's config dir. It is never your own opencode's database.
+- `dataDir` — opencode's logs, shell output, state, caches and temp files (its XDG data, state and cache dirs, as `data/`, `state/`, `cache/` under it, and its `TMPDIR`, as `tmp/`). Default: an `opencode` folder beside codeoid's transcript dir (`transcriptDir` / `CODEOID_TRANSCRIPT_DIR`); a relative path resolves from codeoid's config dir. Nothing goes to your own `~/.local/share/opencode` or `~/.cache/opencode`, nor to a shared `/tmp/opencode`.
+- `agent` — the opencode agent sessions run (`build`, `plan`, or your own); omit for opencode's default.
+- `model` — the default model, `provider/model`, for sessions that don't pick one; omit for opencode's default among the models it has a credential for (with none, a turn fails, saying what to set). Refused with `{`, `}`, quotes, backslashes or spaces in it (opencode would expand a `{file:…}` there).
+- `hostedModels` (`CODEOID_OPENCODE_HOSTED_MODELS`) — offer opencode's own hosted models (provider `opencode`: opencode.ai / Zen, its free no-key models included) and let opencode fetch its model catalog from opencode.ai. Default `false`: they aren't offered, listed or picked as a default, your opencode config can't enable them, and a session's code only goes to providers codeoid or your opencode config gave a credential for (docs/opencode.md, *opencode's hosted models*).
+- Credentials are codeoid's own: its `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `GOOGLE_API_KEY` (or `GEMINI_API_KEY`), each sent to the gateway its `*_BASE_URL` names when one does, its Qwen backend on an API key or its default account (`providers.qwen`, as provider `qwen`), and its OpenAI-compatible endpoints (as `oai-<name>`). codeoid writes each to a file only it can read and names the file in opencode's config; the files are removed when the server stops, and a daemon that's gone has its files removed when another starts (each daemon keeps its own). The opencode server's environment carries no key, nor a proxy URL with credentials in it. Sign-ins stored in codeoid's opencode database (`OPENCODE_DB=<that path> opencode auth login`) work too. `codeoid account` doesn't apply to it.
+- Every setting here is read when the daemon starts; change one, then restart the daemon (the settings UI says so).
+
+### One daemon per data directory
+
+A daemon owns its data: the directory of its database (`dbPath`, `~/.codeoid/` by default), its transcripts and checkpoints (`transcriptDir`), opencode's database and data dirs (`providers.opencode.dbPath`, `providers.opencode.dataDir`) and memory's database dir. Two daemons on the same data would corrupt each other's state, so `codeoid start` takes a lock on each of those directories (a `codeoid-daemon.lock` file in it, recording the daemon's pid, host, machine id, boot, pid namespace and process start time) before it opens or cleans up anything, and a second start on any of them is refused, naming the daemon that holds it:
+
+```
+[codeoid] the daemon couldn't start: another codeoid daemon (pid 4242 on laptop, port 7400, since …) uses /home/u/.codeoid: process 4242 still runs. …
+```
+
+Stop that daemon first, or give the second one data of its own. The simplest way is to start it with its own `XDG_CONFIG_HOME` (its config, database, transcripts, memory and opencode's data all move there). Otherwise every owned directory must differ: a new `CODEOID_DB_PATH` in the same directory still collides, and so do memory's database (`memory.dbPath`) and opencode's dirs, which default beside the database and transcripts. A refusal names the directory, what of the daemon's data the settings put there, and the setting for each.
+
+- The lock goes when the daemon stops, however it stops (a signal, a signal while it is still starting, a failed start). A daemon killed outright (`kill -9`, a crash) leaves it; the next start takes it over, with a line in its log, only when the process that took it is provably gone: on this machine and boot, in the same pid namespace, its pid no longer runs, or now runs another process (a different start time, read the same whatever time zone or locale the start runs under).
+- This machine and boot means the hostname, the machine id (`/etc/machine-id` on Linux, the hardware UUID on macOS) and the boot id all match, each where either side has one: VMs cloned from one template and images with a baked-in machine id share it, so it alone proves nothing. A lock from anywhere else is never taken over: another machine (data on a shared or network home), an earlier boot of this one (after a power loss, or a crash and a reboot: it can't be told from a twin machine with the same name and id), a renamed machine, or another pid namespace (a container restarted after its daemon was killed). The start is refused, naming the holder and the lock file; if that daemon is gone, remove the file and start again. In a container, give `docker stop` time for the daemon's 30-second shutdown grace (`docker stop -t 40`) so the lock is released.
+- A running daemon checks every minute that its locks are still its own. One removed, or taken over by another start, stops the daemon (it shuts down as on a signal, saying why in its log), so two daemons never keep writing the same data.
+- A start that dies while it takes over a stale lock leaves a `.takeover` guard beside it; the next start judges the guard as it judges a lock, and removes it when that start is gone.
+- The lock file is read only as a small regular file, never through a symlink; anything else at its path refuses the start, saying so. A directory the lock has to create is made private (0700); an existing one is left as it is. A data directory that can't be created or written (a parent you can't write, a path through a file, a read-only filesystem) refuses the start, saying which and why.
+- Nothing of a live daemon's is ever removed or changed while deciding.
+- Only `codeoid start` takes it. Every other command (`codeoid ls`, `send`, `attach`, `settings`, …) talks to the running daemon and needs no lock.
+
 ### `~/.codeoid/.env` — env-only secrets
 
 Some daemon settings are env-only (notably the Telegram frontend). Rather than
@@ -207,7 +253,8 @@ TELEGRAM_ALLOWED_USER_IDS=6714605885
 
 ## Model prices
 
-Some backends report what each turn cost (Claude, pi); the others report tokens only (Codex, OpenAI and OpenAI-compatible endpoints, Gemini, Qwen).
+Some backends report what each turn cost (Claude, pi, opencode); the others report tokens only (Codex, OpenAI and OpenAI-compatible endpoints, Gemini, Qwen).
+A $0 with tokens from a backend that reports cost isn't a price (a gateway, a subscription sign-in, a model the backend's catalog prices at $0): its tokens are priced as below, under the backend's model id (`provider/model` on opencode).
 For those, codeoid prices the tokens at the model's list price, so session totals, routine spend caps and the fleet board count them; the UI marks such a total as an estimate (`~$0.42`).
 A model on your own machine costs nothing: llama.cpp on a loopback host (`127.0.0.1`, `localhost`) that answers `/props` as llama-server (a proxy on a loopback port doesn't, so it isn't free unless you say so).
 For your own server elsewhere on your network, set `providers.llamacpp.free: true`; anything else (it could be a gateway forwarding to a paid API) is priced like any other backend, and a price in `pricing.models` always wins.
@@ -230,8 +277,9 @@ Your own prices win, per model, in USD per million tokens:
 `cacheRead` and `cacheWrite` default to the input price; `inputAbove200k` / `outputAbove200k` (and `cacheReadAbove200k` / `cacheWriteAbove200k`, which default to the cache rates raised as input's is) apply to a request whose prompt is over 200k tokens.
 Each request is billed at its own tier when the backend reported every request's tokens; otherwise the whole turn is billed at its largest request's tier.
 The snapshot never lists a model as free (a provider's free tier isn't the model's price elsewhere); only `pricing.models` can.
+The snapshot is keyed by bare model ids (`claude-sonnet-4-5`, `gpt-5`); opencode names its models `provider/model` (`anthropic/claude-sonnet-4-5`), which the snapshot never matches, so an opencode model needs its entry here under that id.
 A model with no price (here or in the snapshot) has an **unknown** cost, shown as `$?` (or `$0.42+` when some turns were priced), never as $0; a routine with a spend cap stops on such a turn (docs/routines.md).
-The Gemini CLI reports no token counts, so its turns are always of unknown cost; so is a turn whose usage never arrived (a server that leaves it out of the stream), a turn that ended mid-way (an error, a stop) without saying what it spent, or while a request was still streaming (its usage comes only when it ends), a Qwen turn that used more than one model, and a Qwen turn that ran a sub-agent (qwen-code reports no usage for its requests).
+The Gemini CLI reports no token counts, so its turns are always of unknown cost; so is a turn whose usage never arrived (a server that leaves it out of the stream), a turn that ended mid-way (an error, a stop) without saying what it spent, or while a request was still streaming (its usage comes only when it ends), a Qwen turn that used more than one model, a Qwen turn that ran a sub-agent (qwen-code reports no usage for its requests), and an opencode turn part of whose spend went unreported (docs/opencode.md, Cost).
 A turn that failed before reaching the model spent nothing.
 Qwen doesn't report thinking tokens separately, so a Qwen estimate leaves them out.
 
@@ -367,7 +415,7 @@ It decides whose credential the agent runs on, which account is billed, and wher
 The account list is daemon-wide, not per tenant: like the rest of `settings:write`, it belongs to whoever runs the daemon.
 
 **Agents can't read the stored tokens.**
-Agent file tools are refused on codeoid's credential files (`accounts.json`, `claude-accounts.json`, `endpoints.json`, `config.json`, `.env`, `codeoid.db`, the local-mode token), on every account's home under `~/.codeoid/accounts/`, on each agent CLI's own stored login (`~/.claude/.credentials.json`, Codex's `auth.json`, `~/.qwen/oauth_creds.json`, the Gemini CLI's `oauth_creds.json` and `google_accounts.json`, pi's `auth.json`), and on any process's `/proc/<pid>/environ` or memory, in every mode.
+Agent file tools are refused on codeoid's credential files (`accounts.json`, `claude-accounts.json`, `endpoints.json`, `config.json`, `.env`, `codeoid.db`, the local-mode token), on every account's home under `~/.codeoid/accounts/`, on each agent CLI's own stored login (`~/.claude/.credentials.json`, Codex's `auth.json`, `~/.qwen/oauth_creds.json`, the Gemini CLI's `oauth_creds.json` and `google_accounts.json`, pi's `auth.json`), on codeoid's opencode credential files and database (`codeoid-credentials/` and `opencode.db` beside it, see `providers.opencode.dbPath`) and its opencode server's config, data, state and cache dirs (`config/` beside the database; `data/`, `state/` and `cache/` of `providers.opencode.dataDir`, less the tool and shell output opencode names to the model, see docs/opencode.md), and on any process's `/proc/<pid>/environ` or memory, in every mode.
 On Claude this is enforced in a `PreToolUse` hook as well as the approval gate, so it also holds for reads the CLI would allow by itself.
 A search rooted above those files, such as a `Grep` over your home directory, is never auto-approved and waits for you instead.
 

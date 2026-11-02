@@ -25,6 +25,7 @@ import type { CompressionRegistry } from "../compress/index.js";
 import type { CodeoidConfig } from "../../config.js";
 import type { SessionProvider, CatalogEntry } from "./interface.js";
 import { CLAUDE_PROVIDER_ID } from "../models.js";
+import type { SessionMode } from "../../protocol/types.js";
 import { ClaudeProvider } from "./claude/index.js";
 import { GeminiProvider } from "./gemini/index.js";
 import { OpenAIProvider } from "./openai/index.js";
@@ -35,12 +36,17 @@ import { CODEX_INSTALL_HINT, resolveCodexCommand } from "./codex/resolve.js";
 import { GeminiAcpProvider } from "./acp/index.js";
 import { GEMINI_CLI_INSTALL_HINT, resolveGeminiCliCommand } from "./acp/resolve.js";
 import { QwenProvider } from "./qwen/index.js";
+import { OPENCODE_DISPLAY_NAME, OPENCODE_PROVIDER_ID, OpencodeProvider } from "./opencode/index.js";
+import { opencodeCredentialInputs } from "./opencode/credentials.js";
+import { OPENCODE_INSTALL_HINT, opencodeDataDir, opencodeDbPath, opencodeLocationsFile, opencodeRefusedPaths, resolveOpencodeCommand } from "./opencode/resolve.js";
+import { OpencodeServer } from "./opencode/server.js";
 import { SCRIPTED_ENV, SCRIPTED_PROVIDER_ID, ScriptedProvider } from "./scripted/index.js";
 import { StatelessSessionProvider } from "./stateless.js";
 import { LLAMACPP_DISPLAY_NAME, LLAMACPP_PROVIDER_ID, createLlamaCppProvider } from "./llamacpp/index.js";
 import type { EndpointStore } from "../openai-endpoints.js";
 import { AccountError, type AccountStore, type ResolvedAccount } from "../accounts.js";
 import { type EndpointCatalog, syncEndpointProviders } from "./endpoint/index.js";
+import { registerSecretPaths } from "../secret-paths.js";
 
 /**
  * Everything a factory may need to construct a provider for ONE session.
@@ -111,6 +117,12 @@ export interface ProviderSessionInit {
    */
   isForeignAgent?: (agentId: string) => boolean;
   /**
+   * The session's mode now (it can change mid-turn). Claude only: in
+   * autonomous mode its PreToolUse hook hands a write outside the working
+   * directory to codeoid's gate past an allow rule (outside-writes.ts).
+   */
+  sessionMode?: () => SessionMode;
+  /**
    * When this session is a fork: whether a task id is one of its parent's
    * (fork-isolation.ts). Claude only: a native fork's copy of the parent's
    * cloud-agent registrations is cleared by it.
@@ -164,6 +176,22 @@ export class ProviderRegistry {
    * created on an id that isn't registered.
    */
   #prefixResolver: ((id: string) => ProviderFactory | undefined) | null = null;
+  /** What building this registry changed outside it (the gate's credential paths), undone by {@link dispose}. */
+  readonly #cleanups: Array<() => void> = [];
+
+  /** Undo, when the registry is let go, what building it changed elsewhere. */
+  onDispose(cleanup: () => void): void {
+    this.#cleanups.push(cleanup);
+  }
+
+  /**
+   * Let the registry go: the credential paths it registered for the gate are
+   * dropped (a test's daemon built under /tmp would otherwise leave every
+   * later session judging /tmp to hold credentials). Idempotent.
+   */
+  dispose(): void {
+    for (const cleanup of this.#cleanups.splice(0)) cleanup();
+  }
 
   register(factory: ProviderFactory): void {
     if (this.#factories.has(factory.id)) {
@@ -297,6 +325,7 @@ const ENABLE_KEY: Record<string, string> = {
   "gemini-cli": "geminiCli",
   qwen: "qwen",
   llamacpp: "llamacpp",
+  opencode: "opencode",
 };
 
 /**
@@ -392,6 +421,8 @@ export function createDefaultProviderRegistry(
   endpoints?: { store: EndpointStore; catalog: EndpointCatalog },
   /** Named accounts: a keyed backend with accounts is registered without an environment key. */
   accounts?: AccountStore,
+  /** `preview`: only checking what the next boot would build (a settings write): nothing is registered with the live daemon's gate. */
+  options: { preview?: boolean } = {},
 ): ProviderRegistry {
   const registry = new ProviderRegistry(config?.session?.defaultProvider ?? CLAUDE_PROVIDER_ID);
   registry.register({
@@ -418,6 +449,7 @@ export function createDefaultProviderRegistry(
         extraEnv: init.extraEnv,
         forkBoundary: init.forkBoundary,
         isForeignAgent: init.isForeignAgent,
+        sessionMode: init.sessionMode,
         isForeignTask: init.isForeignTask,
         isFork: init.isFork,
         isOwnTask: init.isOwnTask,
@@ -591,6 +623,81 @@ export function createDefaultProviderRegistry(
           extraEnv: init.extraEnv,
         }),
     });
+  }
+  // opencode's credential files and database (stored sign-ins) are refused to
+  // every backend's file tools, as codeoid's own are: registered whether or
+  // not opencode is enabled or found, since both outlive the daemon that
+  // wrote them, and at the default and recorded locations too (a moved dbPath
+  // leaves them). So are the server's config, data, state and cache dirs: a
+  // plugin written to its config dir runs in the server at once. Not for a
+  // preview: the live daemon's gate isn't its to change.
+  if (!options.preview) registry.onDispose(registerSecretPaths(opencodeRefusedPaths(config)));
+  if (config?.providers?.opencode?.enabled !== false) {
+    const configured = config?.providers?.opencode?.command;
+    const resolution = resolveOpencodeCommand(configured === "opencode" ? undefined : configured, env);
+    if (resolution) {
+      // ONE server for every opencode session of this daemon, started by the
+      // first one's first turn (opencode/server.ts). A server reporting a
+      // version outside the supported range takes the backend off the
+      // catalog, with the reason as its hint.
+      const dbPath = opencodeDbPath(config);
+      let server: OpencodeServer | null = null;
+      const shared = (store: Store): OpencodeServer => {
+        server ??= new OpencodeServer({
+          command: resolution.command,
+          argsPrefix: resolution.argsPrefix,
+          dbPath,
+          locationsFile: opencodeLocationsFile(config),
+          dataDir: opencodeDataDir(config),
+          // The server's cwd leads to none of these (opencodeServerCwd).
+          codeoidPaths: [config?.dbPath, config?.transcriptDir].filter((p): p is string => typeof p === "string"),
+          defaultModel: config?.providers?.opencode?.model,
+          // opencode.ai (its hosted models, its catalog fetch): only when the owner opted in.
+          hostedModels: config?.providers?.opencode?.hostedModels === true,
+          // codeoid's keys reach opencode through its config, from files; read at each server start.
+          credentials: () =>
+            opencodeCredentialInputs(config, env, {
+              qwenCatalog: () => store.getModelCatalog("qwen"),
+              // The Qwen backend's own default account, as its sessions resolve it.
+              qwenAccount: accounts ? () => accounts.resolve("qwen", null) : undefined,
+              endpoints: () => endpoints?.store.entries() ?? [],
+            }),
+          onIncompatible: (hint) => {
+            // The default backend stays registered: its sessions keep failing with the hint instead.
+            if (registry.has(OPENCODE_PROVIDER_ID) && registry.defaultId !== OPENCODE_PROVIDER_ID) registry.unregister(OPENCODE_PROVIDER_ID);
+            registry.markUnavailable(OPENCODE_PROVIDER_ID, hint);
+          },
+        });
+        return server;
+      };
+      registry.register({
+        id: OPENCODE_PROVIDER_ID,
+        displayName: OPENCODE_DISPLAY_NAME,
+        create: (init) =>
+          new OpencodeProvider({
+            sessionId: init.sessionId,
+            initialBackingId: init.initialBackingId,
+            server: shared(init.store),
+            store: init.store,
+            workspaceId: init.workspaceId,
+            tenant: init.tenant,
+            memoryMcp: init.memoryMcp,
+            mcpProxy: init.mcpHub?.proxy ?? undefined,
+            blackboardMcp: init.blackboardMcp,
+            mcpRegistry: init.mcpRegistry,
+            onModels: init.onModels,
+            agent: config?.providers?.opencode?.agent,
+            modelPrices: () => config?.pricing?.models,
+          }),
+      });
+    } else {
+      registry.markUnavailable(
+        OPENCODE_PROVIDER_ID,
+        configured !== undefined && configured !== "opencode"
+          ? `providers.opencode.command (${JSON.stringify(configured)}) does not exist or is not on PATH`
+          : OPENCODE_INSTALL_HINT,
+      );
+    }
   }
   // The end-to-end suite's scripted backend (#429): only when a test names a
   // script, so a normal install never offers it.

@@ -1,0 +1,1108 @@
+/**
+ * The policy codeoid imposes on its private opencode server.
+ *
+ * codeoid owns approvals, so opencode must ask about EVERY action and never
+ * settle one itself. opencode evaluates a request against
+ * `[...agent rules (global config rules included), ...session rules]`, last
+ * match winning, then saved "always" approvals and plugin hooks. Four layers
+ * make that hold:
+ *
+ *   1. Every codeoid session (and every child session a subagent spawns) is
+ *      given `SESSION_RULES`: `* / * / ask` last, so nothing an agent allows
+ *      survives on it.
+ *   2. The injected config's global `permissions` is the same catch-all.
+ *   3. opencode documents that "a custom subagent uses its own permissions":
+ *      agent rules come after global ones, and a child session may not carry
+ *      its parent's session rules. The built-in `explore` subagent allows
+ *      `shell`, for one. So once a server is up, codeoid reads every agent's
+ *      rules (`GET /api/agent`) and, if any `allow` is not overridden by a
+ *      later ask/deny, restarts the server once with config overrides that
+ *      turn each agent's allows into asks ({@link agentOverrides}), and refuses
+ *      to use a server where one still survives ({@link unsafeAgents}).
+ *   4. codeoid replies `once` or `reject`, never `always`, so no saved rule is
+ *      ever written; any found in the private database are removed, and the
+ *      session's rules set again, before every turn (any process of the
+ *      daemon's user can read the server's password from its environment).
+ *
+ * Tools that never ask (opencode's session-utility tools: `session_rename`,
+ * `session_move`, `worktree_*`, and the `schedule_*` tools, which would run
+ * work nobody is watching) are removed by disabling the plugins that add
+ * them. Code Mode (`execute`) is removed by a deny rule, which hides the
+ * tool: on opencode 2.2.2 a Code Mode script's `fetch` runs without asking
+ * anything (2.2.5 asks `webfetch`), so the script could reach any URL past
+ * codeoid's gate. With Code Mode gone opencode lists the tools it kept in its
+ * catalog directly, so opencode's own `browser` deny (its agents have it,
+ * and codeoid's ask-everything would reopen it) is kept too.
+ *
+ * A plugin can settle a permission request itself (its `permission.evaluate`
+ * hook runs after the rules), so opencode would never publish it. The server
+ * reads its global config — plugins, agents, MCP servers, instructions — from
+ * a codeoid-owned directory (`OPENCODE_CONFIG_DIR`), never the user's; only
+ * the provider and model keys of the user's global config are carried over
+ * ({@link userModelConfig}). A server listing any plugin that isn't one of
+ * opencode's built-ins is refused (server.ts), and a call that ran without
+ * asking stops it (index.ts).
+ */
+
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
+import { OPENCODE_MODEL_ID } from "../../../config.js";
+import type { OcAgentInfo, OcPluginInfo, OcRule } from "./client.js";
+
+/** Plugins whose tools act without asking — disabled (`-<id>`, opencode's plugin control). */
+export const DISABLED_PLUGINS = ["-opencode.tools", "-opencode.tool.schedule", "-opencode.vcs.hg"] as const;
+
+/**
+ * opencode's own hosted providers, served by opencode.ai: `opencode` (Zen,
+ * whose free models need no key: 2.2.5 enables it with the key `public` when
+ * it has none) and `opencode-go` (Go, with a key) — the two 2.2.5 treats as
+ * its own (its free-model filter and Console integration name exactly
+ * these). Off unless the owner opts in (`providers.opencode.hostedModels`):
+ * the injected config's `disabled_providers` names them (opencode turns that
+ * into a `provider.use` deny, which removes a provider and its models from
+ * every listing and from the default), nothing carried from the user's config
+ * may bring them back — no entry of either id, none whose `canonical` copies
+ * one, none whose base URL is on opencode.ai ({@link hostedEntry}) — and the
+ * server's environment turns off its catalog fetch from opencode.ai and its
+ * free models ({@link serverEnv}).
+ */
+export const HOSTED_PROVIDER_IDS: readonly string[] = ["opencode", "opencode-go"];
+
+/** Whether `id` is one of opencode's hosted providers. */
+export function isHostedProvider(id: string): boolean {
+  return HOSTED_PROVIDER_IDS.includes(id);
+}
+
+/** Whether a `provider/model` id names one of opencode's hosted providers. */
+export function isHostedModel(model: string): boolean {
+  const slash = model.indexOf("/");
+  return slash > 0 && isHostedProvider(model.slice(0, slash));
+}
+
+/** A URL on opencode.ai (`opencode.ai`, `*.opencode.ai`). */
+function onOpencodeAi(v: string): boolean {
+  try {
+    const host = new URL(v).hostname.toLowerCase().replace(/\.$/, "");
+    return host === "opencode.ai" || host.endsWith(".opencode.ai");
+  } catch {
+    return false;
+  }
+}
+
+/** `opencode.ai` as a whole host name (or its subdomain's end) anywhere in a text. */
+const OPENCODE_AI = /(?<![a-z0-9-])opencode\.ai(?!\.?[a-z0-9-])/;
+/** Characters a host parser drops (UTS #46 maps them to nothing). */
+const IGNORED = /\p{Default_Ignorable_Code_Point}/gu;
+
+/**
+ * Whether a setting's text names opencode.ai, after what a URL's host
+ * parsing would undo: percent-encoding (repeatedly), compatibility forms
+ * (fullwidth letters and dots, `。`), case, ignored characters. Any
+ * setting, not only a URL: opencode's bundled SDKs build hosts from plain
+ * settings ({@link HOST_SETTINGS}), and `x@opencode.ai/v1?` spliced into
+ * one makes opencode.ai the host.
+ */
+export function mentionsOpencodeAi(v: string): boolean {
+  let text = v;
+  for (let i = 0; i < 4; i++) {
+    const next = text
+      .replace(/%([0-9a-f]{2})/gi, (_m, h: string) => String.fromCharCode(Number.parseInt(h, 16)))
+      .normalize("NFKC")
+      .replace(IGNORED, "")
+      .replace(/[\u3002\uff0e\uff61]/g, ".")
+      .toLowerCase();
+    if (next === text) break;
+    text = next;
+  }
+  // Percent-decoded bytes may be UTF-8 of a lookalike dot or letter.
+  try {
+    text += ` ${decodeURIComponent(v).normalize("NFKC").replace(IGNORED, "").replace(/[\u3002\uff0e\uff61]/g, ".").toLowerCase()}`;
+  } catch {
+    // not decodable as a whole: the byte-wise reading above stands
+  }
+  return OPENCODE_AI.test(text) || onOpencodeAi(v) || onOpencodeAi(`https://${v}`);
+}
+
+/** One DNS label: a host part opencode's SDKs splice in (`bedrock-runtime.${region}.amazonaws.com`). */
+const LABEL = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
+/** Dot-separated labels (a Google universe domain, `googleapis.com`). */
+const DOMAIN = /^[A-Za-z0-9][A-Za-z0-9-]*(?:\.[A-Za-z0-9][A-Za-z0-9-]*)*$/;
+
+/**
+ * The settings opencode 2.2.5's bundled SDKs build a request's host (or
+ * path) from, rather than taking a URL, and the form each must have: a
+ * value with `@`, `/`, `?`, `#` or `:` in it moves the host (`x@opencode.ai/v1?`
+ * makes opencode.ai the host, the vendor's suffix a query). Read from the
+ * binary's templates: Bedrock and Bedrock Mantle `region`
+ * (`bedrock-runtime.${region}.amazonaws.com`), Alibaba `region` and
+ * `workspaceID` (`${workspaceID}.${region}.maas.aliyuncs.com`), Azure
+ * `resourceName` (`${resourceName}.openai.azure.com`), Vertex `location`
+ * (`${location}-aiplatform.googleapis.com`) and `project` (the path),
+ * Snowflake `account` (`${account}.snowflakecomputing.com`; its locator form
+ * has dots and underscores), Cloudflare `accountId` and `gateway`, Google
+ * auth's `universeDomain` (`iamcredentials.${universeDomain}`).
+ */
+const HOST_SETTINGS: Record<string, RegExp> = {
+  region: LABEL,
+  workspaceID: LABEL,
+  workspaceId: LABEL,
+  resourceName: LABEL,
+  location: LABEL,
+  project: /^[A-Za-z0-9][A-Za-z0-9.:-]*$/,
+  account: /^[A-Za-z0-9][A-Za-z0-9_.-]*$/,
+  accountId: LABEL,
+  gateway: /^[A-Za-z0-9][A-Za-z0-9_-]*$/,
+  universeDomain: DOMAIN,
+  universe_domain: DOMAIN,
+};
+
+/**
+ * Why a provider entry (or a listed model's settings) could reach a host
+ * codeoid can't check, or opencode.ai: a host-building setting that isn't
+ * in its plain form ({@link HOST_SETTINGS}), at any depth, or any setting
+ * whose text names opencode.ai ({@link mentionsOpencodeAi}); null when none.
+ */
+export function hostSettingProblem(entry: unknown, key?: string): string | null {
+  if (typeof entry === "string") {
+    if (mentionsOpencodeAi(entry)) return `${key ?? "a setting"} names opencode.ai`;
+    const form = key === undefined ? undefined : HOST_SETTINGS[key];
+    if (form && !form.test(entry) && !SUBSTITUTION.test(entry)) return `${key} (${JSON.stringify(entry)}) isn't a plain name, and opencode builds a host from it`;
+    return null;
+  }
+  if (Array.isArray(entry)) {
+    for (const v of entry) {
+      const why = hostSettingProblem(v, key);
+      if (why) return why;
+    }
+    return null;
+  }
+  if (!isRecord(entry)) return null;
+  for (const [k, v] of Object.entries(entry)) {
+    if (mentionsOpencodeAi(k)) return `a setting's name names opencode.ai`;
+    const why = hostSettingProblem(v, k);
+    if (why) return why;
+  }
+  return null;
+}
+
+/**
+ * Whether a provider entry reaches opencode's hosted service under another
+ * id: its `canonical` copies a hosted provider (2.2.5's `overlayProvider`
+ * takes the source's URL and catalog), or one in `hosted` (another entry
+ * already dropped), or a URL in it is on opencode.ai, or a setting names
+ * it or would move the host opencode builds ({@link hostSettingProblem}).
+ */
+export function hostedEntry(entry: unknown, hosted: ReadonlySet<string> = new Set(HOSTED_PROVIDER_IDS)): boolean {
+  if (!isRecord(entry)) return false;
+  if (typeof entry.canonical === "string" && (hosted.has(entry.canonical) || isHostedProvider(entry.canonical))) return true;
+  const urls = (v: unknown): boolean => (typeof v === "string" ? onOpencodeAi(v) : Array.isArray(v) ? v.some(urls) : isRecord(v) ? Object.values(v).some(urls) : false);
+  return urls(entry) || hostSettingProblem(entry) !== null;
+}
+
+/** A setting that opencode builds a request's URL or host from: a URL, a host or domain, an endpoint, a proxy, `api`, `canonical`, or one of {@link HOST_SETTINGS}. */
+function buildsAddress(key: string): boolean {
+  return /url|uri|endpoint|host|domain|origin|proxy|server|^api$|^canonical$/i.test(key) || key in HOST_SETTINGS;
+}
+
+/**
+ * The setting of a provider entry that holds a `{file:…}` (or other
+ * substitution) whose text can't be checked for opencode.ai before opencode
+ * reads it: one that builds a URL or host ({@link buildsAddress}: `baseURL`,
+ * `api`, `url`, `canonical`, `region`, a `Host` header, …), or a header's
+ * name; null when none. A credential through a file (`apiKey`, Bedrock's
+ * keys, a Vertex private key, an OpenAI organization) is carried: the
+ * server-start check sees what opencode substituted.
+ */
+export function uncheckedReference(entry: unknown, key?: string): string | null {
+  if (typeof entry === "string") return key !== undefined && buildsAddress(key) && SUBSTITUTION.test(entry) ? key : null;
+  if (Array.isArray(entry)) {
+    for (const v of entry) {
+      const k = uncheckedReference(v, key);
+      if (k) return k;
+    }
+    return null;
+  }
+  if (!isRecord(entry)) return null;
+  for (const [k, v] of Object.entries(entry)) {
+    const found = k === "headers" && isRecord(v) ? (Object.keys(v).find((h) => SUBSTITUTION.test(h)) ?? uncheckedReference(v)) : uncheckedReference(v, k);
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * Whether a model opencode lists (`GET /api/model`, its `settings` with
+ * every `{file:}` substituted) is served by opencode's hosted service: a
+ * hosted provider's, or one whose settings — its own, a variant's, its
+ * headers or body — name opencode.ai or splice a host ({@link hostedEntry}).
+ */
+export function hostedModelInfo(m: { providerID: string; settings?: unknown; variants?: unknown; headers?: unknown; body?: unknown }): boolean {
+  return isHostedProvider(m.providerID) || hostedEntry({ settings: m.settings, variants: m.variants, headers: m.headers, body: m.body });
+}
+
+/**
+ * The ids of `providers` (an id → entry map, the user's or codeoid's) that
+ * reach opencode's hosted service: a hosted id, or an entry that does
+ * ({@link hostedEntry}), each in turn until none is added (an entry whose
+ * `canonical` names another such one).
+ */
+export function hostedIdsOf(...maps: unknown[]): Set<string> {
+  const hosted = new Set(HOSTED_PROVIDER_IDS);
+  const entries = maps.flatMap((m) => (isRecord(m) ? Object.entries(m) : []));
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const [id, entry] of entries) {
+      if (hosted.has(id) || !hostedEntry(entry, hosted)) continue;
+      hosted.add(id);
+      grew = true;
+    }
+  }
+  return hosted;
+}
+
+/** Prefix of every MCP server codeoid mounts on opencode (`coid<session>_<name>`). */
+export const MCP_MOUNT_PREFIX = "coid";
+
+/**
+ * The per-session part of a mounted server's name. opencode's MCP set is per
+ * DIRECTORY, not per session, so two codeoid sessions in one workdir see each
+ * other's mounts; each mount is named for its session and the session rules
+ * deny every other session's (`coid*` deny, then own `coid<sfx>_*` ask).
+ */
+export function mountSuffix(sessionId: string): string {
+  return createHash("sha256").update(sessionId).digest("hex").slice(0, 10);
+}
+
+/** `coid<sfx>_` — the action prefix of this session's own MCP tools. */
+export function ownMountPrefix(sessionId: string): string {
+  return `${MCP_MOUNT_PREFIX}${mountSuffix(sessionId)}_`;
+}
+
+/** opencode's server-name normalization (`McpTool.namespace`): anything outside [a-zA-Z0-9_-] becomes `_`. */
+export function mcpNamespace(name: string): string {
+  return name.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+/**
+ * opencode's own slash commands, by the description each lists (2.2.2 and
+ * 2.2.5 alike). A command from a config dir (`commands/*.md`, codeoid's own
+ * or `/etc/opencode`'s) runs every `` !`…` `` of its template through the
+ * shell, the message's arguments substituted in first, with no permission
+ * request — past codeoid's gate. One named like a built-in replaces it, so a
+ * built-in is known by its description too.
+ *
+ * Not `goal`: after every round its plugin sends the model a reviewer
+ * request of its own (`plugin/goal.ts` `judge`, up to 50 rounds), which no
+ * step, `usage.updated` or session total of opencode's reports, so neither
+ * the turn's cost nor `maxBudgetUsd` would see it.
+ */
+const BUILTIN_COMMANDS = new Map([
+  ["init", "guided AGENTS.md setup"],
+  ["review", "review changes [commit|branch|pr], defaults to uncommitted"],
+]);
+
+/**
+ * Whether a command opencode lists runs as a command in this session (else a
+ * `/name …` message goes to the model as text): one of opencode's built-ins,
+ * or a prompt of one of this session's own MCP mounts (`<mount>:<prompt>`,
+ * `ownMounts` the mounts' normalized names). Another session's mount in the
+ * same location lists its prompts too: run here, its server would be called
+ * with that session's credential, the result landing in this conversation.
+ * With `args`, a built-in carries none with a shell span: it doesn't
+ * interpolate them, but a config command that took its name and description
+ * would.
+ */
+export function runnableCommand(sessionId: string, command: { name: string; description?: string }, ownMounts: Iterable<string>, args?: string): boolean {
+  const builtin = BUILTIN_COMMANDS.get(command.name);
+  if (builtin !== undefined) return command.description === builtin && !args?.includes("!`");
+  const prefix = ownMountPrefix(sessionId);
+  for (const mount of ownMounts) if (command.name.startsWith(`${prefix}${mount}:`)) return true;
+  return false;
+}
+
+/** Tools opencode must not offer at all: a deny rule hides them (see the file header). */
+export const HIDDEN_TOOL_RULES: readonly OcRule[] = [
+  { action: "execute", resource: "*", effect: "deny" },
+  { action: "browser", resource: "*", effect: "deny" },
+];
+
+/** The session rules: ask for everything, only this session's own mounts, and never Code Mode. */
+export function sessionRules(sessionId: string): OcRule[] {
+  return [
+    { action: "*", resource: "*", effect: "ask" },
+    ...HIDDEN_TOOL_RULES,
+    { action: `${MCP_MOUNT_PREFIX}*`, resource: "*", effect: "deny" },
+    { action: `${ownMountPrefix(sessionId)}*`, resource: "*", effect: "ask" },
+  ];
+}
+
+/**
+ * opencode's `webfetch` follows redirects itself, checking each hop only
+ * against the rules (a hop is never asked about: under ask-everything, every
+ * one passes). So while an approved fetch runs, its session's rules also
+ * carry this fence: every other site is denied, and a redirect there fails
+ * the call — the model has to fetch the new address as a call of its own,
+ * which asks. Hops on an approved fetch's own origin still pass. `origins`:
+ * of the session's approved fetches still running; null for one whose
+ * origin can't be pinned (none of its hops pass).
+ */
+export function fetchFence(origins: Iterable<string | null>): OcRule[] {
+  const pinned = [...new Set([...origins].filter((o): o is string => o !== null))];
+  return [
+    { action: "webfetch", resource: "*", effect: "deny" },
+    ...pinned.map((origin) => ({ action: "webfetch", resource: `${origin}/*`, effect: "ask" as const })),
+  ];
+}
+
+/**
+ * The origin a fetch of `url` stays on, as opencode writes each hop's URL
+ * (`URL.href`: `<origin>/…`). Null when it can't be pinned: not http(s), or a
+ * `*` in it (a wildcard in a rule).
+ */
+export function fetchOrigin(url: string): string | null {
+  try {
+    const u = new URL(url);
+    if ((u.protocol !== "http:" && u.protocol !== "https:") || u.origin.includes("*")) return null;
+    return u.origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * opencode's wildcard (`Wildcard.match`): `*` matches any run, the rest is
+ * literal. Used to judge whether one rule's pattern covers another's.
+ */
+function wildcard(pattern: string): RegExp {
+  return new RegExp(`^${pattern.split("*").map((s) => s.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*")}$`, "s");
+}
+
+/** True when every value `inner` matches, `outer` matches too (conservative: literal or `*`-pattern match). */
+function covers(outer: string, inner: string): boolean {
+  if (outer === "*" || outer === inner) return true;
+  return !inner.includes("*") && wildcard(outer).test(inner);
+}
+
+/**
+ * The `allow` rules of a ruleset that no later ask/deny rule overrides — what
+ * an agent would run without asking anyone.
+ */
+export function survivingAllows(rules: readonly OcRule[]): OcRule[] {
+  return rules.filter(
+    (r, i) =>
+      r.effect === "allow" &&
+      !rules.slice(i + 1).some((later) => later.effect !== "allow" && covers(later.action, r.action) && covers(later.resource, r.resource)),
+  );
+}
+
+/**
+ * Agents a child session could run as that would act on something without
+ * asking. Only subagents: opencode's subagent tool refuses a `primary` agent,
+ * and a primary agent only runs in a codeoid session, whose own rules end in
+ * ask-everything.
+ */
+export function unsafeAgents(agents: readonly OcAgentInfo[]): OcAgentInfo[] {
+  return agents.filter((a) => a.mode !== "primary" && survivingAllows(a.permissions ?? []).length > 0);
+}
+
+/**
+ * Config overrides that make each unsafe agent ask where it allowed: its
+ * surviving allows, appended again as asks. Agent config rules are appended
+ * after the agent's own, so these are last for it; its denies stay in force.
+ */
+export function agentOverrides(agents: readonly OcAgentInfo[]): Record<string, { permissions: OcRule[] }> {
+  const out: Record<string, { permissions: OcRule[] }> = {};
+  for (const a of unsafeAgents(agents)) {
+    out[a.id] = { permissions: survivingAllows(a.permissions).map((r) => ({ ...r, effect: "ask" as const })) };
+  }
+  return out;
+}
+
+/**
+ * The keys of the user's global opencode config codeoid's server takes:
+ * which models and providers it has. Nothing that changes what runs or what
+ * asks (plugins, agents, permissions, MCP servers, instructions); within
+ * them, only what {@link userModelConfig} lets through.
+ */
+const CARRIED_KEYS = ["provider", "providers", "model", "small_model", "enabled_providers", "disabled_providers"] as const;
+
+const SUBSTITUTION = /\{(?:file|env):/;
+
+/**
+ * Whether a config value holds an opencode substitution (`{file:…}` /
+ * `{env:…}`): opencode expands them anywhere in the config's text, a
+ * relative file against the location it loads (a session's workdir).
+ */
+export function hasSubstitution(value: unknown): boolean {
+  if (typeof value === "string") return SUBSTITUTION.test(value);
+  if (Array.isArray(value)) return value.some(hasSubstitution);
+  if (value && typeof value === "object") return Object.entries(value).some(([k, v]) => SUBSTITUTION.test(k) || hasSubstitution(v));
+  return false;
+}
+
+/**
+ * The AI SDK package names opencode 2.2.5 maps onto providers it bundles
+ * (`@opencode/ai/providers/…`); anything else it imports (`file://`, an
+ * installed module) or installs from npm and imports, inside the server.
+ */
+const BUNDLED_PACKAGE_ALIASES = new Set([
+  "@ai-sdk/amazon-bedrock", "@ai-sdk/alibaba", "@ai-sdk/anthropic", "@ai-sdk/azure", "@ai-sdk/cerebras", "@ai-sdk/cohere",
+  "@ai-sdk/deepinfra", "@ai-sdk/google", "@ai-sdk/google-vertex", "@ai-sdk/google-vertex/anthropic", "@ai-sdk/groq",
+  "@ai-sdk/mistral", "@ai-sdk/openai", "@ai-sdk/openai-compatible", "@ai-sdk/togetherai", "@ai-sdk/xai", "@ai-sdk/gateway",
+  "@openrouter/ai-sdk-provider", "ai-gateway-provider", "venice-ai-sdk-provider",
+]);
+const BUNDLED_PACKAGE = /^@opencode\/ai\/providers\/[a-z0-9-]+(?:\/[a-z0-9-]+)*$/;
+
+/** The first provider package (`package`, v1's `npm`) in a config entry that isn't one opencode bundles. */
+function foreignPackage(value: unknown): string | undefined {
+  if (Array.isArray(value)) return value.map(foreignPackage).find((p) => p !== undefined);
+  if (!isRecord(value)) return undefined;
+  for (const [k, v] of Object.entries(value)) {
+    if ((k === "package" || k === "npm") && !(typeof v === "string" && (BUNDLED_PACKAGE.test(v) || BUNDLED_PACKAGE_ALIASES.has(v)))) return String(v);
+    const nested = foreignPackage(v);
+    if (nested !== undefined) return nested;
+  }
+  return undefined;
+}
+
+/** A key anywhere in `value` that holds a substitution: opencode would expand it too. */
+function substitutionInKey(value: unknown): boolean {
+  if (Array.isArray(value)) return value.some(substitutionInKey);
+  if (!isRecord(value)) return false;
+  return Object.entries(value).some(([k, v]) => SUBSTITUTION.test(k) || substitutionInKey(v));
+}
+
+/**
+ * `value` with each relative `{file:…}` made absolute against the user's
+ * config dir `dir`, as their own opencode reads it (`~/…` and absolute ones
+ * stay): codeoid's server would read it against the location it loads, a
+ * session's workdir. Null when a path can't be written back faithfully
+ * (`}`, or anything JSON escapes).
+ */
+function rebasedFileReferences(value: unknown, dir: string): unknown {
+  if (typeof value === "string") {
+    let ok = true;
+    const out = value.replace(/\{file:([^}]+)\}/g, (ref, path: string) => {
+      if (path.startsWith("~/") || isAbsolute(path)) return ref;
+      const abs = resolve(dir, path);
+      if (/[}"\\\u0000-\u001f]/.test(abs)) ok = false;
+      return `{file:${abs}}`;
+    });
+    return ok ? out : null;
+  }
+  if (Array.isArray(value)) {
+    const out = value.map((v) => rebasedFileReferences(v, dir));
+    return out.includes(null) ? null : out;
+  }
+  if (!isRecord(value)) return value;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) {
+    const r = rebasedFileReferences(v, dir);
+    if (r === null) return null;
+    out[k] = r;
+  }
+  return out;
+}
+
+/**
+ * `value` with every literal string in it (but a `package`/`npm` name, and
+ * one naming a `{file:…}` already) replaced by `file(string)`, a `{file:…}`
+ * reference to a file holding it: a key written in the user's config must not
+ * ride the injected config, which is in the server's environment. Null when
+ * one can't go through a file as written: opencode trims what it reads.
+ */
+function literalsToFiles(value: unknown, file: (literal: string) => string, key?: string): unknown {
+  if (typeof value === "string") {
+    if (key === "package" || key === "npm" || /\{file:[^}]+\}/.test(value)) return value;
+    return value.trim() === value ? file(value) : null;
+  }
+  if (Array.isArray(value)) {
+    const out = value.map((v) => literalsToFiles(v, file));
+    return out.includes(null) ? null : out;
+  }
+  if (!isRecord(value)) return value;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value)) {
+    const r = literalsToFiles(v, file, k);
+    if (r === null) return null;
+    out[k] = r;
+  }
+  return out;
+}
+
+/**
+ * What codeoid's server may take of one carried key from the user's config
+ * in `dir`. A provider entry is dropped whole when it names a package
+ * opencode doesn't bundle (opencode would import it — a `file://` module,
+ * or one it installs from npm — into the server, with the injected config
+ * in its environment), or holds an `{env:…}` (it reads the server's
+ * environment, its password included; no key is there). Its relative
+ * `{file:…}` references are made the user's config dir's, and its literal
+ * strings go through files (`literalsToFiles`, `file`), as codeoid's own keys
+ * do. A default model must be a `provider/model` id (`OPENCODE_MODEL_ID`),
+ * as codeoid's own is.
+ */
+function carriedValue(
+  key: (typeof CARRIED_KEYS)[number],
+  value: unknown,
+  dir: string,
+  skipped: string[],
+  file: (literal: string) => string,
+  hosted: ReadonlySet<string> | null,
+): unknown {
+  if (key === "provider" || key === "providers") {
+    if (!isRecord(value)) return undefined;
+    const kept: Record<string, unknown> = {};
+    for (const [id, entry] of Object.entries(value)) {
+      // Off, a host opencode would build from a setting must be one codeoid can read.
+      const spliced = hosted && !isHostedProvider(id) ? hostSettingProblem(entry) : null;
+      if (spliced) {
+        skipped.push(`${key}.${id}: ${spliced}, which may reach opencode's hosted service (opencode.ai), which is off (set providers.opencode.hostedModels to use it)`);
+        continue;
+      }
+      if (hosted?.has(id)) {
+        skipped.push(
+          isHostedProvider(id)
+            ? `${key}.${id}: opencode's hosted provider is off (set providers.opencode.hostedModels to use it)`
+            : `${key}.${id}: it reaches opencode's hosted service (opencode.ai), which is off (set providers.opencode.hostedModels to use it)`,
+        );
+        continue;
+      }
+      // Off, a URL that only opencode's substitution shows can't be checked for opencode.ai.
+      const unchecked = hosted ? uncheckedReference(entry) : null;
+      if (unchecked) {
+        skipped.push(`${key}.${id}: its ${unchecked} comes from a {file:…} reference, and opencode builds a URL or host from it, which may be opencode's hosted service: that is off and can't be checked there (write the ${unchecked} itself, or set providers.opencode.hostedModels)`);
+        continue;
+      }
+      const pkg = foreignPackage(entry);
+      const rebased = pkg === undefined ? rebasedFileReferences(entry, dir) : null;
+      if (pkg !== undefined) skipped.push(`${key}.${id}: its package ${JSON.stringify(pkg)} isn't one opencode bundles, and opencode would load it into codeoid's server`);
+      else if (/\{env:/.test(JSON.stringify(entry)) || SUBSTITUTION.test(id) || substitutionInKey(entry)) {
+        skipped.push(`${key}.${id}: it holds an {env:…} reference, which codeoid's server would read from its own environment (no key is there; name a key with {file:…})`);
+      } else if (rebased === null) skipped.push(`${key}.${id}: a {file:…} path in it can't be passed on as written`);
+      else {
+        // A dry run first: an entry not carried leaves no file.
+        const filed = literalsToFiles(rebased, (l) => l) === null ? null : literalsToFiles(rebased, file);
+        if (filed === null) skipped.push(`${key}.${id}: a value in it has leading or trailing whitespace, which opencode would lose reading it from a file (codeoid hands opencode no key in its environment)`);
+        else kept[id] = filed;
+      }
+    }
+    return kept;
+  }
+  if (key === "model" || key === "small_model") {
+    if (typeof value === "string" && hosted?.has(value.split("/")[0]!)) {
+      skipped.push(`${key}: ${value} is on opencode's hosted service, which is off (set providers.opencode.hostedModels to use it)`);
+      return undefined;
+    }
+    if (typeof value === "string" && OPENCODE_MODEL_ID.test(value)) return value;
+    skipped.push(`${key}: it isn't a \`provider/model\` id (no \`{\`, \`}\`, quotes or spaces)`);
+    return undefined;
+  }
+  if (Array.isArray(value) && value.every((v) => typeof v === "string") && !hasSubstitution(value)) {
+    if (key !== "enabled_providers" || !hosted || !value.some((v) => hosted.has(v))) return value;
+    // Naming them would not re-enable them (the injected deny comes later), but say they aren't.
+    // A restriction stays one: a list that named only hosted providers enables none of the user's.
+    const rest = value.filter((v) => !hosted.has(v));
+    skipped.push(
+      rest.length > 0
+        ? `${key}: its entries for opencode's hosted service (${value.filter((v) => hosted.has(v)).join(", ")}), which is off (set providers.opencode.hostedModels to use it)`
+        : `${key}: it names only opencode's hosted service, which is off: none of your own providers is enabled (set providers.opencode.hostedModels to use it)`,
+    );
+    return rest;
+  }
+  skipped.push(`${key}: it isn't a list of provider ids`);
+  return undefined;
+}
+
+/** The user's own opencode global config directory, as their opencode finds it. */
+export function userOpencodeConfigDir(env: Record<string, string | undefined> = process.env): string {
+  return join(env.XDG_CONFIG_HOME || join(env.HOME || homedir(), ".config"), "opencode");
+}
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+
+/**
+ * The provider and model keys ({@link CARRIED_KEYS}) of the user's global
+ * opencode config in `dir` (`opencode.json`, then `opencode.jsonc`, as
+ * opencode merges them), less what {@link carriedValue} drops (each said in
+ * `skipped`). A provider's literal strings are handed to `file`, which keeps
+ * each in a file and returns its `{file:…}` reference. Without `hostedModels`,
+ * nothing reaching opencode's hosted service is carried ({@link hostedIdsOf}:
+ * a provider entry of a hosted id, one copying it with `canonical`, one on
+ * opencode.ai, a `model` or `small_model` on any of them, their
+ * `enabled_providers` entries — the list itself kept, a restriction still).
+ * Unreadable or absent: nothing.
+ */
+export function userModelConfig(
+  dir: string,
+  skipped: string[],
+  file: (literal: string) => string,
+  opts: { hostedModels?: boolean } = {},
+): Record<string, unknown> {
+  const merged: Record<string, unknown> = {};
+  for (const name of ["opencode.json", "opencode.jsonc"]) {
+    let parsed: unknown;
+    try {
+      parsed = Bun.JSONC.parse(readFileSync(join(dir, name), "utf8"));
+    } catch {
+      continue;
+    }
+    if (!isRecord(parsed)) continue;
+    for (const k of CARRIED_KEYS) {
+      if (!(k in parsed)) continue;
+      const prev = merged[k];
+      merged[k] = isRecord(prev) && isRecord(parsed[k]) ? { ...prev, ...parsed[k] } : parsed[k];
+    }
+  }
+  const out: Record<string, unknown> = {};
+  // Off: every id that reaches opencode.ai, the user's own aliases included.
+  const hosted = opts.hostedModels === true ? null : hostedIdsOf(merged.providers, merged.provider);
+  for (const k of CARRIED_KEYS) {
+    if (!(k in merged)) continue;
+    const v = carriedValue(k, merged[k], dir, skipped, file, hosted);
+    if (v !== undefined) out[k] = v;
+  }
+  return out;
+}
+
+/**
+ * The config injected with `OPENCODE_CONFIG_CONTENT`. `providers` adds model
+ * providers (opencode's `providers` key: codeoid's credentials, see
+ * credentials.ts), `carried` the user's provider and model keys
+ * ({@link userModelConfig}); the policy keys aren't reachable from either.
+ * A provider codeoid configures replaces the user's of the same id (under
+ * `providers` and the older `provider`): the user's own stands only where
+ * codeoid has nothing. `model` (`providers.opencode.model`) is the default
+ * model, over the user's, when it is a `provider/model` id
+ * (`OPENCODE_MODEL_ID`): one holding a substitution would have opencode read
+ * a file or variable into the model id it sends with every request.
+ *
+ * Without `hostedModels`, opencode's hosted providers are denied
+ * (`disabled_providers`, beside any the user's config disables) and nothing
+ * here reaches them ({@link hostedIdsOf}): no provider entry of a hosted id,
+ * copying one or on opencode.ai, no default or small model on one, no
+ * `enabled_providers` entry.
+ *
+ * A carried `enabled_providers` is a restriction (opencode denies every
+ * provider, then allows each listed): it keeps its meaning for the user's
+ * own providers, and codeoid's own (`providers`) are added to it, as they
+ * are codeoid's to hand over, not the user's to restrict.
+ */
+export function opencodeConfig(
+  overrides: Record<string, { permissions: OcRule[] }> = {},
+  providers?: Record<string, unknown>,
+  carried: Record<string, unknown> = {},
+  opts: { model?: string; hostedModels?: boolean } = {},
+): Record<string, unknown> {
+  const on = opts.hostedModels === true;
+  const models: Record<string, unknown> = {};
+  for (const k of CARRIED_KEYS) if (carried[k] !== undefined) models[k] = carried[k];
+  const ours = { ...(providers ?? {}) };
+  const hosted = on ? new Set<string>() : hostedIdsOf(models.providers, models.provider, ours);
+  if (!on) {
+    for (const id of Object.keys(ours)) if (hosted.has(id)) delete ours[id];
+    for (const k of ["provider", "providers"] as const) {
+      if (isRecord(models[k])) models[k] = Object.fromEntries(Object.entries(models[k]).filter(([id]) => !hosted.has(id)));
+    }
+    for (const k of ["model", "small_model"] as const) if (typeof models[k] === "string" && hosted.has(models[k].split("/")[0]!)) delete models[k];
+    if (Array.isArray(models.enabled_providers)) models.enabled_providers = models.enabled_providers.filter((v) => !hosted.has(v));
+    const disabled = Array.isArray(models.disabled_providers) ? models.disabled_providers.filter((v) => !hosted.has(v)) : [];
+    models.disabled_providers = [...disabled, ...hosted];
+  }
+  if (Array.isArray(models.enabled_providers)) models.enabled_providers = [...new Set([...models.enabled_providers, ...Object.keys(ours)])];
+  const allProviders = { ...(isRecord(models.providers) ? models.providers : {}), ...ours };
+  delete models.providers;
+  if (isRecord(models.provider)) {
+    const legacy = Object.fromEntries(Object.entries(models.provider).filter(([id]) => !(id in ours)));
+    if (Object.keys(legacy).length > 0) models.provider = legacy;
+    else delete models.provider;
+  }
+  if (opts.model && OPENCODE_MODEL_ID.test(opts.model) && !hosted.has(opts.model.split("/")[0]!)) models.model = opts.model;
+  return {
+    ...models,
+    ...(Object.keys(allProviders).length > 0 ? { providers: allProviders } : {}),
+    permissions: [{ action: "*", resource: "*", effect: "ask" }, ...HIDDEN_TOOL_RULES],
+    plugins: [...DISABLED_PLUGINS],
+    // No formatter runs a workspace's code after an approved edit (prettier
+    // loads its config, `mix format` its project): a boolean resets every
+    // document below this one, and one above it is refused (formatterProblem).
+    formatter: false,
+    // codeoid pins the version it speaks; opencode must not replace itself.
+    update: "disable",
+    share: "disabled",
+    ...(Object.keys(overrides).length > 0 ? { agents: overrides } : {}),
+  };
+}
+
+/**
+ * Environment for the opencode server: what opencode needs to run and no
+ * credential at all — no `*_API_KEY` / `*_API_TOKEN`, no provider-prefixed
+ * variable, no `CODEOID_AGENT_ENV_ALLOW` name, no codeoid token. opencode
+ * runs some shell lines without asking, and a subagent codeoid hasn't set a
+ * shell environment for yet runs its shell with this one, so anything here
+ * could be printed into a result the model reads. Model keys reach opencode
+ * through its config, from files (credentials.ts). The user's own
+ * `OPENCODE_*` settings don't pass either: a password, database or config
+ * dir from the user's environment would point the private server at the
+ * user's own opencode. codeoid sets its own ({@link serverEnv}).
+ */
+export function buildOpencodeEnv(base: Record<string, string | undefined> = process.env): Record<string, string> {
+  return basicEnv(base);
+}
+
+/** Anything that could substitute, redirect, pipe, group, escape or background: never in a {@link commandlessShellLine}. */
+const SHELL_ACTIVE = /[$`<>|(){}\\!]|(?<!&)&(?!&)|&&&/;
+const SHELL_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const SHELL_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*\+?=/;
+/** Builtins that only change the shell's own state (it ends with the call), given names or assignments. */
+const SHELL_STATE_BUILTINS = new Set(["export", "unset", "readonly"]);
+/** Declaration builtins 2.2.5's scanner finds no command in, whatever their words: with options or none, they list the shell's state. */
+const SHELL_DECLARATION_BUILTINS = new Set(["export", "unset", "readonly", "declare", "typeset", "local"]);
+const SHELL_OPTION = /^-[A-Za-z]+$/;
+
+/**
+ * A shell line opencode runs without asking, as 2.2.5 does a line its
+ * scanner finds no command in (`shell.ts`: it asks only `if
+ * (parsed.commands.length > 0)`), that can do nothing outside the shell
+ * process of the call: only assignments, `cd`, `export`/`unset`/`readonly`,
+ * comments and separators (`;`, `&&`, newlines), with no substitution,
+ * expansion, redirection, pipe, group, escape or background in it. Such a
+ * call succeeding unasked is opencode's own rule, not something settling
+ * requests behind codeoid's back. Conservative: any other line that ran
+ * unasked still stops the server.
+ *
+ * With `listing`, a declaration builtin given options or nothing
+ * (`export -p`, `declare -p`, `unset -v X`, `local`) counts too: it prints
+ * the shell's variables or functions. Only for a shell whose environment
+ * is known to be codeoid's bare one (the session's, set before its turn):
+ * a subagent's may still be the server's, password and all, when a feed
+ * gap hid its start, and such a listing stopping the server is what
+ * changes that password.
+ */
+export function commandlessShellLine(line: string, opts: { listing?: boolean } = {}): boolean {
+  // A comment runs nothing, whatever it holds (`# $(…)`): judged without them.
+  const command = withoutComments(line);
+  if (command === null || SHELL_ACTIVE.test(command)) return false;
+  const segments: string[][] = [[]];
+  let word: string | null = null;
+  const end = () => {
+    if (word !== null) segments.at(-1)!.push(word);
+    word = null;
+  };
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    if (ch === "'" || ch === '"') {
+      const close = command.indexOf(ch, i + 1);
+      if (close < 0) return false;
+      word = (word ?? "") + command.slice(i + 1, close);
+      i = close;
+    } else if (ch === "#" && word === null) {
+      // A comment, to the end of its line.
+      const nl = command.indexOf("\n", i);
+      if (nl < 0) break;
+      i = nl - 1;
+    } else if (ch === ";" || ch === "\n" || ch === "&") {
+      end();
+      segments.push([]);
+      if (ch === "&") i++; // `&&` (a lone `&` is refused above)
+    } else if (ch === " " || ch === "\t") {
+      end();
+    } else {
+      word = (word ?? "") + ch;
+    }
+  }
+  end();
+  return segments.every(([first, ...rest]) => {
+    if (first === undefined) return true;
+    if (first === "cd") return rest.length <= 2;
+    const declaration = (w: string) => SHELL_NAME.test(w) || SHELL_ASSIGNMENT.test(w);
+    // With no name, or an option (`export -p`), they print variables instead.
+    if (opts.listing && SHELL_DECLARATION_BUILTINS.has(first)) return rest.every((w) => declaration(w) || SHELL_OPTION.test(w));
+    if (SHELL_STATE_BUILTINS.has(first)) return rest.length > 0 && rest.every(declaration);
+    return [first, ...rest].every((w) => SHELL_ASSIGNMENT.test(w));
+  });
+}
+
+/**
+ * A shell line less its comments, as the shell reads them: an unquoted `#`
+ * that starts a word, to the end of its line. Null with a quote left open.
+ * A `#` after anything but a blank, `;`, `&` or a newline is kept (it may
+ * not start a word): a line keeping one is judged as written.
+ */
+function withoutComments(line: string): string | null {
+  let out = "";
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]!;
+    if (ch === "'" || ch === '"') {
+      const close = line.indexOf(ch, i + 1);
+      if (close < 0) return null;
+      out += line.slice(i, close + 1);
+      i = close;
+    } else if (ch === "#" && (i === 0 || " \t;&\n".includes(line[i - 1]!))) {
+      const nl = line.indexOf("\n", i);
+      if (nl < 0) break;
+      i = nl - 1;
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+/** What the server and a session's shell keep of the daemon's environment: nothing secret-bearing. */
+const SHELL_EXACT = new Set([
+  "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "LANGUAGE", "TZ", "TERM", "TMPDIR", "TEMP", "TMP", "COLORTERM",
+  "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
+]);
+const SHELL_PROXY = new Set(["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "all_proxy", "no_proxy"]);
+/** The user's own XDG base dirs: a session's commands use them, as the user's would. The server's are codeoid's ({@link serverEnv}). */
+const XDG_DIRS = ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR"] as const;
+
+function basicEnv(base: Record<string, string | undefined>): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (v === undefined) continue;
+    if (SHELL_EXACT.has(k) || k.startsWith("LC_") || (SHELL_PROXY.has(k) && !proxyHasCredentials(v))) env[k] = v;
+  }
+  return env;
+}
+
+/**
+ * The environment a codeoid session's shell commands run with (set per
+ * opencode session: `PUT …/environment`; opencode uses the server's own
+ * otherwise). opencode asks about a shell line only when its scanner finds a
+ * command in it, so a line of assignments runs unasked and can print any
+ * variable it expands (`X=${U?$PASSWORD}`). The server's environment carries
+ * its password and the injected config: none of it reaches the shell. Only
+ * basics, locale, CA trust, proxies that carry no credentials, and the
+ * daemon's own XDG base dirs and TMPDIR (never the server's, which point into
+ * codeoid's opencode data dir); no model key, no `CODEOID_AGENT_ENV_ALLOW` name.
+ */
+export function opencodeShellEnv(base: Record<string, string | undefined> = process.env): Record<string, string> {
+  const env = basicEnv(base);
+  for (const k of XDG_DIRS) {
+    const v = base[k];
+    if (v) env[k] = v;
+  }
+  return env;
+}
+
+function proxyHasCredentials(value: string): boolean {
+  try {
+    const u = new URL(value.includes("://") ? value : `http://${value}`);
+    return u.username !== "" || u.password !== "";
+  } catch {
+    // Not a URL (NO_PROXY's host list): credentials would need an `@`.
+    return value.includes("@");
+  }
+}
+
+/**
+ * Where opencode keeps its data, logs, state, caches and temp files under
+ * codeoid's opencode data dir (`providers.opencode.dataDir`): its XDG base
+ * dirs, and its `TMPDIR` (opencode's own tmp is `$TMPDIR/opencode`, created
+ * at every start and where `image_generate` saves by default: never a shared
+ * `/tmp/opencode` another local user could have made first).
+ */
+export function opencodeServerDirs(dataDir: string): { XDG_DATA_HOME: string; XDG_STATE_HOME: string; XDG_CACHE_HOME: string; TMPDIR: string } {
+  return { XDG_DATA_HOME: join(dataDir, "data"), XDG_STATE_HOME: join(dataDir, "state"), XDG_CACHE_HOME: join(dataDir, "cache"), TMPDIR: join(dataDir, "tmp") };
+}
+
+/**
+ * The shell opencode runs a session's lines with: the `bash` on `PATH`, else
+ * `/bin/sh` (opencode's own fallback). opencode 2.2.5 takes the server's
+ * `$SHELL` for any shell but fish and nu, `-Command` for pwsh, while codeoid
+ * judges every line as bash reads it (#431): a login shell that reads a line
+ * otherwise (pwsh, tcsh, xonsh) could run what the card doesn't show.
+ */
+export function opencodeServerShell(path: string | undefined = process.env.PATH): string {
+  const found = Bun.which("bash", { PATH: absolutePath(path) });
+  return found && isAbsolute(found) ? found : "/bin/sh";
+}
+
+/**
+ * git config every git opencode runs on its own gets (`GIT_CONFIG_COUNT`,
+ * which outranks the repository's config; git 2.31+, an older one ignores it
+ * and a repository's workdir is refused, server.ts `gitProblem`): opencode reads a workspace's repo
+ * unasked (`rev-parse`, `remote get-url`, `rev-list`, `check-ignore`, …) and
+ * snapshots it into a gitdir of its own, and a repo's config can make git run
+ * a command. Hooks, fsmonitor and an external diff are off, nothing is
+ * signed or shows a signature, no submodule is recursed into, and a bare
+ * repository is used only when named. With {@link OPENCODE_GIT_ENV}: no
+ * transport at all, so no `core.sshCommand`, `ext::` remote, credential
+ * helper or promisor fetch is reached. Filter and textconv drivers are
+ * defined by name, so can't be shut off here: opencode 2.2.5 runs no command
+ * on a workspace's own repo that applies them.
+ */
+export const OPENCODE_GIT_OVERRIDES: ReadonlyArray<readonly [string, string]> = [
+  ["core.hooksPath", "/dev/null"],
+  ["core.fsmonitor", "false"],
+  ["core.untrackedCache", "false"],
+  ["diff.external", ""],
+  ["commit.gpgSign", "false"],
+  ["tag.gpgSign", "false"],
+  ["log.showSignature", "false"],
+  ["submodule.recurse", "false"],
+  ["safe.bareRepository", "explicit"],
+];
+
+/** The rest of what git opencode runs on its own gets: no transport, no lazy fetch, no prompt, no pager. */
+export const OPENCODE_GIT_ENV: Readonly<Record<string, string>> = {
+  GIT_ALLOW_PROTOCOL: "none",
+  GIT_NO_LAZY_FETCH: "1",
+  GIT_TERMINAL_PROMPT: "0",
+  GIT_PAGER: "cat",
+};
+
+/**
+ * What Mercurial opencode runs on its own gets: opencode 2.2.5 runs
+ * `hg log -r roots(all())` in every location under a `.hg` (its project id;
+ * its `opencode.vcs.hg` plugin, which runs more, is disabled), and hg reads
+ * the repository's `.hg/hgrc` for every command, whose `[hooks]` and
+ * `[extensions]` run code. No repository hgrc (`HGRCSKIPREPO`, Mercurial
+ * 5.4+: an older one is refused, server.ts `mercurialProblem`), no user or
+ * system one either (`HGRCPATH` empty), plain output.
+ */
+export const OPENCODE_HG_ENV: Readonly<Record<string, string>> = {
+  HGRCSKIPREPO: "1",
+  HGRCPATH: "",
+  HGPLAIN: "1",
+};
+
+/** {@link OPENCODE_GIT_OVERRIDES} as git's environment keys. */
+export function gitOverrideEnv(overrides: ReadonlyArray<readonly [string, string]> = OPENCODE_GIT_OVERRIDES): Record<string, string> {
+  const env: Record<string, string> = { GIT_CONFIG_COUNT: String(overrides.length) };
+  overrides.forEach(([k, v], i) => {
+    env[`GIT_CONFIG_KEY_${i}`] = k;
+    env[`GIT_CONFIG_VALUE_${i}`] = v;
+  });
+  return env;
+}
+
+/**
+ * A `PATH`'s absolute entries: a relative one (`.`, `bin`) names another file
+ * in each directory a program is started in, and opencode starts git, hg and
+ * ripgrep in the workspace unasked: with `.` on its `PATH`, a repository's
+ * own `./git` would run.
+ */
+export function absolutePath(path: string | undefined): string {
+  return (path ?? "").split(":").filter(isAbsolute).join(":");
+}
+
+/** The server's own settings, set last over {@link buildOpencodeEnv}. */
+export function serverEnv(opts: {
+  password: string;
+  dbPath: string;
+  configDir: string;
+  dataDir: string;
+  config: Record<string, unknown>;
+  shell?: string;
+  path?: string;
+  hostedModels?: boolean;
+}): Record<string, string> {
+  return {
+    // What it runs on its own resolves to the same program wherever it runs it.
+    ...(opts.path !== undefined ? { PATH: absolutePath(opts.path) } : {}),
+    // The shell its lines run with is the one codeoid judges them as; a
+    // session's commands still see the user's own `$SHELL` (opencodeShellEnv).
+    SHELL: opts.shell ?? opencodeServerShell(),
+    // Its logs, shell output, state, caches and temp files: codeoid's, never
+    // the user's `~/.local/share/opencode`, `~/.cache/opencode` or a shared
+    // `/tmp/opencode`. A session's shell keeps the user's own (opencodeShellEnv).
+    ...opencodeServerDirs(opts.dataDir),
+    OPENCODE_PASSWORD: opts.password,
+    OPENCODE_DB: opts.dbPath,
+    // Its global config (plugins, agents, MCP servers) is codeoid's, not the
+    // user's `~/.config/opencode`: a plugin there could settle permissions.
+    OPENCODE_CONFIG_DIR: opts.configDir,
+    OPENCODE_CONFIG_CONTENT: JSON.stringify(opts.config),
+    // A repo's opencode.json could allow tools or add MCP servers codeoid
+    // never sees; codeoid's own Claude-side settings aren't opencode's.
+    OPENCODE_DISABLE_PROJECT_CONFIG: "1",
+    OPENCODE_DISABLE_CLAUDE_CODE: "1",
+    // The version control opencode runs unasked in a workspace runs none of
+    // the repository's code. A session's shell has its own environment
+    // (opencodeShellEnv): git and hg the user approves there behave as theirs.
+    ...gitOverrideEnv(),
+    ...OPENCODE_GIT_ENV,
+    ...OPENCODE_HG_ENV,
+    // opencode.ai only when the owner opted in: 2.2.5 fetches its model
+    // catalog from models.opencode.ai at every start (the catalog it bundles
+    // has every built-in provider's models), and offers its hosted free
+    // models with no key. The injected `disabled_providers` is what keeps the
+    // hosted provider out; this is the second lock on its free models.
+    ...(opts.hostedModels ? {} : { OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_FREE_MODELS: "1" }),
+  };
+}
+
+/**
+ * Why a server offers opencode's hosted service though codeoid turned it
+ * off, or null. `providers` from `GET /api/provider`; `models` from
+ * `GET /api/model`, whose settings opencode has substituted; `config` the
+ * documents of `GET /api/config`. The injected deny should have removed the
+ * hosted providers, and the carried config drops what reaches them; a
+ * config document opencode ranks above the injected one (`/etc/opencode`)
+ * could still add one, under any id, by an opencode.ai URL. Refused: a
+ * listed provider of a hosted id, one copying one (`canonical`), one a
+ * config document makes reach opencode.ai ({@link hostedIdsOf}), one with a
+ * model whose settings name opencode.ai. Fail closed.
+ */
+export function hostedProviderProblem(
+  providers: ReadonlyArray<{ id: string; canonical?: string }>,
+  hostedModels: boolean,
+  more: { models?: ReadonlyArray<Parameters<typeof hostedModelInfo>[0]>; config?: ReadonlyArray<{ info?: Record<string, unknown> }> } = {},
+): string | null {
+  if (hostedModels) return null;
+  const configured = hostedIdsOf(...(more.config ?? []).flatMap((e) => [e.info?.provider, e.info?.providers]));
+  const byModel = new Set((more.models ?? []).filter(hostedModelInfo).map((m) => m.providerID));
+  const listed = [...providers, ...[...byModel].filter((id) => !providers.some((p) => p.id === id)).map((id) => ({ id }))];
+  const found = listed.filter((p: { id: string; canonical?: string }) => configured.has(p.id) || byModel.has(p.id) || (typeof p.canonical === "string" && isHostedProvider(p.canonical)));
+  if (found.length === 0) return null;
+  return `opencode offers its own hosted models (provider ${found.map((p) => `\`${p.id}\``).join(", ")}, opencode.ai) though codeoid turned them off — refusing to use this opencode server. Remove what enables them from opencode's configuration (its system configuration, or a file your own configuration names through {file:…}), or set providers.opencode.hostedModels to use them.`;
+}
+
+/**
+ * Why opencode would run formatters for a location whose config documents
+ * are `entries` (`GET /api/config`, lowest priority first), or null. opencode
+ * resolves `formatter` across them as its formatter plugin does: a boolean
+ * resets everything before it, an object merges over what's before; it
+ * registers its built-ins (prettier, gofmt, `mix format`, rubocop, …) for
+ * anything but undefined or false, and runs one after each edit, unasked
+ * (the card showed only the edit): several run the workspace's own code.
+ * codeoid's injected `false` resets every document below it; one above it
+ * (opencode's system config dir, `/etc/opencode`, outranks the injected
+ * config) that turns them back on is named. Fail closed: any value but
+ * false counts, an object whose entries are all disabled too.
+ */
+export function formatterProblem(entries: ReadonlyArray<{ type: string; path?: string; info?: Record<string, unknown> }>): string | null {
+  let effective: unknown;
+  let from: string[] = [];
+  for (const e of entries) {
+    if (e.type !== "document" || e.info?.formatter === undefined) continue;
+    const value = e.info.formatter;
+    const where = e.path ?? "codeoid's injected config";
+    if (typeof value === "boolean" || typeof effective !== "object" || effective === null) from = [where];
+    else from.push(where);
+    effective = value;
+  }
+  if (effective === undefined || effective === false) return null;
+  return `opencode's configuration turns its formatters on (\`formatter\` in ${from.join(", ")}), which run programs in the workspace after an edit without asking codeoid — refusing to use this opencode server. Remove the \`formatter\` key from opencode's system configuration.`;
+}
+
+/**
+ * Plugins a server runs that aren't opencode's own built-ins: any of them
+ * could settle permission requests without codeoid seeing them.
+ */
+export function foreignPlugins(plugins: readonly OcPluginInfo[]): OcPluginInfo[] {
+  return plugins.filter((p) => p.source?.type !== "builtin");
+}
+
+/** How a plugin is named in a refusal. */
+export function describePlugin(p: OcPluginInfo): string {
+  const where = p.source?.path ?? p.source?.target;
+  return `${p.id ?? "(unnamed)"}${where ? ` (${where})` : ""}`;
+}

@@ -103,6 +103,19 @@ export function isElicitationTool(name: string): boolean {
   return ELICITATION_TOOLS.has(name);
 }
 
+/**
+ * A call whose path codeoid couldn't resolve for certain — where it leads
+ * in the backend's process isn't known (opencode's `opencode_unresolved_path`
+ * card, providers/opencode/translate.ts). Only a path proven to lead where
+ * the card says may run unasked, so it is asked about in EVERY mode,
+ * autonomous included, like an elicitation.
+ */
+const UNRESOLVED_PATH_TOOLS = new Set<string>(["opencode_unresolved_path"]);
+
+export function isUnresolvedPathTool(name: string): boolean {
+  return UNRESOLVED_PATH_TOOLS.has(name);
+}
+
 // ── Capability-role enforcement (ambient pack activation — docs/pack-loading.md)
 
 /** Built-in file-mutation tools. A `write:false` capability role (e.g. the
@@ -151,6 +164,10 @@ export function roleDeniesTool(role: ToolRole, toolName: string): string | null 
   if (role.write === false && isWriteTool(toolName)) {
     return `capability role is read-only (write: false) — "${toolName}" is not permitted`;
   }
+  // It may be a write, and where it leads isn't known: not a read-only role's to ask about.
+  if (role.write === false && isUnresolvedPathTool(toolName)) {
+    return `capability role is read-only (write: false) — "${toolName}" names a path that can't be resolved for certain`;
+  }
   if (role.network === false && isNetworkTool(toolName)) {
     return `capability role forbids network access (network: false) — "${toolName}" is not permitted`;
   }
@@ -165,8 +182,10 @@ export function roleDeniesTool(role: ToolRole, toolName: string): string | null 
  *  tool names this file keys off. Other backends use their own tool names, skip
  *  canUseTool in autonomous mode (codex), or expose no write tools — so a role
  *  there is ADVISORY: the constitution + role-contract system prompt guide the
- *  model, but nothing hard-denies. See docs/pipeline-run.md (enforcement matrix). */
-const HARD_ROLE_ENFORCEMENT = new Set(["claude"]);
+ *  model, but nothing hard-denies. See docs/pipeline-run.md (enforcement matrix).
+ *  opencode asks codeoid about every action in every mode, under these names
+ *  (opencode/translate.ts), so a role is enforced there too. */
+const HARD_ROLE_ENFORCEMENT = new Set(["claude", "opencode"]);
 
 /** Whether the capability-role tool gate is HARD-enforced on `providerId`, or
  *  only ADVISORY (soft, prompt-contract-only). */

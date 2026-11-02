@@ -558,6 +558,52 @@ const pi: SettingsTab = {
   ],
 };
 
+const opencode: SettingsTab = {
+  id: "opencode",
+  title: "opencode",
+  icon: "◇",
+  description:
+    "opencode 2.2.5+ over its HTTP server: one private server per daemon (docs/opencode.md). Its model credentials are codeoid's own — the Anthropic, OpenAI and Google keys, the Qwen backend's key, the OpenAI-compatible endpoints — handed to opencode from files, never through its environment; or a sign-in stored in codeoid's opencode database. Every setting here is read when the daemon starts its opencode server.",
+  groups: [
+    {
+      id: "opencode-provider",
+      title: "Backend",
+      fields: [
+        cfg("providers.opencode.enabled", "Enable opencode", "Register the opencode backend in the provider catalog.", { kind: "boolean", default: true }),
+        cfg("providers.opencode.command", "opencode command", "Binary to spawn — a name on PATH, a wrapper script or an absolute path. Must be opencode 2.2.5 or a later 2.2.", {
+          default: "opencode",
+          advanced: true,
+        }),
+        cfg("providers.opencode.agent", "Agent", "The opencode agent sessions run: `build`, `plan` (read-only planning), or one of your own. Empty: opencode's default (`build`).", {
+          placeholder: "build",
+        }),
+        cfg("providers.opencode.model", "Default model", "Model for sessions that don't pick one, as `provider/model` (e.g. `qwen/qwen3.8-max`, `anthropic/claude-sonnet-5`). Empty: opencode's default among the models codeoid offers it; with none, a turn fails saying what to set.", {
+          placeholder: "provider/model",
+        }),
+        cfg(
+          "providers.opencode.hostedModels",
+          "opencode's hosted models",
+          "Offer opencode's own hosted models (provider `opencode`: opencode.ai / Zen, its free no-key models included), and let opencode fetch its model catalog from opencode.ai. Off: they're not offered, nor picked as a default, and a session's code goes only to providers codeoid or your opencode config gave a credential for.",
+          { kind: "boolean", default: false },
+        ),
+      ],
+    },
+    {
+      id: "opencode-storage",
+      title: "Storage",
+      description: "Where codeoid's opencode keeps its sessions and files — never your own opencode's.",
+      fields: [
+        cfg("providers.opencode.dbPath", "Database", "opencode's database for codeoid's sessions. Default: `opencode/opencode.db` beside codeoid's database. Relative paths resolve from codeoid's config dir. Moving it starts opencode's sessions afresh (codeoid's history carries over).", {
+          advanced: true,
+        }),
+        cfg("providers.opencode.dataDir", "Data dir", "opencode's logs, shell output, state and caches. Default: an `opencode` folder beside codeoid's transcript dir. Relative paths resolve from codeoid's config dir.", {
+          advanced: true,
+        }),
+      ],
+    },
+  ],
+};
+
 const openai: SettingsTab = {
   id: "openai",
   title: "OpenAI",
@@ -718,7 +764,7 @@ const hooks: SettingsTab = {
 
 export const SETTINGS_MANIFEST: SettingsManifest = {
   version: MANIFEST_VERSION,
-  tabs: [general, memory, fleet, claude, codex, geminiCli, pi, openai, gemini, llamacpp, identity, frontends, hooks],
+  tabs: [general, memory, fleet, claude, codex, geminiCli, pi, opencode, openai, gemini, llamacpp, identity, frontends, hooks],
 };
 
 // ── Derived accessors ─────────────────────────────────────────────────────────

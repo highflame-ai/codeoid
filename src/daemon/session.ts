@@ -44,6 +44,7 @@ import {
   type CatalogEntry,
   isPlaceholderModel,
   BUDGET_STOP_MESSAGE,
+  UNPRICED_STOP_MESSAGE,
 } from "./providers/interface.js";
 import { createDefaultProviderRegistry, type ProviderRegistry } from "./providers/registry.js";
 import { selectContextStrategy, renderSessionMap, renderRotationSeed, type ContextStrategy } from "./providers/context-strategy.js";
@@ -71,7 +72,7 @@ import type {
   SessionWorktree,
   McpReconnectResult,
 } from "../protocol/types.js";
-import { basename, dirname, join, resolve as resolvePath } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
@@ -166,7 +167,7 @@ import {
   type MemoryEngine,
   type MemoryMcpMount,
 } from "./memory/index.js";
-import { isElicitationTool, isSafeTool, roleDeniesTool } from "./providers/tool-safety.js";
+import { isElicitationTool, isSafeTool, isUnresolvedPathTool, roleDeniesTool } from "./providers/tool-safety.js";
 import type { PackActivation } from "./pipeline/index.js";
 import { McpRegistry } from "./mcp/registry.js";
 import { mcpSpecKey, SessionMcpView, type WorkdirReach } from "./mcp/session-view.js";
@@ -198,10 +199,11 @@ import { secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir } from "./compress/spill.js";
 import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
+import { type OutsideWrite, outsideWriteOf, outsideWriteReason } from "./outside-writes.js";
 import { outsideEffects } from "./risk/effects.js";
 import { assessShellCommandSync, type ShellRisk, UNREADABLE_SHELL_CALL } from "./risk/shell-risk.js";
 import { loadShellParser, shellParserReady } from "./shell/parse.js";
-import { isShellTool, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
+import { isShellTool, runsNoCommand, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -249,6 +251,8 @@ const SUBAGENT_REGISTRATION_FENCE_MS = 5_000;
  * that, and it bounds the stall if the backend ever does not continue.
  */
 const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
+/** How long a send waits for an ended run's last events before its own turn replaces it. */
+const ENDED_RUN_DRAIN_MS = 5_000;
 
 /**
  * A fork's parent's task asked to stop that the backend still lists after
@@ -264,6 +268,7 @@ const CANCEL_REASON: Record<SessionUiResolvedMsg["reason"], NonNullable<UiRespon
   cancelled: "dismissed",
   timeout: "timeout",
   interrupted: "interrupted",
+  withdrawn: "withdrawn",
 };
 
 /** A person (or their token), as opposed to a daemon principal (`system:dispatch`, `system:routines`, …). */
@@ -736,9 +741,21 @@ export function irreversibleEffects(turns: readonly CanonicalTurn[], ctx: { work
       if (tc.name.startsWith("mcp__") || tool.startsWith("mcp__")) {
         out.push({ tool, detail: shorten(JSON.stringify(tc.input)) });
       } else if (isShellTool(tc.name, tool)) {
-        const cmd = shellCommandOf(tc.input);
-        // Judged by what it runs (#431), from the workspace it ran in.
-        if (outsideEffects(cmd, ctx)) out.push({ tool, detail: shorten(cmd) });
+        const call = shellCallOf(tc.name, tc.input) ?? shellCallOf(tool, tc.input);
+        const cmd = call?.command ?? shellCommandOf(tc.input);
+        // Judged by what it runs (#431), in the directory it ran in, as the gate judged it.
+        const cwd = call?.cwd ? resolvePath(ctx.workdir, call.cwd) : ctx.workdir;
+        if (outsideEffects(cmd, { ...ctx, cwd })) out.push({ tool, detail: shorten(cmd) });
+      } else if (isUnresolvedPathTool(tc.name)) {
+        // opencode's shell call in a directory it couldn't resolve for certain:
+        // judged in each place it may have run, as the gate judged it.
+        const inner = typeof tc.input.tool === "string" ? tc.input.tool : "";
+        const call = tc.input.call && typeof tc.input.call === "object" ? shellCallOf(inner, tc.input.call as Record<string, unknown>) : null;
+        if (!call) continue;
+        const places = Array.isArray(tc.input.paths) ? tc.input.paths.filter((p): p is string => typeof p === "string" && p.length > 0) : [];
+        if ((places.length > 0 ? places : [ctx.workdir]).some((cwd) => outsideEffects(call.command, { ...ctx, cwd: resolvePath(ctx.workdir, cwd) }))) {
+          out.push({ tool: inner, detail: shorten(call.command) });
+        }
       }
     }
   }
@@ -803,6 +820,12 @@ interface TurnCounts {
   reports: number;
   /** The model streamed output after the last usage report: a request whose usage hasn't come yet (#430). */
   unreported?: boolean;
+}
+
+/** How serious a shell call's verdict is: a refusal, then a credential ask, then its level (#431). */
+function riskWeight(r: ShellRisk): number {
+  const level = { low: 0, medium: 1, unknown: 2, high: 3 }[r.level];
+  return (r.secret?.action === "deny" ? 20 : r.secret ? 10 : 0) + (r.unreadable ? 4 : level);
 }
 
 /** A usage report that counts some tokens. */
@@ -1363,7 +1386,7 @@ export class Session {
    * (qwen) could otherwise show one call while another is parked. Set just
    * before parking, cleared when the wait returns.
    */
-  #approvalInputs = new Map<string, { toolName: string; input: unknown }>();
+  #approvalInputs = new Map<string, { toolName: string; input: unknown; shellCwd?: string | null }>();
   /**
    * Decisions that arrived BEFORE canUseTool registered its resolver. The
    * event consumer broadcasts the waiting_confirmation tool message (and the
@@ -1390,6 +1413,8 @@ export class Session {
       msg: SessionUiRequestMsg;
       resolve: (r: UiResponse) => void;
       timer?: ReturnType<typeof setTimeout>;
+      /** Stops listening for the provider's withdrawal (`UiRequest.signal`). */
+      unlisten?: () => void;
     }
   >();
 
@@ -1753,6 +1778,7 @@ export class Session {
       // Read per query: a fork is primed after its provider is built.
       forkBoundary: () => this.#forkIsolation?.boundaryAt,
       isForeignAgent: (agentId) => this.#isForeignAgent(agentId),
+      sessionMode: () => this.#mode,
       isForeignTask: (taskId) => this.#forkIsolation?.foreignTasks.has(taskId) === true,
       isFork: () => this.#forkIsolation !== null,
       isOwnTask: (taskId) => this.#isOwnTask(taskId),
@@ -3138,8 +3164,9 @@ export class Session {
   /**
    * Raise a dialog on behalf of the provider and await the user's answer.
    * Passed to providers as `TurnOpts.requestUserInput`. The promise settles
-   * when the first client answers, the request times out (`timeoutMs`), or
-   * the session is interrupted/destroyed — never rejects. With no deadline it
+   * when the first client answers, the request times out (`timeoutMs`), the
+   * provider withdraws it (`signal`), or the session is interrupted/destroyed
+   * — never rejects. With no deadline it
    * waits for a human however long, like a tool approval: it is re-sent to
    * every client that attaches and can render it, and shows in the session's
    * info (`pendingDialog`) so any surface can see what it is waiting on. A
@@ -3147,6 +3174,7 @@ export class Session {
    */
   requestUserInput(req: UiRequest): Promise<UiResponse> {
     if (this.#unattended > 0) return Promise.resolve({ cancelled: true, reason: "unattended" });
+    if (req.signal?.aborted) return Promise.resolve({ cancelled: true, reason: "withdrawn" });
     const requestId = randomUUID();
     const msg: SessionUiRequestMsg = {
       type: "session.ui_request",
@@ -3168,7 +3196,12 @@ export class Session {
               this.#settleUiRequest(requestId, { cancelled: true }, "timeout");
             }, req.timeoutMs)
           : undefined;
-      this.#pendingUiRequests.set(requestId, { msg, resolve, timer });
+      // The provider withdrew it (the backend settled the question itself): nobody's answer would reach it.
+      const signal = req.signal;
+      const withdraw = () => this.#settleUiRequest(requestId, { cancelled: true }, "withdrawn");
+      signal?.addEventListener("abort", withdraw, { once: true });
+      const unlisten = signal ? () => signal.removeEventListener("abort", withdraw) : undefined;
+      this.#pendingUiRequests.set(requestId, { msg, resolve, timer, ...(unlisten ? { unlisten } : {}) });
       this.#broadcastToCapable(CAPABILITIES.UI_DIALOGS, msg);
       this.#broadcastInfoUpdate(); // pendingDialog
     });
@@ -3242,6 +3275,7 @@ export class Session {
     if (!pending) return false;
     this.#pendingUiRequests.delete(requestId);
     if (pending.timer) clearTimeout(pending.timer);
+    pending.unlisten?.();
     pending.resolve(
       response.cancelled && response.reason === undefined
         ? { ...response, reason: CANCEL_REASON[reason] }
@@ -3604,7 +3638,7 @@ export class Session {
     // it shapes that run rather than starting one — so the running turn's
     // remaining output stays attributed to it. `previousTurnId` lets a send
     // that is refused or stopped below hand attribution back.
-    const joinsRunningTurn = wasWorking && !!this.#activeRun?.pushMidTurn && this.#currentTurnId !== null;
+    const joinsRunningTurn = wasWorking && this.#takesMidTurn(this.#activeRun) && this.#currentTurnId !== null;
     const previousTurnId = this.#currentTurnId;
     let turnId = joinsRunningTurn ? (previousTurnId as string) : this.#beginTurn();
     // Per-turn controls belong to a turn that STARTS here, not to one this
@@ -3688,7 +3722,7 @@ export class Session {
     }
 
     // For keep-warm mid-turn pushes (ClaudeProvider), inject directly into the live run.
-    if (wasWorking && this.#activeRun?.pushMidTurn) {
+    if (wasWorking && this.#activeRun && this.#takesMidTurn(this.#activeRun)) {
       const hint =
         effectivePriority === "now"
           ? // Provider-agnostic: this path is reached by any keep-warm backend
@@ -3869,6 +3903,11 @@ export class Session {
     // agent can touch them — what "go back to before this message" restores.
     // Bounded wait; a snapshot still running when the turn starts is `late`.
     await this.#checkpointTurn(turnId);
+    // A run whose turn the backend already ended, its last events still being
+    // read: let its end land (its result, spend included) before this turn
+    // replaces it, or the ownership guard would drop it.
+    const ended = this.#activeRun;
+    if (ended?.pushMidTurn && !this.#takesMidTurn(ended)) await this.turnDrained(ENDED_RUN_DRAIN_MS);
     this.#throwIfStoppedBeforeStart(stopGen);
     // The fork's notes again, after every await: one may have been armed or
     // spent meanwhile (a settle, a turn the backend started and was handed
@@ -3881,7 +3920,7 @@ export class Session {
     // whose runTurn would close the adopted queue mid-reply. Joining means
     // the adopted turn's id, not the one minted for this prompt.
     const adopted = this.#activeRun;
-    if (adopted?.pushMidTurn) {
+    if (adopted && this.#takesMidTurn(adopted)) {
       // The snapshot was for a turn that won't happen.
       void this.#dropCheckpoint(turnId);
       // #adoptTurn gave the adopted run its own id (current, unless unset).
@@ -4923,8 +4962,9 @@ export class Session {
     for (const approvalId of this.#pendingApprovals.keys()) {
       const gated = this.#approvalInputs.get(approvalId);
       if (!gated) continue;
-      const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>);
-      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...(risk ? { risk: { level: risk.level, reasons: risk.reasons } } : {}) });
+      const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
+      const outside = this.#outsideWrite(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
+      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, outside) });
     }
     return out;
   }
@@ -5954,6 +5994,11 @@ export class Session {
   /** The pack this session runs under, for a fork to carry (its role's tool deny included). */
   get packActivation(): PackActivation | undefined {
     return this.#pack;
+  }
+
+  /** The run takes a mid-turn message (its backend's turn hasn't ended under it). */
+  #takesMidTurn(run: TurnRun | null): run is TurnRun & Required<Pick<TurnRun, "pushMidTurn">> {
+    return !!run?.pushMidTurn && run.acceptsMidTurn?.() !== false;
   }
 
   /**
@@ -7186,6 +7231,10 @@ export class Session {
     // waiting_approval until the owner attaches and answers.
     if (isElicitationTool(toolName)) return false;
 
+    // HARD gate, mode-independent: a call whose path the backend couldn't
+    // resolve for certain is never run unasked (tool-safety.ts).
+    if (isUnresolvedPathTool(toolName)) return false;
+
     if (this.#mode === "interactive") return false;
 
     // Read-only / retrieval tools — safe in both guarded and autonomous.
@@ -7222,7 +7271,7 @@ export class Session {
   #budgetSpentFor(toolName: string): boolean {
     if (this.#onBudgetExhausted !== "end_attempt" || this.#mode !== "autonomous") return false;
     if (this.#turnsRemaining === undefined || this.#turnsRemaining > 0) return false;
-    if (isFleetSendTool(toolName) || isElicitationTool(toolName)) return false;
+    if (isFleetSendTool(toolName) || isElicitationTool(toolName) || isUnresolvedPathTool(toolName)) return false;
     return !isSafeTool(toolName) && !this.#isReadonlyMcpTool(toolName);
   }
 
@@ -7237,6 +7286,7 @@ export class Session {
   #peekAutoApprove(toolName: string): boolean {
     if (isFleetSendTool(toolName)) return false;
     if (isElicitationTool(toolName)) return false;
+    if (isUnresolvedPathTool(toolName)) return false;
     if (this.#mode === "interactive") return false;
     if (isSafeTool(toolName)) return true;
     if (this.#isReadonlyMcpTool(toolName)) return true;
@@ -7430,11 +7480,36 @@ export class Session {
    * loaded at daemon start), so the gate and the approval card it draws
    * read the same verdict.
    */
-  #shellRisk(toolName: string, input: Record<string, unknown>): ShellRisk | null {
+  #shellRisk(toolName: string, input: Record<string, unknown>, shellCwd?: string | null): ShellRisk | null {
+    if (isUnresolvedPathTool(toolName)) return this.#unresolvedShellRisk(input);
     const call = shellCallOf(toolName, input);
-    if (!call) return isShellTool(toolName) ? UNREADABLE_SHELL_CALL : null;
-    const cwd = call.cwd ? resolvePath(this.workdir, call.cwd) : this.workdir;
+    if (!call) return isShellTool(toolName) && !runsNoCommand(toolName, input) ? UNREADABLE_SHELL_CALL : null;
+    // Where the backend reports its shell is (Claude's Bash keeps a `cd`), else the workdir.
+    const base = typeof shellCwd === "string" && isAbsolute(shellCwd) ? shellCwd : this.workdir;
+    const cwd = call.cwd ? resolvePath(base, call.cwd) : base;
     return assessShellCommandSync(call.command, { cwd, workdir: this.workdir, configDir: getConfigDir() });
+  }
+
+  /**
+   * A shell call whose directory can't be resolved for certain (opencode's
+   * `opencode_unresolved_path` card: `tool`, `paths` it may lead to, `call`):
+   * asked in every mode already, its command is judged in each of those
+   * places and the worst verdict stands, so a credential read is refused
+   * there as anywhere (#431). Null for a card wrapping any other tool.
+   */
+  #unresolvedShellRisk(input: Record<string, unknown>): ShellRisk | null {
+    const tool = typeof input.tool === "string" ? input.tool : "";
+    const call = input.call && typeof input.call === "object" ? (input.call as Record<string, unknown>) : null;
+    if (!isShellTool(tool) || !call) return null;
+    const command = shellCallOf(tool, call)?.command;
+    if (command === undefined) return UNREADABLE_SHELL_CALL;
+    const places = Array.isArray(input.paths) ? input.paths.filter((p): p is string => typeof p === "string" && p.length > 0) : [];
+    let worst: ShellRisk | null = null;
+    for (const cwd of places.length > 0 ? places : [this.workdir]) {
+      const r = this.#shellRisk("Bash", { command, cwd });
+      if (r && (!worst || riskWeight(r) > riskWeight(worst))) worst = r;
+    }
+    return worst;
   }
 
   /** A shell call that asks whatever the mode: high risk, a credential search, or not understood (#431). */
@@ -7445,9 +7520,40 @@ export class Session {
     return risk.level === "unknown" && (this.#config?.approvals?.askOnUnknown ?? true);
   }
 
-  /** A low-risk shell call that guarded mode runs unasked, when the config says so (#431). */
-  #riskAllows(risk: ShellRisk | null): boolean {
+  /** A low-risk shell call that guarded mode runs unasked, when the config says so (#431);
+   *  never one the hard gates keep asked (an unresolved directory), whatever its rating. */
+  #riskAllows(toolName: string, risk: ShellRisk | null): boolean {
+    if (isUnresolvedPathTool(toolName)) return false;
     return risk?.level === "low" && !risk.secret && this.#mode === "guarded" && (this.#config?.approvals?.autoAllowLowRisk ?? false);
+  }
+
+  /**
+   * In autonomous mode, a write, edit, delete or move whose target provably
+   * resolves outside the working directory, or can't be resolved for certain
+   * (outside-writes.ts): asked, not run. Null in every other mode, and for a
+   * call that writes nowhere outside. Fail closed: a judgement that throws
+   * asks.
+   */
+  #outsideWrite(toolName: string, input: Record<string, unknown>, shellCwd?: string | null): OutsideWrite | null {
+    if (this.#mode !== "autonomous") return null;
+    try {
+      return outsideWriteOf(toolName, input, this.workdir, shellCwd, { cdpathUnset: this.#provider.shellCdpathUnset === true });
+    } catch (err) {
+      console.error(`[codeoid/session ${this.id}] judging where ${toolName} writes failed, asking: ${err instanceof Error ? err.message : String(err)}`);
+      return { path: "(couldn't be judged)", resolved: false };
+    }
+  }
+
+  /**
+   * What the approval card says of a call's risk: a shell command's (#431),
+   * and an outside write's reason — first when it is what makes the call ask,
+   * after a high or not-understood command's own.
+   */
+  #cardRisk(risk: ShellRisk | null, outside: OutsideWrite | null): { risk?: { level: ShellRisk["level"]; reasons: string[] } } {
+    if (!outside) return risk ? { risk: { level: risk.level, reasons: risk.reasons } } : {};
+    const why = outsideWriteReason(outside);
+    if (risk && riskWeight(risk) > 1) return { risk: { level: risk.level, reasons: [...risk.reasons, why] } };
+    return { risk: { level: "medium", reasons: [why, ...(risk?.reasons ?? [])] } };
   }
 
   #makeCanUseToolFn(sender: AuthContext): ToolApprovalFn {
@@ -7455,7 +7561,7 @@ export class Session {
     // here, not at call time, so the rewrite check below refers to it even if
     // the session's provider has changed by the time a call arrives.
     const provider = this.#provider;
-    return async (toolId, approvalId, toolName, inputObj, signal, agentId) => {
+    return async (toolId, approvalId, toolName, inputObj, signal, agentId, shellCwd) => {
       // One of a fork's parent's agents, still running in the fork's backend:
       // it is the parent's work, and nothing it asks for runs or asks here.
       // Its tool card was never shown (#isForeignActivity). A later layer:
@@ -7605,10 +7711,10 @@ export class Session {
       // Secret-path gate (secret-paths.ts), every mode: a call naming one of the
       // daemon's credential files or a process environment is refused; one
       // searching a directory that holds them is asked about, never auto-run.
-      const secret = secretPathVerdict(toolName, effectiveInput, { workdir: this.workdir, configDir: getConfigDir() });
+      const secret = secretPathVerdict(toolName, effectiveInput, { workdir: this.workdir, configDir: getConfigDir(), cwd: shellCwd });
       // A shell command is judged by what it runs (#431): one naming a
       // credential file is refused like the file tools; a risky one asks.
-      const risk = this.#shellRisk(toolName, effectiveInput);
+      const risk = this.#shellRisk(toolName, effectiveInput, shellCwd);
       const refused = secret?.action === "deny" ? secret : risk?.secret?.action === "deny" ? risk.secret : null;
       if (refused) {
         const reason = `${refused.path} holds credentials — agents can't read it. Manage it through codeoid instead.`;
@@ -7636,11 +7742,19 @@ export class Session {
       // ends the attempt instead — whatever else would have asked about it.
       if (this.#budgetSpentFor(toolName)) return this.#endAttemptOnBudget(approvalId, toolName, sender);
       const riskAsks = this.#riskAsks(risk);
+      // Autonomous mode asks before writing outside the working directory, as
+      // a high-risk command asks: no budget spent, an unattended run parks.
+      const outside = this.#outsideWrite(toolName, effectiveInput, shellCwd);
       const autoApprove =
-        !riskAsks && secret?.action !== "ask" && !settingsWrite && (this.#riskAllows(risk) || this.#shouldAutoApprove(toolName));
+        !riskAsks &&
+        !outside &&
+        secret?.action !== "ask" &&
+        !settingsWrite &&
+        (this.#riskAllows(toolName, risk) || this.#shouldAutoApprove(toolName));
       if (riskAsks && this.#mode === "autonomous") {
         this.#store.audit(sender.sub, "session.risk_ask", this.id, `tool=${toolName} risk=${risk?.level} ${risk?.reasons[0] ?? ""}`.trim());
       }
+      if (outside) this.#store.audit(sender.sub, "session.outside_write_ask", this.id, `tool=${toolName} path=${outside.path}`);
 
       if (autoApprove) {
         this.#approvalIdToMessageId.delete(approvalId); // clean up — no manual approval will reference this
@@ -7657,7 +7771,7 @@ export class Session {
       // with or without a turn: it is what renders the approval bar.
       this.#setStatus("waiting_approval");
       this.#withdrawOnAbort(approvalId, signal);
-      this.#approvalInputs.set(approvalId, { toolName, input: effectiveInput });
+      this.#approvalInputs.set(approvalId, { toolName, input: effectiveInput, ...(shellCwd !== undefined ? { shellCwd } : {}) });
       // This request's own decision, never a past one's under the same id (#430).
       if (this.#earlyApprovals.get(approvalId)?.owner) this.#noteOwnerApproval(approvalId);
       else this.#ownerApproved.delete(approvalId);
@@ -7932,6 +8046,11 @@ export class Session {
           continue;
         }
 
+        // A failed turn the backend costed itself: its figure, not an estimate at exit (#430).
+        if (event.type === "error" && event.result && !resultRecorded) {
+          this.#recordTurnFromResult(event.result);
+          resultRecorded = true;
+        }
         await this.#handleProviderEvent(event);
         if (event.type === "turn_done") resultRecorded = true;
         if (event.type === "turn_done" || event.type === "error") break;
@@ -8276,12 +8395,14 @@ export class Session {
         // #shouldAutoApprove. Using #shouldAutoApprove here would decrement
         // twice per tool call (this handler runs in the same microtask batch
         // as canUseTool's synchronous section, always after it).
-        const risk = this.#shellRisk(event.name, event.input);
+        const risk = this.#shellRisk(event.name, event.input, event.shellCwd);
+        const outside = this.#outsideWrite(event.name, event.input, event.shellCwd);
         const autoApprove =
-          secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir() }) === null &&
+          secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir(), cwd: event.shellCwd }) === null &&
           !risk?.secret &&
           !this.#riskAsks(risk) &&
-          (this.#riskAllows(risk) || this.#peekAutoApprove(event.name));
+          !outside &&
+          (this.#riskAllows(event.name, risk) || this.#peekAutoApprove(event.name));
         // end_attempt: the gate will refuse this call outright — no approval card.
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
         const toolMsg = this.#makeMessage(
@@ -8303,7 +8424,7 @@ export class Session {
                   description: `${event.name}(${Object.keys(event.input).join(", ")})`,
                   approvalId: event.approvalId,
                   ...this.#collaborationCostFor(event.name),
-                  ...(risk ? { risk: { level: risk.level, reasons: risk.reasons } } : {}),
+                  ...this.#cardRisk(risk, outside),
                 } as unknown as ToolState),
           },
         );
@@ -8585,7 +8706,7 @@ export class Session {
               // The reply's final text block on its own (the notice after narration).
               last?.role === "assistant" ? (this.#accumulator.lastTextBlock ?? undefined) : undefined,
             ],
-            explained: tooLong || event.result.errorMessage === BUDGET_STOP_MESSAGE,
+            explained: tooLong || event.result.errorMessage === BUDGET_STOP_MESSAGE || event.result.errorMessage === UNPRICED_STOP_MESSAGE,
           });
           const hint = tooLong
             ? " — this session's context no longer fits the model. Send /rotate to continue in a fresh context (memory recall keeps the history reachable)."

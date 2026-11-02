@@ -129,14 +129,14 @@ import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "
 import { getConfigDir } from "../config.js";
 import { mcpToolPrefix } from "../daemon/mcp/types.js";
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, symlinkSync, realpathSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryEngine } from "../daemon/memory/engine.js";
 import { applyAccountEnv, bedrockModel, type ResolvedClaudeAccount, type StoredClaudeAccount } from "../daemon/claude-accounts.js";
 import { SqliteEpisodeStore } from "../daemon/memory/store.js";
 import { MEMORY_TOOL_NAMES } from "../daemon/memory/index.js";
 import type { Embedder } from "../daemon/memory/embedder.js";
-import type { EffortLevel } from "../protocol/types.js";
+import type { EffortLevel, SessionMode } from "../protocol/types.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -2758,6 +2758,132 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
     const secret = join(getConfigDir(), "config.json");
     expect((await hookCall("Read", { file_path: secret })) as unknown).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
     expect(audits.filter((a) => a === "session.secret_path_deny")).toHaveLength(2);
+    openGate();
+    await p.teardown();
+  });
+
+  it("in autonomous mode a write outside the working directory goes to codeoid's gate, past any allow rule; not in guarded mode (#447)", async () => {
+    let mode: SessionMode = "autonomous";
+    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => mode });
+    turnOn(p);
+    const outside = "/opt/codeoid-elsewhere/a.ts";
+    expect(await hookCall("Write", { file_path: outside, content: "x" })).toEqual({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: `writes outside the working directory: ${outside}` },
+    });
+    expect(await hookCall("NotebookEdit", { notebook_path: "/opt/codeoid-elsewhere/n.ipynb" })).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask" } });
+    // Inside the working directory (the turn's is the temp dir), and a read outside: no opinion.
+    expect(await hookCall("Write", { file_path: "/tmp/codeoid-inside.ts", content: "x" })).toEqual({});
+    expect(await hookCall("Read", { file_path: outside })).toEqual({});
+    mode = "guarded";
+    expect(await hookCall("Write", { file_path: outside, content: "x" })).toEqual({});
+    openGate();
+    await p.teardown();
+  });
+
+  it("a shell call's relative writes are judged from the cwd the CLI reports, in the hook and at codeoid's gate (round 25)", async () => {
+    await loadShellParser();
+    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => "autonomous" });
+    const gated: Array<{ name: string; shellCwd: string | null | undefined }> = [];
+    const events: ProviderEvent[] = [];
+    const run = p.runTurn({
+      history: [],
+      userMessage: "go",
+      workdir: "/tmp",
+      canUseTool: async (_id, _ap, name, _input, _signal, _agent, shellCwd) => {
+        gated.push({ name, shellCwd });
+        return { behavior: "allow" as const };
+      },
+    });
+    const drain = (async () => {
+      for await (const e of run.events) events.push(e);
+    })();
+    // Claude's Bash kept a `cd` into a directory outside the workdir: a relative target there is outside.
+    const elsewhere = join(homedir(), "codeoid-r25-elsewhere");
+    const hook = (command: string, cwd: string, tool_use_id: string) =>
+      preToolUseOf()({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command }, tool_use_id, cwd });
+    expect(await hook("echo planted > my-skill/NOTE.md", elsewhere, "tu-out")).toEqual({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: `writes outside the working directory: ${elsewhere}/my-skill/NOTE.md` },
+    });
+    expect(await hook("echo x > notes.txt", "/tmp", "tu-in")).toEqual({});
+    // canUseTool hands the hook's cwd to the gate (and to tool_start); a shell call it has none for is unknown; a file tool has none.
+    const gate = (capturedQueryOpts as { options: { canUseTool: (n: string, i: unknown, o: { toolUseID: string; signal: AbortSignal }) => Promise<unknown> } }).options.canUseTool;
+    const signal = new AbortController().signal;
+    await gate("Bash", { command: "echo planted > my-skill/NOTE.md" }, { toolUseID: "tu-out", signal });
+    await gate("Bash", { command: "echo x > notes.txt" }, { toolUseID: "tu-unseen", signal });
+    await gate("Write", { file_path: "/tmp/a", content: "x" }, { toolUseID: "tu-w", signal });
+    // Round 26: every tool's call carries the cwd the hook reported (null when it reported none).
+    expect(gated).toEqual([
+      { name: "Bash", shellCwd: elsewhere },
+      { name: "Bash", shellCwd: null },
+      { name: "Write", shellCwd: null },
+    ]);
+    expect(events.flatMap((e) => (e.type === "tool_start" ? [e.shellCwd] : []))).toEqual([elsewhere, null, null]);
+    openGate();
+    await drain;
+    await p.teardown();
+  });
+
+  it("the CLI's shell runs with CDPATH empty, over the daemon's, so a `cd` by a bare name is followed where it leads (round 26)", async () => {
+    await loadShellParser();
+    const saved = { CDPATH: process.env.CDPATH, ALLOW: process.env.CODEOID_AGENT_ENV_ALLOW };
+    process.env.CDPATH = "/";
+    process.env.CODEOID_AGENT_ENV_ALLOW = "CDPATH";
+    try {
+      const root = realpathSync(mkdtempSync(join(homedir(), ".codeoid-r26-cdpath-")));
+      const workdir = join(root, "w");
+      mkdirSync(join(workdir, "sub"), { recursive: true });
+      mkdirSync(join(root, "elsewhere"));
+      symlinkSync(join(root, "elsewhere"), join(workdir, "away"));
+      const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => "autonomous" });
+      void p.runTurn({ history: [], userMessage: "go", workdir, canUseTool: async () => ({ behavior: "allow" as const }) });
+      expect(envOf().CDPATH).toBe("");
+      expect(p.shellCdpathUnset).toBe(true);
+      const hook = (command: string) => preToolUseOf()({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command }, tool_use_id: `tu-${Math.random()}`, cwd: workdir });
+      expect(await hook("cd away && touch planted")).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask", permissionDecisionReason: `writes outside the working directory: ${join(root, "elsewhere", "planted")}` } });
+      expect(await hook("cd sub && touch x")).toEqual({});
+      openGate();
+      await p.teardown();
+      rmSync(root, { recursive: true, force: true });
+    } finally {
+      for (const [k, v] of [["CDPATH", saved.CDPATH], ["CODEOID_AGENT_ENV_ALLOW", saved.ALLOW]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
+  it("a Grep or Glob's relative path is judged from the cwd the CLI reports, which it resolves it from (round 26)", async () => {
+    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => "autonomous" });
+    turnOn(p);
+    // The CLI's Bash ran `cd` into a directory beside codeoid's config; a relative path from there reaches its key.
+    const moved = join(getConfigDir(), "moved-into");
+    const call = (tool_name: string, tool_input: unknown, cwd?: string) =>
+      preToolUseOf()({ hook_event_name: "PreToolUse", tool_name, tool_input, tool_use_id: `tu-${Math.random()}`, ...(cwd ? { cwd } : {}) });
+    expect(await call("Grep", { pattern: "apiKey", path: "../config.json" }, moved)).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(await call("Glob", { pattern: "*", path: ".." }, moved)).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask" } });
+    // No path: the search root is that cwd.
+    expect(await call("Grep", { pattern: "apiKey" }, getConfigDir())).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask" } });
+    // A relative path with no cwd reported can't be placed: asked.
+    expect(await call("Grep", { pattern: "x", path: "src" })).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask" } });
+    // From the workdir it would be elsewhere: as before.
+    expect(await call("Grep", { pattern: "x", path: "src" }, "/tmp")).toEqual({});
+    openGate();
+    await p.teardown();
+  });
+
+  it("Monitor's command is a shell command: judged by risk, credential paths and where it writes; a WebSocket watch isn't (round 26)", async () => {
+    await loadShellParser();
+    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => "autonomous" });
+    turnOn(p);
+    const call = (tool_input: unknown) => preToolUseOf()({ hook_event_name: "PreToolUse", tool_name: "Monitor", tool_input, tool_use_id: `tu-${Math.random()}`, cwd: "/tmp" });
+    const outside = join(homedir(), "codeoid-r26-elsewhere", "notes.txt");
+    expect(await call({ description: "d", timeout_ms: 1000, command: `echo pwned >> ${outside}` })).toMatchObject({
+      hookSpecificOutput: { permissionDecision: "ask", permissionDecisionReason: `writes outside the working directory: ${outside}` },
+    });
+    expect(await call({ description: "d", timeout_ms: 1000, command: "echo pwned >> /etc/profile" })).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask", permissionDecisionReason: expect.stringContaining("high risk") } });
+    expect(await call({ description: "d", timeout_ms: 1000, command: `tail -f ${join(getConfigDir(), "config.json")}` })).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(await call({ description: "d", timeout_ms: 1000, command: "tail -f log.txt" })).toEqual({});
+    expect(await call({ description: "d", timeout_ms: 1000, ws: { url: "wss://example.test/feed" } })).toEqual({});
     openGate();
     await p.teardown();
   });

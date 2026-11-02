@@ -58,6 +58,15 @@ export type ToolApprovalFn = (
    * gate refuse an agent that isn't this session's (a fork's parent's).
    */
   agentId?: string,
+  /**
+   * The directory the backend reports this call runs in (Claude's Bash keeps
+   * a `cd` between calls, and the CLI resolves a Grep or Glob's relative
+   * `path` from there too; its PreToolUse hook's `cwd`): a shell call's
+   * relative write targets and a tool's relative paths are judged from there
+   * (outside-writes.ts, secret-paths.ts). Null: the backend's cwd may have
+   * moved and it didn't say where. Absent: the backend runs in the workdir.
+   */
+  shellCwd?: string | null,
 ) => Promise<{
   behavior: "allow" | "deny";
   updatedInput?: Record<string, unknown>;
@@ -79,6 +88,12 @@ export interface UiRequest {
   prefill?: string;
   /** Auto-cancel deadline in ms. Absent = wait for a human (or interrupt). */
   timeoutMs?: number;
+  /**
+   * Aborted when the backend no longer wants the answer (it settled the
+   * question itself: its call ended, its agent stopped). The dialog is
+   * dismissed everywhere and settles cancelled, reason `withdrawn`.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -94,9 +109,10 @@ export interface UiResponse {
    * Why a cancelled dialog got no answer: a client dismissed it, its own
    * `timeoutMs` elapsed, the turn was interrupted / the session torn down, or
    * the turn is unattended (`unattended` — the daemon is driving it, e.g. a
-   * pipeline phase, and never prompts). Absent when answered.
+   * pipeline phase, and never prompts), or the provider withdrew it
+   * (`withdrawn`, its `signal`). Absent when answered.
    */
-  reason?: "dismissed" | "timeout" | "interrupted" | "unattended";
+  reason?: "dismissed" | "timeout" | "interrupted" | "unattended" | "withdrawn";
 }
 
 /** Raise a dialog and await the user's answer. Implemented by Session. */
@@ -108,6 +124,14 @@ export type UiRequestFn = (req: UiRequest) => Promise<UiResponse>;
  * tell "over budget" from any other failure without parsing vendor text.
  */
 export const BUDGET_STOP_MESSAGE = "Stopped at the spend ceiling for this run (maxBudgetUsd).";
+
+/**
+ * The turn error a backend reports when it stopped itself under a spend
+ * ceiling because a request's spend can't be counted: its backend put no
+ * price on tokens it used and codeoid has none either (#430). Not over
+ * budget: the run can't tell, so it fails, as a capped run of unknown cost does.
+ */
+export const UNPRICED_STOP_MESSAGE = "Stopped: this run has a spend ceiling, and a request's spend has no price (set one in pricing.models).";
 
 export interface TurnOpts {
   /**
@@ -343,6 +367,8 @@ export type ProviderEvent =
        * the daemon's approval sanitizer doesn't need per-tool hardcoding.
        */
       patchableKeys?: string[];
+      /** As {@link ToolApprovalFn}'s `shellCwd`: where the backend reports this shell call runs. */
+      shellCwd?: string | null;
     }
   /** Fired when a tool result is available (from the provider's user message). */
   | {
@@ -423,8 +449,11 @@ export type ProviderEvent =
    * The turn failed. `detail` is the backend's STRUCTURED error, when it gave
    * one (codex's `codexErrorInfo` + reset instant — codexErrorDetail): read by
    * the usage-limit classifier, never shown. `message` stays the display text.
+   * `result`: what the failed turn spent, for a backend that counts it itself
+   * (opencode): recorded as the turn's cost, instead of an estimate from the
+   * `llm_call`s Session saw (#430).
    */
-  | { type: "error"; message: string; detail?: Record<string, unknown> };
+  | { type: "error"; message: string; detail?: Record<string, unknown>; result?: NormalizedTurnResult };
 
 /**
  * True when a text/thinking ProviderEvent was produced by a subagent
@@ -539,6 +568,13 @@ export interface TurnRun {
   interrupt(): Promise<void>;
   /** Push a message mid-turn (ClaudeProvider only). */
   pushMidTurn?(content: string, priority: "now" | "next" | "later"): void;
+  /**
+   * False once the run can't take a `pushMidTurn` any more: the backend's
+   * turn already ended, though Session may not have read its end yet. The
+   * message then starts a turn of its own, as on a backend with no mid-turn
+   * injection. Absent means it always can.
+   */
+  acceptsMidTurn?(): boolean;
   /**
    * Signal that the consumer has stopped reading `events` — called from
    * Session's turn-exit path, exactly once per run.
@@ -734,6 +770,14 @@ export interface AgentProvider {
    * A loop controller falls back to wall-time limits (supervisor.ts) there.
    */
   readonly enforcesToolBudget?: boolean;
+  /**
+   * True when the backend's shell runs with `CDPATH` unset or empty, because
+   * codeoid gives it its environment (Claude's CLI: `CDPATH=` in its env;
+   * opencode: a bare `PUT …/environment`, run non-login). The outside-write
+   * check then follows a `cd` by a bare name (`cd src && …`) to where it
+   * really leads. Absent = not known: such a `cd` isn't followed.
+   */
+  readonly shellCdpathUnset?: boolean;
   /**
    * Pids of the processes this backend spawned itself (its CLI / app-server)
    * that are alive now. Session.terminateBackend snapshots their whole tree

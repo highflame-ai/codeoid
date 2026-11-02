@@ -1,5 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import { parseShell } from "./parse.js";
+import { parseShell, SHAPE_ANY, SHAPE_ONE, SHAPE_STAR, wordShape } from "./parse.js";
 
 const argvs = async (c: string) => (await parseShell(c)).commands.map((x) => x.argv.map((w) => w.value));
 
@@ -180,6 +180,20 @@ describe("shell parsing (#431)", () => {
     expect(commands[by("wget").feeds!]!.argv[0]!.value).toBe("bash");
   });
 
+  it("records `$(< FILE)` as the `cat < FILE` bash runs for it (#447 round-19 audit)", async () => {
+    for (const line of ["echo $(< f)", "echo `< f`", "x=$(<f)", 'echo "$(< f)"', "echo $(< f 2>/dev/null)"]) {
+      const { commands } = await parseShell(line);
+      const read = commands.find((c) => c.argv[0]?.value === "cat");
+      expect([line, read?.substitution, read?.redirects.find((r) => r.op === "<")?.target?.value]).toEqual([line, "command", "f"]);
+    }
+    // The command whose word holds it is what its output feeds.
+    const { commands } = await parseShell("echo $(< f)");
+    expect(commands[commands[1]!.feeds!]!.argv[0]!.value).toBe("echo");
+    // A process substitution or a statement of only a redirect reads nothing out.
+    expect(await argvs("cat <(< f)")).toEqual([["cat", null]]);
+    expect(await argvs("< f")).toEqual([]);
+  });
+
   it("marks a shell that runs its input, and what a statement's redirect substitution feeds (round-1 audit)", async () => {
     const stdin = async (c: string) => (await parseShell(c)).commands.filter((x) => x.stdinScript).map((x) => x.argv[0]!.value);
     expect(await stdin("x | sh")).toEqual(["sh"]);
@@ -218,5 +232,36 @@ describe("shell parsing (#431)", () => {
     let deep = "rm x";
     for (let i = 0; i < 10; i++) deep = `bash -c ${JSON.stringify(deep)}`;
     expect((await parseShell(deep)).problems.length).toBeGreaterThan(0);
+  });
+  it("gives each word the shape of the values it could take: run-time parts, globs, braces, xargs and find arguments (#447 round-18 audit)", async () => {
+    const shapes = async (c: string) => (await parseShell(c)).commands.flatMap((x) => x.argv.slice(1).map(wordShape));
+    expect(await shapes(`cat /proc/$PPID/environ "/proc/\${P}/x" /proc/*/e?v[ab] x[0-9]*y 'a*' b{1,2}c \\*`)).toEqual([
+      `/proc/${SHAPE_ANY}/environ`,
+      `/proc/${SHAPE_ANY}/x`,
+      `/proc/${SHAPE_STAR}/e${SHAPE_ONE}v${SHAPE_ONE}`,
+      `x${SHAPE_ONE}${SHAPE_STAR}y`,
+      "a*",
+      `b${SHAPE_ANY}c`,
+      "*",
+    ]);
+    expect(await shapes("ls | xargs -I% cat %/environ")).toEqual([`${SHAPE_ANY}/environ`]);
+    expect((await shapes("find . -exec cat {}/x +")).at(-1)).toBe(`${SHAPE_ANY}/x`);
+  });
+
+  it("reads a word the grammar splits in two as the one word bash reads (#447 round-18 audit)", async () => {
+    const { commands } = await parseShell("cat /proc/$PPID/task/$PPID/environ x");
+    expect(commands[0]!.argv.map((w) => w.raw)).toEqual(["cat", "/proc/$PPID/task/$PPID/environ", "x"]);
+    expect(wordShape(commands[0]!.argv[1]!)).toBe(`/proc/${SHAPE_ANY}/task/${SHAPE_ANY}PPID/environ`);
+  });
+
+  it("records every variable a line sets: a loop's, getopts', a quoted export; one whose name is only known at run time isn't understood (#447 round-18 audit)", async () => {
+    const set = async (c: string) => (await parseShell(c)).assignments.map((a) => [a.name, a.value.value]);
+    expect(await set("for X in a b; do :; done")).toEqual([["X", "a"], ["X", "b"]]);
+    expect(await set("getopts ab OPT")).toEqual([["OPT", null]]);
+    expect(await set('export "LD_PRELOAD=./x.so" PS_FORMAT')).toEqual([["LD_PRELOAD", "./x.so"]]);
+    for (const c of ['declare -x "$n=1"', 'export "$n"', 'printf -v "$n" x', 'read "$n"']) {
+      const parsed = await parseShell(c);
+      expect([c, parsed.assignments.some((a) => a.name === ""), parsed.problems.length > 0]).toEqual([c, true, true]);
+    }
   });
 });

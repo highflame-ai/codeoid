@@ -107,6 +107,25 @@ describe("GeminiAcpProvider over fake-acp", () => {
     expect(events.some((e) => e.type === "text_done" || (e.type === "text_delta" && e.content === "Cleaned up."))).toBe(true);
   });
 
+  it("A2b: an edit's request names its file in `locations`, not rawInput: the gate and the card are shown it", async () => {
+    const p = makeProvider();
+    const gated: Array<{ name: string; input: Record<string, unknown> }> = [];
+    const events = await collect(
+      p.runTurn(
+        turnOpts("please use-edit /w/src/a.ts", {
+          canUseTool: async (_id, _approvalId, toolName, input) => {
+            gated.push({ name: toolName, input });
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(gated).toEqual([{ name: "acp_edit", input: { locations: ["/w/src/a.ts"] } }]);
+    const start = events.find((e) => e.type === "tool_start") as { input: Record<string, unknown> } | undefined;
+    expect(start?.input).toEqual({ title: "Edit /w/src/a.ts", locations: ["/w/src/a.ts"] });
+  });
+
   it("A3: denial picks the reject option and the tool never runs", async () => {
     const p = makeProvider();
     const events = await collect(

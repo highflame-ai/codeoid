@@ -871,6 +871,14 @@ const EmbedSchema = z
   .default({ allowedOrigins: [] });
 
 /** Per-backend provider settings. Append-only — one optional block per provider. */
+/**
+ * An opencode model id as codeoid hands it to opencode (`provider/model`):
+ * nothing opencode would substitute (`{file:…}`, `{env:…}`: it would read a
+ * file or variable into the id, sent with every request), no quote,
+ * backslash, whitespace or control character.
+ */
+export const OPENCODE_MODEL_ID = /^[^/\s{}"\\\u0000-\u001f]+\/[^\s{}"\\\u0000-\u001f]+$/;
+
 const ProvidersSchema = z
   .object({
     /** pi coding agent (https://pi.dev) driven over `pi --mode rpc`. */
@@ -960,6 +968,46 @@ const ProvidersSchema = z
         free: z.boolean().optional(),
       })
       .default({ enabled: false, baseUrl: "http://127.0.0.1:8080/v1", apiKey: "sk-local", mcpServers: [] }),
+    /**
+     * opencode 2.x (https://opencode.ai), driven over its HTTP server. codeoid
+     * runs ONE private `opencode serve` per daemon, started on the first
+     * opencode session (docs/opencode.md).
+     */
+    opencode: z
+      .object({
+        /** Register the opencode backend in the provider catalog. */
+        enabled: z.boolean().default(true),
+        /** Binary to spawn — override for a wrapper script or absolute path. */
+        command: z.string().default("opencode"),
+        /**
+         * opencode's database for codeoid's sessions. Default: an `opencode`
+         * folder beside codeoid's own database (`dbPath`). Relative paths
+         * resolve from codeoid's config dir. Never the user's own opencode DB.
+         */
+        dbPath: z.string().optional(),
+        /**
+         * opencode's data, logs, state and caches (its XDG base dirs).
+         * Default: an `opencode` folder beside codeoid's transcript
+         * directory. Relative paths resolve from codeoid's config dir. Never
+         * the user's own `~/.local/share/opencode` or `~/.cache/opencode`.
+         */
+        dataDir: z.string().optional(),
+        /** opencode agent sessions run (`build`, `plan`, or a custom one); omit for opencode's default. */
+        agent: z.string().optional(),
+        /** Default model (`provider/model`, e.g. `anthropic/claude-sonnet-5`) when a session doesn't pick one; omit for opencode's default. */
+        model: z
+          .string()
+          .regex(OPENCODE_MODEL_ID, "must be `provider/model`, without `{`, `}`, quotes, backslashes or spaces")
+          .optional(),
+        /**
+         * Offer opencode's own hosted models (provider `opencode`: opencode.ai
+         * / Zen, its free no-key models included) and let the server fetch
+         * its model catalog from opencode.ai. Off: a session's prompts never
+         * go to a vendor codeoid wasn't given a credential for.
+         */
+        hostedModels: z.boolean().default(false),
+      })
+      .default({ enabled: true, command: "opencode", hostedModels: false }),
   })
   .default({
     pi: { enabled: true, command: "pi" },
@@ -967,6 +1015,7 @@ const ProvidersSchema = z
     geminiCli: { enabled: true, command: "gemini" },
     qwen: { enabled: true },
     llamacpp: { enabled: false, baseUrl: "http://127.0.0.1:8080/v1", apiKey: "sk-local", mcpServers: [] },
+    opencode: { enabled: true, command: "opencode", hostedModels: false },
   });
 
 /**
@@ -1566,6 +1615,19 @@ export interface CodeoidConfig {
       model?: string;
       mcpServers: string[];
     };
+    /** Optional in the type (older hand-built configs predate it); loadConfig always fills it. */
+    opencode?: {
+      enabled: boolean;
+      command: string;
+      /** Absolute once loadConfig resolved it (default beside `dbPath`). */
+      dbPath?: string;
+      /** Absolute once loadConfig resolved it (default beside `transcriptDir`). */
+      dataDir?: string;
+      agent?: string;
+      model?: string;
+      /** opencode's own hosted models (provider `opencode`, opencode.ai) offered; default false. */
+      hostedModels?: boolean;
+    };
   };
   /**
    * Canonical MCP server registry — declared once, mounted on every backend
@@ -1710,6 +1772,8 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_SEED_CHARS_PER_TOKEN", path: "session.seedCharsPerToken", kind: "float" },
   { env: "CODEOID_SEED_WINDOW_FRACTION", path: "session.seedWindowFraction", kind: "float" },
   { env: "CODEOID_NATIVE_CONTINUATION", path: "session.nativeContinuation", kind: "boolean" },
+  // opencode's hosted models (opencode.ai) — off unless the owner opts in.
+  { env: "CODEOID_OPENCODE_HOSTED_MODELS", path: "providers.opencode.hostedModels", kind: "boolean" },
   // Embed-SSO trusted framing origins (comma-separated). Each is an exact
   // origin (scheme://host[:port]) permitted to frame the web UI and hand it a
   // credential via the URL hash. Empty ⇒ hash handoff disabled (safe default).
@@ -1928,7 +1992,21 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     collaboration: parsed.collaboration,
     rateLimit: parsed.rateLimit,
     pipeline: parsed.pipeline,
-    providers: parsed.providers,
+    providers: {
+      ...parsed.providers,
+      // opencode's database lives with codeoid's data: beside codeoid's own
+      // database unless overridden, never the user's opencode home; its
+      // data, logs and caches beside codeoid's transcripts.
+      opencode: {
+        ...parsed.providers.opencode,
+        dbPath: parsed.providers.opencode.dbPath
+          ? configRelResolve(parsed.providers.opencode.dbPath)
+          : join(dirname(dbPath), "opencode", "opencode.db"),
+        dataDir: parsed.providers.opencode.dataDir
+          ? configRelResolve(parsed.providers.opencode.dataDir)
+          : join(dirname(transcriptDir), "opencode"),
+      },
+    },
     mcpServers: parsed.mcpServers,
     mcpOAuth: parsed.mcpOAuth,
     hooks: parsed.hooks,

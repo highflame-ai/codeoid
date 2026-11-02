@@ -490,6 +490,22 @@ describe("models.list serves live → persisted → baked-in fallback, per provi
     expect((await listModels(manager)).models.map((m) => m.value)).toEqual(["other"]);
   });
 
+  it("a persisted opencode catalog listing opencode's hosted models doesn't offer them unless opted in", async () => {
+    const first = new SessionManager(store, new TranscriptStore(join(tmp, "t")));
+    (first as unknown as CacheModels)._cacheModels("opencode", [
+      { value: "opencode/big-pickle", displayName: "Big Pickle" },
+      { value: "anthropic/claude-sonnet-5", displayName: "Claude Sonnet 5" },
+    ]);
+    const off = new SessionManager(store, new TranscriptStore(join(tmp, "t")), undefined, undefined, undefined, {
+      config: { dbPath: join(tmp, "codeoid.db"), providers: { opencode: { enabled: true, command: "opencode", hostedModels: false } } } as unknown as CodeoidConfig,
+    });
+    expect((await listModels(off, "opencode")).models.map((m) => m.value)).toEqual(["anthropic/claude-sonnet-5"]);
+    const on = new SessionManager(store, new TranscriptStore(join(tmp, "t")), undefined, undefined, undefined, {
+      config: { dbPath: join(tmp, "codeoid.db"), providers: { opencode: { enabled: true, command: "opencode", hostedModels: true } } } as unknown as CodeoidConfig,
+    });
+    expect((await listModels(on, "opencode")).models.map((m) => m.value)).toEqual(["opencode/big-pickle", "anthropic/claude-sonnet-5"]);
+  });
+
   it("an empty report never clobbers an already-cached catalog", async () => {
     const manager = new SessionManager(store, new TranscriptStore(join(tmp, "t")));
     const cache = manager as unknown as CacheModels;

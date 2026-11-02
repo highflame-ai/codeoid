@@ -6,6 +6,9 @@
  *
  *   "use-tool"      → session/request_permission (allow/reject options),
  *                     runs the tool_call only when allowed
+ *   "use-edit <path>" → session/request_permission for an edit, shaped as
+ *                     gemini-cli 0.50 sends it: no rawInput, the file in
+ *                     `locations` ({path}) and in a `diff` content block
  *   "auto-tool"     → tool_call + tool_call_update without asking
  *   "echo-prompt"   → agent_message_chunk with the full prompt
  *   "echo-mcp"      → agent_message_chunk with the last session/new mcpServers
@@ -53,6 +56,29 @@ async function runTurn(sessionId: string, prompt: string): Promise<string> {
     } else {
       update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Permission refused; skipping." } });
     }
+    return "end_turn";
+  }
+  const edit = /use-edit (\S+)/.exec(prompt);
+  if (edit) {
+    const path = edit[1]!;
+    const resp = await serverRequest("session/request_permission", {
+      sessionId,
+      toolCall: {
+        toolCallId: "tc-3",
+        status: "pending",
+        title: `Edit ${path}`,
+        content: [{ type: "diff", path, oldText: "a", newText: "b" }],
+        locations: [{ path }],
+        kind: "edit",
+      },
+      options: [
+        { optionId: "allow-1", name: "Allow", kind: "allow_once" },
+        { optionId: "reject-1", name: "Reject", kind: "reject_once" },
+      ],
+    });
+    const outcome = (resp.result as { outcome?: { outcome?: string; optionId?: string } } | undefined)?.outcome;
+    const allowed = outcome?.outcome === "selected" && outcome.optionId === "allow-1";
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: allowed ? "Edited." : "Permission refused; skipping." } });
     return "end_turn";
   }
   if (prompt.includes("auto-tool")) {

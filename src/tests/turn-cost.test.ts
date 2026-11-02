@@ -276,6 +276,22 @@ describe("a turn's cost (#430)", () => {
     expect(s.toInfo().usage!.totalCostUsd).toBeCloseTo(4, 6);
   });
 
+  it("a failed turn whose error carries the backend's own result is recorded at that figure, not estimated from its requests (#430)", async () => {
+    const { s, run } = await sessionWith([
+      [
+        { type: "llm_call", isPrimary: true, usage: { inputTokens: 1_000_000, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 } },
+        { type: "error", message: "rate limited", result: result({ totalCostUsd: 0.37, costSource: "backend", isError: true }) },
+      ],
+    ]);
+    await run();
+    const u = s.toInfo().usage!;
+    expect(u.numTurns).toBe(1);
+    expect(u.totalCostUsd).toBe(0.37);
+    expect(u.costEstimated).toBeUndefined();
+    expect(u.costUnknownTurns).toBeUndefined();
+    expect(s.status).toBe("error");
+  });
+
   it("a turn that fails while a request streams is unknown — that request's usage never came (#430)", async () => {
     // Claude, Codex and Qwen report a request's usage only when it ends, and send no model_request.
     const reported: ProviderEvent = { type: "llm_call", isPrimary: true, usage: { inputTokens: 10_000, outputTokens: 100, cacheReadTokens: 0, cacheCreationTokens: 0 } };

@@ -8,6 +8,28 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Autonomous mode asks before writing outside the working directory** (#447).
+  A write, edit, delete or move whose target resolves outside the session's working directory (resolved as the kernel does, through dangling links too, `..` after a link taken physically; the temp dir counts as inside, less codeoid's own files there) asks in autonomous mode, on every backend, with the card saying where it lands.
+  For every backend's file tools this is a hard rule: a path that can't be resolved for certain counts as outside (none given, a file with several hard links, a link loop). For shell commands it is best-effort guidance, like the risk levels: a target the parser can name and place is judged the same way (`ln` counts what it links to), and one it can't place asks only when its text could plausibly leave the working directory (absolute, `~`, `..`, a variable or substitution, a line that sets `HOME`, a `cd` that may lead anywhere), so `rm -f *.log`, `cp -r src dist`, `cd src && sed -i … index.ts` and `find src -exec sed -i … {} \;` run unasked. The real boundary for a shell command is the OS sandbox (#448); docs/approvals.md lists what the shell reader doesn't see. On Claude and opencode, whose shells run with no `CDPATH`, `cd src && …` is followed to where it leads; Claude's `Monitor` command is judged as a shell command. The Gemini CLI's edits are judged by the files its approval request names.
+  Reads and searches outside it, and guarded and interactive mode, are unchanged; an unattended run parks on such a write for your approval, as on a high-risk command.
+  See [docs/approvals.md](docs/approvals.md#writes-outside-the-working-directory).
+
+- **A second daemon on the same data is refused** (#447).
+  `codeoid start` locks each directory the daemon owns (its database's, transcripts and checkpoints, opencode's database and data dirs, memory's) before it opens anything, and a start on data another live daemon uses exits, naming that daemon (pid, host, port) and how to clear a stale lock, instead of running alongside it and corrupting both.
+  A lock left by a daemon that's gone (killed outright: its pid no longer runs, or now belongs to another process) is taken over with a log line; one from another machine (told by its machine id) is never guessed at, and one from a container restarted after a crash is taken over once it hasn't been refreshed for 10 minutes.
+  See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#one-daemon-per-data-directory).
+
+- **opencode as a backend** (#447).
+  opencode 2.2 opens its 75+ model providers (GitHub Copilot, OpenRouter, Bedrock, Vertex, Azure, local Ollama, …) to sessions, routines and loops, with codeoid's approvals, spend caps and memory on top.
+  codeoid runs one private opencode server per daemon — started by the first opencode session, loopback-only with a fresh password, its own database beside codeoid's (`providers.opencode.dbPath`), restarted if it dies and stopped with the daemon — so codeoid's sessions never mix with your own opencode.
+  Every action opencode takes asks codeoid's gate first, under codeoid's tool names (a shell command is `Bash` with its command line), including its subagents', whose own allow rules codeoid turns into asks; codeoid answers each once, never "always", and refuses what it can't show.
+  Shell commands are judged by risk as Claude's are (#431), in the directory opencode runs them in.
+  Replies and thinking stream into the session's history; stop, resume after a restart, native forks, models with their reasoning variants as efforts, real per-step cost and tokens (opencode's own figure, never re-priced; a routine's cap stops a turn as the spend lands), codeoid's memory, blackboard and registry MCP servers, subagents and background subagents, slash commands and skills, questions, and messages that steer a running turn all work.
+  `providers.opencode.agent` picks the opencode agent (`plan` for read-only planning).
+  A turn part of whose spend opencode didn't report (a step stopped while the model answered, a dropped connection that couldn't be read back) is of unknown cost, as is one opencode prices at $0 (a subscription sign-in, a free model) unless `pricing.models` prices it (#430).
+  docs/opencode.md has setup and limits.
+  opencode's own hosted models (opencode.ai's Zen, free ones included, which opencode would otherwise pick as the default with no credential, and Go: providers `opencode` and `opencode-go`) are off unless `providers.opencode.hostedModels` (`CODEOID_OPENCODE_HOSTED_MODELS`) is set: not offered, not listed, not re-enabled by your opencode config (under their ids, a `canonical` copy, a provider pointed at opencode.ai, or one whose host setting (`region`, `resourceName`, …) isn't a plain name; a credential your config keeps in a `{file:…}` is still carried), and opencode doesn't fetch its catalog from opencode.ai. A carried `enabled_providers` stays a restriction, and codeoid's own providers are added to it. A turn with no usable model fails before anything is sent, saying what to set.
+
 - **Approvals judge what a shell command does** (#431).
   Every shell command an agent wants to run is parsed (pipelines, chains, subshells, `bash -c`, `sudo`, `xargs`, `find -exec` and other wrappers seen through) and given a risk level: low, medium, high, or not understood.
   The levels are guidance drawn from reading the command line, not a sandbox.
@@ -209,6 +231,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   require a pack; an explicit-`phases` plan cannot declare one.
 
 ### Fixed
+
+- **On Claude, a Grep or Glob relative path is judged where the CLI resolves it** (#447).
+  After the agent's Bash `cd`s, the CLI resolves a search's relative `path` (and a missing one) from there, but codeoid judged it from the working directory, so `../../.codeoid/config.json` could read codeoid's own key; it is now judged from the directory the CLI reports, and a relative path is asked about when it reports none.
 
 - **Idle sessions no longer keep their backend running forever** (#451).
   A session left idle for `session.idleReleaseMinutes` (default 30; `CODEOID_IDLE_RELEASE_MINUTES`, also in Settings) has its backend process (the Claude CLI, codex, pi, the Gemini CLI, Qwen) and the MCP servers it started stopped; the next message starts it again and resumes the same conversation.

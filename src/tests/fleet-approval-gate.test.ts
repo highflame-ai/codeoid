@@ -210,6 +210,25 @@ describe("elicitation hard gate", () => {
   });
 });
 
+describe("unresolved-path hard gate", () => {
+  test("a call whose path couldn't be resolved for certain requires approval even in autonomous mode", async () => {
+    const provider = new MockSessionProvider("mock", [
+      toolTurn("opencode_unresolved_path", { tool: "read", path: "/w/l/x", paths: ["/w/x"], reason: "codeoid can't tell for certain where /w/l/x leads" }),
+    ]);
+    const session = makeSession(provider);
+    attachRecorder(session);
+    session.setMode("autonomous");
+
+    await session.send("read it", TEST_AUTH);
+    await until(() => session.status === "waiting_approval");
+    await new Promise((r) => setTimeout(r, 150));
+    expect(session.status).toBe("waiting_approval");
+
+    session.approve("approval-1", false, TEST_AUTH);
+    await until(() => session.status === "idle" || session.status === "error");
+  });
+});
+
 // ── The cost roll-up rides the same gate ────────────────────────────────────
 
 // §11 P3 words the guard as a roll-up "surfaced at approve-time", and
