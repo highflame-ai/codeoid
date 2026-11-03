@@ -2500,6 +2500,10 @@ describe("opencode (real binary)", () => {
       for (const l of gits) {
         const env = l.split("|")[3]!;
         for (const want of ["GIT_CONFIG_KEY_0=core.hooksPath", "GIT_CONFIG_KEY_1=core.fsmonitor", "GIT_ALLOW_PROTOCOL=none", "GIT_NO_LAZY_FETCH=1"]) expect(env).toContain(want);
+        // Through codeoid's git shim (#448 round 4), its attributes not read; in the workspace's own repository its
+        // drivers reset by name (the shim's own read of the config's key names comes first, and runs nothing).
+        expect(env).toMatch(/GIT_CONFIG_KEY_\d+=attr\.tree /);
+        if (l.startsWith(`git|${ws}|rev-parse`)) expect(env).toMatch(/GIT_CONFIG_KEY_\d+=filter\.evil\.clean /);
       }
       expect(existsSync(marks) ? readFileSync(marks, "utf8") : "").toBe("");
 

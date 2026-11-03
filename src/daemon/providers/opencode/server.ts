@@ -32,6 +32,7 @@
  * stream: it carries the sessions' durable events as well.
  */
 
+import { pathWithShim, writeGitShim } from "../../sandbox/git-shim.js";
 import { launcherRoot } from "../../sandbox/session-sandbox.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
@@ -423,11 +424,15 @@ export class OpencodeServer {
     }
     const config = opencodeConfig(this.#overrides, { ...plan.providers, ...this.#opts.modelProviders }, carried, { model: defaultModel, hostedModels });
     const base = this.#opts.env?.() ?? buildOpencodeEnv();
-    const env = {
+    const env: Record<string, string> = {
       ...base,
       // Its lines run through codeoid's shim: each in its session's OS sandbox (#448), with bash.
       ...serverEnv({ password, dbPath: this.#opts.dbPath, configDir: this.configDir, dataDir: this.dataDir, config, shell: writeOpencodeShellShim(join(this.dataDir, "bin"), opencodeServerShell(base.PATH), launcherRoot()), path: base.PATH, hostedModels }),
     };
+    // The git it runs for itself (#448): the one its PATH finds, with nothing a repository's config names run
+    // (git-shim.ts; no one session's sandbox fits a shared server, so defused). Its sessions' shells have their own PATH.
+    const realGit = Bun.which("git", { PATH: env.PATH ?? "" });
+    if (realGit) env.PATH = pathWithShim(writeGitShim(join(this.dataDir, "git-bin"), { git: realGit, launcher: null, caller: "opencode's server" }), env.PATH);
     this.#home = homeOf(env);
     // Requests name their directory; the server's own cwd is only its default.
     // A shell reaches it as `/proc/$PPID/cwd`, which the gate can't follow, so

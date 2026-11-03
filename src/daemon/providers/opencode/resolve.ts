@@ -55,9 +55,15 @@ export function opencodeSecretLocations(config: CodeoidConfig | undefined): { di
   return {
     dirs: files.map(opencodeCredentialsRoot),
     files,
-    serverDirs: [...files.map(opencodeConfigDir), ...data.flatMap((d) => [d.XDG_DATA_HOME, d.XDG_STATE_HOME, d.XDG_CACHE_HOME])],
+    serverDirs: [...files.map(opencodeConfigDir), ...data.flatMap((d) => [d.XDG_DATA_HOME, d.XDG_STATE_HOME, d.XDG_CACHE_HOME, ...opencodeShimDirs(d)])],
     open: data.flatMap((d) => OPENCODE_OUTPUT_DIRS.map((o) => join(d.XDG_DATA_HOME, "opencode", o))),
   };
+}
+
+/** The server's shell and git shims (`<dataDir>/bin`, `<dataDir>/git-bin`): what it runs every line and its own git with. */
+function opencodeShimDirs(d: { XDG_DATA_HOME: string }): string[] {
+  const dataDir = dirname(d.XDG_DATA_HOME);
+  return [join(dataDir, "bin"), join(dataDir, "git-bin")];
 }
 
 /** What the gate refuses of {@link opencodeSecretLocations}, as `registerSecretPaths` takes it. */

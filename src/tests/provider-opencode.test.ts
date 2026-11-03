@@ -318,6 +318,31 @@ describe("opencode server lifecycle", () => {
     }
   });
 
+  it("the git opencode runs for itself is codeoid's shim: a filter driver a repository's config defines, which no override names, runs nothing (#448 round 4)", async () => {
+    const { server } = makeServer({});
+    expect(done(await collect(makeProvider(server).runTurn(opts("hi", { workdir: realpathSync(tmp()) }))))).toBeTruthy();
+    const env = (await fakeState(server)).env as Record<string, string>;
+    const git = Bun.which("git", { PATH: env.PATH ?? "" });
+    expect(git).toBe(join(server.dataDir, "git-bin", "git"));
+    // A repository a sandboxed command made: its filter (a marker script) applied by its attributes, a stat-dirty file.
+    const ws = realpathSync(tmp());
+    const mark = join(tmp(), "MARK");
+    writeFileSync(join(ws, "f.sh"), `#!/bin/sh\necho ran >> '${mark}'\ncat\n`, { mode: 0o755 });
+    const setup = (...args: string[]) => Bun.spawnSync([GIT_BIN, "-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: ws, env: { PATH: process.env.PATH ?? "", HOME: ws, GIT_CONFIG_NOSYSTEM: "1" } });
+    setup("init", "-q", ".");
+    writeFileSync(join(ws, ".gitattributes"), "a.txt filter=x\n");
+    writeFileSync(join(ws, "a.txt"), "a\n");
+    setup("add", "a.txt", ".gitattributes");
+    setup("commit", "-qm", "init");
+    setup("config", "filter.x.clean", join(ws, "f.sh"));
+    Bun.spawnSync(["touch", "-d", "2001-01-01", join(ws, "a.txt")]);
+    // As opencode runs it: its own environment (codeoid's overrides in GIT_CONFIG_COUNT), in the workspace.
+    const r = Bun.spawnSync([git ?? "", "--no-optional-locks", "status", "--short"], { cwd: ws, env, stdin: "ignore" });
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.toString()).toBe("?? f.sh\n");
+    expect(existsSync(mark)).toBe(false);
+  });
+
   it("a relative entry of the daemon's PATH never reaches the server: opencode would run a repository's own ./git", async () => {
     const marks = join(tmp(), "marks.log");
     const ws = realpathSync(tmp());
@@ -326,7 +351,8 @@ describe("opencode server lifecycle", () => {
     const { server } = makeServer({}, { env: () => ({ ...buildOpencodeEnv(), PATH: `.:bin:${process.env.PATH}` }) });
     expect(done(await collect(makeProvider(server).runTurn(opts("hi", { workdir: ws }))))).toBeTruthy();
     expect(existsSync(marks) ? readFileSync(marks, "utf8") : "").toBe("");
-    expect((await fakeState(server)).env.PATH).toBe(process.env.PATH);
+    // Absolute entries only, after codeoid's git shim (#448 round 4: the git opencode runs for itself, defused).
+    expect((await fakeState(server)).env.PATH).toBe(`${join(server.dataDir, "git-bin")}:${process.env.PATH}`);
     // The session's shell keeps the daemon's PATH as it is: what runs there is asked.
     expect(opencodeShellEnv({ PATH: ".:/usr/bin" }).PATH).toBe(".:/usr/bin");
   });
@@ -374,8 +400,9 @@ describe("opencode server lifecycle", () => {
       const err = events.find((e) => e.type === "error") as Extract<ProviderEvent, { type: "error" }> | undefined;
       expect(err?.message).toContain(`opencode would run git in ${ws} without asking`);
       expect(err?.message).toContain(version ? "is 2.30: before 2.31 it ignores the overrides" : "didn't say its version");
-      // Only codeoid's own `git --version`, in the server's empty cwd: nothing in the repository.
-      expect(m.calls().filter((l) => l.startsWith("git|")).map((l) => l.split("|").slice(0, 3).join("|"))).toEqual([`git|${server.cwd}|--version `]);
+      // Only codeoid's own `git --version`, in the server's empty cwd: nothing in the repository. (Through the
+      // git shim, which reads the config's key names first: that runs nothing.)
+      expect(m.calls().filter((l) => l.startsWith("git|") && !l.includes("|config --show-scope --name-only --list ")).map((l) => l.split("|").slice(0, 3).join("|"))).toEqual([`git|${server.cwd}|--version `]);
       // A workdir outside any repository still works on that server.
       const plain = realpathSync(tmp());
       expect(done(await collect(makeProvider(server, { sessionId: "sess-2" }).runTurn(opts("hi", { workdir: plain }))))).toBeTruthy();

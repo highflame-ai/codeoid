@@ -33,6 +33,7 @@ import {
   opencodeCredentialsRoot,
   opencodeDataDir,
   opencodeLocationsFile,
+  opencodeRefusedPaths,
   opencodeSecretLocations,
   recordOpencodeDbPath,
 } from "../daemon/providers/opencode/resolve.js";
@@ -493,6 +494,19 @@ describe("the credential files", () => {
     const undo = registerSecretPaths(locations);
     try {
       expect(secretPathVerdict("Read", { file_path: join(own, "production.key") }, { workdir: project, configDir: join(root, "cfg") })).toBeNull();
+    } finally {
+      undo();
+    }
+  });
+
+  it("the server's shell and git shims are refused to a file tool: nothing rewrites what runs every line and its own git (#448 round 4)", () => {
+    const config = { dbPath: join(root, "codeoid.db"), providers: { opencode: { enabled: true, command: "opencode" } } } as unknown as CodeoidConfig;
+    const dataDir = opencodeDataDir(config);
+    const undo = registerSecretPaths(opencodeRefusedPaths(config));
+    try {
+      for (const file of [join(dataDir, "git-bin", "git"), join(dataDir, "bin", "codeoid-shell")]) {
+        expect(secretPathVerdict("Write", { file_path: file }, { workdir: join(root, "proj"), configDir: join(root, "cfg") })).not.toBeNull();
+      }
     } finally {
       undo();
     }
