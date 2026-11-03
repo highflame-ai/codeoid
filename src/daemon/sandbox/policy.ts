@@ -25,7 +25,7 @@
 
 import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CodeoidConfig } from "../../config.js";
 import { getConfigDir } from "../../config.js";
 import { daemonOwnedDirs } from "../data-lock.js";
@@ -547,13 +547,46 @@ function isLink(p: string): boolean {
   }
 }
 
-/** A dir (`"dir"`) or a file with `content`, made only where nothing (not even a link) is: never through one. */
-function makeIfMissing(p: string, content: string): void {
+/** A dir (`"dir"`) or a file with `content`, made only where nothing (not even a link) is: never through one. Whether it was made. */
+function makeIfMissing(p: string, content: string): boolean {
   try {
     if (content === "dir") mkdirSync(p, { mode: 0o755 });
     else writeFileSync(p, content, { flag: "wx", mode: 0o644 });
+    return true;
   } catch {
     /* there already, or a repository codeoid can't write either */
+    return false;
+  }
+}
+
+/** The line codeoid's entries in a repository's `info/exclude` follow. */
+const EXCLUDE_MARK = "# codeoid sandbox placeholders (#448): empty configs that keep these from being created inside";
+
+/**
+ * Keep the placeholder files codeoid made at the workspace's top out of
+ * `git status` and `git add -A`, as its empty dirs are: listed in the
+ * repository's `info/exclude` (read-only from inside), each anchored to its
+ * place in the worktree. Never through a link; best effort.
+ */
+function excludePlaceholders(workspace: string, home: string, names: readonly string[]): void {
+  if (names.length === 0) return;
+  const layout = gitLayoutOf(workspace, home);
+  if (!layout?.common) return;
+  const info = join(layout.common, "info");
+  const exclude = join(info, "exclude");
+  try {
+    if (!lexists(info)) mkdirSync(info, { mode: 0o755 });
+    if (isLink(info) || isLink(exclude)) return;
+    const rel = relative(dirname(layout.dotgit), resolve(workspace));
+    if (rel.startsWith("..") || isAbsolute(rel)) return;
+    const have = lexists(exclude) ? readFileSync(exclude, "utf8") : "";
+    const lines = have.split("\n");
+    const add = names.map((n) => `/${rel ? `${rel.split(sep).join("/")}/` : ""}${n}`).filter((l) => !lines.includes(l));
+    if (add.length === 0) return;
+    const head = lines.includes(EXCLUDE_MARK) ? [] : [EXCLUDE_MARK];
+    writeFileSync(exclude, `${have}${have && !have.endsWith("\n") ? "\n" : ""}${[...head, ...add].join("\n")}\n`, { flag: "w" });
+  } catch {
+    /* a repository codeoid can't write: the placeholder shows in `git status` */
   }
 }
 
@@ -619,19 +652,27 @@ function validWorktree(gitDir: string, common: string, dotgit: string): boolean 
 /**
  * Project settings agent CLIs load from a workspace and run code from, on
  * the host, in a later session (a Claude hook, an MCP server, a pi or
- * opencode extension): read-only from inside, so a command of one backend
- * can't plant what another runs outside any sandbox. Directories whole
- * (made empty first where missing: git doesn't see an empty dir), so
- * nothing can be added in them either; the files at the workspace's top
- * where they exist (a new `.mcp.json` server is asked about before it runs:
- * the CLI's and codeoid's own approval).
+ * opencode extension; your own `opencode` loads a project `opencode.json`'s
+ * MCP servers and plugins at its start): read-only from inside, so a command
+ * of one backend can't plant what another runs outside any sandbox.
+ * Directories whole (made empty first where missing: git doesn't see an
+ * empty dir), so nothing can be added in them either; the files at the
+ * workspace's top made first where missing too, holding the empty config
+ * each CLI reads as nothing ({@link PROJECT_CONFIG_PLACEHOLDERS}; an empty
+ * dir there breaks opencode's config load).
  */
 export const PROJECT_CONFIG_DIRS: readonly string[] = [".claude", ".gemini", ".qwen", ".codex", ".pi", ".opencode"];
 export const PROJECT_CONFIG_FILES: readonly string[] = [".mcp.json", "opencode.json", "opencode.jsonc"];
+/** What a project config file is made with where missing: an empty config, read by its CLI as none (checked: Claude's CLI, opencode 2.2.5). */
+export const PROJECT_CONFIG_PLACEHOLDERS: Readonly<Record<string, string>> = {
+  ".mcp.json": '{"mcpServers":{}}\n',
+  "opencode.json": "{}\n",
+  "opencode.jsonc": "{}\n",
+};
 
 /**
  * {@link PROJECT_CONFIG_DIRS} and {@link PROJECT_CONFIG_FILES} of
- * `workspace`, the dirs made when missing — but only in a project's own
+ * `workspace`, made when missing — but only in a project's own
  * directory: in the home itself (where `~/.claude`, `~/.codex`, … are the
  * CLIs' own config dirs), a directory holding it, a temp root or `/`, what
  * is there is held and nothing is made.
@@ -646,10 +687,13 @@ export function projectConfigPaths(workspace: string, home: string = process.env
     // A link can't be held by a bind (it can be replaced); a dir it leads to outside the workspace is out of reach anyway.
     if (lexists(at) && !isLink(at)) out.push(at);
   }
+  const made: string[] = [];
   for (const name of PROJECT_CONFIG_FILES) {
     const at = join(workspace, name);
+    if (!shared && makeIfMissing(at, PROJECT_CONFIG_PLACEHOLDERS[name] ?? "{}\n")) made.push(name);
     if (lexists(at) && !isLink(at)) out.push(at);
   }
+  excludePlaceholders(workspace, home, made);
   return out;
 }
 

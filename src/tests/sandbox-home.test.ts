@@ -177,7 +177,7 @@ describe("the workspace's git repository", () => {
     expect(g.readOnly).toEqual([join(repo, "HEAD"), join(repo, ".git")]);
   });
 
-  test("the project settings agent CLIs run code from: read-only, their dirs made empty first (git doesn't see them), a top-level file only where it exists, never a link (#448 round 2)", () => {
+  test("the project settings agent CLIs run code from: read-only, their dirs made empty first (git doesn't see them), a top-level file made as an empty config where missing (#448 round 3), never a link (#448 round 2)", () => {
     const home = join(root, "pc");
     const ws = join(home, "proj");
     mkdirSync(ws, { recursive: true });
@@ -189,10 +189,29 @@ describe("the workspace's git repository", () => {
       expect(statSync(join(ws, d)).isDirectory()).toBe(true);
     }
     expect(spec.readOnly).toContain(join(ws, "opencode.json"));
-    expect(spec.readOnly).not.toContain(join(ws, ".mcp.json"));
-    expect(existsSync(join(ws, ".mcp.json"))).toBe(false);
+    // An existing one is kept as it is; a missing one is made holding an empty config, and held.
+    expect(readFileSync(join(ws, "opencode.json"), "utf8")).toBe("{}");
+    expect(spec.readOnly).toContain(join(ws, ".mcp.json"));
+    expect(readFileSync(join(ws, ".mcp.json"), "utf8")).toBe('{"mcpServers":{}}\n');
+    expect(readFileSync(join(ws, "opencode.jsonc"), "utf8")).toBe("{}\n");
     expect(spec.readOnly).not.toContain(join(ws, ".pi"));
     expect(existsSync(join(root, "pc-elsewhere"))).toBe(false);
+  });
+
+  test("the placeholders codeoid makes in a repository stay out of git status and git add -A, anchored to the workspace (#448 round 3)", () => {
+    const home = join(root, "pe");
+    const repo = join(home, "repo");
+    mkdirSync(join(repo, "sub"), { recursive: true });
+    git(["init", "-q", "-b", "main"], repo);
+    writeFileSync(join(repo, "sub", "keep.txt"), "k\n");
+    for (const ws of [repo, join(repo, "sub")]) buildSandboxSpec({ sessionId: "s", workspace: ws, tempDir: join(root, "pe-t"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    expect(existsSync(join(repo, "sub", "opencode.json"))).toBe(true);
+    expect(git(["status", "--porcelain", "--untracked-files=all"], repo)).toBe("?? sub/keep.txt\n");
+    const exclude = readFileSync(join(repo, ".git", "info", "exclude"), "utf8");
+    for (const line of ["/.mcp.json", "/opencode.json", "/sub/opencode.jsonc"]) expect(exclude.split("\n")).toContain(line);
+    // Again: nothing added twice.
+    buildSandboxSpec({ sessionId: "s", workspace: repo, tempDir: join(root, "pe-t"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    expect(readFileSync(join(repo, ".git", "info", "exclude"), "utf8")).toBe(exclude);
   });
 
   test("the toolchains' caches: a writable cache dir of the user's, outside what their own tools read; Go reads the user's downloads first (#448 round 2)", () => {
@@ -240,7 +259,7 @@ describe("the workspace's git repository", () => {
     mkdirSync(join(home, ".claude"), { recursive: true });
     for (const ws of [home, join(root, "pcs")]) {
       const spec = buildSandboxSpec({ sessionId: "s", workspace: ws, tempDir: join(root, "pcs-t"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
-      for (const d of [".codex", ".gemini", ".qwen", ".pi", ".opencode"]) expect(existsSync(join(ws, d))).toBe(false);
+      for (const d of [".codex", ".gemini", ".qwen", ".pi", ".opencode", ".mcp.json", "opencode.json"]) expect(existsSync(join(ws, d))).toBe(false);
       if (ws === home) expect(spec.readOnly).toContain(join(home, ".claude"));
     }
   });

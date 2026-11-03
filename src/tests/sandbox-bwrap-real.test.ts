@@ -876,6 +876,27 @@ describe.skipIf(!probe.available)("bubblewrap, for real: round 2 of the #448 aud
     expect(existsSync(join(ws, ".claude", "settings.json"))).toBe(false);
     expect(readFileSync(join(ws, ".mcp.json"), "utf8")).toBe('{"mcpServers":{}}\n');
   });
+
+  test("a project config file that didn't exist (.mcp.json, opencode.json, opencode.jsonc) can't be created at the workspace's top: a placeholder each, held (#448 round 3)", async () => {
+    const home = join(root, "home3");
+    const ws = join(root, "ws3");
+    const tmp = join(root, "tmp3");
+    for (const d of [home, ws, tmp]) mkdirSync(d, { recursive: true });
+    const spec = buildSandboxSpec({ sessionId: "proj3", workspace: ws, tempDir: tmp, network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    const h = await provider.open(spec);
+    try {
+      const tries = ["opencode.json", "opencode.jsonc", ".mcp.json"].flatMap((f) => [`printf '{"mcp":{}}' > ${f}`, `rm -f ${f}`, `mv ${f} ${f}.old`]);
+      const script = `${tries.map((t, i) => `${t} 2>/dev/null && echo WROTE-${i}`).join("; ")}; echo ok > src.txt && echo WS-WRITABLE`;
+      const r = await h.exec(["/bin/sh", "-c", script], { cwd: ws, env: { PATH: "/usr/bin:/bin" }, timeoutMs: 20_000 });
+      expect(r.stdout).not.toContain("WROTE");
+      expect(r.stdout).toContain("WS-WRITABLE");
+    } finally {
+      await h.close();
+    }
+    expect(readFileSync(join(ws, "opencode.json"), "utf8")).toBe("{}\n");
+    expect(readFileSync(join(ws, "opencode.jsonc"), "utf8")).toBe("{}\n");
+    expect(readFileSync(join(ws, ".mcp.json"), "utf8")).toBe('{"mcpServers":{}}\n');
+  });
 });
 
 /**
