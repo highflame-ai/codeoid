@@ -82,8 +82,8 @@ describe("codex's own sandbox, per session", () => {
   });
 
   test("codex's own home stays reachable: CODEX_HOME and the default one an account's links lead to", () => {
-    expect(codexOwnState({ HOME: "/h" })).toEqual(["/h/.codex"]);
-    expect(codexOwnState({ HOME: "/h", CODEX_HOME: "/cfg/accounts/codex/work" })).toEqual(["/cfg/accounts/codex/work", "/h/.codex"]);
+    expect(codexOwnState({ HOME: "/h" }, { HOME: "/h" })).toEqual(["/h/.codex"]);
+    expect(codexOwnState({ HOME: "/h", CODEX_HOME: "/cfg/accounts/codex/work" }, { HOME: "/h" })).toEqual(["/cfg/accounts/codex/work", "/h/.codex"]);
   });
 
   test("end to end: turn/start carries the policy, and the app-server is started through the sandbox, network on for it", async () => {

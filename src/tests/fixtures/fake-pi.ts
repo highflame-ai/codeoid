@@ -152,6 +152,15 @@ async function runPrompt(message: string): Promise<void> {
       result: { content: [{ type: "text", text: "wrote file" }] },
       isError: false,
     });
+  } else if (message.startsWith("read-file:")) {
+    // What this process can read at a path (the OS sandbox tests, #448).
+    let text: string;
+    try {
+      text = `CONTENT:${(await Bun.file(message.slice("read-file:".length).trim()).text()).trim()}`;
+    } catch (err) {
+      text = `UNREADABLE:${err instanceof Error ? err.message : String(err)}`;
+    }
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } });
   } else if (message.includes("echo-thinking")) {
     emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `thinking:${thinkingLevel}` }], stopReason: "stop" } });
   } else if (message.includes("echo-prompt")) {

@@ -1668,7 +1668,6 @@ function usageDelta(to: CodexTokenUsage, from: CodexTokenUsage | null): CodexTok
 }
 
 /** What codex's own process must still reach inside a sandbox: its home (CODEX_HOME, and the default one an account's links lead to). */
-export function codexOwnState(env: Record<string, string | undefined>): string[] {
-  const own = env.CODEX_HOME || defaultCodexHome(env);
-  return [...new Set([own, defaultCodexHome({ ...env, CODEX_HOME: undefined })])];
+export function codexOwnState(env: Record<string, string | undefined>, base: Record<string, string | undefined> = process.env): string[] {
+  return [...new Set([defaultCodexHome(env), defaultCodexHome(base)])];
 }

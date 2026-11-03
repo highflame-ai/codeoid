@@ -13,7 +13,7 @@
  * starts on it.
  */
 
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
@@ -70,6 +70,13 @@ export interface SandboxRuntime {
   open(backendState?: readonly string[], opts?: OpenOptions): Promise<SandboxHandle>;
   /** The same, for a caller that can't wait (a spawn callback); local providers only. */
   openSync(backendState?: readonly string[], opts?: OpenOptions): SandboxHandle;
+  /**
+   * An executable that runs `argv` inside `handle` with the arguments it is
+   * given appended, for a spawner codeoid doesn't control (an SDK that takes
+   * a path to its CLI). Written to a daemon-private dir outside anything the
+   * sandbox can write; removed with the session.
+   */
+  launcher(handle: SandboxHandle, argv: readonly string[], cwd: string): string;
 }
 
 /** The setting a session ends up with: its own fields over the config's. */
@@ -191,6 +198,8 @@ export class SessionSandbox {
   #handles = new Set<SandboxHandle>();
   #resolvedFor: string | null = null;
   #closed = false;
+  #launcherDir: string | null = null;
+  #launchers = 0;
 
   constructor(opts: { sessionId: string; workdir: string; registry: SandboxRegistry; config?: CodeoidConfig; setting?: SessionSandboxSetting }) {
     this.#sessionId = opts.sessionId;
@@ -277,8 +286,21 @@ export class SessionSandbox {
         if (!provider.openSync) throw new Error(`${provider.displayName} can't be opened synchronously`);
         return this.#track(provider.openSync(open(backendState, o)));
       },
+      launcher: (handle, argv, cwd) => this.#writeLauncher(handle, argv, cwd),
     };
     return r.info;
+  }
+
+  #writeLauncher(handle: SandboxHandle, argv: readonly string[], cwd: string): string {
+    if (!handle.wrap) throw new Error(`${handle.providerId} can't start a local program inside`);
+    if (!this.#launcherDir) {
+      const safe = this.#sessionId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "session";
+      this.#launcherDir = mkdtempSync(join(tmpdir(), `codeoid-launch-${safe}-`));
+    }
+    const wrapped = handle.wrap(argv, { cwd, env: {} });
+    const path = join(this.#launcherDir, `launch-${++this.#launchers}`);
+    writeFileSync(path, launcherScript(wrapped.argv), { mode: 0o700 });
+    return path;
   }
 
   #track(h: SandboxHandle): SandboxHandle {
@@ -323,5 +345,19 @@ export class SessionSandbox {
       rmSync(this.#tempDir, { recursive: true, force: true });
       this.#tempDir = null;
     }
+    if (this.#launcherDir) {
+      rmSync(this.#launcherDir, { recursive: true, force: true });
+      this.#launcherDir = null;
+    }
   }
+}
+
+/** A word as the shell reads it literally. */
+export function shellQuote(word: string): string {
+  return `'${word.replace(/'/g, `'\\''`)}'`;
+}
+
+/** A POSIX sh script that execs `argv` with its own arguments appended. */
+export function launcherScript(argv: readonly string[]): string {
+  return `#!/bin/sh\n# Written by codeoid (#448): starts a backend inside its session's sandbox.\nexec ${argv.map(shellQuote).join(" ")} "$@"\n`;
 }

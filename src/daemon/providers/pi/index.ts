@@ -53,9 +53,14 @@ import type { McpHub } from "../../mcp/hub.js";
 import { PiRpcProcess, type PiFrame } from "./rpc.js";
 import { translatePiEvent } from "./translate.js";
 import type { ResolvedAccount } from "../../accounts.js";
-import { applyPiAccount, applyPiSettingsOverlay, piDefaultThinkingLevel } from "../../account-apply.js";
+import { applyPiAccount, applyPiSettingsOverlay, piAgentDirOf, piDefaultThinkingLevel } from "../../account-apply.js";
+import { dirname } from "node:path";
+import { programLocations } from "../../sandbox/policy.js";
+import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 
 export interface PiProviderInit {
+  /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448): pi starts inside it. */
+  sandbox?: () => SandboxRuntime | null;
   sessionId: string;
   /** pi session FILE from a previous run (absolute .jsonl path), or the
    *  codeoid session id on first run (nothing to resume). */
@@ -112,6 +117,8 @@ export class PiProvider implements SessionProvider {
   #backingSessionId: string;
   #command: string;
   #resolveAccount: (() => ResolvedAccount | null) | null;
+  /** The session's OS sandbox, read each time pi starts (#448). */
+  readonly #sandbox: (() => SandboxRuntime | null) | null;
   readonly #extraEnv: Readonly<Record<string, string>> | undefined;
   #argsPrefix: string[];
   #store: Store;
@@ -148,6 +155,7 @@ export class PiProvider implements SessionProvider {
     this.#command = init.command;
     this.#resolveAccount = init.resolveAccount ?? null;
     this.#extraEnv = init.extraEnv;
+    this.#sandbox = init.sandbox ?? null;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#store = init.store;
     this.#onModels = init.onModels;
@@ -326,23 +334,32 @@ export class PiProvider implements SessionProvider {
     if (this.#proc?.alive) return;
 
     const mcpTools = await this.#discoverMcpTools();
-    const args: string[] = ["-e", writeBridgeExtension({ memoryTools: this.#memory != null, mcpTools })];
+    const bridge = writeBridgeExtension({ memoryTools: this.#memory != null, mcpTools });
+    const args: string[] = ["-e", bridge];
     if (opts.systemPromptAppend) {
       args.push("--append-system-prompt", opts.systemPromptAppend);
     }
 
     this.#bridgeReady = false;
     this.#thinkingLevel = null; // a new pi reports its own (get_state, below)
+    // Allowlisted env (GHSA-38vh): pi gets its credentials (~/.pi via
+    // HOME, provider API keys), never codeoid's own secrets.
+    // pi's thinking-level writes stay in a copy of its settings (#417).
+    // Then the caller's extra env, which can't override the account (withExtraEnv).
+    const env = withExtraEnv(this.#piEnv(), this.#extraEnv);
+    // The OS sandbox (#448): pi's whole process starts inside the session's,
+    // its own agent dir reachable, its program and codeoid's bridge readable.
+    const rt = this.#sandbox?.() ?? null;
+    const handle = rt?.plan.wrapsBackend
+      ? await rt.open(piOwnState(env), { readable: [...programLocations(this.#command, this.#argsPrefix), dirname(bridge)] })
+      : null;
     this.#proc = new PiRpcProcess({
       command: this.#command,
       argsPrefix: this.#argsPrefix,
       args,
       cwd: opts.workdir,
-      // Allowlisted env (GHSA-38vh): pi gets its credentials (~/.pi via
-      // HOME, provider API keys), never codeoid's own secrets.
-      // pi's thinking-level writes stay in a copy of its settings (#417).
-      // Then the caller's extra env, which can't override the account (withExtraEnv).
-      env: withExtraEnv(this.#piEnv(), this.#extraEnv),
+      env,
+      ...(handle?.wrap ? { wrap: handle.wrap.bind(handle) } : {}),
       onEvent: (frame) => this.#onFrame(frame),
       onExit: ({ code, signal, stderrTail }) => {
         this.#bridgeReady = false;
@@ -846,4 +863,13 @@ export function piThinkingLevels(m: { reasoning?: unknown; thinkingLevelMap?: un
     if (mapped === null) return false;
     return level === "xhigh" || level === "max" ? mapped !== undefined : true;
   });
+}
+
+/**
+ * What pi's own process must still reach inside a sandbox: its agent dir as
+ * it runs (an account's or settings overlay), and the daemon's own, which an
+ * overlay's links lead to.
+ */
+export function piOwnState(env: Record<string, string | undefined>, base: Record<string, string | undefined> = process.env): string[] {
+  return [...new Set([piAgentDirOf(env), piAgentDirOf(base)])];
 }

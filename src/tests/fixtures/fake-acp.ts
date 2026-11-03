@@ -92,6 +92,17 @@ async function runTurn(sessionId: string, prompt: string): Promise<string> {
     return "end_turn";
   }
 
+  if (prompt.startsWith("read-file:")) {
+    // What this process can read at a path (the OS sandbox tests, #448).
+    let text: string;
+    try {
+      text = `CONTENT:${(await Bun.file(prompt.slice("read-file:".length).trim()).text()).trim()}`;
+    } catch (err) {
+      text = `UNREADABLE:${err instanceof Error ? err.message : String(err)}`;
+    }
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+    return "end_turn";
+  }
   if (prompt.includes("echo-prompt")) {
     update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `PROMPT:${prompt}` } });
     return "end_turn";

@@ -46,10 +46,15 @@ import type { McpServerView } from "../../mcp/registry.js";
 import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import type { ResolvedAccount } from "../../accounts.js";
-import { applyGeminiCliAccount, applyGeminiCliEffort } from "../../account-apply.js";
+import { applyGeminiCliAccount, applyGeminiCliEffort, defaultGeminiCliRoot } from "../../account-apply.js";
+import { join } from "node:path";
+import { programLocations } from "../../sandbox/policy.js";
+import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import { effortRejectionHint } from "../effort.js";
 
 export interface GeminiAcpProviderInit {
+  /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448): the CLI starts inside it. */
+  sandbox?: () => SandboxRuntime | null;
   sessionId: string;
   /** ACP sessionId from a previous run, or the codeoid session id on first run. */
   initialBackingId: string;
@@ -112,6 +117,8 @@ export class GeminiAcpProvider implements SessionProvider {
   #argsPrefix: string[];
   #resolveAccount: (() => ResolvedAccount | null) | null;
   readonly #extraEnv: Readonly<Record<string, string>> | undefined;
+  /** The session's OS sandbox, read each time the CLI starts (#448). */
+  readonly #sandbox: (() => SandboxRuntime | null) | null;
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
   /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
@@ -148,6 +155,7 @@ export class GeminiAcpProvider implements SessionProvider {
     this.#command = init.command;
     this.#resolveAccount = init.resolveAccount ?? null;
     this.#extraEnv = init.extraEnv;
+    this.#sandbox = init.sandbox ?? null;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#workspaceId = init.workspaceId ?? init.sessionId;
     this.#memoryMcp = init.memoryMcp ?? null;
@@ -318,18 +326,24 @@ export class GeminiAcpProvider implements SessionProvider {
     if (this.#proc?.alive && this.#acpSessionId) return;
 
     if (!this.#proc?.alive) {
+      // The account's own GEMINI_CLI_HOME (an overlay selecting its auth type).
+      // ...and, for a thinking effort, an overlay of that whose settings set it (#417).
+      // Then the caller's extra env, which can't override either (withExtraEnv).
+      const env = withExtraEnv(
+        applyGeminiCliEffort(opts.effort, applyGeminiCliAccount(this.#resolveAccount?.() ?? null, buildGeminiCliEnv())),
+        this.#extraEnv,
+      );
+      // The OS sandbox (#448): the CLI's whole process starts inside the
+      // session's, its own ~/.gemini reachable and its program readable.
+      const rt = this.#sandbox?.() ?? null;
+      const handle = rt?.plan.wrapsBackend ? await rt.open(geminiCliOwnState(env), { readable: programLocations(this.#command, this.#argsPrefix) }) : null;
       this.#proc = new StdioJsonRpcProcess({
         name: "gemini-cli",
         command: this.#command,
         args: [...this.#argsPrefix, "--acp"],
         cwd: opts.workdir,
-        // The account's own GEMINI_CLI_HOME (an overlay selecting its auth type).
-        // ...and, for a thinking effort, an overlay of that whose settings set it (#417).
-        // Then the caller's extra env, which can't override either (withExtraEnv).
-        env: withExtraEnv(
-          applyGeminiCliEffort(opts.effort, applyGeminiCliAccount(this.#resolveAccount?.() ?? null, buildGeminiCliEnv())),
-          this.#extraEnv,
-        ),
+        env,
+        ...(handle?.wrap ? { wrap: handle.wrap.bind(handle) } : {}),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {
@@ -613,4 +627,9 @@ function toolCallOutput(update: Record<string, unknown>): string {
       .join("\n");
   }
   return "";
+}
+
+/** What the Gemini CLI's own process must still reach inside a sandbox: its `.gemini` (an account overlay's, and the default one). */
+export function geminiCliOwnState(env: Record<string, string | undefined>, base: Record<string, string | undefined> = process.env): string[] {
+  return [...new Set([join(defaultGeminiCliRoot(env), ".gemini"), join(defaultGeminiCliRoot(base), ".gemini")])];
 }
