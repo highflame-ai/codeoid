@@ -60,6 +60,7 @@ function fakeRuntime(kind: "native" | "process", network: "on" | "off", tempDir:
       throw new Error("unused");
     },
     privateHome: (key: string) => mkdtempSync(join(tmpdir(), `codeoid-home-test-${key}-`)),
+    stateDir: (key: string) => mkdtempSync(join(tmpdir(), `codeoid-state-test-${key}-`)),
   } as unknown as SandboxRuntime;
   return { rt, opened, wrapped };
 }

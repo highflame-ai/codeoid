@@ -344,7 +344,7 @@ export class GeminiAcpProvider implements SessionProvider {
       if (rt?.plan.wrapsBackend) {
         const root = rt.privateHome("gemini-cli");
         mkdirSync(join(root, ".gemini"), { mode: 0o700 });
-        const own = preparePrivateHome(join(defaultGeminiCliRoot(env), ".gemini"), join(root, ".gemini"), GEMINI_CLI_HOME_LAYOUT);
+        const own = preparePrivateHome(join(defaultGeminiCliRoot(env), ".gemini"), join(root, ".gemini"), GEMINI_CLI_HOME_LAYOUT, { state: rt.stateDir("gemini-cli") });
         env = { ...env, GEMINI_CLI_HOME: root };
         handle = await rt.open([root, ...own.writable], { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix)] });
       }

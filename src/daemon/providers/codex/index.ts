@@ -960,7 +960,7 @@ export class CodexProvider implements SessionProvider {
       let handle: SandboxHandle | null = null;
       let procEnv = env;
       if (rt?.plan.wrapsBackend) {
-        const own = preparePrivateHome(defaultCodexHome(env), rt.privateHome("codex"), CODEX_HOME_LAYOUT);
+        const own = preparePrivateHome(defaultCodexHome(env), rt.privateHome("codex"), CODEX_HOME_LAYOUT, { state: rt.stateDir("codex") });
         procEnv = { ...env, CODEX_HOME: own.home };
         handle = await rt.open(own.writable, { backendNetwork: true, readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix)] });
       }

@@ -3526,6 +3526,7 @@ describe("ClaudeProvider — the OS sandbox", () => {
         };
       },
       privateHome: () => home,
+      stateDir: () => mkdtempSync(join(tmpdir(), "codeoid-claude-state-")),
       claudeTemp: () => temp,
     };
     return { rt, spawned, opened, home, temp };

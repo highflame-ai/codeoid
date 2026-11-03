@@ -5368,6 +5368,8 @@ export class Session {
     // don't leave a zombie SDK subprocess alive holding the transcript file.
     await this.#teardownProvider();
     await this.#sandbox?.close();
+    // What its backends kept across starts (their conversations, #448): gone with it.
+    this.#sandbox?.removeState();
     // Events the pump emitted while winding down could re-arm the fallback;
     // clear it again and stop listening — this session is gone.
     this.#provider.onSessionEvent = undefined;

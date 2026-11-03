@@ -7,7 +7,7 @@
  * sandbox-claude-real.test.ts.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
@@ -286,7 +286,7 @@ describe("Claude's own sandbox, with the home model", () => {
 });
 
 describe("a backend's private home", () => {
-  test("its login and code linked (shown read-only), its conversations the real ones (writable, made when missing), small files copied, dirs empty, large files left out", () => {
+  test("its login and code linked (shown read-only), its conversations the session's own (never the real ones: #448 round 2), small files copied, dirs empty, large files left out", () => {
     const real = join(root, "pi-real");
     const overlay = join(root, "pi-overlay");
     mkdirSync(join(real, "extensions", "e"), { recursive: true });
@@ -300,7 +300,11 @@ describe("a backend's private home", () => {
     for (const n of ["auth.json", "settings.json", "extensions", "cache", "big.db"]) symlinkSync(join(real, n), join(overlay, n));
     const target = join(root, "pi-private");
     mkdirSync(target);
-    const own = preparePrivateHome(overlay, target, PI_HOME_LAYOUT);
+    mkdirSync(join(real, "sessions", "--other-project--"), { recursive: true });
+    writeFileSync(join(real, "sessions", "--other-project--", "s.jsonl"), "OTHER-PROJECT-TRANSCRIPT");
+    symlinkSync(join(real, "sessions"), join(overlay, "sessions"));
+    const state = join(root, "pi-state");
+    const own = preparePrivateHome(overlay, target, PI_HOME_LAYOUT, { state });
     expect(own.home).toBe(target);
     expect(readlinkSync(join(target, "auth.json"))).toBe(join(real, "auth.json"));
     expect(own.readable).toEqual(expect.arrayContaining([join(real, "auth.json"), join(real, "extensions")]));
@@ -310,11 +314,17 @@ describe("a backend's private home", () => {
     expect(lstatSync(join(target, "cache")).isDirectory()).toBe(true);
     expect(existsSync(join(target, "cache", "x"))).toBe(false);
     expect(existsSync(join(target, "big.db"))).toBe(false);
-    // Conversations: made in the real home (through the overlay), linked, writable.
-    expect(statSync(join(overlay, "sessions")).isDirectory()).toBe(true);
-    expect(own.writable).toEqual([target, realpathSync(join(overlay, "sessions"))]);
-    // The real home itself is never among what it may write.
-    expect(own.writable).not.toContain(real);
+    // Conversations: the session's own state dir, linked, writable; never the real one with every project's in it.
+    expect(readlinkSync(join(target, "sessions"))).toBe(realpathSync(join(state, "sessions")));
+    expect(own.writable).toEqual([target, realpathSync(join(state, "sessions"))]);
+    expect(readdirSync(join(target, "sessions"))).toEqual([]);
+    for (const w of own.writable) expect(w.startsWith(real)).toBe(false);
+    // Without a state dir: an empty dir of the private home's own, gone with it.
+    const bare = join(root, "pi-private-bare");
+    mkdirSync(bare);
+    const none = preparePrivateHome(overlay, bare, PI_HOME_LAYOUT);
+    expect(lstatSync(join(bare, "sessions")).isDirectory()).toBe(true);
+    expect(none.writable).toEqual([bare]);
   });
 });
 

@@ -442,6 +442,21 @@ describe("review fixes (#448)", () => {
     expect(await call("opencode", "Write", { file_path: join(workdir, ".claude", "settings.json"), content: "{}" }, { provider: "off" })).toBe(false);
   });
 
+  test("a destroyed session's backend state (its own conversations, #448 round 2) goes with it", async () => {
+    const transcripts = mkdtempSync(join(tmpdir(), "codeoid-sbx-state-"));
+    try {
+      const { session } = makeSession(new MockSessionProvider("pi", [[DONE]]), { config: { transcriptDir: transcripts } });
+      await session.ensureSandbox();
+      const state = join(transcripts, "sandbox-state", session.id.replace(/[^A-Za-z0-9_-]/g, ""), "pi", "sessions");
+      mkdirSync(state, { recursive: true });
+      writeFileSync(join(state, "s.jsonl"), "{}\n");
+      await session.destroy(AUTH);
+      expect(existsSync(join(transcripts, "sandbox-state", session.id))).toBe(false);
+    } finally {
+      rmSync(transcripts, { recursive: true, force: true });
+    }
+  });
+
   test("widening is told from what it would really be: a provider that can't run is no sandbox", async () => {
     const reg = new SandboxRegistry("linux", HOST_HAS);
     reg.register(fakeProvider("bwrap", { available: true }));

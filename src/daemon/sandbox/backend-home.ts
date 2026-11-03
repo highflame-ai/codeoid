@@ -14,9 +14,15 @@
  *   - login files: linked to the real ones, shown read-only (a token it
  *     refreshes can't be saved from inside; the host's is read at the next
  *     start);
- *   - conversations (its sessions dir): linked to the real one, writable, so
- *     a session resumes across restarts and with the sandbox on or off. Data
- *     only: nothing in it is run;
+ *   - conversations (its sessions dir; the Gemini CLI's `tmp/` and its
+ *     checkpoint git repository `history/`): the session's own, never the
+ *     real ones — linked to a dir of the session's that outlives this home
+ *     (SandboxRuntime.stateDir: a session resumes across restarts), removed
+ *     with the session. The real dirs hold every project's transcripts, and
+ *     what later runs load from them (Claude's project memory, the Gemini
+ *     CLI's checkpoint repository, whose git config and hooks run), so no
+ *     sandboxed session reads another's or writes what an unsandboxed run
+ *     loads;
  *   - code it loads (plugins, extensions, skills, commands): linked, shown
  *     read-only;
  *   - every other file up to {@link COPY_LIMIT}: copied (settings, model
@@ -33,7 +39,7 @@ import { join } from "node:path";
 export interface BackendHomeLayout {
   /** Entries holding its login: shown read-only. */
   login: readonly string[];
-  /** Directories holding its conversations: the real ones, writable (made in the real home when missing). */
+  /** Directories holding its conversations: the session's own (made empty, or linked to its state dir), writable. */
   shared: readonly string[];
   /** Directories of code it loads: shown read-only. */
   code: readonly string[];
@@ -79,7 +85,7 @@ export const QWEN_HOME_LAYOUT: BackendHomeLayout = {
 export interface PrivateHome {
   /** The private home: point the backend at it. */
   home: string;
-  /** Writable for the backend: the private home and the real conversations dirs it links to. */
+  /** Writable for the backend: the private home and the session's conversations dirs it links to. */
   writable: string[];
   /** Read-only for the backend: its login and its code, where the links lead. */
   readable: string[];
@@ -97,10 +103,18 @@ function realOr(p: string): string {
  * Fill `target` (fresh and empty: SandboxRuntime.privateHome) from `source`
  * (the home the backend would use: the vendor's, an account's or an effort
  * overlay's, whose entries may be links into the vendor's) per `layout`.
- * `extraFiles`: files from elsewhere copied in under a name (Claude's
+ * `state`: the session's own dir its conversations live in across starts
+ * (SandboxRuntime.stateDir); without one they are empty and go with this
+ * home. `extraFiles`: files from elsewhere copied in under a name (Claude's
  * `~/.claude.json`, which the CLI reads from its config dir when one is set).
  */
-export function preparePrivateHome(source: string, target: string, layout: BackendHomeLayout, extraFiles: Record<string, string> = {}): PrivateHome {
+export function preparePrivateHome(
+  source: string,
+  target: string,
+  layout: BackendHomeLayout,
+  opts: { state?: string; extraFiles?: Record<string, string> } = {},
+): PrivateHome {
+  const extraFiles = opts.extraFiles ?? {};
   const out: PrivateHome = { home: target, writable: [target], readable: [] };
   const link = (name: string, to: string) => {
     try {
@@ -113,14 +127,18 @@ export function preparePrivateHome(source: string, target: string, layout: Backe
   const shared = new Set(layout.shared);
   const code = new Set(layout.code);
   for (const name of shared) {
-    const real = join(source, name);
-    // Where the backend would have put them without the sandbox: made there, so they outlive this home.
+    if (!opts.state) {
+      // Nowhere to keep them: empty, and gone with this home.
+      copyEntryDir(join(target, name));
+      continue;
+    }
+    const own = join(opts.state, name);
     try {
-      mkdirSync(real, { recursive: true, mode: 0o700 });
+      mkdirSync(own, { recursive: true, mode: 0o700 });
     } catch {
       continue;
     }
-    const at = realOr(real);
+    const at = realOr(own);
     link(name, at);
     out.writable.push(at);
   }
@@ -143,6 +161,14 @@ export function preparePrivateHome(source: string, target: string, layout: Backe
   }
   for (const [name, from] of Object.entries(extraFiles)) copyEntry(from, join(target, name), { fileOnly: true, anySize: true });
   return out;
+}
+
+function copyEntryDir(to: string): void {
+  try {
+    mkdirSync(to, { mode: 0o700 });
+  } catch {
+    /* there already */
+  }
 }
 
 /** A small file copied (0600), a directory made empty, anything else left out. */

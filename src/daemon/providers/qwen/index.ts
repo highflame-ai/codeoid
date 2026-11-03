@@ -1220,7 +1220,7 @@ export function qwenExecutableOption<E extends Record<string, string | undefined
 ): { pathToQwenExecutable?: string; env?: E & { QWEN_HOME: string }; handle?: SandboxHandle } {
   if (!rt?.plan.wrapsBackend) return configured ? { pathToQwenExecutable: configured } : {};
   const argv = qwenCliArgv(configured);
-  const own = preparePrivateHome(env.QWEN_HOME || join(env.HOME || homedir(), ".qwen"), rt.privateHome("qwen"), QWEN_HOME_LAYOUT);
+  const own = preparePrivateHome(env.QWEN_HOME || join(env.HOME || homedir(), ".qwen"), rt.privateHome("qwen"), QWEN_HOME_LAYOUT, { state: rt.stateDir("qwen") });
   const withHome = { ...env, QWEN_HOME: own.home };
   const handle = rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(argv[0] ?? "", argv.slice(1))] });
   return { pathToQwenExecutable: rt.launcher(handle, argv, Object.keys(withHome), "qwen"), env: withHome, handle };

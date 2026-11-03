@@ -193,10 +193,16 @@ What each leaves open:
   made afresh at each start (`src/daemon/sandbox/backend-home.ts`) and pointed
   at by the variable it reads (`PI_CODING_AGENT_DIR`, `GEMINI_CLI_HOME`,
   `QWEN_HOME`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`): its login linked and shown
-  read-only, its conversations (`sessions/`, `projects/`, `tmp/`) the real
-  ones (data, never run: a session resumes with the sandbox on or off), the
-  code it loads (plugins, extensions, skills, commands) shown read-only, its
-  other small files (settings, model lists) copied, its other dirs empty.
+  read-only, its conversations (`sessions/`, `projects/`, the Gemini CLI's
+  `tmp/` and `history/`, Qwen's `tmp/`) the **session's own**, kept in
+  `<transcriptDir>/sandbox-state/<session>/<backend>/` across restarts and
+  removed when the session is destroyed — never the real dirs, which hold
+  every project's transcripts and what later runs load (Claude's project
+  memory, the Gemini CLI's checkpoint repository, whose git config and hooks
+  run), so a sandboxed session reads no other session's or project's, and
+  writes nothing an unsandboxed run loads. The code it loads (plugins,
+  extensions, skills, commands) is shown read-only, its other small files
+  (settings, model lists) copied, its other dirs empty.
   Nothing its commands write there (a hook, an MCP server, an extension,
   `config.toml`) reaches the real home, where your own CLI, or a session with
   the sandbox off, would run it. Its login is readable by its commands, the
@@ -206,6 +212,13 @@ What each leaves open:
   read-only); the next start reads the host's again. Not verified with the
   real vendor CLIs here: whether each tolerates that save failing (the fakes
   do).
+- **Conversations across a sandbox change.** A process backend's native
+  conversation lives in the session's own dir while sandboxed and in your real
+  home while not: switching a session's sandbox off or on, a fork, and a
+  backend switch continue from codeoid's own history (the transcript seed),
+  not the backend's native copy. A session that ran sandboxed under an
+  earlier build kept its conversation in the real dir; it resumes from
+  codeoid's history the same way.
 - **opencode**: its file tools run in its shared server, outside the sandbox,
   under codeoid's gate. A subagent created in a feed gap, before codeoid set its
   shell environment, runs nothing.
@@ -388,6 +401,12 @@ works, and skip where it doesn't):
 - Round 2, the real Claude CLI: a sign-in home the daemon makes while the
   session runs (in its private dir) is unreadable and unlisted in Claude's own
   sandbox; one in the host's `/tmp`, as sign-ins were made before, was read.
+- Round 2, conversations (real bubblewrap): pi can't read another project's
+  transcript in the real `sessions/`, the Gemini CLI can't read the real
+  checkpoint repository's config, and what each writes there lands in the
+  session's own state, which is there again after a restart and gone with the
+  session. (The bundled Gemini CLI 0.50.0 runs ripgrep from its own package
+  or a trusted system path, not from `~/.gemini/tmp/bin`.)
 - `src/tests/provider-opencode.integration.test.ts` I69 (real opencode 2.2.5,
   scripted local model, `CODEOID_OPENCODE_INTEGRATION=1`): a session's shell
   lines run inside its bubblewrap; a session whose sandbox is off runs bash as

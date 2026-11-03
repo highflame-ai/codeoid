@@ -101,6 +101,13 @@ export interface SandboxRuntime {
    * what was there from its last start is gone.
    */
   privateHome(key: string): string;
+  /**
+   * The session's own dir for what its backend keeps across starts (its
+   * conversations: backend-home.ts), the same for the same `key` each time:
+   * under the daemon's transcripts (hidden from every sandbox but this
+   * session's backend), removed with the session.
+   */
+  stateDir(key: string): string;
   /** Claude's native sandbox: where its CLI and its commands keep temp files (claude-native.ts). */
   claudeTemp(): ClaudeTempDirs;
 }
@@ -362,6 +369,7 @@ export class SessionSandbox {
       },
       launcher: (handle, argv, envNames, name) => this.#writeLauncher(handle, argv, envNames ?? [], name),
       privateHome: (key) => this.#privateHome(key),
+      stateDir: (key) => this.#stateDir(key),
       claudeTemp: () => this.#ensureClaudeTemp(),
     };
     return r.info;
@@ -378,6 +386,27 @@ export class SessionSandbox {
     rmSync(dir, { recursive: true, force: true });
     mkdirSync(dir, { mode: 0o700 });
     return dir;
+  }
+
+  /** The session's state root: under the transcripts dir when there is one, else (an embedder, tests) with its private homes. */
+  #stateRoot(): string {
+    const dir = this.#config?.transcriptDir;
+    const safe = this.#sessionId.replace(/[^A-Za-z0-9_-]/g, "") || "session";
+    if (dir) return join(resolve(dir), "sandbox-state", safe);
+    if (!this.#homesDir) this.#homesDir = mkdtempSync(join(sandboxRoot(), `home-${this.#sessionSlug()}-`));
+    return join(this.#homesDir, ".state");
+  }
+
+  #stateDir(key: string): string {
+    if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
+    const dir = join(this.#stateRoot(), key.replace(/[^A-Za-z0-9_-]/g, "") || "backend");
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    return dir;
+  }
+
+  /** Remove what the session's backends kept across starts (with the session: its destroy). */
+  removeState(): void {
+    rmSync(this.#stateRoot(), { recursive: true, force: true });
   }
 
   #ensureClaudeTemp(): ClaudeTempDirs {

@@ -360,11 +360,11 @@ export class PiProvider implements SessionProvider {
     let env = withExtraEnv(this.#piEnv(), this.#extraEnv);
     // The OS sandbox (#448): pi's whole process starts inside the session's,
     // in a private copy of its agent dir (backend-home.ts: its login
-    // read-only, its sessions shared), its program and codeoid's bridge readable.
+    // read-only, its sessions the session's own), its program and codeoid's bridge readable.
     const rt = this.#sandbox?.() ?? null;
     let handle: SandboxHandle | null = null;
     if (rt?.plan.wrapsBackend) {
-      const own = preparePrivateHome(piAgentDirOf(env), rt.privateHome("pi"), PI_HOME_LAYOUT);
+      const own = preparePrivateHome(piAgentDirOf(env), rt.privateHome("pi"), PI_HOME_LAYOUT, { state: rt.stateDir("pi") });
       env = { ...env, PI_CODING_AGENT_DIR: own.home };
       handle = await rt.open(own.writable, { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix), dirname(bridge)] });
     }

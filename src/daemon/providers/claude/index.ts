@@ -2869,7 +2869,10 @@ export function claudeSandboxOptions(
         const home = o.env.HOME || homedir();
         const source = o.env.CLAUDE_CONFIG_DIR || join(home, ".claude");
         // With CLAUDE_CONFIG_DIR set the CLI reads `.claude.json` from there: the user's own, copied in.
-        const own = preparePrivateHome(source, rt.privateHome("claude"), CLAUDE_HOME_LAYOUT, o.env.CLAUDE_CONFIG_DIR ? {} : { ".claude.json": join(home, ".claude.json") });
+        const own = preparePrivateHome(source, rt.privateHome("claude"), CLAUDE_HOME_LAYOUT, {
+          state: rt.stateDir("claude"),
+          ...(o.env.CLAUDE_CONFIG_DIR ? {} : { extraFiles: { ".claude.json": join(home, ".claude.json") } }),
+        });
         configDir = own.home;
         handle = rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(o.command, [])] });
         track?.(handle);
