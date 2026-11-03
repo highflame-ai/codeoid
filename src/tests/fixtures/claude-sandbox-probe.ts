@@ -5,14 +5,20 @@
  * with one Bash call and the next with "finished". Prints one JSON line:
  * what the call's result said and which tool calls reached canUseTool.
  *
- *   bun claude-sandbox-probe.ts <root> <on|off|allowlist> <command-file> [unsandboxed|policy] [allowHost]
+ *   bun claude-sandbox-probe.ts <root> <on|off|allowlist> <command-file> [unsandboxed|policy|policy-env|policy-env-unsandboxed] [allowHost]
  *
  * `<root>` holds the planted files (`ws`, `tmp`, `secrets`); the command is
  * read from a file so it is never part of a shell line. `policy`: the spec
  * is codeoid's own (buildSandboxSpec) for a fake home `<root>/home` with the
  * workspace `<root>/home/proj` (or `<root>/wt` when it exists: a worktree),
  * and the CLI gets the session's temp dirs as the provider gives them
- * (claudeTempEnv), under `<root>/sbx`. Run in its own
+ * (claudeTempEnv), under `<root>/sbx`. `policy-env`: the same, with the
+ * CLI's environment as the provider builds it (claudeNativeEnv: the cache
+ * variables for sandboxed commands only), a stdio MCP server that writes
+ * the environment it got to `<root>/mcp-env.json`, and the caller's own
+ * environment carrying a stale `SANDBOX_RUNTIME`; `policy-env-unsandboxed`:
+ * that, with the call asking to run outside the sandbox and allowed (the
+ * owner's yes). Run in its own
  * process: a test file that mocks the SDK module must not see this one.
  * canUseTool here allows a sandboxed call and DENIES one asking to run
  * outside the sandbox, as codeoid's gate would until its owner says yes.
@@ -20,15 +26,17 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { type ClaudeTempDirs, claudeSandboxSettings, claudeTempEnv } from "../../daemon/sandbox/claude-native.js";
+import { type ClaudeTempDirs, claudeNativeEnv, claudeSandboxSettings, claudeTempEnv } from "../../daemon/sandbox/claude-native.js";
 import { buildSandboxSpec } from "../../daemon/sandbox/policy.js";
 import { daemonTempDir } from "../../daemon/sandbox/root.js";
 
 const [root = "", networkArg = "off", commandFile = "", flag = "", allowHost = ""] = process.argv.slice(2);
 const network = networkArg as "on" | "off" | "allowlist";
 const command = readFileSync(commandFile, "utf8");
-const unsandboxed = flag === "unsandboxed";
-const policy = flag === "policy";
+const nativeEnv = flag === "policy-env" || flag === "policy-env-unsandboxed";
+const unsandboxed = flag === "unsandboxed" || flag === "policy-env-unsandboxed";
+const allowUnsandboxed = flag === "policy-env-unsandboxed";
+const policy = flag === "policy" || nativeEnv;
 
 let toolResult: string | null = null;
 const sse = (events: Array<[string, unknown]>) => events.map(([e, d]) => `event: ${e}\ndata: ${JSON.stringify(d)}\n\n`).join("");
@@ -110,6 +118,7 @@ const spec = policy
       unsetEnv: [],
     };
 const sandbox = claudeSandboxSettings({ spec, config } as never, env, policy ? temp : undefined);
+const cliEnv = nativeEnv ? claudeNativeEnv(spec as never, temp, { ...env, SANDBOX_RUNTIME: "1" }) : env;
 // A sign-in started after the session's sandbox was built (#448 round 2): its home where the daemon makes it, the
 // path told to the test through a file.
 if (process.env.CODEOID_PROBE_SIGNIN_PATH) {
@@ -124,13 +133,14 @@ try {
     prompt: "run the probe",
     options: {
       cwd: workspace,
-      env,
+      env: cliEnv,
       sandbox,
+      ...(nativeEnv ? { mcpServers: { probe: { type: "stdio" as const, command: process.execPath, args: [join(import.meta.dir, "env-dump.ts"), join(root, "mcp-env.json")] } } } : {}),
       permissionMode: "default",
       settingSources: [],
       canUseTool: async (name, input) => {
         asked.push(name);
-        if ((input as { dangerouslyDisableSandbox?: boolean }).dangerouslyDisableSandbox) return { behavior: "deny", message: "denied by the gate" };
+        if ((input as { dangerouslyDisableSandbox?: boolean }).dangerouslyDisableSandbox && !allowUnsandboxed) return { behavior: "deny", message: "denied by the gate" };
         return { behavior: "allow", updatedInput: input };
       },
     },

@@ -3532,7 +3532,10 @@ describe("ClaudeProvider — the OS sandbox", () => {
     return { rt, spawned, opened, home, temp };
   }
   const home = mkdtempSync(join(tmpdir(), "codeoid-claude-home-"));
-  const temp = { cli: "/tmp/codeoid-sandbox-x/claude-s/cli", root: "/tmp/codeoid-sandbox-x/claude-s/cmd", commands: "/tmp/codeoid-sandbox-x/claude-s/cmd/claude-1" };
+  const tempBase = mkdtempSync(join(tmpdir(), "codeoid-claude-temp-"));
+  const temp = { cli: join(tempBase, "cli"), root: join(tempBase, "cmd"), commands: join(tempBase, "cmd", "claude-1") };
+  mkdirSync(temp.cli);
+  mkdirSync(temp.commands, { recursive: true });
   function providerWith(get: () => unknown, audits: Array<{ action: string }> = []): ClaudeProvider {
     return new ClaudeProvider({
       sessionId: "test-session",

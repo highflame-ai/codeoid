@@ -30,7 +30,7 @@
  *     its commands.
  */
 
-import { realpathSync } from "node:fs";
+import { realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { SandboxSettings } from "@anthropic-ai/claude-agent-sdk";
@@ -61,15 +61,45 @@ export function claudeTempEnv(t: ClaudeTempDirs): Record<string, string> {
   return { TMPDIR: t.root, CLAUDE_CODE_TMPDIR: t.cli };
 }
 
+/** POSIX shell single-quoting. */
+function shQuote(v: string): string {
+  return `'${v.replace(/'/g, `'\\''`)}'`;
+}
+
 /**
- * The toolchains' cache variables (SandboxSpec.env) for a native session's
- * CLI, whose commands inherit them. Not `XDG_CACHE_HOME`: the CLI itself
- * runs outside the sandbox and would keep its own files in the sandbox's
- * cache dir, which its commands can write.
+ * The CLI's environment for a native session: its temp dirs
+ * ({@link claudeTempEnv}), and the toolchains' cache variables
+ * (SandboxSpec.env) for its sandboxed commands only. The cache dir is
+ * writable by every sandboxed command, and a cache is code to the toolchain
+ * reading it (`CARGO_HOME`'s `config.toml` and `bin/`, a module in
+ * `GOMODCACHE`, an install in npx's cache), so nothing that runs outside a
+ * sandbox may get them: not the CLI, nor what it starts with its own
+ * environment (stdio MCP servers, hooks, a command the owner let run outside
+ * the sandbox). So they aren't in the CLI's environment at all: the CLI
+ * sources `CLAUDE_ENV_FILE` into every Bash command, and the file codeoid
+ * writes (in the CLI's own temp dir, which no command can write) exports
+ * them only where the CLI's sandbox marks the command as inside it
+ * (`SANDBOX_RUNTIME=1`, which the CLI sets for its sandboxed commands and
+ * codeoid takes out of the CLI's own environment). A `CLAUDE_ENV_FILE` of
+ * the caller's is sourced after it.
  */
-export function claudeCacheEnv(spec: Pick<SandboxSpec, "env">): Record<string, string> {
-  const { XDG_CACHE_HOME: _cli, ...tools } = spec.env ?? {};
-  return tools;
+export function claudeNativeEnv(spec: Pick<SandboxSpec, "env">, temp: ClaudeTempDirs, env: Record<string, string | undefined>): Record<string, string | undefined> {
+  const { SANDBOX_RUNTIME: _marker, ...rest } = env;
+  const exports = Object.entries(spec.env ?? {})
+    .filter(([k]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k))
+    .map(([k, v]) => `  export ${k}=${shQuote(v)}`);
+  const own = env.CLAUDE_ENV_FILE;
+  const lines = [
+    "# codeoid (#448): the toolchains' caches, for commands inside the sandbox only.",
+    ...(exports.length > 0 ? ['if [ "${SANDBOX_RUNTIME-}" = 1 ]; then', ...exports, "fi"] : []),
+    ...(own ? [`[ -r ${shQuote(own)} ] && . ${shQuote(own)}`] : []),
+    "",
+  ];
+  const file = join(temp.cli, "command-env.sh");
+  const part = `${file}.${process.pid}.part`;
+  writeFileSync(part, lines.join("\n"), { mode: 0o600 });
+  renameSync(part, file);
+  return { ...rest, ...claudeTempEnv(temp), CLAUDE_ENV_FILE: file };
 }
 
 /** The SDK's `sandbox` option for a session whose sandbox is on and native. */

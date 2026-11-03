@@ -28,7 +28,7 @@ import {
   withLoginsSynced,
 } from "../daemon/sandbox/backend-home.js";
 import { bwrapArgs, type PathKind } from "../daemon/sandbox/bwrap.js";
-import { claudeCacheEnv, claudeSandboxSettings, claudeTempEnv, physicalOf } from "../daemon/sandbox/claude-native.js";
+import { claudeNativeEnv, claudeSandboxSettings, claudeTempEnv, physicalOf } from "../daemon/sandbox/claude-native.js";
 import { buildSandboxSpec, DEFAULT_HOME_READABLE, gitWorkspacePaths, homeCredentialFilesIn, programLocations, sandboxConfigOf } from "../daemon/sandbox/policy.js";
 import type { SandboxSpec } from "../daemon/sandbox/types.js";
 
@@ -213,10 +213,19 @@ describe("the workspace's git repository", () => {
     });
     // Nothing the user's own (unsandboxed) tools read is writable: not their caches, not their module cache.
     for (const own of [join(home, ".cache"), join(home, "go"), join(home, ".bun"), join(home, ".npm")]) expect(spec.writable).not.toContain(own);
-    // Claude's CLI runs outside its sandbox: it gets the tools' variables, never XDG_CACHE_HOME (it would keep its own files there).
-    const cli = claudeCacheEnv(spec);
-    expect(cli.XDG_CACHE_HOME).toBeUndefined();
-    expect(cli.GOCACHE).toBe(join(cache, "go-build"));
+    // Claude's CLI runs outside its sandbox, and so does what it starts with its environment (MCP servers, hooks, a
+    // command let run outside): none of the cache variables there, only in its sandboxed commands (#448 round 3).
+    const temp = { cli: join(root, "tc-cli"), root: join(root, "tc-cmd"), commands: join(root, "tc-cmd", "c") };
+    mkdirSync(temp.cli);
+    const cli = claudeNativeEnv(spec, temp, { HOME: home, SANDBOX_RUNTIME: "1", CLAUDE_ENV_FILE: join(home, "own-env.sh") });
+    for (const k of Object.keys(spec.env ?? {})) expect(cli[k]).toBeUndefined();
+    expect(cli.SANDBOX_RUNTIME).toBeUndefined();
+    expect(cli).toMatchObject({ TMPDIR: temp.root, CLAUDE_CODE_TMPDIR: temp.cli, CLAUDE_ENV_FILE: join(temp.cli, "command-env.sh") });
+    const script = readFileSync(join(temp.cli, "command-env.sh"), "utf8");
+    expect(script).toContain(`if [ "\${SANDBOX_RUNTIME-}" = 1 ]; then`);
+    expect(script).toContain(`  export CARGO_HOME='${join(cache, "cargo")}'`);
+    expect(script).toContain(`  export XDG_CACHE_HOME='${cache}'`);
+    expect(script.trimEnd().split("\n").at(-1)).toBe(`[ -r '${join(home, "own-env.sh")}' ] && . '${join(home, "own-env.sh")}'`);
     // Under XDG_CACHE_HOME when that is set.
     const xdg = join(root, "tc-xdg");
     expect(buildSandboxSpec({ sessionId: "s", workspace: ws, tempDir: join(root, "tc-t"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home, XDG_CACHE_HOME: xdg }, daemonTmp: "/tmp" } }).env?.XDG_CACHE_HOME).toBe(join(xdg, "codeoid-sandbox"));

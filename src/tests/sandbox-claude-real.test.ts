@@ -178,6 +178,23 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(listing).not.toContain("codeoid-login-");
   }, 120_000);
 
+  test("the toolchains' cache variables reach only sandboxed commands: never the CLI, its MCP servers, or a command run outside the sandbox (#448 round 3)", async () => {
+    mkdirSync(join(root, "home", "proj"), { recursive: true });
+    const show = `echo "cargo=[$CARGO_HOME] gomod=[$GOMODCACHE] npm=[$npm_config_cache] xdg=[$XDG_CACHE_HOME] marker=[$SANDBOX_RUNTIME]"`;
+    const cache = join(root, "home", ".cache", "codeoid-sandbox");
+    rmSync(join(root, "mcp-env.json"), { force: true });
+    const inside = await probe("off", show, ["policy-env"]);
+    expect(inside.result).toBe("success");
+    expect(inside.toolResult).toContain(`cargo=[${join(cache, "cargo")}] gomod=[${join(cache, "go-mod")}] npm=[${join(cache, "npm")}] xdg=[${cache}] marker=[1]`);
+    // The stdio MCP server the CLI started, with its own environment.
+    const mcp = JSON.parse(readFileSync(join(root, "mcp-env.json"), "utf8")) as Record<string, string>;
+    for (const k of ["CARGO_HOME", "GOCACHE", "GOMODCACHE", "npm_config_cache", "UV_CACHE_DIR", "PIP_CACHE_DIR", "BUN_INSTALL_CACHE_DIR", "XDG_CACHE_HOME", "SANDBOX_RUNTIME"]) expect(mcp[k]).toBeUndefined();
+    // A command the owner let run outside the sandbox.
+    const outsideCmd = await probe("off", show, ["policy-env-unsandboxed"]);
+    expect(outsideCmd.asked).toEqual(["Bash"]);
+    expect(outsideCmd.toolResult).toContain("cargo=[] gomod=[] npm=[] xdg=[] marker=[]");
+  }, 180_000);
+
   test("a command asking to run outside the sandbox reaches the gate, and a denial means it never runs", async () => {
     const r = await probe("off", `rm -rf ${outside}; echo RAN`, ["unsandboxed"]);
     expect(r.asked).toEqual(["Bash"]);
