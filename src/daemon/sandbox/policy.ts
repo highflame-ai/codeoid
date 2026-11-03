@@ -251,6 +251,8 @@ export interface SpecInputs {
   hidden?: HiddenPathInputs;
   /** Look for the workspace's git repository (default: yes). */
   git?: boolean;
+  /** Hold the workspace's project settings read-only (default: yes; projectConfigPaths). */
+  projectConfig?: boolean;
 }
 
 /** The home a spec hides: absolute, and not `/` (nothing is left to show then). */
@@ -534,12 +536,42 @@ function validWorktree(gitDir: string, common: string, dotgit: string): boolean 
   }
 }
 
+/**
+ * Project settings agent CLIs load from a workspace and run code from, on
+ * the host, in a later session (a Claude hook, an MCP server, a pi or
+ * opencode extension): read-only from inside, so a command of one backend
+ * can't plant what another runs outside any sandbox. Directories whole
+ * (made empty first where missing: git doesn't see an empty dir), so
+ * nothing can be added in them either; the files at the workspace's top
+ * where they exist (a new `.mcp.json` server is asked about before it runs:
+ * the CLI's and codeoid's own approval).
+ */
+export const PROJECT_CONFIG_DIRS: readonly string[] = [".claude", ".gemini", ".qwen", ".codex", ".pi", ".opencode"];
+export const PROJECT_CONFIG_FILES: readonly string[] = [".mcp.json", "opencode.json", "opencode.jsonc"];
+
+/** {@link PROJECT_CONFIG_DIRS} and {@link PROJECT_CONFIG_FILES} of `workspace`, the dirs made when missing. */
+export function projectConfigPaths(workspace: string): string[] {
+  const out: string[] = [];
+  for (const name of PROJECT_CONFIG_DIRS) {
+    const at = join(workspace, name);
+    makeIfMissing(at, "dir");
+    // A link can't be held by a bind (it can be replaced); a dir it leads to outside the workspace is out of reach anyway.
+    if (lexists(at) && !isLink(at)) out.push(at);
+  }
+  for (const name of PROJECT_CONFIG_FILES) {
+    const at = join(workspace, name);
+    if (lexists(at) && !isLink(at)) out.push(at);
+  }
+  return out;
+}
+
 /** The spec for one session. */
 export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const env = inputs.hidden?.env ?? process.env;
   const home = inputs.hidden?.home ?? env.HOME ?? homedir();
   const workspace = resolve(inputs.workspace);
   const git = inputs.git === false ? { writable: [], readOnly: [], gitDirs: [] } : gitWorkspacePaths(workspace, home);
+  const projectConfig = inputs.projectConfig === false ? [] : projectConfigPaths(workspace);
   const own = [...(inputs.backendState ?? []).map((p) => resolve(p)), ...git.writable];
   const ownReal = own.map(realOr);
   const root = sandboxRootIfMade();
@@ -573,7 +605,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     tempDir,
     writable: own,
     hidden,
-    readOnly: git.readOnly,
+    readOnly: [...git.readOnly, ...projectConfig],
     gitDirs: git.gitDirs,
     pinned: protectedAncestors(hidden, [workspace, tempDir, ...own]),
     reexposed,

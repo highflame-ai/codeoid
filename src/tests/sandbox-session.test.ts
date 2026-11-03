@@ -423,6 +423,25 @@ describe("review fixes (#448)", () => {
     expect(r.asked).toBe(true);
   });
 
+  test("every backend's file tools (they run outside the sandbox): a write into the project settings agent CLIs run code from asks in every mode while the sandbox is on (#448 round 2)", async () => {
+    const call = async (backend: string, name: string, input: Record<string, unknown>, sandbox?: { provider: string }) => {
+      const provider = new MockSessionProvider(backend, [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name, input, approvalId: "ap-1" }, DONE]]);
+      const { session } = makeSession(provider, { mode: "autonomous", ...(sandbox ? { sandbox } : {}) });
+      void session.send("go", AUTH).catch(() => {});
+      await until(() => provider.canUseToolResults.length > 0 || session.pendingToolApprovals().length > 0);
+      const asked = session.pendingToolApprovals().length > 0;
+      if (asked) await session.interrupt(AUTH);
+      return asked;
+    };
+    expect(await call("opencode", "Write", { file_path: join(workdir, ".claude", "settings.json"), content: "{}" })).toBe(true);
+    expect(await call("opencode", "Edit", { file_path: join(workdir, "a.ts"), files: [join(workdir, ".gemini", "settings.json")] })).toBe(true);
+    expect(await call("opencode", "Write", { file_path: join(workdir, ".mcp.json"), content: "{}" })).toBe(true);
+    expect(await call("pi", "write", { path: ".pi/extensions/x.ts", content: "" })).toBe(true);
+    expect(await call("opencode", "Write", { file_path: join(workdir, "src.ts"), content: "" })).toBe(false);
+    // The sandbox off: the owner's choice, nothing is held.
+    expect(await call("opencode", "Write", { file_path: join(workdir, ".claude", "settings.json"), content: "{}" }, { provider: "off" })).toBe(false);
+  });
+
   test("widening is told from what it would really be: a provider that can't run is no sandbox", async () => {
     const reg = new SandboxRegistry("linux", HOST_HAS);
     reg.register(fakeProvider("bwrap", { available: true }));

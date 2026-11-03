@@ -291,6 +291,29 @@ export function outsideWriteOf(
   return null;
 }
 
+/**
+ * The first place a file-tool call writes inside the workspace's project
+ * settings (`dirs` whole, `files` at the workspace's top: what agent CLIs
+ * run code from, sandbox/policy.ts `PROJECT_CONFIG_*`), as resolved; null
+ * when it writes none, or isn't a file tool (a shell command's writes there
+ * are the OS sandbox's to refuse). A target that can't be resolved for
+ * certain counts.
+ */
+export function projectSettingsWriteOf(toolName: string, input: Record<string, unknown>, workdir: string, dirs: readonly string[], files: readonly string[]): string | null {
+  const targets = writeTargets(toolName, input);
+  if (!targets) return null;
+  const work = landing(resolve(workdir)) ?? resolve(workdir);
+  const held = [...dirs.map((d) => ({ at: `${work}/${d}`, whole: true })), ...files.map((f) => ({ at: `${work}/${f}`, whole: false }))];
+  for (const raw of targets) {
+    if (raw === null) continue;
+    const at = writeLandings(raw, workdir);
+    if (at === null) return raw;
+    const hit = at.find((p) => held.some((h) => (h.whole ? within(p, h.at) : norm(p) === norm(h.at))));
+    if (hit !== undefined) return hit;
+  }
+  return null;
+}
+
 /** The approval card's reason for an outside write. */
 export function outsideWriteReason(w: OutsideWrite): string {
   if (w.resolved) return `writes outside the working directory: ${w.path}`;

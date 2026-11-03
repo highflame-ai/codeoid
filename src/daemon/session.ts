@@ -199,7 +199,7 @@ import { secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir } from "./compress/spill.js";
 import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
-import { type OutsideWrite, outsideWriteOf, outsideWriteReason } from "./outside-writes.js";
+import { type OutsideWrite, outsideWriteOf, outsideWriteReason, projectSettingsWriteOf } from "./outside-writes.js";
 import { outsideEffects } from "./risk/effects.js";
 import { assessShellCommandSync, type ShellRisk, UNREADABLE_SHELL_CALL } from "./risk/shell-risk.js";
 import { loadShellParser, shellParserReady } from "./shell/parse.js";
@@ -208,6 +208,7 @@ import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import { asksOutsideSandbox } from "./sandbox/confinement.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
 import { resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { PROJECT_CONFIG_DIRS, PROJECT_CONFIG_FILES } from "./sandbox/policy.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -2096,6 +2097,27 @@ export class Session {
     } catch {
       return true; // an account that can't be resolved won't run anyway; don't wave this through
     }
+  }
+
+  /**
+   * Is this a file-tool write into the workspace's project settings (what
+   * agent CLIs run code from: `.claude/`, `.mcp.json`, …) while the
+   * session's OS sandbox is on (#448)? Its commands can't write them (the
+   * sandbox holds them read-only); a file tool runs in the backend's own
+   * process, outside it (Claude's, opencode's), so it is asked in every mode,
+   * as running a command outside the sandbox is. Fail closed: a judgement
+   * that throws asks.
+   */
+  #writesProjectSettings(toolName: string, input: unknown, sender: { sub: string }): boolean {
+    if (this.#sandbox?.info?.state !== "on" || !input || typeof input !== "object") return false;
+    let at: string | null;
+    try {
+      at = projectSettingsWriteOf(toolName, input as Record<string, unknown>, this.workdir, PROJECT_CONFIG_DIRS, PROJECT_CONFIG_FILES);
+    } catch {
+      at = "(couldn't be judged)";
+    }
+    if (at) this.#store.audit(sender.sub, "session.project_settings_write_ask", this.id, `tool=${toolName} path=${at}`);
+    return at !== null;
   }
 
   /**
@@ -8029,7 +8051,7 @@ export class Session {
       // A write to a Claude settings file on a named account: the CLI reloads
       // it mid-turn and applies its env, after the turn-start check
       // (assertClaudeAccountUsable) — so it never runs unasked, in any mode.
-      const settingsWrite = this.#writesClaudeSettingsOnNamedAccount(toolName, effectiveInput);
+      const settingsWrite = this.#writesClaudeSettingsOnNamedAccount(toolName, effectiveInput) || this.#writesProjectSettings(toolName, effectiveInput, sender);
       // end_attempt: a call the spent budget would have parked is denied and
       // ends the attempt instead — whatever else would have asked about it.
       if (this.#budgetSpentFor(toolName)) return this.#endAttemptOnBudget(approvalId, toolName, sender);

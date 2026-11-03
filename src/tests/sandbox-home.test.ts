@@ -159,6 +159,24 @@ describe("the workspace's git repository", () => {
     expect(g.readOnly).toEqual([join(repo, ".git")]);
   });
 
+  test("the project settings agent CLIs run code from: read-only, their dirs made empty first (git doesn't see them), a top-level file only where it exists, never a link (#448 round 2)", () => {
+    const home = join(root, "pc");
+    const ws = join(home, "proj");
+    mkdirSync(ws, { recursive: true });
+    writeFileSync(join(ws, "opencode.json"), "{}");
+    symlinkSync(join(root, "pc-elsewhere"), join(ws, ".pi"));
+    const spec = buildSandboxSpec({ sessionId: "s", workspace: ws, tempDir: join(root, "pc-t"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    for (const d of [".claude", ".gemini", ".qwen", ".codex", ".opencode"]) {
+      expect(spec.readOnly).toContain(join(ws, d));
+      expect(statSync(join(ws, d)).isDirectory()).toBe(true);
+    }
+    expect(spec.readOnly).toContain(join(ws, "opencode.json"));
+    expect(spec.readOnly).not.toContain(join(ws, ".mcp.json"));
+    expect(existsSync(join(ws, ".mcp.json"))).toBe(false);
+    expect(spec.readOnly).not.toContain(join(ws, ".pi"));
+    expect(existsSync(join(root, "pc-elsewhere"))).toBe(false);
+  });
+
   test("placeholders are never made through a link", () => {
     const home = join(root, "gp");
     const repo = join(home, "repo");

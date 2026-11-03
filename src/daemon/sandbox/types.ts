@@ -85,7 +85,8 @@ export interface SandboxSpec {
    * Locations inside a writable one that stay read-only, with everything in
    * them: what of a repository decides which config, hooks and git dir git
    * uses (a hook planted there would run outside the sandbox at the user's
-   * next commit). Each exists (made first where missing).
+   * next commit), and the project settings agent CLIs run code from
+   * (`.claude/`, `.mcp.json`, …). Each exists (made first where missing).
    */
   readOnly?: readonly string[];
   /**

@@ -721,3 +721,44 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: ro
     }
   });
 });
+
+describe.skipIf(!probe.available)("bubblewrap, for real: round 2 of the #448 audit (project settings)", () => {
+  let root: string;
+  beforeAll(() => {
+    root = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-round2p-")));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  test("a command can't write the settings agent CLIs run code from: .claude (made when missing), other CLIs' dirs, an existing .mcp.json; the rest of the workspace is writable", async () => {
+    const home = join(root, "home");
+    const ws = join(root, "ws");
+    const tmp = join(root, "tmp");
+    for (const d of [home, ws, tmp]) mkdirSync(d, { recursive: true });
+    writeFileSync(join(ws, ".mcp.json"), '{"mcpServers":{}}\n');
+    const spec = buildSandboxSpec({ sessionId: "proj", workspace: ws, tempDir: tmp, network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    const h = await provider.open(spec);
+    try {
+      const tries = [
+        "echo x > .claude/settings.json",
+        "echo x > .claude/settings.local.json",
+        "mkdir .claude/hooks",
+        "mv .claude .claude-old",
+        "echo x > .gemini/settings.json",
+        "echo x > .qwen/settings.json",
+        "echo x > .codex/config.toml",
+        "mkdir .pi/extensions",
+        "echo x > .opencode/opencode.json",
+        "echo x >> .mcp.json",
+        "rm -f .mcp.json",
+      ];
+      const script = `${tries.map((t, i) => `${t} 2>/dev/null && echo WROTE-${i}`).join("; ")}; echo ok > src.txt && echo WS-WRITABLE`;
+      const r = await h.exec(["/bin/sh", "-c", script], { cwd: ws, env: { PATH: "/usr/bin:/bin" }, timeoutMs: 20_000 });
+      expect(r.stdout).not.toContain("WROTE");
+      expect(r.stdout).toContain("WS-WRITABLE");
+    } finally {
+      await h.close();
+    }
+    expect(existsSync(join(ws, ".claude", "settings.json"))).toBe(false);
+    expect(readFileSync(join(ws, ".mcp.json"), "utf8")).toBe('{"mcpServers":{}}\n');
+  });
+});
