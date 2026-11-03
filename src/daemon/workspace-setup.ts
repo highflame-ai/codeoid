@@ -53,7 +53,7 @@
 
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
-import { GIT_BIN, gitEnv } from "./git-env.js";
+import { GIT_BIN, safeGitEnv } from "./git-env.js";
 import {
   closeSync,
   constants,
@@ -195,12 +195,13 @@ export function parseSetupRecipe(text: string): SetupRecipe {
 
 // ── git ──────────────────────────────────────────────────────────────────────
 
-/** git with hooks and fsmonitor off and git-env.ts's environment (no network, no replace refs); `okCodes` are exits that aren't errors. */
+/** git with nothing the repository's config names run (git-env.ts `safeGitEnv`: no hook, fsmonitor or driver, no network, no replace refs); `okCodes` are exits that aren't errors. */
 async function git(args: string[], cwd: string, opts: { okCodes?: number[]; input?: string } = {}): Promise<{ code: number; stdout: string }> {
-  const argv = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args];
+  const argv = args;
+  const env = await safeGitEnv(cwd);
   if (opts.input !== undefined) {
     return new Promise((resolve, reject) => {
-      const child = spawn(GIT_BIN, argv, { cwd, env: gitEnv(), stdio: ["pipe", "pipe", "pipe"] });
+      const child = spawn(GIT_BIN, argv, { cwd, env, stdio: ["pipe", "pipe", "pipe"] });
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (b: Buffer) => {
@@ -221,7 +222,7 @@ async function git(args: string[], cwd: string, opts: { okCodes?: number[]; inpu
   try {
     // No network: a lazy fetch would run whatever remote config an agent wrote
     // (this runs during a loop's verification, after its worker is stopped).
-    const { stdout } = await execFileP(GIT_BIN, argv, { cwd, env: gitEnv(), timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
+    const { stdout } = await execFileP(GIT_BIN, argv, { cwd, env, timeout: 60_000, maxBuffer: 16 * 1024 * 1024 });
     return { code: 0, stdout };
   } catch (err) {
     const code = (err as { code?: unknown }).code;
@@ -278,9 +279,9 @@ export async function readSetupRecipe(repoDir: string): Promise<FoundRecipe | nu
   const blob = m[3] as string;
   // Trust is pinned to this id: the text run must be the text it names, not
   // whatever a rewritten object in the store holds. Hashed as raw bytes.
-  const { stdout: bytes } = await execFileP(GIT_BIN, ["-c", "core.hooksPath=/dev/null", "cat-file", "blob", blob], {
+  const { stdout: bytes } = await execFileP(GIT_BIN, ["cat-file", "blob", blob], {
     cwd: root,
-    env: gitEnv(),
+    env: await safeGitEnv(root),
     encoding: "buffer",
     timeout: 60_000,
     maxBuffer: LIMITS.RECIPE_BYTES + 1024,

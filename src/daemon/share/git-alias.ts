@@ -22,7 +22,7 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import { GIT_BIN, gitEnv } from "../git-env.js";
+import { GIT_BIN, safeGitEnv } from "../git-env.js";
 
 const execFileP = promisify(execFile);
 
@@ -100,8 +100,8 @@ async function tryGit(cwd: string, args: string[]): Promise<string | null> {
   try {
     const { stdout } = await execFileP(GIT_BIN, args, {
       cwd,
-      // The session's repository: never the daemon's environment.
-      env: gitEnv(),
+      // The session's repository: never the daemon's environment, nothing its config names run.
+      env: await safeGitEnv(cwd, { timeoutMs: 2_000 }),
       timeout: 2_000,
     });
     const out = stdout.trim();
