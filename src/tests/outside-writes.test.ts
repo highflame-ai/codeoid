@@ -19,7 +19,8 @@ import { existsSync, linkSync, mkdirSync, mkdtempSync, realpathSync, rmSync, sym
 import { homedir, tmpdir } from "node:os";
 import { join, relative } from "node:path";
 import { type CodeoidConfig, getConfigDir } from "../config.js";
-import { outsideWriteOf, writeTargets } from "../daemon/outside-writes.js";
+import { heldWriteOf, heldWriteReason, outsideWriteOf, writeTargets } from "../daemon/outside-writes.js";
+import { protectedWriteTargets } from "../daemon/sandbox/policy.js";
 import type { ProviderEvent, SessionProvider } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { OpencodeProvider } from "../daemon/providers/opencode/index.js";
@@ -716,4 +717,54 @@ describe("opencode's write outside the working directory, end to end", () => {
     expect(inside.asked).toBe(false);
     expect(inside.reply).toContain("wrote it");
   }, 30_000);
+});
+
+describe("file tools writing what the sandbox holds read-only (#448 round 3)", () => {
+  let base: string;
+  beforeAll(() => {
+    base = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-held-")));
+  });
+  afterAll(() => rmSync(base, { recursive: true, force: true }));
+  const sh = (args: string[], cwd: string) => Bun.spawnSync(["git", ...args], { cwd, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@e", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@e" } });
+
+  test("a plain repository: its .git whole, the project settings; through a link in the workspace too; nothing else", () => {
+    const ws = join(base, "plain");
+    mkdirSync(ws);
+    sh(["init", "-q"], ws);
+    symlinkSync(join(ws, ".git", "hooks"), join(ws, "hooks-link"));
+    const held = protectedWriteTargets(ws, base);
+    const of = (tool: string, input: Record<string, unknown>) => heldWriteOf(tool, input, ws, held);
+    expect(of("Write", { file_path: join(ws, ".git", "hooks", "pre-commit") })).toEqual({ path: join(ws, ".git", "hooks", "pre-commit"), what: "git" });
+    expect(of("Edit", { file_path: join(ws, ".git", "config") })?.what).toBe("git");
+    expect(of("write", { path: ".git/info/attributes" })?.what).toBe("git");
+    expect(of("Write", { file_path: join(ws, "hooks-link", "post-checkout") })).toEqual({ path: join(ws, ".git", "hooks", "post-checkout"), what: "git" });
+    expect(of("Write", { file_path: join(ws, "sub", "..", ".git", "HEAD") })?.what).toBe("git");
+    expect(of("Write", { file_path: join(ws, ".mcp.json") })?.what).toBe("settings");
+    expect(of("Write", { file_path: join(ws, "opencode.jsonc") })?.what).toBe("settings");
+    expect(of("write_file", { file_path: join(ws, ".claude", "hooks", "x.sh") })?.what).toBe("settings");
+    expect(of("Write", { file_path: join(ws, "src", "a.ts") })).toBeNull();
+    expect(of("Write", { file_path: join(ws, ".gitignore") })).toBeNull();
+    expect(of("Bash", { command: "echo x > .git/config" })).toBeNull();
+    expect(of("Write", { file_path: "/proc/self/cwd/.git/config" })?.what).toBe("unresolved");
+    expect(heldWriteReason({ path: join(ws, ".git", "config"), what: "git" })).toContain("runs outside the sandbox");
+  });
+
+  test("a linked worktree: its .git file, its own git dir and the repository's (outside the workspace), another worktree's .git file inside it", () => {
+    const repo = join(base, "repo");
+    mkdirSync(repo);
+    sh(["init", "-q", "-b", "main"], repo);
+    writeFileSync(join(repo, "a"), "a");
+    sh(["add", "."], repo);
+    sh(["commit", "-qm", "i"], repo);
+    const ws = join(base, "wt");
+    sh(["worktree", "add", "-q", "-b", "f", ws], repo);
+    sh(["worktree", "add", "-q", "-b", "g", join(ws, "nested")], repo);
+    const held = protectedWriteTargets(ws, base);
+    const of = (p: string) => heldWriteOf("Write", { file_path: p }, ws, held)?.what ?? null;
+    expect(of(join(ws, ".git"))).toBe("git");
+    expect(of(join(repo, ".git", "worktrees", "wt", "commondir"))).toBe("git");
+    expect(of(join(repo, ".git", "hooks", "pre-commit"))).toBe("git");
+    expect(of(join(ws, "nested", ".git"))).toBe("git");
+    expect(of(join(ws, "nested", "a"))).toBeNull();
+  });
 });

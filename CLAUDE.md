@@ -275,8 +275,10 @@ any other `.git` file is held read-only and said in the sandbox's limits
 Codex's extra writable roots. The project settings agent CLIs run code from
 (`PROJECT_CONFIG_DIRS`/`_FILES`: `.claude/`, `.mcp.json`, …; missing ones made
 first, files as an empty config listed in `info/exclude`) read-only, and a
-file tool writing them asks in every mode while sandboxed
-(`projectSettingsWriteOf`). Toolchain caches point at
+file tool writing them, or the repository's git structure (its git dirs,
+`.git` files: `protectedWriteTargets`), asks in every mode while sandboxed
+(`heldWriteOf`; on Claude the PreToolUse hook routes it past allow rules,
+`heldWriteDecision`). Toolchain caches point at
 `~/.cache/codeoid-sandbox` (`SandboxSpec.env`, `toolchainCacheEnv`), set only inside a sandbox, never
 for a CLI or what it runs outside one (Claude native: `claudeNativeEnv`, a
 `CLAUDE_ENV_FILE` exporting them only under `SANDBOX_RUNTIME=1`); a link in

@@ -455,6 +455,40 @@ describe("review fixes (#448)", () => {
     expect(await call("opencode", "Write", { file_path: join(workdir, ".claude", "settings.json"), content: "{}" }, { provider: "off" })).toBe(false);
   });
 
+  test("file tools writing the repository's git structure ask in every mode while the sandbox is on, the card saying why (#448 round 3)", async () => {
+    const execFile = (args: string[], cwd: string) => Bun.spawnSync(["git", ...args], { cwd, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
+    execFile(["init", "-q", "-b", "main"], workdir);
+    try {
+      const call = async (backend: string, name: string, input: Record<string, unknown>) => {
+        const provider = new MockSessionProvider(backend, [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name, input, approvalId: "ap-1" }, DONE]]);
+        const { session, cards } = makeSession(provider, { mode: "autonomous" });
+        void session.send("go", AUTH).catch(() => {});
+        await until(() => provider.canUseToolResults.length > 0 || session.pendingToolApprovals().length > 0);
+        const pending = session.pendingToolApprovals();
+        const card = cards[0]?.tool?.state as { risk?: { reasons: string[] } } | undefined;
+        if (pending.length > 0) await session.interrupt(AUTH);
+        return { asked: pending.length > 0, reason: pending[0]?.risk?.reasons[0] ?? "", card: card?.risk?.reasons[0] ?? "" };
+      };
+      const hook = await call("claude", "Write", { file_path: join(workdir, ".git", "hooks", "pre-commit"), content: "x" });
+      expect(hook.asked).toBe(true);
+      expect(hook.reason).toContain("the repository's git structure");
+      expect(hook.card).toContain("the repository's git structure");
+      for (const [backend, name, input] of [
+        ["claude", "Edit", { file_path: join(workdir, ".git", "config"), old_string: "[core]", new_string: "[core]" }],
+        ["claude", "Write", { file_path: join(workdir, ".git", "commondir"), content: "x" }],
+        ["claude", "NotebookEdit", { notebook_path: join(workdir, ".git", "info", "attributes.ipynb") }],
+        ["opencode", "Edit", { file_path: join(workdir, "a.ts"), files: [join(workdir, ".git", "info", "attributes")] }],
+        ["pi", "write", { path: ".git/HEAD", content: "x" }],
+      ] as const) {
+        expect(await call(backend, name, input as Record<string, unknown>)).toMatchObject({ asked: true });
+      }
+      expect((await call("claude", "Write", { file_path: join(workdir, "src.ts"), content: "" })).asked).toBe(false);
+    } finally {
+      rmSync(join(workdir, ".git"), { recursive: true, force: true });
+      rmSync(join(workdir, "HEAD"), { recursive: true, force: true });
+    }
+  });
+
   test("a destroyed session's backend state (its own conversations, #448 round 2) goes with it", async () => {
     const transcripts = mkdtempSync(join(tmpdir(), "codeoid-sbx-state-"));
     try {

@@ -291,27 +291,47 @@ export function outsideWriteOf(
   return null;
 }
 
+/** A path a file tool must not write unasked: a dir `whole`, or the file itself (sandbox/policy.ts `protectedWriteTargets`). */
+export interface HeldPath {
+  /** Absolute. */
+  at: string;
+  whole: boolean;
+  /** What it is, for the card: `git` (the repository's structure) or `settings` (project settings agent CLIs run code from). */
+  what: "git" | "settings";
+}
+
 /**
- * The first place a file-tool call writes inside the workspace's project
- * settings (`dirs` whole, `files` at the workspace's top: what agent CLIs
- * run code from, sandbox/policy.ts `PROJECT_CONFIG_*`), as resolved; null
- * when it writes none, or isn't a file tool (a shell command's writes there
- * are the OS sandbox's to refuse). A target that can't be resolved for
- * certain counts.
+ * The first place a file-tool call writes among `held` (the repository's
+ * git dirs and `.git` files, the workspace's project settings), as
+ * resolved, and what it is; null when it writes none, or isn't a file tool
+ * (a shell command's writes there are the OS sandbox's to refuse). A target
+ * that can't be resolved for certain counts.
  */
-export function projectSettingsWriteOf(toolName: string, input: Record<string, unknown>, workdir: string, dirs: readonly string[], files: readonly string[]): string | null {
+export function heldWriteOf(toolName: string, input: Record<string, unknown>, workdir: string, held: readonly HeldPath[]): { path: string; what: HeldPath["what"] | "unresolved" } | null {
   const targets = writeTargets(toolName, input);
   if (!targets) return null;
-  const work = landing(resolve(workdir)) ?? resolve(workdir);
-  const held = [...dirs.map((d) => ({ at: `${work}/${d}`, whole: true })), ...files.map((f) => ({ at: `${work}/${f}`, whole: false }))];
+  const real = held.map((h) => ({ ...h, at: landing(resolve(h.at)) ?? resolve(h.at) }));
   for (const raw of targets) {
     if (raw === null) continue;
     const at = writeLandings(raw, workdir);
-    if (at === null) return raw;
-    const hit = at.find((p) => held.some((h) => (h.whole ? within(p, h.at) : norm(p) === norm(h.at))));
-    if (hit !== undefined) return hit;
+    if (at === null) return { path: raw, what: "unresolved" };
+    for (const p of at) {
+      const hit = real.find((h) => (h.whole ? within(p, h.at) : norm(p) === norm(h.at)));
+      if (hit) return { path: p, what: hit.what };
+    }
   }
   return null;
+}
+
+/** The approval card's reason for a file-tool write into what the sandbox holds read-only. */
+export function heldWriteReason(w: { path: string; what: HeldPath["what"] | "unresolved" }): string {
+  const where =
+    w.what === "git"
+      ? "the repository's git structure (its config, hooks or git dir, which git runs from at your next command)"
+      : w.what === "settings"
+        ? "project settings an agent CLI runs code from"
+        : "a path that can't be resolved for certain";
+  return `writes ${where}: ${w.path} — this tool runs outside the sandbox, which holds it read-only for commands`;
 }
 
 /** The approval card's reason for an outside write. */

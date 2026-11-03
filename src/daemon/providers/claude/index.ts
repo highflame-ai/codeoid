@@ -51,7 +51,7 @@ import { LOOP_MCP_SERVER_NAME, LOOP_REPORT_TOOL_FQ } from "../../loops/tools.js"
 import { rewriteBashToolInput } from "../../compress/index.js";
 import { type CodeoidConfig, getConfigDir } from "../../../config.js";
 import { assessShellCommandSync } from "../../risk/shell-risk.js";
-import { outsideWriteOf, outsideWriteReason } from "../../outside-writes.js";
+import { heldWriteOf, heldWriteReason, outsideWriteOf, outsideWriteReason } from "../../outside-writes.js";
 import { secretPathVerdict } from "../../secret-paths.js";
 import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "../../fork-isolation.js";
 import { isShellTool, runsNoCommand, shellCallOf } from "../../shell/tool-call.js";
@@ -78,7 +78,7 @@ import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.
 import { listProcesses } from "../../process-tree.js";
 import { CLAUDE_HOME_LAYOUT, preparePrivateHome, withLoginsSynced } from "../../sandbox/backend-home.js";
 import { asksUnsandboxed, claudeNativeEnv, claudeSandboxSettings } from "../../sandbox/claude-native.js";
-import { programLocations } from "../../sandbox/policy.js";
+import { programLocations, protectedWriteTargets } from "../../sandbox/policy.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../../sandbox/types.js";
 import type { LLMCallUsage } from "../../context-math.js";
@@ -1354,6 +1354,13 @@ export class ClaudeProvider implements SessionProvider {
               // (outside-writes.ts): never on an allow rule either. Fail-closed.
               const outside = this.#outsideWriteDecision(input, opts.workdir);
               if (outside) return outside;
+              // While sandboxed (#448) a file tool writing the repository's git structure or the
+              // project settings (read-only to commands; this tool runs outside the sandbox) asks
+              // in every mode: never on an allow rule. Fail-closed.
+              if (sandbox) {
+                const held = heldWriteDecision(input, opts.workdir);
+                if (held) return held;
+              }
               // Past this point a throw fails OPEN: the CLI takes a hook that
               // errors as having no opinion (its createHookCallback returns {}),
               // so a call it would allow itself goes ahead.
@@ -2829,6 +2836,27 @@ export function claudeCatalogEntry(m: {
     ...(m.description ? { description: m.description } : {}),
     ...(efforts ? { efforts } : {}),
   };
+}
+
+/**
+ * The PreToolUse hook's decision for a file-tool write into what the OS
+ * sandbox holds read-only (#448: outside-writes.ts `heldWriteOf`): `ask`,
+ * so it reaches codeoid's gate past any allow rule; null for one that
+ * writes none. A judgement that throws asks.
+ */
+export function heldWriteDecision(
+  input: PreToolUseHookInput,
+  workdir: string,
+): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "ask"; permissionDecisionReason: string } } | null {
+  let reason: string;
+  try {
+    const held = heldWriteOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, workdir, protectedWriteTargets(workdir));
+    if (!held) return null;
+    reason = heldWriteReason(held);
+  } catch {
+    reason = "codeoid couldn't tell whether this write reaches what the sandbox holds read-only, so it needs the owner's approval.";
+  }
+  return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: reason } };
 }
 
 /** What the running query's OS sandbox was built from (#448): a change rebuilds it. */

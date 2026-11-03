@@ -3632,6 +3632,39 @@ describe("ClaudeProvider — the OS sandbox", () => {
     await p.teardown();
   });
 
+  it("a file tool writing the repository's git structure or the project settings goes to codeoid's gate past any allow rule while sandboxed, in every mode (#448 round 3)", async () => {
+    const ws = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-claude-held-")));
+    mkdirSync(join(ws, ".git", "hooks"), { recursive: true });
+    mkdirSync(join(ws, ".git", "objects"));
+    writeFileSync(join(ws, ".git", "HEAD"), "ref: refs/heads/main\n");
+    const p = providerWith(() => runtime("native").rt);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const run = p.runTurn({ history: [], userMessage: "go", workdir: ws, canUseTool: async () => ({ behavior: "allow" as const }) });
+    const drain = (async () => {
+      await gate;
+      for await (const _ of run.events) {
+        /* drain */
+      }
+    })();
+    const hook = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }> } } }).options.hooks.PreToolUse[0]!.hooks[0]!;
+    const decision = async (input: Record<string, unknown>, id: string) =>
+      (await hook({ hook_event_name: "PreToolUse", tool_name: "Write", tool_input: input, tool_use_id: id, cwd: ws })) as { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } };
+    const git = await decision({ file_path: join(ws, ".git", "hooks", "pre-commit"), content: "x" }, "tu-g");
+    expect(git.hookSpecificOutput?.permissionDecision).toBe("ask");
+    expect(git.hookSpecificOutput?.permissionDecisionReason).toContain("the repository's git structure");
+    const settings = await decision({ file_path: join(ws, "opencode.json"), content: "{}" }, "tu-s");
+    expect(settings.hookSpecificOutput?.permissionDecisionReason).toContain("project settings");
+    const plain = await decision({ file_path: join(ws, "a.ts"), content: "" }, "tu-p");
+    expect(plain.hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    release();
+    await drain;
+    await p.teardown();
+    rmSync(ws, { recursive: true, force: true });
+  });
+
   it("what the query was built with: a changed sandbox is a different build", () => {
     const a = runtime("native").rt;
     expect(sandboxFingerprint(a as never)).toBe(sandboxFingerprint(runtime("native").rt as never));

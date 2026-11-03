@@ -29,6 +29,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { CodeoidConfig } from "../../config.js";
 import { getConfigDir } from "../../config.js";
 import { daemonOwnedDirs } from "../data-lock.js";
+import type { HeldPath } from "../outside-writes.js";
 import { cliCredentialFiles, registeredSecretLocations } from "../secret-paths.js";
 import { DEFAULT_HOME_READABLE } from "./home-readable.js";
 import { validAllowedHost } from "./hosts.js";
@@ -488,6 +489,31 @@ export function gitWorkspacePaths(workspace: string, home: string = process.env.
     if (f && f !== dotgit && within(f, ws) && lexists(f) && !isLink(f)) out.readOnly.push(f);
   }
   out.gitDirs.push(common, ...(own ? [own] : []));
+  return out;
+}
+
+/**
+ * What a file tool that runs outside the sandbox (Claude's Write and Edit,
+ * opencode's, any in a backend's own process) must not write unasked while
+ * the sandbox is on (#448): the repository's git dirs and its `.git`, the
+ * `.git` files of other checkouts in the workspace, and the project settings
+ * ({@link PROJECT_CONFIG_DIRS} whole, {@link PROJECT_CONFIG_FILES}). The
+ * sandbox holds them read-only for commands; a file tool isn't one. No side
+ * effects (nothing is made).
+ */
+export function protectedWriteTargets(workspace: string, home: string = process.env.HOME ?? homedir()): HeldPath[] {
+  const ws = resolve(workspace);
+  const out: HeldPath[] = [];
+  const layout = gitLayoutOf(ws, home);
+  if (layout) {
+    for (const p of [layout.dotgit, layout.common, layout.own, layout.named]) if (p) out.push({ at: p, whole: true, what: "git" });
+    if (layout.common) {
+      const others = listDirs(join(layout.common, "worktrees")).map((n) => gitdirTarget(join(layout.common as string, "worktrees", n)));
+      for (const f of [...others, ...submoduleCheckouts(join(layout.common, "modules"))]) if (f && within(f, ws)) out.push({ at: f, whole: true, what: "git" });
+    }
+  }
+  for (const d of PROJECT_CONFIG_DIRS) out.push({ at: join(ws, d), whole: true, what: "settings" });
+  for (const f of PROJECT_CONFIG_FILES) out.push({ at: join(ws, f), whole: false, what: "settings" });
   return out;
 }
 

@@ -199,7 +199,7 @@ import { secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir } from "./compress/spill.js";
 import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
-import { type OutsideWrite, outsideWriteOf, outsideWriteReason, projectSettingsWriteOf } from "./outside-writes.js";
+import { type HeldPath, heldWriteOf, heldWriteReason, type OutsideWrite, outsideWriteOf, outsideWriteReason, writeTargets } from "./outside-writes.js";
 import { outsideEffects } from "./risk/effects.js";
 import { assessShellCommandSync, type ShellRisk, UNREADABLE_SHELL_CALL } from "./risk/shell-risk.js";
 import { loadShellParser, shellParserReady } from "./shell/parse.js";
@@ -208,7 +208,7 @@ import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import { asksOutsideSandbox } from "./sandbox/confinement.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
 import { resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
-import { PROJECT_CONFIG_DIRS, PROJECT_CONFIG_FILES } from "./sandbox/policy.js";
+import { protectedWriteTargets } from "./sandbox/policy.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -2101,24 +2101,22 @@ export class Session {
   }
 
   /**
-   * Is this a file-tool write into the workspace's project settings (what
-   * agent CLIs run code from: `.claude/`, `.mcp.json`, …) while the
-   * session's OS sandbox is on (#448)? Its commands can't write them (the
-   * sandbox holds them read-only); a file tool runs in the backend's own
-   * process, outside it (Claude's, opencode's), so it is asked in every mode,
-   * as running a command outside the sandbox is. Fail closed: a judgement
-   * that throws asks.
+   * A file-tool write into what the session's OS sandbox holds read-only
+   * (#448) while it is on: the repository's git structure (its git dirs,
+   * `.git` files) or the project settings agent CLIs run code from
+   * (`.claude/`, `.mcp.json`, `opencode.json`, …). Its commands can't
+   * write them; a file tool runs in the backend's own process, outside the
+   * sandbox (Claude's, opencode's), so it is asked in every mode, as running
+   * a command outside the sandbox is. Fail closed: a judgement that throws
+   * asks. Null when it writes none.
    */
-  #writesProjectSettings(toolName: string, input: unknown, sender: { sub: string }): boolean {
-    if (this.#sandbox?.info?.state !== "on" || !input || typeof input !== "object") return false;
-    let at: string | null;
+  #heldWrite(toolName: string, input: unknown): { path: string; what: HeldPath["what"] | "unresolved" } | null {
+    if (this.#sandbox?.info?.state !== "on" || !input || typeof input !== "object") return null;
     try {
-      at = projectSettingsWriteOf(toolName, input as Record<string, unknown>, this.workdir, PROJECT_CONFIG_DIRS, PROJECT_CONFIG_FILES);
+      return heldWriteOf(toolName, input as Record<string, unknown>, this.workdir, protectedWriteTargets(this.workdir));
     } catch {
-      at = "(couldn't be judged)";
+      return writeTargets(toolName, input as Record<string, unknown>) ? { path: "(couldn't be judged)", what: "unresolved" } : null;
     }
-    if (at) this.#store.audit(sender.sub, "session.project_settings_write_ask", this.id, `tool=${toolName} path=${at}`);
-    return at !== null;
   }
 
   /**
@@ -5268,7 +5266,7 @@ export class Session {
       if (!gated) continue;
       const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
       const outside = this.#outsideWrite(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
-      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, outside), ...this.#cardSandbox(gated.toolName, gated.input) });
+      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, outside, this.#heldWrite(gated.toolName, gated.input)), ...this.#cardSandbox(gated.toolName, gated.input) });
     }
     return out;
   }
@@ -7857,7 +7855,13 @@ export class Session {
    * and an outside write's reason — first when it is what makes the call ask,
    * after a high or not-understood command's own.
    */
-  #cardRisk(risk: ShellRisk | null, outside: OutsideWrite | null): { risk?: { level: ShellRisk["level"]; reasons: string[] } } {
+  #cardRisk(risk: ShellRisk | null, outside: OutsideWrite | null, held: { path: string; what: HeldPath["what"] | "unresolved" } | null = null): { risk?: { level: ShellRisk["level"]; reasons: string[] } } {
+    if (held) {
+      const why = heldWriteReason(held);
+      const rest = [...(outside ? [outsideWriteReason(outside)] : []), ...(risk?.reasons ?? [])];
+      if (risk && riskWeight(risk) > 1) return { risk: { level: risk.level, reasons: [why, ...rest] } };
+      return { risk: { level: "medium", reasons: [why, ...rest] } };
+    }
     if (!outside) return risk ? { risk: { level: risk.level, reasons: risk.reasons } } : {};
     const why = outsideWriteReason(outside);
     if (risk && riskWeight(risk) > 1) return { risk: { level: risk.level, reasons: [...risk.reasons, why] } };
@@ -8062,7 +8066,11 @@ export class Session {
       // A write to a Claude settings file on a named account: the CLI reloads
       // it mid-turn and applies its env, after the turn-start check
       // (assertClaudeAccountUsable) — so it never runs unasked, in any mode.
-      const settingsWrite = this.#writesClaudeSettingsOnNamedAccount(toolName, effectiveInput) || this.#writesProjectSettings(toolName, effectiveInput, sender);
+      const held = this.#heldWrite(toolName, effectiveInput);
+      if (held) {
+        this.#store.audit(sender.sub, held.what === "git" ? "session.git_structure_write_ask" : "session.project_settings_write_ask", this.id, `tool=${toolName} path=${held.path}`);
+      }
+      const settingsWrite = this.#writesClaudeSettingsOnNamedAccount(toolName, effectiveInput) || held !== null;
       // end_attempt: a call the spent budget would have parked is denied and
       // ends the attempt instead — whatever else would have asked about it.
       if (this.#budgetSpentFor(toolName)) return this.#endAttemptOnBudget(approvalId, toolName, sender);
@@ -8728,6 +8736,7 @@ export class Session {
         // as canUseTool's synchronous section, always after it).
         const risk = this.#shellRisk(event.name, event.input, event.shellCwd);
         const outside = this.#outsideWrite(event.name, event.input, event.shellCwd);
+        const held = this.#heldWrite(event.name, event.input);
         // Claude's sandbox asking for a host: decided by the session's network alone (#448).
         const networkAsk = event.name === SANDBOX_NETWORK_TOOL && this.#sandbox?.info?.state === "on";
         const autoApprove = networkAsk
@@ -8737,6 +8746,7 @@ export class Session {
           !risk?.secret &&
           !this.#riskAsks(risk) &&
           !outside &&
+          !held &&
           (this.#riskAllows(event.name, risk) || this.#peekAutoApprove(event.name));
         // end_attempt: the gate will refuse this call outright — no approval card.
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
@@ -8759,7 +8769,7 @@ export class Session {
                   description: `${event.name}(${Object.keys(event.input).join(", ")})`,
                   approvalId: event.approvalId,
                   ...this.#collaborationCostFor(event.name),
-                  ...this.#cardRisk(risk, outside),
+                  ...this.#cardRisk(risk, outside, held),
                   ...this.#cardSandbox(event.name, event.input),
                 } as unknown as ToolState),
           },
