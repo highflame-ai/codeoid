@@ -76,6 +76,19 @@ describe("seatbeltProfile", () => {
     expect(at(`"${g}/worktrees/w/commondir"`)).toBeGreaterThan(at(`(allow file-read* file-write* (subpath "${g}/worktrees/w"))`));
   });
 
+  test("worktrees/ read-only whole, this worktree's own git dir writable inside it, its commondir read-only again: later rules win, so each comes after the one it overrides (#448 round 3)", () => {
+    const g = "/Users/u/repo/.git";
+    const dirsHere = new Set([...dirs, g, `${g}/worktrees`, `${g}/worktrees/w`, "/Users/u/repo/HEAD"]);
+    const { profile, params } = seatbeltProfile(spec({ writable: [g, `${g}/worktrees/w`], readOnly: [`${g}/worktrees`, `${g}/worktrees/w/commondir`, "/Users/u/repo/HEAD", "/Users/u/repo/opencode.json"] }), { ...fs, isDir: (p) => (dirsHere.has(p) ? true : fs.isDir(p)) });
+    const text = profile.replace(/\(param "(P\d+)"\)/g, (_m, n: string) => JSON.stringify(params[n]));
+    const at = (n: string) => text.indexOf(n);
+    expect(at(`(allow file-read* file-write* (subpath "${g}/worktrees/w"))`)).toBeGreaterThan(at(`(deny file-write* (subpath "${g}/worktrees"))`));
+    expect(at(`(deny file-write* (subpath "${g}/worktrees"))`)).toBeGreaterThan(at(`(allow file-read* file-write* (subpath "${g}"))`));
+    expect(at(`"${g}/worktrees/w/commondir"`)).toBeGreaterThan(at(`(allow file-read* file-write* (subpath "${g}/worktrees/w"))`));
+    expect(at('(deny file-write* (subpath "/Users/u/repo/HEAD"))')).toBeGreaterThan(at('(allow file-read* file-write* (subpath "/Users/u/repo"))'));
+    expect(text).toContain('"/Users/u/repo/opencode.json"');
+  });
+
   test("a repository's hooks and config can't be written, with what is in them", () => {
     const { text } = readable(spec({ readOnly: ["/Users/u/repo/.git/hooks", "/Users/u/repo/.git/config"] }));
     expect(text).toContain('"/Users/u/repo/.git/hooks"');
