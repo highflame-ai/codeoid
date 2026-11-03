@@ -22,12 +22,15 @@ import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
-import type { AuthContext, DaemonMessage, SessionInfo } from "../protocol/types.js";
+import { type AuthContext, CAPABILITIES, type DaemonMessage, type SessionInfo } from "../protocol/types.js";
 
 const AUTH: AuthContext = { sub: "user:sbx", scopes: [...ALL_SCOPES] as AuthContext["scopes"], delegationDepth: 0, accountId: "acc", projectId: "proj" };
 const OTHER: AuthContext = { ...AUTH, sub: "user:other" };
 const NO_APPROVE: AuthContext = { ...AUTH, scopes: AUTH.scopes.filter((s) => s !== "session:approve") as AuthContext["scopes"] };
 const CLIENT = { id: "cli", auth: AUTH, send: () => {} };
+
+/** What these tests' host has on PATH: everything (Claude's sandbox needs socat on Linux; whether this machine has it doesn't matter here). */
+const HOST_HAS = (name: string) => `/usr/bin/${name}`;
 
 const DONE: ProviderEvent = { type: "turn_done", result: { providerId: "claude", model: "m", inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0, durationMs: 1 } };
 
@@ -66,15 +69,21 @@ let store: Store;
 let transcript: TranscriptStore;
 let managers: SessionManager[];
 
-function newManager(probe: SandboxProbe = { available: true }): SessionManager {
+function newManager(probe: SandboxProbe = { available: true }, sandbox?: Record<string, unknown>): SessionManager {
   const registry = new ProviderRegistry("claude");
   for (const id of ["claude", "openai"]) registry.register({ id, displayName: id, create: () => new MockSessionProvider(id, [[DONE], [DONE]]) });
-  const sandboxRegistry = new SandboxRegistry("linux");
+  const sandboxRegistry = new SandboxRegistry("linux", HOST_HAS);
   sandboxRegistry.register(fake("bwrap", probe));
   sandboxRegistry.register(fake("docker", { available: false, reason: "the Docker daemon isn't reachable" }));
-  const m = new SessionManager(store, transcript, undefined, undefined, undefined, { config: mkConfig(tmp), providers: registry, sandboxRegistry });
+  const config = { ...mkConfig(tmp), ...(sandbox ? { sandbox: { provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [], docker: { image: "x" }, ...sandbox } } : {}) } as CodeoidConfig;
+  const m = new SessionManager(store, transcript, undefined, undefined, undefined, { config, providers: registry, sandboxRegistry });
   managers.push(m);
   return m;
+}
+
+/** A manager whose daemon-wide sandbox default is `sandbox` (over auto, network on). */
+function newManagerWith(sandbox: Record<string, unknown>): SessionManager {
+  return newManager({ available: true }, sandbox);
 }
 
 beforeEach(() => {
@@ -190,5 +199,87 @@ describe("SessionManager and the OS sandbox", () => {
     const listed = (await m.handle({ type: "session.list", id: "l" }, AUTH, CLIENT)) as { sessions: SessionInfo[] };
     const f = listed.sessions.find((s) => s.id === forkInfo?.id);
     expect(f?.sandbox?.network).toBe("off");
+  });
+});
+
+describe("round 1 of the #448 audit: wider than the daemon's sandbox is the owner's own", () => {
+  const DELEGATED: AuthContext = { ...AUTH, delegationDepth: 1, delegatedBy: AUTH.sub } as AuthContext;
+  let audits: Array<{ action: string; detail: string }> = [];
+  beforeEach(() => {
+    audits = [];
+    const audit = store.audit.bind(store);
+    store.audit = (subject, action, sessionId, detail) => {
+      audits.push({ action, detail: detail ?? "" });
+      audit(subject, action, sessionId, detail);
+    };
+  });
+  const audited = (action: string) => audits.filter((a) => a.action === action);
+
+  it("create: off, a wider network or another provider needs session:approve and an undelegated token; narrower needs neither", async () => {
+    const m = newManagerWith({ network: "off" });
+    for (const sandbox of [{ provider: "off" }, { network: "on" }, { provider: "bwrap" }, { network: "allowlist", allowedHosts: ["github.com"] }]) {
+      const r = await create(m, { sandbox }, DELEGATED);
+      expect(r).toMatchObject({ type: "response.error", code: "forbidden" });
+      expect(await create(m, { sandbox }, NO_APPROVE)).toMatchObject({ type: "response.error", code: "forbidden" });
+    }
+    expect(audited("session.sandbox_wider_refused").length).toBeGreaterThan(0);
+    // The daemon's own, or narrower: anyone who may create.
+    expect(infoOf(await create(m, { sandbox: { network: "off" } }, DELEGATED))?.sandbox?.network).toBe("off");
+    expect(infoOf(await create(m, {}, DELEGATED))?.sandbox?.state).toBe("on");
+    // The owner, undelegated: as before.
+    expect(infoOf(await create(m, { sandbox: { provider: "off" } }))?.sandbox?.state).toBe("off");
+  });
+
+  it("a fork carries a wider sandbox only for its owner, undelegated; a narrower one for anyone in the tenant", async () => {
+    const m = newManager();
+    const off = infoOf(await create(m, { sandbox: { provider: "off" } }))?.id as string;
+    expect(await m.handle({ type: "session.fork", id: "f", sessionId: off } as never, OTHER, { ...CLIENT, auth: OTHER })).toMatchObject({ type: "response.error", code: "forbidden" });
+    expect(await m.handle({ type: "session.fork", id: "f", sessionId: off } as never, DELEGATED, { ...CLIENT, auth: DELEGATED })).toMatchObject({ type: "response.error", code: "forbidden" });
+    expect((await m.handle({ type: "session.fork", id: "f", sessionId: off } as never, AUTH, CLIENT)).type).not.toBe("response.error");
+    const narrow = infoOf(await create(m, { sandbox: { network: "off" } }))?.id as string;
+    expect((await m.handle({ type: "session.fork", id: "f", sessionId: narrow } as never, OTHER, { ...CLIENT, auth: OTHER })).type).not.toBe("response.error");
+  });
+
+  it("the turn-off confirm is answered only by the owner's own token, through the manager too", async () => {
+    const m = newManager();
+    const info = infoOf(await create(m));
+    const id = info?.id as string;
+    const asked: Array<{ requestId: string }> = [];
+    m.findByName(info?.name as string, AUTH)?.attach({
+      id: "dialogs",
+      auth: AUTH,
+      capabilities: [CAPABILITIES.UI_DIALOGS],
+      send: (msg: { type: string; requestId?: string }) => {
+        if (msg.type === "session.ui_request") asked.push({ requestId: msg.requestId ?? "" });
+      },
+    } as never);
+    expect(await m.handle({ type: "session.set_sandbox", id: "x", sessionId: id, sandbox: { provider: "off" } }, AUTH, CLIENT)).toMatchObject({ data: { pending: true } });
+    for (let i = 0; i < 100 && asked.length === 0; i++) await Bun.sleep(10);
+    const requestId = asked[0]?.requestId ?? "";
+    expect(requestId).not.toBe("");
+    for (const who of [DELEGATED, OTHER]) {
+      expect(await m.handle({ type: "session.ui_response", id: "u", sessionId: id, requestId, confirmed: true } as never, who, { ...CLIENT, auth: who })).toMatchObject({ type: "response.error", code: "forbidden" });
+    }
+    expect(await m.handle({ type: "session.ui_response", id: "u", sessionId: id, requestId, confirmed: true } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
+    for (let i = 0; i < 100 && audited("session.set_sandbox").length === 0; i++) await Bun.sleep(10);
+    expect(audited("session.set_sandbox").at(-1)?.detail).toContain("→ off");
+  });
+
+  it("a delegated token can't change the daemon's sandbox settings, and is audited", async () => {
+    const m = newManager();
+    for (const key of ["sandbox.provider", "sandbox.bwrapPath", "sandbox.docker.image", "sandbox.homeReadable"]) {
+      const r = await m.handle({ type: "settings.set", id: "s", patches: [{ key, value: "off" }] } as never, DELEGATED, { ...CLIENT, auth: DELEGATED });
+      expect(r).toMatchObject({ type: "response.error", code: "forbidden" });
+      expect((r as { error: string }).error).toContain("sandbox");
+    }
+    expect(audited("settings.set.denied").some((a) => a.detail.includes("sandbox.provider") && a.detail.includes("delegated"))).toBe(true);
+  });
+
+  it("a session whose sandbox is off is made autonomous only by its owner's own token", async () => {
+    const m = newManager();
+    const id = infoOf(await create(m, { sandbox: { provider: "off" } }))?.id as string;
+    expect(await m.handle({ type: "session.set_mode", id: "m", sessionId: id, mode: "autonomous" }, DELEGATED, { ...CLIENT, auth: DELEGATED })).toMatchObject({ code: "forbidden" });
+    expect(await m.handle({ type: "session.set_mode", id: "m", sessionId: id, mode: "autonomous" }, OTHER, { ...CLIENT, auth: OTHER })).toMatchObject({ code: "forbidden" });
+    expect(await m.handle({ type: "session.set_mode", id: "m", sessionId: id, mode: "autonomous" }, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
   });
 });

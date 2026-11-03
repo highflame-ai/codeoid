@@ -137,7 +137,7 @@ import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
-import { openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem } from "./sandbox/session-sandbox.js";
+import { effectiveSetting, openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import { sandboxConfigOf } from "./sandbox/policy.js";
 import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
@@ -2255,12 +2255,14 @@ mcpHub: this.#mcpHub,
         code: "forbidden",
       };
     }
-    // Worktree setup decides whether a repository's command runs unasked:
+    // Worktree setup decides whether a repository's command runs unasked,
+    // and the OS sandbox (#448) what every session's commands can reach:
     // an undelegated owner only, and every change audited old → new.
-    const setupPatches = msg.patches.filter((p) => p.key.startsWith("worktree.setup."));
+    const setupPatches = msg.patches.filter((p) => p.key.startsWith("worktree.setup.") || p.key.startsWith("sandbox."));
     if (setupPatches.length > 0 && auth.delegationDepth > 0) {
       this.#store.audit(auth.sub, "settings.set.denied", "", `keys=${setupPatches.map((p) => p.key).join(",")} reason=delegated`);
-      return { type: "response.error", requestId: msg.id, error: "A delegated token can't change worktree setup settings.", code: "forbidden" };
+      const what = setupPatches.some((p) => p.key.startsWith("sandbox.")) ? "sandbox" : "worktree setup";
+      return { type: "response.error", requestId: msg.id, error: `A delegated token can't change ${what} settings.`, code: "forbidden" };
     }
     const setupBefore = setupPatches.length > 0 ? getSnapshot().values : undefined;
     try {
@@ -2296,7 +2298,8 @@ mcpHub: this.#mcpHub,
       );
       if (result.ok && setupBefore) {
         for (const p of setupPatches) {
-          this.#store.audit(auth.sub, "settings.set.worktree_setup", "", `key=${p.key} old=${JSON.stringify(setupBefore[p.key]?.value ?? null)} new=${JSON.stringify(p.value)}`);
+          const event = p.key.startsWith("sandbox.") ? "settings.set.sandbox" : "settings.set.worktree_setup";
+          this.#store.audit(auth.sub, event, "", `key=${p.key} old=${JSON.stringify(setupBefore[p.key]?.value ?? null)} new=${JSON.stringify(p.value)}`);
           if (p.key === "worktree.setup.runCommands") {
             this.#worktreeSetupPolicy = { ...this.#worktreeSetupPolicy, runCommands: p.value === "trusted-repos" ? "trusted-repos" : "never" };
           }
@@ -4323,17 +4326,18 @@ mcpHub: this.#mcpHub,
     // children. Built BEFORE the session because `fleet` is a constructor
     // input; the id it scopes to is read lazily through the thunk, which is
     // only ever called from a tool handler mid-turn.
-    // The OS sandbox (#448): a setting the daemon can use, and `off` only
-    // with the scope that approves what runs unasked.
+    // The OS sandbox (#448): a setting the daemon can use, and one wider than
+    // the daemon's (off, a wider network, another provider) only as
+    // `session.set_sandbox` would allow it: the scope that approves what
+    // runs unasked, and never a delegated token.
     if (msg.sandbox) {
       if (!this.#sandboxRegistry) {
         return { type: "response.error", requestId: msg.id, error: "This daemon has no OS sandbox", code: "invalid_request" };
       }
       const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry) ?? (await this.#sandboxUnavailable(msg.sandbox));
       if (problem) return { type: "response.error", requestId: msg.id, error: problem, code: "invalid_request" };
-      if (msg.sandbox.provider === "off" && !hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)) {
-        return { type: "response.error", requestId: msg.id, error: "Missing scope: session:approve (needed to create a session with its sandbox off)", code: "forbidden" };
-      }
+      const refused = this.#widerSandboxRefusal(msg.sandbox, auth, "create a session");
+      if (refused) return { type: "response.error", requestId: msg.id, error: refused, code: "forbidden" };
     }
 
     let goalSessionId = "";
@@ -4877,6 +4881,11 @@ mcpHub: this.#mcpHub,
     if (!parent) {
       return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
     }
+    // The fork keeps its parent's sandbox (#448): one off or wider than the
+    // daemon's is carried over only by its owner, undelegated, as only they
+    // could have chosen it (a fork or a compare isn't a way around that).
+    const sandboxRefused = this.#widerSandboxRefusal(parent.sandboxSetting, auth, "fork this session", parent.createdBy);
+    if (sandboxRefused) return { type: "response.error", requestId: msg.id, error: sandboxRefused, code: "forbidden" };
     // Forking THE conductor would mint a second fleet supervisor — refuse.
     // The fork keeps running on the parent's Claude account, and choosing what
     // a session runs on (and bills) is `settings:write` — a fork or a compare
@@ -6424,6 +6433,8 @@ mcpHub: this.#mcpHub,
             if (!this.#sandboxRegistry) return err("This daemon has no OS sandbox", "invalid_request");
             const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry);
             if (problem) return err(problem, "invalid_request");
+            const wider = this.#widerSandboxRefusal(msg.sandbox, auth, "start a loop");
+            if (wider) return err(wider, "forbidden");
           }
           const sandboxRefused = await this.#unattendedSandboxRefusal(provider, msg.sandbox);
           if (sandboxRefused) return err(`The loop can't start: ${sandboxRefused}`, "invalid_request");
@@ -8841,6 +8852,9 @@ mcpHub: this.#mcpHub,
       { value: msg.value, confirmed: msg.confirmed, cancelled: msg.cancelled },
       auth,
     );
+    if (applied === "forbidden") {
+      return { type: "response.error", requestId: msg.id, error: "Only the session's owner can answer this (with their own token, not a delegated one)", code: "forbidden" };
+    }
     if (!applied) {
       // Already answered elsewhere, timed out, or never existed. Clients
       // treat this as "dismiss my copy" (the ui_resolved broadcast already
@@ -8938,9 +8952,37 @@ mcpHub: this.#mcpHub,
         this.#store.audit(auth.sub, "session.sandbox_refused", session.id, `set_mode autonomous: ${refused}`);
         return { type: "response.error", requestId: msg.id, error: `Can't switch to autonomous: ${refused}`, code: "invalid_request" };
       }
+      // Its sandbox turned off is the owner's choice; running it unasked that way is theirs too.
+      if (session.sandboxInfo?.state === "off" && (auth.delegationDepth > 0 || auth.sub !== session.createdBy)) {
+        this.#store.audit(auth.sub, "session.sandbox_refused", session.id, "set_mode autonomous: sandbox off, not the owner's own token");
+        return { type: "response.error", requestId: msg.id, error: "This session's sandbox is off: only its owner, with their own token, can make it autonomous", code: "forbidden" };
+      }
     }
     session.setMode(msg.mode, msg.maxTurns, auth);
     return { type: "response.ok", requestId: msg.id };
+  }
+
+  /**
+   * Why `auth` can't have a session with `setting` (#448), or null: one wider
+   * than the daemon's default (widens: off, a wider network, another
+   * provider) needs session:approve and an undelegated token, as widening a
+   * session's own does (`session.set_sandbox`). `owner`: the sub whose
+   * session's setting is being carried over (a fork, a compare, a
+   * collaboration child): only that owner may carry a wider one.
+   */
+  #widerSandboxRefusal(setting: SessionSandboxSetting | undefined, auth: AuthContext, what: string, owner?: string): string | null {
+    if (!setting || Object.keys(setting).length === 0) return null;
+    const cfg = sandboxConfigOf(this.#config);
+    if (!widens(effectiveSetting(cfg, undefined), effectiveSetting(cfg, setting))) return null;
+    const refusal = !hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)
+      ? `Missing scope: session:approve (needed to ${what} with a sandbox off or wider than the daemon's)`
+      : auth.delegationDepth > 0
+        ? `A delegated token can't ${what} with a sandbox off or wider than the daemon's`
+        : owner !== undefined && owner !== auth.sub
+          ? `Only the session's owner can ${what} with its sandbox (off or wider than the daemon's)`
+          : null;
+    if (refusal) this.#store.audit(auth.sub, "session.sandbox_wider_refused", "", `${what}: ${refusal}`);
+    return refusal;
   }
 
   /**

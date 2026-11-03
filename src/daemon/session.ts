@@ -1193,6 +1193,8 @@ export class Session {
   #sandbox: SessionSandbox | null = null;
   /** Started for unattended work: turns need an enforced sandbox (SessionCreateOptions.requireSandbox). */
   #requireSandbox = false;
+  /** The sandbox changed while the backend process ran: it runs in the old one until it is restarted. */
+  #sandboxRestartPending = false;
   /** Why the last finished turn failed, when a usage or rate limit was the cause; null after a success. */
   #lastTurnInfraError: TurnInfraError | null = null;
   /**
@@ -1438,6 +1440,10 @@ export class Session {
       timer?: ReturnType<typeof setTimeout>;
       /** Stops listening for the provider's withdrawal (`UiRequest.signal`). */
       unlisten?: () => void;
+      /** Only the session's owner, with an undelegated token, may answer (a sandbox widening, #448). */
+      ownerOnly?: boolean;
+      /** Who answered (for the audit of what it decided). */
+      onAnswer?: (sub: string) => void;
     }
   >();
 
@@ -1978,6 +1984,7 @@ export class Session {
           return;
         }
         this.#releaseProviderWhenIdle = false;
+        this.#sandboxRestartPending = false;
         // Before the teardown, as terminateBackend does: codex and the Gemini
         // CLI are stopped with a bare SIGKILL, and what they started (MCP
         // servers, commands) would otherwise be left running, out of reach.
@@ -3000,11 +3007,25 @@ export class Session {
   }
 
   /**
+   * Why the sandbox can't be changed now, or null: a turn running, an
+   * approval or dialog waiting, or background work the backend holds. What
+   * runs must match what the session reports, and a running backend is
+   * restarted to take a new sandbox: never in the middle of work.
+   */
+  #sandboxBusyReason(): string | null {
+    if (this.#switchBusyReason() || this.#turnActive()) return "the session is busy — change its sandbox once its turn is over";
+    if (this.#hasAgentBackgroundWork()) return "the session has background work running — stop it (or let it finish), then change its sandbox";
+    return null;
+  }
+
+  /**
    * Change the session's sandbox setting (owner only: SessionManager checks).
-   * Narrowing applies at once; widening — the sandbox off, the network wider,
-   * another provider — is asked of the owner on the session, in every mode,
-   * and applies only on a yes. A backend already running is restarted with
-   * the new sandbox at its next turn (now when idle, after the turn when not).
+   * Only while idle (#sandboxBusyReason). Narrowing applies at once;
+   * widening — the sandbox off, the network wider, another provider — is
+   * asked of the owner on the session, in every mode, and applies only on
+   * the owner's own yes (not a delegated token's, not another member's). A
+   * backend already running is restarted in the new sandbox before its next
+   * turn; until it is, a turn that needs the sandbox is refused.
    */
   async setSandbox(
     setting: SessionSandboxSetting,
@@ -3015,6 +3036,8 @@ export class Session {
     if (!sbx) return { ok: false, error: "this daemon has no OS sandbox" };
     const problem = sandboxSettingProblem(setting, sbx.registry);
     if (problem) return { ok: false, error: problem };
+    const busy = this.#sandboxBusyReason();
+    if (busy) return { ok: false, error: busy };
     const next: SessionSandboxSetting = { ...(sbx.setting ?? {}), ...setting };
     if (setting.network && setting.network !== "allowlist" && setting.allowedHosts === undefined) delete next.allowedHosts;
     const before = sbx.effective();
@@ -3022,17 +3045,29 @@ export class Session {
     const describe = (e: { choice: string; network: { mode: string; allow?: readonly string[] } }) =>
       `${e.choice === "off" ? "off" : e.choice}, network ${e.network.mode}${e.network.mode === "allowlist" ? ` (${(e.network.allow ?? []).join(", ")})` : ""}`;
     const change = `${describe(before)} → ${describe(after)}`;
-    const apply = async (): Promise<void> => {
+    const apply = async (answeredBy?: string): Promise<boolean> => {
+      // A confirm answered later: the session may have got busy meanwhile.
+      const nowBusy = this.#sandboxBusyReason();
+      if (nowBusy) {
+        this.#store.audit(answeredBy ?? sender.sub, "session.sandbox_change_busy", this.id, `${change} not applied: ${nowBusy}`);
+        const note = this.#makeMessage("info", `🛡 Sandbox not changed: ${nowBusy}`, SYSTEM_IDENTITY, undefined, undefined, { event: "sandbox.unchanged", setting: next });
+        this.#persistAndBuffer(note);
+        this.#broadcastRaw(note);
+        return false;
+      }
       await sbx.set(next);
-      this.#store.audit(sender.sub, "session.set_sandbox", this.id, change);
+      this.#store.audit(sender.sub, "session.set_sandbox", this.id, answeredBy && answeredBy !== sender.sub ? `${change} (confirmed by ${answeredBy})` : change);
       this.#saveMetaNow();
+      // A backend running now runs in the old sandbox: restarted before its next turn.
+      if (PROCESS_BACKENDS.has(this.#provider.id) && this.#provider.hasQueried) this.#sandboxRestartPending = true;
       await this.ensureSandbox();
       this.#broadcastInfoUpdate();
       const info = this.#makeMessage("info", `🛡 Sandbox: ${change}`, SYSTEM_IDENTITY, undefined, undefined, { event: "sandbox.changed", setting: next });
       this.#persistAndBuffer(info);
       this.#broadcastRaw(info);
-      // The backend picks it up when it next starts.
-      this.releaseIdleProvider();
+      // The backend picks it up when it next starts: stopped now (idle).
+      this.releaseIdleProvider({ idle: true });
+      return true;
     };
     if (!widens(before, after)) {
       await apply();
@@ -3048,15 +3083,22 @@ export class Session {
     const message = unsandboxed
       ? `The agent's commands would run with your full rights${after.choice === "off" ? "" : ` (${resolvedAfter?.info.reason ?? "the sandbox can't run here"})`}: they could read your credentials and change any file you can.`
       : `Commands would run with: ${describe(after)} (now: ${describe(before)}).`;
-    void this.requestUserInput({ method: "confirm", title, message }).then(
+    // Answered by the owner alone, undelegated: what bounds the owner's agent is the owner's call.
+    let answeredBy: string | undefined;
+    void this.requestUserInput({ method: "confirm", title, message }, {
+        ownerOnly: true,
+        onAnswer: (sub) => {
+          answeredBy = sub;
+        },
+      }).then(
       async (answer) => {
         if (answer.cancelled || answer.confirmed !== true) {
-          this.#store.audit(sender.sub, "session.sandbox_widen_denied", this.id, `${change} ${answer.reason ?? "declined"}`);
+          this.#store.audit(answeredBy ?? sender.sub, "session.sandbox_widen_denied", this.id, `${change} ${answer.reason ?? "declined"}`);
           opts.onDecided?.(false, answer.reason ?? "declined");
           return;
         }
-        await apply();
-        opts.onDecided?.(true);
+        const applied = await apply(answeredBy);
+        opts.onDecided?.(applied, applied ? undefined : "busy");
       },
       () => opts.onDecided?.(false, "failed"),
     );
@@ -3386,7 +3428,7 @@ export class Session {
    * info (`pendingDialog`) so any surface can see what it is waiting on. A
    * cancelled answer carries `reason`. An unattended turn never waits.
    */
-  requestUserInput(req: UiRequest): Promise<UiResponse> {
+  requestUserInput(req: UiRequest, own: { ownerOnly?: boolean; onAnswer?: (sub: string) => void } = {}): Promise<UiResponse> {
     if (this.#unattended > 0) return Promise.resolve({ cancelled: true, reason: "unattended" });
     if (req.signal?.aborted) return Promise.resolve({ cancelled: true, reason: "withdrawn" });
     const requestId = randomUUID();
@@ -3415,7 +3457,7 @@ export class Session {
       const withdraw = () => this.#settleUiRequest(requestId, { cancelled: true }, "withdrawn");
       signal?.addEventListener("abort", withdraw, { once: true });
       const unlisten = signal ? () => signal.removeEventListener("abort", withdraw) : undefined;
-      this.#pendingUiRequests.set(requestId, { msg, resolve, timer, ...(unlisten ? { unlisten } : {}) });
+      this.#pendingUiRequests.set(requestId, { msg, resolve, timer, ...(unlisten ? { unlisten } : {}), ...(own.ownerOnly ? { ownerOnly: true } : {}), ...(own.onAnswer ? { onAnswer: own.onAnswer } : {}) });
       this.#broadcastToCapable(CAPABILITIES.UI_DIALOGS, msg);
       this.#broadcastInfoUpdate(); // pendingDialog
     });
@@ -3455,8 +3497,14 @@ export class Session {
     requestId: string,
     response: { value?: string; confirmed?: boolean; cancelled?: boolean },
     sender: AuthContext,
-  ): boolean {
-    if (!this.#pendingUiRequests.has(requestId)) return false;
+  ): boolean | "forbidden" {
+    const pending = this.#pendingUiRequests.get(requestId);
+    if (!pending) return false;
+    if (pending.ownerOnly && (sender.sub !== this.createdBy || sender.delegationDepth > 0)) {
+      this.#store.audit(sender.sub, "session.ui_response_refused", this.id, `requestId=${requestId} owner-only`);
+      return "forbidden";
+    }
+    pending.onAnswer?.(sender.sub);
     const cancelled = response.cancelled === true;
     this.#store.audit(
       sender.sub,
@@ -3779,7 +3827,10 @@ export class Session {
     // The OS sandbox (#448), resolved for this backend before it starts. An
     // autonomous or unattended turn doesn't start without one that holds.
     await this.ensureSandbox();
-    const sandboxRefused = this.sandboxRefusal();
+    const sandboxRefused =
+      this.sandboxRefusal() ??
+      // Its backend still runs in the sandbox it had before a change: not what the session reports.
+      (this.#sandboxRestartPending && this.#sandboxRequired() ? "its backend still runs in its previous sandbox (it restarts once the session is idle)" : null);
     if (sandboxRefused) {
       this.#store.audit(sender.sub, "session.sandbox_refused", this.id, sandboxRefused);
       throw new SandboxRequiredError(`Not started: ${sandboxRefused}`);

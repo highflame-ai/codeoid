@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
@@ -16,7 +16,7 @@ import { MockSessionProvider } from "../daemon/providers/mock/session-provider.j
 import { confinementFor } from "../daemon/sandbox/confinement.js";
 import { LocalSandboxHandle } from "../daemon/sandbox/local-handle.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
-import { resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, widens } from "../daemon/sandbox/session-sandbox.js";
+import { openCheckSandbox, resolveSandbox, SandboxRequiredError, type SandboxRuntime, SessionSandbox, sandboxRefusalOf, widens } from "../daemon/sandbox/session-sandbox.js";
 import { sandboxConfigOf } from "../daemon/sandbox/policy.js";
 import { sandboxRoot } from "../daemon/sandbox/root.js";
 import type { NetworkMode, SandboxProbe, SandboxProvider, SandboxSpec } from "../daemon/sandbox/types.js";
@@ -49,7 +49,7 @@ function fakeProvider(id: string, probe: SandboxProbe, network: NetworkMode[] = 
 }
 
 function registry(probe: SandboxProbe = { available: true }): SandboxRegistry {
-  const r = new SandboxRegistry("linux");
+  const r = new SandboxRegistry("linux", HOST_HAS);
   r.register(fakeProvider("bwrap", probe));
   r.register(fakeProvider("docker", { available: true }));
   return r;
@@ -90,6 +90,9 @@ afterEach(async () => {
   } catch {}
   rmSync(root, { recursive: true, force: true });
 });
+
+/** What these tests' host has on PATH: everything (Claude's sandbox needs socat on Linux; whether this machine has it doesn't matter here). */
+const HOST_HAS = (name: string) => `/usr/bin/${name}`;
 
 const DONE: ProviderEvent = { type: "turn_done", result: { providerId: "claude", model: "m", inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0, durationMs: 1 } };
 
@@ -208,7 +211,7 @@ describe("what a session's sandbox resolves to", () => {
     const sb = fakeProvider("seatbelt", { available: true });
     const dk = fakeProvider("docker", { available: true });
     const kind = (b: string, p: SandboxProvider) => {
-      const c = confinementFor(b, p);
+      const c = confinementFor(b, p, { platform: "linux", which: HOST_HAS });
       return c.ok ? c.plan.kind : `no: ${c.reason}`;
     };
     expect([kind("claude", bw), kind("claude", sb), kind("claude", dk)]).toEqual(["native", "native", "process"]);
@@ -421,7 +424,7 @@ describe("review fixes (#448)", () => {
   });
 
   test("widening is told from what it would really be: a provider that can't run is no sandbox", async () => {
-    const reg = new SandboxRegistry("linux");
+    const reg = new SandboxRegistry("linux", HOST_HAS);
     reg.register(fakeProvider("bwrap", { available: true }));
     reg.register(fakeProvider("docker", { available: false, reason: "no daemon" }));
     const { session, dialogs } = makeSession(new MockSessionProvider("claude", [[DONE]]), { registry: reg });
@@ -432,5 +435,199 @@ describe("review fixes (#448)", () => {
     await until(() => dialogs.length > 0);
     expect(dialogs[0]?.title).toContain("Turn the sandbox off");
     expect(dialogs[0]?.message).toContain("no daemon");
+  });
+});
+
+describe("round 1 of the #448 audit", () => {
+  test("Claude on Linux without socat: not sandboxed, with the reason (interactive runs and says so, autonomous is refused) instead of every turn failing", async () => {
+    const noSocat = new SandboxRegistry("linux", (n) => (n === "socat" ? null : `/usr/bin/${n}`));
+    noSocat.register(fakeProvider("bwrap", { available: true }));
+    const interactive = makeSession(new MockSessionProvider("claude", [[DONE]]), { registry: noSocat });
+    const info = await interactive.session.ensureSandbox();
+    expect(info).toMatchObject({ state: "unavailable", enforced: false });
+    expect(info?.reason).toContain("socat");
+    await interactive.session.send("go", AUTH);
+    const autonomous = makeSession(new MockSessionProvider("claude", [[DONE]]), { mode: "autonomous", registry: noSocat });
+    await expect(autonomous.session.send("go", AUTH)).rejects.toThrow(/socat/);
+    // Only Claude's own sandbox needs it: pi under the same bubblewrap is on.
+    expect((await resolveSandbox({ registry: noSocat, config: sandboxConfigOf(undefined), setting: undefined, backendId: "pi" })).info.state).toBe("on");
+    // macOS: Seatbelt needs no socat.
+    const mac = fakeProvider("seatbelt", { available: true });
+    expect(confinementFor("claude", mac, { platform: "darwin", which: () => null }).ok).toBe(true);
+  });
+
+  test("a narrowing set while the first resolution is still probing isn't lost: the last setting is what stands", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const slow: SandboxProvider = {
+      ...fakeProvider("bwrap", { available: true }),
+      probe: async () => {
+        await gate;
+        return { available: true };
+      },
+    };
+    const r = new SandboxRegistry("linux", HOST_HAS);
+    r.register(slow);
+    const sbx = new SessionSandbox({ sessionId: "race", workdir, registry: r });
+    let probing = false;
+    const probe = slow.probe;
+    slow.probe = () => {
+      probing = true;
+      return probe();
+    };
+    const first = sbx.refresh("opencode");
+    // The first resolution is under way (its setting taken) before the change.
+    await until(() => probing);
+    await sbx.set({ network: "off" });
+    const second = sbx.refresh("opencode");
+    release();
+    await Promise.all([first, second]);
+    expect(sbx.setting).toEqual({ network: "off" });
+    expect(sbx.resolvedFor("opencode")).toBe(true);
+    expect(sbx.info?.network).toBe("off");
+    expect(sbx.runtime?.spec.network).toEqual({ mode: "off" });
+    await sbx.close();
+  });
+
+  test("a set while a resolution runs is resolved again even with no second refresh asked for", async () => {
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let probes = 0;
+    const slow: SandboxProvider = {
+      ...fakeProvider("bwrap", { available: true }),
+      probe: async () => {
+        if (probes++ === 0) await gate;
+        return { available: true };
+      },
+    };
+    const r = new SandboxRegistry("linux", HOST_HAS);
+    r.register(slow);
+    const sbx = new SessionSandbox({ sessionId: "race2", workdir, registry: r });
+    const first = sbx.refresh("opencode");
+    await until(() => probes > 0);
+    await sbx.set({ network: "off" });
+    r.resetProbes();
+    release();
+    await first;
+    expect(sbx.info?.network).toBe("off");
+    await sbx.close();
+  });
+
+  test("a workspace of / can't be sandboxed: unavailable, with why (and a check there is refused)", async () => {
+    const r = registry();
+    const at = await resolveSandbox({ registry: r, config: sandboxConfigOf(undefined), setting: undefined, backendId: "pi", workspace: "/" });
+    expect(at.info).toMatchObject({ state: "unavailable", enforced: false });
+    expect(at.info.reason).toContain("working in /");
+    const sbx = new SessionSandbox({ sessionId: "root", workdir: "/", registry: r });
+    expect(await sbx.refresh("claude")).toMatchObject({ state: "unavailable" });
+    expect(sbx.runtime).toBeNull();
+    await sbx.close();
+    expect(await openCheckSandbox({ registry: r, config: undefined, setting: undefined, workspace: "/", label: "c" })).toMatchObject({ kind: "refused" });
+    // Off is still off: the owner's choice.
+    expect((await resolveSandbox({ registry: r, config: sandboxConfigOf(undefined), setting: { provider: "off" }, backendId: "pi", workspace: "/" })).info.state).toBe("off");
+  });
+
+  test("a loop check's temp dir is removed when its sandbox fails to open", async () => {
+    const r = new SandboxRegistry("linux", HOST_HAS);
+    r.register({
+      ...fakeProvider("bwrap", { available: true }),
+      open: async () => {
+        throw new Error("open failed");
+      },
+    });
+    const checks = () => readdirSync(sandboxRoot()).filter((n) => n.startsWith("check-leak"));
+    const before = checks().length;
+    await expect(openCheckSandbox({ registry: r, config: undefined, setting: undefined, workspace: workdir, label: "leak" })).rejects.toThrow("open failed");
+    expect(checks().length).toBe(before);
+  });
+
+  test("a closed handle is let go of; a change of setting closes none a backend still uses", async () => {
+    const sbx = new SessionSandbox({ sessionId: "handles", workdir, registry: registry() });
+    await sbx.refresh("pi");
+    const rt = sbx.runtime as SandboxRuntime;
+    const a = await rt.open([]);
+    const b = rt.openSync([]);
+    expect(sbx.openHandles).toBe(2);
+    await a.close();
+    expect(sbx.openHandles).toBe(1);
+    await sbx.set({ network: "off" });
+    // Still usable: the backend running in it is restarted when idle, never cut off mid-turn.
+    expect(() => b.wrap?.(["true"], { cwd: "/", env: {} })).not.toThrow();
+    expect(sbx.openHandles).toBe(1);
+    await sbx.close();
+    expect(sbx.openHandles).toBe(0);
+    expect(() => b.wrap?.(["true"], { cwd: "/", env: {} })).toThrow(/closed/);
+  });
+
+  test("a private home is fresh at each start, and Claude's temp dirs are the session's own, gone with it", async () => {
+    const sbx = new SessionSandbox({ sessionId: "homes", workdir, registry: registry() });
+    await sbx.refresh("pi");
+    const rt = sbx.runtime as SandboxRuntime;
+    const home = rt.privateHome("pi");
+    writeFileSync(join(home, "planted"), "x");
+    expect(rt.privateHome("pi")).toBe(home);
+    expect(existsSync(join(home, "planted"))).toBe(false);
+    expect(statSync(home).mode & 0o777).toBe(0o700);
+    const t = rt.claudeTemp();
+    expect(t.commands).toBe(join(t.root, `claude-${process.getuid?.() ?? "user"}`));
+    expect(existsSync(t.commands) && existsSync(t.cli)).toBe(true);
+    expect(t.cli.startsWith(sandboxRoot())).toBe(true);
+    await sbx.close();
+    expect(existsSync(home)).toBe(false);
+    expect(existsSync(t.cli)).toBe(false);
+  });
+
+  test("the sandbox isn't changed while the session is busy (a turn waiting on an approval, background work), so what runs always matches what it says", async () => {
+    const provider = new MockSessionProvider("claude", [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name: "Bash", input: { command: "ls" }, approvalId: "ap-1" }, DONE], [DONE]]);
+    const { session } = makeSession(provider);
+    await session.ensureSandbox();
+    void session.send("go", AUTH).catch(() => {});
+    await until(() => session.pendingToolApprovals().length > 0);
+    const busy = await session.setSandbox({ network: "off" }, AUTH);
+    expect(busy).toMatchObject({ ok: false });
+    expect((busy as { error: string }).error).toContain("busy");
+    expect(session.sandboxSetting).toBeUndefined();
+    await session.interrupt(AUTH);
+    await until(() => !session.pendingToolApprovals().length);
+    provider.onSessionEvent?.({ type: "background_tasks", tasks: [{ id: "bg1", kind: "local_bash", description: "dev server", status: "running" }] });
+    await until(() => session.toInfo().status === "idle");
+    const bg = await session.setSandbox({ network: "off" }, AUTH);
+    expect(bg).toMatchObject({ ok: false });
+    expect((bg as { error: string }).error).toContain("background work");
+  });
+
+  test("a change while idle restarts a backend that ran, before its next turn", async () => {
+    const provider = new MockSessionProvider("claude", [[DONE], [DONE]]);
+    const { session } = makeSession(provider);
+    await session.send("one", AUTH);
+    await until(() => session.toInfo().status === "idle");
+    expect(provider.hasQueried).toBe(true);
+    const before = provider.teardownCount;
+    expect(await session.setSandbox({ network: "off" }, AUTH)).toEqual({ ok: true });
+    await until(() => provider.teardownCount > before);
+    await session.send("two", AUTH);
+    expect(provider.capturedOpts).toHaveLength(2);
+  });
+
+  test("a widening confirm is answered by the owner alone, with their own token: another member's or a delegated answer is refused, and who answered is audited", async () => {
+    const { session, dialogs } = makeSession(new MockSessionProvider("claude", [[DONE]]));
+    await session.ensureSandbox();
+    let decided: boolean | undefined;
+    await session.setSandbox({ provider: "off" }, AUTH, { onDecided: (a) => { decided = a; } });
+    const requestId = dialogs[0]?.requestId ?? "";
+    const other: AuthContext = { ...AUTH, sub: "someone-else" };
+    const delegated: AuthContext = { ...AUTH, delegationDepth: 1 };
+    expect(session.resolveUiRequestFromClient(requestId, { confirmed: true }, other)).toBe("forbidden");
+    expect(session.resolveUiRequestFromClient(requestId, { confirmed: true }, delegated)).toBe("forbidden");
+    expect(session.sandboxInfo?.state).toBe("on");
+    expect(audits.filter((a) => a.action === "session.ui_response_refused")).toHaveLength(2);
+    expect(session.resolveUiRequestFromClient(requestId, { confirmed: true }, AUTH)).toBe(true);
+    await until(() => decided !== undefined);
+    expect(decided as boolean | undefined).toBe(true);
+    expect(session.sandboxInfo?.state).toBe("off");
   });
 });
