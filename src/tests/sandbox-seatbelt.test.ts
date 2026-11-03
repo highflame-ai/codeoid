@@ -115,6 +115,14 @@ describe("seatbeltProfile", () => {
     expect(args[0]).toBe("-p");
     expect(args.filter((a) => a === "-D").length).toBe(Object.keys(seatbeltProfile(s, fs).params).length);
     expect(args).toContain("P0=/Users/u/.ssh");
+    // The toolchains' caches (#448 round 2), set before TMPDIR.
+    expect(seatbeltEnvPrefix(spec({ env: { GOCACHE: "/Users/u/.cache/codeoid-sandbox/go-build" } }))).toEqual([
+      "/usr/bin/env",
+      "-u",
+      "SSH_AUTH_SOCK",
+      "GOCACHE=/Users/u/.cache/codeoid-sandbox/go-build",
+      "TMPDIR=/private/var/folders/x/T/codeoid-sandbox-s",
+    ]);
   });
 
   test("the provider wraps an argv; it is registered for macOS and is auto there", async () => {

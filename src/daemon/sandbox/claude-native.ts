@@ -35,6 +35,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { SandboxSettings } from "@anthropic-ai/claude-agent-sdk";
 import type { SandboxRuntime } from "./session-sandbox.js";
+import type { SandboxSpec } from "./types.js";
 
 /** A variable whose value is a credential (by name). */
 const CREDENTIAL_NAME = /(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|COOKIE|AUTH)(?:_|$)/i;
@@ -58,6 +59,17 @@ export interface ClaudeTempDirs {
 /** The CLI's environment for {@link ClaudeTempDirs}. */
 export function claudeTempEnv(t: ClaudeTempDirs): Record<string, string> {
   return { TMPDIR: t.root, CLAUDE_CODE_TMPDIR: t.cli };
+}
+
+/**
+ * The toolchains' cache variables (SandboxSpec.env) for a native session's
+ * CLI, whose commands inherit them. Not `XDG_CACHE_HOME`: the CLI itself
+ * runs outside the sandbox and would keep its own files in the sandbox's
+ * cache dir, which its commands can write.
+ */
+export function claudeCacheEnv(spec: Pick<SandboxSpec, "env">): Record<string, string> {
+  const { XDG_CACHE_HOME: _cli, ...tools } = spec.env ?? {};
+  return tools;
 }
 
 /** The SDK's `sandbox` option for a session whose sandbox is on and native. */

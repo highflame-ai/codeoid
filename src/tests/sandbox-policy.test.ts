@@ -224,7 +224,8 @@ describe("hidden paths", () => {
       backendState: [join(home, ".pi", "agent")],
       hidden: { home, configDir, env: { HOME: home, PI_CODING_AGENT_DIR: join(home, ".pi", "agent") }, daemonTmp: "/tmp" },
     });
-    expect(s.writable).toEqual([join(home, ".pi", "agent")]);
+    // Its state, and the sandbox's cache dir (the toolchains' caches).
+    expect(s.writable).toEqual([join(home, ".pi", "agent"), join(home, ".cache", "codeoid-sandbox")]);
     expect(s.hidden.some((h) => h.startsWith(join(home, ".pi", "agent")))).toBe(false);
     // The home is hidden whole; a credential store in it needs no rule of its own.
     expect(s.hidden).toContain(home);

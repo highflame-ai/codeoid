@@ -16,10 +16,10 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { runCheck } from "../daemon/evidence/runner.js";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
-import { buildSandboxSpec } from "../daemon/sandbox/policy.js";
+import { buildSandboxSpec, programLocations } from "../daemon/sandbox/policy.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
 import { sandboxRoot } from "../daemon/sandbox/root.js";
 import { openCheckSandbox } from "../daemon/sandbox/session-sandbox.js";
@@ -761,4 +761,86 @@ describe.skipIf(!probe.available)("bubblewrap, for real: round 2 of the #448 aud
     expect(existsSync(join(ws, ".claude", "settings.json"))).toBe(false);
     expect(readFileSync(join(ws, ".mcp.json"), "utf8")).toBe('{"mcpServers":{}}\n');
   });
+});
+
+/**
+ * Round 2: the home is read-only inside, so the toolchains' caches are
+ * pointed at the sandbox's own cache dir (SandboxSpec.env). With the network
+ * off: `go build` of a module that depends on one in the user's own module
+ * cache (read from it as a file proxy), and `bun install` of a local
+ * dependency, both work; the user's own caches aren't written.
+ */
+describe.skipIf(!probe.available)("bubblewrap, for real: round 2 of the #448 audit (toolchain caches)", () => {
+  let root: string;
+  beforeAll(() => {
+    root = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-round2c-")));
+  });
+  afterAll(() => {
+    // Go makes its module cache read-only.
+    Bun.spawnSync(["chmod", "-R", "u+w", root]);
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const specFor = (name: string, home: string, ws: string, readable: string[] = []) => {
+    const tmp = join(root, `tmp-${name}`);
+    mkdirSync(tmp, { recursive: true });
+    return buildSandboxSpec({ sessionId: name, workspace: ws, tempDir: tmp, network: { mode: "off" }, backendReadable: readable, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+  };
+
+  test.skipIf(!Bun.which("go") || !Bun.which("zip"))("go build, with a dependency from the user's module cache", async () => {
+    const home = join(root, "go-home");
+    const ws = join(home, "app");
+    const dl = join(home, "go", "pkg", "mod", "cache", "download", "example.com", "dep", "@v");
+    const src = join(root, "dep-src", "example.com", "dep@v1.0.0");
+    for (const d of [ws, dl, src]) mkdirSync(d, { recursive: true });
+    const mod = "module example.com/dep\n\ngo 1.21\n";
+    writeFileSync(join(src, "go.mod"), mod);
+    writeFileSync(join(src, "dep.go"), 'package dep\n\nfunc Hello() string { return "FROM-DEP" }\n');
+    writeFileSync(join(dl, "list"), "v1.0.0\n");
+    writeFileSync(join(dl, "v1.0.0.info"), '{"Version":"v1.0.0","Time":"2024-01-01T00:00:00Z"}\n');
+    writeFileSync(join(dl, "v1.0.0.mod"), mod);
+    expect(Bun.spawnSync(["zip", "-qrD", join(dl, "v1.0.0.zip"), "example.com"], { cwd: join(root, "dep-src") }).exitCode).toBe(0);
+    writeFileSync(join(ws, "go.mod"), "module example.com/app\n\ngo 1.21\n\nrequire example.com/dep v1.0.0\n");
+    writeFileSync(join(ws, "main.go"), 'package main\n\nimport (\n\t"fmt"\n\n\t"example.com/dep"\n)\n\nfunc main() { fmt.Println(dep.Hello()) }\n');
+    const spec = specFor("go", home, ws, [dirname(realpathSync(Bun.which("go") as string))]);
+    expect(spec.env?.GOCACHE).toBe(join(home, ".cache", "codeoid-sandbox", "go-build"));
+    const h = await provider.open(spec);
+    try {
+      const r = await h.exec(["/bin/sh", "-c", "go build -o app . && ./app"], {
+        cwd: ws,
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, GOFLAGS: "-mod=mod", GOSUMDB: "off", GOTOOLCHAIN: "local" },
+        timeoutMs: 120_000,
+      });
+      expect(r.stderr).not.toContain("read-only file system");
+      expect(r.stdout).toContain("FROM-DEP");
+    } finally {
+      await h.close();
+    }
+    // The user's own module cache got nothing new: the module was extracted into the sandbox's.
+    expect(existsSync(join(home, "go", "pkg", "mod", "example.com"))).toBe(false);
+    expect(existsSync(join(home, ".cache", "codeoid-sandbox", "go-mod", "example.com", "dep@v1.0.0", "dep.go"))).toBe(true);
+  }, 180_000);
+
+  test("bun install of a local dependency", async () => {
+    const home = join(root, "bun-home");
+    const ws = join(home, "app");
+    mkdirSync(join(ws, "dep"), { recursive: true });
+    // bun's own cache in the home, as an installed bun has it: on the allowlist, read-only inside.
+    mkdirSync(join(home, ".bun", "install", "cache"), { recursive: true });
+    writeFileSync(join(ws, "dep", "package.json"), '{"name":"dep","version":"1.0.0","main":"index.js"}\n');
+    writeFileSync(join(ws, "dep", "index.js"), 'module.exports = "FROM-DEP";\n');
+    writeFileSync(join(ws, "package.json"), '{"name":"app","version":"1.0.0","dependencies":{"dep":"file:./dep"}}\n');
+    const h = await provider.open(specFor("bun", home, ws, programLocations(process.execPath)));
+    try {
+      const r = await h.exec(["/bin/sh", "-c", `'${process.execPath}' install --no-progress && '${process.execPath}' -e 'console.log(require("dep"))'`], {
+        cwd: ws,
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home },
+        timeoutMs: 120_000,
+      });
+      expect(r.stderr).not.toContain("ReadOnlyFileSystem");
+      expect(r.stdout).toContain("FROM-DEP");
+    } finally {
+      await h.close();
+    }
+  }, 180_000);
 });

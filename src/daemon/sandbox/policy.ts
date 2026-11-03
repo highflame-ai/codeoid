@@ -253,6 +253,8 @@ export interface SpecInputs {
   git?: boolean;
   /** Hold the workspace's project settings read-only (default: yes; projectConfigPaths). */
   projectConfig?: boolean;
+  /** Give the toolchains a writable cache (default: yes; sandboxCacheDir). */
+  cache?: boolean;
 }
 
 /** The home a spec hides: absolute, and not `/` (nothing is left to show then). */
@@ -565,6 +567,52 @@ export function projectConfigPaths(workspace: string): string[] {
   return out;
 }
 
+/**
+ * The sandbox's own cache dir: writable inside, where the toolchains'
+ * caches are pointed ({@link toolchainCacheEnv}), since the home is
+ * read-only. One per user, outside anything the user's own tools read
+ * (`${XDG_CACHE_HOME:-~/.cache}/codeoid-sandbox`), shared by the sandboxed
+ * sessions (what one downloads or builds another reuses). Null when it
+ * can't be made.
+ */
+export function sandboxCacheDir(home: string, env: Record<string, string | undefined> = process.env): string | null {
+  const xdg = env.XDG_CACHE_HOME && isAbsolute(env.XDG_CACHE_HOME) ? env.XDG_CACHE_HOME : join(home, ".cache");
+  const dir = join(xdg, "codeoid-sandbox");
+  try {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+    const st = lstatSync(dir);
+    if (!st.isDirectory() || (typeof process.getuid === "function" && st.uid !== process.getuid())) return null;
+    return dir;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The toolchains' cache variables, pointed into `cacheDir`: XDG's (pip, uv,
+ * go's build cache and every tool that follows it), Go's build and module
+ * caches (modules the user already downloaded are read from their own
+ * module cache first, as a file proxy), bun's, npm's, uv's, pip's and
+ * cargo's home (its registry cache).
+ */
+export function toolchainCacheEnv(cacheDir: string, home: string, env: Record<string, string | undefined> = process.env): Record<string, string> {
+  const out: Record<string, string> = {
+    XDG_CACHE_HOME: cacheDir,
+    GOCACHE: join(cacheDir, "go-build"),
+    GOMODCACHE: join(cacheDir, "go-mod"),
+    BUN_INSTALL_CACHE_DIR: join(cacheDir, "bun"),
+    npm_config_cache: join(cacheDir, "npm"),
+    UV_CACHE_DIR: join(cacheDir, "uv"),
+    PIP_CACHE_DIR: join(cacheDir, "pip"),
+    CARGO_HOME: join(cacheDir, "cargo"),
+  };
+  // The user's own downloads (read-only inside, `~/go/pkg` is on the allowlist) before the network.
+  const gopath = env.GOPATH?.split(":")[0] || join(home, "go");
+  const downloaded = join(env.GOMODCACHE || join(gopath, "pkg", "mod"), "cache", "download");
+  if (existsSync(downloaded)) out.GOPROXY = `file://${downloaded},${env.GOPROXY || "https://proxy.golang.org,direct"}`;
+  return out;
+}
+
 /** The spec for one session. */
 export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const env = inputs.hidden?.env ?? process.env;
@@ -572,7 +620,8 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const workspace = resolve(inputs.workspace);
   const git = inputs.git === false ? { writable: [], readOnly: [], gitDirs: [] } : gitWorkspacePaths(workspace, home);
   const projectConfig = inputs.projectConfig === false ? [] : projectConfigPaths(workspace);
-  const own = [...(inputs.backendState ?? []).map((p) => resolve(p)), ...git.writable];
+  const cache = inputs.cache === false ? null : sandboxCacheDir(home, env);
+  const own = [...(inputs.backendState ?? []).map((p) => resolve(p)), ...git.writable, ...(cache ? [cache] : [])];
   const ownReal = own.map(realOr);
   const root = sandboxRootIfMade();
   const tempDir = resolve(inputs.tempDir);
@@ -607,6 +656,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     hidden,
     readOnly: [...git.readOnly, ...projectConfig],
     gitDirs: git.gitDirs,
+    ...(cache ? { env: toolchainCacheEnv(cache, home, env) } : {}),
     pinned: protectedAncestors(hidden, [workspace, tempDir, ...own]),
     reexposed,
     containerSockets: containerSocketPaths(home, env),

@@ -376,7 +376,7 @@ describe("changing a session's sandbox", () => {
     expect(statSync(sandboxRoot()).mode & 0o777).toBe(0o700);
     expect(sbx.runtime?.spec.hidden).toContain(sandboxRoot());
     const h = await sbx.runtime?.open([join(root, "pi-home")]);
-    expect(h?.spec.writable).toEqual([join(root, "pi-home")]);
+    expect(h?.spec.writable[0]).toBe(join(root, "pi-home"));
     await sbx.close();
     await sbx.close();
     expect(existsSync(dir)).toBe(false);

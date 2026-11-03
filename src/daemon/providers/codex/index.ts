@@ -226,8 +226,9 @@ function threadConfig(opts: TurnOpts, rt: SandboxRuntime | null): Record<string,
 /**
  * The sandbox codex runs a session's commands in (#448). With codeoid's
  * sandbox on and native (bubblewrap): codex's own workspace-write — the
- * workspace, the session's temp dir and the repository's git dirs
- * writable, the network per the session — inside codeoid's bubblewrap around the app-server, which hides
+ * workspace, the session's temp dir, the repository's git dirs and the
+ * sandbox's cache dir writable, the network per the session — inside
+ * codeoid's bubblewrap around the app-server, which hides
  * what codex's own leaves readable. With codeoid's sandbox around the whole
  * process instead (Seatbelt, Docker; nested sandboxes don't work there):
  * full access inside it, which is the boundary. Without codeoid's sandbox
@@ -239,7 +240,8 @@ export function codexSandboxPolicy(rt: SandboxRuntime | null, fallback: SandboxM
       type: "workspaceWrite",
       // The repository's git dirs too: codex's own sandbox makes every `.git` read-only, so nothing would commit.
       // What of them must stay read-only is held so by codeoid's bubblewrap around the app-server (gitWorkspacePaths).
-      writableRoots: [...new Set([workdir, ...tempRoots(rt.spec), ...(rt.spec.gitDirs ?? [])])],
+      // And the sandbox's cache dir, where the toolchains' caches are pointed (SandboxSpec.env).
+      writableRoots: [...new Set([workdir, ...tempRoots(rt.spec), ...(rt.spec.gitDirs ?? []), ...cacheRoots(rt.spec)])],
       networkAccess: rt.spec.network.mode === "on",
       excludeTmpdirEnvVar: false,
       excludeSlashTmp: false,
@@ -258,6 +260,12 @@ export function codexSandboxPolicy(rt: SandboxRuntime | null, fallback: SandboxM
 function tempRoots(spec: SandboxRuntime["spec"]): string[] {
   const t = resolve(spec.tempDir);
   return t === "/tmp" || t.startsWith("/tmp/") ? [] : [t];
+}
+
+/** The sandbox's cache dir, when its toolchains' caches are pointed there. */
+function cacheRoots(spec: SandboxRuntime["spec"]): string[] {
+  const dir = spec.env?.XDG_CACHE_HOME;
+  return dir && spec.writable.includes(dir) ? [dir] : [];
 }
 
 function sandboxPolicyWire(mode: SandboxMode, workdir: string): Record<string, unknown> {

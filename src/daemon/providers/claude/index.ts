@@ -77,7 +77,7 @@ import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from ".
 import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.js";
 import { listProcesses } from "../../process-tree.js";
 import { CLAUDE_HOME_LAYOUT, preparePrivateHome } from "../../sandbox/backend-home.js";
-import { asksUnsandboxed, claudeSandboxSettings, claudeTempEnv } from "../../sandbox/claude-native.js";
+import { asksUnsandboxed, claudeCacheEnv, claudeSandboxSettings, claudeTempEnv } from "../../sandbox/claude-native.js";
 import { programLocations } from "../../sandbox/policy.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../../sandbox/types.js";
@@ -2842,7 +2842,8 @@ export function sandboxFingerprint(rt: SandboxRuntime | null): string {
  * The query options that put a session's commands in its OS sandbox (#448):
  * the SDK's `sandbox` (Claude Code's own, codeoid's policy) on a local OS
  * provider, its CLI and its commands each with temp dirs of their own
- * (`env`: claudeTempEnv); or a spawner that starts the whole CLI inside the
+ * (`env`: claudeTempEnv) and the toolchains' caches in the sandbox's cache
+ * dir (claudeCacheEnv); or a spawner that starts the whole CLI inside the
  * session's sandbox (Docker) in a private copy of its config dir
  * (backend-home.ts), the handle it opens given to `track` (the caller
  * closes it when the query is replaced). Nothing when the sandbox is off or
@@ -2857,7 +2858,7 @@ export function claudeSandboxOptions(
   if (!rt) return {};
   if (rt.plan.kind === "native") {
     const temp = rt.claudeTemp();
-    return { sandbox: claudeSandboxSettings(rt, env, temp), env: { ...env, ...claudeTempEnv(temp) } };
+    return { sandbox: claudeSandboxSettings(rt, env, temp), env: { ...env, ...claudeCacheEnv(rt.spec), ...claudeTempEnv(temp) } };
   }
   if (rt.plan.kind !== "process") return {};
   let handle: SandboxHandle | null = null;

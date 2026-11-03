@@ -80,12 +80,13 @@ describe("codex's own sandbox, per session", () => {
     expect(codexSandboxPolicy(fakeRuntime("native", "off", "/tmp/codeoid-sandbox-s/tmp-x").rt, "danger-full-access", "/w")).toMatchObject({ writableRoots: ["/w"], excludeSlashTmp: false });
   });
 
-  test("native: the repository's git dirs are writable roots too (#448 round 2: codex's own sandbox makes every .git read-only)", () => {
+  test("native: the repository's git dirs and the sandbox's cache dir are writable roots too (#448 round 2: codex's own sandbox makes every .git read-only)", () => {
     const { rt } = fakeRuntime("native", "off", "/t");
     const spec = rt.spec as unknown as Record<string, unknown>;
     spec.gitDirs = ["/r/.git", "/r/.git/worktrees/w"];
-    spec.writable = ["/r/.git", "/r/.git/worktrees", "/r/.git/worktrees/w"];
-    expect(codexSandboxPolicy(rt, "danger-full-access", "/w")).toMatchObject({ writableRoots: ["/w", "/t", "/r/.git", "/r/.git/worktrees/w"] });
+    spec.writable = ["/r/.git", "/r/.git/worktrees", "/r/.git/worktrees/w", "/h/.cache/codeoid-sandbox"];
+    spec.env = { XDG_CACHE_HOME: "/h/.cache/codeoid-sandbox" };
+    expect(codexSandboxPolicy(rt, "danger-full-access", "/w")).toMatchObject({ writableRoots: ["/w", "/t", "/r/.git", "/r/.git/worktrees/w", "/h/.cache/codeoid-sandbox"] });
   });
 
   test("the whole process inside codeoid's: full access inside it; no sandbox: the old default", () => {

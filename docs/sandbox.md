@@ -27,6 +27,7 @@ With the default policy (workspace-write):
 | **Project settings** (read-only) | `.claude/`, `.gemini/`, `.qwen/`, `.codex/`, `.pi/`, `.opencode/` in the workspace, whole (made empty first where missing: git doesn't see an empty dir), and `.mcp.json`, `opencode.json`, `opencode.jsonc` where they exist. A Claude hook, an MCP server, a pi or opencode plugin written there by one backend's command would run on the host in a later session of another, or in your own CLI. Changing them needs the sandbox lifted for that command: Claude's `dangerouslyDisableSandbox` and Codex's permission request are asked about in every mode (below); on other backends edit them yourself, or turn the session's sandbox off. A file tool that runs in the backend's own process, outside the sandbox (Claude's Write and Edit, opencode's), writing there is asked about in every mode while the sandbox is on (audited `session.project_settings_write_ask`). A new `.mcp.json` at the top of the workspace can still be made: its servers run only once approved (the CLI asks, and codeoid's `codeoid mcp approve`). |
 | **Hidden besides** (not readable at all) | outside the home, or in a workspace that holds it: codeoid's config dir (`~/.codeoid`: keys, accounts, endpoints, the local token) and every data dir it owns wherever it is configured (the database, transcripts and checkpoints, opencode's database and data dirs, memory's; their lock files); the agent CLIs' logins (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.qwen/oauth_creds.json`, `~/.gemini/oauth_creds.json` …, pi's `auth.json`) and what backends registered as credentials (opencode's key files); `~/.ssh`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.config/gh`, `~/.config/hub`, `~/.config/glab-cli`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.local/share/keyrings`, `~/.password-store`, `~/.config/op`, `~/.vault-token`, `~/.pypirc`, `~/.cargo/credentials(.toml)`, `~/.terraform.d/credentials.tfrc.json`, `~/.claude.json` (MCP tokens), `~/.local/share/opencode/auth.json` and `mcp-auth.json`, `~/.config/github-copilot`, `~/.pgpass`, `~/.config/rclone`, `~/.s3cfg`, `~/.boto`, `~/.pulumi/credentials.json`, `~/.config/doctl`, `~/.fly`, `~/.npmrc`, `~/.bunfig.toml`, `~/.yarnrc.yml`, `~/.gradle/gradle.properties`, `~/.m2/settings.xml`, `~/Library/Keychains`; the desktop session's runtime dir (`$XDG_RUNTIME_DIR`: keyring, D-Bus, agent sockets) and `$SSH_AUTH_SOCK`'s dir; the daemon's own temp dir when it isn't `/tmp` (sign-in homes); plus `sandbox.hiddenPaths` (which also beats the allowlist). |
 | **Never reachable** | container runtime sockets: `/run/docker.sock`, `/var/run/docker.sock`, containerd, podman, CRI-O, buildkit, k3s, the user's rootless sockets, Docker Desktop / Colima / Lima / Rancher / OrbStack, `$DOCKER_HOST`. A container socket is root on the machine. |
+| **Toolchain caches** | the home is read-only, so the caches are pointed at the sandbox's own cache dir, `${XDG_CACHE_HOME:-~/.cache}/codeoid-sandbox` (one per user, writable inside, read by none of your own tools): `XDG_CACHE_HOME` (pip, uv, Go's build cache and what else follows XDG), `GOCACHE`, `GOMODCACHE`, `BUN_INSTALL_CACHE_DIR`, `npm_config_cache`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`, `CARGO_HOME` (cargo's registry cache; your `~/.cargo/config.toml` is still read from above a workspace in your home, not from `CARGO_HOME`). Go modules you already downloaded are read from your own module cache first, as a file proxy (`GOPROXY=file://~/go/pkg/mod/cache/download,<yours>`), so `go build` works with the network off. `go build`/`go test`, `bun install`, `npm install`, `uv` and `pip` work inside. The sandboxed sessions share this dir: what one downloads or builds, another reuses (and could have tampered with: a build cache is trust among your sandboxed sessions). On Claude's own sandbox the CLI gets the tools' variables but not `XDG_CACHE_HOME` (the CLI runs outside its sandbox and would keep its own files there). |
 | **Environment** | `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GPG_AGENT_INFO`, `DBUS_SESSION_BUS_ADDRESS`, `DOCKER_HOST`, `CONTAINER_HOST`, `KUBECONFIG` are unset inside. On Claude, every credential-named variable the CLI runs with is denied to its commands. |
 | **Network** | `on` (default), `off`, or `allowlist` (hosts in `sandbox.allowedHosts`), per session and in config. |
 | **Processes** | no new privileges; under bubblewrap a pid namespace (the sandbox sees only its own processes, so not the daemon's or the CLI's environment) and processes die with the sandbox they run in (see Limits for opencode). |
@@ -146,7 +147,7 @@ How a backend is put inside is the backend's (`src/daemon/sandbox/confinement.ts
 | Backend | bubblewrap (Linux) | Seatbelt (macOS) | Docker |
 |---|---|---|---|
 | **Claude** | Claude Code's own sandbox with codeoid's policy (Agent SDK `sandbox`): commands only; network on/off/**allowlist** via its proxy | the same, on Seatbelt | the whole CLI in the container (`spawnClaudeCodeProcess`); network on only |
-| **Codex** | codex's own `workspace-write` (the workspace, `/tmp` and the repository's git dirs writable, network per session) **inside** codeoid's bubblewrap around the app-server, which holds the repository's structure read-only; network on/off | the whole app-server under Seatbelt, full access inside it (Seatbelt doesn't nest); network on only | the whole app-server in the container; network on only |
+| **Codex** | codex's own `workspace-write` (the workspace, `/tmp`, the repository's git dirs and the sandbox's cache dir writable, network per session) **inside** codeoid's bubblewrap around the app-server, which holds the repository's structure read-only; network on/off | the whole app-server under Seatbelt, full access inside it (Seatbelt doesn't nest); network on only | the whole app-server in the container; network on only |
 | **opencode** | each shell line in the session's bubblewrap (the shared server's `SHELL` is codeoid's shim); network on/off | each line under Seatbelt | each line in its own container |
 | **pi, Gemini CLI, Qwen Code** | the whole process inside; network on only | the same | the same |
 | **OpenAI, Gemini API, llama.cpp, `oai:*` endpoints** | run no commands: "no shell", never refused | | |
@@ -261,10 +262,10 @@ to the workspace.
   add them to `sandbox.hiddenPaths` or keep them out of the workdir. A
   workspace that is your home itself shows the home (the hidden list still
   applies in it); one that holds it (`/home`) hides it.
-- **The home is read-only and mostly empty inside.** A tool that writes a cache
-  or state in the home (`~/.cache`, `~/.npm` when it fetches, `~/.cargo/registry`
-  when it updates) fails there: point it at `$TMPDIR` or the workspace
-  (`npm_config_cache`, `CARGO_HOME`, `XDG_CACHE_HOME`), or prefetch outside. A
+- **The home is read-only and mostly empty inside.** The usual caches are
+  pointed at the sandbox's cache dir (above); a tool that writes other state in
+  the home fails there (`pip install --user`, `go install` into `~/go/bin`,
+  `cargo install`): use a virtualenv or the workspace, or run it yourself. A
   tool installed elsewhere in the home (`~/.volta`, `~/.sdkman`) needs adding to
   `sandbox.homeReadable`. Under bubblewrap the home's tmpfs is read-only too.
 - **Within a dir that is shown** (the workspace, an allowlisted dir), a hidden
@@ -374,6 +375,10 @@ works, and skip where it doesn't):
   repository's git dir (E) — and afterwards your `git status` (run outside
   the session's sandbox) runs nothing planted; commits, branches and a branch
   deletion still work from inside, in a plain repository and a worktree.
+- Round 2, toolchain caches (real bubblewrap, network off): `go build` of a
+  module depending on one in the user's own module cache works, the module
+  extracted into the sandbox's cache, never the user's; `bun install` of a
+  local dependency works with bun's own cache in the home read-only.
 - `src/tests/provider-opencode.integration.test.ts` I69 (real opencode 2.2.5,
   scripted local model, `CODEOID_OPENCODE_INTEGRATION=1`): a session's shell
   lines run inside its bubblewrap; a session whose sandbox is off runs bash as

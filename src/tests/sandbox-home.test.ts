@@ -14,7 +14,7 @@ import type { CodeoidConfig } from "../config.js";
 import { loadConfig } from "../config.js";
 import { COPY_LIMIT, PI_HOME_LAYOUT, preparePrivateHome } from "../daemon/sandbox/backend-home.js";
 import { bwrapArgs, type PathKind } from "../daemon/sandbox/bwrap.js";
-import { claudeSandboxSettings, claudeTempEnv, physicalOf } from "../daemon/sandbox/claude-native.js";
+import { claudeCacheEnv, claudeSandboxSettings, claudeTempEnv, physicalOf } from "../daemon/sandbox/claude-native.js";
 import { buildSandboxSpec, DEFAULT_HOME_READABLE, gitWorkspacePaths, homeCredentialFilesIn, programLocations, sandboxConfigOf } from "../daemon/sandbox/policy.js";
 import type { SandboxSpec } from "../daemon/sandbox/types.js";
 
@@ -175,6 +175,37 @@ describe("the workspace's git repository", () => {
     expect(existsSync(join(ws, ".mcp.json"))).toBe(false);
     expect(spec.readOnly).not.toContain(join(ws, ".pi"));
     expect(existsSync(join(root, "pc-elsewhere"))).toBe(false);
+  });
+
+  test("the toolchains' caches: a writable cache dir of the user's, outside what their own tools read; Go reads the user's downloads first (#448 round 2)", () => {
+    const home = join(root, "tc");
+    mkdirSync(join(home, "go", "pkg", "mod", "cache", "download"), { recursive: true });
+    const ws = join(home, "proj");
+    mkdirSync(ws, { recursive: true });
+    const spec = buildSandboxSpec({ sessionId: "s", workspace: ws, tempDir: join(root, "tc-t"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    const cache = join(home, ".cache", "codeoid-sandbox");
+    expect(statSync(cache).mode & 0o777).toBe(0o700);
+    expect(spec.writable).toContain(cache);
+    expect(spec.env).toMatchObject({
+      XDG_CACHE_HOME: cache,
+      GOCACHE: join(cache, "go-build"),
+      GOMODCACHE: join(cache, "go-mod"),
+      BUN_INSTALL_CACHE_DIR: join(cache, "bun"),
+      npm_config_cache: join(cache, "npm"),
+      UV_CACHE_DIR: join(cache, "uv"),
+      PIP_CACHE_DIR: join(cache, "pip"),
+      CARGO_HOME: join(cache, "cargo"),
+      GOPROXY: `file://${join(home, "go", "pkg", "mod", "cache", "download")},https://proxy.golang.org,direct`,
+    });
+    // Nothing the user's own (unsandboxed) tools read is writable: not their caches, not their module cache.
+    for (const own of [join(home, ".cache"), join(home, "go"), join(home, ".bun"), join(home, ".npm")]) expect(spec.writable).not.toContain(own);
+    // Claude's CLI runs outside its sandbox: it gets the tools' variables, never XDG_CACHE_HOME (it would keep its own files there).
+    const cli = claudeCacheEnv(spec);
+    expect(cli.XDG_CACHE_HOME).toBeUndefined();
+    expect(cli.GOCACHE).toBe(join(cache, "go-build"));
+    // Under XDG_CACHE_HOME when that is set.
+    const xdg = join(root, "tc-xdg");
+    expect(buildSandboxSpec({ sessionId: "s", workspace: ws, tempDir: join(root, "tc-t"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home, XDG_CACHE_HOME: xdg }, daemonTmp: "/tmp" } }).env?.XDG_CACHE_HOME).toBe(join(xdg, "codeoid-sandbox"));
   });
 
   test("placeholders are never made through a link", () => {

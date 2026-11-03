@@ -149,12 +149,13 @@ export function seatbeltArgs(spec: SandboxSpec, fs?: Parameters<typeof seatbeltP
 }
 
 /**
- * What runs before `sandbox-exec`: `env` removing the spec's unset names and
- * pointing TMPDIR at the session's temp dir. In the argv, not the spawn's
+ * What runs before `sandbox-exec`: `env` removing the spec's unset names,
+ * setting its variables (the toolchains' caches) and pointing TMPDIR at the
+ * session's temp dir. In the argv, not the spawn's
  * environment, so a launcher (which has only an argv) does it too.
  */
 export function seatbeltEnvPrefix(spec: SandboxSpec): string[] {
-  return ["/usr/bin/env", ...spec.unsetEnv.flatMap((n) => ["-u", n]), `TMPDIR=${spec.tempDir}`];
+  return ["/usr/bin/env", ...spec.unsetEnv.flatMap((n) => ["-u", n]), ...Object.entries(spec.env ?? {}).map(([k, v]) => `${k}=${v}`), `TMPDIR=${spec.tempDir}`];
 }
 
 export class SeatbeltSandboxProvider implements SandboxProvider {

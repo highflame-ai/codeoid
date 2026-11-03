@@ -10,8 +10,10 @@
  *   --bind <workspace>       the workspace writable (and any other writable location)
  *   --tmpfs <dir>            a hidden directory: empty, then read-only again (--remount-ro)
  *   --ro-bind /dev/null <f>  a hidden file or socket: empty, and nothing to connect to
- *   --ro-bind <p> <p>        read-only inside something writable (a repository's hooks and config)
+ *   --ro-bind <p> <p>        read-only inside something writable (what of a repository decides its config,
+ *                            hooks and git dir; the project settings agent CLIs run code from)
  *   --bind <d> <d>           a pinned directory: a mount point, so it can't be renamed, still writable inside
+ *   --setenv                 the toolchains' caches in the sandbox's cache dir (spec.env)
  *   --unshare-net            network off
  *   --die-with-parent, --new-session; bwrap always sets no_new_privs
  *
@@ -162,6 +164,7 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   const boundAt = new Set(mounts.filter((m) => m.kind === "bind").map((m) => m.path));
   for (const m of mounts) if (m.kind === "hide-dir" && !boundAt.has(m.path)) args.push("--remount-ro", m.path);
   for (const name of spec.unsetEnv) args.push("--unsetenv", name);
+  for (const [k, v] of Object.entries(spec.env ?? {})) args.push("--setenv", k, v);
   args.push("--setenv", "TMPDIR", "/tmp");
   // No cwd: the caller's own (a launcher run from wherever its caller is; bwrap keeps it).
   if (cwd) args.push("--chdir", cwd);

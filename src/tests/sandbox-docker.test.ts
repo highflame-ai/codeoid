@@ -140,6 +140,8 @@ describe("dockerRunArgs", () => {
   test("variables by name only, never the docker client's own or an agent socket; the cwd, or the caller's for a launcher", () => {
     const args = dockerRunArgs(spec(), ["x"], base);
     expect(flags(args, "-e")).toEqual(["OPENAI_API_KEY", "TMPDIR=/tmp", `HOME=${homedir()}`]);
+    // The toolchains' caches (#448 round 2), by value: they are the sandbox's, not the client's.
+    expect(flags(dockerRunArgs(spec({ env: { GOCACHE: "/c/go-build" } }), ["x"], base), "-e")).toContain("GOCACHE=/c/go-build");
     expect(flags(args, "-w")).toEqual(["/work/repo/sub"]);
     const launcher = dockerRunArgs(spec(), ["x"], { ...base, cwd: "" });
     expect(flags(launcher, "-w")).toEqual([CWD_FROM_CALLER]);

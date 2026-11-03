@@ -96,6 +96,11 @@ export interface SandboxSpec {
    */
   gitDirs?: readonly string[];
   /**
+   * Variables set for what runs inside: toolchain caches pointed at the
+   * sandbox's writable cache dir (the home is read-only).
+   */
+  env?: Readonly<Record<string, string>>;
+  /**
    * Directories inside a writable location that must not be renamed or
    * removed, while what is in them stays writable: each one between a
    * writable root and a hidden path inside it. A mount point (or a denied

@@ -155,6 +155,7 @@ export function dockerRunArgs(spec: SandboxSpec, argv: readonly string[], o: Doc
   }
   args.push("-w", o.cwd ? o.cwd : CWD_FROM_CALLER);
   for (const n of o.envNames) if (!spec.unsetEnv.includes(n) && !CLIENT_ENV.includes(n)) args.push("-e", n);
+  for (const [k, v] of Object.entries(spec.env ?? {})) args.push("-e", `${k}=${v}`);
   args.push("-e", "TMPDIR=/tmp", "-e", `HOME=${homedir()}`);
   args.push(o.image, ...argv);
   return args;
