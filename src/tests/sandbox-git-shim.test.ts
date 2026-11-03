@@ -261,6 +261,16 @@ describe.skipIf(!bwrapProbe.available)("git shim: inside the session's sandbox (
     expect(runShim(shim, ["rev-parse", "--show-prefix"], join(ws, "sub")).out.trim()).toBe("sub/");
   });
 
+  test("started from a dir the sandbox hides, git fails there rather than answer for another dir", () => {
+    const hiddenDir = join(home, "elsewhere");
+    mkdirSync(hiddenDir, { recursive: true });
+    setup(hiddenDir, ["init", "-q", "."]);
+    // bwrap would otherwise start it in $HOME: one that is a repository the sandbox shows (the workspace).
+    const r = runShim(shim, ["rev-parse", "--show-toplevel"], hiddenDir, { env: { HOME: ws } });
+    expect(r.code).not.toBe(0);
+    expect(r.out).toBe("");
+  });
+
   test("the hidden home stays hidden, and there is no network (the session's own is on)", () => {
     const r = runShim(shim, ["hash-object", join(home, "secret.txt")], ws);
     expect(r.code).not.toBe(0);

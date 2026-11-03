@@ -33,6 +33,7 @@ import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { type ClaudeTempDirs, claudeNativeEnv, claudeSandboxSettings, claudeTempEnv } from "../../daemon/sandbox/claude-native.js";
 import { BwrapSandboxProvider } from "../../daemon/sandbox/bwrap.js";
+import { CWD_FROM_CALLER } from "../../daemon/sandbox/docker.js";
 import { gitProgramLocations, gitShimSpec, writeGitShim } from "../../daemon/sandbox/git-shim.js";
 import { buildSandboxSpec } from "../../daemon/sandbox/policy.js";
 import { daemonTempDir } from "../../daemon/sandbox/root.js";
@@ -142,7 +143,7 @@ function gitShim(): string {
     backendReadable: gitProgramLocations(),
   })));
   const dir = daemonTempDir("launch-probe-");
-  const wrapped = handle.wrap?.([GIT_BIN], { cwd: "", env: {} });
+  const wrapped = handle.wrap?.([GIT_BIN], { cwd: CWD_FROM_CALLER, env: {} });
   if (!wrapped) throw new Error("no wrap");
   const launcher = join(dir, "launch-git");
   writeFileSync(launcher, launcherScript(wrapped.argv), { mode: 0o700 });

@@ -476,17 +476,19 @@ export class SessionSandbox {
     let program: string | null = null;
     if (provider.openSync && provider.capabilities.wrapsArgv && provider.capabilities.placement === "local") {
       const handle = this.#track(provider.openSync(gitShimSpec(this.#spec({ mode: "off" }, [], gitProgramLocations()))));
-      launcher = this.#writeLauncher(handle, [GIT_BIN], [], "git");
+      // In the caller's own directory, or not at all: one the sandbox hides isn't swapped for another (bwrap's `$HOME`).
+      launcher = this.#writeLauncher(handle, [GIT_BIN], [], "git", CWD_FROM_CALLER);
       program = handle.wrap?.([GIT_BIN], { cwd: "", env: {} }).argv[0] ?? null;
     }
     return writeGitShim(dir, { launcher, provider: program, caller });
   }
 
-  #writeLauncher(handle: SandboxHandle, argv: readonly string[], envNames: readonly string[], name?: string): string {
+  #writeLauncher(handle: SandboxHandle, argv: readonly string[], envNames: readonly string[], name?: string, cwd = ""): string {
     if (!handle.wrap) throw new Error(`${handle.providerId} can't start a local program inside`);
     const launcherDir = this.#ensureLauncherDir();
-    // Started from wherever its caller is: the cwd is the caller's, not fixed here.
-    const wrapped = handle.wrap(argv, { cwd: "", env: Object.fromEntries(envNames.map((n) => [n, ""])) });
+    // Started from wherever its caller is: the cwd is the caller's, not fixed here
+    // (CWD_FROM_CALLER: named to the provider as the dir it is run from).
+    const wrapped = handle.wrap(argv, { cwd, env: Object.fromEntries(envNames.map((n) => [n, ""])) });
     const path = join(launcherDir, `launch-${name ? name.replace(/[^A-Za-z0-9_-]/g, "") : ++this.#launchers}`);
     // Written beside it and renamed over it: a caller running it meanwhile gets the old one or the new one, whole.
     const part = `${path}.${++this.#launchers}.part`;
