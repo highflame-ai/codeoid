@@ -7,6 +7,7 @@
  */
 
 import { BwrapSandboxProvider } from "./bwrap.js";
+import type { ConfinementHost } from "./confinement.js";
 import type { SandboxConfig } from "./policy.js";
 import { DockerSandboxProvider } from "./docker.js";
 import { SeatbeltSandboxProvider } from "./seatbelt.js";
@@ -25,9 +26,12 @@ export class SandboxRegistry {
   readonly #providers = new Map<string, SandboxProvider>();
   readonly #probes = new Map<string, { at: number; probe: SandboxProbe; pending?: Promise<SandboxProbe> }>();
   readonly #platform: NodeJS.Platform;
+  /** What the host offers a confinement plan (a program on PATH: Claude's sandbox needs socat on Linux). */
+  readonly host: ConfinementHost;
 
-  constructor(platform: NodeJS.Platform = process.platform) {
+  constructor(platform: NodeJS.Platform = process.platform, which: (name: string) => string | null = (name) => Bun.which(name) ?? null) {
     this.#platform = platform;
+    this.host = { platform, which };
   }
 
   register(provider: SandboxProvider): void {

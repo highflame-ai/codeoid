@@ -9,9 +9,10 @@
  *     codeoid's provider, since codex's own leaves credentials readable.
  *   - `process`: the backend's whole process starts inside (pi, the Gemini
  *     CLI, Qwen; Claude and Codex under Docker; Codex under Seatbelt, which
- *     doesn't nest). Its own state stays reachable by it, so by its commands
- *     too; it needs the network to reach its model, so the network can't be
- *     turned off for its commands.
+ *     doesn't nest). It runs in a private copy of its home (backend-home.ts),
+ *     its login read-only and its conversations shared, so nothing its
+ *     commands write there runs later outside a sandbox; it needs the network
+ *     to reach its model, so the network can't be turned off for its commands.
  *   - `command`: each shell command starts inside (opencode: one server
  *     serves every session, so its shell is a codeoid shim that runs each
  *     line in the session's sandbox). File tools run in the server, outside,
@@ -45,7 +46,7 @@ const HTTP_BACKENDS = new Set(["openai", "gemini", "llamacpp"]);
 const NO_COMMAND_BACKENDS = new Set(["scripted", "mock"]);
 
 const PROCESS_LIMITS = (backend: string) => [
-  `${backend}'s own state (its login and settings) stays reachable by its commands`,
+  `${backend}'s login is readable (not writable) by its commands; its settings are a private copy, made afresh at each start`,
   `${backend} needs the network to reach its model, so its commands have the network too`,
 ];
 
@@ -58,11 +59,34 @@ function localOs(p: SandboxProvider): boolean {
   return p.capabilities.placement === "local" && p.capabilities.wrapsArgv && p.capabilities.workspace === "mount";
 }
 
+/** What the host offers a plan (tests replace it). */
+export interface ConfinementHost {
+  platform: NodeJS.Platform;
+  /** A program on PATH, or null. */
+  which(name: string): string | null;
+}
+
+const realHost: ConfinementHost = { platform: process.platform, which: (name) => Bun.which(name) ?? null };
+
+/**
+ * Why Claude Code's own sandbox can't start here, or null. On Linux it is
+ * bubblewrap plus `socat` (its network proxy's bridge into the sandbox);
+ * without socat the CLI refuses every query (`failIfUnavailable`), so the
+ * session says it isn't sandboxed instead (interactive runs, unattended is
+ * refused).
+ */
+export function claudeNativeProblem(host: ConfinementHost = realHost): string | null {
+  if (host.platform === "linux" && !host.which("socat")) {
+    return "Claude Code's sandbox needs socat on Linux, and it isn't installed — install the `socat` package";
+  }
+  return null;
+}
+
 /**
  * The plan for `backendId` under `provider`, or why it can't be sandboxed
  * that way. `provider` null: only a no-command backend has a plan.
  */
-export function confinementFor(backendId: string, provider: SandboxProvider | null): ConfinementResult {
+export function confinementFor(backendId: string, provider: SandboxProvider | null, host: ConfinementHost = realHost): ConfinementResult {
   if (runsNoCommands(backendId)) {
     return { ok: true, plan: { kind: "no-shell", via: "runs no commands", network: ["on", "off", "allowlist"], fileTools: true, wrapsBackend: false, limits: [] } };
   }
@@ -73,6 +97,8 @@ export function confinementFor(backendId: string, provider: SandboxProvider | nu
     case "claude": {
       // Claude Code's own sandbox is bubblewrap on Linux and Seatbelt on macOS.
       if (localOs(provider) && caps.isolation === "os" && (provider.id === "bwrap" || provider.id === "seatbelt")) {
+        const missing = claudeNativeProblem(host);
+        if (missing) return { ok: false, reason: missing };
         return {
           ok: true,
           plan: {
@@ -100,7 +126,7 @@ export function confinementFor(backendId: string, provider: SandboxProvider | nu
             network: ["on", "off"],
             fileTools: true,
             wrapsBackend: true,
-            limits: ["codex's own home (CODEX_HOME, with its login) stays reachable by its commands"],
+            limits: ["codex's login is readable (not writable) by its commands; its settings are a private copy, made afresh at each start"],
           },
         };
       }
