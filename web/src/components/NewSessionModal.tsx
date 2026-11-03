@@ -26,7 +26,21 @@ import { newRequestId, refreshSessions, request } from "../state/connection";
 import { fetchPacks, packsState } from "../state/packs";
 import { runPipeline } from "../state/pipelines";
 import { focusSession, mergeSession, sessionList } from "../state/sessions";
-import type { PackWire, SessionInfo } from "../protocol/types";
+import type { PackWire, SandboxProviderWire, SessionInfo } from "../protocol/types";
+
+/** The `sandbox.providers` reply's data (#448). */
+interface SandboxProvidersData {
+  enabled: boolean;
+  auto: string | null;
+  default: { provider: string; network: string };
+  providers: SandboxProviderWire[];
+}
+
+function sandboxDefaultLabel(d: SandboxProvidersData | null): string {
+  if (!d) return "auto";
+  const p = d.default.provider === "auto" && d.auto ? `auto: ${d.auto}` : d.default.provider;
+  return `${p}, network ${d.default.network}`;
+}
 import DirectoryPicker from "./files/DirectoryPicker";
 import { providerIds, providerLabel } from "../state/providers";
 import { accountDetail, backendAccounts, DEFAULT_ACCOUNT, fetchAccounts } from "../state/accounts";
@@ -133,6 +147,20 @@ const NewSessionModal: Component = () => {
   // daemon default, "default" = pin the daemon's own login, else a named
   // account (accounts.ts). Names are per backend, so a provider change resets it.
   const [account, setAccount] = createSignal("");
+  // OS sandbox (#448): "" = the daemon's default; else auto | off | a provider id.
+  const [sandboxChoice, setSandboxChoice] = createSignal("");
+  // "" = the daemon's default network; else on | off.
+  const [sandboxNetwork, setSandboxNetwork] = createSignal("");
+  // The sandbox choice is opened on demand ("change"), and only then asks the
+  // daemon what it has (absent: an older daemon, or no sandboxing).
+  const [sandboxOpen, setSandboxOpen] = createSignal(false);
+  const [sandboxProviders, setSandboxProviders] = createSignal<SandboxProvidersData | null>(null);
+  function openSandboxChoice(): void {
+    setSandboxOpen(true);
+    request({ type: "sandbox.providers", id: newRequestId() })
+      .then((data) => setSandboxProviders(data as SandboxProvidersData))
+      .catch(() => setSandboxProviders(null));
+  }
   // Ambient pack activation (docs/pack-loading.md): "" = freestyle (no pack).
   const [packId, setPackId] = createSignal("");
   // Capability role declared by the chosen pack; "" = no role restriction.
@@ -408,6 +436,9 @@ const NewSessionModal: Component = () => {
     setAccount("");
     setPackId("");
     setPackRole("");
+    setSandboxChoice("");
+    setSandboxNetwork("");
+    setSandboxOpen(false);
     setRoles(defaultRoles());
     setWarnings([]);
   }
@@ -545,6 +576,14 @@ const NewSessionModal: Component = () => {
             : {}),
         ...(packId() ? { pack: packId() } : {}),
         ...(packRole() ? { packRole: packRole() } : {}),
+        ...(sandboxChoice() || sandboxNetwork()
+          ? {
+              sandbox: {
+                ...(sandboxChoice() ? { provider: sandboxChoice() } : {}),
+                ...(sandboxNetwork() ? { network: sandboxNetwork() as "on" | "off" } : {}),
+              },
+            }
+          : {}),
       });
       const { info, warnings: warns } = unwrapCreate(data);
       if (info) {
@@ -940,6 +979,63 @@ const NewSessionModal: Component = () => {
                 Which credential this session runs on and bills. You can switch it later without losing the conversation.
               </p>
             </label>
+          </Show>
+
+          <Show when={mode() === "session" && !sandboxOpen()}>
+            <p class="text-[11px] text-fg-faint">
+              Sandbox: the daemon's default.{" "}
+              <button type="button" class="text-accent underline-offset-2 hover:underline" onClick={openSandboxChoice} disabled={busy()}>
+                change
+              </button>
+            </p>
+          </Show>
+          <Show when={mode() === "session" && sandboxOpen()}>
+            <div class="block space-y-1.5">
+              <span class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">Sandbox</span>
+              <Show when={sandboxProviders() && !sandboxProviders()?.enabled}>
+                <p class="text-[11px] text-warn">This daemon has no OS sandbox.</p>
+              </Show>
+              <div class="flex gap-2">
+                <select
+                  value={sandboxChoice()}
+                  onChange={(e) => setSandboxChoice(e.currentTarget.value)}
+                  disabled={busy()}
+                  aria-label="Sandbox"
+                  class="flex-1 rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
+                >
+                  <option value="">Daemon default ({sandboxDefaultLabel(sandboxProviders())})</option>
+                  <option value="auto">auto{sandboxProviders()?.auto ? ` — ${sandboxProviders()?.auto}` : ""}</option>
+                  <For each={sandboxProviders()?.providers ?? []}>
+                    {(p) => (
+                      <option value={p.id} disabled={!p.available} title={p.reason}>
+                        {p.displayName}
+                        {p.available ? "" : ` — not available: ${p.reason ?? ""}`}
+                      </option>
+                    )}
+                  </For>
+                  <option value="off">off — commands run with your full rights</option>
+                </select>
+                <select
+                  value={sandboxNetwork()}
+                  onChange={(e) => setSandboxNetwork(e.currentTarget.value)}
+                  disabled={busy() || sandboxChoice() === "off"}
+                  aria-label="Sandbox network"
+                  class="rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
+                >
+                  <option value="">network: default ({sandboxProviders()?.default.network ?? "on"})</option>
+                  <option value="on">network on</option>
+                  <option value="off">network off</option>
+                </select>
+              </div>
+              <Show when={sandboxChoice() === "off"}>
+                <p class="text-[11px] text-warn">
+                  Off: the agent's commands can read your credentials and change any file you can, in every mode.
+                </p>
+              </Show>
+              <p class="text-[11px] text-fg-faint">
+                The workspace and a private temp dir are writable; everything else is read-only and credential stores are hidden. Change it later with /sandbox.
+              </p>
+            </div>
           </Show>
 
           {/* Pack. Session mode: OPTIONAL ambient activation (constitution +

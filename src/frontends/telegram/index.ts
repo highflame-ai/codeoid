@@ -19,7 +19,7 @@
 import { Bot, type Context, InlineKeyboard } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { randomUUID } from "node:crypto";
-import { EFFORT_LABELS, effortChangeSummary, formatCollaborationCost, formatToolRisk, mcpRefreshSummary, parseEffort } from "@highflame/codeoid-core";
+import { approvalSandboxLine, EFFORT_LABELS, effortChangeSummary, formatCollaborationCost, formatToolRisk, mcpRefreshSummary, parseEffort } from "@highflame/codeoid-core";
 import { getManifest, getSnapshot } from "../../daemon/settings/store.js";
 import { ALL_SCOPES_STRING } from "../../protocol/scopes.js";
 import type { Frontend, FrontendContext } from "../types.js";
@@ -1345,13 +1345,16 @@ export class TelegramFrontend implements Frontend {
     // A shell command's risk (#431), in the same words as every other surface.
     const riskText = "risk" in tool.state ? formatToolRisk(tool.state.risk) : "";
     const risk = riskText ? `\n▲ ${riskText}` : "";
+    // Whether it runs in the session's OS sandbox (#448), as every surface says it.
+    const sandboxText = tool.state.phase === "waiting_confirmation" ? approvalSandboxLine(tool.state) : null;
+    const sandbox = sandboxText ? `\n${sandboxText}` : "";
     const kb = new InlineKeyboard()
       .text("✅ Approve", `a:${short}:y`)
       .text("❌ Deny", `a:${short}:n`);
     this.#bot.api
       .sendMessage(
         chatId,
-        `⚠️ Permission needed — ${tool.name}\n${String(desc).slice(0, 800)}${risk}${cost}`,
+        `⚠️ Permission needed — ${tool.name}\n${String(desc).slice(0, 800)}${risk}${sandbox}${cost}`,
         { reply_markup: kb } as Record<string, unknown>,
       )
       .catch(() => {});

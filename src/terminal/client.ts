@@ -6,7 +6,7 @@
 
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
-import { formatToolRisk, mcpRefreshSummary } from "@highflame/codeoid-core";
+import { approvalSandboxLine, formatToolRisk, mcpRefreshSummary, sandboxSummary } from "@highflame/codeoid-core";
 import type { CodeoidConfig } from "../config.js";
 import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
@@ -23,6 +23,9 @@ import type {
   PipelineWire,
   SessionInfo,
   SessionApproveOutcome,
+  SandboxProviderWire,
+  SessionSandboxInfo,
+  SessionSandboxSetting,
 } from "../protocol/types.js";
 import { acquireToken, TokenError } from "./token.js";
 import { sanitizeTerminalOutput } from "../tui/ansi/codes.js";
@@ -155,7 +158,7 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
     }
 
     case "session.message": {
-      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string; risk?: ToolRisk } }; identity?: { name?: string; type?: string } };
+      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string; risk?: ToolRisk; sandboxed?: boolean; sandboxNote?: string } }; identity?: { name?: string; type?: string } };
       const id = sm.identity?.name ? `${DIM}${S(sm.identity.name)}${RESET} ` : "";
       switch (sm.role) {
         case "user":
@@ -185,7 +188,8 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
             state.latestApprovalMsgId = sm.messageId ?? null;
             state.lastPrompt = "tool";
             const risk = formatToolRisk(sm.tool?.state?.risk);
-            return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n${risk ? `  ${RED}▲ ${S(risk)}${RESET}\n` : ""}  Type 'yes' to approve, 'no' to deny\n`;
+            const sandbox = approvalSandboxLine(sm.tool?.state ?? {});
+            return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n${risk ? `  ${RED}▲ ${S(risk)}${RESET}\n` : ""}${sandbox ? `  ${S(sandbox)}\n` : ""}  Type 'yes' to approve, 'no' to deny\n`;
           }
           return `\n${id}${YELLOW}⚡ ${name} [${phase}]${RESET}\n${reshow}`;
         }
@@ -357,6 +361,8 @@ export class TerminalClient {
         const status = this.#formatStatus(s.status);
         console.log(`  ${s.name.padEnd(20)} ${status.padEnd(20)} ${s.workdir}`);
         console.log(`  ${"".padEnd(20)} id: ${s.id}  clients: ${s.attachedClients}`);
+        const sandbox = sandboxSummary(s.sandbox);
+        if (sandbox) console.log(`  ${"".padEnd(20)} ${sandbox}`);
         const effective = s.effectiveAccount ?? s.effectiveClaudeAccount;
         if (effective) {
           // Which account it bills on its backend, and whether that is its own choice.
@@ -440,6 +446,44 @@ export class TerminalClient {
     for (const line of formatPackList(resp)) console.log(line);
   }
 
+  /** Change a session's OS sandbox (#448); a widening waits for the owner's yes on the session. */
+  async setSandbox(sessionIdOrName: string, sandbox: SessionSandboxSetting): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const resp = await this.#request({ type: "session.set_sandbox", id: randomUUID(), sessionId, sandbox });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const data = resp.data as { pending?: boolean; sandbox?: SessionSandboxInfo | null };
+    if (data.pending) {
+      console.log(`Asked on the session: it changes when its owner says yes (codeoid approve ${sessionIdOrName}, or the web UI).`);
+    }
+    const line = sandboxSummary(data.sandbox ?? undefined);
+    if (line) console.log(data.pending ? `  now: ${line}` : line);
+  }
+
+  /** The daemon's sandbox providers and whether each runs here (#448). */
+  async sandboxProviders(): Promise<void> {
+    const resp = await this.#request({ type: "sandbox.providers", id: randomUUID() });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const data = resp.data as { enabled: boolean; auto: string | null; default: { provider: string; network: string }; providers: SandboxProviderWire[] };
+    if (!data.enabled) {
+      console.log("This daemon has no OS sandbox.");
+      return;
+    }
+    console.log(`\n  Default: ${data.default.provider}${data.default.provider === "auto" && data.auto ? ` (${data.auto} here)` : ""}, network ${data.default.network}\n`);
+    for (const p of data.providers) {
+      const where = `${p.isolation} isolation, ${p.placement}, network ${p.network.join("/")}`;
+      console.log(`  ${p.id.padEnd(10)} ${p.available ? "available" : "not available"}  ${p.displayName} — ${where}`);
+      if (!p.available && p.reason) console.log(`  ${"".padEnd(10)} ${p.reason}`);
+    }
+    console.log();
+  }
+
   async createSession(
     name: string,
     workdir: string,
@@ -453,6 +497,8 @@ export class TerminalClient {
       account?: string;
       effort?: EffortLevel | null;
       collaboration?: CollaborationConfig;
+      /** OS sandbox (#448); absent = the daemon's config. */
+      sandbox?: SessionSandboxSetting;
     } = {},
   ): Promise<void> {
     const resp = await this.#request({
@@ -471,6 +517,7 @@ export class TerminalClient {
       ...(opts.pack ? { pack: opts.pack } : {}),
       ...(opts.packRole ? { packRole: opts.packRole } : {}),
       ...(opts.collaboration ? { collaboration: opts.collaboration } : {}),
+      ...(opts.sandbox ? { sandbox: opts.sandbox } : {}),
     });
 
     if (resp.type === "response.ok") {
@@ -478,6 +525,8 @@ export class TerminalClient {
       const profile = data.profile ? ` [pack: ${data.profile}]` : "";
       const provider = data.providerId ? ` [${data.providerId}]` : "";
       console.log(`Session created: ${data.name} (${data.id})${provider}${profile}`);
+      const sandbox = sandboxSummary(data.sandbox);
+      if (sandbox) console.log(`  ${sandbox}`);
       // Non-fatal binding notes (skipped cross-vendor bindings, unmapped
       // tiers) — the daemon adjusted something the operator should know about.
       for (const w of resp.warnings ?? []) console.log(`  ⚠ ${w}`);
@@ -1193,6 +1242,8 @@ export class TerminalClient {
     console.log(`${oneLine(pending.toolName)}  (${oneLine(pending.approvalId)})`);
     const risk = formatToolRisk(pending.risk);
     if (risk) console.log(`▲ ${oneLine(risk)}`);
+    const sandbox = approvalSandboxLine(pending);
+    if (sandbox) console.log(oneLine(sandbox));
     const shown = plainText(pending.input === undefined ? "" : JSON.stringify(pending.input, null, 2) ?? "");
     const cut = shown.length > APPROVE_SHOW_MAX;
     console.log(cut ? shown.slice(0, APPROVE_SHOW_MAX) : shown);

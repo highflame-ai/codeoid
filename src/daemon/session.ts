@@ -5169,7 +5169,7 @@ export class Session {
       if (!gated) continue;
       const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
       const outside = this.#outsideWrite(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
-      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, outside) });
+      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, outside), ...this.#cardSandbox(gated.toolName, gated.input) });
     }
     return out;
   }

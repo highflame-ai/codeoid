@@ -255,8 +255,12 @@ const ApprovalsSchema = z
  */
 const SandboxSchema = z
   .object({
-    /** `auto` (bubblewrap on Linux, Seatbelt on macOS), `off`, or a provider id (`bwrap`, `seatbelt`, `docker`). */
-    provider: z.string().min(1).max(64).default("auto"),
+    /**
+     * `auto` (bubblewrap on Linux, Seatbelt on macOS), `off`, or a provider id
+     * (sandbox/registry.ts). Closed: a typo fails the load rather than leaving
+     * every session unsandboxed; a new provider adds its id here.
+     */
+    provider: z.enum(["auto", "off", "bwrap", "seatbelt", "docker"]).default("auto"),
     /** What a sandboxed command may reach: everything, nothing, or `allowedHosts`. */
     network: z.enum(["on", "off", "allowlist"]).default("on"),
     allowedHosts: z.array(z.string().min(1).max(253)).max(256).default([]),

@@ -37,6 +37,9 @@ export interface PendingToolApproval {
   input: unknown;
   /** A shell command's risk (#431). */
   risk?: ToolRisk;
+  /** Whether it runs inside the session's OS sandbox, and why not (#448; as on the card). */
+  sandboxed?: boolean;
+  sandboxNote?: string;
 }
 
 export interface SessionApprovalsResultMsg {

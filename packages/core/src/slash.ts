@@ -6,6 +6,7 @@
  *   /interrupt               — interrupt current turn
  *   /rotate                  — rotate context (refresh skills/settings)
  *   /mode <i|g|x>            — interactive | guarded | autonomous
+ *   /sandbox <auto|off|id> [on|off|allow:host,host] — the session's OS sandbox (#448); off is asked of the owner
  *   /model <id|alias>        — switch model (opus / sonnet / haiku / full id)
  *   /account <name|default|--follow-default> — switch the session's Claude account
  *   /help                    — surface help modal (TODO P6)
@@ -22,6 +23,7 @@ import {
   type EffortLevel,
   type SessionInfo,
   type SessionMode,
+  type SessionSandboxSetting,
   type McpReconnectResult,
   type McpRefreshResult,
 } from "@highflame/codeoid-protocol";
@@ -33,6 +35,7 @@ export type SlashCommand =
   | { kind: "interrupt" }
   | { kind: "rotate" }
   | { kind: "mode"; mode: SessionMode; maxTurns?: number }
+  | { kind: "sandbox"; sandbox: SessionSandboxSetting }
   | { kind: "model"; model: string; fallback?: string | null }
   | { kind: "model-picker" }
   | { kind: "effort"; effort: EffortLevel | null }
@@ -90,6 +93,27 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
       return { kind: "interrupt" };
     case "rotate":
       return { kind: "rotate" };
+    case "sandbox": {
+      const usage = "/sandbox <auto|off|bwrap|seatbelt|docker> [on|off|allow:host,host]";
+      if (rest.length === 0) throw new Error(usage);
+      const sandbox: SessionSandboxSetting = {};
+      for (const word of rest) {
+        const w = word.toLowerCase();
+        if (w === "on" || w === "off") {
+          // A lone `off` turns the sandbox off; after a provider it's the network.
+          if (w === "off" && sandbox.provider === undefined && rest.length === 1) sandbox.provider = "off";
+          else sandbox.network = w;
+        } else if (w.startsWith("allow:")) {
+          sandbox.network = "allowlist";
+          sandbox.allowedHosts = word.slice("allow:".length).split(",").filter(Boolean);
+        } else if (sandbox.provider === undefined) {
+          sandbox.provider = w;
+        } else {
+          throw new Error(usage);
+        }
+      }
+      return { kind: "sandbox", sandbox };
+    }
     case "mode": {
       const m = rest[0]?.toLowerCase();
       if (!m) throw new Error("/mode <guarded|interactive|autonomous>");
@@ -292,6 +316,14 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
         type: "session.rotate",
         id: ctx.newRequestId(),
         sessionId: ctx.sessionId,
+      });
+      return;
+    case "sandbox":
+      fire({
+        type: "session.set_sandbox",
+        id: ctx.newRequestId(),
+        sessionId: ctx.sessionId,
+        sandbox: cmd.sandbox,
       });
       return;
     case "mode":

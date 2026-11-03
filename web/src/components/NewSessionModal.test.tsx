@@ -823,3 +823,56 @@ describe("NewSessionModal — three modes", () => {
     );
   });
 });
+
+describe("NewSessionModal sandbox choice (#448)", () => {
+  const providersReply = {
+    enabled: true,
+    auto: "bwrap",
+    default: { provider: "auto", network: "on", allowedHosts: [] },
+    providers: [
+      { id: "bwrap", displayName: "bubblewrap", available: true, isolation: "os", placement: "local", workspace: "mount", network: ["on", "off"] },
+      { id: "docker", displayName: "Docker", available: false, reason: "the Docker daemon isn't reachable", isolation: "os", placement: "local", workspace: "mount", network: ["on", "off"] },
+    ],
+  };
+
+  it("asks the daemon nothing until changed, and sends no sandbox by default", async () => {
+    authMock.mockReturnValue(authOk(["claude"]));
+    requestMock.mockResolvedValue({ id: "s-new", name: "n", workdir: "/w" });
+    const { getByText, getByPlaceholderText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    expect(getByText(/Sandbox: the daemon's default/)).toBeTruthy();
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "demo" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    expect(requestMock.mock.calls.map((c) => (c[0] as { type: string }).type)).toEqual(["session.create"]);
+    expect("sandbox" in (requestMock.mock.calls[0]![0] as object)).toBe(false);
+  });
+
+  it("change: lists what the daemon has (an unavailable one disabled, with why) and sends the choice", async () => {
+    authMock.mockReturnValue(authOk(["claude"]));
+    requestMock.mockImplementation(async (m: { type: string }) => (m.type === "sandbox.providers" ? providersReply : { id: "s-new", name: "n", workdir: "/w" }));
+    const { getByText, getByLabelText, getByPlaceholderText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.click(getByText("change"));
+    await waitFor(() => expect(getByText(/Docker — not available: the Docker daemon isn't reachable/)).toBeTruthy());
+    expect((getByText(/Docker — not available/) as HTMLOptionElement).disabled).toBe(true);
+    fireEvent.change(getByLabelText("Sandbox"), { target: { value: "bwrap" } });
+    fireEvent.change(getByLabelText("Sandbox network"), { target: { value: "off" } });
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "demo" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() =>
+      expect(requestMock).toHaveBeenCalledWith(expect.objectContaining({ type: "session.create", sandbox: { provider: "bwrap", network: "off" } })),
+    );
+  });
+
+  it("off says what it means", async () => {
+    authMock.mockReturnValue(authOk(["claude"]));
+    requestMock.mockResolvedValue(providersReply);
+    const { getByText, getByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.click(getByText("change"));
+    await waitFor(() => expect(getByLabelText("Sandbox")).toBeTruthy());
+    fireEvent.change(getByLabelText("Sandbox"), { target: { value: "off" } });
+    expect(getByText(/can read your credentials and change any file you can/)).toBeTruthy();
+  });
+});

@@ -52,7 +52,7 @@ import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
 import { bedrockFromSettings, formatAccounts, formatClaudeAccounts, parseHeaderFlags, parseSettingFlags } from "./terminal/claude-accounts.js";
 import { formatEndpoints, importPiModels, parseModelFlags, parseTokens } from "./terminal/endpoints.js";
-import type { ClientMessage, DaemonMessage, EffortLevel, SessionInfo } from "./protocol/types.js";
+import type { ClientMessage, DaemonMessage, EffortLevel, SessionInfo, SessionSandboxSetting } from "./protocol/types.js";
 import { parseEffort } from "@highflame/codeoid-core";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
 import { cleartextOffHost, controlUrl, MCP_SCOPE_PRESETS, TokenError } from "./terminal/token.js";
@@ -1037,6 +1037,12 @@ program
     "Thinking effort: off | minimal | low | medium | high | xhigh | max, or default for the backend's own (omitted: session.defaultEffort, else the backend's own). Change it later with /effort.",
   )
   .option(
+    "--sandbox <provider>",
+    "OS sandbox for its commands: auto (bubblewrap on Linux, Seatbelt on macOS) | bwrap | seatbelt | docker | off. Default: sandbox.provider. off needs session:approve.",
+  )
+  .option("--network <mode>", "What a sandboxed command may reach: on | off | allowlist (with --allow-host). Default: sandbox.network.")
+  .option("--allow-host <host>", "A host the allowlist lets through, repeatable (example.com, *.example.com).", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .option(
     "--pack <id>",
     "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents). With --collaborate, the collaboration ADOPTS the pack: role names bind strictly to the pack's declared roles.",
   )
@@ -1070,9 +1076,19 @@ program
         packRole?: string;
         collaborate?: string;
         role: string[];
+        sandbox?: string;
+        network?: string;
+        allowHost: string[];
       },
     ) => {
       const config = loadConfig();
+      let sandbox: SessionSandboxSetting | undefined;
+      try {
+        sandbox = sandboxSettingFromFlags(opts);
+      } catch (e) {
+        console.error(e instanceof Error ? e.message : String(e));
+        process.exit(1);
+      }
       let resolvedWorkdir = workdir;
       if (opts.worktree) {
         const { createWorktree } = await import("./worktree.js");
@@ -1134,10 +1150,64 @@ program
         pack: opts.pack,
         packRole: opts.packRole,
         collaboration,
+        ...(sandbox ? { sandbox } : {}),
       });
       client.disconnect();
     },
   );
+
+/** A session's sandbox setting from `--sandbox` / `--network` / `--allow-host` (#448); undefined when none is given. */
+function sandboxSettingFromFlags(o: { sandbox?: string; network?: string; allowHost?: string[] }): SessionSandboxSetting | undefined {
+  const out: SessionSandboxSetting = {};
+  if (o.sandbox) out.provider = o.sandbox;
+  if (o.network) {
+    if (o.network !== "on" && o.network !== "off" && o.network !== "allowlist") throw new Error("--network is on, off or allowlist");
+    out.network = o.network;
+  }
+  if (o.allowHost && o.allowHost.length > 0) {
+    if (out.network && out.network !== "allowlist") throw new Error("--allow-host goes with --network allowlist");
+    out.network = "allowlist";
+    out.allowedHosts = o.allowHost;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+const sandboxCmd = program
+  .command("sandbox")
+  .description("The OS sandbox agents' commands run in (docs/sandbox.md): see what this daemon has, or change a session's");
+
+sandboxCmd
+  .command("providers")
+  .description("List the sandbox providers, whether each runs here, and the default")
+  .action(async () => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    await client.sandboxProviders();
+    client.disconnect();
+  });
+
+sandboxCmd
+  .command("set <session> [provider]")
+  .description("Change a session's sandbox: auto | bwrap | seatbelt | docker | off, and/or --network. Turning it off or widening it is asked of the owner on the session")
+  .option("--network <mode>", "on | off | allowlist")
+  .option("--allow-host <host>", "a host the allowlist lets through, repeatable", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .action(async (session: string, provider: string | undefined, o: { network?: string; allowHost: string[] }) => {
+    let setting: SessionSandboxSetting | undefined;
+    try {
+      setting = sandboxSettingFromFlags({ ...(provider ? { sandbox: provider } : {}), ...o });
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
+    if (!setting) {
+      console.error("Give a provider (auto | bwrap | seatbelt | docker | off) or --network.");
+      process.exit(1);
+    }
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    await client.setSandbox(session, setting);
+    client.disconnect();
+  });
 
 program
   .command("attach <session>")
@@ -1566,6 +1636,9 @@ function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
     .option("--check-timeout <s>", "check timeout in seconds (default 60)")
     .option("--provider <id>", "backend: claude, codex, gemini, qwen, …")
     .option("--model <name>", "model for the backend")
+    .option("--sandbox <provider>", "OS sandbox for its runs: auto | bwrap | seatbelt | docker | off (default: sandbox.provider); a run whose sandbox can't run here doesn't start")
+    .option("--network <mode>", "what a sandboxed command may reach: on | off | allowlist")
+    .option("--allow-host <host>", "a host the allowlist lets through (repeatable)", collect, [])
     .option("--guarded", "every non-read tool waits for your approval")
     .option("--autonomous", "tools auto-approve within --tool-budget (default)")
     .option("--tool-budget <n>", "autonomous tool calls per run (default 50)")
@@ -1627,6 +1700,9 @@ loop
   .option("--budget <n>", "Autonomous tool calls per attempt (default 60)")
   .option("--provider <id>", "Backend for the worker (default: the daemon's)")
   .option("--model <id>", "Model for the worker")
+  .option("--sandbox <provider>", "The worker's OS sandbox: auto | bwrap | seatbelt | docker | off (default: sandbox.provider); the run is refused where it can't run")
+  .option("--network <mode>", "What the worker's commands may reach: on | off | allowlist")
+  .option("--allow-host <host>", "A host the allowlist lets through (repeatable)", collect, [])
   .option("--wait", "Follow the run until it ends")
   .action(
     (
@@ -1641,10 +1717,21 @@ loop
         budget?: string;
         provider?: string;
         model?: string;
+        sandbox?: string;
+        network?: string;
+        allowHost: string[];
         wait?: boolean;
       },
     ) =>
       withClient(async (c) => {
+        let sandbox: SessionSandboxSetting | undefined;
+        try {
+          sandbox = sandboxSettingFromFlags(f);
+        } catch (e) {
+          console.error(e instanceof Error ? e.message : String(e));
+          process.exitCode = 1;
+          return;
+        }
         if (f.check.length === 0) {
           console.error("Give at least one --check: the command that must pass.");
           process.exitCode = 1;
@@ -1664,6 +1751,7 @@ loop
           checks: f.check.map((raw) => ({ ...parseCheckFlag(raw), ...(f.test ? { expectTests: true } : {}) })),
           ...(f.provider ? { provider: f.provider } : {}),
           ...(f.model ? { model: f.model } : {}),
+          ...(sandbox ? { sandbox } : {}),
           ...(f.budget ? { toolBudget: int(f.budget) } : {}),
           ...(Object.keys(limits).length > 0 ? { limits: limits as never } : {}),
         });
