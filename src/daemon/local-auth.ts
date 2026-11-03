@@ -17,7 +17,12 @@
  *   1. mint a random 256-bit token at startup,
  *   2. hand it to local clients through a 0600 file in the config dir,
  *   3. bind loopback only — a non-loopback bind is refused unless the
- *      operator passes an explicit second flag.
+ *      operator passes an explicit second flag,
+ *   4. never hand it to a request for being loopback (#448 round 4): an
+ *      agent's sandboxed command with the network on is a loopback client
+ *      too. The web UI gets it by exchanging a one-time code
+ *      ({@link LocalUiLinks}) that only the banner and `codeoid ui` (which
+ *      reads the file, hidden from every sandbox) show.
  *
  * Time-to-first-session is unchanged by all three: nothing is typed, nothing
  * is registered, nothing is fetched.
@@ -42,7 +47,7 @@
  * `src/tests/local-auth.test.ts` walks the import graph and fails on it.
  */
 
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { ALL_SCOPES, type AuthContext } from "@highflame/codeoid-protocol";
@@ -290,4 +295,76 @@ export function removeLocalTokenFile(path: string): void {
   } catch {
     /* best effort — a stale file fails closed at the verifier anyway */
   }
+}
+
+// ── Web UI sign-in links (#448 round 4) ─────────────────────────────────────
+
+/** The URL fragment key carrying a one-time sign-in code (`/ui/#codeoid-local-code=…`): a fragment never reaches a server log or a Referer. */
+export const UI_LINK_FRAGMENT = "codeoid-local-code";
+/** How long the code in the start banner's link lasts. */
+export const UI_LINK_START_TTL_MS = 15 * 60_000;
+/** How long a code `codeoid ui` asks for lasts. */
+export const UI_LINK_TTL_MS = 2 * 60_000;
+/** Codes outstanding at once: a client minting in a loop can't grow the map. */
+const UI_LINK_MAX = 32;
+
+/** The `/ui/` link that signs a browser in with `code`. */
+export function uiLinkUrl(httpBase: string, code: string): string {
+  return `${httpBase.replace(/\/+$/, "")}/ui/#${UI_LINK_FRAGMENT}=${code}`;
+}
+
+/**
+ * One-time, short-lived codes a browser exchanges once for the local token
+ * (the web UI's `POST /ui/local-session`). A code is 256 random bits, kept
+ * only as its hash, gone at its first use or when it expires; minting one
+ * needs the token itself (`codeoid ui`) or is the daemon's own (the start
+ * banner). So nothing reachable without the token — a page, a sandboxed
+ * command on the loopback — gets it.
+ */
+export class LocalUiLinks {
+  readonly #codes = new Map<string, number>();
+  readonly #now: () => number;
+
+  constructor(now: () => number = Date.now) {
+    this.#now = now;
+  }
+
+  /** A fresh code, valid once for `ttlMs`. */
+  mint(ttlMs: number): string {
+    this.#sweep();
+    while (this.#codes.size >= UI_LINK_MAX) {
+      const oldest = this.#codes.keys().next().value;
+      if (oldest === undefined) break;
+      this.#codes.delete(oldest);
+    }
+    const code = randomBytes(32).toString("base64url");
+    this.#codes.set(hashCode(code), this.#now() + ttlMs);
+    return code;
+  }
+
+  /** Whether `code` is a live one; it is spent either way. */
+  redeem(code: unknown): boolean {
+    this.#sweep();
+    if (typeof code !== "string" || code.length === 0 || code.length > 128) return false;
+    const key = hashCode(code);
+    const until = this.#codes.get(key);
+    this.#codes.delete(key);
+    return until !== undefined && until > this.#now();
+  }
+
+  #sweep(): void {
+    const now = this.#now();
+    for (const [k, until] of this.#codes) if (until <= now) this.#codes.delete(k);
+  }
+}
+
+function hashCode(code: string): string {
+  return createHash("sha256").update(code).digest("hex");
+}
+
+/** Whether `presented` is `expected`, in constant time (a bearer header against the local token). */
+export function sameLocalToken(presented: string, expected: string): boolean {
+  const a = Buffer.from(presented, "utf8");
+  const b = Buffer.from(expected, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
 }

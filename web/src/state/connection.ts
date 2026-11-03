@@ -13,6 +13,7 @@ import { createSignal } from "solid-js";
 import {
   forgetOAuthToken,
   jwtExpiryMs,
+  forgetLocalModeToken,
   readLocalModeToken,
   refreshAccessToken,
   rememberedApiKey,
@@ -74,6 +75,10 @@ const [bootError, setBootError] = createSignal<string | null>(null);
 export const connectionStatus = status;
 export const authIdentity = auth;
 export const bootstrapError = bootError;
+/** Say why the page couldn't sign in (a spent or expired local sign-in link), for SignIn to show. */
+export function reportBootError(message: string): void {
+  setBootError(message);
+}
 
 let client: CodeoidClient | null = null;
 
@@ -301,8 +306,10 @@ export async function bootstrap(opts: { apiKey?: string; token?: string } = {}):
         }
         // No refresh path: drop the identity to fall back to <SignIn> instead of
         // showing "reconnecting…" forever, and forget the stale token so a
-        // reload doesn't immediately re-enter the same dead loop.
+        // reload doesn't immediately re-enter the same dead loop (a local-mode
+        // token too: the daemon restarted with a new one).
         forgetOAuthToken();
+        forgetLocalModeToken();
         setAuth(null);
         setBootError(`Session expired — please sign in again. (${s.reason})`);
       }

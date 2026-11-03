@@ -12,7 +12,7 @@ codeoid start --local          # terminal 1 — prints a token, binds 127.0.0.1 
 codeoid tui                    # terminal 2 — picks the token up automatically
 ```
 
-Or open <http://localhost:7400/ui/> — already signed in, because the daemon hands the page its token.
+Or open the web UI with the link the banner prints (`http://127.0.0.1:7400/ui/#codeoid-local-code=…`): it signs that browser in, once. Later, `codeoid ui` opens a fresh one.
 
 To move to real identities later: `codeoid login`, then start without `--local`.
 
@@ -58,6 +58,7 @@ The daemon runs coding agents with shell and file-write authority. A token-less 
 2. **It is published to `~/.codeoid/local-token-<port>`** (mode `0600`) so clients on this machine pick it up with zero setup — and **removed when the daemon shuts down**, so it never becomes a durable credential lying around.
    The filename is scoped to the daemon's port, so two local daemons on one machine can't overwrite or delete each other's credential.
 3. **The bind is loopback-only.** A non-loopback `--host` is *refused* unless you also pass `--local-allow-remote`.
+4. **Being on the loopback earns nothing.** No route hands out the token to a request for coming from this machine: an agent's sandboxed command with the network on is a loopback client too, and its sandbox hides the token file precisely so it can't take over the daemon. The web UI is signed in by a one-time link instead ([below](#how-the-web-ui-signs-in)).
 
 None of that costs you a setup step. Nothing is typed, nothing is registered, nothing is fetched.
 
@@ -73,16 +74,19 @@ exposes an agent with shell and file-write access to anything that can reach thi
   • accept the risk: add --local-allow-remote (the minted token becomes the only guard)
 ```
 
-If you genuinely need remote reach, use ZeroID. That is what it is for. `--local-allow-remote` exists for containers and lab setups where you have your own network boundary, and it changes one more thing: the web UI **stops** being handed the token automatically (see below), because on a wide bind the served HTML would hand full control to anyone who can reach the port.
+If you genuinely need remote reach, use ZeroID. That is what it is for. `--local-allow-remote` exists for containers and lab setups where you have your own network boundary, and it changes one more thing: there are **no sign-in links** (see below); paste the token into the sign-in box.
 
-### Why the web UI needs no sign-in
+### How the web UI signs in
 
-On a loopback bind the daemon injects the token into the `index.html` it serves, as a synchronous `window.__CODEOID_LOCAL_TOKEN__` global — the same channel it already uses to publish the embed-SSO allowlist. The page connects with it directly.
+The page the daemon serves never carries the token. Whoever can fetch it reads all of it — another local process, a page whose domain an attacker rebinds to `127.0.0.1`, and an agent's sandboxed command, which with the sandbox's network `on` (the default) reaches the daemon's loopback port like any local program. (Until #448 round 4 the token was injected into `index.html` for any loopback `Host`; a sandboxed `curl http://127.0.0.1:7400/ui/` read it, and with it could start an unsandboxed session.)
 
-Two guards apply:
+Instead, on a loopback bind:
 
-- **Loopback bind only.** Under `--local-allow-remote` the token is never injected; paste it into the sign-in box instead (the field accepts `codeoid_local_…` verbatim, no exchange).
-- **A DNS-rebinding check on the request's own `Host`.** A loopback-bound daemon is still reachable from a page whose domain an attacker rebinds to `127.0.0.1`; the browser would then treat the response as same-origin with the attacker's origin and could read it. So the token is emitted only when the request's `Host` names a loopback address. Any other `Host` — a tunnel hostname, a rebound domain — gets the UI with no credential.
+1. **The start banner prints a one-time link**, `http://127.0.0.1:7400/ui/#codeoid-local-code=<code>`. Opening it signs that browser in: the page takes the code out of the address bar, exchanges it once at `POST /ui/local-session` for the token, and keeps the token in its own storage (a reload, or another tab of the same browser, stays signed in). The code is 256 random bits, works once, and expires after 15 minutes; it is in the URL's fragment, which no server log or `Referer` carries.
+2. **`codeoid ui`** gives a fresh link whenever you need one (another browser, the first one spent or expired, the daemon restarted with a new token): it reads the token from its file — hidden inside every sandbox — and asks the daemon for a code (`POST /ui/local-link` with the token as its bearer; a code lasts 2 minutes), then prints the link and opens your browser (`--no-open`: print only).
+3. **Or paste the token** into the sign-in box (the field accepts `codeoid_local_…` verbatim, no exchange). That is the only way under `--local-allow-remote`.
+
+The page says only that the daemon is in local mode (`window.__CODEOID_LOCAL_MODE__`), so the sign-in box can tell you which of these to use. The exchange answers only a request whose own `Host` names a loopback address (the DNS-rebinding guard); a spent, expired, guessed or missing code gets nothing.
 
 ### Why Telegram is refused
 
@@ -134,14 +138,18 @@ The published file outranks a stored ZeroID key on purpose. It exists *only whil
 
 **Stale files.** The graceful shutdown path removes the token, so a leftover file means the daemon was killed hard (`kill -9`, power loss). Starting a **ZeroID-mode** daemon on that port sweeps it — successfully binding the port proves no local daemon is listening on it, so any token file for it is dead. (The sweep runs *after* the bind, so a failed bind can never delete a live daemon's credential.) A stale file with nothing listening just fails to connect.
 
-For the web UI, the daemon-injected global takes precedence over anything in `localStorage`, for the same reason.
+For the web UI, a local-mode token it was signed in with (by a link) takes precedence over a stored ZeroID credential while the daemon serving the page says it is in local mode, for the same reason. When the daemon refuses it (it restarted with a new token), the page forgets it: use the new banner's link or `codeoid ui`.
 
 ## Flags and variables
 
 | Flag | Effect |
 |---|---|
 | `--local` | Mint a token, publish it, bind loopback only, disable ZeroID-dependent subsystems |
-| `--local-allow-remote` | Permit `--local` on a non-loopback bind. **Unsafe** — the minted token becomes the only guard, and the web UI no longer gets it automatically |
+| `--local-allow-remote` | Permit `--local` on a non-loopback bind. **Unsafe** — the minted token becomes the only guard, and there are no web UI sign-in links (paste the token) |
+
+| Command | Effect |
+|---|---|
+| `codeoid ui [--no-open]` | Print (and open) a one-time link that signs a browser in to the local-mode daemon at `daemonUrl`; on a ZeroID daemon, the plain `/ui/` |
 
 | Variable | Effect |
 |---|---|
@@ -185,7 +193,8 @@ The daemon picks one verifier at construction. Everything downstream — all ~20
 
 **Reject in review:** any `if (localMode) …` branch inside a scope check, the handshake, an audit write, or any other enforcement site. The moment local mode becomes a conditional inside the verified path, it stops being an isolated second posture and becomes a hole in the first one.
 
-Two further invariants are enforced by tests (`src/tests/local-auth.test.ts`, `src/tests/local-mode-server.test.ts`, `src/tests/web-ui-boot-script.test.ts`):
+Three further invariants are enforced by tests (`src/tests/local-auth.test.ts`, `src/tests/local-mode-server.test.ts`, `src/tests/web-ui-boot-script.test.ts`):
 
 - **`local-auth.ts` never imports `@highflame/sdk`, directly or transitively.** A test walks the import graph. This is what makes local mode genuinely offline-capable, and it is the regression most likely to creep back in silently.
 - **Local mode fails closed.** A wrong, empty, truncated, or superstring token is rejected with the same `4003` close code a bad JWT gets.
+- **Nothing reachable without the token hands it out** (`src/tests/web-ui-boot-script.test.ts`, and `src/tests/sandbox-loopback-token-real.test.ts`, which asks every route from inside a real bubblewrap sandbox with the network on).

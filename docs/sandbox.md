@@ -355,10 +355,20 @@ to the workspace.
 ## Limits
 
 - **Network `on` shares the host's network.** A sandboxed command can reach
-  services listening on localhost (they still need their own credentials:
-  codeoid's port needs a token, which is hidden) and, under bubblewrap and
-  Seatbelt, abstract Unix sockets (an X11 or D-Bus abstract address). With the
-  network `off` under bubblewrap it has its own loopback and none of these.
+  every service listening on localhost: a database, a dev server, a local
+  model server, an admin API, whatever you run there, with only that
+  service's own authentication between them (and, under bubblewrap and
+  Seatbelt, abstract Unix sockets: an X11 or D-Bus abstract address).
+  codeoid's own port is one of them: nothing it answers without the token
+  hands the token out or acts (the web UI is signed in by a one-time link,
+  never by being on the loopback: docs/local-mode.md), and the token's file
+  is hidden. For unattended work (routines, loops, autonomous sessions), or
+  next to local services that trust the loopback, use `sandbox.network: off`
+  (`CODEOID_SANDBOX_NETWORK=off`, or `--network off` per session) or an
+  `allowlist` of the hosts the work needs (enforced on Claude's own
+  sandbox; elsewhere an allowlist runs with the network off). With the
+  network `off` under bubblewrap a command has its own loopback and none of
+  these.
 - **Allowlists** are enforced by Claude's sandbox only (its proxy). bubblewrap,
   Seatbelt and Docker run an allowlist with the network off.
 - **Seatbelt has no pid namespace**: a sandboxed command can list other

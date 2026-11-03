@@ -39,8 +39,11 @@ import {
   assertLocalBindAllowed,
   isLoopbackHost,
   LOCAL_TOKEN_ENV,
+  LocalUiLinks,
   mintLocalToken,
   removeLocalTokenFile,
+  UI_LINK_START_TTL_MS,
+  uiLinkUrl,
 } from "./daemon/local-auth.js";
 import {
   CAPABILITIES,
@@ -200,17 +203,17 @@ program
 
     // Web UI (always enabled unless --no-web) — the SolidJS app at /ui,
     // single-origin so one HTTPS tunnel also serves as a Telegram Mini App.
+    // In local mode on a loopback bind, a one-time link signs a browser in:
+    // the banner's, then `codeoid ui`'s. The page itself never carries the
+    // token (a sandboxed command on the loopback could fetch it, #448 round 4).
+    // On a wide bind there is no link: the operator pastes the token.
+    let uiLinks: LocalUiLinks | undefined;
     if (opts.web !== false) {
       const { WebUiFrontend } = await import("./frontends/web-ui/index.js");
-      // In local mode on a loopback bind, hand the browser the token directly so
-      // /ui needs no sign-in at all. On a wide bind we deliberately do NOT — the
-      // HTML would be readable by anything that can reach the port — so the
-      // operator pastes the token into the sign-in box instead.
-      const injectToken =
-        localMode && isLoopbackHost(bindHost) ? localMode.token : undefined;
+      if (localMode && isLoopbackHost(bindHost)) uiLinks = new LocalUiLinks();
       // Thread the embed-SSO allowlist so the served index.html publishes it to
       // the web UI's trusted-framing-origin gate. Empty ⇒ hash handoff disabled.
-      daemon.use(new WebUiFrontend(config.embed?.allowedOrigins ?? [], injectToken));
+      daemon.use(new WebUiFrontend(config.embed?.allowedOrigins ?? [], localMode && uiLinks ? { token: localMode.token, links: uiLinks } : undefined));
     }
 
     // Telegram (enabled when TELEGRAM_BOT_TOKEN is set)
@@ -275,6 +278,7 @@ program
         port: String(opts.port),
         loopback: isLoopbackHost(bindHost),
         web: opts.web !== false,
+        ...(uiLinks ? { link: uiLinkUrl(`http://${displayHost}:${opts.port}`, uiLinks.mint(UI_LINK_START_TTL_MS)) } : {}),
       });
     }
   });
@@ -294,6 +298,8 @@ function printLocalModeBanner(o: {
   port: string;
   loopback: boolean;
   web: boolean;
+  /** The one-time link that signs a browser in (loopback local mode). */
+  link?: string;
 }): void {
   const lines: string[] = [
     "",
@@ -306,8 +312,8 @@ function printLocalModeBanner(o: {
   ];
   if (o.web) {
     lines.push(
-      o.loopback
-        ? `  Or open the web UI — already signed in:  http://${o.host}:${o.port}/ui/`
+      o.link
+        ? `  Or open the web UI — this link signs one browser in (once, within ${Math.round(UI_LINK_START_TTL_MS / 60_000)} minutes):\n      ${o.link}\n    later, a new link:  codeoid ui`
         : `  Or open the web UI and paste the token below:  http://${o.host}:${o.port}/ui/`,
       "",
     );
@@ -414,6 +420,30 @@ function writeConfigKeys(updates: Record<string, unknown>): string {
   writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
   return path;
 }
+
+program
+  .command("ui")
+  .description("Open the web UI; on a local-mode daemon, with a one-time link that signs this browser in")
+  .option("--no-open", "print the link, don't open a browser")
+  .action(async (opts) => {
+    const { webUiLink } = await import("./terminal/ui-link.js");
+    const link = await webUiLink(loadConfig().daemonUrl);
+    if ("error" in link) {
+      console.error(`codeoid ui: ${link.error}`);
+      process.exit(1);
+    }
+    console.log(link.url);
+    if (link.signsIn) console.log(`  (signs one browser in, once, within ${Math.round((link.expiresInMs ?? 0) / 1000)} seconds)`);
+    if (opts.open === false) return;
+    const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? null : "xdg-open";
+    const bin = opener ? Bun.which(opener) : null;
+    if (!bin) return;
+    try {
+      Bun.spawn([bin, link.url], { stdin: "ignore", stdout: "ignore", stderr: "ignore" }).unref();
+    } catch {
+      /* the link is printed */
+    }
+  });
 
 program
   .command("login [apiKey]")

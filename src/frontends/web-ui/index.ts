@@ -17,52 +17,89 @@
  * credential is consumed, so a synchronous injected global fits better than
  * an async fetch. Empty allowlist ⇒ no origin is trusted ⇒ handoff disabled.
  *
- * Local mode: the same channel carries the minted local token as
- * `window.__CODEOID_LOCAL_TOKEN__`, so opening `/ui` on a local-mode daemon
- * connects with no sign-in step at all. This is only ever populated for a
- * LOOPBACK bind (the CLI decides) — on a wide bind, serving the token inside
- * the HTML would hand full control to anyone who can reach the port, so there
- * the operator pastes it into the sign-in box instead.
+ * Local mode: the page never carries the token (#448 round 4). Being a
+ * loopback client proves nothing — an agent's sandboxed command with the
+ * network on is one — so the token goes only to a browser that presents a
+ * one-time code it was given out of band: the link the start banner prints,
+ * or one `codeoid ui` asks for with the token it read from its file (hidden
+ * from every sandbox). The page exchanges the code once
+ * (`POST /ui/local-session`) and keeps the token itself. The channel above
+ * carries only `window.__CODEOID_LOCAL_MODE__`, so the sign-in box can say
+ * how to get a link. Only for a LOOPBACK bind (the CLI decides); on a wide
+ * bind the operator pastes the token.
  */
 
 import { existsSync } from "node:fs";
 import { join, normalize, resolve, sep } from "node:path";
-import { isLoopbackHost } from "../../daemon/local-auth.js";
+import { isLoopbackHost, type LocalUiLinks, sameLocalToken, UI_LINK_TTL_MS } from "../../daemon/local-auth.js";
 import type { Frontend, FrontendContext } from "../types.js";
 
 // src/frontends/web-ui → repo root → web/dist
 const DIST = resolve(import.meta.dir, "../../../web/dist");
-const INDEX_HTML = join(DIST, "index.html");
 
 /**
  * Build the inline <script> of boot-time globals injected into `index.html`.
  *
- * Pure and exported so the trust decisions here are unit-testable without a
- * built UI on disk — there are two of them:
- *
- *  1. **Escaping.** Values are operator- or daemon-controlled, but they are
- *     JSON-encoded with `<` neutralized so nothing can close the <script>.
- *  2. **DNS-rebinding guard on the token.** A loopback-bound daemon is still
- *     reachable from a page whose domain an attacker rebinds to 127.0.0.1; the
- *     browser then treats the response as same-origin with the ATTACKER's
- *     origin and can read it. Since the token is the whole prize, it is emitted
- *     only when the request's own `Host` names a loopback address. Any other
- *     Host (a tunnel hostname, a rebound domain) gets the UI with no
- *     credential, and the operator pastes the token into the sign-in box.
+ * Pure and exported so it is unit-testable without a built UI on disk.
+ * Values are operator- or daemon-controlled, but they are JSON-encoded with
+ * `<` neutralized so nothing can close the <script>. No credential is ever
+ * in it: whoever can fetch the page (a sandboxed command on the loopback, a
+ * page whose domain an attacker rebinds to 127.0.0.1) reads all of it.
  */
 export function buildBootScript(opts: {
   allowedOrigins?: readonly string[];
-  /** The minted local-mode token, when the daemon is in local mode. */
-  localToken?: string;
-  /** The full request URL — its hostname is the `Host` the client used. */
-  requestUrl: string;
+  /** The daemon is in local mode on a loopback bind: the page can be signed in by a one-time link. */
+  localMode?: boolean;
 }): string {
   const enc = (v: unknown): string => JSON.stringify(v).replace(/</g, "\\u003c");
   let script = `window.__CODEOID_EMBED_ORIGINS__=${enc(opts.allowedOrigins ?? [])};`;
-  if (opts.localToken && hostIsLoopback(opts.requestUrl)) {
-    script += `window.__CODEOID_LOCAL_TOKEN__=${enc(opts.localToken)};`;
-  }
+  if (opts.localMode) script += "window.__CODEOID_LOCAL_MODE__=true;";
   return `<script>${script}</script>`;
+}
+
+/** Where the page exchanges a one-time code for the local token. */
+export const LOCAL_SESSION_PATH = "/ui/local-session";
+/** Where `codeoid ui` asks for a fresh code, with the token. */
+export const LOCAL_LINK_PATH = "/ui/local-link";
+
+/** What local mode gives the web UI: the token, and the one-time codes that get it. */
+export interface WebUiLocal {
+  token: string;
+  links: LocalUiLinks;
+}
+
+const NO_STORE = { "Cache-Control": "no-store" } as const;
+
+/**
+ * `POST /ui/local-session` `{code}` → `{token}`, once per code; and
+ * `POST /ui/local-link` with the token as its bearer → a fresh `{code}`.
+ * Anything else (no code, a spent or expired one, no bearer, a wrong one,
+ * a Host that isn't loopback) gets no token and no code. Exported for tests.
+ */
+export async function handleLocalSignIn(req: Request, path: string, local: WebUiLocal | undefined): Promise<Response | null> {
+  if (path !== LOCAL_SESSION_PATH && path !== LOCAL_LINK_PATH) return null;
+  if (!local) return new Response("Not Found", { status: 404 });
+  if (req.method !== "POST") return Response.json({ error: "POST only" }, { status: 405, headers: { Allow: "POST" } });
+  // A page whose domain is rebound to 127.0.0.1 is answered nothing here either.
+  if (!hostIsLoopback(req.url)) return Response.json({ error: "local sign-in is for this machine's own address only" }, { status: 403, headers: NO_STORE });
+  if (path === LOCAL_LINK_PATH) {
+    const auth = req.headers.get("authorization") ?? "";
+    const bearer = /^Bearer\s+(\S+)$/i.exec(auth)?.[1] ?? "";
+    if (!bearer || !sameLocalToken(bearer, local.token)) return Response.json({ error: "this needs the daemon's local token" }, { status: 401, headers: NO_STORE });
+    return Response.json({ code: local.links.mint(UI_LINK_TTL_MS), expiresInMs: UI_LINK_TTL_MS }, { headers: NO_STORE });
+  }
+  let code: unknown;
+  try {
+    const body = await req.text();
+    if (body.length > 1024) return Response.json({ error: "request too large" }, { status: 413, headers: NO_STORE });
+    code = (JSON.parse(body) as { code?: unknown }).code;
+  } catch {
+    code = undefined;
+  }
+  if (!local.links.redeem(code)) {
+    return Response.json({ error: "this sign-in link has expired or was already used — run `codeoid ui` for a new one" }, { status: 403, headers: NO_STORE });
+  }
+  return Response.json({ token: local.token }, { headers: NO_STORE });
 }
 
 /**
@@ -112,30 +149,36 @@ export class WebUiFrontend implements Frontend {
   readonly #allowedOrigins: readonly string[];
 
   /**
-   * Local-mode token to hand the browser directly, or undefined. Set ONLY when
-   * the daemon is in local mode AND bound to loopback — see the module doc.
+   * Local mode's token and sign-in links, or undefined. Set ONLY when the
+   * daemon is in local mode AND bound to loopback — see the module doc.
    */
-  readonly #localToken: string | undefined;
+  readonly #local: WebUiLocal | undefined;
+  readonly #dist: string;
 
-  constructor(allowedOrigins: readonly string[] = [], localToken?: string) {
+  constructor(allowedOrigins: readonly string[] = [], local?: WebUiLocal, dist: string = DIST) {
     this.#allowedOrigins = allowedOrigins;
-    this.#localToken = localToken;
+    this.#local = local;
+    this.#dist = dist;
+  }
+
+  get #indexHtml(): string {
+    return join(this.#dist, "index.html");
   }
 
   async start(_ctx: FrontendContext): Promise<void> {
-    if (existsSync(INDEX_HTML)) {
+    if (existsSync(this.#indexHtml)) {
       console.log("[codeoid] web-ui (Mini App) served at /ui");
       if (this.#allowedOrigins.length > 0) {
         console.log(
           `[codeoid] web-ui embed SSO allowlist: ${this.#allowedOrigins.join(", ")}`,
         );
       }
-      if (this.#localToken) {
-        console.log("[codeoid] web-ui: local-mode token injected — /ui needs no sign-in");
+      if (this.#local) {
+        console.log("[codeoid] web-ui: local mode — the link in the banner (or `codeoid ui`) signs a browser in");
       }
     } else {
       console.error(
-        `[codeoid:web-ui] no build at ${DIST} — run: cd web && bunx vite build --base=/ui/`,
+        `[codeoid:web-ui] no build at ${this.#dist} — run: cd web && bunx vite build --base=/ui/`,
       );
     }
   }
@@ -143,13 +186,9 @@ export class WebUiFrontend implements Frontend {
   async stop(): Promise<void> {}
 
   /** Read index.html and inject the boot-time globals just inside <head>. */
-  async #serveIndexHtml(req: Request): Promise<Response> {
-    let html = await Bun.file(INDEX_HTML).text();
-    const inject = buildBootScript({
-      allowedOrigins: this.#allowedOrigins,
-      localToken: this.#localToken,
-      requestUrl: req.url,
-    });
+  async #serveIndexHtml(): Promise<Response> {
+    let html = await Bun.file(this.#indexHtml).text();
+    const inject = buildBootScript({ allowedOrigins: this.#allowedOrigins, localMode: this.#local !== undefined });
     // Insert right after the opening <head> so the global is defined before the
     // SPA module executes. Fall back to prepending if there's no <head>.
     html = /<head[^>]*>/i.test(html)
@@ -166,9 +205,11 @@ export class WebUiFrontend implements Frontend {
   async handleFetch(req: Request): Promise<Response | null> {
     const path = new URL(req.url).pathname;
     if (path !== "/ui" && !path.startsWith("/ui/")) return null;
+    const signIn = await handleLocalSignIn(req, path, this.#local);
+    if (signIn) return signIn;
 
     // Path-traversal guard — never serve outside the dist root.
-    const asset = resolveUiAsset(DIST, path);
+    const asset = resolveUiAsset(this.#dist, path);
     if (!asset) return new Response("Forbidden", { status: 403 });
     const { rel, target } = asset;
 
@@ -177,13 +218,13 @@ export class WebUiFrontend implements Frontend {
       // A missing asset (has an extension) is a real 404; a missing route
       // (no extension) is an SPA deep-link → serve index.html.
       if (rel.includes(".")) return new Response("Not Found", { status: 404 });
-      file = INDEX_HTML;
+      file = this.#indexHtml;
     }
     if (!existsSync(file)) return new Response("UI not built", { status: 503 });
 
     // index.html (direct or SPA deep-link fallback) is served with the embed
     // allowlist injected; all other assets stream straight from disk.
-    if (file === INDEX_HTML) return this.#serveIndexHtml(req);
+    if (file === this.#indexHtml) return this.#serveIndexHtml();
 
     const cache = "public, max-age=3600";
     // Bun infers Content-Type from the file extension.

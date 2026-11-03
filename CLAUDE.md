@@ -208,6 +208,7 @@ codeoid start        # daemon + all frontends
 codeoid ls           # list sessions
 codeoid new <n> [d]  # create session (workdir required unless --worktree); --model, --effort <level>
 codeoid attach <n>   # interactive attach (with scrollback replay)
+codeoid ui [--no-open]  # the web UI; local mode: a one-time link that signs a browser in (the page never carries the token)
 codeoid send <n> <m> # one-shot message
 codeoid interrupt <n>
 codeoid approve <n> [--deny] [--pick N | --id <approvalId>] [--yes]
@@ -313,7 +314,7 @@ the session, `SandboxRuntime.warn`), over an unchanged real one; conversations t
 on destroy; code read-only, small files copied), never its real home
 writable; its handle is closed when its process ends. session-sandbox.ts: `SessionSandbox` (setting
 over `sandbox.*`, `resolveSandbox` → `SessionInfo.sandbox` with `enforced`,
-`/` as a workspace unavailable, lazy 0700 temp dir, handles, launchers;
+`/` as a workspace unavailable, lazy 0700 temp dir, handles, launchers, the git shim;
 refreshes serialized, a `set` during one re-resolves) and
 `ProviderSessionInit.sandbox()` hands the `SandboxRuntime` to the backend
 (`runtimeFor`: the last resolution stands until a changed setting's replaces
@@ -328,6 +329,15 @@ root.ts: one private dir per daemon, made at `codeoid start`, for temp dirs,
 private homes, launchers and every temp entry of the daemon's own
 (`daemonTempDir`: sign-in homes, check artifacts, loop index, pi's bridge),
 hidden from every sandbox (Claude's own, which keeps the host's `/tmp`, too).
+A backend CLI that runs outside the sandbox finds codeoid's `git` first on its
+`PATH` (git-shim.ts): Claude native's (`SandboxRuntime.gitShim`) runs the real
+git inside the session's sandbox, read-only and offline, its Bash commands'
+`PATH` without it (claude-native.ts's env file); opencode's server's, and one
+whose provider is gone, run git defused (BASE_OVERRIDES appended to the
+caller's `GIT_CONFIG_COUNT`, agent-scope drivers and helpers reset by name,
+`attr.tree` empty). In local mode no route hands the token to a loopback
+request (a sandboxed command is one): the web UI exchanges a one-time code
+from the banner's link or `codeoid ui` (`LocalUiLinks`, `/ui/local-session`).
 The daemon's own git in a repository an agent can write runs with
 `safeGitEnv` (git-env.ts): no hook (the hooks dir's or `hook.<name>.command`, off per event), fsmonitor, alternates' ref command, signing or signature check, editor, pager, git-protocol proxy, auto gc (each config key `git help -c` lists as running a program; git-env.test.ts's table); drivers and
 credential helpers from agent-writable scopes reset to the user's own;
