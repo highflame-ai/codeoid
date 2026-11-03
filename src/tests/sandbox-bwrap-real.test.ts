@@ -13,7 +13,7 @@
  *   - a process started inside dies when the handle closes.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -843,4 +843,44 @@ describe.skipIf(!probe.available)("bubblewrap, for real: round 2 of the #448 aud
       await h.close();
     }
   }, 180_000);
+});
+
+describe.skipIf(!probe.available)("bubblewrap, for real: round 2 of the #448 audit (~/.local)", () => {
+  let root: string;
+  beforeAll(() => {
+    root = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-round2l-")));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  test("a tool in ~/.local/bin linked into ~/.local/share runs, a pip --user package is there, read-only; a link into a credential dir shows nothing of it", async () => {
+    const home = join(root, "home");
+    const ws = join(home, "proj");
+    const venvBin = join(home, ".local", "share", "pipx", "venvs", "tool", "bin");
+    const versions = join(home, ".local", "share", "claude", "versions");
+    for (const d of [ws, venvBin, versions, join(home, ".local", "bin"), join(home, ".local", "lib", "python3.12", "site-packages", "userpkg"), join(home, ".ssh"), join(root, "tmp")]) mkdirSync(d, { recursive: true });
+    writeFileSync(join(venvBin, "tool"), "#!/bin/sh\necho PIPX-TOOL-RAN\n", { mode: 0o755 });
+    symlinkSync(join(venvBin, "tool"), join(home, ".local", "bin", "tool"));
+    // The Claude installer's layout: a binary per version, linked from ~/.local/bin (a script stands in for it).
+    writeFileSync(join(versions, "9.9.9"), "#!/bin/sh\necho INSTALLER-TOOL-RAN\n", { mode: 0o755 });
+    symlinkSync(join(versions, "9.9.9"), join(home, ".local", "bin", "claude-like"));
+    writeFileSync(join(home, ".local", "lib", "python3.12", "site-packages", "userpkg", "__init__.py"), "X = 1\n");
+    writeFileSync(join(home, ".ssh", "id_ed25519"), "PLANTED-LINKED-KEY\n");
+    symlinkSync(join(home, ".ssh", "id_ed25519"), join(home, ".local", "bin", "sneaky"));
+    const spec = buildSandboxSpec({ sessionId: "local", workspace: ws, tempDir: join(root, "tmp"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    const h = await provider.open(spec);
+    try {
+      const bin = join(home, ".local", "bin");
+      const r = await h.exec(
+        ["/bin/sh", "-c", `${join(bin, "tool")}; ${join(bin, "claude-like")}; ls ${join(home, ".local", "lib", "python3.12", "site-packages")}; cat ${join(bin, "sneaky")} ${join(home, ".ssh", "id_ed25519")} 2>/dev/null; echo x > ${join(venvBin, "tool")} 2>/dev/null || echo TOOL-READ-ONLY`],
+        { cwd: ws, env: { PATH: "/usr/bin:/bin", HOME: home }, timeoutMs: 20_000 },
+      );
+      expect(r.stdout).toContain("PIPX-TOOL-RAN");
+      expect(r.stdout).toContain("INSTALLER-TOOL-RAN");
+      expect(r.stdout).toContain("userpkg");
+      expect(r.stdout).not.toContain("PLANTED");
+      expect(r.stdout).toContain("TOOL-READ-ONLY");
+    } finally {
+      await h.close();
+    }
+  });
 });

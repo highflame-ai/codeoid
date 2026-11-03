@@ -132,6 +132,7 @@ export const HOME_CREDENTIAL_PATHS: readonly string[] = [
   ".yarnrc.yml",
   ".gradle/gradle.properties",
   ".m2/settings.xml",
+  ".local/share/uv/credentials",
 ];
 
 /**
@@ -290,6 +291,36 @@ export function homeCredentialFilesIn(readable: readonly string[]): string[] {
     for (const v of versions) out.push(join(r, "versions", "node", v, "etc", "npmrc"));
   }
   return out;
+}
+
+/**
+ * What the links directly in each of `dirs` lead to, inside `home` (a tool
+ * in `~/.local/bin` linked into a pipx venv, `uv tool`'s, the Claude
+ * installer's versions): its dir, the install it belongs to and the
+ * interpreter its `#!` names (programLocations), never the home itself or
+ * what holds it; bounded. The caller drops what is hidden.
+ */
+export function linkedPrograms(dirs: readonly string[], home: string): string[] {
+  const out: string[] = [];
+  let budget = 500;
+  for (const dir of dirs) {
+    let entries: import("node:fs").Dirent[] = [];
+    try {
+      if (!lstatSync(dir).isDirectory()) continue;
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (!e.isSymbolicLink() || --budget < 0) continue;
+      const link = join(dir, e.name);
+      const real = realOr(link);
+      // Only what leads somewhere else in the home: outside it, nothing is hidden by it.
+      if (real === link || !within(real, resolve(home))) continue;
+      for (const p of programLocations(link, [], "", home)) if (within(p, resolve(home))) out.push(p);
+    }
+  }
+  return [...new Set(out)];
 }
 
 /** What a sandbox makes of the workspace's git repository. */
@@ -629,10 +660,15 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   // A workspace that is the home itself: the home is what the session works on (the hidden list still applies in it).
   const homeHidden = hiddenHome(home) === workspace ? null : hiddenHome(home);
   const userHidden = sandboxConfigOf(inputs.config).hiddenPaths.map((p) => resolve(expandHome(p, home))).filter(isAbsolute);
+  const allowed = homeHidden ? homeReadablePaths(inputs.config, homeHidden).filter((r) => !userHidden.some((u) => within(r, u))) : [];
+  // What links in the allowlist lead to elsewhere in the home, less anything hidden (a credential, an explicit hide).
+  const hiddenInHome = homeHidden ? hiddenPathsFor(inputs.config, inputs.hidden).filter((h) => h !== homeHidden && within(h, homeHidden)) : [];
+  const linked = homeHidden ? linkedPrograms(allowed, homeHidden).filter((p) => !hiddenInHome.some((h) => within(p, h) || within(h, p))) : [];
   const reexposed = [
     ...(inputs.backendReadable ?? []).map((p) => resolve(p)),
     // The allowlist, less what `sandbox.hiddenPaths` hides: an explicit hide wins.
-    ...(homeHidden ? homeReadablePaths(inputs.config, homeHidden).filter((r) => !userHidden.some((u) => within(r, u))) : []),
+    ...allowed,
+    ...linked,
   ];
   // What stays visible inside the hidden home: a hidden path there matters only inside one of these.
   const shown = [workspace, tempDir, ...own, ...ownReal, ...reexposed, ...reexposed.map(realOr)];

@@ -10,7 +10,10 @@
  * `~/.pypirc`, `~/.bunfig.toml`, git's in `~/.git-credentials` and
  * `~/.config/git/credentials`: none of them listed). A token written into
  * `~/.gitconfig` itself (a URL with one, an `extraHeader`) would show.
- * A global npmrc inside an nvm install is hidden again (policy.ts `homeCredentialFilesIn`).
+ * A global npmrc inside an nvm install is hidden again (policy.ts `homeCredentialFilesIn`),
+ * and so is uv's credential store (`~/.local/share/uv/credentials`). What a
+ * link directly in a shown dir leads to (`~/.local/bin/x` into a pipx venv or
+ * the Claude installer's versions) is shown too (policy.ts `linkedPrograms`).
  */
 export const DEFAULT_HOME_READABLE: readonly string[] = [
   "~/.bun",
@@ -21,7 +24,11 @@ export const DEFAULT_HOME_READABLE: readonly string[] = [
   "~/.nvm",
   "~/.npm",
   "~/.local/bin",
+  "~/.local/lib",
   "~/.local/share/pnpm",
+  "~/.local/share/uv",
+  "~/.local/share/pipx",
+  "~/.local/share/mise",
   "~/.pyenv",
   "~/go/pkg",
   "~/go/bin",
