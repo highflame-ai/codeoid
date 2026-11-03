@@ -89,7 +89,7 @@ function isSecretConfigFile(name: string): boolean {
 }
 
 /** The agent CLIs' own stored logins. */
-function cliCredentialFiles(): string[] {
+export function cliCredentialFiles(): string[] {
   const home = homedir();
   const claudeDir = process.env.CLAUDE_CONFIG_DIR || join(home, ".claude");
   return [
@@ -142,6 +142,18 @@ export function registerSecretPaths(paths: { dirs?: readonly string[]; files?: r
 }
 
 const SQLITE_SIDECARS = ["", "-wal", "-shm", "-journal"];
+
+/**
+ * The credential locations backends registered ({@link registerSecretPaths}):
+ * dirs, and files with their SQLite sidecars. The OS sandbox hides them
+ * (sandbox/policy.ts).
+ */
+export function registeredSecretLocations(): { dirs: string[]; files: string[] } {
+  return {
+    dirs: [...REGISTERED_DIRS.keys()],
+    files: [...REGISTERED_FILES.keys()].flatMap((f) => SQLITE_SIDECARS.map((s) => `${f}${s}`)),
+  };
+}
 
 /**
  * `/proc/<pid>/environ`, `/proc/self/mem`, `/proc/<pid>/task/<tid>/fd/3`, …:

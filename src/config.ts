@@ -15,6 +15,7 @@
  */
 
 import type { ModelPrice } from "./daemon/pricing/index.js";
+import type { SandboxConfig } from "./daemon/sandbox/policy.js";
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, rmSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join, isAbsolute, resolve, dirname } from "node:path";
@@ -246,6 +247,31 @@ const ApprovalsSchema = z
     askOnUnknown: z.boolean().default(true),
   })
   .default({ autoAllowLowRisk: false, askOnUnknown: true });
+
+/**
+ * OS sandbox for what agents run (#448, docs/sandbox.md): on by default.
+ * The workspace and a private temp dir are writable, credential locations
+ * hidden, container sockets unreachable; the network per `network`.
+ */
+const SandboxSchema = z
+  .object({
+    /** `auto` (bubblewrap on Linux, Seatbelt on macOS), `off`, or a provider id (`bwrap`, `seatbelt`, `docker`). */
+    provider: z.string().min(1).max(64).default("auto"),
+    /** What a sandboxed command may reach: everything, nothing, or `allowedHosts`. */
+    network: z.enum(["on", "off", "allowlist"]).default("on"),
+    allowedHosts: z.array(z.string().min(1).max(253)).max(256).default([]),
+    /** Paths hidden on top of the built-in list (`~` expands). */
+    hiddenPaths: z.array(z.string().min(1).max(4096)).max(256).default([]),
+    /** The bwrap binary (default: on PATH). */
+    bwrapPath: z.string().refine(isAbsolute, "must be an absolute path").optional(),
+    docker: z
+      .object({
+        image: z.string().min(1).max(512).default("node:22-bookworm-slim"),
+        runtime: z.string().min(1).max(64).optional(),
+      })
+      .default({ image: "node:22-bookworm-slim" }),
+  })
+  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], docker: { image: "node:22-bookworm-slim" } });
 
 const CompressSchema = z
   .object({
@@ -1260,6 +1286,7 @@ const RootSchema = z.object({
   workspaceIndex: WorkspaceIndexSchema,
   compress: CompressSchema,
   approvals: ApprovalsSchema,
+  sandbox: SandboxSchema,
   guard: GuardSchema,
   labeling: LabelingSchema,
   telemetry: TelemetrySchema,
@@ -1403,6 +1430,12 @@ export interface CodeoidConfig {
    * hand-built config literal need not carry it; the defaults apply.
    */
   approvals?: { autoAllowLowRisk: boolean; askOnUnknown: boolean };
+  /**
+   * OS sandbox (#448, sandbox/policy.ts `SandboxConfig`). Optional on the
+   * type so a hand-built config literal need not carry it; absent = the
+   * defaults (on, `auto`, network on).
+   */
+  sandbox?: SandboxConfig;
   /** Homegrown CLI output compressor (RTK-style). Disabled by default. */
   compress: {
     enabled: boolean;
@@ -1743,6 +1776,12 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   // Routines kill switch — stop every routine for one run of the daemon
   // without touching config.json (nothing is deleted). Other knobs: file only.
   { env: "CODEOID_ROUTINES_ENABLED", path: "routines.enabled", kind: "boolean" },
+  // OS sandbox (#448): provider (auto | off | bwrap | seatbelt | docker) and network.
+  { env: "CODEOID_SANDBOX", path: "sandbox.provider", kind: "string" },
+  { env: "CODEOID_SANDBOX_NETWORK", path: "sandbox.network", kind: "string" },
+  { env: "CODEOID_SANDBOX_ALLOWED_HOSTS", path: "sandbox.allowedHosts", kind: "csv" },
+  { env: "CODEOID_SANDBOX_HIDDEN_PATHS", path: "sandbox.hiddenPaths", kind: "csv" },
+  { env: "CODEOID_SANDBOX_DOCKER_IMAGE", path: "sandbox.docker.image", kind: "string" },
   { env: "CODEOID_ROUTINES_MAX_CONCURRENT", path: "routines.maxConcurrentRuns", kind: "int" },
   { env: "CODEOID_MCP_CONTROL_ACTIONS", path: "mcpControl.allowActions", kind: "boolean" },
   { env: "CODEOID_MAX_SESSIONS_PER_USER", path: "rateLimit.maxSessionsPerUser", kind: "int" },
@@ -1978,6 +2017,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     workspaceIndex: parsed.workspaceIndex,
     compress: parsed.compress,
     approvals: parsed.approvals,
+    sandbox: parsed.sandbox,
     guard: parsed.guard,
     labeling: parsed.labeling,
     telemetry: { osc8: osc8Mode },
