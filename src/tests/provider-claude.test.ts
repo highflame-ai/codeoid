@@ -3528,6 +3528,7 @@ describe("ClaudeProvider — the OS sandbox", () => {
       privateHome: () => home,
       stateDir: () => mkdtempSync(join(tmpdir(), "codeoid-claude-state-")),
       claudeTemp: () => temp,
+      gitShim: () => "/codeoid/launch-test/git-bin",
     };
     return { rt, spawned, opened, home, temp };
   }
@@ -3563,6 +3564,8 @@ describe("ClaudeProvider — the OS sandbox", () => {
     expect(sb.filesystem).toMatchObject({ allowWrite: ["/work/repo", temp.commands].map(physicalOf), denyRead: ["/home/u/.ssh", "/home/u/.codeoid", "/run/docker.sock"].map(physicalOf) });
     expect((options().env as Record<string, string>).TMPDIR).toBe(temp.root);
     expect((options().env as Record<string, string>).CLAUDE_CODE_TMPDIR).toBe(temp.cli);
+    // The CLI's own git is the session's shim (#448 round 4: its `git status` at every start runs inside the sandbox).
+    expect((options().env as Record<string, string>).PATH?.split(":")[0]).toBe("/codeoid/launch-test/git-bin");
     // The CLI's settings (hooks, excluded commands) aren't its commands' to write.
     expect((sb.filesystem as { denyWrite: string[] }).denyWrite).toContain("/work/repo/.claude");
     expect(sb.network).toEqual({});
