@@ -260,9 +260,19 @@ hidden whole (deny by default: a credential made or renamed in later isn't
 there), shown back read-only by `sandbox.homeReadable` (home-readable.ts,
 `DEFAULT_HOME_READABLE`: toolchains, git's settings; never a token file);
 workspace + a private temp dir writable; the workspace's git repository
-(`gitWorkspacePaths`: a linked worktree's common dir writable, believed only in
-git's own back-linked layout; `hooks/`, `config`, `config.worktree`,
-`modules/` read-only, `SandboxSpec.readOnly`); hidden besides: config dir,
+(`gitWorkspacePaths`, believed only in git's own back-linked layout): only
+what a commit writes is writable, its git dirs bound at their own paths (no
+rename), and what picks config, hooks or git dir read-only
+(`SandboxSpec.readOnly`: `config`, `config.worktree`, `commondir`, `hooks/`,
+`info/`, `modules/`, other worktrees' git dirs, a worktree's `commondir`/
+`gitdir`, `.git` files), made first where missing (a `commondir` of `.`); a
+link among them makes the git dir read-only whole; `SandboxSpec.gitDirs` are
+Codex's extra writable roots. The project settings agent CLIs run code from
+(`PROJECT_CONFIG_DIRS`/`_FILES`: `.claude/`, `.mcp.json`, …) read-only, and a
+file tool writing them asks in every mode while sandboxed
+(`projectSettingsWriteOf`). Toolchain caches point at
+`~/.cache/codeoid-sandbox` (`SandboxSpec.env`, `toolchainCacheEnv`); links in
+the allowlist are followed (`linkedPrograms`). Hidden besides: config dir,
 `daemonOwnedDirs`, the CLIs' logins and `registeredSecretLocations`
 (secret-paths.ts), `HOME_CREDENTIAL_PATHS`, `$XDG_RUNTIME_DIR`, the daemon's
 temp dir, `sandbox.hiddenPaths` (beats the allowlist); container sockets;
@@ -275,9 +285,11 @@ whole backend inside: pi, Gemini CLI, Qwen via a launcher, Claude/Codex under
 Docker), `command` (opencode's shell shim), `no-shell` (HTTP backends). A
 backend whose process is inside runs in a private copy of its home
 (backend-home.ts `preparePrivateHome` into `SandboxRuntime.privateHome`,
-afresh each start: login linked read-only, conversations shared, code
-read-only, small files copied), never its real home writable; its handle is
-closed when its process ends. session-sandbox.ts: `SessionSandbox` (setting
+afresh each start: its refreshable login a private copy written back on its
+handle's close, `withLoginsSynced`, only a valid credential over an unchanged
+real one; conversations the session's own, `SandboxRuntime.stateDir`, removed
+on destroy; code read-only, small files copied), never its real home
+writable; its handle is closed when its process ends. session-sandbox.ts: `SessionSandbox` (setting
 over `sandbox.*`, `resolveSandbox` → `SessionInfo.sandbox` with `enforced`,
 `/` as a workspace unavailable, lazy 0700 temp dir, handles, launchers;
 refreshes serialized, a `set` during one re-resolves) and
@@ -290,8 +302,14 @@ confirm is answered by the owner's own token only (`requestUserInput`
 `ownerOnly`). A wider-than-default sandbox at create, fork/compare or loop
 start needs session:approve, an undelegated token, and (fork) the parent's
 owner (`#widerSandboxRefusal`); `sandbox.*` settings refuse delegated tokens.
-root.ts: one private dir per daemon for temp dirs, private homes and
-launchers, hidden from every sandbox. `protectedAncestors` → `SandboxSpec.pinned`:
+root.ts: one private dir per daemon, made at `codeoid start`, for temp dirs,
+private homes, launchers and every temp entry of the daemon's own
+(`daemonTempDir`: sign-in homes, check artifacts, loop index, pi's bridge),
+hidden from every sandbox (Claude's own, which keeps the host's `/tmp`, too).
+The daemon's own git in a repository an agent can write runs with
+`safeGitEnv` (git-env.ts): no hook, fsmonitor, signing, editor; drivers and
+credential helpers from agent-writable scopes reset to the user's own;
+https/ssh only. `protectedAncestors` → `SandboxSpec.pinned`:
 dirs between a writable root and a hidden path in it can't be renamed (bwrap
 self-bind, Seatbelt `literal`, Docker self-mount), still writable inside
 (Claude's `denyWrite`: the subtree). Docker binds are `--mount` with CSV

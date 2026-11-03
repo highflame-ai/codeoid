@@ -34,10 +34,14 @@ interface SandboxSpec {
   sessionId: string;
   workspace: string;          // writable
   tempDir: string;            // writable, private; the sandbox's /tmp where it can be
-  writable: string[];         // the backend's private home (when its whole process is inside); a git repository's dir
+  writable: string[];         // the backend's private home (when its whole process is inside); a git repository's dirs; the cache dir
+                              // (each bound at its own path: none may be renamed, as a mount point can't)
   hidden: string[];           // not readable at all (the user's home first, whole)
   reexposed: string[];        // read-only inside something hidden (the home allowlist, the backend's program and login)
-  readOnly?: string[];        // read-only inside something writable, with what is in it (a repository's hooks, config)
+  readOnly?: string[];        // read-only inside something writable, with what is in it (what picks a repository's config,
+                              // hooks and git dir; the project settings agent CLIs run code from); each exists
+  gitDirs?: string[];         // the git dirs a commit writes (a backend's own sandbox's extra writable roots)
+  env?: Record<string, string>; // set inside: the toolchains' caches in the sandbox's cache dir
   pinned?: string[];          // can't be renamed or removed, contents still writable (a dir between the workspace and a hidden path)
   containerSockets: string[]; // never reachable
   network: { mode: "on" | "off" | "allowlist"; allow?: string[] };
@@ -83,15 +87,18 @@ own process reach its home, `launcher(handle, argv, envNames)` — an
 executable script that starts `argv` inside, for spawners codeoid doesn't
 control (an SDK's `pathToQwenExecutable`, opencode's `SHELL`), `privateHome(key)`
 — a fresh private dir for the backend's own home (`backend-home.ts`: a backend
-whose process is inside never gets its real home writable), and `claudeTemp()`
-for Claude's native sandbox.
+whose process is inside never gets its real home writable), `stateDir(key)` —
+the session's own dir its conversations live in across starts, and
+`claudeTemp()` for Claude's native sandbox.
 
 A provider must lay the spec so a hidden path stays hidden whatever the host
 does meanwhile: the home is hidden as a whole (a tmpfs, a subtree denial, or
 not mounting it), so a file created or renamed in later isn't seen; paths it
 binds are taken physically (a destination reached through a linked dir is a
-trap: Claude's own bubblewrap couldn't mount through `/var/run`); a pinned dir
-must refuse a rename without making its contents read-only.
+trap: Claude's own bubblewrap couldn't mount through `/var/run`); a pinned dir,
+and every writable location besides the workspace and temp dir, must refuse a
+rename without making its contents read-only; `env` is set for what runs
+inside.
 
 A backend closes the handle it opened when its process ends (one per process,
 not one per start piling up); a change of setting closes none (the backend is
