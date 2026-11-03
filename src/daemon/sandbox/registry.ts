@@ -8,6 +8,7 @@
 
 import { BwrapSandboxProvider } from "./bwrap.js";
 import type { SandboxConfig } from "./policy.js";
+import { SeatbeltSandboxProvider } from "./seatbelt.js";
 import { SANDBOX_AUTO, SANDBOX_OFF, type SandboxProbe, type SandboxProvider } from "./types.js";
 
 /** How long a probe's answer stands (a package installed meanwhile is seen within it). */
@@ -101,5 +102,6 @@ export class SandboxRegistry {
 export function createDefaultSandboxRegistry(config: SandboxConfig, platform: NodeJS.Platform = process.platform): SandboxRegistry {
   const registry = new SandboxRegistry(platform);
   registry.register(new BwrapSandboxProvider(config.bwrapPath ? { bwrapPath: config.bwrapPath } : {}));
+  registry.register(new SeatbeltSandboxProvider());
   return registry;
 }
