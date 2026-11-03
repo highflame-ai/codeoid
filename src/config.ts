@@ -16,6 +16,8 @@
 
 import type { ModelPrice } from "./daemon/pricing/index.js";
 import type { SandboxConfig } from "./daemon/sandbox/policy.js";
+import { DEFAULT_HOME_READABLE } from "./daemon/sandbox/home-readable.js";
+import { validAllowedHost } from "./daemon/sandbox/hosts.js";
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, rmSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join, isAbsolute, resolve, dirname } from "node:path";
@@ -263,9 +265,12 @@ const SandboxSchema = z
     provider: z.enum(["auto", "off", "bwrap", "seatbelt", "docker"]).default("auto"),
     /** What a sandboxed command may reach: everything, nothing, or `allowedHosts`. */
     network: z.enum(["on", "off", "allowlist"]).default("on"),
-    allowedHosts: z.array(z.string().min(1).max(253)).max(256).default([]),
+    /** Each a domain, a `*.` wildcard of one, or `localhost` (as a session's own allowlist). */
+    allowedHosts: z.array(z.string().min(1).max(253).refine(validAllowedHost, "not a host an allowlist can name")).max(256).default([]),
     /** Paths hidden on top of the built-in list (`~` expands). */
     hiddenPaths: z.array(z.string().min(1).max(4096)).max(256).default([]),
+    /** What of the hidden home stays readable, read-only (`~` expands): toolchains and tool settings with no secrets. */
+    homeReadable: z.array(z.string().min(1).max(4096)).max(256).default([...DEFAULT_HOME_READABLE]),
     /** The bwrap binary (default: on PATH). */
     bwrapPath: z.string().refine(isAbsolute, "must be an absolute path").optional(),
     docker: z
@@ -275,7 +280,7 @@ const SandboxSchema = z
       })
       .default({ image: "node:22-bookworm-slim" }),
   })
-  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], docker: { image: "node:22-bookworm-slim" } });
+  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], docker: { image: "node:22-bookworm-slim" } });
 
 const CompressSchema = z
   .object({
@@ -1785,6 +1790,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_SANDBOX_NETWORK", path: "sandbox.network", kind: "string" },
   { env: "CODEOID_SANDBOX_ALLOWED_HOSTS", path: "sandbox.allowedHosts", kind: "csv" },
   { env: "CODEOID_SANDBOX_HIDDEN_PATHS", path: "sandbox.hiddenPaths", kind: "csv" },
+  { env: "CODEOID_SANDBOX_HOME_READABLE", path: "sandbox.homeReadable", kind: "csv" },
   { env: "CODEOID_SANDBOX_DOCKER_IMAGE", path: "sandbox.docker.image", kind: "string" },
   { env: "CODEOID_ROUTINES_MAX_CONCURRENT", path: "routines.maxConcurrentRuns", kind: "int" },
   { env: "CODEOID_MCP_CONTROL_ACTIONS", path: "mcpControl.allowActions", kind: "boolean" },

@@ -272,14 +272,19 @@ describe.skipIf(!probe.available)("bubblewrap, for real: what the review found (
       network: { mode: "off" },
       hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" },
     });
-    expect(spec.readOnly).toContain(join(home, ".config"));
+    expect(spec.pinned).toContain(join(home, ".config"));
     const sh = (h: SandboxHandle, script: string) => h.exec(["/bin/sh", "-c", script], { cwd: home, env: { PATH: "/usr/bin:/bin" }, timeoutMs: 20_000 });
     const first = await provider.open(spec);
     try {
-      const r = await sh(first, `mv ${join(home, ".config")} ${join(home, "c")}; echo "mv=$?"; mv ${join(home, ".config", "gh")} ${join(home, "g")}; echo "mv2=$?"; echo x > ${join(home, "made")} && echo HOME-WRITABLE`);
+      const r = await sh(
+        first,
+        `mv ${join(home, ".config")} ${join(home, "c")}; echo "mv=$?"; mv ${join(home, ".config", "gh")} ${join(home, "g")}; echo "mv2=$?"; echo x > ${join(home, "made")} && echo HOME-WRITABLE; echo x > ${join(home, ".config", "other", "edit.ts")} && echo PINNED-INSIDE-WRITABLE`,
+      );
       expect(r.stdout).toContain("mv=1");
       expect(r.stdout).toContain("mv2=1");
       expect(r.stdout).toContain("HOME-WRITABLE");
+      // Pinned, not read-only: what is in the dir stays writable (#448 round 1).
+      expect(r.stdout).toContain("PINNED-INSIDE-WRITABLE");
     } finally {
       await first.close();
     }
@@ -337,5 +342,170 @@ describe.skipIf(!probe.available)("bubblewrap, for real: what the review found (
     }
     const refused = await runCheck({ id: "exit:test", command: "exit 0", timeoutMs: 5_000 }, { cwd: ws, artifactDir: art, sandbox: { refused: "bubblewrap is not installed" } });
     expect(refused).toMatchObject({ result: "error", reason: "not run: not sandboxed: bubblewrap is not installed" });
+  });
+});
+
+/** git as the tests run it: a fixed identity, no system or user config, nothing of the real home. */
+function gitEnv(home: string): Record<string, string> {
+  return {
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    HOME: home,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_AUTHOR_NAME: "t",
+    GIT_AUTHOR_EMAIL: "t@example.invalid",
+    GIT_COMMITTER_NAME: "t",
+    GIT_COMMITTER_EMAIL: "t@example.invalid",
+  };
+}
+
+function git(args: string[], cwd: string, home: string): string {
+  const r = Bun.spawnSync(["git", ...args], { cwd, env: gitEnv(home) });
+  if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+  return r.stdout.toString();
+}
+
+describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: round 1 of the #448 audit", () => {
+  let root: string;
+  beforeAll(() => {
+    root = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-round1-")));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  const sh = (h: SandboxHandle, cwd: string, script: string, env: Record<string, string> = { PATH: "/usr/bin:/bin" }) => h.exec(["/bin/sh", "-c", script], { cwd, env, timeoutMs: 30_000 });
+
+  test("the home is hidden whole: a credential on no list, one created after the start, one replaced by a rename, all unreadable; the allowlist and the workspace in the home are there", async () => {
+    const home = join(root, "home-deny");
+    const ws = join(home, "proj");
+    for (const d of [ws, join(home, ".local", "share", "opencode"), join(home, ".config", "github-copilot"), join(home, ".bun", "bin"), join(home, ".config", "git")]) mkdirSync(d, { recursive: true });
+    writeFileSync(join(home, ".npmrc"), "PLANTED-NPM-TOKEN\n");
+    writeFileSync(join(home, ".pgpass"), "PLANTED-PGPASS\n");
+    writeFileSync(join(home, ".local", "share", "opencode", "auth.json"), "PLANTED-OPENCODE-LOGIN\n");
+    writeFileSync(join(home, ".config", "github-copilot", "apps.json"), "PLANTED-COPILOT\n");
+    writeFileSync(join(home, "unlisted-secret.txt"), "PLANTED-UNLISTED\n");
+    writeFileSync(join(home, ".claude.json"), "PLANTED-OLD-CLAUDEJSON\n");
+    writeFileSync(join(home, ".gitconfig"), "[user]\n\tname = allowlisted\n");
+    writeFileSync(join(home, ".config", "git", "credentials"), "PLANTED-GIT-CRED\n");
+    writeFileSync(join(home, ".bun", "bin", "tool"), "#!/bin/sh\necho ALLOWLISTED-TOOL-RAN\n", { mode: 0o755 });
+    const tmp = join(root, "tmp-home-deny");
+    mkdirSync(tmp);
+    const spec = buildSandboxSpec({ sessionId: "home", workspace: ws, tempDir: tmp, network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    expect(spec.hidden).toContain(home);
+    const h = await provider.open(spec);
+    try {
+      const reads = [".npmrc", ".pgpass", ".local/share/opencode/auth.json", ".config/github-copilot/apps.json", "unlisted-secret.txt", ".config/git/credentials", ".claude.json"].map((f) => `cat ${join(home, f)} 2>/dev/null`).join("; ");
+      // Long-lived: the host replaces and creates credentials while it sleeps.
+      const run = sh(
+        h,
+        ws,
+        `${reads}; cat ${join(home, ".gitconfig")}; ${join(home, ".bun", "bin", "tool")}; echo w > ${join(ws, "made.txt")} && echo WS-WRITABLE; echo w > ${join(home, "pwn")} 2>/dev/null || echo HOME-READ-ONLY; sleep 2; cat ${join(home, ".claude.json")} ${join(home, ".aws", "credentials")} 2>/dev/null; echo END`,
+      );
+      await Bun.sleep(700);
+      writeFileSync(join(home, ".claude.json.tmp"), "PLANTED-REPLACED-CLAUDEJSON\n");
+      Bun.spawnSync(["mv", join(home, ".claude.json.tmp"), join(home, ".claude.json")]);
+      mkdirSync(join(home, ".aws"), { recursive: true });
+      writeFileSync(join(home, ".aws", "credentials"), "PLANTED-AWS-LATE\n");
+      const r = await run;
+      expect(r.stdout).not.toContain("PLANTED");
+      expect(r.stdout).toContain("name = allowlisted");
+      expect(r.stdout).toContain("ALLOWLISTED-TOOL-RAN");
+      expect(r.stdout).toContain("WS-WRITABLE");
+      expect(r.stdout).toContain("HOME-READ-ONLY");
+      expect(r.stdout).toContain("END");
+    } finally {
+      await h.close();
+    }
+    expect(readFileSync(join(ws, "made.txt"), "utf8")).toBe("w\n");
+    expect(existsSync(join(home, "pwn"))).toBe(false);
+  });
+
+  test("a linked worktree commits from inside (its repository under the home, or under the host's /tmp); the repository's hooks and config stay read-only", async () => {
+    for (const where of ["home", "host-tmp"] as const) {
+      const home = join(root, `home-git-${where}`);
+      mkdirSync(home, { recursive: true });
+      const base = where === "home" ? join(home, "src") : realpathSync(mkdtempSync(join(tmpdir(), "codeoid-sbx-gitrepo-")));
+      const repo = join(base, "repo");
+      mkdirSync(repo, { recursive: true });
+      try {
+        git(["init", "-q", "-b", "main"], repo, home);
+        writeFileSync(join(repo, "a.txt"), "a\n");
+        git(["add", "."], repo, home);
+        git(["commit", "-qm", "init"], repo, home);
+        // Where codeoid puts a session's worktree: beside the repository (here: in the scratch dir, not /tmp).
+        const wt = join(root, `wt-${where}`);
+        git(["worktree", "add", "-q", "-b", `feat-${where}`, wt], repo, home);
+        const tmp = join(root, `tmp-git-${where}`);
+        mkdirSync(tmp);
+        const spec = buildSandboxSpec({ sessionId: "git", workspace: wt, tempDir: tmp, network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+        const h = await provider.open(spec);
+        try {
+          writeFileSync(join(wt, "new.txt"), "x\n");
+          const r = await sh(
+            h,
+            wt,
+            `git add -A && git commit -qm sandboxed && echo COMMITTED; echo bad > ${join(repo, ".git", "hooks", "post-commit")} 2>/dev/null || echo HOOKS-READ-ONLY; echo bad >> ${join(repo, ".git", "config")} 2>/dev/null || echo CONFIG-READ-ONLY`,
+            gitEnv(home),
+          );
+          // git itself says nothing went wrong (no lock it couldn't take); the shell's refusals are the hook and config writes.
+          expect(r.stderr).not.toContain("Unable to create");
+          expect(r.stderr).not.toContain("fatal");
+          expect(r.stdout).toContain("COMMITTED");
+          expect(r.stdout).toContain("HOOKS-READ-ONLY");
+          expect(r.stdout).toContain("CONFIG-READ-ONLY");
+        } finally {
+          await h.close();
+        }
+        expect(git(["log", "--oneline", `feat-${where}`], repo, home)).toContain("sandboxed");
+        expect(existsSync(join(repo, ".git", "hooks", "post-commit"))).toBe(false);
+        expect(readFileSync(join(repo, ".git", "config"), "utf8")).not.toContain("bad");
+      } finally {
+        if (where === "host-tmp") rmSync(base, { recursive: true, force: true });
+      }
+    }
+  });
+
+  test("a plain repository's hooks and config are read-only from inside, while committing works", async () => {
+    const home = join(root, "home-plain");
+    const repo = join(home, "repo");
+    mkdirSync(repo, { recursive: true });
+    git(["init", "-q", "-b", "main"], repo, home);
+    const tmp = join(root, "tmp-plain");
+    mkdirSync(tmp);
+    const spec = buildSandboxSpec({ sessionId: "plain", workspace: repo, tempDir: tmp, network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    const h = await provider.open(spec);
+    try {
+      writeFileSync(join(repo, "f.txt"), "f\n");
+      const r = await sh(h, repo, "git add -A && git commit -qm in && echo COMMITTED; echo bad > .git/hooks/pre-commit 2>/dev/null || echo HOOKS-READ-ONLY; git config core.fsmonitor bad 2>/dev/null || echo CONFIG-READ-ONLY", gitEnv(home));
+      expect(r.stdout).toContain("COMMITTED");
+      expect(r.stdout).toContain("HOOKS-READ-ONLY");
+      expect(r.stdout).toContain("CONFIG-READ-ONLY");
+    } finally {
+      await h.close();
+    }
+    expect(existsSync(join(repo, ".git", "hooks", "pre-commit"))).toBe(false);
+  });
+
+  test("a workspace's .git file naming a credential dir as its git dir makes nothing of it writable or readable", async () => {
+    const home = join(root, "home-forged");
+    const ws = join(home, "proj");
+    const secret = join(home, ".ssh");
+    mkdirSync(ws, { recursive: true });
+    mkdirSync(join(secret, "worktrees", "x"), { recursive: true });
+    writeFileSync(join(secret, "id_rsa"), "PLANTED-FORGED-SSH\n");
+    // Looks like a worktree's git dir, but git's back-link doesn't name this workspace.
+    writeFileSync(join(secret, "worktrees", "x", "gitdir"), "/elsewhere/.git\n");
+    writeFileSync(join(ws, ".git"), `gitdir: ${join(secret, "worktrees", "x")}\n`);
+    const tmp = join(root, "tmp-forged");
+    mkdirSync(tmp);
+    const spec = buildSandboxSpec({ sessionId: "forged", workspace: ws, tempDir: tmp, network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    expect([...spec.writable, ...spec.reexposed].some((p) => p.startsWith(secret))).toBe(false);
+    const h = await provider.open(spec);
+    try {
+      const r = await sh(h, ws, `cat ${join(secret, "id_rsa")} 2>/dev/null; echo x > ${join(secret, "planted")} 2>/dev/null || echo NOT-WRITABLE`);
+      expect(r.stdout).not.toContain("PLANTED-FORGED-SSH");
+      expect(r.stdout).toContain("NOT-WRITABLE");
+    } finally {
+      await h.close();
+    }
+    expect(existsSync(join(secret, "planted"))).toBe(false);
   });
 });

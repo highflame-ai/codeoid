@@ -6,9 +6,12 @@
  *   - no writes anywhere, then writes to the workspace, the session's temp
  *     dir, the backend's own state, and the devices every program writes
  *     (/dev/null, a tty, /dev/fd);
- *   - per path, shallowest first: hidden ones neither readable nor writable,
- *     a workspace or state dir inside a hidden one allowed back, a hidden one
- *     inside the workspace hidden again (as bwrap.ts lays its mounts);
+ *   - per path, shallowest first: hidden ones (the whole home among them)
+ *     neither readable nor writable, a workspace, state dir or allowlisted
+ *     path inside a hidden one allowed back, a hidden one inside the
+ *     workspace hidden again (as bwrap.ts lays its mounts); a repository's
+ *     hooks and config not writable; a pinned directory not writable itself
+ *     (`literal`: no rename, no removal), what is in it still writable;
  *   - container sockets: not readable, and no connection to them;
  *   - network off (and an allowlist, which Seatbelt can't enforce by host):
  *     no network at all.
@@ -87,7 +90,7 @@ export function seatbeltProfile(
   };
 
   const writable = [...new Set([spec.workspace, spec.tempDir, ...spec.writable].map(real))];
-  type Rule = { path: string; kind: "hide" | "write" | "read" | "read-only" };
+  type Rule = { path: string; kind: "hide" | "write" | "read" | "read-only" | "pinned" };
   const rules: Rule[] = [];
   const seen = new Set<string>();
   for (const p of [...spec.hidden, ...spec.containerSockets].map(real)) {
@@ -97,11 +100,16 @@ export function seatbeltProfile(
   }
   const hidden = rules.map((r) => r.path);
   for (const p of writable) rules.push({ path: p, kind: "write" });
-  for (const p of spec.reexposed.map(real)) {
-    if (hidden.some((h) => within(p, h) && h !== p)) rules.push({ path: p, kind: "read" });
+  for (const r of spec.reexposed) {
+    // A link is read by its own path and where it leads: both allowed.
+    for (const p of new Set([r, real(r)])) {
+      if (hidden.some((h) => within(p, h) && h !== p)) rules.push({ path: p, kind: "read" });
+    }
   }
-  // Every dir between a writable root and a hidden path in it: no writes (so no rename of it either).
+  // A repository's hooks and config: not writable, with everything in them.
   for (const p of (spec.readOnly ?? []).map(real)) rules.push({ path: p, kind: "read-only" });
+  // Every dir between a writable root and a hidden path in it: the directory itself not writable (so no rename), its contents still.
+  for (const p of (spec.pinned ?? []).map(real)) rules.push({ path: p, kind: "pinned" });
   const rank = (r: Rule) => (r.kind === "hide" ? 0 : 1);
   rules.sort((a, b) => depth(a.path) - depth(b.path) || rank(a) - rank(b));
 
@@ -116,6 +124,7 @@ export function seatbeltProfile(
     if (r.kind === "hide") lines.push(`(deny file-read* file-write* ${filter(r.path)})`);
     else if (r.kind === "write") lines.push(`(allow file-read* file-write* ${filter(r.path)})`);
     else if (r.kind === "read-only") lines.push(`(deny file-write* ${filter(r.path)})`);
+    else if (r.kind === "pinned") lines.push(`(deny file-write* (literal ${param(r.path)}))`);
     else lines.push(`(allow file-read* ${filter(r.path)})`);
   }
   // Container runtimes: nothing connects to their sockets.

@@ -56,10 +56,29 @@ describe("seatbeltProfile", () => {
     expect(at('(allow file-read* file-write* (subpath "/Users/u/.codeoid/worktree"))')).toBeLessThan(at('"/Users/u/.codeoid/worktree/.ssh"'));
   });
 
-  test("a dir between the workspace and a hidden path in it can't be written (so not renamed)", () => {
-    const { text } = readable(spec({ workspace: "/Users/u", hidden: ["/Users/u/.codeoid/worktree"], readOnly: ["/Users/u/.codeoid"] }));
+  test("a dir between the workspace and a hidden path in it can't itself be written (so not renamed), while what is in it can (#448 round 1)", () => {
+    const { text } = readable(spec({ workspace: "/Users/u", hidden: ["/Users/u/.codeoid/worktree"], pinned: ["/Users/u/.codeoid"] }));
     const at = (n: string) => text.indexOf(n);
-    expect(at('(deny file-write* (subpath "/Users/u/.codeoid"))')).toBeGreaterThan(at('(allow file-read* file-write* (subpath "/Users/u"))'));
+    expect(at('(deny file-write* (literal "/Users/u/.codeoid"))')).toBeGreaterThan(at('(allow file-read* file-write* (subpath "/Users/u"))'));
+    expect(text).not.toContain('(deny file-write* (subpath "/Users/u/.codeoid"))');
+  });
+
+  test("a repository's hooks and config can't be written, with what is in them", () => {
+    const { text } = readable(spec({ readOnly: ["/Users/u/repo/.git/hooks", "/Users/u/repo/.git/config"] }));
+    expect(text).toContain('"/Users/u/repo/.git/hooks"');
+    expect(text.indexOf('(deny file-write* (literal "/Users/u/repo/.git/config") (subpath "/Users/u/repo/.git/config"))')).toBeGreaterThan(text.indexOf('(allow file-read* file-write* (subpath "/Users/u/repo"))'));
+  });
+
+  test("the home hidden whole; the allowlist allowed back (a link by its own path and where it leads), the workspace in it writable (#448 round 1)", () => {
+    const real = (p: string) => (p === "/Users/u/.gitconfig" ? "/Users/u/dotfiles/gitconfig" : p);
+    const s = spec({ workspace: "/Users/u/repo", hidden: ["/Users/u"], reexposed: ["/Users/u/.gitconfig", "/Users/u/.bun"] });
+    const { profile, params } = seatbeltProfile(s, { real, isDir: (p) => (p === "/Users/u" || p === "/Users/u/.bun" || p === "/Users/u/repo" ? true : p.includes("gitconfig") ? false : null) });
+    const text = profile.replace(/\(param "(P\d+)"\)/g, (_m, n: string) => JSON.stringify(params[n]));
+    const at = (n: string) => text.indexOf(n);
+    expect(at('(deny file-read* file-write* (subpath "/Users/u"))')).toBeGreaterThan(-1);
+    for (const allow of ['(allow file-read* (literal "/Users/u/.gitconfig"))', '(allow file-read* (literal "/Users/u/dotfiles/gitconfig"))', '(allow file-read* (subpath "/Users/u/.bun"))', '(allow file-read* file-write* (subpath "/Users/u/repo"))']) {
+      expect(at(allow)).toBeGreaterThan(at('(deny file-read* file-write* (subpath "/Users/u"))'));
+    }
   });
 
   test("network: on adds nothing; off and an allowlist (Seatbelt can't hold one by host) deny it all", () => {

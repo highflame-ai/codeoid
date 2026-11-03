@@ -2,27 +2,40 @@
  * What a session's sandbox hides, makes writable and lets through (#448):
  * the workspace-write policy, as a {@link SandboxSpec}.
  *
- *   - writable: the workspace, a private temp dir, and (only when a backend's
- *     whole process is inside) that backend's own state dir;
- *   - hidden: codeoid's config dir and every data dir it owns (database,
- *     transcripts, opencode's, memory's, the lock files), the agent CLIs'
- *     logins and what backends registered as credentials (secret-paths.ts),
- *     the usual credential stores (SSH, cloud CLIs, kube, docker, gnupg, gh,
- *     netrc, git credentials, keyrings), the daemon's own temp dir, the
- *     desktop session's runtime dir, plus `sandbox.hiddenPaths`;
+ *   - the user's home is hidden whole (deny by default: a credential made
+ *     after the sandbox started, or put back by a rename, or simply not on
+ *     any list, isn't there), then shown again: the workspace (writable) when
+ *     it is inside, a read-only allowlist of toolchains and tool settings that
+ *     hold no secrets (`sandbox.homeReadable`), and what the backend itself
+ *     needs (its program, its private home: backend-home.ts);
+ *   - writable: the workspace, a private temp dir, a git worktree's own git
+ *     dir and its repository's objects and refs, and (only when a backend's
+ *     whole process is inside) that backend's private home;
+ *   - read-only inside the writable: a repository's `hooks/` and `config`;
+ *   - hidden besides: codeoid's config dir and every data dir it owns
+ *     (database, transcripts, opencode's, memory's, the lock files) wherever
+ *     they are, the agent CLIs' logins and what backends registered as
+ *     credentials (secret-paths.ts), the usual credential stores (SSH, cloud
+ *     CLIs, kube, docker, gnupg, gh, netrc, git credentials, keyrings: what
+ *     a workspace that holds the home would show), the daemon's own temp dir,
+ *     the desktop session's runtime dir, plus `sandbox.hiddenPaths`;
  *   - container runtime sockets: never reachable;
  *   - network per policy.
  */
 
-import { existsSync, realpathSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { CodeoidConfig } from "../../config.js";
 import { getConfigDir } from "../../config.js";
 import { daemonOwnedDirs } from "../data-lock.js";
 import { cliCredentialFiles, registeredSecretLocations } from "../secret-paths.js";
+import { DEFAULT_HOME_READABLE } from "./home-readable.js";
+import { validAllowedHost } from "./hosts.js";
 import { sandboxRootIfMade } from "./root.js";
 import type { NetworkMode, NetworkPolicy, SandboxSpec } from "./types.js";
+
+export { DEFAULT_HOME_READABLE, validAllowedHost };
 
 /** `sandbox.*` in the config (config.ts `SandboxSchema`). */
 export interface SandboxConfig {
@@ -33,6 +46,11 @@ export interface SandboxConfig {
   allowedHosts: string[];
   /** More paths to hide, on top of the built-in list (`~` expands). */
   hiddenPaths: string[];
+  /**
+   * What of the (otherwise hidden) home stays readable, read-only (`~`
+   * expands): toolchains and tool settings that hold no secrets.
+   */
+  homeReadable: string[];
   /** The bwrap binary (default: on PATH). */
   bwrapPath?: string;
   docker: {
@@ -43,11 +61,13 @@ export interface SandboxConfig {
   };
 }
 
+
 export const DEFAULT_SANDBOX_CONFIG: SandboxConfig = {
   provider: "auto",
   network: "on",
   allowedHosts: [],
   hiddenPaths: [],
+  homeReadable: [...DEFAULT_HOME_READABLE],
   docker: { image: "node:22-bookworm-slim" },
 };
 
@@ -96,6 +116,22 @@ export const HOME_CREDENTIAL_PATHS: readonly string[] = [
   ".terraform.d/credentials.tfrc.json",
   ".claude.json",
   "Library/Keychains",
+  // Other agents' and tools' logins.
+  ".local/share/opencode/auth.json",
+  ".local/share/opencode/mcp-auth.json",
+  ".config/github-copilot",
+  ".pgpass",
+  ".config/rclone",
+  ".s3cfg",
+  ".boto",
+  ".pulumi/credentials.json",
+  ".config/doctl",
+  ".fly",
+  ".npmrc",
+  ".bunfig.toml",
+  ".yarnrc.yml",
+  ".gradle/gradle.properties",
+  ".m2/settings.xml",
 ];
 
 /**
@@ -205,42 +241,200 @@ export interface SpecInputs {
   config?: CodeoidConfig;
   /**
    * What the backend's own process must still reach when it runs inside
-   * (its home: login, settings, sessions). Taken out of the hidden list and
-   * made writable. Empty when only commands run inside.
+   * (its private home: backend-home.ts, and the conversations it shares with
+   * the vendor's). Taken out of the hidden list and made writable. Empty when
+   * only commands run inside.
    */
   backendState?: readonly string[];
-  /** Read-only locations the backend's process needs inside a hidden one. */
+  /** Read-only locations the backend's process needs inside a hidden one (its program, its login). */
   backendReadable?: readonly string[];
   hidden?: HiddenPathInputs;
+  /** Look for the workspace's git repository (default: yes). */
+  git?: boolean;
+}
+
+/** The home a spec hides: absolute, and not `/` (nothing is left to show then). */
+function hiddenHome(home: string): string | null {
+  const h = resolve(home);
+  return isAbsolute(home) && h !== "/" ? h : null;
+}
+
+/** `sandbox.homeReadable`, absolute (`~` expanded). */
+export function homeReadablePaths(config: CodeoidConfig | undefined, home: string): string[] {
+  const out: string[] = [];
+  for (const p of sandboxConfigOf(config).homeReadable) {
+    const abs = expandHome(p, home);
+    if (isAbsolute(abs)) out.push(resolve(abs));
+  }
+  return out;
+}
+
+/**
+ * Credential files inside a readable allowlist entry, hidden again: a
+ * global npmrc of an nvm-installed node (`~/.nvm/versions/node/<v>/etc/npmrc`).
+ */
+export function homeCredentialFilesIn(readable: readonly string[]): string[] {
+  const out: string[] = [];
+  for (const r of readable) {
+    if (!r.endsWith(`${sep}.nvm`)) continue;
+    let versions: string[] = [];
+    try {
+      versions = readdirSync(join(r, "versions", "node"));
+    } catch {
+      continue;
+    }
+    for (const v of versions) out.push(join(r, "versions", "node", v, "etc", "npmrc"));
+  }
+  return out;
+}
+
+/** What a sandbox makes of the workspace's git repository. */
+export interface GitPaths {
+  /** Writable: the repository's git dir (a linked worktree's common dir), when outside the workspace. */
+  writable: string[];
+  /** Read-only even where the rest is writable: the repository's hooks, config and submodules' git dirs. */
+  readOnly: string[];
+}
+
+function readGitFile(dotgit: string): string | null {
+  try {
+    const m = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotgit, "utf8"));
+    return m?.[1] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The workspace's git repository, found as git finds it (the nearest `.git`
+ * at or above the workspace, below the home): a linked worktree (`.git` a
+ * file naming its git dir) or a plain repository. Committing writes the
+ * worktree's git dir and the repository's objects, refs, logs and
+ * `packed-refs.lock` (git takes it beside `packed-refs` on a ref update),
+ * so the repository's git dir is writable wherever it is. What git runs
+ * from it stays read-only: `hooks/`, `config` (`core.hooksPath`,
+ * `core.fsmonitor`, a filter), `config.worktree`, and `modules/` (a
+ * submodule's git dir, with hooks and config of its own), since anything
+ * planted there would run outside the sandbox at the user's next git
+ * command. Those are made when missing (an empty dir, an empty
+ * `config.worktree` where the config turns them on), so there is something
+ * to hold read-only.
+ *
+ * A worktree's `.git` file is the agent's to write, so what it names is
+ * believed only in git's own layout: `<common>/worktrees/<name>`, whose
+ * `gitdir` file (outside the workspace) names this `.git` back, in a
+ * repository with `objects/` and `HEAD`. Anything else gets nothing.
+ */
+export function gitWorkspacePaths(workspace: string, home: string = process.env.HOME ?? homedir()): GitPaths {
+  const out: GitPaths = { writable: [], readOnly: [] };
+  const ws = resolve(workspace);
+  const stop = resolve(home);
+  let dotgit: string | null = null;
+  for (let dir = ws; ; dir = dirname(dir)) {
+    // Never the home's own (a dotfiles repository) or the root's: no workspace commits there.
+    if (dir === stop || dir === "/") break;
+    try {
+      lstatSync(join(dir, ".git"));
+      dotgit = join(dir, ".git");
+      break;
+    } catch {
+      /* not here */
+    }
+    if (dirname(dir) === dir) break;
+  }
+  if (!dotgit) return out;
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(dotgit);
+  } catch {
+    return out;
+  }
+  let common: string;
+  if (st.isDirectory()) {
+    common = dotgit;
+  } else if (st.isFile()) {
+    const named = readGitFile(dotgit);
+    if (!named) return out;
+    const gitDir = resolve(dirname(dotgit), named);
+    common = dirname(dirname(gitDir));
+    if (basename(dirname(gitDir)) !== "worktrees" || !validWorktree(gitDir, common, dotgit)) return out;
+    out.readOnly.push(join(gitDir, "config.worktree"));
+  } else {
+    return out;
+  }
+  // Writable already when inside the workspace.
+  if (!within(common, ws)) out.writable.push(common);
+  for (const dir of ["hooks", "modules"]) {
+    try {
+      mkdirSync(join(common, dir), { mode: 0o755 });
+    } catch {
+      /* there already, or a repository codeoid can't write either */
+    }
+  }
+  try {
+    // Read where the config turns it on: there must be one to hold read-only.
+    if (/worktreeconfig\s*=\s*true/i.test(readFileSync(join(common, "config"), "utf8"))) writeFileSync(join(common, "config.worktree"), "", { flag: "a" });
+  } catch {
+    /* no config to read, or none codeoid can write */
+  }
+  out.readOnly.push(join(common, "hooks"), join(common, "config"), join(common, "config.worktree"), join(common, "modules"));
+  return out;
+}
+
+/** git's own record that `gitDir` is the worktree whose `.git` file is `dotgit`, in a real repository `common`. */
+function validWorktree(gitDir: string, common: string, dotgit: string): boolean {
+  try {
+    if (!lstatSync(common).isDirectory() || !lstatSync(join(common, "objects")).isDirectory() || !lstatSync(join(common, "HEAD")).isFile()) return false;
+    if (!lstatSync(gitDir).isDirectory()) return false;
+    const back = readFileSync(join(gitDir, "gitdir"), "utf8").trim();
+    return realpathSync(resolve(gitDir, back)) === realpathSync(dotgit);
+  } catch {
+    return false;
+  }
 }
 
 /** The spec for one session. */
 export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const env = inputs.hidden?.env ?? process.env;
   const home = inputs.hidden?.home ?? env.HOME ?? homedir();
-  const own = (inputs.backendState ?? []).map((p) => resolve(p));
-  const ownReal = own.map((p) => {
-    try {
-      return realpathSync(p);
-    } catch {
-      return p;
-    }
-  });
   const workspace = resolve(inputs.workspace);
+  const git = inputs.git === false ? { writable: [], readOnly: [] } : gitWorkspacePaths(workspace, home);
+  const own = [...(inputs.backendState ?? []).map((p) => resolve(p)), ...git.writable];
+  const ownReal = own.map(realOr);
   const root = sandboxRootIfMade();
-  const hidden = [...hiddenPathsFor(inputs.config, inputs.hidden), ...(root ? [root] : [])].filter(
-    // The backend's own state stays reachable by it; nothing it holds is taken out otherwise.
-    (h) => ![...own, ...ownReal].some((o) => within(h, o)),
-  );
   const tempDir = resolve(inputs.tempDir);
+  // A workspace that is the home itself: the home is what the session works on (the hidden list still applies in it).
+  const homeHidden = hiddenHome(home) === workspace ? null : hiddenHome(home);
+  const userHidden = sandboxConfigOf(inputs.config).hiddenPaths.map((p) => resolve(expandHome(p, home))).filter(isAbsolute);
+  const reexposed = [
+    ...(inputs.backendReadable ?? []).map((p) => resolve(p)),
+    // The allowlist, less what `sandbox.hiddenPaths` hides: an explicit hide wins.
+    ...(homeHidden ? homeReadablePaths(inputs.config, homeHidden).filter((r) => !userHidden.some((u) => within(r, u))) : []),
+  ];
+  // What stays visible inside the hidden home: a hidden path there matters only inside one of these.
+  const shown = [workspace, tempDir, ...own, ...ownReal, ...reexposed, ...reexposed.map(realOr)];
+  const hidden = [
+    ...(homeHidden ? [homeHidden] : []),
+    ...hiddenPathsFor(inputs.config, inputs.hidden),
+    ...homeCredentialFilesIn(reexposed),
+    ...(root ? [root] : []),
+  ].filter(
+    (h, i, all) =>
+      all.indexOf(h) === i &&
+      // The backend's own state stays reachable by it; nothing it holds is taken out otherwise.
+      ![...own, ...ownReal].some((o) => within(h, o)) &&
+      // Inside the hidden home, only what is inside something shown needs hiding again.
+      (!homeHidden || h === homeHidden || !within(h, homeHidden) || shown.some((x) => within(h, x))),
+  );
   return {
     sessionId: inputs.sessionId,
     workspace,
     tempDir,
     writable: own,
     hidden,
-    readOnly: protectedAncestors(hidden, [workspace, tempDir, ...own]),
-    reexposed: (inputs.backendReadable ?? []).map((p) => resolve(p)),
+    readOnly: git.readOnly,
+    pinned: protectedAncestors(hidden, [workspace, tempDir, ...own]),
+    reexposed,
     containerSockets: containerSocketPaths(home, env),
     network: inputs.network,
     unsetEnv: SANDBOX_UNSET_ENV,
@@ -257,8 +451,8 @@ function realOr(p: string): string {
 
 /**
  * The directories strictly between a writable root and a hidden path that
- * exists inside it: kept read-only, so none can be renamed to carry the
- * hidden path out from under its rule. Real paths.
+ * exists inside it: pinned (SandboxSpec.pinned), so none can be renamed to
+ * carry the hidden path out from under its rule. Real paths.
  */
 export function protectedAncestors(hidden: readonly string[], writableRoots: readonly string[], exists: (p: string) => boolean = existsSync): string[] {
   const roots = writableRoots.map(realOr);
@@ -281,26 +475,78 @@ export function networkPolicyOf(config: SandboxConfig, override?: { mode?: Netwo
   return mode === "allowlist" ? { mode, allow: [...allow] } : { mode };
 }
 
-/** A host an allowlist may name: a domain, a `*.` wildcard of one, or `localhost`. */
-export function validAllowedHost(h: string): boolean {
-  return /^(\*\.)?[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)*$/.test(h) && h.length <= 253;
-}
 
 /**
- * Where a backend's program lives (its binary, and each absolute script
- * path before its own arguments), by directory: shown read-only inside a
- * sandbox that would otherwise hide it (an install under the host's /tmp).
+ * Where a backend's program lives, by directory: shown read-only inside a
+ * sandbox that would otherwise hide it (the home, the host's /tmp). For the
+ * command (found on PATH when it is a bare name) and each absolute script
+ * path before its own arguments: its directory and where it really is, the
+ * package it belongs to (the nearest directory with a `package.json`: an
+ * npm-installed CLI needs its `node_modules`), and the interpreter its
+ * `#!` line names (`#!/usr/bin/env node`: node as PATH finds it, with the
+ * install it belongs to).
  */
-export function programLocations(command: string, argsPrefix: readonly string[] = []): string[] {
+export function programLocations(
+  command: string,
+  argsPrefix: readonly string[] = [],
+  path: string | undefined = process.env.PATH,
+  home: string = process.env.HOME ?? homedir(),
+): string[] {
   const out: string[] = [];
-  for (const p of [command, ...argsPrefix]) {
-    if (!isAbsolute(p)) continue;
+  const which = (name: string): string | null => Bun.which(name, path !== undefined ? { PATH: path } : {}) ?? null;
+  const add = (p: string) => {
     out.push(dirname(p));
-    try {
-      out.push(dirname(realpathSync(p)));
-    } catch {
-      /* not there: nothing to show */
+    const real = realOr(p);
+    out.push(dirname(real));
+    const pkg = packageRoot(real);
+    if (pkg) out.push(pkg);
+    return real;
+  };
+  for (const [i, p] of [command, ...argsPrefix].entries()) {
+    const abs = isAbsolute(p) ? p : i === 0 && p && !p.includes("/") ? which(p) : null;
+    if (!abs) continue;
+    const real = add(abs);
+    const interpreter = shebangProgram(real);
+    const found = interpreter ? (isAbsolute(interpreter) ? interpreter : which(interpreter)) : null;
+    if (found) {
+      add(found);
+      // An install's bin dir (`…/node/v22/bin/node`): the install with it (its lib).
+      const dir = dirname(realOr(found));
+      if (basename(dir) === "bin") out.push(dirname(dir));
     }
   }
-  return [...new Set(out)];
+  // Never the home itself or anything holding it (a stray `~/package.json`): that would show it all.
+  const h = resolve(home);
+  return [...new Set(out)].filter((d) => d !== "/" && !within(h, d));
+}
+
+/** The nearest directory at or above `file`'s holding a `package.json`, below `/`. */
+function packageRoot(file: string): string | null {
+  for (let dir = dirname(file); dir !== dirname(dir); dir = dirname(dir)) {
+    try {
+      if (lstatSync(join(dir, "package.json")).isFile()) return dir;
+    } catch {
+      /* not here */
+    }
+  }
+  return null;
+}
+
+/** The program a script's `#!` line runs (`env`'s argument for `#!/usr/bin/env x`), or null. */
+function shebangProgram(file: string): string | null {
+  let head = "";
+  try {
+    const fd = openSync(file, "r");
+    try {
+      const buf = Buffer.alloc(256);
+      head = buf.subarray(0, readSync(fd, buf, 0, 256, 0)).toString("utf8");
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+  const m = /^#!\s*(\S+)(?:[ \t]+(?:-S[ \t]+)?(\S+))?/.exec(head);
+  if (!m?.[1]) return null;
+  return basename(m[1]) === "env" ? (m[2] ?? null) : m[1];
 }

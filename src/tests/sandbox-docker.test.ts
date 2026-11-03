@@ -29,6 +29,38 @@ function spec(over: Partial<SandboxSpec> = {}): SandboxSpec {
 const kinds: Record<string, DockerPathKind> = { "/work/repo/.secrets": "dir", "/work/repo/.env": "other", "/home/u/.pi/agent": "dir", "/opt/node/bin": "dir", "/home/u/.ssh": "dir", "/run/docker.sock": "other" };
 const base = { image: "node:22-bookworm-slim", name: "codeoid-sess-1-ab", cwd: "/work/repo/sub", envNames: ["PATH", "OPENAI_API_KEY", "SSH_AUTH_SOCK", "DOCKER_HOST"], uid: 1000, gid: 1000, kind: (p: string) => kinds[p] ?? null };
 
+/** One CSV line as Go's encoding/csv reads it (what Docker's --mount parser uses). */
+function parseCsvLine(line: string): string[] {
+  const out: string[] = [];
+  let i = 0;
+  while (i <= line.length) {
+    let field = "";
+    if (line[i] === '"') {
+      i++;
+      for (;;) {
+        const q = line.indexOf('"', i);
+        if (q < 0) throw new Error("unterminated");
+        field += line.slice(i, q);
+        if (line[q + 1] === '"') {
+          field += '"';
+          i = q + 2;
+        } else {
+          i = q + 1;
+          break;
+        }
+      }
+    } else {
+      const c = line.indexOf(",", i);
+      field = line.slice(i, c < 0 ? line.length : c);
+      i = c < 0 ? line.length : c;
+    }
+    out.push(field);
+    if (line[i] !== ",") break;
+    i++;
+  }
+  return out;
+}
+
 /** Pairs of [flag, value] as they follow each other. */
 function flags(args: string[], flag: string): string[] {
   const out: string[] = [];
@@ -44,6 +76,7 @@ describe("dockerRunArgs", () => {
     expect(args.slice(0, 4)).toEqual(["run", "--rm", "-i", "--init"]);
     expect(flags(args, "--name")).toEqual(["codeoid-sess-1-ab"]);
     expect(flags(args, "--label")).toEqual(["codeoid.session=sess-1"]);
+    expect(flags(dockerRunArgs(spec(), ["x"], { ...base, handle: "h1" }), "--label")).toEqual(["codeoid.session=sess-1", "codeoid.handle=h1"]);
     expect(flags(args, "--user")).toEqual(["1000:1000"]);
     expect(flags(args, "--cap-drop")).toEqual(["ALL"]);
     expect(flags(args, "--security-opt")).toEqual(["no-new-privileges"]);
@@ -52,22 +85,47 @@ describe("dockerRunArgs", () => {
 
   test("only the workspace, the session's /tmp and what the backend needs are mounted; a hidden path inside one is covered again", () => {
     const args = dockerRunArgs(spec({ writable: ["/home/u/.pi/agent"], reexposed: ["/opt/node/bin", "/work/repo/node_modules"] }), ["x"], base);
-    expect(flags(args, "-v")).toEqual([
-      "/work/repo:/work/repo",
-      "/tmp/codeoid-sandbox-sess-1:/tmp",
-      "/home/u/.pi/agent:/home/u/.pi/agent",
-      "/opt/node/bin:/opt/node/bin:ro",
-      "/dev/null:/work/repo/.env:ro",
+    expect(flags(args, "-v")).toEqual([]);
+    expect(flags(args, "--mount")).toEqual([
+      "type=bind,source=/work/repo,target=/work/repo",
+      "type=bind,source=/tmp/codeoid-sandbox-sess-1,target=/tmp",
+      "type=bind,source=/home/u/.pi/agent,target=/home/u/.pi/agent",
+      "type=bind,source=/opt/node/bin,target=/opt/node/bin,readonly",
+      "type=tmpfs,destination=/work/repo/.secrets,readonly",
+      "type=bind,source=/dev/null,target=/work/repo/.env,readonly",
     ]);
-    expect(flags(args, "--mount")).toEqual(["type=tmpfs,destination=/work/repo/.secrets,readonly"]);
     // ~/.ssh and the Docker socket aren't mounted at all: nothing to hide.
     expect(args.join(" ")).not.toContain(".ssh");
     expect(args.join(" ")).not.toContain("docker.sock");
   });
 
-  test("a dir between the workspace and a hidden path in it is mounted read-only", () => {
-    const args = dockerRunArgs(spec({ readOnly: ["/work/repo/config"] }), ["x"], { ...base, kind: (p: string) => (p === "/work/repo/config" ? "dir" : (kinds[p] ?? null)) });
-    expect(flags(args, "-v")).toContain("/work/repo/config:/work/repo/config:ro");
+  test("a dir between the workspace and a hidden path in it is pinned: mounted on itself (no rename), writable (#448 round 1); a repository's hooks are mounted read-only", () => {
+    const k = (p: string) => (p === "/work/repo/config" || p === "/work/repo/.git/hooks" ? "dir" : (kinds[p] ?? null));
+    const args = dockerRunArgs(spec({ pinned: ["/work/repo/config"], readOnly: ["/work/repo/.git/hooks"] }), ["x"], { ...base, kind: k });
+    expect(flags(args, "--mount")).toContain("type=bind,source=/work/repo/config,target=/work/repo/config");
+    expect(flags(args, "--mount")).not.toContain("type=bind,source=/work/repo/config,target=/work/repo/config,readonly");
+    expect(flags(args, "--mount")).toContain("type=bind,source=/work/repo/.git/hooks,target=/work/repo/.git/hooks,readonly");
+  });
+
+  test("a path with `:`, `,` or `\"` is one path: every --mount field is CSV-quoted (#448 round 1)", () => {
+    const args = dockerRunArgs(spec({ workspace: '/home/u/proj:v2,"x"', hidden: [] }), ["x"], { ...base, kind: () => "dir" });
+    expect(flags(args, "--mount")[0]).toBe('type=bind,"source=/home/u/proj:v2,""x""","target=/home/u/proj:v2,""x"""');
+    // Docker's own reader (encoding/csv): the quoted fields come back whole.
+    const fields = parseCsvLine(flags(args, "--mount")[0] ?? "");
+    expect(fields).toEqual(["type=bind", 'source=/home/u/proj:v2,"x"', 'target=/home/u/proj:v2,"x"']);
+  });
+
+  test("a launcher names no container (it may run many at once); each handle labels its own containers (#448 round 1)", async () => {
+    const h = await new DockerSandboxProvider({ image: "img", docker: "/usr/bin/docker" }).open(spec());
+    const launcher = h.wrap?.(["sh"], { cwd: "", env: {} }).argv ?? [];
+    expect(flags(launcher, "--name")).toEqual([]);
+    const direct = h.wrap?.(["sh"], { cwd: "/work/repo", env: {} }).argv ?? [];
+    expect(flags(direct, "--name")).toHaveLength(1);
+    const handleLabel = flags(direct, "--label").find((l) => l.startsWith("codeoid.handle="));
+    expect(handleLabel).toBeDefined();
+    expect(flags(launcher, "--label")).toContain(handleLabel ?? "");
+    const other = await new DockerSandboxProvider({ image: "img", docker: "/usr/bin/docker" }).open(spec());
+    expect(flags(other.wrap?.(["sh"], { cwd: "", env: {} }).argv ?? [], "--label")).not.toContain(handleLabel ?? "");
   });
 
   test("network: on is the bridge, off and an allowlist (Docker can't hold one) are none", () => {

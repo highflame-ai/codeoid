@@ -6,9 +6,12 @@
  *   --ro-bind / /            everything read-only
  *   --dev /dev, --proc /proc a minimal /dev, and a /proc of the sandbox's own processes only
  *   --bind <temp> /tmp       a private /tmp (the host's, with other sessions' files and sockets, isn't there)
+ *   --tmpfs <home>           the home hidden whole, then (read-only) the allowlist and the workspace in it shown again
  *   --bind <workspace>       the workspace writable (and any other writable location)
  *   --tmpfs <dir>            a hidden directory: empty, then read-only again (--remount-ro)
  *   --ro-bind /dev/null <f>  a hidden file or socket: empty, and nothing to connect to
+ *   --ro-bind <p> <p>        read-only inside something writable (a repository's hooks and config)
+ *   --bind <d> <d>           a pinned directory: a mount point, so it can't be renamed, still writable inside
  *   --unshare-net            network off
  *   --die-with-parent, --new-session; bwrap always sets no_new_privs
  *
@@ -19,7 +22,7 @@
  */
 
 import { lstatSync, realpathSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { LocalSandboxHandle } from "./local-handle.js";
 import type { NetworkMode, SandboxCapabilities, SandboxHandle, SandboxProbe, SandboxProvider, SandboxSpawnOptions, SandboxSpec } from "./types.js";
 
@@ -63,7 +66,7 @@ type Mount =
   | { kind: "hide-dir"; path: string }
   | { kind: "hide-file"; path: string }
   | { kind: "bind"; src: string; path: string }
-  | { kind: "ro-bind"; path: string };
+  | { kind: "ro-bind"; src: string; path: string };
 
 /** The network bwrap gives a spec's policy: on, or off (an allowlist can't be enforced, so it is off). */
 export function bwrapNetwork(mode: NetworkMode): "on" | "off" {
@@ -111,20 +114,35 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
     seen.add(`w:${temp}`);
     mounts.push({ kind: "bind", src: temp, path: temp });
   }
-  // Every dir between a writable root and a hidden path in it: read-only, a mount point nothing can rename.
+  // Read-only inside something writable (a repository's hooks and config), with everything in it.
   for (const p of spec.readOnly ?? []) {
+    const at = realOr(p);
+    if (!kind(at) || seen.has(`o:${at}`)) continue;
+    seen.add(`o:${at}`);
+    mounts.push({ kind: "ro-bind", src: at, path: at });
+  }
+  // Every dir between a writable root and a hidden path in it: a mount point nothing can rename, still writable inside.
+  for (const p of spec.pinned ?? []) {
     const at = realOr(p);
     if (kind(at) !== "dir" || seen.has(`o:${at}`)) continue;
     seen.add(`o:${at}`);
-    mounts.push({ kind: "ro-bind", path: at });
+    mounts.push({ kind: "bind", src: at, path: at });
   }
+  const coveredAt = (at: string) => hiddenDirs.some((d) => within(at, d) && d !== at) || (within(at, "/tmp") && at !== "/tmp" && !writable.some((w) => within(at, w)));
   for (const p of spec.reexposed) {
     const at = realOr(p);
     // Only what a hidden directory, or the sandbox's own /tmp, covers needs showing again.
-    const covered = hiddenDirs.some((d) => within(at, d) && d !== at) || (within(at, "/tmp") && at !== "/tmp" && !writable.some((w) => within(at, w)));
-    if (!kind(at) || seen.has(`r:${at}`) || !covered) continue;
-    seen.add(`r:${at}`);
-    mounts.push({ kind: "ro-bind", path: at });
+    if (!kind(at) || seen.has(`r:${at}`)) continue;
+    if (coveredAt(at)) {
+      seen.add(`r:${at}`);
+      mounts.push({ kind: "ro-bind", src: at, path: at });
+    }
+    // A link (`~/.gitconfig` into a dotfiles repository): what it leads to, at its own path too.
+    const literal = resolve(p);
+    if (literal !== at && coveredAt(literal) && !seen.has(`r:${literal}`)) {
+      seen.add(`r:${literal}`);
+      mounts.push({ kind: "ro-bind", src: at, path: literal });
+    }
   }
   // Shallowest first; at the same depth, hide before showing.
   const rank = (m: Mount) => (m.kind === "hide-dir" || m.kind === "hide-file" ? 0 : 1);
@@ -136,10 +154,12 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
     if (m.kind === "hide-dir") args.push("--tmpfs", m.path);
     else if (m.kind === "hide-file") args.push("--ro-bind", "/dev/null", m.path);
     else if (m.kind === "bind") args.push("--bind", m.src, m.path);
-    else args.push("--ro-bind", m.path, m.path);
+    else args.push("--ro-bind", m.src, m.path);
   }
-  // A hidden directory's tmpfs is read-only like the rest (its mount points are made by now).
-  for (const m of mounts) if (m.kind === "hide-dir") args.push("--remount-ro", m.path);
+  // A hidden directory's tmpfs is read-only like the rest (its mount points are made by now),
+  // unless something writable was bound over it at the same path (then that is what is there).
+  const boundAt = new Set(mounts.filter((m) => m.kind === "bind").map((m) => m.path));
+  for (const m of mounts) if (m.kind === "hide-dir" && !boundAt.has(m.path)) args.push("--remount-ro", m.path);
   for (const name of spec.unsetEnv) args.push("--unsetenv", name);
   args.push("--setenv", "TMPDIR", "/tmp");
   // No cwd: the caller's own (a launcher run from wherever its caller is; bwrap keeps it).

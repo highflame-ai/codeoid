@@ -4,16 +4,22 @@
  * mounted, so everything else on the host — credentials, other repos, the
  * container runtime's own socket — simply isn't there:
  *
- *   docker run --rm -i --init --name codeoid-<session>-<n> --label codeoid.session=<session>
+ *   docker run --rm -i --init [--name codeoid-<session>-<n>] --label codeoid.session=<session> --label codeoid.handle=<h>
  *     --user <uid>:<gid> --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096
  *     --network none | bridge            off (and an allowlist it can't hold) | on
- *     -v <workspace>:<workspace>          writable, at the same path
- *     -v <temp>:/tmp                      the session's temp dir
- *     -v <state>:<state>                  the backend's own state, when its whole process is inside
- *     -v <program>:<program>:ro           the backend's own program (it must run on the image)
- *     --mount type=tmpfs,…  /  -v /dev/null:<file>:ro   a hidden path inside something mounted
+ *     --mount type=bind,source=<w>,target=<w>               the workspace, writable, at the same path
+ *     --mount type=bind,source=<temp>,target=/tmp           the session's temp dir
+ *     --mount type=bind,source=<state>,target=<state>       the backend's private home, when its whole process is inside
+ *     --mount type=bind,…,readonly        the backend's own program (it must run on the image), the home allowlist
+ *     --mount type=tmpfs,…  /  …source=/dev/null,…,readonly  a hidden path inside something mounted
  *     -w <cwd> -e NAME …                  values copied from the docker client's environment
  *     <image> <argv…>
+ *
+ * Nothing of the home is mounted but what the spec shows: the home is hidden
+ * by not being there. Every `--mount` field is CSV-quoted, so a path with a
+ * `,`, `:` or `"` is one path. A launcher (run many times, maybe at once)
+ * names no container; each handle labels its containers, so closing one
+ * removes only its own.
  *
  * The container runtime's socket is never mounted, and `DOCKER_HOST` is the
  * docker client's only, never the container's. With `--runtime runsc`
@@ -27,6 +33,7 @@ import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
+import { resolve as resolvePath } from "node:path";
 import { LocalSandboxHandle } from "./local-handle.js";
 import type { NetworkMode, SandboxCapabilities, SandboxHandle, SandboxProbe, SandboxProvider, SandboxSpawnOptions, SandboxSpec } from "./types.js";
 
@@ -69,8 +76,10 @@ export interface DockerRunOptions {
   image: string;
   /** `--runtime` (e.g. `runsc`). */
   runtime?: string;
-  /** The container's name (unique). */
-  name: string;
+  /** The container's name (unique); none for a launcher, which may run many at once. */
+  name?: string;
+  /** Labels this handle's containers (closing it removes only those). */
+  handle?: string;
   /** Where the program starts; empty: the caller's directory (a launcher). */
   cwd: string;
   /** The names of the variables handed in (values come from the docker client's environment). */
@@ -88,10 +97,10 @@ export function dockerRunArgs(spec: SandboxSpec, argv: readonly string[], o: Doc
     "--rm",
     "-i",
     "--init",
-    "--name",
-    o.name,
+    ...(o.name ? ["--name", o.name] : []),
     "--label",
     `codeoid.session=${spec.sessionId}`,
+    ...(o.handle ? ["--label", `codeoid.handle=${o.handle}`] : []),
     "--user",
     `${o.uid}:${o.gid}`,
     "--cap-drop",
@@ -106,9 +115,10 @@ export function dockerRunArgs(spec: SandboxSpec, argv: readonly string[], o: Doc
   ];
   const mounted: string[] = [];
   const bind = (src: string, dest: string, ro: boolean) => {
-    args.push("-v", `${src}:${dest}${ro ? ":ro" : ""}`);
+    args.push("--mount", mountSpec([["type", "bind"], ["source", src], ["target", dest]], ro));
     mounted.push(dest);
   };
+  const inMounted = (at: string) => mounted.some((m) => m !== "/tmp" && within(at, m) && at !== m);
   const workspace = realOr(spec.workspace);
   bind(workspace, workspace, false);
   bind(realOr(spec.tempDir), "/tmp", false);
@@ -119,25 +129,44 @@ export function dockerRunArgs(spec: SandboxSpec, argv: readonly string[], o: Doc
   for (const r of spec.reexposed) {
     const at = realOr(r);
     if (kind(at) && !mounted.some((m) => within(at, m))) bind(at, at, true);
+    // A link (`~/.gitconfig` into a dotfiles repository): what it leads to, at its own path too.
+    const literal = resolvePath(r);
+    if (literal !== at && kind(at) && !mounted.some((m) => within(literal, m))) bind(at, literal, true);
   }
-  // Every dir between a mounted writable root and a hidden path in it: read-only (Docker mounts parents first).
+  // A repository's hooks and config inside something mounted: read-only, with everything in them.
   for (const p of spec.readOnly ?? []) {
     const at = realOr(p);
-    if (kind(at) === "dir" && mounted.some((m) => m !== "/tmp" && within(at, m) && at !== m)) bind(at, at, true);
+    if (kind(at) && inMounted(at)) bind(at, at, true);
+  }
+  // Every dir between a mounted writable root and a hidden path in it: a mount point (no rename), still writable (Docker mounts parents first).
+  for (const p of spec.pinned ?? []) {
+    const at = realOr(p);
+    if (kind(at) === "dir" && inMounted(at)) bind(at, at, false);
   }
   // A hidden path inside something mounted is covered again.
   for (const h of [...spec.hidden, ...spec.containerSockets]) {
     const at = realOr(h);
-    if (!mounted.some((m) => m !== "/tmp" && within(at, m) && at !== m)) continue;
+    if (!inMounted(at)) continue;
     const k = kind(at);
-    if (k === "dir") args.push("--mount", `type=tmpfs,destination=${at},readonly`);
-    else if (k === "other") args.push("-v", `/dev/null:${at}:ro`);
+    if (k === "dir") args.push("--mount", mountSpec([["type", "tmpfs"], ["destination", at]], true));
+    else if (k === "other") args.push("--mount", mountSpec([["type", "bind"], ["source", "/dev/null"], ["target", at]], true));
   }
   args.push("-w", o.cwd ? o.cwd : CWD_FROM_CALLER);
   for (const n of o.envNames) if (!spec.unsetEnv.includes(n) && !CLIENT_ENV.includes(n)) args.push("-e", n);
   args.push("-e", "TMPDIR=/tmp", "-e", `HOME=${homedir()}`);
   args.push(o.image, ...argv);
   return args;
+}
+
+/** One `--mount` field, CSV-quoted as Docker reads it (a `,` or `"` inside stays inside). */
+function mountField(key: string, value: string): string {
+  const f = `${key}=${value}`;
+  return /[",\n\r]/.test(f) ? `"${f.replace(/"/g, '""')}"` : f;
+}
+
+/** A `--mount` value from its fields. */
+export function mountSpec(fields: Array<[string, string]>, readonly: boolean): string {
+  return [...fields.map(([k, v]) => mountField(k, v)), ...(readonly ? ["readonly"] : [])].join(",");
 }
 
 export interface DockerProviderOptions {
@@ -194,6 +223,8 @@ export class DockerSandboxProvider implements SandboxProvider {
     const uid = typeof process.getuid === "function" ? process.getuid() : 1000;
     const gid = typeof process.getgid === "function" ? process.getgid() : 1000;
     const safe = spec.sessionId.replace(/[^A-Za-z0-9_.-]/g, "").slice(0, 32) || "session";
+    // This handle's containers, apart from the session's other handles'.
+    const handleId = randomBytes(6).toString("hex");
     const clientEnv: Record<string, string> = {};
     for (const n of CLIENT_ENV) {
       const v = process.env[n];
@@ -205,7 +236,9 @@ export class DockerSandboxProvider implements SandboxProvider {
         ...dockerRunArgs(spec, argv, {
           image: this.#opts.image,
           ...(this.#opts.runtime ? { runtime: this.#opts.runtime } : {}),
-          name: `codeoid-${safe}-${randomBytes(4).toString("hex")}`,
+          // A launcher (no cwd: it runs from wherever it is started, maybe many at once) names none.
+          ...(opts.cwd ? { name: `codeoid-${safe}-${randomBytes(4).toString("hex")}` } : {}),
+          handle: handleId,
           cwd: opts.cwd,
           envNames: Object.keys(opts.env),
           uid,
@@ -215,10 +248,10 @@ export class DockerSandboxProvider implements SandboxProvider {
       // The program's variables for `-e NAME` to copy, and the docker client's own settings.
       env: { ...opts.env, ...clientEnv },
     });
-    // Containers outlive a killed client: remove every one this session started.
+    // Containers outlive a killed client: remove every one this handle started.
     const onClose = () =>
       new Promise<void>((resolve) => {
-        execFile(docker, ["ps", "-aq", "--filter", `label=codeoid.session=${spec.sessionId}`], { env: { ...clientEnv } }, (err, out) => {
+        execFile(docker, ["ps", "-aq", "--filter", `label=codeoid.handle=${handleId}`], { env: { ...clientEnv } }, (err, out) => {
           const ids = err ? [] : out.split("\n").filter(Boolean);
           if (ids.length === 0) return resolve();
           execFile(docker, ["rm", "-f", ...ids], { env: { ...clientEnv } }, () => resolve());

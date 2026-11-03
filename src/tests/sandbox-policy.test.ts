@@ -12,6 +12,7 @@ import type { CodeoidConfig } from "../config.js";
 import { loadConfig } from "../config.js";
 import { BwrapSandboxProvider, type PathKind, bwrapArgs } from "../daemon/sandbox/bwrap.js";
 import {
+  DEFAULT_HOME_READABLE,
   HOME_CREDENTIAL_PATHS,
   buildSandboxSpec,
   containerSocketPaths,
@@ -225,7 +226,9 @@ describe("hidden paths", () => {
     });
     expect(s.writable).toEqual([join(home, ".pi", "agent")]);
     expect(s.hidden.some((h) => h.startsWith(join(home, ".pi", "agent")))).toBe(false);
-    expect(s.hidden).toContain(join(home, ".ssh"));
+    // The home is hidden whole; a credential store in it needs no rule of its own.
+    expect(s.hidden).toContain(home);
+    expect(s.hidden).not.toContain(join(home, ".ssh"));
     expect(s.unsetEnv).toContain("SSH_AUTH_SOCK");
     expect(s.containerSockets).toContain("/run/docker.sock");
   });
@@ -251,7 +254,7 @@ describe("hidden paths", () => {
 describe("config", () => {
   test("on by default: auto, network on", () => {
     const c = loadConfig({ raw: {}, env: {}, quiet: true });
-    expect(c.sandbox).toEqual({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], docker: { image: "node:22-bookworm-slim" } });
+    expect(c.sandbox).toEqual({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], docker: { image: "node:22-bookworm-slim" } });
   });
 
   test("env vars override the file", () => {
@@ -363,14 +366,15 @@ describe("protected ancestors (#448 review)", () => {
     expect(protectedAncestors(["/w"], ["/w"], () => true)).toEqual([]);
   });
 
-  test("bwrap: they are read-only mount points, laid between the workspace and the hidden path; the temp dir's own-path bind isn't covered by a hidden dir above it", () => {
+  test("bwrap: they are writable self-bind mount points (no rename, still writable inside: #448 round 1), laid between the workspace and the hidden path; the temp dir's own-path bind isn't covered by a hidden dir above it", () => {
     const fsKinds: Record<string, PathKind> = { "/home/u": "dir", "/home/u/.config": "dir", "/home/u/.config/gh": "dir", "/var/tmp/d": "dir", "/var/tmp/d/codeoid-sandbox-x/tmp-s": "dir" };
     const m = mounts(
-      bwrapArgs(spec({ workspace: "/home/u", tempDir: "/var/tmp/d/codeoid-sandbox-x/tmp-s", hidden: ["/home/u/.config/gh", "/var/tmp/d"], readOnly: ["/home/u/.config"] }), "", (p) => fsKinds[p] ?? null),
+      bwrapArgs(spec({ workspace: "/home/u", tempDir: "/var/tmp/d/codeoid-sandbox-x/tmp-s", hidden: ["/home/u/.config/gh", "/var/tmp/d"], pinned: ["/home/u/.config"] }), "", (p) => fsKinds[p] ?? null),
     );
     const at = (op: string[]) => m.findIndex((x) => x.join(" ") === op.join(" "));
-    expect(at(["--bind", "/home/u", "/home/u"])).toBeLessThan(at(["--ro-bind", "/home/u/.config", "/home/u/.config"]));
-    expect(at(["--ro-bind", "/home/u/.config", "/home/u/.config"])).toBeLessThan(at(["--tmpfs", "/home/u/.config/gh"]));
+    expect(m).not.toContainEqual(["--ro-bind", "/home/u/.config", "/home/u/.config"]);
+    expect(at(["--bind", "/home/u", "/home/u"])).toBeLessThan(at(["--bind", "/home/u/.config", "/home/u/.config"]));
+    expect(at(["--bind", "/home/u/.config", "/home/u/.config"])).toBeLessThan(at(["--tmpfs", "/home/u/.config/gh"]));
     expect(at(["--tmpfs", "/var/tmp/d"])).toBeLessThan(at(["--bind", "/var/tmp/d/codeoid-sandbox-x/tmp-s", "/var/tmp/d/codeoid-sandbox-x/tmp-s"]));
     // No cwd: a launcher starts where its caller is.
     expect(m.some((x) => x[0] === "--chdir")).toBe(false);

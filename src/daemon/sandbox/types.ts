@@ -75,15 +75,26 @@ export interface SandboxSpec {
   writable: readonly string[];
   /** Locations that must not be readable at all (directories and files). */
   hidden: readonly string[];
-  /** Locations inside a hidden one that stay readable (a backend's own login, when its whole process is inside). */
+  /**
+   * Locations inside a hidden one that stay readable: the home allowlist
+   * (`sandbox.homeReadable`), the backend's own program and login when its
+   * whole process is inside, a git worktree's common dir.
+   */
   reexposed: readonly string[];
   /**
-   * Directories inside a writable location that must stay read-only: each
-   * one between a writable root and a hidden path inside it. A mount point
-   * (or a denied path) can't be renamed, so `mv ~/.config ~/c` can't move a
-   * hidden `~/.config/gh` out from under the rule that hides it.
+   * Locations inside a writable one that stay read-only, with everything in
+   * them: a repository's `hooks/` and `config` (a hook planted there would
+   * run outside the sandbox at the user's next commit).
    */
   readOnly?: readonly string[];
+  /**
+   * Directories inside a writable location that must not be renamed or
+   * removed, while what is in them stays writable: each one between a
+   * writable root and a hidden path inside it. A mount point (or a denied
+   * path) can't be renamed, so `mv ~/.config ~/c` can't move a hidden
+   * `~/.config/gh` out from under the rule that hides it.
+   */
+  pinned?: readonly string[];
   /** Container runtime sockets (and their dirs): never reachable, they are root-equivalent. */
   containerSockets: readonly string[];
   network: NetworkPolicy;

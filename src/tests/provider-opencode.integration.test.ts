@@ -1182,11 +1182,11 @@ describe("opencode (real binary)", () => {
     const output = (events: ProviderEvent[]) => (events.find((e) => e.type === "tool_complete") as Extract<ProviderEvent, { type: "tool_complete" }> | undefined)?.output ?? "";
     try {
       const p = provider({ sandbox: () => sbx.runtime });
-      const line = `cat ${join(root, "secrets", "token")} 2>&1; rm -rf ${outside} 2>&1; echo rm=$?; echo hi > made.txt && echo WROTE; test -e /proc/${process.pid} && echo DAEMON-VISIBLE; echo cwd=$PWD`;
+      const line = `cat ${join(root, "secrets", "token")} 2>&1; rm -rf ${outside} 2>&1; echo x > ${join(outside, "x")} 2>/dev/null || echo OUTSIDE-NOT-WRITABLE; echo hi > made.txt && echo WROTE; test -e /proc/${process.pid} && echo DAEMON-VISIBLE; echo cwd=$PWD`;
       const out = output(await collect(p.runTurn(opts(shell(line), { workdir: ws }))));
       expect(out).not.toContain("PLANTED");
-      expect(out).toContain("rm=1");
-      expect(out).toContain("Read-only file system");
+      // Read-only, or (in the home, hidden whole: #448 round 1) not there at all.
+      expect(out).toContain("OUTSIDE-NOT-WRITABLE");
       expect(out).toContain("WROTE");
       expect(out).toContain(`cwd=${ws}`);
       expect(out).not.toContain("DAEMON-VISIBLE");
