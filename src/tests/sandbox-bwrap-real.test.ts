@@ -720,6 +720,121 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: ro
       expect(git(["log", "--oneline", worktree ? "feat" : "main"], f.repo, f.home)).toContain("inside");
     }
   });
+
+  test("F (#448 round 3): a plain repository's .git made invalid (HEAD garbled, refs/ gone) doesn't let git take a repository planted at the workspace's top", async () => {
+    for (const variant of ["head", "refs"] as const) {
+      const f = fixture(`f-${variant}`);
+      const h = await provider.open(f.spec);
+      try {
+        const invalidate = variant === "head" ? "echo 'not a ref' > .git/HEAD && echo INVALIDATED" : "rm -rf .git/refs && echo INVALIDATED";
+        const r = await sh(
+          h,
+          f.ws,
+          `git init -q --bare "$TMPDIR/skel" && cp -r "$TMPDIR/skel/HEAD" "$TMPDIR/skel/objects" "$TMPDIR/skel/refs" "$TMPDIR/skel/config" . 2>/dev/null; git config -f config core.bare false; git config -f config core.worktree "$PWD"; git config -f config core.fsmonitor '${f.mark}' && echo PLANTED; ${invalidate}`,
+          f.env,
+        );
+        expect(r.stdout).toContain("INVALIDATED");
+      } finally {
+        await h.close();
+      }
+      userGit(f, f.ws);
+      expect(existsSync(f.marker)).toBe(false);
+    }
+  });
+
+  test("G (#448 round 3): a worktree added after the sandbox opened is read-only from it (its commondir, its gitdir), and so is anything made in worktrees/", async () => {
+    for (const worktree of [false, true]) {
+      const f = fixture(worktree ? "g-wt" : "g", { worktree });
+      const h = await provider.open(f.spec);
+      const late = join(f.dir, "late");
+      try {
+        // The user (or a fork) adds a worktree while the session's sandbox is open.
+        git(["worktree", "add", "-q", "-b", "late", late], f.repo, f.home);
+        const lateDir = join(f.common, "worktrees", "late");
+        const r = await sh(
+          h,
+          f.ws,
+          `cp -r '${f.common}' "$PWD/.evilcommon" && git --git-dir="$PWD/.evilcommon" config core.fsmonitor '${f.mark}' && echo BUILT; echo "$PWD/.evilcommon" > '${join(lateDir, "commondir")}' 2>/dev/null && echo REWROTE || echo LATE-READ-ONLY; echo x > '${join(lateDir, "gitdir")}' 2>/dev/null && echo REWROTE-GITDIR || echo GITDIR-READ-ONLY; mkdir '${join(f.common, "worktrees", "planted")}' 2>/dev/null && echo MADE || echo WORKTREES-READ-ONLY`,
+          f.env,
+        );
+        expect(r.stdout).toContain("BUILT");
+        expect(r.stdout).toContain("LATE-READ-ONLY");
+        expect(r.stdout).toContain("GITDIR-READ-ONLY");
+        expect(r.stdout).toContain("WORKTREES-READ-ONLY");
+        // Still commits (the worktree's own git dir stays writable over the read-only worktrees/).
+        writeFileSync(join(f.ws, "g.txt"), "g\n");
+        const c = await sh(h, f.ws, "git add g.txt && git commit -qm g-inside && echo COMMITTED", f.env);
+        expect(c.stdout).toContain("COMMITTED");
+      } finally {
+        await h.close();
+      }
+      userGit(f, late);
+      expect(existsSync(f.marker)).toBe(false);
+    }
+  });
+
+  test("H (#448 round 3): a submodule checkout's .git file can't be pointed at a planted git dir; commits from inside work", async () => {
+    const dir = join(root, "h");
+    const home = join(dir, "home");
+    const src = join(dir, "src");
+    const sup = join(dir, "super");
+    for (const d of [home, src, sup, join(dir, "tmp")]) mkdirSync(d, { recursive: true });
+    git(["init", "-q", "-b", "main"], src, home);
+    writeFileSync(join(src, "f"), "f\n");
+    git(["add", "."], src, home);
+    git(["commit", "-qm", "s"], src, home);
+    git(["init", "-q", "-b", "main"], sup, home);
+    git(["-c", "protocol.file.allow=always", "submodule", "add", "-q", src, "sub"], sup, home);
+    const ws = join(sup, "sub");
+    const marker = join(dir, "RAN-OUTSIDE");
+    const mark = join(dir, "mark.sh");
+    writeFileSync(mark, `#!/bin/sh\necho ran >> '${marker}'\n`, { mode: 0o755 });
+    const spec = buildSandboxSpec({ sessionId: "h", workspace: ws, tempDir: join(dir, "tmp"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    const h = await provider.open(spec);
+    try {
+      writeFileSync(join(ws, "new.txt"), "n\n");
+      const r = await sh(
+        h,
+        ws,
+        `git add new.txt && git commit -qm sub-inside && echo COMMITTED; git init -q evilgit && git -C evilgit config core.fsmonitor '${mark}' && echo BUILT; printf 'gitdir: ./evilgit/.git\\n' > .git 2>/dev/null && echo REWROTE || echo DOTGIT-READ-ONLY; git config core.fsmonitor '${mark}' 2>/dev/null && echo CONFIG-SET || echo CONFIG-READ-ONLY`,
+        gitEnv(home),
+      );
+      expect(r.stdout).toContain("COMMITTED");
+      expect(r.stdout).toContain("BUILT");
+      expect(r.stdout).toContain("DOTGIT-READ-ONLY");
+      expect(r.stdout).toContain("CONFIG-READ-ONLY");
+    } finally {
+      await h.close();
+    }
+    userGit({ dir, home }, ws);
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  test("I (#448 round 3): remotes/ and branches/ are held read-only, made where missing", async () => {
+    const f = fixture("i");
+    const h = await provider.open(f.spec);
+    try {
+      const r = await sh(h, f.ws, "mkdir -p .git/branches .git/remotes 2>/dev/null; echo 'https://example.invalid/x' > .git/branches/x 2>/dev/null && echo BRANCHES-WRITTEN || echo BRANCHES-READ-ONLY; echo 'URL: https://example.invalid/x' > .git/remotes/x 2>/dev/null && echo REMOTES-WRITTEN || echo REMOTES-READ-ONLY", f.env);
+      expect(r.stdout).toContain("BRANCHES-READ-ONLY");
+      expect(r.stdout).toContain("REMOTES-READ-ONLY");
+    } finally {
+      await h.close();
+    }
+  });
+
+  test("checking out and switching branches still work from inside a plain repository with the HEAD placeholder", async () => {
+    const f = fixture("switch");
+    const h = await provider.open(f.spec);
+    try {
+      const r = await sh(h, f.ws, "git checkout -q -b topic && echo t > t.txt && git add t.txt && git commit -qm topic && git switch -q main && git merge -q --no-edit topic && echo SWITCHED", f.env);
+      expect(r.stderr).not.toContain("fatal");
+      expect(r.stdout).toContain("SWITCHED");
+    } finally {
+      await h.close();
+    }
+    expect(git(["log", "--oneline", "main"], f.repo, f.home)).toContain("topic");
+    expect(git(["status", "--porcelain"], f.repo, f.home)).toBe("");
+  });
 });
 
 describe.skipIf(!probe.available)("bubblewrap, for real: round 2 of the #448 audit (project settings)", () => {

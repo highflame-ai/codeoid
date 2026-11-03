@@ -206,6 +206,19 @@ describe("what a session's sandbox resolves to", () => {
     expect(sandboxRefusalOf(unknown.info)).toContain("doesn't know how to sandbox");
   });
 
+  test("a workspace whose .git names a git dir git's records don't name back says so in the sandbox's limits (#448 round 3)", async () => {
+    const ws = mkdtempSync(join(tmpdir(), "codeoid-sbx-sgd-"));
+    try {
+      writeFileSync(join(ws, ".git"), `gitdir: ${join(ws, "..", "elsewhere.git")}\n`);
+      const r = await resolveSandbox({ registry: registry(), config: sandboxConfigOf(undefined), setting: undefined, backendId: "pi", workspace: ws });
+      expect(r.info.limits?.join(" ")).toContain("committing from inside fails");
+      const plain = await resolveSandbox({ registry: registry(), config: sandboxConfigOf(undefined), setting: undefined, backendId: "pi", workspace: workdir });
+      expect(plain.info.limits?.join(" ") ?? "").not.toContain("committing from inside");
+    } finally {
+      rmSync(ws, { recursive: true, force: true });
+    }
+  });
+
   test("the per-backend confinement table", () => {
     const bw = fakeProvider("bwrap", { available: true });
     const sb = fakeProvider("seatbelt", { available: true });

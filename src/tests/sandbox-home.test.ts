@@ -28,8 +28,8 @@ import {
   withLoginsSynced,
 } from "../daemon/sandbox/backend-home.js";
 import { bwrapArgs, type PathKind } from "../daemon/sandbox/bwrap.js";
-import { claudeNativeEnv, claudeSandboxSettings, claudeTempEnv, physicalOf } from "../daemon/sandbox/claude-native.js";
-import { buildSandboxSpec, DEFAULT_HOME_READABLE, gitWorkspacePaths, homeCredentialFilesIn, programLocations, sandboxConfigOf } from "../daemon/sandbox/policy.js";
+import { claudeNativeEnv, claudeSandboxSettings, claudeTempEnv, denyAround, physicalOf } from "../daemon/sandbox/claude-native.js";
+import { buildSandboxSpec, DEFAULT_HOME_READABLE, gitLayoutOf, gitLayoutProblem, gitWorkspacePaths, homeCredentialFilesIn, programLocations, sandboxConfigOf } from "../daemon/sandbox/policy.js";
 import type { SandboxSpec } from "../daemon/sandbox/types.js";
 
 let root: string;
@@ -134,15 +134,16 @@ describe("the workspace's git repository", () => {
     const common = join(repo, ".git");
     const own = join(common, "worktrees", "gh-wt");
     const g = gitWorkspacePaths(wt, home);
-    expect(g.writable).toEqual([common, join(common, "worktrees"), own]);
+    expect(g.writable).toEqual([common, own]);
     expect(g.gitDirs).toEqual([common, own]);
-    for (const p of ["hooks", "info", "config", "config.worktree", "commondir", "modules"]) expect(g.readOnly).toContain(join(common, p));
+    for (const p of ["hooks", "info", "config", "config.worktree", "commondir", "modules", "remotes", "branches", "worktrees"]) expect(g.readOnly).toContain(join(common, p));
     for (const p of ["commondir", "gitdir", "config.worktree"]) expect(g.readOnly).toContain(join(own, p));
-    expect(g.readOnly).toContain(join(common, "worktrees", "nested"));
     expect(g.readOnly).toContain(join(wt, ".git"));
     expect(g.readOnly).toContain(join(nested, ".git"));
     expect(g.readOnly).not.toContain(own);
-    for (const d of ["hooks", "info", "modules"]) expect(statSync(join(common, d)).isDirectory()).toBe(true);
+    for (const d of ["hooks", "info", "modules", "remotes", "branches"]) expect(statSync(join(common, d)).isDirectory()).toBe(true);
+    // No HEAD placeholder in a linked worktree: its `.git` file, made invalid, doesn't fall through.
+    expect(existsSync(join(wt, "HEAD"))).toBe(false);
     // Placeholders: an empty config.worktree in every git dir, and a commondir naming the repository's git dir itself.
     expect(readFileSync(join(common, "config.worktree"), "utf8")).toBe("");
     expect(readFileSync(join(common, "worktrees", "nested", "config.worktree"), "utf8")).toBe("");
@@ -151,10 +152,13 @@ describe("the workspace's git repository", () => {
     expect(git(["rev-parse", "--path-format=absolute", "--git-common-dir"], repo).trim()).toBe(realpathSync(common));
     // A plain repository: its .git bound writable at its own path (no rename), the same held read-only.
     const plain = gitWorkspacePaths(repo, home);
-    expect(plain.writable).toEqual([common, join(common, "worktrees")]);
+    expect(plain.writable).toEqual([common]);
     expect(plain.gitDirs).toEqual([common]);
-    for (const p of ["hooks", "config", "commondir"]) expect(plain.readOnly).toContain(join(common, p));
-    expect(plain.readOnly).toContain(join(common, "worktrees", "gh-wt"));
+    for (const p of ["hooks", "config", "commondir", "worktrees"]) expect(plain.readOnly).toContain(join(common, p));
+    // Its top can't become a git dir of its own when .git is made invalid: an empty HEAD dir, held (#448 round 3).
+    expect(plain.readOnly).toContain(join(repo, "HEAD"));
+    expect(readdirSync(join(repo, "HEAD"))).toEqual([]);
+    expect(git(["status", "--porcelain"], repo)).not.toContain("HEAD");
     // A subdir of it: as git finds it, upward.
     mkdirSync(join(repo, "sub"));
     expect(gitWorkspacePaths(join(repo, "sub"), home).readOnly).toContain(join(common, "config"));
@@ -170,7 +174,7 @@ describe("the workspace's git repository", () => {
     const g = gitWorkspacePaths(repo, home);
     expect(g.writable).toEqual([]);
     expect(g.gitDirs).toEqual([]);
-    expect(g.readOnly).toEqual([join(repo, ".git")]);
+    expect(g.readOnly).toEqual([join(repo, "HEAD"), join(repo, ".git")]);
   });
 
   test("the project settings agent CLIs run code from: read-only, their dirs made empty first (git doesn't see them), a top-level file only where it exists, never a link (#448 round 2)", () => {
@@ -252,7 +256,7 @@ describe("the workspace's git repository", () => {
     expect(existsSync(elsewhere)).toBe(false);
   });
 
-  test("a .git file naming anything but git's own worktree layout, back-linked to it, gets nothing", () => {
+  test("a .git file naming anything git's own records don't name back: nothing writable, the .git file (and what it names inside the workspace) read-only (#448 round 3)", () => {
     const home = join(root, "gf");
     const ws = join(home, "proj");
     const target = join(home, ".ssh");
@@ -260,7 +264,8 @@ describe("the workspace's git repository", () => {
     mkdirSync(join(target, "worktrees", "x"), { recursive: true });
     for (const named of [target, join(target, "worktrees", "x"), "../.ssh"]) {
       writeFileSync(join(ws, ".git"), `gitdir: ${named}\n`);
-      expect(gitWorkspacePaths(ws, home)).toEqual({ writable: [], readOnly: [], gitDirs: [] });
+      expect(gitWorkspacePaths(ws, home)).toEqual({ writable: [], readOnly: [join(ws, ".git")], gitDirs: [] });
+      expect(gitLayoutProblem(ws, home)).toContain("committing from inside fails");
     }
     // Even a real repository's worktree dir, when its back-link names another worktree.
     const repo = join(home, "repo");
@@ -269,11 +274,39 @@ describe("the workspace's git repository", () => {
     mkdirSync(join(repo, ".git", "worktrees", "other"), { recursive: true });
     writeFileSync(join(repo, ".git", "worktrees", "other", "gitdir"), `${join(root, "elsewhere", ".git")}\n`);
     writeFileSync(join(ws, ".git"), `gitdir: ${join(repo, ".git", "worktrees", "other")}\n`);
-    expect(gitWorkspacePaths(ws, home)).toEqual({ writable: [], readOnly: [], gitDirs: [] });
-    // A link where `.git` should be is no repository either.
+    expect(gitWorkspacePaths(ws, home)).toEqual({ writable: [], readOnly: [join(ws, ".git")], gitDirs: [] });
+    // A git dir inside the workspace that names nothing back (--separate-git-dir into it): read-only whole too.
+    git(["init", "-q", `--separate-git-dir=${join(ws, ".store")}`, join(home, "unused")], home);
+    writeFileSync(join(ws, ".git"), `gitdir: ${join(ws, ".store")}\n`);
+    expect(gitWorkspacePaths(ws, home)).toEqual({ writable: [], readOnly: [join(ws, ".git"), join(ws, ".store")], gitDirs: [] });
+    // A link where `.git` should be is no repository either (and can't be held).
     rmSync(join(ws, ".git"));
     symlinkSync(join(repo, ".git"), join(ws, ".git"));
     expect(gitWorkspacePaths(ws, home)).toEqual({ writable: [], readOnly: [], gitDirs: [] });
+    expect(gitLayoutProblem(repo, home)).toBeNull();
+  });
+
+  test("a submodule checkout: its git dir (named back by its core.worktree) is treated as the repository's, its .git file held (#448 round 3)", () => {
+    const home = join(root, "gs");
+    const src = join(home, "src");
+    const sup = join(home, "super");
+    mkdirSync(src, { recursive: true });
+    mkdirSync(sup);
+    git(["init", "-q", "-b", "main"], src);
+    writeFileSync(join(src, "f"), "f");
+    git(["add", "."], src);
+    git(["commit", "-qm", "s"], src);
+    git(["init", "-q", "-b", "main"], sup);
+    git(["-c", "protocol.file.allow=always", "submodule", "add", "-q", src, "sub"], sup);
+    const ws = join(sup, "sub");
+    const modules = join(sup, ".git", "modules", "sub");
+    expect(gitLayoutOf(ws, home)).toEqual({ dotgit: join(ws, ".git"), kind: "submodule", common: modules, own: null });
+    const g = gitWorkspacePaths(ws, home);
+    expect(g.writable).toEqual([modules]);
+    expect(g.gitDirs).toEqual([modules]);
+    for (const p of ["config", "hooks", "commondir", "info", "worktrees"]) expect(g.readOnly).toContain(join(modules, p));
+    expect(g.readOnly).toContain(join(ws, ".git"));
+    expect(gitLayoutProblem(ws, home)).toBeNull();
   });
 
   test("never the home's own repository (dotfiles) or the root's", () => {
@@ -285,6 +318,29 @@ describe("the workspace's git repository", () => {
 });
 
 describe("Claude's own sandbox, with the home model", () => {
+  test("a read-only dir holding a writable one (worktrees/ holding this worktree's git dir) is denied entry by entry around it; a plain repository's worktrees/ whole (#448 round 3)", () => {
+    const home = join(root, "da");
+    const repo = join(home, "repo");
+    mkdirSync(repo, { recursive: true });
+    git(["init", "-q", "-b", "main"], repo);
+    writeFileSync(join(repo, "a"), "a");
+    git(["add", "."], repo);
+    git(["commit", "-qm", "i"], repo);
+    const wt = join(root, "da-wt");
+    git(["worktree", "add", "-q", "-b", "f", wt], repo);
+    git(["worktree", "add", "-q", "-b", "g", join(root, "da-other")], repo);
+    const worktrees = join(repo, ".git", "worktrees");
+    const g = gitWorkspacePaths(wt, home);
+    const deny = denyAround(g.readOnly, g.writable);
+    expect(deny).not.toContain(worktrees);
+    expect(deny).toContain(join(worktrees, "da-other"));
+    expect(deny).not.toContain(join(worktrees, "da-wt"));
+    expect(deny).toContain(join(worktrees, "da-wt", "commondir"));
+    expect(deny).toContain(join(repo, ".git", "config"));
+    const plain = gitWorkspacePaths(repo, home);
+    expect(denyAround(plain.readOnly, plain.writable)).toContain(worktrees);
+  });
+
   test("every path physical: a socket behind a linked dir (/var/run → /run) is named where it is; what doesn't exist yet keeps its name under its real parent", () => {
     const real = join(root, "run");
     mkdirSync(real);

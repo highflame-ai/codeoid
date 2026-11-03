@@ -178,6 +178,48 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(listing).not.toContain("codeoid-login-");
   }, 120_000);
 
+  test("a worktree added while a command runs is read-only to it, under Claude's sandbox too (a plain repository's worktrees/ is held whole) (#448 round 3)", async () => {
+    const r2 = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-claude-late-")));
+    try {
+      const home = join(r2, "home");
+      const repo = join(home, "proj");
+      mkdirSync(repo, { recursive: true });
+      const genv = { ...process.env, HOME: home, GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com" };
+      const git = (args: string[], cwd: string) => Bun.spawnSync(["git", ...args], { cwd, env: genv });
+      git(["init", "-q", "-b", "main"], repo);
+      writeFileSync(join(repo, "a.txt"), "a\n");
+      git(["add", "."], repo);
+      git(["commit", "-qm", "init"], repo);
+      const lateDir = join(repo, ".git", "worktrees", "late");
+      const command = [
+        `touch ${join(repo, "started")}`,
+        `i=0; while [ ! -e ${join(repo, "go")} ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done`,
+        `echo /elsewhere > ${join(lateDir, "commondir")} 2>/dev/null && echo REWROTE || echo LATE-READ-ONLY`,
+        `echo t > ${join(repo, "t.txt")} && git add t.txt && git -c user.name=t -c user.email=t@example.com commit -qm inside && echo COMMITTED`,
+      ].join("; ");
+      const file = join(r2, "cmd-late.txt");
+      writeFileSync(file, command);
+      const p = Bun.spawn([process.execPath, PROBE, r2, "off", file, "policy"], { stdout: "pipe", stderr: "pipe", timeout: 90_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
+      let exited = false;
+      void p.exited.then(() => {
+        exited = true;
+      });
+      for (let i = 0; i < 600 && !exited && !existsSync(join(repo, "started")); i++) await Bun.sleep(100);
+      expect(existsSync(join(repo, "started"))).toBe(true);
+      expect(git(["worktree", "add", "-q", "-b", "late", join(r2, "late")], repo).exitCode).toBe(0);
+      writeFileSync(join(repo, "go"), "");
+      const out = await new Response(p.stdout).text();
+      await p.exited;
+      const r = JSON.parse(out.trim().split("\n").at(-1) ?? "{}") as { result: string; toolResult: string | null };
+      expect(r.result).toBe("success");
+      expect(r.toolResult).toContain("LATE-READ-ONLY");
+      expect(r.toolResult).toContain("COMMITTED");
+      expect(readFileSync(join(lateDir, "commondir"), "utf8")).not.toContain("elsewhere");
+    } finally {
+      rmSync(r2, { recursive: true, force: true });
+    }
+  }, 120_000);
+
   test("the toolchains' cache variables reach only sandboxed commands: never the CLI, its MCP servers, or a command run outside the sandbox (#448 round 3)", async () => {
     mkdirSync(join(root, "home", "proj"), { recursive: true });
     const show = `echo "cargo=[$CARGO_HOME] gomod=[$GOMODCACHE] npm=[$npm_config_cache] xdg=[$XDG_CACHE_HOME] marker=[$SANDBOX_RUNTIME]"`;

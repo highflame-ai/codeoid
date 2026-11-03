@@ -264,9 +264,14 @@ workspace + a private temp dir writable; the workspace's git repository
 what a commit writes is writable, its git dirs bound at their own paths (no
 rename), and what picks config, hooks or git dir read-only
 (`SandboxSpec.readOnly`: `config`, `config.worktree`, `commondir`, `hooks/`,
-`info/`, `modules/`, other worktrees' git dirs, a worktree's `commondir`/
-`gitdir`, `.git` files), made first where missing (a `commondir` of `.`); a
-link among them makes the git dir read-only whole; `SandboxSpec.gitDirs` are
+`info/`, `modules/`, `remotes/`, `branches/`, `worktrees/` whole (the own
+worktree git dir writable over it; Claude native: `denyAround`), a worktree's
+`commondir`/`gitdir`, `.git` files, an empty `HEAD/` beside a plain `.git` at
+the workspace top so an invalidated `.git` can't fall through to a planted
+bare repo), made first where missing (a `commondir` of `.`); a submodule's git
+dir (its `core.worktree` names it back) is the repository's (`gitLayoutOf`);
+any other `.git` file is held read-only and said in the sandbox's limits
+(`gitLayoutProblem`); a link among them makes the git dir read-only whole; `SandboxSpec.gitDirs` are
 Codex's extra writable roots. The project settings agent CLIs run code from
 (`PROJECT_CONFIG_DIRS`/`_FILES`: `.claude/`, `.mcp.json`, …) read-only, and a
 file tool writing them asks in every mode while sandboxed

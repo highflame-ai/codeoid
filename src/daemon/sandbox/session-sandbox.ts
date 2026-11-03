@@ -20,7 +20,7 @@ import type { CodeoidConfig } from "../../config.js";
 import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { CWD_FROM_CALLER } from "./docker.js";
-import { buildSandboxSpec, networkPolicyOf, type SandboxConfig, sandboxConfigOf, validAllowedHost } from "./policy.js";
+import { buildSandboxSpec, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, validAllowedHost } from "./policy.js";
 import type { SandboxRegistry } from "./registry.js";
 import { launcherRoot, sandboxRoot } from "./root.js";
 import {
@@ -208,7 +208,9 @@ export async function resolveSandbox(opts: {
   const c = confinementFor(opts.backendId, provider, opts.registry.host);
   if (!c.ok) return { info: { ...base, ...named, state: "unavailable", reason: c.reason, enforced: false }, provider, plan: null, network };
   const net = enforcedNetwork(c.plan, network.mode, provider.displayName);
-  const limits = [...c.plan.limits, ...(net.note ? [net.note] : [])];
+  // A repository whose `.git` names a git dir codeoid can't verify: held read-only, said (policy.ts gitWorkspacePaths).
+  const gitNote = opts.workspace !== undefined && c.plan.kind !== "no-shell" ? gitLayoutProblem(opts.workspace) : null;
+  const limits = [...c.plan.limits, ...(net.note ? [net.note] : []), ...(gitNote ? [gitNote] : [])];
   const applied: NetworkPolicy = net.mode === "allowlist" ? network : { mode: net.mode };
   return {
     info: {

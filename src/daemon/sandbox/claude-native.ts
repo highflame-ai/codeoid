@@ -30,7 +30,7 @@
  *     its commands.
  */
 
-import { realpathSync, renameSync, writeFileSync } from "node:fs";
+import { readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { SandboxSettings } from "@anthropic-ai/claude-agent-sdk";
@@ -127,7 +127,7 @@ export function claudeSandboxSettings(rt: Pick<SandboxRuntime, "spec" | "config"
       // would run outside the sandbox from the CLI's next start. A
       // repository's hooks and config, for the same reason. And every dir
       // between the workspace and a hidden path in it (nothing renames it away).
-      denyWrite: physical([...claudeSettingsPaths(spec.workspace, env), ...(spec.readOnly ?? []), ...(spec.pinned ?? [])]),
+      denyWrite: physical([...claudeSettingsPaths(spec.workspace, env), ...denyAround(spec.readOnly ?? [], spec.writable), ...(spec.pinned ?? [])]),
       denyRead: physical([...spec.hidden, ...spec.containerSockets]),
       // Inside the denied home: the allowlist, and what is written (a workspace in it).
       allowRead: physical([spec.workspace, tempDir, ...spec.writable, ...spec.reexposed]),
@@ -136,6 +136,40 @@ export function claudeSandboxSettings(rt: Pick<SandboxRuntime, "spec" | "config"
     ...(envVars.length > 0 ? { credentials: { envVars } } : {}),
     ...(rt.config.bwrapPath ? { bwrapPath: rt.config.bwrapPath } : {}),
   };
+}
+
+/**
+ * `readOnly` as the CLI's `denyWrite` can hold it. Its denials win over
+ * `allowWrite` wherever they overlap, so a read-only dir holding a writable
+ * one (a repository's `worktrees/` holding this worktree's own git dir) is
+ * denied entry by entry instead, all but the way down to the writable one:
+ * what is made in it later (a worktree added after the query started) isn't
+ * held there (docs/sandbox.md, Limits). Read-only paths inside the writable
+ * one (its `commondir`) stay as they are.
+ */
+export function denyAround(readOnly: readonly string[], writable: readonly string[]): string[] {
+  const out: string[] = [];
+  const inside = (child: string, parent: string) => child !== parent && child.startsWith(`${parent}/`);
+  const split = (dir: string, keep: string[]): void => {
+    let names: string[] = [];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      const at = join(dir, name);
+      const held = keep.filter((w) => w === at || inside(w, at));
+      if (held.length === 0) out.push(at);
+      else if (!held.includes(at)) split(at, held);
+    }
+  };
+  for (const r of readOnly) {
+    const keep = writable.map((w) => resolve(w)).filter((w) => inside(w, resolve(r)));
+    if (keep.length === 0) out.push(r);
+    else split(resolve(r), keep);
+  }
+  return out;
 }
 
 /**
