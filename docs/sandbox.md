@@ -354,7 +354,7 @@ to the workspace.
   `denyWrite` wins over `allowWrite` wherever they overlap, a linked
   worktree's `worktrees/` is held entry by entry around its own git dir, so a
   worktree added while its query runs isn't held there (the end-of-session
-  check below sees its `commondir` change); a plain repository's
+  warning, above, names its `commondir` if it changes); a plain repository's
   `worktrees/` is held whole there too. Not held,
   because they are the workspace's own content: a repository planted in a
   subdirectory of the workspace (a `.git` made in a directory that had none,
