@@ -32,7 +32,7 @@ import { daemonOwnedDirs } from "../data-lock.js";
 import { cliCredentialFiles, registeredSecretLocations } from "../secret-paths.js";
 import { DEFAULT_HOME_READABLE } from "./home-readable.js";
 import { validAllowedHost } from "./hosts.js";
-import { sandboxRootIfMade } from "./root.js";
+import { sandboxRoot } from "./root.js";
 import type { NetworkMode, NetworkPolicy, SandboxSpec } from "./types.js";
 
 export { DEFAULT_HOME_READABLE, validAllowedHost };
@@ -623,7 +623,8 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const cache = inputs.cache === false ? null : sandboxCacheDir(home, env);
   const own = [...(inputs.backendState ?? []).map((p) => resolve(p)), ...git.writable, ...(cache ? [cache] : [])];
   const ownReal = own.map(realOr);
-  const root = sandboxRootIfMade();
+  // Made now if it wasn't: what the daemon puts there later is hidden too.
+  const root = sandboxRootOrNull();
   const tempDir = resolve(inputs.tempDir);
   // A workspace that is the home itself: the home is what the session works on (the hidden list still applies in it).
   const homeHidden = hiddenHome(home) === workspace ? null : hiddenHome(home);
@@ -663,6 +664,14 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     network: inputs.network,
     unsetEnv: SANDBOX_UNSET_ENV,
   };
+}
+
+function sandboxRootOrNull(): string | null {
+  try {
+    return sandboxRoot();
+  } catch {
+    return null;
+  }
 }
 
 function realOr(p: string): string {

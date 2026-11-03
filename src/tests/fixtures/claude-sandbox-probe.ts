@@ -17,11 +17,12 @@
  * canUseTool here allows a sandboxed call and DENIES one asking to run
  * outside the sandbox, as codeoid's gate would until its owner says yes.
  */
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { type ClaudeTempDirs, claudeSandboxSettings, claudeTempEnv } from "../../daemon/sandbox/claude-native.js";
 import { buildSandboxSpec } from "../../daemon/sandbox/policy.js";
+import { daemonTempDir } from "../../daemon/sandbox/root.js";
 
 const [root = "", networkArg = "off", commandFile = "", flag = "", allowHost = ""] = process.argv.slice(2);
 const network = networkArg as "on" | "off" | "allowlist";
@@ -109,6 +110,13 @@ const spec = policy
       unsetEnv: [],
     };
 const sandbox = claudeSandboxSettings({ spec, config } as never, env, policy ? temp : undefined);
+// A sign-in started after the session's sandbox was built (#448 round 2): its home where the daemon makes it, the
+// path told to the test through a file.
+if (process.env.CODEOID_PROBE_SIGNIN_PATH) {
+  const signin = daemonTempDir("codeoid-login-");
+  writeFileSync(join(signin, ".credentials.json"), "PLANTED-SIGNIN-TOKEN\n");
+  writeFileSync(process.env.CODEOID_PROBE_SIGNIN_PATH, signin);
+}
 const asked: string[] = [];
 let result = "";
 try {

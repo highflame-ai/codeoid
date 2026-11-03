@@ -160,6 +160,24 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(existsSync(join(repo, ".git", "hooks", "post-commit"))).toBe(false);
   }, 120_000);
 
+  test("codeoid's own temp entries are hidden from Claude's sandbox, which keeps the host's /tmp: a sign-in made while the session runs is unreadable (#448 round 2)", async () => {
+    const pathFile = join(root, "signin-path");
+    const file = join(root, "cmd-signin.txt");
+    // The sign-in is made after the sandbox settings are built; its path is read when the command runs.
+    writeFileSync(file, `s=$(cat ${pathFile}); cat "$s/.credentials.json" 2>&1 || echo SIGNIN-UNREADABLE; ls "$(dirname "$s")" 2>&1 | head -3; echo LS-DONE`);
+    const p = Bun.spawn([process.execPath, PROBE, root, "off", file, "policy"], { stdout: "pipe", stderr: "pipe", timeout: 90_000, env: { ...process.env, CODEOID_PROBE_SIGNIN_PATH: pathFile } });
+    const out = await new Response(p.stdout).text();
+    await p.exited;
+    const r = JSON.parse(out.trim().split("\n").at(-1) ?? "{}") as { result: string; toolResult: string | null };
+    expect(r.result).toBe("success");
+    expect(existsSync(pathFile)).toBe(true);
+    expect(r.toolResult).not.toContain("PLANTED-SIGNIN-TOKEN");
+    expect(r.toolResult).toContain("SIGNIN-UNREADABLE");
+    // Nor is the daemon's private dir listable (cat's own error repeats the path it was given).
+    const listing = (r.toolResult ?? "").split("SIGNIN-UNREADABLE")[1]?.split("LS-DONE")[0] ?? "";
+    expect(listing).not.toContain("codeoid-login-");
+  }, 120_000);
+
   test("a command asking to run outside the sandbox reaches the gate, and a denial means it never runs", async () => {
     const r = await probe("off", `rm -rf ${outside}; echo RAN`, ["unsandboxed"]);
     expect(r.asked).toEqual(["Bash"]);

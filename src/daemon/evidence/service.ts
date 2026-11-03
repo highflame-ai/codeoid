@@ -8,12 +8,12 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { type RunCheckOptions, runCheck } from "./runner.js";
 import type { EvidenceStore, EvidenceTenant } from "./store.js";
 import type { CheckOutcome, CheckSpec, EvidenceOwnerKind, EvidenceRecord } from "./types.js";
+import { daemonTempDir } from "../sandbox/root.js";
 
 /** Who the evidence is for and what it judged. */
 export interface EvidenceContext {
@@ -207,7 +207,7 @@ function safeReaddir(dir: string): string[] {
  * artifact paths do not.
  */
 export const ephemeralCheck: CheckRunner = async (spec, cwd) => {
-  const artifactDir = mkdtempSync(join(tmpdir(), "codeoid-evidence-"));
+  const artifactDir = daemonTempDir("codeoid-evidence-");
   try {
     return { outcome: await runCheck(spec, { cwd, artifactDir }) };
   } finally {

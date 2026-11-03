@@ -1,14 +1,17 @@
 /**
  * The daemon's own directory for what it makes for sandboxes (#448): each
  * session's private temp dir, the launchers that start a backend or a shell
- * line inside one, a check's temp dir. One per daemon process, made private
- * (mkdtemp, 0700) under the daemon's temp dir, and hidden from every sandbox
- * (policy.ts): a session whose workspace is `/tmp` or `/` must not reach
- * another session's temp dir, or rewrite a launcher that would then run
- * outside its sandbox.
+ * line inside one, a check's temp dir — and every other temp entry of the
+ * daemon's ({@link daemonTempDir}: sign-in homes, a check's artifacts, a
+ * loop's index, pi's bridge). One per daemon process, made private
+ * (mkdtemp, 0700) under the daemon's temp dir at its start, and hidden from
+ * every sandbox (policy.ts): a session whose workspace is `/tmp` or `/` must
+ * not reach another session's temp dir, or rewrite a launcher that would then
+ * run outside its sandbox, and Claude's own sandbox, which keeps the host's
+ * `/tmp`, must not read a sign-in made while it runs.
  */
 
-import { lstatSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -44,6 +47,31 @@ export function sandboxRoot(): string {
 /** The root, when it has been made (for the hidden list: nothing to hide before). */
 export function sandboxRootIfMade(): string | null {
   return root;
+}
+
+/**
+ * A fresh private dir of the daemon's own, `<root>/<prefix>XXXXXX`: under the
+ * root every sandbox hides, whenever it is made (a sign-in started after a
+ * session's sandbox was built is hidden from it too).
+ */
+export function daemonTempDir(prefix: string): string {
+  return mkdtempSync(join(sandboxRoot(), prefix));
+}
+
+/** A path for a temp file of the daemon's own (not made), under the root every sandbox hides. */
+export function daemonTempPath(name: string): string {
+  return join(sandboxRoot(), name);
+}
+
+/** Every daemon's root in `tmp` (this one's, another's, a killed one's): `codeoid-sandbox-*`. */
+export function sandboxRootsIn(tmp: string = tmpdir()): string[] {
+  try {
+    return readdirSync(tmp)
+      .filter((n) => n.startsWith("codeoid-sandbox-"))
+      .map((n) => join(tmp, n));
+  } catch {
+    return [];
+  }
 }
 
 /** Where every launcher lives: `<this>…/launch-<n>` (opencode's shell shim checks the prefix). */

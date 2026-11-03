@@ -9,7 +9,6 @@
 import type { CheckSandbox } from "../sandbox/session-sandbox.js";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants as fsConstants, copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
-import { tmpdir } from "node:os";
 import { basename, dirname, join, relative } from "node:path";
 import type { AuthContext } from "../../protocol/types.js";
 import type { Dispatcher } from "../dispatch.js";
@@ -25,6 +24,7 @@ import { assertNoLinkedParent, commitTree, copyDir, fingerprint, listTree, remov
 import type { CandidateCheckout, LoopHost, PreparedWorkspace, WorkerInfo } from "./service.js";
 import { githubFetch, parseGithubRemote } from "./triggers/github.js";
 import { type LoopRunRow, LoopWorkspaceUnsupportedError } from "./types.js";
+import { daemonTempPath } from "../sandbox/root.js";
 
 
 /**
@@ -594,7 +594,7 @@ export function buildLoopHost(d: LoopHostDeps): LoopHost {
     // id is what delivery commits, so what was verified is what lands.
     snapshot: async (run) => {
       if (!run.baseRevision) return { ok: false, reason: "the run has no workspace" };
-      const index = join(tmpdir(), `codeoid-loop-index-${run.id}-${randomUUID()}`);
+      const index = daemonTempPath(`codeoid-loop-index-${run.id}-${randomUUID()}`);
       try {
         const { root, env: pin } = pinnedGit(run);
         const env = { ...pin, GIT_INDEX_FILE: index };

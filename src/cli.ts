@@ -28,6 +28,7 @@ import pkg from "../package.json" with { type: "json" };
 import { acquireDaemonLocks, type DaemonLocks, DataDirLockError, daemonOwnedDirs } from "./daemon/data-lock.js";
 import { sandboxConfigOf } from "./daemon/sandbox/policy.js";
 import { createDefaultSandboxRegistry } from "./daemon/sandbox/registry.js";
+import { sandboxRoot } from "./daemon/sandbox/root.js";
 import { DaemonServer } from "./daemon/server.js";
 import { DefaultProviderError } from "./daemon/providers/registry.js";
 import { clearStaleOpencodeCredentials } from "./daemon/providers/opencode/credentials.js";
@@ -147,7 +148,10 @@ program
       process.exit(1);
     }
 
-    // The OS sandbox agents' commands run in (#448): on by default.
+    // The OS sandbox agents' commands run in (#448): on by default. The
+    // daemon's private temp root first: every sandbox hides it, so what the
+    // daemon makes there later (a sign-in's home) is hidden from each.
+    sandboxRoot();
     const sandboxConfig = sandboxConfigOf(config);
     const sandboxRegistry = createDefaultSandboxRegistry(sandboxConfig);
     void sandboxRegistry.resolve(sandboxConfig.provider).then((r) => {

@@ -44,10 +44,10 @@
 
 import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
-import { appendFile, copyFile, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { appendFile, copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { daemonTempDir } from "./sandbox/root.js";
 
 const execFileP = promisify(execFile);
 
@@ -769,7 +769,7 @@ export function shadowGitLiteral(root: string, sessionId: string, args: string[]
 export async function ignoredUnderTree(root: string, sessionId: string, sha: string, paths: readonly string[]): Promise<string[]> {
   if (paths.length === 0) return [];
   const shadow = shadowRepoPath(root, sessionId);
-  const scratch = await mkdtemp(path.join(tmpdir(), "codeoid-ign-"));
+  const scratch = daemonTempDir("codeoid-ign-");
   const t = DEFAULT_CHECKPOINT_LIMITS.timeoutMs;
   try {
     const listed = await run(["ls-tree", "-r", "-z", "--name-only", sha], {
