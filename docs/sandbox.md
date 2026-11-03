@@ -20,15 +20,22 @@ With the default policy (workspace-write):
 
 | | |
 |---|---|
-| **Writable** | the session's working directory (its worktree), and a private temp dir made for the session (`$TMPDIR`, and the sandbox's `/tmp` under bubblewrap and Docker). Nothing else. |
-| **Read-only** | everything else on the machine. `rm -rf ~` fails with "Read-only file system". |
-| **Hidden** (not readable at all) | codeoid's config dir (`~/.codeoid`: keys, accounts, endpoints, the local token) and every data dir it owns (the database, transcripts and checkpoints, opencode's database and data dirs, memory's; their lock files); the agent CLIs' logins (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.qwen/oauth_creds.json`, `~/.gemini/oauth_creds.json` …, pi's `auth.json`) and what backends registered as credentials (opencode's key files); `~/.ssh`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.config/gh`, `~/.config/hub`, `~/.config/glab-cli`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.local/share/keyrings`, `~/.password-store`, `~/.config/op`, `~/.vault-token`, `~/.pypirc`, `~/.cargo/credentials(.toml)`, `~/.terraform.d/credentials.tfrc.json`, `~/.claude.json` (MCP tokens), `~/Library/Keychains`; the desktop session's runtime dir (`$XDG_RUNTIME_DIR`: keyring, D-Bus, agent sockets) and `$SSH_AUTH_SOCK`'s dir; the daemon's own temp dir when it isn't `/tmp` (sign-in homes); plus `sandbox.hiddenPaths`. |
+| **Your home: hidden whole** | the sandbox starts from an empty, read-only home. A credential that isn't on any list, one created after the session started (`aws configure`, `gh auth login`), or one a program replaces by writing a new file and renaming it over the old one, is simply not there. What is shown again, read-only: the **allowlist** `sandbox.homeReadable` (below), and what the backend itself needs (its program; its private home, below). The workspace, when it is in your home, is shown writable. |
+| **Home allowlist** (`sandbox.homeReadable`, read-only) | by default toolchains and tool settings that hold no secret: `~/.bun`, `~/.cargo/bin`, `~/.cargo/registry`, `~/.cargo/git`, `~/.rustup`, `~/.nvm`, `~/.npm`, `~/.local/bin`, `~/.local/share/pnpm`, `~/.pyenv`, `~/go/pkg`, `~/go/bin`, `~/.gitconfig`, `~/.config/git/config`, `~/.config/git/ignore`, `~/.config/git/attributes`. Not listed, so hidden: `~/.npmrc`, `~/.bunfig.toml`, `~/.yarnrc.yml`, `~/.pypirc`, `~/.cargo/credentials.toml`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.gradle`, `~/.m2` and everything else. A global npmrc inside an nvm install (`~/.nvm/versions/node/*/etc/npmrc`) is hidden again. A link in the list (`~/.gitconfig` into a dotfiles repository) is shown at its own path and where it leads. A token written into `~/.gitconfig` itself (a URL carrying one, an `http.extraHeader`) would show: keep it in a credential helper. |
+| **Writable** | the session's working directory (its worktree), a private temp dir made for the session (`$TMPDIR`, and the sandbox's `/tmp` under bubblewrap and Docker), and the workspace's **git repository**: a linked worktree's git dir and its repository's (objects, refs, logs, `packed-refs.lock`), wherever they are, a repository under the host's `/tmp` included. Nothing else. |
+| **Read-only** | everything else on the machine. `rm -rf ~` fails with "Read-only file system". Inside the writable, a repository's `hooks/`, `config`, `config.worktree` and `modules/` (a submodule's git dir carries hooks and config of its own) stay read-only: a hook, `core.hooksPath` or `core.fsmonitor` planted there would run outside the sandbox at your next `git commit`. |
+| **Hidden besides** (not readable at all) | outside the home, or in a workspace that holds it: codeoid's config dir (`~/.codeoid`: keys, accounts, endpoints, the local token) and every data dir it owns wherever it is configured (the database, transcripts and checkpoints, opencode's database and data dirs, memory's; their lock files); the agent CLIs' logins (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.qwen/oauth_creds.json`, `~/.gemini/oauth_creds.json` …, pi's `auth.json`) and what backends registered as credentials (opencode's key files); `~/.ssh`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.config/gh`, `~/.config/hub`, `~/.config/glab-cli`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.local/share/keyrings`, `~/.password-store`, `~/.config/op`, `~/.vault-token`, `~/.pypirc`, `~/.cargo/credentials(.toml)`, `~/.terraform.d/credentials.tfrc.json`, `~/.claude.json` (MCP tokens), `~/.local/share/opencode/auth.json` and `mcp-auth.json`, `~/.config/github-copilot`, `~/.pgpass`, `~/.config/rclone`, `~/.s3cfg`, `~/.boto`, `~/.pulumi/credentials.json`, `~/.config/doctl`, `~/.fly`, `~/.npmrc`, `~/.bunfig.toml`, `~/.yarnrc.yml`, `~/.gradle/gradle.properties`, `~/.m2/settings.xml`, `~/Library/Keychains`; the desktop session's runtime dir (`$XDG_RUNTIME_DIR`: keyring, D-Bus, agent sockets) and `$SSH_AUTH_SOCK`'s dir; the daemon's own temp dir when it isn't `/tmp` (sign-in homes); plus `sandbox.hiddenPaths` (which also beats the allowlist). |
 | **Never reachable** | container runtime sockets: `/run/docker.sock`, `/var/run/docker.sock`, containerd, podman, CRI-O, buildkit, k3s, the user's rootless sockets, Docker Desktop / Colima / Lima / Rancher / OrbStack, `$DOCKER_HOST`. A container socket is root on the machine. |
 | **Environment** | `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GPG_AGENT_INFO`, `DBUS_SESSION_BUS_ADDRESS`, `DOCKER_HOST`, `CONTAINER_HOST`, `KUBECONFIG` are unset inside. On Claude, every credential-named variable the CLI runs with is denied to its commands. |
 | **Network** | `on` (default), `off`, or `allowlist` (hosts in `sandbox.allowedHosts`), per session and in config. |
-| **Processes** | no new privileges; under bubblewrap a pid namespace (the sandbox sees only its own processes, so not the daemon's or the CLI's environment) and processes die with the session. |
-| **Hidden stays hidden** | every directory between the workspace and a hidden path inside it (a workspace of `~` holding `~/.config/gh`) is read-only, so it can't be renamed to move the hidden path out from under its rule. The daemon's own sandbox dir (each session's temp dir, the launchers) is hidden from every session, a session whose workspace is `/tmp` or `/` included. |
+| **Processes** | no new privileges; under bubblewrap a pid namespace (the sandbox sees only its own processes, so not the daemon's or the CLI's environment) and processes die with the sandbox they run in (see Limits for opencode). |
+| **Hidden stays hidden** | every directory between the workspace and a hidden path inside it (a workspace of `/home` holding your home, a `sandbox.hiddenPaths` entry inside the project) is pinned: it can't be renamed or removed, so the hidden path can't be moved out from under its rule; what is in it stays writable (on Claude's own sandbox the whole dir is read-only: see Limits). The daemon's own sandbox dir (each session's temp dir, private homes, the launchers) is hidden from every session, a session whose workspace is `/tmp` included. |
 | **Loop checks** | a loop's acceptance checks judge agent-written code, so they run in the loop's sandbox too (the check's checkout writable, credentials hidden), recorded `isolation: "sandbox"`; one whose sandbox can't run is an `error`, not a pass. |
+
+A workspace of `/` can't be sandboxed (the whole filesystem would be writable,
+the sandbox's own `/proc`, `/dev` and `/tmp` covered): such a session is "not
+sandboxed" (interactive runs and says so, unattended is refused), and a check
+there is refused.
 
 A command that needs more fails inside the sandbox and the agent sees why
 (`Read-only file system`, `No such file or directory`, a refused connection;
@@ -43,15 +50,23 @@ UI's settings and `/settings`) is the default for new sessions:
 | Value | |
 |---|---|
 | `auto` (default) | bubblewrap on Linux, Seatbelt on macOS |
-| `bwrap` | [bubblewrap](https://github.com/containers/bubblewrap) (Linux; `apt install bubblewrap`). Claude Code also needs `socat` for its network proxy. |
+| `bwrap` | [bubblewrap](https://github.com/containers/bubblewrap) (Linux; `apt install bubblewrap`). Claude Code's own sandbox also needs `socat` (`apt install socat`); without it a Claude session is "not sandboxed", with that reason. |
 | `seatbelt` | macOS `sandbox-exec` |
 | `docker` | a container of `sandbox.docker.image` (default `node:22-bookworm-slim`; it must carry what the backend runs). `sandbox.docker.runtime: runsc` runs it on gVisor, a separate kernel. Never chosen by `auto`. |
 | `off` | no sandbox: commands run with your full rights |
 
 `sandbox.network` (`CODEOID_SANDBOX_NETWORK`): `on` | `off` | `allowlist`,
 with `sandbox.allowedHosts` (`CODEOID_SANDBOX_ALLOWED_HOSTS`, `example.com`,
-`*.example.com`). `sandbox.hiddenPaths` (`CODEOID_SANDBOX_HIDDEN_PATHS`) adds
-paths to hide (`~` expands). `sandbox.bwrapPath` picks the bwrap binary.
+`*.example.com`, `localhost`; anything else fails the config's load).
+`sandbox.hiddenPaths` (`CODEOID_SANDBOX_HIDDEN_PATHS`) adds paths to hide (`~`
+expands). `sandbox.homeReadable` (`CODEOID_SANDBOX_HOME_READABLE`, comma
+separated) replaces the home allowlist: add what your tools need that holds no
+secret (`~/.volta`, `~/.sdkman/candidates`, `~/.config/starship.toml`), never a
+file with a token. `sandbox.bwrapPath` picks the bwrap binary.
+
+Changing any `sandbox.*` setting daemon-wide (`settings.set`, the Sandbox tab)
+needs `settings:write` from an undelegated token, and is audited old → new
+(`settings.set.sandbox`; a refusal `settings.set.denied`).
 
 Per session:
 
@@ -60,18 +75,38 @@ Per session:
   `session.create`'s `sandbox: { provider?, network?, allowedHosts? }`;
 - later, by the session's owner: `codeoid sandbox set <session> <provider> [--network …]`,
   `/sandbox <auto|off|id> [on|off|allow:host,…]`, or `session.set_sandbox`.
-  Narrowing (on, the network off) is applied without asking. **Widening —
-  turning it off, a wider network, another provider — is a confirm shown on the
-  session to its owner, in every mode, and audited** (`session.sandbox_widen_ask`,
-  `…_denied`, `session.set_sandbox`); it never lands on an unattended turn, and a
-  delegated token can't ask for it. Either reaches the backend when it next
-  starts: an idle one is stopped at once, a busy one after its turn (opencode:
-  its next turn; Claude: its next query). Creating a session with `off`, or a
-  routine whose runs are `off`, needs `session:approve`. A provider named
-  explicitly that can't run here is refused (choose another, or `off`);
+  A change is made only while the session is idle: no turn running, no
+  approval or dialog waiting, no background work (a dev server, a subagent).
+  Otherwise it is refused, saying why ("the session is busy", "has background
+  work running") — what runs must match what the session reports, and a
+  backend running in the old sandbox is restarted to take the new one, never
+  in the middle of work. Narrowing (on, the network off) is applied without
+  asking. **Widening — turning it off, a wider network, another provider — is
+  a confirm shown on the session, answered only by its owner with their own
+  token (another member's or a delegated token's answer is refused, audited
+  `session.ui_response_refused`), in every mode, and audited**
+  (`session.sandbox_widen_ask`, `…_denied`, `session.set_sandbox` naming who
+  confirmed); it never lands on an unattended turn, a delegated token can't ask
+  for it, and one answered after the session got busy isn't applied (it says
+  so). Once applied, a backend process that ran (Claude, Codex, pi, the Gemini
+  CLI, Qwen) is stopped at once and starts in the new sandbox with the next
+  message; until it has been, a turn that needs the sandbox is refused
+  (opencode takes it at its next turn, Claude native at its next query).
+- **The same authority for a wider sandbox anywhere**: creating a session (or
+  starting a loop) whose sandbox is off or wider than the daemon's default —
+  `off`, a wider network, another provider, hosts the default doesn't allow —
+  needs `session:approve` and an undelegated token (audited
+  `session.sandbox_wider_refused` when refused). A fork or a compare of a
+  session with such a sandbox is made only by its owner, undelegated (anyone
+  in the tenant may fork one whose sandbox is the daemon's or narrower). A
+  session whose sandbox is off is switched to autonomous only by its owner's
+  own token. A routine whose runs are `off` needs `session:approve` (routine
+  changes are refused to delegated tokens). A provider named explicitly that
+  can't run here is refused (choose another, or `off`);
 - routines (`codeoid routine add … --sandbox …`, the spec's `sandbox`) and loops
   (`codeoid loop start … --sandbox …`, `loop.start`'s `sandbox`) take one too.
-- A fork, and a collaboration's children, keep their parent's setting.
+- A fork, and a collaboration's children, keep their parent's setting (a
+  collaboration's lead is created by the same request, under the rule above).
 
 `codeoid sandbox providers` (`sandbox.providers`) lists what the daemon has and
 whether each runs here, and why not.
@@ -79,7 +114,10 @@ whether each runs here, and why not.
 ## When it can't run
 
 Where the chosen sandbox can't run — bubblewrap missing, unprivileged user
-namespaces forbidden, a backend that provider can't hold — or can't enforce
+namespaces forbidden, Claude Code's own sandbox without `socat` on Linux (its
+network proxy's bridge: without it the CLI would refuse every query, so the
+session says "not sandboxed: Claude Code's sandbox needs socat on Linux …"
+instead), a workspace of `/`, a backend that provider can't hold — or can't enforce
 what was asked (a backend that must keep the network to reach its model, with
 the network asked off):
 
@@ -119,34 +157,61 @@ What each leaves open:
   refused, writes outside the workspace ask in autonomous mode, a write to
   `.claude/settings*.json` asks in every mode: a hook or an excluded command
   there would run outside the sandbox). Its commands can't write the project's
-  `.claude/` or the user's Claude config dir at all. The CLI's own login and key
-  are not visible to its commands (its credentials file is denied, its key
-  variables are denied to commands, and it has its own pid namespace). Network
-  `on` means hosts the CLI's proxy asks about are allowed by codeoid's gate
+  `.claude/` or the user's Claude config dir at all. The home is denied whole
+  (`denyRead`) and the allowlist allowed back (`allowRead`); verified with the
+  real CLI that it enforces it as a fresh home, so a credential made or
+  replaced while a command runs stays hidden. The CLI's own login and key are
+  not visible to its commands (its credentials file is denied, its key
+  variables are denied to commands, and it has its own pid namespace). Its
+  `TMPDIR` is a dir of the session's whose `claude-<uid>` (where it points its
+  commands' `TMPDIR`) is the commands' only writable temp dir, and its own
+  transient files (its settings file, sockets) are under
+  `CLAUDE_CODE_TMPDIR`, another dir of the session's, out of the commands'
+  reach: no session shares a temp dir with another or with your own Claude
+  Code. Every path is handed to the CLI physically resolved (its bubblewrap
+  can't mount through a linked dir such as `/var/run`). Network `on` means
+  hosts the CLI's proxy asks about are allowed by codeoid's gate
   (`SandboxNetworkAccess`). Hooks and MCP servers already in the project's
   settings run in the CLI, outside the sandbox, as they always did (#395
   approves a project's MCP servers).
-- **Codex (bubblewrap)**: codex's own home (`CODEX_HOME`, with `auth.json`) stays
-  readable by its commands — the app-server needs it, and codex's sandbox
-  doesn't hide reads. Everything else is hidden by codeoid's bubblewrap. The
-  network `off` is codex's own sandbox's (codeoid's bubblewrap keeps it on for
-  the app-server): in guarded or interactive mode, a command codex asks to rerun
-  outside its sandbox arrives as an ordinary command approval and, approved,
-  runs with the network inside codeoid's bubblewrap (in autonomous mode codex
-  asks nothing and nothing leaves its sandbox).
-- **Process backends (pi, the Gemini CLI, Qwen; Claude and Codex under Docker)**:
-  the backend's own home (its login, settings, sessions) is reachable and
-  writable by its commands, the API key in its environment is visible to them
-  (`env`, `/proc/<backend>/environ` in the same sandbox), and they have the
-  network (the backend needs it).
+- **Codex (bubblewrap)**: the app-server runs in a private copy of its home
+  (below): its `auth.json` stays readable by its commands (codex's sandbox
+  doesn't hide reads), but neither it nor anything else of the real
+  `CODEX_HOME` can be written. Everything else is hidden by codeoid's
+  bubblewrap. The network `off` is codex's own sandbox's (codeoid's bubblewrap
+  keeps it on for the app-server): in guarded or interactive mode, a command
+  codex asks to rerun outside its sandbox arrives as an ordinary command
+  approval and, approved, runs with the network inside codeoid's bubblewrap
+  (in autonomous mode codex asks nothing and nothing leaves its sandbox).
+- **Process backends (pi, the Gemini CLI, Qwen; Claude and Codex under Docker,
+  Codex under Seatbelt)**: the backend runs in a **private copy of its home**,
+  made afresh at each start (`src/daemon/sandbox/backend-home.ts`) and pointed
+  at by the variable it reads (`PI_CODING_AGENT_DIR`, `GEMINI_CLI_HOME`,
+  `QWEN_HOME`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`): its login linked and shown
+  read-only, its conversations (`sessions/`, `projects/`, `tmp/`) the real
+  ones (data, never run: a session resumes with the sandbox on or off), the
+  code it loads (plugins, extensions, skills, commands) shown read-only, its
+  other small files (settings, model lists) copied, its other dirs empty.
+  Nothing its commands write there (a hook, an MCP server, an extension,
+  `config.toml`) reaches the real home, where your own CLI, or a session with
+  the sandbox off, would run it. Its login is readable by its commands, the
+  API key in its environment is visible to them (`env`, `/proc/<backend>/environ`
+  in the same sandbox), and they have the network (the backend needs it). A
+  token the backend refreshes can't be saved from inside (its login is
+  read-only); the next start reads the host's again. Not verified with the
+  real vendor CLIs here: whether each tolerates that save failing (the fakes
+  do).
 - **opencode**: its file tools run in its shared server, outside the sandbox,
   under codeoid's gate. A subagent created in a feed gap, before codeoid set its
-  shell environment, now runs nothing (it used to run with the server's
-  environment).
+  shell environment, runs nothing.
 - **MCP servers** a backend mounts (stdio servers from config, a project's
   `.mcp.json`) and the workdir's own hooks run as the backend starts them:
   inside the sandbox for process backends, outside it for Claude (native),
   Codex's own MCP servers inside codeoid's bubblewrap.
+- A backend installed under the home (an npm-global `pi`, a CLI whose `#!`
+  names `node` from nvm) is shown read-only inside: its dir, the package it
+  belongs to, and its interpreter's install (`programLocations`), never the
+  home itself.
 
 ## Running one command outside the sandbox
 
@@ -191,10 +256,42 @@ to the workspace.
   script from the workdir, an earlier run's agent may have changed it — keep the
   gate to commands you trust, or run with `--worktree`.
 - Credentials in **project files** (`.env` in the workspace) are the workspace's:
-  add them to `sandbox.hiddenPaths` or keep them out of the workdir.
-  Registry tokens in `~/.npmrc`, `~/.gradle/gradle.properties` and
-  `~/.m2/settings.xml` aren't hidden by default (those files are configuration
-  too); add them to `sandbox.hiddenPaths` to hide them.
+  add them to `sandbox.hiddenPaths` or keep them out of the workdir. A
+  workspace that is your home itself shows the home (the hidden list still
+  applies in it); one that holds it (`/home`) hides it.
+- **The home is read-only and mostly empty inside.** A tool that writes a cache
+  or state in the home (`~/.cache`, `~/.npm` when it fetches, `~/.cargo/registry`
+  when it updates) fails there: point it at `$TMPDIR` or the workspace
+  (`npm_config_cache`, `CARGO_HOME`, `XDG_CACHE_HOME`), or prefetch outside. A
+  tool installed elsewhere in the home (`~/.volta`, `~/.sdkman`) needs adding to
+  `sandbox.homeReadable`. Under bubblewrap the home's tmpfs is read-only too.
+- **Within a dir that is shown** (the workspace, an allowlisted dir), a hidden
+  file is still laid over at the start (bubblewrap, Docker): replaced by a
+  rename, or created later there, it shows to a sandbox already running. The
+  home's own files can't do that (the home isn't shown).
+- **Git**: with a repository's `hooks/`, `config` and `modules/` read-only,
+  `git config …` (writing the repository's config), installing a hook and
+  `git submodule update --init` fail inside; run them yourself. A repository
+  whose `.git` names a git dir outside git's own worktree layout
+  (`--separate-git-dir`) gets nothing extra: commits there fail inside.
+- **Claude's own sandbox** puts placeholder files in the workspace while a
+  command runs (`.bashrc`, `.gitconfig`, `.gitmodules`, `.idea`, `.mcp.json`
+  …, its mandatory denies), so `git add -A` / `git add .` fails there
+  ("can only add regular files"): add paths explicitly. They don't persist; no
+  CLI setting turns them off (checked on Agent SDK 0.3.281). Its `denyWrite`
+  takes a whole subtree, so a pinned dir (between the workspace and a hidden
+  path in it) is read-only with everything in it, not only unrenamable as
+  under bubblewrap, Seatbelt and Docker. Its commands' `/tmp` is read-only
+  (`$TMPDIR` is theirs).
+- **opencode under bubblewrap: a background job dies with its line.** Each
+  shell line runs in its own sandbox, and what it leaves running in the
+  background (`npm run dev &`, `nohup … &`) is ended when the line ends (the
+  sandbox's pid namespace goes with its first process). Run a long-lived
+  server as its own call that keeps running (opencode's background shell), or
+  from a backend that runs a whole process inside (decided for this round:
+  documented, not changed; keeping one sandbox per session alive and entering
+  it per line needs `nsenter` into an unprivileged user namespace, left for a
+  later change).
 - A sandbox session's private temp dir lives under the daemon's temp dir; one
   left by a daemon that was killed outright stays until the OS cleans it.
 
@@ -230,6 +327,28 @@ works, and skip where it doesn't):
   processes (fake agents) inside real bubblewrap can't read a planted credential
   and can read their own login; Qwen Code's real bundled CLI starts through its
   launcher inside bubblewrap.
+- Round 1 of the audit, real bubblewrap (`sandbox-bwrap-real.test.ts`, "round
+  1"): with a fake home holding planted credentials on no list
+  (`~/.local/share/opencode/auth.json`, `~/.pgpass`, `~/.npmrc`, copilot's,
+  an unlisted file), none is readable, nor one the host replaces by a rename
+  or creates (`~/.aws/credentials`) while the sandbox runs; the allowlisted
+  `~/.gitconfig` and a tool in `~/.bun/bin` are there; the home is read-only.
+  A linked worktree (its repository under the home, and under the host's
+  `/tmp`) commits from inside with git saying nothing went wrong, while its
+  repository's hooks and config can't be written; a plain repository the
+  same; a forged `.git` file naming `~/.ssh` gets nothing. A file inside a
+  pinned dir is writable while the dir can't be renamed. pi's, the Gemini
+  CLI's and codex's processes can read their login but can't write it, their
+  real settings, or their real home (`sandbox-process-backends`,
+  `sandbox-codex`).
+- Round 1, the real Claude CLI (`sandbox-claude-real.test.ts`): with codeoid's
+  own spec for a fake home, a credential on no list, one replaced by a rename
+  and one created while the command runs are all unreadable; the allowlist is
+  there; `$TMPDIR` is the session's `claude-<uid>` and the CLI's own temp dir
+  can't be written; a linked worktree commits and its repository's hooks stay
+  read-only. Container sockets behind a linked dir (`/var/run`) are handed
+  physically (before, the CLI's bubblewrap failed every command where
+  `/var/run/docker.sock` existed).
 - `src/tests/provider-opencode.integration.test.ts` I69 (real opencode 2.2.5,
   scripted local model, `CODEOID_OPENCODE_INTEGRATION=1`): a session's shell
   lines run inside its bubblewrap; a session whose sandbox is off runs bash as
@@ -247,7 +366,10 @@ works, and skip where it doesn't):
    (`ps eww`, `sysctl KERN_PROCARGS2`); if it can, add a `process-info` denial.
    Likewise whether it can get keychain items (`security find-generic-password`,
    `git credential-osxkeychain get`); if so, deny the `securityd` mach lookup.
-   And that `mv` of a read-only ancestor (`readOnly`) is refused.
+   And that `mv` of a pinned dir (`pinned`, a `literal` write denial) is
+   refused while a file inside it can still be written; that the home denial
+   with the allowlist allowed back (`subpath` deny, then `literal`/`subpath`
+   allows) leaves the workspace in the home usable.
 6. Claude's native Seatbelt sandbox with codeoid's settings (the
    `sandbox-claude-real` probe with Seatbelt).
 7. Codex's app-server, pi, the Gemini CLI and Qwen launched under `sandbox-exec`
@@ -265,7 +387,9 @@ reaching the client from a launcher (opencode, Qwen).
 - `src/daemon/sandbox/types.ts` — the `SandboxProvider` contract;
   [sandbox-providers.md](sandbox-providers.md) describes it and how to add one.
 - `registry.ts` — `auto | off | <id>`, cached probes.
-- `policy.ts` — the hidden-path list and the spec.
+- `policy.ts` — the hidden home and its allowlist (`home-readable.ts`), the
+  hidden-path list, the workspace's git repository, and the spec.
+- `backend-home.ts` — a process backend's private home.
 - `bwrap.ts`, `seatbelt.ts`, `docker.ts` — the providers.
 - `confinement.ts` — per (backend, provider), how it is put inside.
 - `session-sandbox.ts` — a session's setting, resolution, temp dir, handles and

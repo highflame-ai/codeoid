@@ -110,7 +110,8 @@ CODEOID_ROUTINES_MAX_CONCURRENT=2       # routine runs executing at once, across
 CODEOID_SANDBOX=auto                    # auto | bwrap | seatbelt | docker | off
 CODEOID_SANDBOX_NETWORK=on              # on | off | allowlist
 CODEOID_SANDBOX_ALLOWED_HOSTS=          # with allowlist: github.com,*.npmjs.org
-CODEOID_SANDBOX_HIDDEN_PATHS=           # more paths to hide: ~/.npmrc,~/work/.env
+CODEOID_SANDBOX_HIDDEN_PATHS=           # more paths to hide: ~/work/.env
+CODEOID_SANDBOX_HOME_READABLE=          # replaces the home allowlist: ~/.bun,~/.cargo/bin,~/.gitconfig
 CODEOID_SANDBOX_DOCKER_IMAGE=node:22-bookworm-slim
 
 # Forks, backend switches and rewinds (docs/FEATURES.md#how-a-fork-switch-or-rewind-carries-the-conversation)
@@ -225,7 +226,7 @@ The opencode backend (opencode 2.2.5 or a later 2.2.x) is on by default when an 
 
 ### OS sandbox
 
-Agents' commands run in an OS sandbox, on by default ([sandbox.md](sandbox.md)): the workspace and a private temp dir writable, everything else read-only, credential stores hidden, container sockets unreachable.
+Agents' commands run in an OS sandbox, on by default ([sandbox.md](sandbox.md)): the workspace and a private temp dir writable, everything else read-only, your home hidden whole but for a read-only allowlist, credential stores hidden, container sockets unreachable.
 
 ```json
 {
@@ -233,7 +234,8 @@ Agents' commands run in an OS sandbox, on by default ([sandbox.md](sandbox.md)):
     "provider": "auto",
     "network": "on",
     "allowedHosts": [],
-    "hiddenPaths": ["~/.npmrc"],
+    "hiddenPaths": ["~/work/.env"],
+    "homeReadable": ["~/.bun", "~/.cargo/bin", "~/.gitconfig", "~/.volta"],
     "bwrapPath": "/usr/bin/bwrap",
     "docker": { "image": "node:22-bookworm-slim", "runtime": "runsc" }
   }
@@ -242,7 +244,9 @@ Agents' commands run in an OS sandbox, on by default ([sandbox.md](sandbox.md)):
 
 - `provider` (`CODEOID_SANDBOX`) — `auto` (bubblewrap on Linux, Seatbelt on macOS), `bwrap`, `seatbelt`, `docker`, or `off`. The default for new sessions; each session can choose its own (`codeoid new --sandbox …`, the new-session dialog, `/sandbox`), and turning one off is asked of its owner.
 - `network` (`CODEOID_SANDBOX_NETWORK`) — `on`, `off` or `allowlist`; `allowedHosts` (`CODEOID_SANDBOX_ALLOWED_HOSTS`) for the allowlist. Only Claude's own sandbox enforces an allowlist; elsewhere it means no network, and the session says so.
-- `hiddenPaths` (`CODEOID_SANDBOX_HIDDEN_PATHS`) — more paths to hide, on top of codeoid's data, the agent CLIs' logins and the usual credential stores (`~` expands).
+- `hiddenPaths` (`CODEOID_SANDBOX_HIDDEN_PATHS`) — more paths to hide, on top of codeoid's data, the agent CLIs' logins and the usual credential stores (`~` expands). An entry here also beats `homeReadable`.
+- `homeReadable` (`CODEOID_SANDBOX_HOME_READABLE`, comma separated) — what of your home a sandboxed command may read (read-only); the rest of the home isn't there. Default: toolchains and tool settings that hold no secret (`~/.bun`, `~/.cargo/bin`, `~/.cargo/registry`, `~/.cargo/git`, `~/.rustup`, `~/.nvm`, `~/.npm`, `~/.local/bin`, `~/.local/share/pnpm`, `~/.pyenv`, `~/go/pkg`, `~/go/bin`, `~/.gitconfig`, `~/.config/git/{config,ignore,attributes}`). Setting it replaces the list: never add a file holding a token (`~/.npmrc`).
+- Every `sandbox.*` change through `settings.set` needs an undelegated token, and is audited old → new.
 - `bwrapPath` — the bubblewrap binary (default: on `PATH`). Claude Code's own sandbox on Linux also needs `socat`.
 - `docker.image` (`CODEOID_SANDBOX_DOCKER_IMAGE`) and `docker.runtime` — what a Docker sandbox runs, and `runsc` for gVisor.
 - Where the sandbox can't run, interactive sessions run unsandboxed and say so on every approval; autonomous sessions, routines and loops refuse to start. `codeoid sandbox providers` shows what runs here.

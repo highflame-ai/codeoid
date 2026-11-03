@@ -255,23 +255,47 @@ network modes, platforms — `probe()`, `open(spec)` → `SandboxHandle` with
 spawn/exec/wrap/close) per backend of isolation: `bwrap` (bwrap.ts, pure
 `bwrapArgs`), `seatbelt` (seatbelt.ts, pure `seatbeltProfile`, paths as `-D`
 params), `docker` (docker.ts, pure `dockerRunArgs`); registry.ts resolves
-`auto | off | <id>` with cached probes. policy.ts builds the spec: workspace +
-a private temp dir writable; hidden: config dir, `daemonOwnedDirs`, the CLIs'
-logins and `registeredSecretLocations` (secret-paths.ts), `HOME_CREDENTIAL_PATHS`,
-`$XDG_RUNTIME_DIR`, the daemon's temp dir, `sandbox.hiddenPaths`; container
-sockets; network. confinement.ts picks per (backend, provider): `native`
-(Claude's SDK `sandbox` option, claude-native.ts; Codex workspace-write inside
-codeoid's bwrap around the app-server), `process` (the whole backend inside:
-pi, Gemini CLI, Qwen via a launcher, Claude/Codex under Docker), `command`
-(opencode's shell shim), `no-shell` (HTTP backends). session-sandbox.ts:
-`SessionSandbox` (setting over `sandbox.*`, `resolveSandbox` → `SessionInfo.sandbox`
-with `enforced`, lazy 0700 temp dir, handles, launchers) and
+`auto | off | <id>` with cached probes. policy.ts builds the spec: the home
+hidden whole (deny by default: a credential made or renamed in later isn't
+there), shown back read-only by `sandbox.homeReadable` (home-readable.ts,
+`DEFAULT_HOME_READABLE`: toolchains, git's settings; never a token file);
+workspace + a private temp dir writable; the workspace's git repository
+(`gitWorkspacePaths`: a linked worktree's common dir writable, believed only in
+git's own back-linked layout; `hooks/`, `config`, `config.worktree`,
+`modules/` read-only, `SandboxSpec.readOnly`); hidden besides: config dir,
+`daemonOwnedDirs`, the CLIs' logins and `registeredSecretLocations`
+(secret-paths.ts), `HOME_CREDENTIAL_PATHS`, `$XDG_RUNTIME_DIR`, the daemon's
+temp dir, `sandbox.hiddenPaths` (beats the allowlist); container sockets;
+network. confinement.ts picks per (backend, provider): `native` (Claude's SDK
+`sandbox` option, claude-native.ts: `denyRead` home + `allowRead`, paths
+physical (`physicalOf`), its own `TMPDIR`/`CLAUDE_CODE_TMPDIR` per session
+(`claudeTemp`); refused without socat on Linux, `claudeNativeProblem`; Codex
+workspace-write inside codeoid's bwrap around the app-server), `process` (the
+whole backend inside: pi, Gemini CLI, Qwen via a launcher, Claude/Codex under
+Docker), `command` (opencode's shell shim), `no-shell` (HTTP backends). A
+backend whose process is inside runs in a private copy of its home
+(backend-home.ts `preparePrivateHome` into `SandboxRuntime.privateHome`,
+afresh each start: login linked read-only, conversations shared, code
+read-only, small files copied), never its real home writable; its handle is
+closed when its process ends. session-sandbox.ts: `SessionSandbox` (setting
+over `sandbox.*`, `resolveSandbox` → `SessionInfo.sandbox` with `enforced`,
+`/` as a workspace unavailable, lazy 0700 temp dir, handles, launchers;
+refreshes serialized, a `set` during one re-resolves) and
 `ProviderSessionInit.sandbox()` hands the `SandboxRuntime` to the backend
 (`runtimeFor`: the last resolution stands until a changed setting's replaces
-it, never nothing in between). root.ts: one private dir per daemon for temp
-dirs and launchers, hidden from every sandbox. `protectedAncestors`: dirs
-between a writable root and a hidden path in it are read-only (no rename
-bypass). Loop acceptance checks run in the loop's sandbox (`openCheckSandbox`,
+it, never nothing in between). `Session.setSandbox` only while idle (no turn,
+approval, dialog or background work); a process backend that ran is
+restarted, and until then a turn needing the sandbox is refused; the widen
+confirm is answered by the owner's own token only (`requestUserInput`
+`ownerOnly`). A wider-than-default sandbox at create, fork/compare or loop
+start needs session:approve, an undelegated token, and (fork) the parent's
+owner (`#widerSandboxRefusal`); `sandbox.*` settings refuse delegated tokens.
+root.ts: one private dir per daemon for temp dirs, private homes and
+launchers, hidden from every sandbox. `protectedAncestors` → `SandboxSpec.pinned`:
+dirs between a writable root and a hidden path in it can't be renamed (bwrap
+self-bind, Seatbelt `literal`, Docker self-mount), still writable inside
+(Claude's `denyWrite`: the subtree). Docker binds are `--mount` with CSV
+quoting; a launcher names no container; each handle labels its own. Loop acceptance checks run in the loop's sandbox (`openCheckSandbox`,
 evidence `isolation: "sandbox"`); routine gate checks don't (they need the
 owner's credentials).
 Fallback: `Session#sendInner` refuses an autonomous / unattended / `requireSandbox`
