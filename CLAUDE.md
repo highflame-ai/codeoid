@@ -249,6 +249,16 @@ never a verdict. Every transition is a compare-and-set on the run's
 (owner-only; session:create + session:send, plus session:approve to start).
 
 **OS sandbox** (#448, docs/sandbox.md, docs/sandbox-providers.md): on by default.
+Hard guarantees: (a) credentials and the hidden home unreadable; (b) nothing
+outside the workspace, the session's temp dir and the sandbox caches writable;
+(c) nothing a sandboxed command writes is run outside a sandbox by codeoid, a
+backend CLI, or anything codeoid starts. NOT guaranteed: that the workspace is
+safe to run after the agent touched it (it is code: scripts, tests, husky hooks
+in a `core.hooksPath` inside it); the git-structure protection is defence in
+depth, best effort, its known limits listed in docs/sandbox.md. At each turn's
+end and at destroy a session warns when the repository's config, hooks (and
+`core.hooksPath`'s), attributes or git-dir links changed (sandbox/git-watch.ts,
+`Session#checkGitControl`, event `sandbox.git_changed`).
 `src/daemon/sandbox/`: a `SandboxProvider` (types.ts: capabilities — isolation
 tier, local/remote, mount/sync, stdio process, commands, argv wrap, enforced
 network modes, platforms — `probe()`, `open(spec)` → `SandboxHandle` with

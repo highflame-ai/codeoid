@@ -208,6 +208,7 @@ import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import { asksOutsideSandbox } from "./sandbox/confinement.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
 import { resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning } from "./sandbox/git-watch.js";
 import { protectedWriteTargets } from "./sandbox/policy.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -1192,6 +1193,8 @@ export class Session {
   #extraEnv: Readonly<Record<string, string>> | undefined;
   /** The session's OS sandbox (#448); null on a Session built without a sandbox registry. */
   #sandbox: SessionSandbox | null = null;
+  /** The repository's git settings as last looked at (#448: #checkGitControl), from the first turn on. */
+  #gitBaseline: GitControlSnapshot | null = null;
   /** Started for unattended work: turns need an enforced sandbox (SessionCreateOptions.requireSandbox). */
   #requireSandbox = false;
   /** The sandbox changed while the backend process ran: it runs in the old one until it is restarted. */
@@ -3143,6 +3146,27 @@ export class Session {
     return widens(sbx.effective(), sbx.effective({ ...(sbx.setting ?? {}), ...setting }));
   }
 
+  /**
+   * The end-of-turn and destroy check (#448, sandbox/git-watch.ts): when the
+   * repository's config, hooks (the hooks dir's, `core.hooksPath`'s),
+   * attributes or git-dir links changed since the last look, a warning line
+   * says which, so the owner looks before running git there. Best effort.
+   */
+  #checkGitControl(sub: string): void {
+    const before = this.#gitBaseline;
+    if (!before) return;
+    try {
+      const now = gitControlSnapshot(this.workdir);
+      const changed = gitControlChanges(before, now);
+      this.#gitBaseline = now;
+      if (changed.length === 0) return;
+      this.#store.audit(sub, "session.git_control_changed", this.id, changed.slice(0, 20).join(","));
+      this.#sandboxWarning(gitControlWarning(changed), "sandbox.git_changed");
+    } catch (err) {
+      console.error(`[codeoid/session ${this.id}] checking the repository's git settings failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   /** A warning line on the session about its sandbox (#448), persisted and shown to every client. */
   #sandboxWarning(text: string, event: string): void {
     if (this.#destroyed) return;
@@ -3865,6 +3889,8 @@ export class Session {
       throw new SandboxRequiredError(`Not started: ${sandboxRefused}`);
     }
     this.#store.audit(sender.sub, "session.send", this.id);
+    // What of the repository git runs at the user's next command, as it is before the agent works (#448).
+    if (this.#sandbox && !this.#gitBaseline) this.#gitBaseline = gitControlSnapshot(this.workdir);
     // A new turn is starting — clear any interrupt from the previous one.
     this.#turnInterrupted = false;
     this.#lastTurnError = null;
@@ -5351,6 +5377,8 @@ export class Session {
   }
 
   async destroy(sender: AuthContext, opts: { deleteBranch?: boolean } = {}): Promise<void> {
+    // Said to whoever is attached (and audited) before the session goes.
+    this.#checkGitControl(sender.sub);
     this.#destroyed = true;
     // This session's own servers' clients in the hub: let go (the last user closes them).
     for (const spec of [...this.#mcpRetained.values(), ...this.#mcpToRelease.values()]) this.#mcpHub?.release(spec, this.#mcpTenant());
@@ -9021,6 +9049,7 @@ export class Session {
         this.#hookBus?.emit("after_turn", this.#hookContext(), {
           result: event.result,
         });
+        this.#checkGitControl(SYSTEM_IDENTITY.sub);
         if (event.result.isError) {
           const errText = event.result.errorMessage ?? "Turn ended with an error";
           // The CLI reports an overflow as the turn's assistant text and ends

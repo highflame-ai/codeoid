@@ -489,6 +489,46 @@ describe("review fixes (#448)", () => {
     }
   });
 
+  test("the repository's git settings changed while the session ran: a warning line at the turn's end, and at destroy (#448 round 3)", async () => {
+    const run = (args: string[]) => Bun.spawnSync(["git", ...args], { cwd: workdir, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
+    run(["init", "-q", "-b", "main"]);
+    try {
+      const provider = new MockSessionProvider("claude", [[DONE], [DONE], [DONE]]);
+      const { session } = makeSession(provider);
+      const infos: Array<{ text: string; event?: string }> = [];
+      session.attach({
+        id: "w",
+        auth: AUTH,
+        capabilities: [],
+        send: (m: { type: string; role?: string; content?: string; metadata?: { event?: string } }) => {
+          if (m.type === "session.message" && m.role === "info") infos.push({ text: m.content ?? "", event: m.metadata?.event });
+        },
+      } as never);
+      const warned = () => infos.filter((i) => i.event === "sandbox.git_changed");
+      await session.send("one", AUTH);
+      await until(() => session.status === "idle");
+      expect(warned()).toEqual([]);
+      // What a command could do during the next turn (here between them: the same look).
+      run(["config", "core.fsmonitor", "planted"]);
+      writeFileSync(join(workdir, ".git", "hooks", "post-checkout"), "#!/bin/sh\n", { mode: 0o755 });
+      await session.send("two", AUTH);
+      await until(() => warned().length === 1);
+      expect(warned()[0]!.text).toContain(".git/config");
+      expect(warned()[0]!.text).toContain(".git/hooks/post-checkout");
+      // Said once: the next turn, with nothing changed, says nothing.
+      await session.send("three", AUTH);
+      await until(() => session.status === "idle");
+      expect(warned()).toHaveLength(1);
+      run(["config", "core.hooksPath", ".husky/_"]);
+      await session.destroy(AUTH);
+      expect(warned()).toHaveLength(2);
+      expect(warned()[1]!.text).toContain("core.hooksPath");
+    } finally {
+      rmSync(join(workdir, ".git"), { recursive: true, force: true });
+      rmSync(join(workdir, "HEAD"), { recursive: true, force: true });
+    }
+  });
+
   test("a destroyed session's backend state (its own conversations, #448 round 2) goes with it", async () => {
     const transcripts = mkdtempSync(join(tmpdir(), "codeoid-sbx-state-"));
     try {

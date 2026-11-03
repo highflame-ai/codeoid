@@ -14,6 +14,39 @@ however the command is spelled.
 
 It is **on by default**, everywhere it can run.
 
+## What it guarantees, and what it doesn't
+
+The sandbox's hard guarantees, on every provider that runs here:
+
+1. **Credentials and the hidden home are unreadable** inside it.
+2. **Nothing outside the workspace, the session's temp dir and codeoid's
+   sandbox caches is writable** (plus, for a backend whose whole process is
+   inside, its private home).
+3. **Nothing a sandboxed command writes is run outside a sandbox by codeoid
+   itself, by a backend CLI, or by anything codeoid starts**: not the
+   toolchain caches (their variables are set only inside), not a backend's
+   login written back (only its token fields), not the daemon's own git
+   (every program a repository's config names is turned off).
+
+It does **not** guarantee that the workspace is safe to run after the agent
+touched it. The workspace is the agent's output, and it is code:
+`package.json` scripts, a Makefile, test files, husky hooks kept in the tree
+(`core.hooksPath=.husky/_`), a build plugin. Review it as you review any
+agent's output before you run it.
+
+The protection of a repository's git structure (below) is **defence in
+depth** against what you wouldn't see in `git status` or a diff — a hook,
+`core.fsmonitor`, a filter in the repository's config, a git dir git is
+pointed at — and is best effort: its known limits are listed under
+[Limits](#limits) rather than chased one by one. As a cheap, visible signal,
+**a session says when the repository's git settings changed while it ran**:
+at the end of each turn and when it is destroyed, if the repository's
+config, hooks (the hooks dir's, or `core.hooksPath`'s when it points into
+the repository), attributes (`.gitattributes`, `info/attributes`) or what
+names its git dirs (`commondir`, a worktree's `gitdir`, the `.git` file)
+changed, a warning line names them (event `sandbox.git_changed`, audited
+`session.git_control_changed`). Look before you run git there.
+
 ## What is protected
 
 With the default policy (workspace-write):
@@ -330,6 +363,24 @@ to the workspace.
   cherry-pick in progress (`rebase-merge/`, `sequencer/`) can carry `exec`
   lines written inside: look before `git rebase --continue` on a state you
   didn't start.
+- **The workspace is code.** What a sandboxed command writes in the
+  workspace runs the next time you build, test or commit there: a
+  `package.json` script, a test, a Makefile target, and a hook in a
+  `core.hooksPath` inside the repository (husky's `.husky/_`, often
+  gitignored, so `git status` doesn't show a hook planted there). These are
+  the workspace's own content, so they stay writable; the end-of-session
+  warning (above) names a changed hooks path, and the rest is the review of
+  the agent's output you'd do anyway.
+- **Git's structure, known limits** (defence in depth, above): a repository
+  planted in a subdirectory of the workspace (a `.git`, or a bare
+  repository's `HEAD`/`objects/`/`refs/`, made where there was none) is used
+  by your git started there, and a workspace that is a subdirectory of its
+  repository is such a directory for git started in it; a symlinked `.git`
+  can't be held; a top-level `HEAD` that is already the project's isn't
+  held; a worktree added while a Claude query runs isn't held by Claude's
+  own sandbox; a `.git` file git's records don't name back is held but
+  unverified. Your global `safe.bareRepository=explicit` closes the bare
+  repository fallback entirely.
 - **Claude's own sandbox** puts placeholder files in the workspace while a
   command runs (`.bashrc`, `.gitconfig`, `.gitmodules`, `.idea`, `.mcp.json`
   …, its mandatory denies), so `git add -A` / `git add .` fails there
