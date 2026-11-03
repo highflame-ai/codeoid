@@ -77,6 +77,7 @@ import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from ".
 import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.js";
 import { listProcesses } from "../../process-tree.js";
 import { asksUnsandboxed, claudeSandboxSettings } from "../../sandbox/claude-native.js";
+import { programLocations } from "../../sandbox/policy.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../../sandbox/types.js";
 import type { LLMCallUsage } from "../../context-math.js";
@@ -2847,7 +2848,7 @@ export function claudeSandboxOptions(
   let handle: SandboxHandle | null = null;
   return {
     spawnClaudeCodeProcess: (o: SpawnOptions): SpawnedProcess => {
-      handle ??= rt.openSync(claudeOwnState(o.env));
+      handle ??= rt.openSync(claudeOwnState(o.env), { readable: programLocations(o.command, []) });
       const childEnv: Record<string, string> = {};
       for (const [k, v] of Object.entries(o.env)) if (v !== undefined) childEnv[k] = v;
       const child = handle.spawn(o.command, o.args, { cwd: o.cwd ?? workdir, env: childEnv });

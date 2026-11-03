@@ -19,6 +19,7 @@ import { join } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
 import type { CodeoidConfig } from "../../config.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
+import { CWD_FROM_CALLER } from "./docker.js";
 import { buildSandboxSpec, networkPolicyOf, type SandboxConfig, sandboxConfigOf, validAllowedHost } from "./policy.js";
 import type { SandboxRegistry } from "./registry.js";
 import { type NetworkMode, type NetworkPolicy, SANDBOX_AUTO, SANDBOX_OFF, type SandboxHandle, type SandboxProvider, type SandboxSpec } from "./types.js";
@@ -75,9 +76,11 @@ export interface SandboxRuntime {
    * given appended, in the directory it is started from, for a spawner
    * codeoid doesn't control (an SDK that takes a path to its CLI, opencode's
    * shell). Written to a daemon-private dir outside anything the sandbox can
-   * write; removed with the session.
+   * write; removed with the session. `envNames`: the variables its caller
+   * passes that must reach the program (a provider that copies them by name,
+   * Docker's `-e NAME`).
    */
-  launcher(handle: SandboxHandle, argv: readonly string[]): string;
+  launcher(handle: SandboxHandle, argv: readonly string[], envNames?: readonly string[]): string;
 }
 
 /** The setting a session ends up with: its own fields over the config's. */
@@ -287,19 +290,19 @@ export class SessionSandbox {
         if (!provider.openSync) throw new Error(`${provider.displayName} can't be opened synchronously`);
         return this.#track(provider.openSync(open(backendState, o)));
       },
-      launcher: (handle, argv) => this.#writeLauncher(handle, argv),
+      launcher: (handle, argv, envNames) => this.#writeLauncher(handle, argv, envNames ?? []),
     };
     return r.info;
   }
 
-  #writeLauncher(handle: SandboxHandle, argv: readonly string[]): string {
+  #writeLauncher(handle: SandboxHandle, argv: readonly string[], envNames: readonly string[]): string {
     if (!handle.wrap) throw new Error(`${handle.providerId} can't start a local program inside`);
     if (!this.#launcherDir) {
       const safe = this.#sessionId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "session";
       this.#launcherDir = mkdtempSync(`${launcherRoot()}${safe}-`);
     }
     // Started from wherever its caller is: the cwd is the caller's, not fixed here.
-    const wrapped = handle.wrap(argv, { cwd: "", env: {} });
+    const wrapped = handle.wrap(argv, { cwd: "", env: Object.fromEntries(envNames.map((n) => [n, ""])) });
     const path = join(this.#launcherDir, `launch-${++this.#launchers}`);
     writeFileSync(path, launcherScript(wrapped.argv), { mode: 0o700 });
     return path;
@@ -359,9 +362,13 @@ export function shellQuote(word: string): string {
   return `'${word.replace(/'/g, `'\\''`)}'`;
 }
 
-/** A POSIX sh script that execs `argv` with its own arguments appended. */
+/**
+ * A POSIX sh script that execs `argv` with its own arguments appended. A
+ * word that is {@link CWD_FROM_CALLER} becomes the directory it is run from.
+ */
 export function launcherScript(argv: readonly string[]): string {
-  return `#!/bin/sh\n# Written by codeoid (#448): starts a backend inside its session's sandbox.\nexec ${argv.map(shellQuote).join(" ")} "$@"\n`;
+  const words = argv.map((w) => (w === CWD_FROM_CALLER ? '"$PWD"' : shellQuote(w)));
+  return `#!/bin/sh\n# Written by codeoid (#448): starts a backend inside its session's sandbox.\nexec ${words.join(" ")} "$@"\n`;
 }
 
 /** Where every session's launchers live: `<this prefix><session>-<random>/launch-<n>` (the opencode shell shim checks it). */

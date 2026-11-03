@@ -1213,5 +1213,5 @@ export function qwenExecutableOption(
   if (!rt?.plan.wrapsBackend) return configured ? { pathToQwenExecutable: configured } : {};
   const argv = qwenCliArgv(configured);
   const handle = rt.openSync(qwenOwnState(env), { readable: programLocations(argv[0] ?? "", argv.slice(1)) });
-  return { pathToQwenExecutable: rt.launcher(handle, argv) };
+  return { pathToQwenExecutable: rt.launcher(handle, argv, Object.keys(env)) };
 }

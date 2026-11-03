@@ -509,7 +509,7 @@ export class OpencodeProvider implements SessionProvider {
     if (!rt || rt.plan.kind !== "command") return "off";
     if (this.#launcher?.rt === rt) return this.#launcher.path;
     const handle = rt.openSync([]);
-    const path = rt.launcher(handle, []);
+    const path = rt.launcher(handle, [], [...Object.keys(opencodeShellEnv()), SANDBOX_LAUNCHER_VAR]);
     this.#launcher = { rt, path };
     return path;
   }

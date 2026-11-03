@@ -8,6 +8,7 @@
 
 import { BwrapSandboxProvider } from "./bwrap.js";
 import type { SandboxConfig } from "./policy.js";
+import { DockerSandboxProvider } from "./docker.js";
 import { SeatbeltSandboxProvider } from "./seatbelt.js";
 import { SANDBOX_AUTO, SANDBOX_OFF, type SandboxProbe, type SandboxProvider } from "./types.js";
 
@@ -103,5 +104,6 @@ export function createDefaultSandboxRegistry(config: SandboxConfig, platform: No
   const registry = new SandboxRegistry(platform);
   registry.register(new BwrapSandboxProvider(config.bwrapPath ? { bwrapPath: config.bwrapPath } : {}));
   registry.register(new SeatbeltSandboxProvider());
+  registry.register(new DockerSandboxProvider({ image: config.docker.image, ...(config.docker.runtime ? { runtime: config.docker.runtime } : {}) }));
   return registry;
 }
