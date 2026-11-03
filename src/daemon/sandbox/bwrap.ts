@@ -124,7 +124,8 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   // Every dir between a writable root and a hidden path in it: a mount point nothing can rename, still writable inside.
   for (const p of spec.pinned ?? []) {
     const at = realOr(p);
-    if (kind(at) !== "dir" || seen.has(`o:${at}`)) continue;
+    // Never one a hidden dir covers (or is): its bind would show the real dir again.
+    if (kind(at) !== "dir" || seen.has(`o:${at}`) || hiddenDirs.some((d) => within(at, d))) continue;
     seen.add(`o:${at}`);
     mounts.push({ kind: "bind", src: at, path: at });
   }

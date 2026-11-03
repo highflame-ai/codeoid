@@ -364,6 +364,9 @@ describe("protected ancestors (#448 review)", () => {
     expect(protectedAncestors(["/home/u/.config/gh", "/home/u/.ssh", "/home/u/.gone", "/srv/other"], ["/home/u"], exists).sort()).toEqual(["/home/u/.config"]);
     expect(protectedAncestors(["/w/a/b/c/.env"], ["/w"], () => true).sort()).toEqual(["/w/a", "/w/a/b", "/w/a/b/c"]);
     expect(protectedAncestors(["/w"], ["/w"], () => true)).toEqual([]);
+    // A hidden dir (the home in a workspace of /home) is never pinned, nor one inside it: a pin would show it again.
+    expect(protectedAncestors(["/w/home", "/w/home/.config/gh"], ["/w"], () => true)).toEqual([]);
+    expect(protectedAncestors(["/w/a/secret", "/w/a"], ["/w"], () => true)).toEqual([]);
   });
 
   test("bwrap: they are writable self-bind mount points (no rename, still writable inside: #448 round 1), laid between the workspace and the hidden path; the temp dir's own-path bind isn't covered by a hidden dir above it", () => {

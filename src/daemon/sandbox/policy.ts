@@ -456,13 +456,19 @@ function realOr(p: string): string {
  */
 export function protectedAncestors(hidden: readonly string[], writableRoots: readonly string[], exists: (p: string) => boolean = existsSync): string[] {
   const roots = writableRoots.map(realOr);
+  const hiddenReal = hidden.map(realOr);
   const out = new Set<string>();
-  for (const h of hidden) {
-    const at = realOr(h);
+  for (const at of hiddenReal) {
     if (!exists(at)) continue;
     for (const w of roots) {
       if (at === w || !within(at, w)) continue;
-      for (let a = dirname(at); a !== w && within(a, w); a = dirname(a)) out.add(a);
+      for (let a = dirname(at); a !== w && within(a, w); a = dirname(a)) {
+        // A dir that is hidden itself, or inside a hidden one, is never pinned: a pin binds
+        // the real dir, which would show it again (the home in a workspace of /home). Hidden,
+        // it is a mount point of its own (no rename) or not there at all.
+        if (hiddenReal.some((h) => within(a, h))) continue;
+        out.add(a);
+      }
     }
   }
   return [...out];

@@ -418,6 +418,34 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: ro
     expect(existsSync(join(home, "pwn"))).toBe(false);
   });
 
+  test("a workspace that holds the home (/home): the home inside it stays hidden, even what is replaced or made in it while the sandbox runs", async () => {
+    const holder = join(root, "holder");
+    const home = join(holder, "u");
+    mkdirSync(join(home, ".ssh"), { recursive: true });
+    writeFileSync(join(home, ".ssh", "id"), "PLANTED-HOLDER-SSH\n");
+    writeFileSync(join(home, ".netrc"), "PLANTED-HOLDER-NETRC\n");
+    const tmp = join(root, "tmp-holder");
+    mkdirSync(tmp);
+    const spec = buildSandboxSpec({ sessionId: "holder", workspace: holder, tempDir: tmp, network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    // Hidden, so never pinned: a pin is a bind of the real dir, which would show it again.
+    expect(spec.pinned).not.toContain(home);
+    const h = await provider.open(spec);
+    try {
+      const run = sh(h, holder, `cat ${join(home, ".ssh", "id")} ${join(home, ".netrc")} 2>/dev/null; sleep 2; cat ${join(home, ".netrc")} ${join(home, "late")} 2>/dev/null; mkdir ${join(home, "made")} 2>/dev/null || echo HOME-NOT-WRITABLE; echo x > ${join(holder, "w")} && echo HOLDER-WRITABLE`);
+      await Bun.sleep(700);
+      writeFileSync(join(home, ".netrc.tmp"), "PLANTED-HOLDER-REPLACED\n");
+      Bun.spawnSync(["mv", join(home, ".netrc.tmp"), join(home, ".netrc")]);
+      writeFileSync(join(home, "late"), "PLANTED-HOLDER-LATE\n");
+      const r = await run;
+      expect(r.stdout).not.toContain("PLANTED");
+      expect(r.stdout).toContain("HOME-NOT-WRITABLE");
+      expect(r.stdout).toContain("HOLDER-WRITABLE");
+    } finally {
+      await h.close();
+    }
+    expect(existsSync(join(home, "made"))).toBe(false);
+  });
+
   test("a linked worktree commits from inside (its repository under the home, or under the host's /tmp); the repository's hooks and config stay read-only", async () => {
     for (const where of ["home", "host-tmp"] as const) {
       const home = join(root, `home-git-${where}`);

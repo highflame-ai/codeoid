@@ -105,6 +105,9 @@ describe("dockerRunArgs", () => {
     expect(flags(args, "--mount")).toContain("type=bind,source=/work/repo/config,target=/work/repo/config");
     expect(flags(args, "--mount")).not.toContain("type=bind,source=/work/repo/config,target=/work/repo/config,readonly");
     expect(flags(args, "--mount")).toContain("type=bind,source=/work/repo/.git/hooks,target=/work/repo/.git/hooks,readonly");
+    // A pinned dir a hidden one covers isn't mounted: that would show the real dir again.
+    const hiddenPin = dockerRunArgs(spec({ hidden: ["/work/repo/.secrets"], pinned: ["/work/repo/.secrets/inner"] }), ["x"], { ...base, kind: () => "dir" });
+    expect(flags(hiddenPin, "--mount").some((m) => m.includes("/work/repo/.secrets/inner"))).toBe(false);
   });
 
   test("a path with `:`, `,` or `\"` is one path: every --mount field is CSV-quoted (#448 round 1)", () => {
