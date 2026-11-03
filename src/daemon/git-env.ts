@@ -72,7 +72,7 @@ export const GIT_HOOK_EVENTS: readonly string[] = [
  * is read last-wins, so these (command scope, `GIT_CONFIG_COUNT`) outrank
  * the repository's.
  */
-const BASE_OVERRIDES: ReadonlyArray<readonly [string, string]> = [
+export const BASE_OVERRIDES: ReadonlyArray<readonly [string, string]> = [
   ["core.hooksPath", "/dev/null"],
   ...GIT_HOOK_EVENTS.map((e) => [`hook.${e}.enabled`, "false"] as const),
   ["core.fsmonitor", "false"],
@@ -102,7 +102,7 @@ const BASE_OVERRIDES: ReadonlyArray<readonly [string, string]> = [
 ];
 
 /** The environment's own say over editors and pagers, which outranks config (`pager.<cmd>` included). */
-const PROGRAM_ENV = { GIT_EDITOR: ":", GIT_SEQUENCE_EDITOR: ":", GIT_PAGER: "cat" } as const;
+export const PROGRAM_ENV = { GIT_EDITOR: ":", GIT_SEQUENCE_EDITOR: ":", GIT_PAGER: "cat" } as const;
 
 /** The protocols a daemon git that may reach a remote may use: no `file`/`ext` (they run programs here), no `git` (`core.gitProxy`). */
 export const REMOTE_PROTOCOLS = "https:ssh";

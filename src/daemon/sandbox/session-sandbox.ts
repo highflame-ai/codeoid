@@ -19,9 +19,11 @@ import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/t
 import type { CodeoidConfig } from "../../config.js";
 import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
+import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
 import { buildSandboxSpec, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, validAllowedHost } from "./policy.js";
 import type { SandboxRegistry } from "./registry.js";
+import { gitProgramLocations, gitShimSpec, writeGitShim } from "./git-shim.js";
 import { launcherRoot, sandboxRoot } from "./root.js";
 import {
   type NetworkMode,
@@ -112,6 +114,14 @@ export interface SandboxRuntime {
   claudeTemp(): ClaudeTempDirs;
   /** Say something on the session (a warning line): a login not written back from the sandbox (backend-home.ts). */
   warn(text: string): void;
+  /**
+   * A dir to put first on the `PATH` of a backend CLI that runs outside the
+   * sandbox (Claude's, under its own sandbox): its `git` runs the real one
+   * inside this sandbox, read-only and offline (git-shim.ts), so a
+   * repository a command planted runs nothing on the host. The same dir for
+   * the runtime's life; `caller` names the CLI in the script.
+   */
+  gitShim(caller: string): string;
 }
 
 /** The setting a session ends up with: its own fields over the config's. */
@@ -368,6 +378,7 @@ export class SessionSandbox {
     };
     // Built (and the temp dir made) when a backend first needs it.
     let spec: SandboxSpec | null = null;
+    let gitShim: string | null = null;
     this.#runtime = {
       info: r.info,
       plan,
@@ -386,6 +397,10 @@ export class SessionSandbox {
       privateHome: (key) => this.#privateHome(key),
       stateDir: (key) => this.#stateDir(key),
       claudeTemp: () => this.#ensureClaudeTemp(),
+      gitShim: (caller) => {
+        gitShim ??= this.#writeGitShim(provider, caller);
+        return gitShim;
+      },
       warn: (text) => {
         try {
           this.#onWarning?.(text);
@@ -444,12 +459,35 @@ export class SessionSandbox {
     return this.#claudeTemp;
   }
 
+  #ensureLauncherDir(): string {
+    if (!this.#launcherDir) this.#launcherDir = mkdtempSync(`${launcherRoot()}${this.#sessionSlug()}-`);
+    return this.#launcherDir;
+  }
+
+  /**
+   * The git shim's dir (git-shim.ts) in the session's launcher dir: a
+   * launcher for the read-only, offline spec when the provider can start a
+   * local program inside, else git defused.
+   */
+  #writeGitShim(provider: SandboxProvider, caller: string): string {
+    if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
+    const dir = join(this.#ensureLauncherDir(), "git-bin");
+    let launcher: string | null = null;
+    let program: string | null = null;
+    if (provider.openSync && provider.capabilities.wrapsArgv && provider.capabilities.placement === "local") {
+      const handle = this.#track(provider.openSync(gitShimSpec(this.#spec({ mode: "off" }, [], gitProgramLocations()))));
+      launcher = this.#writeLauncher(handle, [GIT_BIN], [], "git");
+      program = handle.wrap?.([GIT_BIN], { cwd: "", env: {} }).argv[0] ?? null;
+    }
+    return writeGitShim(dir, { launcher, provider: program, caller });
+  }
+
   #writeLauncher(handle: SandboxHandle, argv: readonly string[], envNames: readonly string[], name?: string): string {
     if (!handle.wrap) throw new Error(`${handle.providerId} can't start a local program inside`);
-    if (!this.#launcherDir) this.#launcherDir = mkdtempSync(`${launcherRoot()}${this.#sessionSlug()}-`);
+    const launcherDir = this.#ensureLauncherDir();
     // Started from wherever its caller is: the cwd is the caller's, not fixed here.
     const wrapped = handle.wrap(argv, { cwd: "", env: Object.fromEntries(envNames.map((n) => [n, ""])) });
-    const path = join(this.#launcherDir, `launch-${name ? name.replace(/[^A-Za-z0-9_-]/g, "") : ++this.#launchers}`);
+    const path = join(launcherDir, `launch-${name ? name.replace(/[^A-Za-z0-9_-]/g, "") : ++this.#launchers}`);
     // Written beside it and renamed over it: a caller running it meanwhile gets the old one or the new one, whole.
     const part = `${path}.${++this.#launchers}.part`;
     writeFileSync(part, launcherScript(wrapped.argv), { mode: 0o700 });

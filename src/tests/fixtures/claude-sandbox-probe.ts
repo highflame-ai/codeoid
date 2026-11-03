@@ -18,7 +18,12 @@
  * the environment it got to `<root>/mcp-env.json`, and the caller's own
  * environment carrying a stale `SANDBOX_RUNTIME`; `policy-env-unsandboxed`:
  * that, with the call asking to run outside the sandbox and allowed (the
- * owner's yes). Run in its own
+ * owner's yes). `policy-env-git` / `policy-env-nogit`: `policy-env` with the
+ * CLI's own git the session's shim (git-shim.ts: git inside the sandbox,
+ * read-only and offline) or not, and a second query after the first (a new
+ * CLI start in the same workspace, the one that runs its `git status`);
+ * the second one's system prompt is told as `system`. A workspace of the
+ * test's own: `CODEOID_PROBE_WORKSPACE`. Run in its own
  * process: a test file that mocks the SDK module must not see this one.
  * canUseTool here allows a sandboxed call and DENIES one asking to run
  * outside the sandbox, as codeoid's gate would until its owner says yes.
@@ -27,18 +32,24 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { type ClaudeTempDirs, claudeNativeEnv, claudeSandboxSettings, claudeTempEnv } from "../../daemon/sandbox/claude-native.js";
+import { BwrapSandboxProvider } from "../../daemon/sandbox/bwrap.js";
+import { gitProgramLocations, gitShimSpec, writeGitShim } from "../../daemon/sandbox/git-shim.js";
 import { buildSandboxSpec } from "../../daemon/sandbox/policy.js";
 import { daemonTempDir } from "../../daemon/sandbox/root.js";
+import { launcherScript } from "../../daemon/sandbox/session-sandbox.js";
+import { GIT_BIN } from "../../daemon/git-env.js";
 
 const [root = "", networkArg = "off", commandFile = "", flag = "", allowHost = ""] = process.argv.slice(2);
 const network = networkArg as "on" | "off" | "allowlist";
 const command = readFileSync(commandFile, "utf8");
-const nativeEnv = flag === "policy-env" || flag === "policy-env-unsandboxed";
+const gitMode = flag === "policy-env-git" ? "shim" : flag === "policy-env-nogit" ? "none" : null;
+const nativeEnv = flag === "policy-env" || flag === "policy-env-unsandboxed" || gitMode !== null;
 const unsandboxed = flag === "unsandboxed" || flag === "policy-env-unsandboxed";
 const allowUnsandboxed = flag === "policy-env-unsandboxed";
 const policy = flag === "policy" || nativeEnv;
 
 let toolResult: string | null = null;
+let system = "";
 const sse = (events: Array<[string, unknown]>) => events.map(([e, d]) => `event: ${e}\ndata: ${JSON.stringify(d)}\n\n`).join("");
 function stream(content: Array<Record<string, unknown>>, stop: string): string {
   const events: Array<[string, unknown]> = [
@@ -64,7 +75,8 @@ const server = Bun.serve({
   port: 0,
   async fetch(req) {
     if (!new URL(req.url).pathname.endsWith("/messages")) return Response.json({ data: [] });
-    const body = (await req.json()) as { tools?: Array<{ name: string }>; messages: Array<{ role: string; content: unknown }> };
+    const body = (await req.json()) as { system?: unknown; tools?: Array<{ name: string }>; messages: Array<{ role: string; content: unknown }> };
+    system += JSON.stringify(body.system ?? "") + JSON.stringify(body.messages);
     for (const m of body.messages) {
       if (!Array.isArray(m.content)) continue;
       for (const c of m.content as Array<{ type?: string; tool_use_id?: string; content?: unknown }>) {
@@ -83,7 +95,7 @@ const server = Bun.serve({
 });
 
 const home = policy ? join(root, "home") : join(root, "home");
-const workspace = policy ? (existsSync(join(root, "wt")) ? join(root, "wt") : join(home, "proj")) : join(root, "ws");
+const workspace = process.env.CODEOID_PROBE_WORKSPACE || (policy ? (existsSync(join(root, "wt")) ? join(root, "wt") : join(home, "proj")) : join(root, "ws"));
 const uid = typeof process.getuid === "function" ? process.getuid() : 0;
 const temp: ClaudeTempDirs = { cli: join(root, "sbx", "cli"), root: join(root, "sbx", "cmd"), commands: join(root, "sbx", "cmd", `claude-${uid}`) };
 if (policy) for (const d of [temp.cli, temp.commands, workspace]) mkdirSync(d, { recursive: true });
@@ -118,7 +130,25 @@ const spec = policy
       unsetEnv: [],
     };
 const sandbox = claudeSandboxSettings({ spec, config } as never, env, policy ? temp : undefined);
-const cliEnv = nativeEnv ? claudeNativeEnv(spec as never, temp, { ...env, SANDBOX_RUNTIME: "1" }) : env;
+/** The session's git shim, as SessionSandbox makes it: a launcher for the read-only, offline spec, in a daemon-private dir. */
+function gitShim(): string {
+  const handle = new BwrapSandboxProvider().openSync(gitShimSpec(buildSandboxSpec({
+    sessionId: "probe",
+    workspace,
+    tempDir: join(root, "tmp"),
+    network: { mode: "off" },
+    config: { sandbox: config } as never,
+    hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" },
+    backendReadable: gitProgramLocations(),
+  })));
+  const dir = daemonTempDir("launch-probe-");
+  const wrapped = handle.wrap?.([GIT_BIN], { cwd: "", env: {} });
+  if (!wrapped) throw new Error("no wrap");
+  const launcher = join(dir, "launch-git");
+  writeFileSync(launcher, launcherScript(wrapped.argv), { mode: 0o700 });
+  return writeGitShim(join(dir, "git-bin"), { launcher, provider: wrapped.argv[0] ?? null, caller: "the Claude CLI" });
+}
+const cliEnv = nativeEnv ? claudeNativeEnv(spec as never, temp, { ...env, SANDBOX_RUNTIME: "1" }, gitMode === "shim" ? gitShim() : undefined) : env;
 // A sign-in started after the session's sandbox was built (#448 round 2): its home where the daemon makes it, the
 // path told to the test through a file.
 if (process.env.CODEOID_PROBE_SIGNIN_PATH) {
@@ -128,7 +158,7 @@ if (process.env.CODEOID_PROBE_SIGNIN_PATH) {
 }
 const asked: string[] = [];
 let result = "";
-try {
+async function run(): Promise<void> {
   for await (const m of query({
     prompt: "run the probe",
     options: {
@@ -138,6 +168,8 @@ try {
       ...(nativeEnv ? { mcpServers: { probe: { type: "stdio" as const, command: process.execPath, args: [join(import.meta.dir, "env-dump.ts"), join(root, "mcp-env.json")] } } } : {}),
       permissionMode: "default",
       settingSources: [],
+      // The preset's context carries the CLI's git status (what its own git found).
+      ...(gitMode ? { systemPrompt: { type: "preset" as const, preset: "claude_code" as const } } : {}),
       canUseTool: async (name, input) => {
         asked.push(name);
         if ((input as { dangerouslyDisableSandbox?: boolean }).dangerouslyDisableSandbox && !allowUnsandboxed) return { behavior: "deny", message: "denied by the gate" };
@@ -147,8 +179,20 @@ try {
   })) {
     if (m.type === "result") result = m.subtype;
   }
+}
+let second: string | undefined;
+try {
+  await run();
+  if (gitMode) {
+    // A new CLI start in the same workspace: no tool call (the stand-in has its result), only the CLI's own git.
+    const first = result;
+    system = "";
+    await run();
+    second = result;
+    result = first;
+  }
 } catch (err) {
   result = `failed: ${err instanceof Error ? err.message : String(err)}`;
 }
 server.stop(true);
-console.log(JSON.stringify({ result, asked, toolResult }));
+console.log(JSON.stringify({ result, asked, toolResult, ...(gitMode ? { second, system } : {}) }));

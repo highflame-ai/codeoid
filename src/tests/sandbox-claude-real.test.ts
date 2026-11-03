@@ -51,10 +51,15 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
   });
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-  async function probe(network: string, command: string, extra: string[] = []): Promise<{ result: string; asked: string[]; toolResult: string | null }> {
+  async function probe(
+    network: string,
+    command: string,
+    extra: string[] = [],
+    env: Record<string, string> = {},
+  ): Promise<{ result: string; asked: string[]; toolResult: string | null; second?: string; system?: string }> {
     const file = join(root, `cmd-${Math.random().toString(36).slice(2)}.txt`);
     writeFileSync(file, command);
-    const p = Bun.spawn([process.execPath, PROBE, root, network, file, ...extra], { stdout: "pipe", stderr: "pipe", timeout: 90_000 });
+    const p = Bun.spawn([process.execPath, PROBE, root, network, file, ...extra], { stdout: "pipe", stderr: "pipe", timeout: 150_000, env: { ...process.env, ...env } });
     const out = await new Response(p.stdout).text();
     await p.exited;
     const line = out.trim().split("\n").at(-1) ?? "{}";
@@ -236,6 +241,41 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(outsideCmd.asked).toEqual(["Bash"]);
     expect(outsideCmd.toolResult).toContain("cargo=[] gomod=[] npm=[] xdg=[] marker=[]");
   }, 180_000);
+
+  // #448 round 4: the CLI runs `git status` (and log, remote) in the workspace at every start, on the host. A
+  // sandboxed command makes a repository there whose filter driver names a script of its own; at the next CLI
+  // start the CLI's git is codeoid's shim, which runs it inside the sandbox (read-only, offline): the script
+  // can't write the marker, and the status still reaches the model.
+  for (const layout of ["no repository", "a subdirectory of its repository"] as const) {
+    test(`a repository a command plants in a workspace that is ${layout} runs nothing on the host at the CLI's next start (#448 round 4)`, async () => {
+      const id = Math.random().toString(36).slice(2, 8);
+      const top = join(root, `layout-${id}`);
+      const ws = layout === "no repository" ? top : join(top, "pkg");
+      mkdirSync(ws, { recursive: true });
+      if (layout !== "no repository") {
+        const g = (args: string[]) => Bun.spawnSync(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=t", "-c", "user.email=t@t", ...args], { cwd: top, env: { PATH: process.env.PATH ?? "", HOME: join(root, "home"), GIT_CONFIG_NOSYSTEM: "1" } });
+        writeFileSync(join(ws, "keep.txt"), "keep\n");
+        g(["init", "-q"]);
+        g(["add", "-A"]);
+        g(["commit", "-qm", "init"]);
+      }
+      const script = join(ws, "f.sh");
+      const mark = join(outside, `MARK-${id}`);
+      const plant = [
+        `printf '#!/bin/sh\\necho ran >> ${mark} 2>/dev/null\\ncat\\n' > ${script}`,
+        `chmod +x ${script}`,
+        `git init -q . && git config filter.x.clean ${script} && echo 'a.txt filter=x' > .gitattributes && echo a > a.txt && git add a.txt .gitattributes && touch -d 2001-01-01 a.txt && echo PLANT-OK`,
+      ].join("; ");
+      const r = await probe("off", plant, ["policy-env-git"], { CODEOID_PROBE_WORKSPACE: ws });
+      expect(r.result).toBe("success");
+      expect(r.toolResult).toContain("PLANT-OK");
+      expect(r.second).toBe("success");
+      // Nothing planted ran on the host: not while planting (inside), not at the CLI's next start (the shim).
+      expect(existsSync(mark)).toBe(false);
+      // git's output still reached the CLI: the status names the untracked script.
+      expect(r.system).toContain("f.sh");
+    }, 300_000);
+  }
 
   test("a command asking to run outside the sandbox reaches the gate, and a denial means it never runs", async () => {
     const r = await probe("off", `rm -rf ${outside}; echo RAN`, ["unsandboxed"]);

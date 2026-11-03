@@ -26,7 +26,9 @@ The sandbox's hard guarantees, on every provider that runs here:
    itself, by a backend CLI, or by anything codeoid starts**: not the
    toolchain caches (their variables are set only inside), not a backend's
    login written back (only its token fields), not the daemon's own git
-   (every program a repository's config names is turned off).
+   (every program a repository's config names is turned off), not the git a
+   backend CLI runs for itself outside the sandbox (its `git` is codeoid's
+   shim: [A backend CLI's own git](#a-backend-clis-own-git)).
 
 It does **not** guarantee that the workspace is safe to run after the agent
 touched it. The workspace is the agent's output, and it is code:
@@ -280,6 +282,53 @@ What each leaves open:
   belongs to, and its interpreter's install (`programLocations`), never the
   home itself.
 
+## A backend CLI's own git
+
+A backend whose CLI runs outside the sandbox runs git there too, for itself:
+the Claude CLI (under its own sandbox) runs `git status`, `git log`,
+`git remote` and `git config` in the workspace at every start, and
+opencode's shared server runs git for its project and snapshots. A
+sandboxed command can make a repository in the workspace (`git init` in a
+workspace with no `.git` of its own: a new project, or a package of a
+monorepo), name a program of its own as a filter driver in its config and
+apply it in `.gitattributes`; a git started outside would run that program
+with your rights at the CLI's next start, with no command of yours.
+
+So that CLI finds codeoid's `git` first on its `PATH`
+(`src/daemon/sandbox/git-shim.ts`): a script in a dir of the daemon's own
+(the session's launcher dir for Claude, `<providers.opencode.dataDir>/git-bin`
+for opencode), hidden from every sandbox and never in the workspace or the
+caches, so nothing inside can rewrite it (opencode's file tools are refused
+it, as its shell shim's `bin/`).
+
+- **Claude (native)**: the shim runs the real git **inside the session's
+  sandbox** — the same provider (bubblewrap, Seatbelt), the same hidden
+  home and paths, the workspace and every other writable location
+  read-only, no network — with the CLI's stdio, exit code, working
+  directory, arguments and environment (its own `-c` list in
+  `GIT_CONFIG_COUNT` included). A driver a planted config names runs there,
+  contained, and the CLI's git status is still right. The CLI's Bash
+  commands get the CLI's `PATH` without the shim (its env file takes it off),
+  so a command's git is the real one: inside the sandbox as before, and a
+  command the owner let run outside (a `git push`) runs as it would.
+  What the CLI starts with its own environment finds the shim too: a hook or
+  a stdio MCP server that runs git in the workspace runs it read-only and
+  offline; give it its own `PATH` in its config if it must write.
+- **When the shim can't sandbox** (its provider's program is gone), and for
+  **opencode's server** (one server for every session, so no one session's
+  sandbox fits; the git it runs is the one its `PATH` found): git runs with
+  every program-running key turned off (the daemon's own list, `safeGitEnv`'s,
+  appended to the caller's `GIT_CONFIG_COUNT`), every filter, diff and merge
+  driver and credential helper a config other than your global and system
+  one defines reset by name, the working tree's attributes not read
+  (`attr.tree` naming the empty tree, git 2.46+), and only https and ssh as
+  protocols unless the caller's own list is narrower (opencode's is none).
+  A config git can't read runs nothing; a diff through a textconv or
+  external diff the repository names fails rather than run it.
+- **Process-confined backends** (pi, the Gemini CLI, Qwen, Claude and Codex
+  under Docker) and **Codex under bubblewrap** run their git inside the
+  sandbox already, with everything else they do.
+
 ## Running one command outside the sandbox
 
 - **Claude**: `allowUnsandboxedCommands` is on, so the model may retry a command
@@ -380,7 +429,9 @@ to the workspace.
   held; a worktree added while a Claude query runs isn't held by Claude's
   own sandbox; a `.git` file git's records don't name back is held but
   unverified. Your global `safe.bareRepository=explicit` closes the bare
-  repository fallback entirely.
+  repository fallback entirely. None of these reach the git a backend CLI
+  runs for itself, which is contained ([above](#a-backend-clis-own-git)):
+  they are about git you, or another tool on the host, start there.
 - **Claude's own sandbox** puts placeholder files in the workspace while a
   command runs (`.bashrc`, `.gitconfig`, `.gitmodules`, `.idea`, `.mcp.json`
   …, its mandatory denies), so `git add -A` / `git add .` fails there

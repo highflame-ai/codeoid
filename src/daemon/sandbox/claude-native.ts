@@ -34,6 +34,7 @@ import { readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { SandboxSettings } from "@anthropic-ai/claude-agent-sdk";
+import { pathWithShim } from "./git-shim.js";
 import type { SandboxRuntime } from "./session-sandbox.js";
 import type { SandboxSpec } from "./types.js";
 
@@ -83,13 +84,20 @@ function shQuote(v: string): string {
  * codeoid takes out of the CLI's own environment). A `CLAUDE_ENV_FILE` of
  * the caller's is sourced after it.
  */
-export function claudeNativeEnv(spec: Pick<SandboxSpec, "env">, temp: ClaudeTempDirs, env: Record<string, string | undefined>): Record<string, string | undefined> {
+export function claudeNativeEnv(
+  spec: Pick<SandboxSpec, "env">,
+  temp: ClaudeTempDirs,
+  env: Record<string, string | undefined>,
+  gitShim?: string,
+): Record<string, string | undefined> {
   const { SANDBOX_RUNTIME: _marker, ...rest } = env;
   const exports = Object.entries(spec.env ?? {})
     .filter(([k]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k))
     .map(([k, v]) => `  export ${k}=${shQuote(v)}`);
   const own = env.CLAUDE_ENV_FILE;
   const lines = [
+    // The CLI's own git is codeoid's shim (git-shim.ts); a command's is the real one (a command the owner let run outside the sandbox pushes as it would).
+    ...(gitShim ? ["# codeoid (#448): the CLI's own git runs sandboxed; a command's PATH is the CLI's without it.", `PATH=\${PATH#${shQuote(`${gitShim}:`)}}`, "export PATH"] : []),
     "# codeoid (#448): the toolchains' caches, for commands inside the sandbox only.",
     ...(exports.length > 0 ? ['if [ "${SANDBOX_RUNTIME-}" = 1 ]; then', ...exports, "fi"] : []),
     ...(own ? [`[ -r ${shQuote(own)} ] && . ${shQuote(own)}`] : []),
@@ -99,7 +107,7 @@ export function claudeNativeEnv(spec: Pick<SandboxSpec, "env">, temp: ClaudeTemp
   const part = `${file}.${process.pid}.part`;
   writeFileSync(part, lines.join("\n"), { mode: 0o600 });
   renameSync(part, file);
-  return { ...rest, ...claudeTempEnv(temp), CLAUDE_ENV_FILE: file };
+  return { ...rest, ...claudeTempEnv(temp), CLAUDE_ENV_FILE: file, ...(gitShim ? { PATH: pathWithShim(gitShim, rest.PATH) } : {}) };
 }
 
 /** The SDK's `sandbox` option for a session whose sandbox is on and native. */

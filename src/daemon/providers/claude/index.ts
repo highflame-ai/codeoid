@@ -2886,7 +2886,8 @@ export function claudeSandboxOptions(
   if (!rt) return {};
   if (rt.plan.kind === "native") {
     const temp = rt.claudeTemp();
-    return { sandbox: claudeSandboxSettings(rt, env, temp), env: claudeNativeEnv(rt.spec, temp, env) };
+    // The CLI's own git (its `git status` at every start) runs inside the sandbox too (git-shim.ts).
+    return { sandbox: claudeSandboxSettings(rt, env, temp), env: claudeNativeEnv(rt.spec, temp, env, rt.gitShim("the Claude CLI")) };
   }
   if (rt.plan.kind !== "process") return {};
   let handle: SandboxHandle | null = null;
