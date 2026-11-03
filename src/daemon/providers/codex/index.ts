@@ -48,6 +48,7 @@
 
 import type { McpTenant } from "../../mcp/oauth.js";
 import { randomUUID } from "node:crypto";
+import { resolve } from "node:path";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
 import type {
@@ -225,8 +226,8 @@ function threadConfig(opts: TurnOpts, rt: SandboxRuntime | null): Record<string,
 /**
  * The sandbox codex runs a session's commands in (#448). With codeoid's
  * sandbox on and native (bubblewrap): codex's own workspace-write — the
- * workspace and the session's temp dir writable, the network per the
- * session — inside codeoid's bubblewrap around the app-server, which hides
+ * workspace, the session's temp dir and the repository's git dirs
+ * writable, the network per the session — inside codeoid's bubblewrap around the app-server, which hides
  * what codex's own leaves readable. With codeoid's sandbox around the whole
  * process instead (Seatbelt, Docker; nested sandboxes don't work there):
  * full access inside it, which is the boundary. Without codeoid's sandbox
@@ -236,7 +237,9 @@ export function codexSandboxPolicy(rt: SandboxRuntime | null, fallback: SandboxM
   if (rt?.plan.kind === "native") {
     return {
       type: "workspaceWrite",
-      writableRoots: [...new Set([workdir, rt.spec.tempDir])],
+      // The repository's git dirs too: codex's own sandbox makes every `.git` read-only, so nothing would commit.
+      // What of them must stay read-only is held so by codeoid's bubblewrap around the app-server (gitWorkspacePaths).
+      writableRoots: [...new Set([workdir, ...tempRoots(rt.spec), ...(rt.spec.gitDirs ?? [])])],
       networkAccess: rt.spec.network.mode === "on",
       excludeTmpdirEnvVar: false,
       excludeSlashTmp: false,
@@ -244,6 +247,17 @@ export function codexSandboxPolicy(rt: SandboxRuntime | null, fallback: SandboxM
   }
   if (rt?.plan.kind === "process") return { type: "dangerFullAccess" };
   return sandboxPolicyWire(fallback, workdir);
+}
+
+/**
+ * The session's temp dir as codex's sandbox sees it. Under the host's /tmp
+ * it is codeoid's bubblewrap's `/tmp` (writable: `excludeSlashTmp: false`)
+ * and isn't at its own path inside, where codex's sandbox would fail every
+ * command binding it; elsewhere it is at its own path too.
+ */
+function tempRoots(spec: SandboxRuntime["spec"]): string[] {
+  const t = resolve(spec.tempDir);
+  return t === "/tmp" || t.startsWith("/tmp/") ? [] : [t];
 }
 
 function sandboxPolicyWire(mode: SandboxMode, workdir: string): Record<string, unknown> {

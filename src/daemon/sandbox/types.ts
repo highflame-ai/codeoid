@@ -83,10 +83,17 @@ export interface SandboxSpec {
   reexposed: readonly string[];
   /**
    * Locations inside a writable one that stay read-only, with everything in
-   * them: a repository's `hooks/` and `config` (a hook planted there would
-   * run outside the sandbox at the user's next commit).
+   * them: what of a repository decides which config, hooks and git dir git
+   * uses (a hook planted there would run outside the sandbox at the user's
+   * next commit). Each exists (made first where missing).
    */
   readOnly?: readonly string[];
+  /**
+   * The git dirs a commit in the workspace writes (writable, in
+   * {@link writable}, their structure in {@link readOnly}): what a backend's
+   * own sandbox must let it write too (Codex's writable roots).
+   */
+  gitDirs?: readonly string[];
   /**
    * Directories inside a writable location that must not be renamed or
    * removed, while what is in them stays writable: each one between a

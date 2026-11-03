@@ -290,11 +290,34 @@ export function homeCredentialFilesIn(readable: readonly string[]): string[] {
 
 /** What a sandbox makes of the workspace's git repository. */
 export interface GitPaths {
-  /** Writable: the repository's git dir (a linked worktree's common dir), when outside the workspace. */
+  /**
+   * Writable, each bound at its own path (so none can be renamed or
+   * replaced): the repository's git dir, a linked worktree's own git dir,
+   * and the `worktrees/` dir that holds the worktrees' git dirs.
+   */
   writable: string[];
-  /** Read-only even where the rest is writable: the repository's hooks, config and submodules' git dirs. */
+  /**
+   * Read-only even where the rest is writable: everything that decides which
+   * config, hooks and git dir git uses (see {@link gitWorkspacePaths}).
+   */
   readOnly: string[];
+  /** The git dirs a commit writes in: what a backend's own sandbox must also let it write (Codex's writable roots). */
+  gitDirs: string[];
 }
+
+/**
+ * In a git dir, what decides which config, hooks and git dirs git uses:
+ * held read-only from inside. `commondir` (in any git dir) names the
+ * repository git reads its config and hooks from; `config.worktree` is read
+ * where the config turns it on; `info/` holds attributes and sparse rules,
+ * `modules/` the submodules' git dirs (each with its own config and hooks),
+ * `remotes/` and `branches/` remotes defined as files.
+ */
+const GIT_CONTROL = ["config", "config.worktree", "commondir", "hooks", "info", "modules", "remotes", "branches"] as const;
+/** In a linked worktree's own git dir: what names its repository and its checkout, and its own config. */
+const WORKTREE_CONTROL = ["commondir", "gitdir", "config.worktree"] as const;
+/** Made when missing, so there is something to hold read-only: empty dirs, and an empty `config.worktree` (read only where the config turns it on). */
+const GIT_PLACEHOLDER_DIRS = ["hooks", "info", "modules"] as const;
 
 function readGitFile(dotgit: string): string | null {
   try {
@@ -308,17 +331,33 @@ function readGitFile(dotgit: string): string | null {
 /**
  * The workspace's git repository, found as git finds it (the nearest `.git`
  * at or above the workspace, below the home): a linked worktree (`.git` a
- * file naming its git dir) or a plain repository. Committing writes the
- * worktree's git dir and the repository's objects, refs, logs and
- * `packed-refs.lock` (git takes it beside `packed-refs` on a ref update),
- * so the repository's git dir is writable wherever it is. What git runs
- * from it stays read-only: `hooks/`, `config` (`core.hooksPath`,
- * `core.fsmonitor`, a filter), `config.worktree`, and `modules/` (a
- * submodule's git dir, with hooks and config of its own), since anything
- * planted there would run outside the sandbox at the user's next git
- * command. Those are made when missing (an empty dir, an empty
- * `config.worktree` where the config turns them on), so there is something
- * to hold read-only.
+ * file naming its git dir) or a plain repository.
+ *
+ * A commit writes the worktree's git dir (index, HEAD, logs, lock files)
+ * and the repository's objects, refs, logs and `packed-refs` (with its
+ * lock, taken beside it), so those git dirs are writable. Nothing of the
+ * repository's structure is: whatever decides which config, hooks or git
+ * dir git uses would run outside the sandbox at the user's next git
+ * command (`core.fsmonitor`, a hook, a filter in a config git was pointed
+ * at). So, read-only:
+ *
+ *   - in the repository's git dir: `config`, `config.worktree`,
+ *     `commondir`, `hooks/`, `info/`, `modules/` ({@link GIT_CONTROL}),
+ *     and every other worktree's git dir under `worktrees/`;
+ *   - in a linked worktree's own git dir: `commondir`, `gitdir`,
+ *     `config.worktree`;
+ *   - the worktree's `.git` file, and the `.git` file of every other
+ *     worktree or submodule checked out inside the workspace.
+ *
+ * The git dirs themselves are bound writable at their own paths (the
+ * workspace's `.git` dir too, and `worktrees/`), so none can be renamed
+ * away and rebuilt. A git dir must stay writable for git's lock files, so
+ * what isn't there yet is made first, to hold read-only: empty `hooks/`,
+ * `info/` and `modules/`, an empty `config.worktree` in every git dir of
+ * the repository, and `commondir` in the repository's git dir holding `.`,
+ * which git reads as that git dir itself. When an entry that must be held
+ * read-only is a link (which a bind can't hold: it can be replaced), the
+ * git dir is read-only whole instead, and committing from inside fails.
  *
  * A worktree's `.git` file is the agent's to write, so what it names is
  * believed only in git's own layout: `<common>/worktrees/<name>`, whose
@@ -326,7 +365,7 @@ function readGitFile(dotgit: string): string | null {
  * repository with `objects/` and `HEAD`. Anything else gets nothing.
  */
 export function gitWorkspacePaths(workspace: string, home: string = process.env.HOME ?? homedir()): GitPaths {
-  const out: GitPaths = { writable: [], readOnly: [] };
+  const out: GitPaths = { writable: [], readOnly: [], gitDirs: [] };
   const ws = resolve(workspace);
   const stop = resolve(home);
   let dotgit: string | null = null;
@@ -350,34 +389,136 @@ export function gitWorkspacePaths(workspace: string, home: string = process.env.
     return out;
   }
   let common: string;
+  let own: string | null = null;
   if (st.isDirectory()) {
     common = dotgit;
+    if (!gitDirShape(common)) return out;
   } else if (st.isFile()) {
     const named = readGitFile(dotgit);
     if (!named) return out;
     const gitDir = resolve(dirname(dotgit), named);
     common = dirname(dirname(gitDir));
     if (basename(dirname(gitDir)) !== "worktrees" || !validWorktree(gitDir, common, dotgit)) return out;
-    out.readOnly.push(join(gitDir, "config.worktree"));
+    own = gitDir;
   } else {
     return out;
   }
-  // Writable already when inside the workspace.
-  if (!within(common, ws)) out.writable.push(common);
-  for (const dir of ["hooks", "modules"]) {
-    try {
-      mkdirSync(join(common, dir), { mode: 0o755 });
-    } catch {
-      /* there already, or a repository codeoid can't write either */
+  // What isn't there yet can't be held read-only (a git dir stays writable for its lock files): made first.
+  for (const dir of GIT_PLACEHOLDER_DIRS) makeIfMissing(join(common, dir), "dir");
+  makeIfMissing(join(common, "config.worktree"), "");
+  // `.` is the git dir itself, as git, libgit2 and gitoxide read it: one an agent writes can't send git elsewhere.
+  makeIfMissing(join(common, "commondir"), ".\n");
+  const worktrees = join(common, "worktrees");
+  const others: string[] = [];
+  for (const name of listDirs(worktrees)) {
+    const dir = join(worktrees, name);
+    makeIfMissing(join(dir, "config.worktree"), "");
+    if (own && resolve(dir) === resolve(own)) continue;
+    others.push(dir);
+  }
+  const control = [
+    ...GIT_CONTROL.map((n) => join(common, n)),
+    ...(own ? WORKTREE_CONTROL.map((n) => join(own, n)) : []),
+  ].filter((p) => lexists(p));
+  // A link can't be held by a bind (it can be replaced): the git dir is read-only whole, and nothing commits from inside.
+  if (control.some(isLink) || (own && isLink(own)) || isLink(common)) {
+    out.readOnly.push(common);
+    if (own) out.readOnly.push(dotgit);
+    return out;
+  }
+  out.writable.push(common);
+  if (lexists(worktrees) && !isLink(worktrees)) out.writable.push(worktrees);
+  if (own) out.writable.push(own);
+  out.readOnly.push(...control, ...others);
+  if (own) out.readOnly.push(dotgit);
+  // Other checkouts of this repository inside the workspace (a worktree, a submodule): their `.git` files too.
+  for (const f of [...others.map((d) => gitdirTarget(d)), ...submoduleCheckouts(join(common, "modules"))]) {
+    if (f && f !== dotgit && within(f, ws) && lexists(f) && !isLink(f)) out.readOnly.push(f);
+  }
+  out.gitDirs.push(common, ...(own ? [own] : []));
+  return out;
+}
+
+/** A git dir as git checks one: `objects/` and `HEAD`. */
+function gitDirShape(dir: string): boolean {
+  try {
+    return lstatSync(join(dir, "objects")).isDirectory() && lstatSync(join(dir, "HEAD")).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function lexists(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isLink(p: string): boolean {
+  try {
+    return lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/** A dir (`"dir"`) or a file with `content`, made only where nothing (not even a link) is: never through one. */
+function makeIfMissing(p: string, content: string): void {
+  try {
+    if (content === "dir") mkdirSync(p, { mode: 0o755 });
+    else writeFileSync(p, content, { flag: "wx", mode: 0o644 });
+  } catch {
+    /* there already, or a repository codeoid can't write either */
+  }
+}
+
+function listDirs(dir: string): string[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+
+/** The `.git` file a worktree's git dir names as its checkout's (its `gitdir` file), absolute. */
+function gitdirTarget(worktreeGitDir: string): string | null {
+  try {
+    const named = readFileSync(join(worktreeGitDir, "gitdir"), "utf8").trim();
+    return named ? resolve(worktreeGitDir, named) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The `.git` files of the submodules checked out from `modules` (each
+ * submodule's git dir names its checkout in `core.worktree`), nested ones
+ * included; bounded.
+ */
+function submoduleCheckouts(modules: string, depth = 0, budget = { left: 200 }): string[] {
+  const out: string[] = [];
+  if (depth > 4) return out;
+  for (const name of listDirs(modules)) {
+    if (--budget.left < 0) break;
+    const dir = join(modules, name);
+    if (gitDirShape(dir)) {
+      try {
+        const m = /^\s*worktree\s*=\s*(.+?)\s*$/im.exec(readFileSync(join(dir, "config"), "utf8"));
+        if (m?.[1]) out.push(join(resolve(dir, m[1]), ".git"));
+      } catch {
+        /* no config: not checked out */
+      }
+      out.push(...submoduleCheckouts(join(dir, "modules"), depth + 1, budget));
+    } else {
+      // A submodule named with a slash (`libs/a`): its git dir is a level down.
+      out.push(...submoduleCheckouts(dir, depth + 1, budget));
     }
   }
-  try {
-    // Read where the config turns it on: there must be one to hold read-only.
-    if (/worktreeconfig\s*=\s*true/i.test(readFileSync(join(common, "config"), "utf8"))) writeFileSync(join(common, "config.worktree"), "", { flag: "a" });
-  } catch {
-    /* no config to read, or none codeoid can write */
-  }
-  out.readOnly.push(join(common, "hooks"), join(common, "config"), join(common, "config.worktree"), join(common, "modules"));
   return out;
 }
 
@@ -398,7 +539,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const env = inputs.hidden?.env ?? process.env;
   const home = inputs.hidden?.home ?? env.HOME ?? homedir();
   const workspace = resolve(inputs.workspace);
-  const git = inputs.git === false ? { writable: [], readOnly: [] } : gitWorkspacePaths(workspace, home);
+  const git = inputs.git === false ? { writable: [], readOnly: [], gitDirs: [] } : gitWorkspacePaths(workspace, home);
   const own = [...(inputs.backendState ?? []).map((p) => resolve(p)), ...git.writable];
   const ownReal = own.map(realOr);
   const root = sandboxRootIfMade();
@@ -433,6 +574,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     writable: own,
     hidden,
     readOnly: git.readOnly,
+    gitDirs: git.gitDirs,
     pinned: protectedAncestors(hidden, [workspace, tempDir, ...own]),
     reexposed,
     containerSockets: containerSocketPaths(home, env),

@@ -22,8 +22,8 @@ With the default policy (workspace-write):
 |---|---|
 | **Your home: hidden whole** | the sandbox starts from an empty, read-only home. A credential that isn't on any list, one created after the session started (`aws configure`, `gh auth login`), or one a program replaces by writing a new file and renaming it over the old one, is simply not there. What is shown again, read-only: the **allowlist** `sandbox.homeReadable` (below), and what the backend itself needs (its program; its private home, below). The workspace, when it is in your home, is shown writable. |
 | **Home allowlist** (`sandbox.homeReadable`, read-only) | by default toolchains and tool settings that hold no secret: `~/.bun`, `~/.cargo/bin`, `~/.cargo/registry`, `~/.cargo/git`, `~/.rustup`, `~/.nvm`, `~/.npm`, `~/.local/bin`, `~/.local/share/pnpm`, `~/.pyenv`, `~/go/pkg`, `~/go/bin`, `~/.gitconfig`, `~/.config/git/config`, `~/.config/git/ignore`, `~/.config/git/attributes`. Not listed, so hidden: `~/.npmrc`, `~/.bunfig.toml`, `~/.yarnrc.yml`, `~/.pypirc`, `~/.cargo/credentials.toml`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.gradle`, `~/.m2` and everything else. A global npmrc inside an nvm install (`~/.nvm/versions/node/*/etc/npmrc`) is hidden again. A link in the list (`~/.gitconfig` into a dotfiles repository) is shown at its own path and where it leads. A token written into `~/.gitconfig` itself (a URL carrying one, an `http.extraHeader`) would show: keep it in a credential helper. |
-| **Writable** | the session's working directory (its worktree), a private temp dir made for the session (`$TMPDIR`, and the sandbox's `/tmp` under bubblewrap and Docker), and the workspace's **git repository**: a linked worktree's git dir and its repository's (objects, refs, logs, `packed-refs.lock`), wherever they are, a repository under the host's `/tmp` included. Nothing else. |
-| **Read-only** | everything else on the machine. `rm -rf ~` fails with "Read-only file system". Inside the writable, a repository's `hooks/`, `config`, `config.worktree` and `modules/` (a submodule's git dir carries hooks and config of its own) stay read-only: a hook, `core.hooksPath` or `core.fsmonitor` planted there would run outside the sandbox at your next `git commit`. |
+| **Writable** | the session's working directory (its worktree), a private temp dir made for the session (`$TMPDIR`, and the sandbox's `/tmp` under bubblewrap and Docker), and what a commit in the workspace's **git repository** writes: its git dir, a linked worktree's own git dir and its repository's (objects, refs, logs, the index, `HEAD`, `packed-refs` and the lock files beside them), wherever they are, a repository under the host's `/tmp` included. Nothing else. |
+| **Read-only** | everything else on the machine. `rm -rf ~` fails with "Read-only file system". Inside the writable, **a repository's structure**: everything that decides which config, hooks or git dir git uses, since a hook, `core.hooksPath` or `core.fsmonitor` planted there (or a config git is pointed at) would run outside the sandbox at your next `git status`. That is, in the repository's git dir: `config`, `config.worktree`, `commondir`, `hooks/`, `info/`, `modules/` (a submodule's git dir carries hooks and config of its own), `remotes/`, `branches/` and every other worktree's git dir; in a linked worktree's own git dir: `commondir`, `gitdir`, `config.worktree`; the worktree's `.git` file, and the `.git` file of every other worktree or submodule checked out inside the workspace. The git dirs themselves are bound at their own paths, so none can be renamed away and rebuilt (`mv .git .git-old` fails), the workspace's `.git` dir included. What of these isn't there yet is made first, so there is something to hold: empty `hooks/`, `info/`, `modules/`, an empty `config.worktree` in every git dir of the repository, and a `commondir` in the repository's git dir holding `.` (git, libgit2 and gitoxide read it as that git dir itself; see Limits). An entry that would have to be held but is a link (a bind can't hold one) makes the git dir read-only whole: commits from inside then fail. |
 | **Hidden besides** (not readable at all) | outside the home, or in a workspace that holds it: codeoid's config dir (`~/.codeoid`: keys, accounts, endpoints, the local token) and every data dir it owns wherever it is configured (the database, transcripts and checkpoints, opencode's database and data dirs, memory's; their lock files); the agent CLIs' logins (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.qwen/oauth_creds.json`, `~/.gemini/oauth_creds.json` …, pi's `auth.json`) and what backends registered as credentials (opencode's key files); `~/.ssh`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.config/gh`, `~/.config/hub`, `~/.config/glab-cli`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.local/share/keyrings`, `~/.password-store`, `~/.config/op`, `~/.vault-token`, `~/.pypirc`, `~/.cargo/credentials(.toml)`, `~/.terraform.d/credentials.tfrc.json`, `~/.claude.json` (MCP tokens), `~/.local/share/opencode/auth.json` and `mcp-auth.json`, `~/.config/github-copilot`, `~/.pgpass`, `~/.config/rclone`, `~/.s3cfg`, `~/.boto`, `~/.pulumi/credentials.json`, `~/.config/doctl`, `~/.fly`, `~/.npmrc`, `~/.bunfig.toml`, `~/.yarnrc.yml`, `~/.gradle/gradle.properties`, `~/.m2/settings.xml`, `~/Library/Keychains`; the desktop session's runtime dir (`$XDG_RUNTIME_DIR`: keyring, D-Bus, agent sockets) and `$SSH_AUTH_SOCK`'s dir; the daemon's own temp dir when it isn't `/tmp` (sign-in homes); plus `sandbox.hiddenPaths` (which also beats the allowlist). |
 | **Never reachable** | container runtime sockets: `/run/docker.sock`, `/var/run/docker.sock`, containerd, podman, CRI-O, buildkit, k3s, the user's rootless sockets, Docker Desktop / Colima / Lima / Rancher / OrbStack, `$DOCKER_HOST`. A container socket is root on the machine. |
 | **Environment** | `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GPG_AGENT_INFO`, `DBUS_SESSION_BUS_ADDRESS`, `DOCKER_HOST`, `CONTAINER_HOST`, `KUBECONFIG` are unset inside. On Claude, every credential-named variable the CLI runs with is denied to its commands. |
@@ -145,7 +145,7 @@ How a backend is put inside is the backend's (`src/daemon/sandbox/confinement.ts
 | Backend | bubblewrap (Linux) | Seatbelt (macOS) | Docker |
 |---|---|---|---|
 | **Claude** | Claude Code's own sandbox with codeoid's policy (Agent SDK `sandbox`): commands only; network on/off/**allowlist** via its proxy | the same, on Seatbelt | the whole CLI in the container (`spawnClaudeCodeProcess`); network on only |
-| **Codex** | codex's own `workspace-write` (workspace + temp dir writable, network per session) **inside** codeoid's bubblewrap around the app-server; network on/off | the whole app-server under Seatbelt, full access inside it (Seatbelt doesn't nest); network on only | the whole app-server in the container; network on only |
+| **Codex** | codex's own `workspace-write` (the workspace, `/tmp` and the repository's git dirs writable, network per session) **inside** codeoid's bubblewrap around the app-server, which holds the repository's structure read-only; network on/off | the whole app-server under Seatbelt, full access inside it (Seatbelt doesn't nest); network on only | the whole app-server in the container; network on only |
 | **opencode** | each shell line in the session's bubblewrap (the shared server's `SHELL` is codeoid's shim); network on/off | each line under Seatbelt | each line in its own container |
 | **pi, Gemini CLI, Qwen Code** | the whole process inside; network on only | the same | the same |
 | **OpenAI, Gemini API, llama.cpp, `oai:*` endpoints** | run no commands: "no shell", never refused | | |
@@ -269,11 +269,22 @@ to the workspace.
   file is still laid over at the start (bubblewrap, Docker): replaced by a
   rename, or created later there, it shows to a sandbox already running. The
   home's own files can't do that (the home isn't shown).
-- **Git**: with a repository's `hooks/`, `config` and `modules/` read-only,
-  `git config …` (writing the repository's config), installing a hook and
-  `git submodule update --init` fail inside; run them yourself. A repository
-  whose `.git` names a git dir outside git's own worktree layout
-  (`--separate-git-dir`) gets nothing extra: commits there fail inside.
+- **Git**: with a repository's structure read-only, `git config …` (writing
+  the repository's config), installing a hook, `git submodule update --init`,
+  `git worktree add`/`remove`, `git sparse-checkout` and editing
+  `.git/info/exclude` fail inside; run them yourself. A repository whose `.git`
+  names a git dir outside git's own worktree layout (`--separate-git-dir`)
+  gets nothing extra: commits there fail inside. The `commondir` placeholder
+  (`.`) in a repository's git dir is what lets bubblewrap and Docker hold it
+  read-only (a mount needs something to mount on, and a git dir must stay
+  writable for git's lock files); it stays after the session. Not held,
+  because they are the workspace's own content: a repository planted in a
+  subdirectory of the workspace (a `.git` made in a directory that had none,
+  an uninitialised submodule's path included) is used by your git there, and
+  by your `git status` in the superproject for a submodule path. A rebase or
+  cherry-pick in progress (`rebase-merge/`, `sequencer/`) can carry `exec`
+  lines written inside: look before `git rebase --continue` on a state you
+  didn't start.
 - **Claude's own sandbox** puts placeholder files in the workspace while a
   command runs (`.bashrc`, `.gitconfig`, `.gitmodules`, `.idea`, `.mcp.json`
   …, its mandatory denies), so `git add -A` / `git add .` fails there
@@ -322,7 +333,10 @@ works, and skip where it doesn't):
   can't create `.claude/settings.json` in the workspace.)
 - `src/tests/sandbox-codex.test.ts`: the app-server started inside real
   bubblewrap can't read a planted credential and can read its own home; codex's
-  own sandbox (0.166) works nested inside codeoid's bubblewrap.
+  own sandbox (0.166) works nested inside codeoid's bubblewrap; with the real
+  `codex sandbox` and the writable roots codeoid gives it, nested in real
+  bubblewrap, a plain repository and a linked worktree commit while
+  `.git/config`, `core.fsmonitor` and renaming `.git` are refused.
 - `src/tests/sandbox-process-backends.test.ts`: pi's and the Gemini CLI's
   processes (fake agents) inside real bubblewrap can't read a planted credential
   and can read their own login; Qwen Code's real bundled CLI starts through its
@@ -349,6 +363,15 @@ works, and skip where it doesn't):
   read-only. Container sockets behind a linked dir (`/var/run`) are handed
   physically (before, the CLI's bubblewrap failed every command where
   `/var/run/docker.sock` existed).
+- Round 2 of the audit, real bubblewrap (`sandbox-bwrap-real.test.ts`, "round
+  2 (git)"): each way of changing which config the user's next git reads is
+  refused — the worktree's `.git` file pointed at a git dir built in the
+  workspace (A), its own or another worktree's `commondir` rewritten (B), a
+  plain repository's `.git` renamed and rebuilt (C), a `config.worktree`
+  planted where the config turns it on (D), a `commondir` made in the
+  repository's git dir (E) — and afterwards your `git status` (run outside
+  the session's sandbox) runs nothing planted; commits, branches and a branch
+  deletion still work from inside, in a plain repository and a worktree.
 - `src/tests/provider-opencode.integration.test.ts` I69 (real opencode 2.2.5,
   scripted local model, `CODEOID_OPENCODE_INTEGRATION=1`): a session's shell
   lines run inside its bubblewrap; a session whose sandbox is off runs bash as

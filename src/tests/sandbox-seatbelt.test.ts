@@ -63,6 +63,19 @@ describe("seatbeltProfile", () => {
     expect(text).not.toContain('(deny file-write* (subpath "/Users/u/.codeoid"))');
   });
 
+  test("a writable git dir can't itself be written (renamed away and rebuilt), what is in it can; its worktrees' git dirs held read-only inside it (#448 round 2)", () => {
+    const g = "/Users/u/repo/.git";
+    const { text } = readable(spec({ writable: [g, `${g}/worktrees`, `${g}/worktrees/w`], readOnly: [`${g}/config`, `${g}/worktrees/other`, `${g}/worktrees/w/commondir`] }));
+    const at = (n: string) => text.indexOf(n);
+    for (const p of [g, `${g}/worktrees`, `${g}/worktrees/w`]) {
+      expect(at(`(deny file-write* (literal "${p}"))`)).toBeGreaterThan(at(`(allow file-read* file-write* (subpath "${p}"))`));
+    }
+    // Neither the workspace nor the temp dir: they are the session's to lay out.
+    expect(text).not.toContain('(deny file-write* (literal "/Users/u/repo"))');
+    expect(at(`"${g}/worktrees/other"`)).toBeGreaterThan(at(`(allow file-read* file-write* (subpath "${g}/worktrees"))`));
+    expect(at(`"${g}/worktrees/w/commondir"`)).toBeGreaterThan(at(`(allow file-read* file-write* (subpath "${g}/worktrees/w"))`));
+  });
+
   test("a repository's hooks and config can't be written, with what is in them", () => {
     const { text } = readable(spec({ readOnly: ["/Users/u/repo/.git/hooks", "/Users/u/repo/.git/config"] }));
     expect(text).toContain('"/Users/u/repo/.git/hooks"');

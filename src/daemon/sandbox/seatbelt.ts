@@ -100,6 +100,10 @@ export function seatbeltProfile(
   }
   const hidden = rules.map((r) => r.path);
   for (const p of writable) rules.push({ path: p, kind: "write" });
+  // A writable location besides the workspace and temp dir (a repository's git dir, a backend's home) can't be
+  // renamed itself, as a mount point can't under bwrap or Docker: renaming a git dir away would leave its read-only parts behind.
+  const own = new Set([real(spec.workspace), real(spec.tempDir)]);
+  for (const p of writable) if (!own.has(p)) rules.push({ path: p, kind: "pinned" });
   for (const r of spec.reexposed) {
     // A link is read by its own path and where it leads: both allowed.
     for (const p of new Set([r, real(r)])) {

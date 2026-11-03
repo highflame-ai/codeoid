@@ -537,3 +537,187 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: ro
     expect(existsSync(join(secret, "planted"))).toBe(false);
   });
 });
+
+/**
+ * Round 2 of the #448 audit: a command inside the sandbox can't change which
+ * config, hooks or git dir the user's next git uses. Each variant tries one
+ * way in, planting a config whose `core.fsmonitor` is a program that only
+ * appends to a marker file in the test's own dir; then "the user's next
+ * git" runs, outside the session's sandbox (in a bubblewrap that may write
+ * only the test's dir), and must run nothing planted.
+ */
+describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: round 2 of the #448 audit (git)", () => {
+  let root: string;
+  beforeAll(() => {
+    root = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-round2-")));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  const sh = (h: SandboxHandle, cwd: string, script: string, env: Record<string, string>) => h.exec(["/bin/sh", "-c", script], { cwd, env, timeoutMs: 30_000 });
+
+  /** A repository with a commit, and (optionally) a linked worktree beside it. */
+  function fixture(name: string, opts: { worktree?: boolean; worktreeConfig?: boolean } = {}) {
+    const dir = join(root, name);
+    const home = join(dir, "home");
+    const repo = join(dir, "repo");
+    mkdirSync(home, { recursive: true });
+    mkdirSync(repo, { recursive: true });
+    git(["init", "-q", "-b", "main"], repo, home);
+    writeFileSync(join(repo, "a.txt"), "a\n");
+    git(["add", "."], repo, home);
+    git(["commit", "-qm", "init"], repo, home);
+    if (opts.worktreeConfig) git(["config", "extensions.worktreeConfig", "true"], repo, home);
+    let ws = repo;
+    if (opts.worktree) {
+      ws = join(dir, "wt");
+      git(["worktree", "add", "-q", "-b", "feat", ws], repo, home);
+      // Another worktree of the same repository, elsewhere.
+      git(["worktree", "add", "-q", "-b", "other", join(dir, "other")], repo, home);
+    }
+    const marker = join(dir, "RAN-OUTSIDE");
+    const mark = join(dir, "mark.sh");
+    // The planted program: appends one line to the marker, nothing else.
+    writeFileSync(mark, `#!/bin/sh\necho ran >> '${marker}'\n`, { mode: 0o755 });
+    const tmp = join(dir, "tmp");
+    mkdirSync(tmp);
+    const spec = buildSandboxSpec({ sessionId: name, workspace: ws, tempDir: tmp, network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    return { dir, home, repo, ws, marker, mark, spec, common: join(repo, ".git"), env: gitEnv(home) };
+  }
+
+  /** The user's next git in `cwd`, outside the session's sandbox: in a bubblewrap that can write only the test's dir. */
+  function userGit(f: { dir: string; home: string }, cwd: string): void {
+    const bwrap = provider.binary() as string;
+    Bun.spawnSync([bwrap, "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--bind", f.dir, f.dir, "--chdir", cwd, "--", "git", "status", "--short"], { env: gitEnv(f.home) });
+  }
+
+  /** What config the user's git would read in `cwd` (runs nothing). */
+  function fsmonitorSeen(f: { home: string }, cwd: string): string {
+    return Bun.spawnSync(["git", "config", "--show-origin", "--get-all", "core.fsmonitor"], { cwd, env: gitEnv(f.home) }).stdout.toString();
+  }
+
+  test("A: the worktree's .git file can't be pointed at a git dir built inside the workspace", async () => {
+    const f = fixture("a", { worktree: true });
+    const h = await provider.open(f.spec);
+    try {
+      const r = await sh(
+        h,
+        f.ws,
+        `cp -r '${f.common}' .evilgit && git --git-dir=.evilgit config core.fsmonitor '${f.mark}' && echo BUILT; printf 'gitdir: %s\\n' "$PWD/.evilgit" > .git && echo REWROTE || echo DOTGIT-READ-ONLY; mv .git .git-moved 2>/dev/null && echo MOVED || echo DOTGIT-PINNED`,
+        f.env,
+      );
+      expect(r.stdout).toContain("BUILT");
+      expect(r.stdout).toContain("DOTGIT-READ-ONLY");
+      expect(r.stdout).toContain("DOTGIT-PINNED");
+    } finally {
+      await h.close();
+    }
+    expect(fsmonitorSeen(f, f.ws)).toBe("");
+    userGit(f, f.ws);
+    expect(existsSync(f.marker)).toBe(false);
+  });
+
+  test("B: the worktree's commondir (and another worktree's) can't be pointed at a repository built inside the workspace", async () => {
+    const f = fixture("b", { worktree: true });
+    const own = join(f.common, "worktrees", "wt");
+    const other = join(f.common, "worktrees", "other");
+    const h = await provider.open(f.spec);
+    try {
+      const r = await sh(
+        h,
+        f.ws,
+        `cp -r '${f.common}' .evilcommon && git --git-dir=.evilcommon config core.fsmonitor '${f.mark}' && echo BUILT; echo "$PWD/.evilcommon" > '${join(own, "commondir")}' && echo REWROTE-OWN || echo OWN-READ-ONLY; echo "$PWD/.evilcommon" > '${join(other, "commondir")}' && echo REWROTE-OTHER || echo OTHER-READ-ONLY; mv '${join(f.common, "worktrees")}' '${join(f.common, "wt-moved")}' 2>/dev/null && echo MOVED || echo WORKTREES-PINNED`,
+        f.env,
+      );
+      expect(r.stdout).toContain("BUILT");
+      expect(r.stdout).toContain("OWN-READ-ONLY");
+      expect(r.stdout).toContain("OTHER-READ-ONLY");
+      expect(r.stdout).toContain("WORKTREES-PINNED");
+    } finally {
+      await h.close();
+    }
+    for (const at of [f.ws, join(f.dir, "other")]) {
+      expect(fsmonitorSeen(f, at)).toBe("");
+      userGit(f, at);
+    }
+    expect(existsSync(f.marker)).toBe(false);
+  });
+
+  test("C: a plain repository's .git can't be renamed and rebuilt", async () => {
+    const f = fixture("c");
+    const h = await provider.open(f.spec);
+    try {
+      const r = await sh(h, f.ws, `mv .git .git-old && echo MOVED || echo DOTGIT-PINNED; cp -r .git .git-copy && git --git-dir=.git-copy config core.fsmonitor '${f.mark}' && echo BUILT; git config core.fsmonitor '${f.mark}' 2>/dev/null && echo CONFIG-SET || echo CONFIG-READ-ONLY`, f.env);
+      expect(r.stdout).toContain("DOTGIT-PINNED");
+      expect(r.stdout).toContain("CONFIG-READ-ONLY");
+    } finally {
+      await h.close();
+    }
+    expect(fsmonitorSeen(f, f.ws)).toBe("");
+    userGit(f, f.ws);
+    expect(existsSync(f.marker)).toBe(false);
+  });
+
+  test("D: a worktree's config.worktree can't be planted where the config turns it on (it didn't exist before)", async () => {
+    const f = fixture("d", { worktree: true, worktreeConfig: true });
+    const own = join(f.common, "worktrees", "wt");
+    const h = await provider.open(f.spec);
+    try {
+      const r = await sh(
+        h,
+        f.ws,
+        `git config -f '${join(own, "config.worktree")}' core.fsmonitor '${f.mark}' 2>/dev/null && echo PLANTED-OWN || echo OWN-READ-ONLY; git config -f '${join(f.common, "worktrees", "other", "config.worktree")}' core.fsmonitor '${f.mark}' 2>/dev/null && echo PLANTED-OTHER || echo OTHER-READ-ONLY; git config --worktree core.fsmonitor '${f.mark}' 2>/dev/null && echo PLANTED-WT || echo WT-READ-ONLY`,
+        f.env,
+      );
+      expect(r.stdout).toContain("OWN-READ-ONLY");
+      expect(r.stdout).toContain("OTHER-READ-ONLY");
+      expect(r.stdout).toContain("WT-READ-ONLY");
+    } finally {
+      await h.close();
+    }
+    for (const at of [f.ws, join(f.dir, "other"), f.repo]) {
+      expect(fsmonitorSeen(f, at)).toBe("");
+      userGit(f, at);
+    }
+    expect(existsSync(f.marker)).toBe(false);
+  });
+
+  test("E: a commondir can't be created in a plain repository's .git (nor in the repository of a worktree) to send git elsewhere", async () => {
+    for (const worktree of [false, true]) {
+      const f = fixture(worktree ? "e-wt" : "e", { worktree });
+      const h = await provider.open(f.spec);
+      try {
+        const r = await sh(
+          h,
+          f.ws,
+          `cp -r '${f.common}' "$PWD/.evil" && git --git-dir="$PWD/.evil" config core.fsmonitor '${f.mark}' && echo BUILT; rm -f '${join(f.common, "commondir")}' 2>/dev/null; echo "$PWD/.evil" > '${join(f.common, "commondir")}' 2>/dev/null && echo PLANTED || echo COMMONDIR-READ-ONLY`,
+          f.env,
+        );
+        expect(r.stdout).toContain("BUILT");
+        expect(r.stdout).toContain("COMMONDIR-READ-ONLY");
+      } finally {
+        await h.close();
+      }
+      expect(fsmonitorSeen(f, f.repo)).toBe("");
+      userGit(f, f.repo);
+      expect(existsSync(f.marker)).toBe(false);
+    }
+  });
+
+  test("commits still work from inside: a plain repository, a linked worktree (branch made and deleted too)", async () => {
+    for (const worktree of [false, true]) {
+      const f = fixture(worktree ? "commit-wt" : "commit", { worktree });
+      const h = await provider.open(f.spec);
+      try {
+        writeFileSync(join(f.ws, "new.txt"), "n\n");
+        const r = await sh(h, f.ws, "git add new.txt && git commit -qm inside && echo COMMITTED && git branch tmp-b && git branch -D tmp-b >/dev/null && echo BRANCHED && git stash list >/dev/null && echo OK", f.env);
+        expect(r.stderr).not.toContain("Unable to create");
+        expect(r.stderr).not.toContain("fatal");
+        expect(r.stdout).toContain("COMMITTED");
+        expect(r.stdout).toContain("BRANCHED");
+      } finally {
+        await h.close();
+      }
+      expect(git(["log", "--oneline", worktree ? "feat" : "main"], f.repo, f.home)).toContain("inside");
+    }
+  });
+});
