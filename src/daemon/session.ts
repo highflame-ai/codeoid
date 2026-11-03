@@ -102,7 +102,7 @@ import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js
 import type { EffortChangeResult, EffortLevel, RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
 import { LIMITS } from "../protocol/types.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
-import type { PendingToolApproval, SessionApproveOutcome } from "../protocol/types.js";
+import type { PendingToolApproval, SessionApproveOutcome, SessionSandboxInfo, SessionSandboxSetting } from "../protocol/types.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -205,6 +205,9 @@ import { assessShellCommandSync, type ShellRisk, UNREADABLE_SHELL_CALL } from ".
 import { loadShellParser, shellParserReady } from "./shell/parse.js";
 import { isShellTool, runsNoCommand, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
+import { asksUnsandboxed } from "./sandbox/claude-native.js";
+import type { SandboxRegistry } from "./sandbox/registry.js";
+import { SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -618,6 +621,19 @@ export interface SessionCreateOptions {
    */
   hooks?: HookBus;
   /**
+   * The daemon's OS sandbox providers (#448). Absent (unit tests building a
+   * Session directly): no sandboxing, and `SessionInfo.sandbox` is absent.
+   */
+  sandboxRegistry?: SandboxRegistry;
+  /** This session's sandbox setting (absent fields follow `sandbox.*`). Restored on resume. */
+  sandbox?: SessionSandboxSetting;
+  /**
+   * Started for unattended work (a routine run, a loop worker, a dispatch
+   * worker): its turns refuse to start while its sandbox can't run, as an
+   * autonomous session's do (#448).
+   */
+  requireSandbox?: boolean;
+  /**
    * Provider override for testing. When present, replaces the registry
    * lookup so integration tests run without the Claude Agent SDK subprocess.
    * Name prefix signals this is test-only infrastructure — do not use in production.
@@ -837,6 +853,9 @@ const SHELL_TASK_KINDS: ReadonlySet<string> = new Set(["local_bash", "bash", "sh
 
 /** Events that mean the model did work in a turn — so the turn spent something (#430). */
 const MODEL_ACTIVITY: ReadonlySet<ProviderEvent["type"]> = new Set(["model_request", "model_output", "text_delta", "text_done", "thinking_delta", "tool_start", "llm_call"]);
+
+/** Claude Code's sandbox asking whether a command may reach a host (#448). */
+const SANDBOX_NETWORK_TOOL = "SandboxNetworkAccess";
 
 export class Session {
   readonly id: string;
@@ -1170,6 +1189,10 @@ export class Session {
   #endAttemptInterruptQueued = false;
   /** See SessionCreateOptions.extraEnv (validated in the constructor). */
   #extraEnv: Readonly<Record<string, string>> | undefined;
+  /** The session's OS sandbox (#448); null on a Session built without a sandbox registry. */
+  #sandbox: SessionSandbox | null = null;
+  /** Started for unattended work: turns need an enforced sandbox (SessionCreateOptions.requireSandbox). */
+  #requireSandbox = false;
   /** Why the last finished turn failed, when a usage or rate limit was the cause; null after a success. */
   #lastTurnInfraError: TurnInfraError | null = null;
   /**
@@ -1496,6 +1519,16 @@ export class Session {
       }
       this.#extraEnv = Object.freeze({ ...opts.extraEnv });
     }
+    if (opts.sandboxRegistry) {
+      this.#sandbox = new SessionSandbox({
+        sessionId: this.id,
+        workdir: opts.workdir,
+        registry: opts.sandboxRegistry,
+        ...(opts.config ? { config: opts.config } : {}),
+        ...(opts.sandbox ? { setting: opts.sandbox } : {}),
+      });
+    }
+    this.#requireSandbox = opts.requireSandbox === true;
     if (opts.initialMode) {
       this.#mode = opts.initialMode.mode;
       this.#turnsRemaining =
@@ -1706,6 +1739,7 @@ export class Session {
         role: this.role,
         providerId: this.#provider.id,
         ...this.#accountMeta(),
+        ...(this.#sandbox?.setting ? { sandbox: this.#sandbox.setting } : {}),
         forkedFrom: this.forkedFrom,
         ...this.#backgroundMeta(),
         worktree: this.worktree,
@@ -1714,6 +1748,14 @@ export class Session {
         // Fire-and-forget: saveMeta's write chain owns the failure log; an
         // unconsumed rejection here would be an unhandled-rejection crash.
       }).catch(() => {});
+    }
+
+    // The OS sandbox resolves in the background (a cached probe), so every
+    // session's info says it soon after it exists; a turn awaits it anyway.
+    if (this.#sandbox) {
+      void this.ensureSandbox().catch((err: unknown) => {
+        console.error(`[codeoid/session ${this.id}] resolving the sandbox failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
     }
 
     // Hook seam: session lifecycle. `resume` = rebuilt from persisted state
@@ -1783,6 +1825,8 @@ export class Session {
       isFork: () => this.#forkIsolation !== null,
       isOwnTask: (taskId) => this.#isOwnTask(taskId),
       onForeignAgentDenied: (agentId, toolName) => this.#noteForeignAgentRefused(agentId, toolName),
+      // Read each time the backend starts, and only when resolved for THIS backend.
+      sandbox: () => (this.#sandbox?.resolvedFor(factory.id) ? this.#sandbox.runtime : null),
       ...(this.#extraEnv ? { extraEnv: this.#extraEnv } : {}),
     });
   }
@@ -2180,6 +2224,15 @@ export class Session {
 
     const previous = this.#provider.id;
 
+    // An autonomous or unattended session can't move to a backend its sandbox can't hold (#448).
+    if (this.#sandbox && this.#sandboxRequired()) {
+      const refusal = sandboxRefusalOf(await this.#sandbox.refresh(requested));
+      if (refusal) {
+        await this.#sandbox.refresh(previous);
+        return { ok: false, code: "invalid_request", error: `${requested} can't be sandboxed here, and this session needs it: ${refusal}` };
+      }
+    }
+
     await this.#teardownProvider();
 
     // Fresh backing id BEFORE building the new provider — the incoming
@@ -2209,6 +2262,8 @@ export class Session {
       // Non-fatal: the in-memory reset governs this lifetime.
     }
 
+    // Resolved for the incoming backend before it is built (it may start at once to take the history).
+    await this.#sandbox?.refresh(requested);
     this.#provider = this.#createProvider(requested);
     this.#warnIfBudgetUnenforced();
     this.#effortRestartPending = false; // the new backend starts with the session's effort
@@ -2891,6 +2946,146 @@ export class Session {
     this.#broadcastInfoUpdate();
   }
 
+  // ── OS sandbox (#448) ─────────────────────────────────────────────────
+
+  /** Whether this session's turns need a sandbox that holds: autonomous mode, an unattended run, or started for unattended work. */
+  #sandboxRequired(): boolean {
+    return this.#mode === "autonomous" || this.#unattended > 0 || this.#requireSandbox;
+  }
+
+  /**
+   * The session's sandbox resolved for its current backend (a provider
+   * switch, a setting change, the first turn re-resolve it). Null on a
+   * Session without sandboxing. Announces a change.
+   */
+  async ensureSandbox(): Promise<SessionSandboxInfo | null> {
+    const sbx = this.#sandbox;
+    if (!sbx) return null;
+    if (sbx.resolvedFor(this.#provider.id) && sbx.info) return sbx.info;
+    const before = JSON.stringify(sbx.info);
+    const info = await sbx.refresh(this.#provider.id);
+    if (JSON.stringify(info) !== before) this.#broadcastInfoUpdate();
+    return info;
+  }
+
+  /** The session's own sandbox setting (persisted; a fork and a collaboration's children inherit it). */
+  get sandboxSetting(): SessionSandboxSetting | undefined {
+    return this.#sandbox?.setting;
+  }
+
+  /** The resolved sandbox, if any (SessionInfo.sandbox). */
+  get sandboxInfo(): SessionSandboxInfo | null {
+    return this.#sandbox?.info ?? null;
+  }
+
+  /** Whether the session was started for unattended work (SessionCreateOptions.requireSandbox). */
+  get requiresSandbox(): boolean {
+    return this.#requireSandbox;
+  }
+
+  /**
+   * Why an autonomous or unattended turn can't start on this session's
+   * sandbox now, or null (it holds, it's turned off by the owner, the
+   * backend runs no commands, or no turn here needs it). Reads the last
+   * resolution: call {@link ensureSandbox} first.
+   */
+  sandboxRefusal(opts: { forMode?: SessionMode } = {}): string | null {
+    const info = this.#sandbox?.info;
+    if (!info) return null;
+    const required = opts.forMode === "autonomous" || this.#sandboxRequired();
+    return required ? sandboxRefusalOf(info) : null;
+  }
+
+  /**
+   * Change the session's sandbox setting (owner only: SessionManager checks).
+   * Narrowing applies at once; widening — the sandbox off, the network wider,
+   * another provider — is asked of the owner on the session, in every mode,
+   * and applies only on a yes. A backend already running is restarted with
+   * the new sandbox at its next turn (now when idle, after the turn when not).
+   */
+  async setSandbox(
+    setting: SessionSandboxSetting,
+    sender: AuthContext,
+    opts: { onDecided?: (applied: boolean, reason?: string) => void } = {},
+  ): Promise<{ ok: true; pending?: { requestId?: string } } | { ok: false; error: string }> {
+    const sbx = this.#sandbox;
+    if (!sbx) return { ok: false, error: "this daemon has no OS sandbox" };
+    const problem = sandboxSettingProblem(setting, sbx.registry);
+    if (problem) return { ok: false, error: problem };
+    const next: SessionSandboxSetting = { ...(sbx.setting ?? {}), ...setting };
+    if (setting.network && setting.network !== "allowlist" && setting.allowedHosts === undefined) delete next.allowedHosts;
+    const before = sbx.effective();
+    const after = sbx.effective(next);
+    const describe = (e: { choice: string; network: { mode: string; allow?: readonly string[] } }) =>
+      `${e.choice === "off" ? "off" : e.choice}, network ${e.network.mode}${e.network.mode === "allowlist" ? ` (${(e.network.allow ?? []).join(", ")})` : ""}`;
+    const change = `${describe(before)} → ${describe(after)}`;
+    const apply = async (): Promise<void> => {
+      await sbx.set(next);
+      this.#store.audit(sender.sub, "session.set_sandbox", this.id, change);
+      this.#saveMetaNow();
+      await this.ensureSandbox();
+      this.#broadcastInfoUpdate();
+      const info = this.#makeMessage("info", `🛡 Sandbox: ${change}`, SYSTEM_IDENTITY, undefined, undefined, { event: "sandbox.changed", setting: next });
+      this.#persistAndBuffer(info);
+      this.#broadcastRaw(info);
+      // The backend picks it up when it next starts.
+      this.releaseIdleProvider();
+    };
+    if (!widens(before, after)) {
+      await apply();
+      return { ok: true };
+    }
+    // Widening: the owner answers on the session, whatever the mode. Never
+    // answered by an unattended turn (requestUserInput cancels it there).
+    this.#store.audit(sender.sub, "session.sandbox_widen_ask", this.id, change);
+    const title = after.choice === "off" ? `Turn the sandbox off for "${this.name}"?` : `Widen the sandbox for "${this.name}"?`;
+    const message =
+      after.choice === "off"
+        ? "The agent's commands would run with your full rights: they could read your credentials and change any file you can."
+        : `Commands would run with: ${describe(after)} (now: ${describe(before)}).`;
+    void this.requestUserInput({ method: "confirm", title, message }).then(
+      async (answer) => {
+        if (answer.cancelled || answer.confirmed !== true) {
+          this.#store.audit(sender.sub, "session.sandbox_widen_denied", this.id, `${change} ${answer.reason ?? "declined"}`);
+          opts.onDecided?.(false, answer.reason ?? "declined");
+          return;
+        }
+        await apply();
+        opts.onDecided?.(true);
+      },
+      () => opts.onDecided?.(false, "failed"),
+    );
+    return { ok: true, pending: {} };
+  }
+
+  /** A call that asks to run outside the sandbox (Claude's `dangerouslyDisableSandbox`), on a session whose sandbox is on. */
+  #unsandboxedRequest(input: unknown): boolean {
+    return this.#sandbox?.info?.state === "on" && asksUnsandboxed(input);
+  }
+
+  /** What an approval card says of the sandbox (#448): whether the call runs inside, and why not. */
+  #cardSandbox(toolName: string, input: unknown): { sandboxed?: boolean; sandboxNote?: string } {
+    const info = this.#sandbox?.info;
+    if (!info) return {};
+    if (this.#unsandboxedRequest(input)) return { sandboxed: false, sandboxNote: "asks to run outside the sandbox" };
+    switch (info.state) {
+      case "on": {
+        const runner = this.#sandbox?.runtime?.plan;
+        const shell = isShellTool(toolName) || isUnresolvedPathTool(toolName);
+        const inside = shell || runner?.fileTools === true;
+        return inside
+          ? { sandboxed: true, sandboxNote: `sandboxed: ${info.providerName ?? info.provider}, network ${info.network}` }
+          : { sandboxed: false, sandboxNote: "runs in the backend's own process, outside the sandbox" };
+      }
+      case "no-shell":
+        return {};
+      case "off":
+        return { sandboxed: false, sandboxNote: "not sandboxed: the sandbox is off for this session" };
+      default:
+        return { sandboxed: false, sandboxNote: `not sandboxed: ${info.reason ?? "unavailable"}` };
+    }
+  }
+
   /**
    * Update the user-visible name. No-ops when `next` matches the current
    * name. Broadcasts `session.info_update` so every attached client
@@ -3562,6 +3757,14 @@ export class Session {
     // Tool calls are judged as they're decided (#431); the daemon loads the
     // shell parser at start, and a turn never begins without it.
     if (!shellParserReady()) await loadShellParser().catch(() => {});
+    // The OS sandbox (#448), resolved for this backend before it starts. An
+    // autonomous or unattended turn doesn't start without one that holds.
+    await this.ensureSandbox();
+    const sandboxRefused = this.sandboxRefusal();
+    if (sandboxRefused) {
+      this.#store.audit(sender.sub, "session.sandbox_refused", this.id, sandboxRefused);
+      throw new SandboxRequiredError(`Not started: ${sandboxRefused}`);
+    }
     this.#store.audit(sender.sub, "session.send", this.id);
     // A new turn is starting — clear any interrupt from the previous one.
     this.#turnInterrupted = false;
@@ -5072,6 +5275,7 @@ export class Session {
     // Tear down the streamInput loop cleanly before wiping storage so we
     // don't leave a zombie SDK subprocess alive holding the transcript file.
     await this.#teardownProvider();
+    await this.#sandbox?.close();
     // Events the pump emitted while winding down could re-arm the fallback;
     // clear it again and stop listening — this session is gone.
     this.#provider.onSessionEvent = undefined;
@@ -6065,6 +6269,7 @@ export class Session {
       providerId: this.#provider.id,
       ...this.#accountInfo(),
       mode: this.#mode,
+      ...(this.#sandbox?.info ? { sandbox: this.#sandbox.info } : {}),
       turnsRemaining: this.#turnsRemaining,
       ...(this.#budgetExhausted ? { budgetExhausted: true as const } : {}),
       pinnedFiles: [...this.#pinnedFiles],
@@ -7708,6 +7913,23 @@ export class Session {
         }
       }
 
+      // Claude's sandbox asking whether a sandboxed command may reach a host
+      // (#448): yes when the session's network is on, never otherwise (an
+      // allowlist the CLI holds itself, without asking).
+      if (toolName === SANDBOX_NETWORK_TOOL && this.#sandbox?.info?.state === "on") {
+        this.#approvalPatchKeys.delete(approvalId);
+        const host = typeof effectiveInput.host === "string" ? effectiveInput.host : "";
+        if (this.#sandbox.info.network === "on") {
+          this.#approvalIdToMessageId.delete(approvalId);
+          this.#store.audit(sender.sub, "session.sandbox_network_allow", this.id, host);
+          return { behavior: "allow" as const, updatedInput: effectiveInput };
+        }
+        const message = `The sandbox's network is ${this.#sandbox.info.network} for this session`;
+        this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message });
+        this.#store.audit(sender.sub, "session.sandbox_network_deny", this.id, host);
+        return { behavior: "deny" as const, message };
+      }
+
       // Secret-path gate (secret-paths.ts), every mode: a call naming one of the
       // daemon's credential files or a process environment is refused; one
       // searching a directory that holds them is asked about, never auto-run.
@@ -7745,7 +7967,12 @@ export class Session {
       // Autonomous mode asks before writing outside the working directory, as
       // a high-risk command asks: no budget spent, an unattended run parks.
       const outside = this.#outsideWrite(toolName, effectiveInput, shellCwd);
+      // A command asking to run outside the OS sandbox (#448) is its own
+      // approval, asked in every mode: no budget spent, an unattended run parks.
+      const unsandboxed = this.#unsandboxedRequest(effectiveInput);
+      if (unsandboxed) this.#store.audit(sender.sub, "session.unsandboxed_ask", this.id, `tool=${toolName}`);
       const autoApprove =
+        !unsandboxed &&
         !riskAsks &&
         !outside &&
         secret?.action !== "ask" &&
@@ -7819,6 +8046,7 @@ export class Session {
 
       if (approved) {
         this.#store.audit(sender.sub, "session.approve", this.id, `tool=${toolName} approvalId=${approvalId}`);
+        if (unsandboxed) this.#store.audit(sender.sub, "session.unsandboxed_approve", this.id, `tool=${toolName} approvalId=${approvalId}`);
         const merged: Record<string, unknown> = sanitizedPatch ? { ...effectiveInput, ...sanitizedPatch } : effectiveInput;
         return { behavior: "allow" as const, updatedInput: merged };
       }
@@ -8397,7 +8625,11 @@ export class Session {
         // as canUseTool's synchronous section, always after it).
         const risk = this.#shellRisk(event.name, event.input, event.shellCwd);
         const outside = this.#outsideWrite(event.name, event.input, event.shellCwd);
-        const autoApprove =
+        // Claude's sandbox asking for a host: decided by the session's network alone (#448).
+        const networkAsk = event.name === SANDBOX_NETWORK_TOOL && this.#sandbox?.info?.state === "on";
+        const autoApprove = networkAsk
+          ? this.#sandbox?.info?.network === "on"
+          : !this.#unsandboxedRequest(event.input) &&
           secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir(), cwd: event.shellCwd }) === null &&
           !risk?.secret &&
           !this.#riskAsks(risk) &&
@@ -8425,6 +8657,7 @@ export class Session {
                   approvalId: event.approvalId,
                   ...this.#collaborationCostFor(event.name),
                   ...this.#cardRisk(risk, outside),
+                  ...this.#cardSandbox(event.name, event.input),
                 } as unknown as ToolState),
           },
         );
@@ -10074,6 +10307,7 @@ export class Session {
       providerId: this.#provider.id,
       // In BOTH meta writes: each overwrites the whole file (see below).
       ...this.#accountMeta(),
+      ...(this.#sandbox?.setting ? { sandbox: this.#sandbox.setting } : {}),
       ...(this.#backingFresh ? { backingFresh: true } : {}),
       ...(this.#redactedBackings.size > 0 ? { redactedBackings: [...this.#redactedBackings] } : {}),
       forkedFrom: this.forkedFrom,

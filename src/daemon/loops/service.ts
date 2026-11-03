@@ -28,7 +28,7 @@
  * `LoopHost`, so it is testable without a SessionManager.
  */
 
-import type { ResponseErrorDetail } from "../../protocol/types.js";
+import type { ResponseErrorDetail, SessionSandboxSetting } from "../../protocol/types.js";
 import type { CheckRun } from "../evidence/service.js";
 import type { CheckSpec, EvidenceRecord } from "../evidence/types.js";
 import { answerPrompt, firstAttemptPrompt, nextAttemptPrompt, takeoverPreamble, withSteering } from "./prompt.js";
@@ -180,6 +180,8 @@ export interface LoopStartInput {
   checks: Array<{ id?: string; command: string; timeoutSec?: number; expectTests?: boolean }>;
   provider?: string;
   model?: string;
+  /** The worker's OS sandbox setting (#448); validated by the caller. */
+  sandbox?: SessionSandboxSetting;
   toolBudget?: number;
   limits?: Partial<LoopContract["limits"]>;
   /** Work from this commit instead of the user's checkout. Daemon-internal
@@ -729,7 +731,11 @@ export class LoopService {
       objective,
       workdir,
       checks,
-      worker: { ...(input.provider ? { provider: input.provider } : {}), ...(input.model ? { model: input.model } : {}) },
+      worker: {
+        ...(input.provider ? { provider: input.provider } : {}),
+        ...(input.model ? { model: input.model } : {}),
+        ...(input.sandbox && Object.keys(input.sandbox).length > 0 ? { sandbox: { ...input.sandbox } } : {}),
+      },
       toolBudget,
       limits,
       ...(input.baseRef ? { baseRef: resolveBaseRef(input.baseRef) } : {}),

@@ -26,6 +26,8 @@ import { type Command, program } from "commander";
 // string to drift). release-smoke asserts these two stay equal.
 import pkg from "../package.json" with { type: "json" };
 import { acquireDaemonLocks, type DaemonLocks, DataDirLockError, daemonOwnedDirs } from "./daemon/data-lock.js";
+import { sandboxConfigOf } from "./daemon/sandbox/policy.js";
+import { createDefaultSandboxRegistry } from "./daemon/sandbox/registry.js";
 import { DaemonServer } from "./daemon/server.js";
 import { DefaultProviderError } from "./daemon/providers/registry.js";
 import { clearStaleOpencodeCredentials } from "./daemon/providers/opencode/credentials.js";
@@ -145,10 +147,21 @@ program
       process.exit(1);
     }
 
+    // The OS sandbox agents' commands run in (#448): on by default.
+    const sandboxConfig = sandboxConfigOf(config);
+    const sandboxRegistry = createDefaultSandboxRegistry(sandboxConfig);
+    void sandboxRegistry.resolve(sandboxConfig.provider).then((r) => {
+      if (r.kind === "off") console.warn("[codeoid] sandbox: off (sandbox.provider) — agents' commands run with your full rights");
+      else if (r.kind === "unknown") console.warn(`[codeoid] sandbox: ${r.reason}`);
+      else if (r.probe.available) console.log(`[codeoid] sandbox: ${r.provider.displayName}, network ${sandboxConfig.network}`);
+      else console.warn(`[codeoid] sandbox: ${r.provider.displayName} can't run here (${r.probe.reason}) — interactive sessions run unsandboxed and say so; autonomous ones, routines and loops won't start`);
+    });
+
     let daemon: DaemonServer;
     try {
       daemon = new DaemonServer({
         dataLock,
+        sandboxRegistry,
         port: bindPort,
         host: bindHost,
         dbPath: config.dbPath,

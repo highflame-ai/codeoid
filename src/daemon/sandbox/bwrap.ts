@@ -98,7 +98,7 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   for (const p of spec.containerSockets) hide(p);
   const hiddenDirs = mounts.filter((m) => m.kind === "hide-dir").map((m) => m.path);
   for (const at of writable) {
-    if (kind(at) !== "dir" || seen.has(`w:${at}`)) continue;
+    if (!kind(at) || seen.has(`w:${at}`)) continue;
     seen.add(`w:${at}`);
     mounts.push({ kind: "bind", src: at, path: at });
   }
@@ -177,6 +177,10 @@ export class BwrapSandboxProvider implements SandboxProvider {
   }
 
   async open(spec: SandboxSpec): Promise<SandboxHandle> {
+    return this.openSync(spec);
+  }
+
+  openSync(spec: SandboxSpec): SandboxHandle {
     const bin = this.binary();
     if (!bin) throw new Error("bubblewrap (bwrap) is not installed");
     return new LocalSandboxHandle(this.id, spec, (argv: readonly string[], opts: SandboxSpawnOptions) => ({

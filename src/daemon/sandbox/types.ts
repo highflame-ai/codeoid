@@ -131,6 +131,8 @@ export interface SandboxProvider {
   /** Whether it can run here now (binary present, kernel allows it, daemon reachable). */
   probe(): Promise<SandboxProbe>;
   open(spec: SandboxSpec): Promise<SandboxHandle>;
+  /** {@link open} for a caller that can't wait (a spawn callback). Local providers whose open does no I/O. */
+  openSync?(spec: SandboxSpec): SandboxHandle;
 }
 
 /** A sandbox setting's value: a provider id, `auto` (the platform's own), or `off`. */

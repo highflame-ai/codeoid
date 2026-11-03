@@ -6,6 +6,8 @@
  * everything a run decides afterwards is checked against it.
  */
 
+import type { SessionSandboxSetting } from "../../protocol/types.js";
+
 /** A check the run's acceptance depends on (§4 `checks.visible`). */
 export interface LoopCheck {
   /** Stable id within the run, e.g. `test`. */
@@ -79,7 +81,8 @@ export interface LoopContract {
   /** The user's repository; the run works in its own worktree of it. */
   workdir: string;
   checks: LoopCheck[];
-  worker: { provider?: string; model?: string };
+  /** `sandbox`: the worker's OS sandbox setting (#448); absent = the daemon's. */
+  worker: { provider?: string; model?: string; sandbox?: SessionSandboxSetting };
   /** Autonomous tool calls per attempt. Past it the attempt ends; the run decides what's next. */
   toolBudget: number;
   limits: LoopLimits;

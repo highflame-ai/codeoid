@@ -47,6 +47,7 @@ import type { EndpointStore } from "../openai-endpoints.js";
 import { AccountError, type AccountStore, type ResolvedAccount } from "../accounts.js";
 import { type EndpointCatalog, syncEndpointProviders } from "./endpoint/index.js";
 import { registerSecretPaths } from "../secret-paths.js";
+import type { SandboxRuntime } from "../sandbox/session-sandbox.js";
 
 /**
  * Everything a factory may need to construct a provider for ONE session.
@@ -138,6 +139,14 @@ export interface ProviderSessionInit {
   isOwnTask?: (taskId: string) => boolean;
   /** One of the parent's agents had a tool call denied (for the scrollback; the provider audits it). */
   onForeignAgentDenied?: (agentId: string, toolName: string) => void;
+  /**
+   * The session's OS sandbox while it is on (#448, sandbox/session-sandbox.ts),
+   * read each time the backend is started: null when it is off, unavailable,
+   * or the backend runs no commands. How a backend uses it is its own
+   * (sandbox/confinement.ts): Claude's own sandbox with codeoid's policy,
+   * the whole process started inside, or each command.
+   */
+  sandbox?: () => SandboxRuntime | null;
 }
 
 /** An HTTP backend's key from the session's account (accounts.ts), or null for the daemon's own. */
@@ -454,6 +463,7 @@ export function createDefaultProviderRegistry(
         isFork: init.isFork,
         isOwnTask: init.isOwnTask,
         onForeignAgentDenied: init.onForeignAgentDenied,
+        sandbox: init.sandbox,
       }),
   });
   // Stateless API backends: usable only with a key — in the environment (the

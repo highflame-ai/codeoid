@@ -94,6 +94,8 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "session.commands": { type: "session.commands", id: "r27", sessionId: "s1" },
   "session.destroy": { type: "session.destroy", id: "r9", sessionId: "s1" },
   "session.set_mode": { type: "session.set_mode", id: "r10", sessionId: "s1", mode: "autonomous", maxTurns: 5 },
+  "session.set_sandbox": { type: "session.set_sandbox", id: "r10s", sessionId: "s1", sandbox: { provider: "bwrap", network: "allowlist", allowedHosts: ["github.com"] } },
+  "sandbox.providers": { type: "sandbox.providers", id: "r10p" },
   "session.pin": { type: "session.pin", id: "r11", sessionId: "s1", path: "SPEC.md" },
   "session.unpin": { type: "session.unpin", id: "r12", sessionId: "s1", path: "SPEC.md" },
   "session.rotate": { type: "session.rotate", id: "r13", sessionId: "s1" },

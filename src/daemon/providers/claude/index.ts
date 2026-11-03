@@ -24,6 +24,9 @@ import {
   type SubagentStopHookInput,
   type McpServerConfig,
   type McpSdkServerConfigWithInstance,
+  type SandboxSettings,
+  type SpawnedProcess,
+  type SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "node:crypto";
 import { readFileSync, readdirSync, realpathSync } from "node:fs";
@@ -73,6 +76,9 @@ import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.js";
 import { listProcesses } from "../../process-tree.js";
+import { asksUnsandboxed, claudeSandboxSettings } from "../../sandbox/claude-native.js";
+import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
+import type { SandboxHandle } from "../../sandbox/types.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { PackSubagent } from "../../pipeline/subagents.js";
 
@@ -154,6 +160,8 @@ export interface ClaudeProviderInit {
   isOwnTask?: (taskId: string) => boolean;
   /** A foreign agent's tool call was denied (ProviderSessionInit.onForeignAgentDenied). */
   onForeignAgentDenied?: (agentId: string, toolName: string) => void;
+  /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448). */
+  sandbox?: () => SandboxRuntime | null;
   /** codeoid session id — used as the initial backing id and for audit/logging. */
   sessionId: string;
   /** Test seam for native continuation (#387); defaults to the real SDK. */
@@ -294,6 +302,8 @@ export class ClaudeProvider implements SessionProvider {
   #builtAccount = "";
   /** The thinking effort the live query loop runs at (#417); "" = the SDK's default. Off is fixed at construction. */
   #builtEffort = "";
+  /** The OS sandbox the running query was built with (#448): rebuilt when it changes. */
+  #builtSandbox = "";
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
@@ -1061,6 +1071,9 @@ export class ClaudeProvider implements SessionProvider {
     });
     const account = this.#init.resolveAccount?.() ?? null;
     const desiredAccount = account ? `${account.name}:${account.fingerprint}` : "";
+    // The session's OS sandbox (#448), read per build: a change reaches the next query.
+    const sandbox = this.#init.sandbox?.() ?? null;
+    const desiredSandbox = sandboxFingerprint(sandbox);
 
     // Exact tool names we hand the SDK as pre-approved. Kept as its own list
     // (rather than inlined into `allowedTools`) because the PreToolUse hook has
@@ -1083,7 +1096,8 @@ export class ClaudeProvider implements SessionProvider {
         this.#builtPluginDirs === desiredPlugins &&
         this.#builtOAuthMcp === oauthMcp.fingerprint &&
         this.#builtAccount === desiredAccount &&
-        this.#builtEffort === (opts.effort ?? "")
+        this.#builtEffort === (opts.effort ?? "") &&
+        this.#builtSandbox === desiredSandbox
       ) {
         return;
       }
@@ -1108,7 +1122,9 @@ export class ClaudeProvider implements SessionProvider {
                 ? "OAuth MCP servers changed"
                 : this.#builtAccount !== desiredAccount
                   ? `Claude account changed (now ${account?.name ?? "default"})`
-                  : `thinking effort changed (now ${opts.effort ?? "default"})`;
+                  : this.#builtSandbox !== desiredSandbox
+                    ? "OS sandbox changed"
+                    : `thinking effort changed (now ${opts.effort ?? "default"})`;
       console.log(
         `[claude-provider ${this.#init.sessionId.slice(0, 8)}] ${reason} — rebuilding query loop`,
       );
@@ -1133,6 +1149,7 @@ export class ClaudeProvider implements SessionProvider {
     this.#builtOAuthMcp = oauthMcp.fingerprint;
     this.#builtAccount = desiredAccount;
     this.#builtEffort = opts.effort ?? "";
+    this.#builtSandbox = desiredSandbox;
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
@@ -1150,6 +1167,17 @@ export class ClaudeProvider implements SessionProvider {
     // A rebuilt loop starts a new stream; an anchor from the old one (a turn
     // that ended without a result) must not be paired with the next result.
     this.#translateState.lastChainUuid = null;
+    const queryEnv = withForkBoundary(
+      withShellBasics(withExtraEnv(
+        account
+          ? account.apply(buildAgentEnv(process.env))
+          : buildAgentEnv(process.env, {
+              gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
+            }),
+        init.extraEnv,
+      )),
+      init.forkBoundary?.(),
+    );
     this.#query = query({
       prompt: this.#inputQueue,
       options: {
@@ -1177,17 +1205,7 @@ export class ClaudeProvider implements SessionProvider {
         // can never undo the account or the gateway re-point.
         //
         // A fork's boundary goes on after all of it (withForkBoundary).
-        env: withForkBoundary(
-          withShellBasics(withExtraEnv(
-            account
-              ? account.apply(buildAgentEnv(process.env))
-              : buildAgentEnv(process.env, {
-                  gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
-                }),
-            init.extraEnv,
-          )),
-          init.forkBoundary?.(),
-        ),
+        env: queryEnv,
         allowedTools: [
           // Every EXACT TOOL NAME here is auto-approved by the SDK BEFORE
           // canUseTool is consulted, so it never reaches our gate — the SDK
@@ -1224,6 +1242,9 @@ export class ClaudeProvider implements SessionProvider {
         // An account may name models its own way (a Bedrock account's mappings).
         ...modelOptions(opts.model, opts.fallbackModel, account),
         ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
+        // The OS sandbox (#448): Claude Code's own with codeoid's policy, or
+        // the whole CLI started inside the session's (Docker).
+        ...claudeSandboxOptions(sandbox, queryEnv, opts.workdir),
         stderr: (data: string) => {
           process.stderr.write(`[claude-subprocess ${sessionId.slice(0, 8)}] ${data}`);
         },
@@ -1289,6 +1310,12 @@ export class ClaudeProvider implements SessionProvider {
               // this hook sees every call.
               const foreign = this.#refuseForeignCall(input);
               if (foreign) return foreign;
+              // A command the model asks to run outside the OS sandbox (#448)
+              // never runs on an allow rule: canUseTool, where codeoid asks
+              // the owner in every mode.
+              if (sandbox?.plan.kind === "native" && asksUnsandboxed(input.tool_input)) {
+                return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask" as const, permissionDecisionReason: "asks to run outside the sandbox" } };
+              }
               // Where the CLI says this call runs (its shell's persisted cwd,
               // which a Grep or Glob's relative path is resolved from too), for
               // the gate's own judgement in canUseTool (#shellCwds).
@@ -2786,5 +2813,46 @@ export function claudeCatalogEntry(m: {
     displayName: m.displayName,
     ...(m.description ? { description: m.description } : {}),
     ...(efforts ? { efforts } : {}),
+  };
+}
+
+/** What the running query's OS sandbox was built from (#448): a change rebuilds it. */
+export function sandboxFingerprint(rt: SandboxRuntime | null): string {
+  if (!rt) return "";
+  const { sessionId: _id, ...spec } = rt.spec;
+  return JSON.stringify({ provider: rt.provider.id, kind: rt.plan.kind, spec });
+}
+
+/** What the Claude CLI's own process must still reach when it runs inside a sandbox: its config dir and `~/.claude.json`. */
+export function claudeOwnState(env: Record<string, string | undefined>): string[] {
+  const home = env.HOME || homedir();
+  return [env.CLAUDE_CONFIG_DIR || join(home, ".claude"), join(home, ".claude.json")];
+}
+
+/**
+ * The query options that put a session's commands in its OS sandbox (#448):
+ * the SDK's `sandbox` (Claude Code's own, codeoid's policy) on a local OS
+ * provider, or a spawner that starts the whole CLI inside the session's
+ * sandbox (Docker). Nothing when the sandbox is off or unavailable: Session
+ * says so, and refuses an autonomous or unattended turn.
+ */
+export function claudeSandboxOptions(
+  rt: SandboxRuntime | null,
+  env: Record<string, string | undefined>,
+  workdir: string,
+): { sandbox?: SandboxSettings; spawnClaudeCodeProcess?: (o: SpawnOptions) => SpawnedProcess } {
+  if (!rt) return {};
+  if (rt.plan.kind === "native") return { sandbox: claudeSandboxSettings(rt, env) };
+  if (rt.plan.kind !== "process") return {};
+  let handle: SandboxHandle | null = null;
+  return {
+    spawnClaudeCodeProcess: (o: SpawnOptions): SpawnedProcess => {
+      handle ??= rt.openSync(claudeOwnState(o.env));
+      const childEnv: Record<string, string> = {};
+      for (const [k, v] of Object.entries(o.env)) if (v !== undefined) childEnv[k] = v;
+      const child = handle.spawn(o.command, o.args, { cwd: o.cwd ?? workdir, env: childEnv });
+      o.signal?.addEventListener("abort", () => child.kill("SIGTERM"), { once: true });
+      return child;
+    },
   };
 }

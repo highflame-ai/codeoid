@@ -35,7 +35,7 @@
 
 import { type ChildProcess, spawn } from "node:child_process";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import type { AuthContext } from "../../protocol/types.js";
+import type { AuthContext, SessionSandboxSetting } from "../../protocol/types.js";
 import { buildSubprocessEnv } from "../providers/env.js";
 import { BUDGET_STOP_MESSAGE } from "../providers/interface.js";
 import { LoopError, resolveLoopBudget, resolveLoopChecks, type LoopStartInput } from "../loops/service.js";
@@ -234,6 +234,8 @@ export interface CreateRunSessionOpts {
   approvals: RoutineSpec["approvals"];
   toolBudget: number;
   worktree: boolean;
+  /** The routine's OS sandbox setting (#448); absent = the daemon's. */
+  sandbox?: SessionSandboxSetting;
   /** Per-run spend ceiling handed to backends that can enforce it themselves. */
   maxCostUsd?: number;
   /** Label for the worktree branch. */
@@ -297,6 +299,8 @@ export interface RoutineHost {
   audit(subject: string, action: string, sessionId: string | undefined, detail: string): void;
   hasProvider(id: string): boolean;
   providerIds(): string[];
+  /** Why a sandbox setting can't be used (an unknown provider, a bad host), or null (#448). Absent: no sandboxing, any setting is refused. */
+  sandboxProblem?(setting: SessionSandboxSetting): string | null;
   /** Expand `~`, resolve, and confirm the directory exists; null when unusable. */
   normalizeWorkdir(path: string): string | null;
   /** Loops, for routines that start one; absent when the daemon has none. */
@@ -1145,6 +1149,7 @@ export class RoutineService {
           approvals: spec.approvals,
           toolBudget: spec.toolBudget,
           worktree: spec.worktree,
+          ...(spec.sandbox ? { sandbox: spec.sandbox } : {}),
           // A native cap counts from when the backend's query started. A
           // persistent session's query spans many runs, so it would cap their
           // TOTAL — only a fresh session's query is exactly one run.
@@ -1454,6 +1459,7 @@ export class RoutineService {
           checks: loop.checks,
           ...(spec.provider !== undefined ? { provider: spec.provider } : {}),
           ...(spec.model !== undefined ? { model: spec.model } : {}),
+          ...(spec.sandbox ? { sandbox: spec.sandbox } : {}),
           toolBudget: loop.toolBudget,
           limits: loop.limits,
           trigger: {
@@ -1858,6 +1864,11 @@ export class RoutineService {
       api: input.api ?? SPEC_DEFAULTS.api,
       failurePauseAfter: int(input.failurePauseAfter, SPEC_DEFAULTS.failurePauseAfter, 0, 100, "failurePauseAfter"),
     };
+    if (input.sandbox && Object.keys(input.sandbox).length > 0) {
+      const problem = this.#host.sandboxProblem ? this.#host.sandboxProblem(input.sandbox) : "this daemon has no OS sandbox";
+      if (problem) bad(`sandbox: ${problem}`);
+      spec.sandbox = { ...input.sandbox };
+    }
     if (spec.worktree && spec.session === "persistent") bad("worktree isolation is per run, so it needs session: fresh");
     if (input.loop) spec.loop = this.#normalizeLoop(spec, input.loop, bad);
     // qwen-code runs shell commands it judges read-only without asking, even

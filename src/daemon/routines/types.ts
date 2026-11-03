@@ -7,6 +7,7 @@
 
 import type { LoopCheck, LoopLimits, LoopStatus } from "../loops/types.js";
 import type { RoutineSchedule } from "./schedule.js";
+import type { SessionSandboxSetting } from "../../protocol/types.js";
 
 export type ApprovalPosture = "autonomous" | "guarded";
 export type SessionStrategy = "fresh" | "persistent";
@@ -42,6 +43,8 @@ export interface RoutineSpec {
   session: SessionStrategy;
   /** Run in a fresh git worktree (fresh sessions) so the run never touches the checkout you work in. */
   worktree: boolean;
+  /** OS sandbox for its sessions (#448); absent = the daemon's `sandbox.*`. A run whose sandbox can't hold doesn't start. */
+  sandbox?: SessionSandboxSetting;
   overlap: OverlapPolicy;
   /** After downtime that missed a scheduled fire, run once on recovery. */
   catchUp: boolean;

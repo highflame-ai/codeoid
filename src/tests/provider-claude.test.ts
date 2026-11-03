@@ -123,8 +123,10 @@ import {
   modelOptions,
   isTaskNotRunningError,
   stopTaskTarget,
+  sandboxFingerprint,
   type ClaudeProviderInit,
 } from "../daemon/providers/claude/index.js";
+import { credentialEnvNames } from "../daemon/sandbox/claude-native.js";
 import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "../daemon/fork-isolation.js";
 import { getConfigDir } from "../config.js";
 import { mcpToolPrefix } from "../daemon/mcp/types.js";
@@ -3484,5 +3486,149 @@ describe("thinking effort", () => {
     expect(claudeCatalogEntry({ value: "haiku", displayName: "Haiku", supportsEffort: false }).efforts).toEqual(["off"]);
     expect(claudeCatalogEntry({ value: "x", displayName: "X" }).efforts).toBeUndefined(); // not said: unknown
     expect(claudeEffortOptions("minimal")).toMatchObject({ effort: "low" }); // no Minimal on Claude
+  });
+});
+
+// ── OS sandbox (#448) ─────────────────────────────────────────────────────────
+
+describe("ClaudeProvider — the OS sandbox", () => {
+  const spec = (network: { mode: "on" | "off" | "allowlist"; allow?: string[] }) => ({
+    sessionId: "test-session",
+    workspace: "/work/repo",
+    tempDir: "/tmp/codeoid-sandbox-x",
+    writable: [],
+    hidden: ["/home/u/.ssh", "/home/u/.codeoid"],
+    reexposed: [],
+    containerSockets: ["/run/docker.sock"],
+    network,
+    unsetEnv: ["SSH_AUTH_SOCK"],
+  });
+  function runtime(kind: "native" | "process", network: Parameters<typeof spec>[0] = { mode: "on" }) {
+    const spawned: Array<{ command: string; args: readonly string[]; env: Record<string, string> }> = [];
+    const opened: string[][] = [];
+    const rt = {
+      info: { choice: "auto", state: "on", network: network.mode, enforced: true },
+      plan: { kind, via: "", network: ["on", "off", "allowlist"], fileTools: kind === "process", wrapsBackend: kind === "process", limits: [] },
+      provider: { id: kind === "native" ? "bwrap" : "docker" },
+      config: { provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], docker: { image: "x" } },
+      spec: spec(network),
+      open: async () => {
+        throw new Error("not used");
+      },
+      openSync: (state: readonly string[] = []) => {
+        opened.push([...state]);
+        return {
+          spawn: (command: string, args: readonly string[], o: { env: Record<string, string> }) => {
+            spawned.push({ command, args, env: o.env });
+            return { stdin: null, stdout: null, kill: () => true, on: () => {}, once: () => {}, off: () => {} };
+          },
+        };
+      },
+    };
+    return { rt, spawned, opened };
+  }
+  function providerWith(get: () => unknown, audits: Array<{ action: string }> = []): ClaudeProvider {
+    return new ClaudeProvider({
+      sessionId: "test-session",
+      initialBackingId: "test-backing",
+      workspaceId: "ws_test",
+      store: {
+        audit: (_s: string, action: string) => audits.push({ action }),
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+      sandbox: get as never,
+    });
+  }
+  const options = () => (capturedQueryOpts as { options: Record<string, unknown> }).options;
+
+  it("a native sandbox: Claude Code's own, failing closed, every command still asked, codeoid's paths and network", async () => {
+    const { rt } = runtime("native");
+    const p = providerWith(() => rt);
+    await collectTurnEvents(p);
+    const sb = options().sandbox as Record<string, unknown>;
+    expect(sb).toMatchObject({ enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: true });
+    expect(sb.filesystem).toEqual({ allowWrite: ["/work/repo", "/tmp/codeoid-sandbox-x"], denyRead: ["/home/u/.ssh", "/home/u/.codeoid", "/run/docker.sock"] });
+    expect(sb.network).toEqual({});
+    // The CLI's credential variables aren't its commands'.
+    const denied = (sb.credentials as { envVars: Array<{ name: string; mode: string }> } | undefined)?.envVars ?? [];
+    expect(denied.every((v) => v.mode === "deny")).toBe(true);
+    expect(options().spawnClaudeCodeProcess).toBeUndefined();
+    await p.teardown();
+  });
+
+  it("network off denies every host without asking; an allowlist allows only its hosts", async () => {
+    const off = providerWith(() => runtime("native", { mode: "off" }).rt);
+    await collectTurnEvents(off);
+    expect((options().sandbox as { network: unknown }).network).toEqual({ allowedDomains: [], deniedDomains: ["*"], strictAllowlist: true });
+    await off.teardown();
+    const list = providerWith(() => runtime("native", { mode: "allowlist", allow: ["github.com", "*.npmjs.org"] }).rt);
+    await collectTurnEvents(list);
+    expect((options().sandbox as { network: unknown }).network).toEqual({ allowedDomains: ["github.com", "*.npmjs.org"], strictAllowlist: true });
+    await list.teardown();
+  });
+
+  it("no sandbox (off, unavailable, or a Session without one): no option at all", async () => {
+    const p = providerWith(() => null);
+    await collectTurnEvents(p);
+    expect(options().sandbox).toBeUndefined();
+    expect(options().spawnClaudeCodeProcess).toBeUndefined();
+    await p.teardown();
+  });
+
+  it("a process sandbox (Docker): the whole CLI is spawned inside, its own config reachable", async () => {
+    const { rt, spawned, opened } = runtime("process");
+    const p = providerWith(() => rt);
+    await collectTurnEvents(p);
+    expect(options().sandbox).toBeUndefined();
+    const spawn = options().spawnClaudeCodeProcess as (o: unknown) => unknown;
+    spawn({ command: "/x/claude", args: ["--a"], cwd: "/work/repo", env: { A: "1", B: undefined, HOME: "/home/u" } });
+    expect(spawned).toEqual([{ command: "/x/claude", args: ["--a"], env: { A: "1", HOME: "/home/u" } }]);
+    expect(opened).toEqual([["/home/u/.claude", "/home/u/.claude.json"]]);
+    await p.teardown();
+  });
+
+  it("a command asking to run outside the sandbox goes to codeoid's gate past any allow rule", async () => {
+    const p = providerWith(() => runtime("native").rt);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const run = p.runTurn({ history: [], userMessage: "go", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+    const drain = (async () => {
+      await gate;
+      for await (const _ of run.events) {
+        /* drain */
+      }
+    })();
+    const hook = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }> } } }).options.hooks.PreToolUse[0]!.hooks[0]!;
+    expect(await hook({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls", dangerouslyDisableSandbox: true }, tool_use_id: "tu-1" })).toEqual({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: "asks to run outside the sandbox" },
+    });
+    expect(await hook({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, tool_use_id: "tu-2" })).not.toMatchObject({
+      hookSpecificOutput: { permissionDecisionReason: "asks to run outside the sandbox" },
+    });
+    release();
+    await drain;
+    await p.teardown();
+  });
+
+  it("what the query was built with: a changed sandbox is a different build", () => {
+    const a = runtime("native").rt;
+    expect(sandboxFingerprint(a as never)).toBe(sandboxFingerprint(runtime("native").rt as never));
+    expect(sandboxFingerprint(a as never)).not.toBe(sandboxFingerprint(runtime("native", { mode: "off" }).rt as never));
+    expect(sandboxFingerprint(a as never)).not.toBe(sandboxFingerprint(runtime("process").rt as never));
+    expect(sandboxFingerprint(null)).toBe("");
+  });
+
+  it("the credential variables a sandboxed command doesn't see", () => {
+    expect(credentialEnvNames({ ANTHROPIC_API_KEY: "k", CLAUDE_CODE_OAUTH_TOKEN: "t", AWS_SECRET_ACCESS_KEY: "s", PATH: "/bin", HOME: "/h", GIT_AUTHOR_NAME: "x", SSH_AUTH_SOCK: "/s" }, ["SSH_AUTH_SOCK"])).toEqual([
+      "ANTHROPIC_API_KEY",
+      "AWS_SECRET_ACCESS_KEY",
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "SSH_AUTH_SOCK",
+    ]);
   });
 });
