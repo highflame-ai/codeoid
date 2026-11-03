@@ -83,6 +83,83 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(r.toolResult).toContain("sandbox_violations");
   }, 120_000);
 
+  test("codeoid's own policy (#448 round 1): the home is hidden whole, even what is made or replaced while the command runs; the allowlist and the workspace in it are there; $TMPDIR is the session's, and the CLI's own temp files are out of reach", async () => {
+    const home = join(root, "home");
+    const ws = join(home, "proj");
+    mkdirSync(join(home, ".bun", "bin"), { recursive: true });
+    mkdirSync(join(home, ".local", "share", "opencode"), { recursive: true });
+    mkdirSync(ws, { recursive: true });
+    writeFileSync(join(home, ".npmrc"), "PLANTED-NPMRC\n");
+    writeFileSync(join(home, ".local", "share", "opencode", "auth.json"), "PLANTED-OPENCODE\n");
+    // The CLI reads it itself (outside its sandbox): JSON.
+    writeFileSync(join(home, ".claude.json"), '{"planted":"PLANTED-OLD"}\n');
+    writeFileSync(join(home, ".gitconfig"), "[user]\n\tname = allowlisted\n");
+    writeFileSync(join(home, ".bun", "bin", "tool"), "#!/bin/sh\necho ALLOWLISTED-TOOL-RAN\n", { mode: 0o755 });
+    const reads = [".npmrc", ".local/share/opencode/auth.json", ".claude.json", ".aws/credentials"].map((f) => `cat ${join(home, f)} 2>/dev/null`).join("; ");
+    const command = [
+      `touch ${join(ws, "started")}`,
+      `i=0; while [ ! -e ${join(ws, "go")} ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done`,
+      reads,
+      `cat ${join(home, ".gitconfig")}`,
+      join(home, ".bun", "bin", "tool"),
+      `echo "TMPDIR=[$TMPDIR]"`,
+      `echo t > "$TMPDIR/t" && echo TMPDIR-WRITABLE`,
+      `echo x > ${join(root, "sbx", "cli", "planted")} 2>/dev/null || echo CLI-TEMP-OUT-OF-REACH`,
+      `ls ${join(root, "sbx", "cli")} 2>/dev/null | head -3; echo LS-DONE`,
+      `echo w > ${join(ws, "made.txt")} && echo WS-WRITABLE`,
+    ].join("; ");
+    const file = join(root, "cmd-policy.txt");
+    writeFileSync(file, command);
+    const p = Bun.spawn([process.execPath, PROBE, root, "off", file, "policy"], { stdout: "pipe", stderr: "pipe", timeout: 90_000 });
+    // Once the command runs: a file replaced by a rename, a credential made afresh.
+    let exited = false;
+    void p.exited.then(() => {
+      exited = true;
+    });
+    for (let i = 0; i < 600 && !exited && !existsSync(join(ws, "started")); i++) await Bun.sleep(100);
+    expect(existsSync(join(ws, "started"))).toBe(true);
+    writeFileSync(join(home, ".claude.json.tmp"), '{"planted":"PLANTED-REPLACED"}\n');
+    Bun.spawnSync(["mv", join(home, ".claude.json.tmp"), join(home, ".claude.json")]);
+    mkdirSync(join(home, ".aws"), { recursive: true });
+    writeFileSync(join(home, ".aws", "credentials"), "PLANTED-AWS-LATE\n");
+    writeFileSync(join(ws, "go"), "");
+    const out = await new Response(p.stdout).text();
+    await p.exited;
+    const r = JSON.parse(out.trim().split("\n").at(-1) ?? "{}") as { result: string; toolResult: string | null };
+    expect(r.result).toBe("success");
+    expect(r.toolResult).not.toContain("PLANTED");
+    expect(r.toolResult).toContain("name = allowlisted");
+    expect(r.toolResult).toContain("ALLOWLISTED-TOOL-RAN");
+    expect(r.toolResult).toContain(`TMPDIR=[${join(root, "sbx", "cmd", `claude-${process.getuid?.() ?? 0}`)}]`);
+    expect(r.toolResult).toContain("TMPDIR-WRITABLE");
+    expect(r.toolResult).toContain("CLI-TEMP-OUT-OF-REACH");
+    expect(r.toolResult).toMatch(/\nLS-DONE/);
+    expect(r.toolResult).toContain("WS-WRITABLE");
+    expect(existsSync(join(root, "sbx", "cli", "planted"))).toBe(false);
+  }, 120_000);
+
+  test("a linked worktree commits from inside Claude's sandbox with codeoid's policy (#448 round 1); the repository's hooks stay read-only", async () => {
+    const repo = join(root, "home", "src", "repo");
+    mkdirSync(repo, { recursive: true });
+    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: join(root, "home"), GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid" };
+    const git = (args: string[], cwd: string) => Bun.spawnSync(["git", ...args], { cwd, env });
+    git(["init", "-q", "-b", "main"], repo);
+    writeFileSync(join(repo, "a.txt"), "a\n");
+    git(["add", "."], repo);
+    git(["commit", "-qm", "init"], repo);
+    expect(git(["worktree", "add", "-q", "-b", "feat", join(root, "wt")], repo).exitCode).toBe(0);
+    const r = await probe(
+      "off",
+      `echo n > new.txt; git add new.txt && git -c user.name=t -c user.email=t@example.invalid commit -qm sandboxed && echo COMMITTED; echo bad > ${join(repo, ".git", "hooks", "post-commit")} 2>/dev/null || echo HOOKS-READ-ONLY`,
+      ["policy"],
+    );
+    expect(r.result).toBe("success");
+    expect(r.toolResult).toContain("COMMITTED");
+    expect(r.toolResult).toContain("HOOKS-READ-ONLY");
+    expect(git(["log", "--oneline", "feat"], repo).stdout.toString()).toContain("sandboxed");
+    expect(existsSync(join(repo, ".git", "hooks", "post-commit"))).toBe(false);
+  }, 120_000);
+
   test("a command asking to run outside the sandbox reaches the gate, and a denial means it never runs", async () => {
     const r = await probe("off", `rm -rf ${outside}; echo RAN`, ["unsandboxed"]);
     expect(r.asked).toEqual(["Bash"]);

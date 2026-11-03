@@ -79,8 +79,10 @@ import { codexKeySafe, codexShellEnvExcludeArgs } from "./shell-env.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import type { ResolvedAccount } from "../../accounts.js";
 import { applyCodexAccount, defaultCodexHome } from "../../account-apply.js";
+import { CODEX_HOME_LAYOUT, preparePrivateHome } from "../../sandbox/backend-home.js";
 import { programLocations } from "../../sandbox/policy.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
+import type { SandboxHandle } from "../../sandbox/types.js";
 
 /** codex `tokenUsage.last` / `.total` shape (thread/tokenUsage/updated). */
 interface CodexTokenUsage {
@@ -930,20 +932,29 @@ export class CodexProvider implements SessionProvider {
       // its own home reachable and the network on (it talks to its model);
       // what its commands may reach is codex's own sandbox's business
       // (codexSandboxPolicy) or, run whole inside, this one's.
+      // Its home is a private copy (backend-home.ts): nothing its commands
+      // write there runs later in a codex outside the sandbox.
       const rt = this.#sandboxRuntime();
-      const handle = rt?.plan.wrapsBackend
-        ? await rt.open(codexOwnState(env), { backendNetwork: true, readable: programLocations(this.#command, this.#argsPrefix) })
-        : null;
+      let handle: SandboxHandle | null = null;
+      let procEnv = env;
+      if (rt?.plan.wrapsBackend) {
+        const own = preparePrivateHome(defaultCodexHome(env), rt.privateHome("codex"), CODEX_HOME_LAYOUT);
+        procEnv = { ...env, CODEX_HOME: own.home };
+        handle = await rt.open(own.writable, { backendNetwork: true, readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix)] });
+      }
+      const opened = handle;
       this.#proc = new CodexRpcProcess({
         command: this.#command,
         argsPrefix: this.#argsPrefix,
         args: [...mcp.args, ...bb.args, ...reg.args, ...oauth.args, ...(shellEnv ?? [])],
         cwd: opts.workdir,
-        env,
+        env: procEnv,
         ...(handle?.wrap ? { wrap: handle.wrap.bind(handle) } : {}),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {
+          // Its sandbox goes with it (#448): the next start opens one for the session's sandbox then.
+          void opened?.close();
           // The process is gone: whatever thread comes next reports its own total (#430).
           this.#threadTotal = null;
           this.#turnBaseTotal = null;
@@ -1667,7 +1678,3 @@ function usageDelta(to: CodexTokenUsage, from: CodexTokenUsage | null): CodexTok
   };
 }
 
-/** What codex's own process must still reach inside a sandbox: its home (CODEX_HOME, and the default one an account's links lead to). */
-export function codexOwnState(env: Record<string, string | undefined>, base: Record<string, string | undefined> = process.env): string[] {
-  return [...new Set([defaultCodexHome(env), defaultCodexHome(base)])];
-}

@@ -11,10 +11,10 @@
  *     can't read a planted credential, and can read its own home.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { CodexProvider, codexOwnState, codexSandboxPolicy } from "../daemon/providers/codex/index.js";
+import { CodexProvider, codexSandboxPolicy } from "../daemon/providers/codex/index.js";
 import type { ProviderEvent, TurnOpts } from "../daemon/providers/interface.js";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
 import { programLocations } from "../daemon/sandbox/policy.js";
@@ -53,11 +53,13 @@ function fakeRuntime(kind: "native" | "process", network: "on" | "off", tempDir:
           wrapped.push([...argv]);
           return { argv: [...argv], env: o.env };
         },
+        close: async () => {},
       } as unknown as SandboxHandle;
     },
     openSync: () => {
       throw new Error("unused");
     },
+    privateHome: (key: string) => mkdtempSync(join(tmpdir(), `codeoid-home-test-${key}-`)),
   } as unknown as SandboxRuntime;
   return { rt, opened, wrapped };
 }
@@ -81,11 +83,6 @@ describe("codex's own sandbox, per session", () => {
     expect(codexSandboxPolicy(null, "workspace-write", "/w")).toMatchObject({ type: "workspaceWrite", networkAccess: false });
   });
 
-  test("codex's own home stays reachable: CODEX_HOME and the default one an account's links lead to", () => {
-    expect(codexOwnState({ HOME: "/h" }, { HOME: "/h" })).toEqual(["/h/.codex"]);
-    expect(codexOwnState({ HOME: "/h", CODEX_HOME: "/cfg/accounts/codex/work" }, { HOME: "/h" })).toEqual(["/cfg/accounts/codex/work", "/h/.codex"]);
-  });
-
   test("end to end: turn/start carries the policy, and the app-server is started through the sandbox, network on for it", async () => {
     const ws = mkdtempSync(join(tmpdir(), "codeoid-sbx-codex-"));
     const { rt, opened, wrapped } = fakeRuntime("native", "off", "/tmp/codeoid-sandbox-x");
@@ -95,7 +92,9 @@ describe("codex's own sandbox, per session", () => {
       expect(policy.turn.approvalPolicy).toBe("never");
       expect(policy.turn.sandboxPolicy).toMatchObject({ type: "workspaceWrite", writableRoots: [ws, "/tmp/codeoid-sandbox-x"], networkAccess: false });
       expect(opened).toHaveLength(1);
-      expect(opened[0]?.opts).toMatchObject({ backendNetwork: true, readable: programLocations(process.execPath, [FIXTURE]) });
+      expect(opened[0]?.opts).toMatchObject({ backendNetwork: true, readable: expect.arrayContaining(programLocations(process.execPath, [FIXTURE])) });
+      // Its home is a private copy (#448 round 1), what it may write.
+      expect(opened[0]?.state[0]).toContain("codeoid-home-test-codex-");
       expect(wrapped[0]?.slice(0, 3)).toEqual([process.execPath, FIXTURE, "app-server"]);
     } finally {
       await p.teardown();
@@ -128,7 +127,7 @@ describe.skipIf(!real.available)("codex's app-server inside real bubblewrap", ()
   });
   afterAll(() => rmSync(root, { recursive: true, force: true }));
 
-  test("a planted credential is unreadable to the app-server; its own home isn't", async () => {
+  test("a planted credential is unreadable to the app-server; its own login isn't, and its real home isn't writable", async () => {
     const registry = new SandboxRegistry("linux");
     registry.register(bwrap);
     const config = { sandbox: { provider: "bwrap", network: "on", allowedHosts: [], hiddenPaths: [join(root, "secrets")], docker: { image: "x" } } } as never;
@@ -149,11 +148,15 @@ describe.skipIf(!real.available)("codex's app-server inside real bubblewrap", ()
     try {
       expect(await textOf(p, turnOpts(`read-file:${join(root, "secrets", "token")}`, join(root, "ws")))).toStartWith("UNREADABLE:");
       expect(await textOf(p, turnOpts(`read-file:${join(root, "codex-home", "auth.json")}`, join(root, "ws")))).toBe("CONTENT:OWN-LOGIN");
+      // Its real home isn't writable: a config.toml planted there would run in the user's own codex (#448 round 1).
+      expect(await textOf(p, turnOpts(`write-file:${join(root, "codex-home", "config.toml")}`, join(root, "ws")))).toStartWith("UNWRITABLE:");
+      expect(await textOf(p, turnOpts(`write-file:${join(root, "codex-home", "auth.json")}`, join(root, "ws")))).toStartWith("UNWRITABLE:");
     } finally {
       if (prev === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = prev;
       await p.teardown();
       await sbx.close();
     }
+    expect(existsSync(join(root, "codex-home", "config.toml"))).toBe(false);
   }, 60_000);
 });

@@ -54,9 +54,20 @@ import { PiRpcProcess, type PiFrame } from "./rpc.js";
 import { translatePiEvent } from "./translate.js";
 import type { ResolvedAccount } from "../../accounts.js";
 import { applyPiAccount, applyPiSettingsOverlay, piAgentDirOf, piDefaultThinkingLevel } from "../../account-apply.js";
+import { realpathSync } from "node:fs";
 import { dirname } from "node:path";
+import { PI_HOME_LAYOUT, preparePrivateHome } from "../../sandbox/backend-home.js";
 import { programLocations } from "../../sandbox/policy.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
+import type { SandboxHandle } from "../../sandbox/types.js";
+
+function realOr(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
 
 export interface PiProviderInit {
   /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448): pi starts inside it. */
@@ -346,13 +357,18 @@ export class PiProvider implements SessionProvider {
     // HOME, provider API keys), never codeoid's own secrets.
     // pi's thinking-level writes stay in a copy of its settings (#417).
     // Then the caller's extra env, which can't override the account (withExtraEnv).
-    const env = withExtraEnv(this.#piEnv(), this.#extraEnv);
+    let env = withExtraEnv(this.#piEnv(), this.#extraEnv);
     // The OS sandbox (#448): pi's whole process starts inside the session's,
-    // its own agent dir reachable, its program and codeoid's bridge readable.
+    // in a private copy of its agent dir (backend-home.ts: its login
+    // read-only, its sessions shared), its program and codeoid's bridge readable.
     const rt = this.#sandbox?.() ?? null;
-    const handle = rt?.plan.wrapsBackend
-      ? await rt.open(piOwnState(env), { readable: [...programLocations(this.#command, this.#argsPrefix), dirname(bridge)] })
-      : null;
+    let handle: SandboxHandle | null = null;
+    if (rt?.plan.wrapsBackend) {
+      const own = preparePrivateHome(piAgentDirOf(env), rt.privateHome("pi"), PI_HOME_LAYOUT);
+      env = { ...env, PI_CODING_AGENT_DIR: own.home };
+      handle = await rt.open(own.writable, { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix), dirname(bridge)] });
+    }
+    const opened = handle;
     this.#proc = new PiRpcProcess({
       command: this.#command,
       argsPrefix: this.#argsPrefix,
@@ -362,6 +378,8 @@ export class PiProvider implements SessionProvider {
       ...(handle?.wrap ? { wrap: handle.wrap.bind(handle) } : {}),
       onEvent: (frame) => this.#onFrame(frame),
       onExit: ({ code, signal, stderrTail }) => {
+        // Its sandbox goes with it (#448).
+        void opened?.close();
         this.#bridgeReady = false;
         const tail = stderrTail ? ` — ${stderrTail.trim().slice(-300)}` : "";
         this.#failTurn(
@@ -392,7 +410,8 @@ export class PiProvider implements SessionProvider {
     const state = await this.#proc.request({ type: "get_state" });
     const data = state.data as { sessionFile?: string; sessionId?: string; thinkingLevel?: string } | undefined;
     if (typeof data?.thinkingLevel === "string") this.#thinkingLevel ??= data.thinkingLevel;
-    const file = data?.sessionFile;
+    // Where the file really is: inside the sandbox pi names it through its private home's link to its sessions dir.
+    const file = typeof data?.sessionFile === "string" && data.sessionFile.length > 0 ? realOr(data.sessionFile) : data?.sessionFile;
     if (typeof file === "string" && file.length > 0 && file !== this.#backingSessionId) {
       this.#backingSessionId = file;
       try {
@@ -865,11 +884,3 @@ export function piThinkingLevels(m: { reasoning?: unknown; thinkingLevelMap?: un
   });
 }
 
-/**
- * What pi's own process must still reach inside a sandbox: its agent dir as
- * it runs (an account's or settings overlay), and the daemon's own, which an
- * overlay's links lead to.
- */
-export function piOwnState(env: Record<string, string | undefined>, base: Record<string, string | undefined> = process.env): string[] {
-  return [...new Set([piAgentDirOf(env), piAgentDirOf(base)])];
-}

@@ -47,9 +47,12 @@ import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import type { ResolvedAccount } from "../../accounts.js";
 import { applyGeminiCliAccount, applyGeminiCliEffort, defaultGeminiCliRoot } from "../../account-apply.js";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
+import { GEMINI_CLI_HOME_LAYOUT, preparePrivateHome } from "../../sandbox/backend-home.js";
 import { programLocations } from "../../sandbox/policy.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
+import type { SandboxHandle } from "../../sandbox/types.js";
 import { effortRejectionHint } from "../effort.js";
 
 export interface GeminiAcpProviderInit {
@@ -329,14 +332,23 @@ export class GeminiAcpProvider implements SessionProvider {
       // The account's own GEMINI_CLI_HOME (an overlay selecting its auth type).
       // ...and, for a thinking effort, an overlay of that whose settings set it (#417).
       // Then the caller's extra env, which can't override either (withExtraEnv).
-      const env = withExtraEnv(
+      let env = withExtraEnv(
         applyGeminiCliEffort(opts.effort, applyGeminiCliAccount(this.#resolveAccount?.() ?? null, buildGeminiCliEnv())),
         this.#extraEnv,
       );
       // The OS sandbox (#448): the CLI's whole process starts inside the
-      // session's, its own ~/.gemini reachable and its program readable.
+      // session's, in a private copy of its ~/.gemini (backend-home.ts: its
+      // login read-only, its chats shared), its program readable.
       const rt = this.#sandbox?.() ?? null;
-      const handle = rt?.plan.wrapsBackend ? await rt.open(geminiCliOwnState(env), { readable: programLocations(this.#command, this.#argsPrefix) }) : null;
+      let handle: SandboxHandle | null = null;
+      if (rt?.plan.wrapsBackend) {
+        const root = rt.privateHome("gemini-cli");
+        mkdirSync(join(root, ".gemini"), { mode: 0o700 });
+        const own = preparePrivateHome(join(defaultGeminiCliRoot(env), ".gemini"), join(root, ".gemini"), GEMINI_CLI_HOME_LAYOUT);
+        env = { ...env, GEMINI_CLI_HOME: root };
+        handle = await rt.open([root, ...own.writable], { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix)] });
+      }
+      const opened = handle;
       this.#proc = new StdioJsonRpcProcess({
         name: "gemini-cli",
         command: this.#command,
@@ -347,6 +359,8 @@ export class GeminiAcpProvider implements SessionProvider {
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {
+          // Its sandbox goes with it (#448).
+          void opened?.close();
           const queue = this.#turnQueue;
           if (queue && !queue.closed) {
             this.#push({
@@ -629,7 +643,3 @@ function toolCallOutput(update: Record<string, unknown>): string {
   return "";
 }
 
-/** What the Gemini CLI's own process must still reach inside a sandbox: its `.gemini` (an account overlay's, and the default one). */
-export function geminiCliOwnState(env: Record<string, string | undefined>, base: Record<string, string | undefined> = process.env): string[] {
-  return [...new Set([join(defaultGeminiCliRoot(env), ".gemini"), join(defaultGeminiCliRoot(base), ".gemini")])];
-}

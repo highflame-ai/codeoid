@@ -13,16 +13,28 @@
  * starts on it.
  */
 
-import { mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
 import type { CodeoidConfig } from "../../config.js";
+import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { CWD_FROM_CALLER } from "./docker.js";
 import { buildSandboxSpec, networkPolicyOf, type SandboxConfig, sandboxConfigOf, validAllowedHost } from "./policy.js";
 import type { SandboxRegistry } from "./registry.js";
 import { launcherRoot, sandboxRoot } from "./root.js";
-import { type NetworkMode, type NetworkPolicy, SANDBOX_AUTO, SANDBOX_OFF, type SandboxHandle, type SandboxProvider, type SandboxSpec } from "./types.js";
+import {
+  type NetworkMode,
+  type NetworkPolicy,
+  SANDBOX_AUTO,
+  SANDBOX_OFF,
+  type SandboxExecOptions,
+  type SandboxExecResult,
+  type SandboxHandle,
+  type SandboxProvider,
+  type SandboxSpawnOptions,
+  type SandboxSpec,
+} from "./types.js";
 
 /** A session's sandbox can't satisfy what an unattended or autonomous run needs. */
 export class SandboxRequiredError extends Error {
@@ -83,6 +95,14 @@ export interface SandboxRuntime {
    * changes (a hidden path that appeared or went).
    */
   launcher(handle: SandboxHandle, argv: readonly string[], envNames?: readonly string[], name?: string): string;
+  /**
+   * A fresh, empty, private directory for the backend's own home inside the
+   * sandbox (backend-home.ts), the same path for the same `key` each time:
+   * what was there from its last start is gone.
+   */
+  privateHome(key: string): string;
+  /** Claude's native sandbox: where its CLI and its commands keep temp files (claude-native.ts). */
+  claudeTemp(): ClaudeTempDirs;
 }
 
 /** The setting a session ends up with: its own fields over the config's. */
@@ -139,12 +159,19 @@ function enforcedNetwork(plan: ConfinementPlan, asked: NetworkMode, providerName
   return { mode: best, note: `the network can't be ${asked === "off" ? "turned off" : "limited to an allowlist"} this way: ${plan.via}, and the backend needs it to reach its model`, widened: best === "on" };
 }
 
+/** Why `workspace` can't be a sandbox's writable workspace, or null: `/` would make the whole filesystem writable, and cover the sandbox's own /proc, /dev and /tmp. */
+export function workspaceProblem(workspace: string): string | null {
+  return resolve(workspace) === "/" ? "a session working in / can't be sandboxed (the whole filesystem would be its writable workspace) — give it a project directory" : null;
+}
+
 /** What a setting resolves to for a backend now (no side effects beyond a cached probe). */
 export async function resolveSandbox(opts: {
   registry: SandboxRegistry;
   config: SandboxConfig;
   setting: SessionSandboxSetting | undefined;
   backendId: string;
+  /** The session's working directory: `/` can't be a sandbox's workspace. */
+  workspace?: string;
 }): Promise<{ info: SessionSandboxInfo; provider: SandboxProvider | null; plan: ConfinementPlan | null; network: NetworkPolicy }> {
   const { choice, network } = effectiveSetting(opts.config, opts.setting);
   const base = {
@@ -167,7 +194,9 @@ export async function resolveSandbox(opts: {
   if (!resolved.probe.available) {
     return { info: { ...base, ...named, state: "unavailable", reason: resolved.probe.reason, enforced: false }, provider, plan: null, network };
   }
-  const c = confinementFor(opts.backendId, provider);
+  const rootProblem = opts.workspace !== undefined ? workspaceProblem(opts.workspace) : null;
+  if (rootProblem) return { info: { ...base, ...named, state: "unavailable", reason: rootProblem, enforced: false }, provider, plan: null, network };
+  const c = confinementFor(opts.backendId, provider, opts.registry.host);
   if (!c.ok) return { info: { ...base, ...named, state: "unavailable", reason: c.reason, enforced: false }, provider, plan: null, network };
   const net = enforcedNetwork(c.plan, network.mode, provider.displayName);
   const limits = [...c.plan.limits, ...(net.note ? [net.note] : [])];
@@ -205,9 +234,15 @@ export class SessionSandbox {
   #resolvedFor: string | null = null;
   /** The setting changed since the last resolution (which still stands until the next one replaces it). */
   #stale = false;
+  /** Bumped by every {@link set}: a resolution that started before it is done again. */
+  #generation = 0;
+  /** Resolutions run one at a time, in order: the last one asked for is the one that stands. */
+  #refreshing: Promise<unknown> = Promise.resolve();
   #closed = false;
   #launcherDir: string | null = null;
   #launchers = 0;
+  #homesDir: string | null = null;
+  #claudeTemp: ClaudeTempDirs | null = null;
 
   constructor(opts: { sessionId: string; workdir: string; registry: SandboxRegistry; config?: CodeoidConfig; setting?: SessionSandboxSetting }) {
     this.#sessionId = opts.sessionId;
@@ -261,16 +296,36 @@ export class SessionSandbox {
     return this.#resolvedFor === backendId ? this.#runtime : null;
   }
 
-  /** Change the setting; the next {@link refresh} resolves it and replaces the runtime. Handles opened under the old one are closed. */
+  /**
+   * Change the setting; the next {@link refresh} resolves it and replaces the
+   * runtime. Handles a backend opened under the old one stay until that
+   * backend is torn down (Session restarts it, idle: a running turn is never
+   * cut off by a change of setting) or the session closes.
+   */
   async set(setting: SessionSandboxSetting | undefined): Promise<void> {
     this.#setting = setting && Object.keys(setting).length > 0 ? { ...setting } : undefined;
     this.#stale = true;
-    await this.#closeHandles();
+    this.#generation += 1;
   }
 
-  /** Resolve for `backendId` (a provider switch, a setting change, the first turn). */
-  async refresh(backendId: string): Promise<SessionSandboxInfo> {
-    const r = await resolveSandbox({ registry: this.#registry, config: this.config, setting: this.#setting, backendId });
+  /**
+   * Resolve for `backendId` (a provider switch, a setting change, the first
+   * turn). One at a time; one that started before a {@link set} resolves
+   * again, so a change made while a slow probe runs is never lost.
+   */
+  refresh(backendId: string): Promise<SessionSandboxInfo> {
+    const run = this.#refreshing.catch(() => {}).then(() => this.#refreshNow(backendId));
+    this.#refreshing = run;
+    return run;
+  }
+
+  async #refreshNow(backendId: string): Promise<SessionSandboxInfo> {
+    let r: Awaited<ReturnType<typeof resolveSandbox>>;
+    for (;;) {
+      const generation = this.#generation;
+      r = await resolveSandbox({ registry: this.#registry, config: this.config, setting: this.#setting, backendId, workspace: this.#workdir });
+      if (generation === this.#generation) break;
+    }
     if (this.#closed) {
       this.#runtime = null;
       return r.info;
@@ -306,16 +361,41 @@ export class SessionSandbox {
         return this.#track(provider.openSync(open(backendState, o)));
       },
       launcher: (handle, argv, envNames, name) => this.#writeLauncher(handle, argv, envNames ?? [], name),
+      privateHome: (key) => this.#privateHome(key),
+      claudeTemp: () => this.#ensureClaudeTemp(),
     };
     return r.info;
   }
 
+  #sessionSlug(): string {
+    return this.#sessionId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "session";
+  }
+
+  #privateHome(key: string): string {
+    if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
+    if (!this.#homesDir) this.#homesDir = mkdtempSync(join(sandboxRoot(), `home-${this.#sessionSlug()}-`));
+    const dir = join(this.#homesDir, key.replace(/[^A-Za-z0-9_-]/g, "") || "backend");
+    rmSync(dir, { recursive: true, force: true });
+    mkdirSync(dir, { mode: 0o700 });
+    return dir;
+  }
+
+  #ensureClaudeTemp(): ClaudeTempDirs {
+    if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
+    if (!this.#claudeTemp) {
+      const base = mkdtempSync(join(sandboxRoot(), `claude-${this.#sessionSlug()}-`));
+      const uid = typeof process.getuid === "function" ? process.getuid() : "user";
+      const t: ClaudeTempDirs = { cli: join(base, "cli"), root: join(base, "cmd"), commands: join(base, "cmd", `claude-${uid}`) };
+      mkdirSync(t.cli, { mode: 0o700 });
+      mkdirSync(t.commands, { recursive: true, mode: 0o700 });
+      this.#claudeTemp = t;
+    }
+    return this.#claudeTemp;
+  }
+
   #writeLauncher(handle: SandboxHandle, argv: readonly string[], envNames: readonly string[], name?: string): string {
     if (!handle.wrap) throw new Error(`${handle.providerId} can't start a local program inside`);
-    if (!this.#launcherDir) {
-      const safe = this.#sessionId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "session";
-      this.#launcherDir = mkdtempSync(`${launcherRoot()}${safe}-`);
-    }
+    if (!this.#launcherDir) this.#launcherDir = mkdtempSync(`${launcherRoot()}${this.#sessionSlug()}-`);
     // Started from wherever its caller is: the cwd is the caller's, not fixed here.
     const wrapped = handle.wrap(argv, { cwd: "", env: Object.fromEntries(envNames.map((n) => [n, ""])) });
     const path = join(this.#launcherDir, `launch-${name ? name.replace(/[^A-Za-z0-9_-]/g, "") : ++this.#launchers}`);
@@ -326,9 +406,16 @@ export class SessionSandbox {
     return path;
   }
 
+  /** Kept until closed (by its backend when its process ends, or with the session); a closed one is let go. */
   #track(h: SandboxHandle): SandboxHandle {
-    this.#handles.add(h);
-    return h;
+    const tracked = new TrackedHandle(h, () => this.#handles.delete(tracked));
+    this.#handles.add(tracked);
+    return tracked;
+  }
+
+  /** How many handles are open (tests). */
+  get openHandles(): number {
+    return this.#handles.size;
   }
 
   #spec(network: NetworkPolicy, backendState: readonly string[], readable: readonly string[] = []): SandboxSpec {
@@ -345,10 +432,7 @@ export class SessionSandbox {
 
   /** The session's private temp dir (made on first use, 0700). */
   #ensureTempDir(): string {
-    if (!this.#tempDir) {
-      const safe = this.#sessionId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "session";
-      this.#tempDir = mkdtempSync(join(sandboxRoot(), `tmp-${safe}-`));
-    }
+    if (!this.#tempDir) this.#tempDir = mkdtempSync(join(sandboxRoot(), `tmp-${this.#sessionSlug()}-`));
     return this.#tempDir;
   }
 
@@ -368,10 +452,46 @@ export class SessionSandbox {
       rmSync(this.#tempDir, { recursive: true, force: true });
       this.#tempDir = null;
     }
-    if (this.#launcherDir) {
-      rmSync(this.#launcherDir, { recursive: true, force: true });
-      this.#launcherDir = null;
+    for (const dir of [this.#launcherDir, this.#homesDir, this.#claudeTemp ? join(this.#claudeTemp.cli, "..") : null]) {
+      if (dir) rmSync(dir, { recursive: true, force: true });
     }
+    this.#launcherDir = null;
+    this.#homesDir = null;
+    this.#claudeTemp = null;
+  }
+}
+
+/** A handle the session tracks, let go of when closed. */
+class TrackedHandle implements SandboxHandle {
+  readonly #inner: SandboxHandle;
+  readonly #onClose: () => void;
+  readonly wrap?: SandboxHandle["wrap"];
+
+  constructor(inner: SandboxHandle, onClose: () => void) {
+    this.#inner = inner;
+    this.#onClose = onClose;
+    if (inner.wrap) this.wrap = inner.wrap.bind(inner);
+  }
+
+  get providerId(): string {
+    return this.#inner.providerId;
+  }
+
+  get spec(): SandboxSpec {
+    return this.#inner.spec;
+  }
+
+  spawn(command: string, args: readonly string[], opts: SandboxSpawnOptions) {
+    return this.#inner.spawn(command, args, opts);
+  }
+
+  exec(argv: readonly string[], opts: SandboxExecOptions): Promise<SandboxExecResult> {
+    return this.#inner.exec(argv, opts);
+  }
+
+  async close(): Promise<void> {
+    this.#onClose();
+    await this.#inner.close();
   }
 }
 
@@ -422,17 +542,26 @@ export async function openCheckSandbox(opts: {
   if (!provider.capabilities.commands || !provider.capabilities.wrapsArgv) {
     return { kind: "refused", reason: `${provider.displayName} can't run a local command` };
   }
+  const rootProblem = workspaceProblem(opts.workspace);
+  if (rootProblem) return { kind: "refused", reason: rootProblem };
   const mode: NetworkMode = provider.capabilities.network.includes(network.mode) ? network.mode : "off";
   const safe = opts.label.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "check";
   const tempDir = mkdtempSync(join(sandboxRoot(), `check-${safe}-`));
-  const spec = buildSandboxSpec({
-    sessionId: `check-${safe}`,
-    workspace: opts.workspace,
-    tempDir,
-    network: mode === "allowlist" ? network : { mode },
-    ...(opts.config ? { config: opts.config } : {}),
-  });
-  const handle = await provider.open(spec);
+  let handle: SandboxHandle;
+  try {
+    const spec = buildSandboxSpec({
+      sessionId: `check-${safe}`,
+      workspace: opts.workspace,
+      tempDir,
+      network: mode === "allowlist" ? network : { mode },
+      ...(opts.config ? { config: opts.config } : {}),
+    });
+    handle = await provider.open(spec);
+  } catch (err) {
+    // Nothing opened: nothing of it is left behind.
+    rmSync(tempDir, { recursive: true, force: true });
+    throw err;
+  }
   if (!handle.wrap) {
     await handle.close();
     rmSync(tempDir, { recursive: true, force: true });

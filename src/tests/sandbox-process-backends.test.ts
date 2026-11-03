@@ -11,10 +11,10 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } fr
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { GeminiAcpProvider, geminiCliOwnState } from "../daemon/providers/acp/index.js";
+import { GeminiAcpProvider } from "../daemon/providers/acp/index.js";
 import type { ProviderEvent, TurnOpts } from "../daemon/providers/interface.js";
-import { PiProvider, piOwnState } from "../daemon/providers/pi/index.js";
-import { qwenCliArgv, qwenExecutableOption, qwenOwnState } from "../daemon/providers/qwen/index.js";
+import { PiProvider } from "../daemon/providers/pi/index.js";
+import { qwenCliArgv, qwenExecutableOption } from "../daemon/providers/qwen/index.js";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
 import { programLocations } from "../daemon/sandbox/policy.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
@@ -46,12 +46,13 @@ function recordingRuntime() {
     plan: { kind: "process", wrapsBackend: true },
     open: async (state: readonly string[] = [], opts?: unknown) => {
       opened.push({ state, opts });
-      return { providerId: "rec", wrap: (argv: readonly string[], o: { env: Record<string, string> }) => ({ argv: [...argv], env: o.env }) } as unknown as SandboxHandle;
+      return { providerId: "rec", wrap: (argv: readonly string[], o: { env: Record<string, string> }) => ({ argv: [...argv], env: o.env }), close: async () => {} } as unknown as SandboxHandle;
     },
     openSync: (state: readonly string[] = [], opts?: unknown) => {
       opened.push({ state, opts });
-      return { providerId: "rec", wrap: (argv: readonly string[]) => ({ argv: ["/usr/bin/bwrap", "--x", "--", ...argv], env: {} }) } as unknown as SandboxHandle;
+      return { providerId: "rec", wrap: (argv: readonly string[]) => ({ argv: ["/usr/bin/bwrap", "--x", "--", ...argv], env: {} }), close: async () => {} } as unknown as SandboxHandle;
     },
+    privateHome: (key: string) => mkdtempSync(join(tmpdir(), `codeoid-home-test-${key}-`)),
     launcher: (h: SandboxHandle, argv: readonly string[]) => {
       const dir = mkdtempSync(join(tmpdir(), "codeoid-launch-test-"));
       const path = join(dir, "launch");
@@ -89,20 +90,24 @@ function makePi(rt: SandboxRuntime | null, workdir: string): PiProvider {
 }
 
 describe("each backend's own state, and how it is started", () => {
-  test("own state: pi's agent dir, the Gemini CLI's .gemini, Qwen's home (an account's and the default)", () => {
-    expect(piOwnState({ HOME: "/h", PI_CODING_AGENT_DIR: "/cfg/accounts/pi-session/x" }, { HOME: "/h", PI_CODING_AGENT_DIR: "/pi" })).toEqual(["/cfg/accounts/pi-session/x", "/pi"]);
-    expect(geminiCliOwnState({ HOME: "/h", GEMINI_CLI_HOME: "/cfg/accounts/gemini/w" })).toEqual(expect.arrayContaining(["/cfg/accounts/gemini/w/.gemini"]));
-    expect(qwenOwnState({ HOME: "/h", QWEN_HOME: "/cfg/accounts/qwen/w" })).toContain("/cfg/accounts/qwen/w");
-  });
-
-  test("pi starts through the sandbox: its agent dir as its state, its program and codeoid's bridge readable", async () => {
+  test("pi starts through the sandbox in a private copy of its agent dir (#448 round 1): its login read-only, its sessions shared, its program and codeoid's bridge readable", async () => {
+    mkdirSync(join(tmp, "pi-agent"), { recursive: true });
+    writeFileSync(join(tmp, "pi-agent", "auth.json"), "{}");
+    writeFileSync(join(tmp, "pi-agent", "settings.json"), '{"theme":"dark"}');
     const { rt, opened } = recordingRuntime();
     const p = makePi(rt, tmp);
     try {
       expect(await textOf(p.runTurn(turn("echo-prompt hi", tmp)))).toContain("received:");
+      const home = await textOf(p.runTurn(turn("echo-env:PI_CODING_AGENT_DIR", tmp)));
+      expect(home).toStartWith("ENV:");
+      const privateHome = home.slice("ENV:".length);
+      expect(privateHome).not.toBe(join(tmp, "pi-agent"));
       expect(opened).toHaveLength(1);
-      expect(opened[0]?.state).toContain(join(tmp, "pi-agent"));
+      // Writable: the private home and the real sessions dir; never the real agent dir.
+      expect(opened[0]?.state).toEqual([privateHome, realpathSync(join(tmp, "pi-agent", "sessions"))]);
+      expect(readFileSync(join(privateHome, "settings.json"), "utf8")).toBe('{"theme":"dark"}');
       const readable = (opened[0]?.opts as { readable: string[] }).readable;
+      expect(readable).toContain(realpathSync(join(tmp, "pi-agent", "auth.json")));
       expect(readable).toEqual(expect.arrayContaining(programLocations(process.execPath, [PI])));
       expect(readable.some((d) => d.includes("codeoid-pi-bridge-"))).toBe(true);
     } finally {
@@ -116,7 +121,11 @@ describe("each backend's own state, and how it is started", () => {
     try {
       expect(await textOf(p.runTurn(turn("echo-prompt hi", tmp)))).toContain("PROMPT:");
       expect(opened).toHaveLength(1);
-      expect((opened[0]?.opts as { readable: string[] }).readable).toEqual(programLocations(process.execPath, [ACP]));
+      expect((opened[0]?.opts as { readable: string[] }).readable).toEqual(expect.arrayContaining(programLocations(process.execPath, [ACP])));
+      // GEMINI_CLI_HOME is a private one, writable; the real one isn't among what it may write (#448 round 1).
+      const home = (await textOf(p.runTurn(turn("echo-env:GEMINI_CLI_HOME", tmp)))).slice("ENV:".length);
+      expect(home).toContain("codeoid-home-test-gemini-cli-");
+      expect(opened[0]?.state[0]).toBe(home);
     } finally {
       await p.teardown();
     }
@@ -136,7 +145,10 @@ describe("each backend's own state, and how it is started", () => {
     const script = readFileSync(opt.pathToQwenExecutable ?? "", "utf8");
     expect(script).toBe(launcherScript(["/usr/bin/bwrap", "--x", "--", ...bundled]));
     expect(statSync(opt.pathToQwenExecutable ?? "").mode & 0o777).toBe(0o700);
-    expect(opened[0]?.state).toContain("/h/.qwen");
+    // A private home, pointed at by QWEN_HOME; its real one isn't writable (#448 round 1).
+    expect(opt.env?.QWEN_HOME).toBeDefined();
+    expect(opened[0]?.state[0]).toBe(opt.env?.QWEN_HOME ?? "missing");
+    expect(opened[0]?.state).not.toContain("/h/.qwen");
     rmSync(join(opt.pathToQwenExecutable ?? "", ".."), { recursive: true, force: true });
   });
 
@@ -178,17 +190,30 @@ describe.skipIf(!real.available)("inside real bubblewrap", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("pi: a planted credential is unreadable, its own agent dir isn't", async () => {
+  test("pi: a planted credential is unreadable, its own login is readable and not writable, its settings a private copy (#448 round 1)", async () => {
     await sbx.refresh("pi");
     expect(sbx.info).toMatchObject({ state: "on", confinement: "process" });
     process.env.PI_CODING_AGENT_DIR = join(root, "pi-agent");
+    writeFileSync(join(root, "pi-agent", "settings.json"), '{"real":true}\n');
     const p = makePi(sbx.runtime, join(root, "ws"));
     try {
       expect(await textOf(p.runTurn(turn(`read-file:${join(root, "secrets", "token")}`, join(root, "ws"))))).toStartWith("UNREADABLE:");
       expect(await textOf(p.runTurn(turn(`read-file:${join(root, "pi-agent", "auth.json")}`, join(root, "ws"))))).toBe("CONTENT:PI-LOGIN");
+      const home = (await textOf(p.runTurn(turn("echo-env:PI_CODING_AGENT_DIR", join(root, "ws"))))).slice("ENV:".length);
+      expect(home).not.toBe(join(root, "pi-agent"));
+      // Its login, read through its home, can't be rewritten; the real agent dir can't be written at all.
+      expect(await textOf(p.runTurn(turn(`read-file:${join(home, "auth.json")}`, join(root, "ws"))))).toBe("CONTENT:PI-LOGIN");
+      expect(await textOf(p.runTurn(turn(`write-file:${join(home, "auth.json")}`, join(root, "ws"))))).toStartWith("UNWRITABLE:");
+      expect(await textOf(p.runTurn(turn(`write-file:${join(root, "pi-agent", "settings.json")}`, join(root, "ws"))))).toStartWith("UNWRITABLE:");
+      expect(await textOf(p.runTurn(turn(`write-file:${join(root, "pi-agent", "extensions", "evil.ts")}`, join(root, "ws"))))).toStartWith("UNWRITABLE:");
+      // Its own settings it may change: in the private copy only.
+      expect(await textOf(p.runTurn(turn(`write-file:${join(home, "settings.json")}`, join(root, "ws"))))).toBe("WROTE");
     } finally {
       await p.teardown();
     }
+    expect(readFileSync(join(root, "pi-agent", "settings.json"), "utf8")).toBe('{"real":true}\n');
+    expect(readFileSync(join(root, "pi-agent", "auth.json"), "utf8")).toBe("PI-LOGIN\n");
+    expect(existsSync(join(root, "pi-agent", "extensions", "evil.ts"))).toBe(false);
   }, 60_000);
 
   test("the Gemini CLI: a planted credential is unreadable, its own .gemini isn't", async () => {
@@ -199,6 +224,8 @@ describe.skipIf(!real.available)("inside real bubblewrap", () => {
     try {
       expect(await textOf(p.runTurn(turn(`read-file:${join(root, "secrets", "token")}`, join(root, "ws"))))).toStartWith("UNREADABLE:");
       expect(await textOf(p.runTurn(turn(`read-file:${join(root, "gemini-home", ".gemini", "oauth_creds.json")}`, join(root, "ws"))))).toBe("CONTENT:GEMINI-LOGIN");
+      // Its real settings can't be written (a hook or an extension planted there would run in the user's own gemini).
+      expect(await textOf(p.runTurn(turn(`write-file:${join(root, "gemini-home", ".gemini", "settings.json")}`, join(root, "ws"))))).toStartWith("UNWRITABLE:");
     } finally {
       if (prev === undefined) delete process.env.GEMINI_CLI_HOME;
       else process.env.GEMINI_CLI_HOME = prev;

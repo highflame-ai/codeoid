@@ -126,7 +126,7 @@ import {
   sandboxFingerprint,
   type ClaudeProviderInit,
 } from "../daemon/providers/claude/index.js";
-import { credentialEnvNames } from "../daemon/sandbox/claude-native.js";
+import { credentialEnvNames, physicalOf } from "../daemon/sandbox/claude-native.js";
 import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "../daemon/fork-isolation.js";
 import { getConfigDir } from "../config.js";
 import { mcpToolPrefix } from "../daemon/mcp/types.js";
@@ -3522,11 +3522,16 @@ describe("ClaudeProvider — the OS sandbox", () => {
             spawned.push({ command, args, env: o.env });
             return { stdin: null, stdout: null, kill: () => true, on: () => {}, once: () => {}, off: () => {} };
           },
+          close: async () => {},
         };
       },
+      privateHome: () => home,
+      claudeTemp: () => temp,
     };
-    return { rt, spawned, opened };
+    return { rt, spawned, opened, home, temp };
   }
+  const home = mkdtempSync(join(tmpdir(), "codeoid-claude-home-"));
+  const temp = { cli: "/tmp/codeoid-sandbox-x/claude-s/cli", root: "/tmp/codeoid-sandbox-x/claude-s/cmd", commands: "/tmp/codeoid-sandbox-x/claude-s/cmd/claude-1" };
   function providerWith(get: () => unknown, audits: Array<{ action: string }> = []): ClaudeProvider {
     return new ClaudeProvider({
       sessionId: "test-session",
@@ -3550,7 +3555,10 @@ describe("ClaudeProvider — the OS sandbox", () => {
     await collectTurnEvents(p);
     const sb = options().sandbox as Record<string, unknown>;
     expect(sb).toMatchObject({ enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: true });
-    expect(sb.filesystem).toMatchObject({ allowWrite: ["/work/repo", "/tmp/codeoid-sandbox-x"], denyRead: ["/home/u/.ssh", "/home/u/.codeoid", "/run/docker.sock"] });
+    // Its commands' temp dir is the session's (#448 round 1), the CLI's own elsewhere.
+    expect(sb.filesystem).toMatchObject({ allowWrite: ["/work/repo", temp.commands].map(physicalOf), denyRead: ["/home/u/.ssh", "/home/u/.codeoid", "/run/docker.sock"].map(physicalOf) });
+    expect((options().env as Record<string, string>).TMPDIR).toBe(temp.root);
+    expect((options().env as Record<string, string>).CLAUDE_CODE_TMPDIR).toBe(temp.cli);
     // The CLI's settings (hooks, excluded commands) aren't its commands' to write.
     expect((sb.filesystem as { denyWrite: string[] }).denyWrite).toContain("/work/repo/.claude");
     expect(sb.network).toEqual({});
@@ -3587,8 +3595,11 @@ describe("ClaudeProvider — the OS sandbox", () => {
     expect(options().sandbox).toBeUndefined();
     const spawn = options().spawnClaudeCodeProcess as (o: unknown) => unknown;
     spawn({ command: "/x/claude", args: ["--a"], cwd: "/work/repo", env: { A: "1", B: undefined, HOME: "/home/u" } });
-    expect(spawned).toEqual([{ command: "/x/claude", args: ["--a"], env: { A: "1", HOME: "/home/u" } }]);
-    expect(opened).toEqual([["/home/u/.claude", "/home/u/.claude.json"]]);
+    // A private copy of its config dir (#448 round 1): never the real ~/.claude writable.
+    expect(spawned).toEqual([{ command: "/x/claude", args: ["--a"], env: { A: "1", HOME: "/home/u", CLAUDE_CONFIG_DIR: home } }]);
+    expect(opened[0]?.[0]).toBe(home);
+    expect(opened[0]).not.toContain("/home/u/.claude");
+    expect(opened[0]).not.toContain("/home/u/.claude.json");
     await p.teardown();
   });
 

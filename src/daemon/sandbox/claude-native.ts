@@ -11,8 +11,18 @@
  *     model asks to run outside (`dangerouslyDisableSandbox`) is routed to
  *     the gate by the PreToolUse hook past any allow rule, and asked about
  *     in every mode (Session#unsandboxedRequest);
- *   - filesystem: the workspace and the session's temp dir writable, every
- *     hidden path and container socket unreadable;
+ *   - filesystem: the home denied whole and its allowlist allowed back
+ *     (`denyRead` / `allowRead`, which the CLI enforces as a tmpfs home with
+ *     binds: a credential made or replaced later isn't there), the workspace
+ *     and the session's command temp dir writable, every hidden path and
+ *     container socket unreadable, a repository's hooks and config and every
+ *     pinned dir not writable (the CLI's `denyWrite` takes a dir's subtree
+ *     with it: what is in a pinned dir is read-only too);
+ *   - temp: the CLI's `TMPDIR` is a dir of the session's whose
+ *     `claude-<uid>` (where the CLI points its commands' `TMPDIR`) is the
+ *     only part writable, and `CLAUDE_CODE_TMPDIR` another, so the CLI's own
+ *     transient files (its settings, sockets) are out of the commands'
+ *     reach and no session shares a temp dir with another ({@link claudeTempEnv});
  *   - network: `on` leaves hosts to the CLI's ask, which codeoid's gate
  *     allows; `off` denies every host; `allowlist` allows only those hosts,
  *     without asking;
@@ -20,8 +30,9 @@
  *     its commands.
  */
 
+import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import type { SandboxSettings } from "@anthropic-ai/claude-agent-sdk";
 import type { SandboxRuntime } from "./session-sandbox.js";
 
@@ -34,9 +45,25 @@ export function credentialEnvNames(env: Record<string, string | undefined>, unse
   return [...new Set(names)].sort();
 }
 
+/** Where a native session's CLI keeps its temp files, and its commands theirs (SandboxRuntime.claudeTemp). */
+export interface ClaudeTempDirs {
+  /** `CLAUDE_CODE_TMPDIR`: the CLI's own (its settings file, sockets). Not writable by commands. */
+  cli: string;
+  /** The CLI's `TMPDIR`: it puts its commands in `<this>/claude-<uid>`. */
+  root: string;
+  /** `<root>/claude-<uid>`: the commands' `TMPDIR`, the only part of these they may write. */
+  commands: string;
+}
+
+/** The CLI's environment for {@link ClaudeTempDirs}. */
+export function claudeTempEnv(t: ClaudeTempDirs): Record<string, string> {
+  return { TMPDIR: t.root, CLAUDE_CODE_TMPDIR: t.cli };
+}
+
 /** The SDK's `sandbox` option for a session whose sandbox is on and native. */
-export function claudeSandboxSettings(rt: Pick<SandboxRuntime, "spec" | "config">, env: Record<string, string | undefined>): SandboxSettings {
+export function claudeSandboxSettings(rt: Pick<SandboxRuntime, "spec" | "config">, env: Record<string, string | undefined>, temp?: ClaudeTempDirs): SandboxSettings {
   const spec = rt.spec;
+  const tempDir = temp?.commands ?? spec.tempDir;
   const network: NonNullable<SandboxSettings["network"]> =
     spec.network.mode === "off"
       ? { allowedDomains: [], deniedDomains: ["*"], strictAllowlist: true }
@@ -49,18 +76,44 @@ export function claudeSandboxSettings(rt: Pick<SandboxRuntime, "spec" | "config"
     failIfUnavailable: true,
     autoAllowBashIfSandboxed: false,
     allowUnsandboxedCommands: true,
+    // Every path physical (physicalOf): the CLI's bubblewrap can't lay a
+    // mount through a symlinked dir (`/var/run` → `/run` made every command
+    // fail where `/var/run/docker.sock` exists).
     filesystem: {
-      allowWrite: [spec.workspace, spec.tempDir, ...spec.writable],
+      allowWrite: physical([spec.workspace, tempDir, ...spec.writable]),
       // The CLI's own settings: a hook or an excluded command written there
-      // would run outside the sandbox from the CLI's next start. And every dir
+      // would run outside the sandbox from the CLI's next start. A
+      // repository's hooks and config, for the same reason. And every dir
       // between the workspace and a hidden path in it (nothing renames it away).
-      denyWrite: [...new Set([...claudeSettingsPaths(spec.workspace, env), ...(spec.readOnly ?? [])])],
-      denyRead: [...new Set([...spec.hidden, ...spec.containerSockets])],
+      denyWrite: physical([...claudeSettingsPaths(spec.workspace, env), ...(spec.readOnly ?? []), ...(spec.pinned ?? [])]),
+      denyRead: physical([...spec.hidden, ...spec.containerSockets]),
+      // Inside the denied home: the allowlist, and what is written (a workspace in it).
+      allowRead: physical([spec.workspace, tempDir, ...spec.writable, ...spec.reexposed]),
     },
     network,
     ...(envVars.length > 0 ? { credentials: { envVars } } : {}),
     ...(rt.config.bwrapPath ? { bwrapPath: rt.config.bwrapPath } : {}),
   };
+}
+
+/**
+ * `p` with no symlink in it: the real path of its longest existing part,
+ * with the rest (what doesn't exist yet) appended.
+ */
+export function physicalOf(p: string): string {
+  const missing: string[] = [];
+  for (let at = resolve(p); ; at = dirname(at)) {
+    try {
+      return join(realpathSync(at), ...missing.reverse());
+    } catch {
+      if (dirname(at) === at) return resolve(p);
+      missing.push(basename(at));
+    }
+  }
+}
+
+function physical(paths: readonly string[]): string[] {
+  return [...new Set(paths.map(physicalOf))];
 }
 
 /** Whether a tool call asks to run outside the sandbox (Claude's Bash `dangerouslyDisableSandbox`). */

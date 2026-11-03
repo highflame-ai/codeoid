@@ -76,7 +76,8 @@ import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.js";
 import { listProcesses } from "../../process-tree.js";
-import { asksUnsandboxed, claudeSandboxSettings } from "../../sandbox/claude-native.js";
+import { CLAUDE_HOME_LAYOUT, preparePrivateHome } from "../../sandbox/backend-home.js";
+import { asksUnsandboxed, claudeSandboxSettings, claudeTempEnv } from "../../sandbox/claude-native.js";
 import { programLocations } from "../../sandbox/policy.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../../sandbox/types.js";
@@ -305,6 +306,8 @@ export class ClaudeProvider implements SessionProvider {
   #builtEffort = "";
   /** The OS sandbox the running query was built with (#448): rebuilt when it changes. */
   #builtSandbox = "";
+  /** The sandbox the running query's CLI runs in, when the whole CLI is inside (#448): closed with the query. */
+  #sandboxHandle: SandboxHandle | null = null;
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
@@ -965,6 +968,9 @@ export class ClaudeProvider implements SessionProvider {
     if (this.#consumerTask) {
       try { await this.#consumerTask; } catch { /* consumer handles its own errors */ }
     }
+    // The CLI's sandbox, when the whole CLI ran inside one (#448).
+    void this.#sandboxHandle?.close();
+    this.#sandboxHandle = null;
     this.#currentTurnQueue?.close();
     this.#currentTurnQueue = null;
     this.#inputQueue = null;
@@ -1179,6 +1185,14 @@ export class ClaudeProvider implements SessionProvider {
       )),
       init.forkBoundary?.(),
     );
+    // The OS sandbox (#448): Claude Code's own with codeoid's policy (and its
+    // temp dirs in the env), or the whole CLI inside the session's sandbox.
+    // The last query's sandbox goes with it.
+    void this.#sandboxHandle?.close();
+    this.#sandboxHandle = null;
+    const { env: sandboxEnv, ...sandboxOptions } = claudeSandboxOptions(sandbox, queryEnv, opts.workdir, (h) => {
+      this.#sandboxHandle = h;
+    });
     this.#query = query({
       prompt: this.#inputQueue,
       options: {
@@ -1206,7 +1220,7 @@ export class ClaudeProvider implements SessionProvider {
         // can never undo the account or the gateway re-point.
         //
         // A fork's boundary goes on after all of it (withForkBoundary).
-        env: queryEnv,
+        env: sandboxEnv ?? queryEnv,
         allowedTools: [
           // Every EXACT TOOL NAME here is auto-approved by the SDK BEFORE
           // canUseTool is consulted, so it never reaches our gate — the SDK
@@ -1245,7 +1259,7 @@ export class ClaudeProvider implements SessionProvider {
         ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
         // The OS sandbox (#448): Claude Code's own with codeoid's policy, or
         // the whole CLI started inside the session's (Docker).
-        ...claudeSandboxOptions(sandbox, queryEnv, opts.workdir),
+        ...sandboxOptions,
         stderr: (data: string) => {
           process.stderr.write(`[claude-subprocess ${sessionId.slice(0, 8)}] ${data}`);
         },
@@ -2824,33 +2838,44 @@ export function sandboxFingerprint(rt: SandboxRuntime | null): string {
   return JSON.stringify({ provider: rt.provider.id, kind: rt.plan.kind, spec });
 }
 
-/** What the Claude CLI's own process must still reach when it runs inside a sandbox: its config dir and `~/.claude.json`. */
-export function claudeOwnState(env: Record<string, string | undefined>): string[] {
-  const home = env.HOME || homedir();
-  return [env.CLAUDE_CONFIG_DIR || join(home, ".claude"), join(home, ".claude.json")];
-}
-
 /**
  * The query options that put a session's commands in its OS sandbox (#448):
  * the SDK's `sandbox` (Claude Code's own, codeoid's policy) on a local OS
- * provider, or a spawner that starts the whole CLI inside the session's
- * sandbox (Docker). Nothing when the sandbox is off or unavailable: Session
- * says so, and refuses an autonomous or unattended turn.
+ * provider, its CLI and its commands each with temp dirs of their own
+ * (`env`: claudeTempEnv); or a spawner that starts the whole CLI inside the
+ * session's sandbox (Docker) in a private copy of its config dir
+ * (backend-home.ts), the handle it opens given to `track` (the caller
+ * closes it when the query is replaced). Nothing when the sandbox is off or
+ * unavailable: Session says so, and refuses an autonomous or unattended turn.
  */
 export function claudeSandboxOptions(
   rt: SandboxRuntime | null,
   env: Record<string, string | undefined>,
   workdir: string,
-): { sandbox?: SandboxSettings; spawnClaudeCodeProcess?: (o: SpawnOptions) => SpawnedProcess } {
+  track?: (handle: SandboxHandle) => void,
+): { sandbox?: SandboxSettings; spawnClaudeCodeProcess?: (o: SpawnOptions) => SpawnedProcess; env?: Record<string, string | undefined> } {
   if (!rt) return {};
-  if (rt.plan.kind === "native") return { sandbox: claudeSandboxSettings(rt, env) };
+  if (rt.plan.kind === "native") {
+    const temp = rt.claudeTemp();
+    return { sandbox: claudeSandboxSettings(rt, env, temp), env: { ...env, ...claudeTempEnv(temp) } };
+  }
   if (rt.plan.kind !== "process") return {};
   let handle: SandboxHandle | null = null;
+  let configDir = "";
   return {
     spawnClaudeCodeProcess: (o: SpawnOptions): SpawnedProcess => {
-      handle ??= rt.openSync(claudeOwnState(o.env), { readable: programLocations(o.command, []) });
+      if (!handle) {
+        const home = o.env.HOME || homedir();
+        const source = o.env.CLAUDE_CONFIG_DIR || join(home, ".claude");
+        // With CLAUDE_CONFIG_DIR set the CLI reads `.claude.json` from there: the user's own, copied in.
+        const own = preparePrivateHome(source, rt.privateHome("claude"), CLAUDE_HOME_LAYOUT, o.env.CLAUDE_CONFIG_DIR ? {} : { ".claude.json": join(home, ".claude.json") });
+        configDir = own.home;
+        handle = rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(o.command, [])] });
+        track?.(handle);
+      }
       const childEnv: Record<string, string> = {};
       for (const [k, v] of Object.entries(o.env)) if (v !== undefined) childEnv[k] = v;
+      childEnv.CLAUDE_CONFIG_DIR = configDir;
       const child = handle.spawn(o.command, o.args, { cwd: o.cwd ?? workdir, env: childEnv });
       o.signal?.addEventListener("abort", () => child.kill("SIGTERM"), { once: true });
       return child;

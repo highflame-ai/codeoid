@@ -161,6 +161,20 @@ async function runPrompt(message: string): Promise<void> {
       text = `UNREADABLE:${err instanceof Error ? err.message : String(err)}`;
     }
     emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } });
+  } else if (message.startsWith("write-file:")) {
+    // Whether this process can write a path (`write-file:<path>`; the OS sandbox tests, #448 round 1).
+    let text: string;
+    try {
+      await Bun.write(message.slice("write-file:".length).trim(), "WRITTEN-BY-BACKEND\n");
+      text = "WROTE";
+    } catch (err) {
+      text = `UNWRITABLE:${err instanceof Error ? err.message : String(err)}`;
+    }
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } });
+  } else if (message.includes("echo-env:")) {
+    // One variable of this process's environment (`echo-env:<NAME>`).
+    const text = `ENV:${process.env[message.slice(message.indexOf("echo-env:") + "echo-env:".length).trim()] ?? ""}`;
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } });
   } else if (message.includes("echo-thinking")) {
     emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `thinking:${thinkingLevel}` }], stopReason: "stop" } });
   } else if (message.includes("echo-prompt")) {

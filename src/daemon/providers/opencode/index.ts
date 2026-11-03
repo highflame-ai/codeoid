@@ -34,6 +34,7 @@
  */
 
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
+import type { SandboxHandle } from "../../sandbox/types.js";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
 import type { McpTenant } from "../../mcp/oauth.js";
@@ -502,13 +503,30 @@ export class OpencodeProvider implements SessionProvider {
     return { ...opencodeShellEnv(), [SANDBOX_LAUNCHER_VAR]: this.#launcherPath() };
   }
 
-  /** Written afresh each time (every turn, every subagent): it lays the sandbox over the filesystem as it is now. */
+  /**
+   * Written afresh each time (every turn, every subagent): it lays the
+   * sandbox over the filesystem as it is now. The handle is kept while what
+   * it lays is the same (one per change, not one per turn); an older one is
+   * never closed meanwhile, since a line it started (a background shell)
+   * may still be running in it. All go with the session.
+   */
   #launcherPath(): string {
     const rt = this.#sandbox?.() ?? null;
     if (!rt || rt.plan.kind !== "command") return "off";
-    const handle = rt.openSync([]);
+    const opened = rt.openSync([]);
+    const last = this.#shellHandle;
+    let handle = opened;
+    if (last && last.runtime === rt && JSON.stringify(last.handle.spec) === JSON.stringify(opened.spec)) {
+      handle = last.handle;
+      void opened.close();
+    } else {
+      this.#shellHandle = { runtime: rt, handle: opened };
+    }
     return rt.launcher(handle, [], [...Object.keys(opencodeShellEnv()), SANDBOX_LAUNCHER_VAR], "opencode-shell");
   }
+
+  /** The handle the session's launcher runs lines in, and the runtime it was opened from. */
+  #shellHandle: { runtime: SandboxRuntime; handle: SandboxHandle } | null = null;
 
   constructor(init: OpencodeProviderInit) {
     this.#sandbox = init.sandbox ?? null;

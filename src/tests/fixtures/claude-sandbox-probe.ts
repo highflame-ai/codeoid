@@ -5,23 +5,29 @@
  * with one Bash call and the next with "finished". Prints one JSON line:
  * what the call's result said and which tool calls reached canUseTool.
  *
- *   bun claude-sandbox-probe.ts <root> <on|off|allowlist> <command-file> [unsandboxed] [allowHost]
+ *   bun claude-sandbox-probe.ts <root> <on|off|allowlist> <command-file> [unsandboxed|policy] [allowHost]
  *
  * `<root>` holds the planted files (`ws`, `tmp`, `secrets`); the command is
- * read from a file so it is never part of a shell line. Run in its own
+ * read from a file so it is never part of a shell line. `policy`: the spec
+ * is codeoid's own (buildSandboxSpec) for a fake home `<root>/home` with the
+ * workspace `<root>/home/proj` (or `<root>/wt` when it exists: a worktree),
+ * and the CLI gets the session's temp dirs as the provider gives them
+ * (claudeTempEnv), under `<root>/sbx`. Run in its own
  * process: a test file that mocks the SDK module must not see this one.
  * canUseTool here allows a sandboxed call and DENIES one asking to run
  * outside the sandbox, as codeoid's gate would until its owner says yes.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import { claudeSandboxSettings } from "../../daemon/sandbox/claude-native.js";
+import { type ClaudeTempDirs, claudeSandboxSettings, claudeTempEnv } from "../../daemon/sandbox/claude-native.js";
+import { buildSandboxSpec } from "../../daemon/sandbox/policy.js";
 
 const [root = "", networkArg = "off", commandFile = "", flag = "", allowHost = ""] = process.argv.slice(2);
 const network = networkArg as "on" | "off" | "allowlist";
 const command = readFileSync(commandFile, "utf8");
 const unsandboxed = flag === "unsandboxed";
+const policy = flag === "policy";
 
 let toolResult: string | null = null;
 const sse = (events: Array<[string, unknown]>) => events.map(([e, d]) => `event: ${e}\ndata: ${JSON.stringify(d)}\n\n`).join("");
@@ -67,33 +73,49 @@ const server = Bun.serve({
   },
 });
 
+const home = policy ? join(root, "home") : join(root, "home");
+const workspace = policy ? (existsSync(join(root, "wt")) ? join(root, "wt") : join(home, "proj")) : join(root, "ws");
+const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+const temp: ClaudeTempDirs = { cli: join(root, "sbx", "cli"), root: join(root, "sbx", "cmd"), commands: join(root, "sbx", "cmd", `claude-${uid}`) };
+if (policy) for (const d of [temp.cli, temp.commands, workspace]) mkdirSync(d, { recursive: true });
 const env: Record<string, string> = {
   PATH: process.env.PATH ?? "/usr/bin:/bin",
-  HOME: join(root, "home"),
+  HOME: home,
   ANTHROPIC_API_KEY: "sk-test-not-a-real-key",
   ANTHROPIC_BASE_URL: `http://127.0.0.1:${server.port}`,
   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1",
   DISABLE_AUTOUPDATER: "1",
+  ...(policy ? { ...claudeTempEnv(temp), GIT_CONFIG_NOSYSTEM: "1" } : {}),
 };
-const spec = {
-  sessionId: "probe",
-  workspace: join(root, "ws"),
-  tempDir: join(root, "tmp"),
-  writable: [],
-  hidden: [join(root, "secrets")],
-  reexposed: [],
-  containerSockets: [],
-  network: network === "allowlist" ? { mode: network, allow: [allowHost] } : { mode: network },
-  unsetEnv: [],
-};
-const sandbox = claudeSandboxSettings({ spec, config: { provider: "auto", network, allowedHosts: [], hiddenPaths: [], docker: { image: "x" } } } as never, env);
+const config = { provider: "auto", network, allowedHosts: [], hiddenPaths: [], homeReadable: ["~/.gitconfig", "~/.bun"], docker: { image: "x" } };
+const spec = policy
+  ? buildSandboxSpec({
+      sessionId: "probe",
+      workspace,
+      tempDir: join(root, "tmp"),
+      network: network === "allowlist" ? { mode: network, allow: [allowHost] } : { mode: network },
+      config: { sandbox: config } as never,
+      hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" },
+    })
+  : {
+      sessionId: "probe",
+      workspace: join(root, "ws"),
+      tempDir: join(root, "tmp"),
+      writable: [],
+      hidden: [join(root, "secrets")],
+      reexposed: [],
+      containerSockets: [],
+      network: network === "allowlist" ? { mode: network, allow: [allowHost] } : { mode: network },
+      unsetEnv: [],
+    };
+const sandbox = claudeSandboxSettings({ spec, config } as never, env, policy ? temp : undefined);
 const asked: string[] = [];
 let result = "";
 try {
   for await (const m of query({
     prompt: "run the probe",
     options: {
-      cwd: join(root, "ws"),
+      cwd: workspace,
       env,
       sandbox,
       permissionMode: "default",

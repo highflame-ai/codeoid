@@ -345,6 +345,16 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
       text = `UNREADABLE:${err instanceof Error ? err.message : String(err)}`;
     }
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
+  } else if (prompt.startsWith("write-file:")) {
+    // Whether this process can write a path (`write-file:<path>`; the OS sandbox tests, #448 round 1).
+    let text: string;
+    try {
+      await Bun.write(prompt.slice("write-file:".length).trim(), "WRITTEN-BY-BACKEND\n");
+      text = "WROTE";
+    } catch (err) {
+      text = `UNWRITABLE:${err instanceof Error ? err.message : String(err)}`;
+    }
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
   } else if (prompt.includes("echo-env")) {
     // The environment the provider spawned us with (extraEnv wiring).
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: JSON.stringify(process.env) } } });
