@@ -129,10 +129,10 @@ describe("each backend's own state, and how it is started", () => {
     expect(existsSync(bundled[1] ?? "")).toBe(true);
     expect(qwenCliArgv("/opt/qwen/cli.mjs")).toEqual([process.execPath, "/opt/qwen/cli.mjs"]);
     expect(qwenCliArgv("/opt/qwen/qwen")).toEqual(["/opt/qwen/qwen"]);
-    expect(qwenExecutableOption(null, undefined, {}, "/w")).toEqual({});
-    expect(qwenExecutableOption(null, "/opt/q", {}, "/w")).toEqual({ pathToQwenExecutable: "/opt/q" });
+    expect(qwenExecutableOption(null, undefined, {})).toEqual({});
+    expect(qwenExecutableOption(null, "/opt/q", {})).toEqual({ pathToQwenExecutable: "/opt/q" });
     const { rt, opened } = recordingRuntime();
-    const opt = qwenExecutableOption(rt, undefined, { HOME: "/h" }, "/w");
+    const opt = qwenExecutableOption(rt, undefined, { HOME: "/h" });
     const script = readFileSync(opt.pathToQwenExecutable ?? "", "utf8");
     expect(script).toBe(launcherScript(["/usr/bin/bwrap", "--x", "--", ...bundled]));
     expect(statSync(opt.pathToQwenExecutable ?? "").mode & 0o777).toBe(0o700);
@@ -208,7 +208,7 @@ describe.skipIf(!real.available)("inside real bubblewrap", () => {
 
   test("Qwen: the real bundled CLI starts through its launcher inside bubblewrap", async () => {
     await sbx.refresh("qwen");
-    const opt = qwenExecutableOption(sbx.runtime, undefined, { HOME: join(root, "home") }, join(root, "ws"));
+    const opt = qwenExecutableOption(sbx.runtime, undefined, { HOME: join(root, "home") });
     const r = Bun.spawnSync([opt.pathToQwenExecutable ?? "", "--version"], { cwd: join(root, "ws"), env: { PATH: process.env.PATH ?? "", HOME: join(root, "home") }, timeout: 60_000 });
     expect(r.stdout.toString().trim()).toMatch(/^\d+\.\d+\.\d+/);
   }, 90_000);
@@ -217,7 +217,7 @@ describe.skipIf(!real.available)("inside real bubblewrap", () => {
     await sbx.refresh("qwen");
     const rt = sbx.runtime as SandboxRuntime;
     const handle = await rt.open([]);
-    const launcher = rt.launcher(handle, ["/bin/cat"], join(root, "ws"));
+    const launcher = rt.launcher(handle, ["/bin/cat"]);
     const r = Bun.spawnSync([launcher, join(root, "secrets", "token")], { cwd: join(root, "ws"), env: { PATH: "/usr/bin:/bin" } });
     expect(r.stdout.toString()).not.toContain("PLANTED");
     expect(r.exitCode).not.toBe(0);

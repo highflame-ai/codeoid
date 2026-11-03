@@ -72,11 +72,12 @@ export interface SandboxRuntime {
   openSync(backendState?: readonly string[], opts?: OpenOptions): SandboxHandle;
   /**
    * An executable that runs `argv` inside `handle` with the arguments it is
-   * given appended, for a spawner codeoid doesn't control (an SDK that takes
-   * a path to its CLI). Written to a daemon-private dir outside anything the
-   * sandbox can write; removed with the session.
+   * given appended, in the directory it is started from, for a spawner
+   * codeoid doesn't control (an SDK that takes a path to its CLI, opencode's
+   * shell). Written to a daemon-private dir outside anything the sandbox can
+   * write; removed with the session.
    */
-  launcher(handle: SandboxHandle, argv: readonly string[], cwd: string): string;
+  launcher(handle: SandboxHandle, argv: readonly string[]): string;
 }
 
 /** The setting a session ends up with: its own fields over the config's. */
@@ -286,18 +287,19 @@ export class SessionSandbox {
         if (!provider.openSync) throw new Error(`${provider.displayName} can't be opened synchronously`);
         return this.#track(provider.openSync(open(backendState, o)));
       },
-      launcher: (handle, argv, cwd) => this.#writeLauncher(handle, argv, cwd),
+      launcher: (handle, argv) => this.#writeLauncher(handle, argv),
     };
     return r.info;
   }
 
-  #writeLauncher(handle: SandboxHandle, argv: readonly string[], cwd: string): string {
+  #writeLauncher(handle: SandboxHandle, argv: readonly string[]): string {
     if (!handle.wrap) throw new Error(`${handle.providerId} can't start a local program inside`);
     if (!this.#launcherDir) {
       const safe = this.#sessionId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "session";
-      this.#launcherDir = mkdtempSync(join(tmpdir(), `codeoid-launch-${safe}-`));
+      this.#launcherDir = mkdtempSync(`${launcherRoot()}${safe}-`);
     }
-    const wrapped = handle.wrap(argv, { cwd, env: {} });
+    // Started from wherever its caller is: the cwd is the caller's, not fixed here.
+    const wrapped = handle.wrap(argv, { cwd: "", env: {} });
     const path = join(this.#launcherDir, `launch-${++this.#launchers}`);
     writeFileSync(path, launcherScript(wrapped.argv), { mode: 0o700 });
     return path;
@@ -360,4 +362,9 @@ export function shellQuote(word: string): string {
 /** A POSIX sh script that execs `argv` with its own arguments appended. */
 export function launcherScript(argv: readonly string[]): string {
   return `#!/bin/sh\n# Written by codeoid (#448): starts a backend inside its session's sandbox.\nexec ${argv.map(shellQuote).join(" ")} "$@"\n`;
+}
+
+/** Where every session's launchers live: `<this prefix><session>-<random>/launch-<n>` (the opencode shell shim checks it). */
+export function launcherRoot(): string {
+  return join(tmpdir(), "codeoid-launch-");
 }

@@ -702,6 +702,7 @@ export function createDefaultProviderRegistry(
             onModels: init.onModels,
             agent: config?.providers?.opencode?.agent,
             modelPrices: () => config?.pricing?.models,
+            sandbox: init.sandbox,
           }),
       });
     } else {

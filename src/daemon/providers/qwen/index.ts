@@ -472,7 +472,7 @@ export class QwenProvider implements SessionProvider {
         ...(opts.fallbackModel ? { fallbackModel: [opts.fallbackModel] } : {}),
         // The OS sandbox (#448): the SDK spawns a launcher that starts its
         // CLI inside the session's sandbox (its own ~/.qwen reachable).
-        ...qwenExecutableOption(init.sandbox?.() ?? null, qwenCfg?.command, qwenEnv, opts.workdir),
+        ...qwenExecutableOption(init.sandbox?.() ?? null, qwenCfg?.command, qwenEnv),
         // codeoid's gate is the only approval authority. `default` keeps
         // read-only tools uncontrolled and routes every write through
         // canUseTool; qwen-code's own `auto` mode would silently auto-approve
@@ -1209,10 +1209,9 @@ export function qwenExecutableOption(
   rt: SandboxRuntime | null,
   configured: string | undefined,
   env: Record<string, string | undefined>,
-  workdir: string,
 ): { pathToQwenExecutable?: string } {
   if (!rt?.plan.wrapsBackend) return configured ? { pathToQwenExecutable: configured } : {};
   const argv = qwenCliArgv(configured);
   const handle = rt.openSync(qwenOwnState(env), { readable: programLocations(argv[0] ?? "", argv.slice(1)) });
-  return { pathToQwenExecutable: rt.launcher(handle, argv, workdir) };
+  return { pathToQwenExecutable: rt.launcher(handle, argv) };
 }

@@ -45,7 +45,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { OPENCODE_MODEL_ID } from "../../../config.js";
@@ -1105,4 +1105,46 @@ export function foreignPlugins(plugins: readonly OcPluginInfo[]): OcPluginInfo[]
 export function describePlugin(p: OcPluginInfo): string {
   const where = p.source?.path ?? p.source?.target;
   return `${p.id ?? "(unnamed)"}${where ? ` (${where})` : ""}`;
+}
+
+/**
+ * The variable in a session's shell environment naming the launcher that
+ * runs its lines inside its OS sandbox (#448), or `off`. Set by codeoid per
+ * session (`PUT …/environment`, with {@link opencodeShellEnv}); a line's own
+ * `export` can't change it for the next line, each runs in a new process.
+ */
+export const SANDBOX_LAUNCHER_VAR = "CODEOID_SANDBOX_LAUNCHER";
+
+/**
+ * The shell opencode's shared server runs every line with (its `SHELL`):
+ * a session's line goes to the launcher its environment names, which starts
+ * `bash -c <line>` inside that session's sandbox, or to bash itself when the
+ * session's sandbox is `off`. Anything else — no variable (the server's own
+ * environment: a command template's `!`), a path that isn't a codeoid
+ * launcher — is refused and runs nothing. Pure (the script's text).
+ */
+export function opencodeShellShim(bash: string, launcherRoot: string): string {
+  const q = (w: string) => `'${w.replace(/'/g, `'\\''`)}'`;
+  return [
+    "#!/bin/sh",
+    "# Written by codeoid (#448): opencode runs every shell line with this.",
+    `l="\${${SANDBOX_LAUNCHER_VAR}-}"`,
+    'case "$l" in',
+    `  off) exec ${q(bash)} "$@" ;;`,
+    "  *..*) ;;",
+    `  ${q(launcherRoot)}*/launch-*) [ -f "$l" ] && [ -x "$l" ] && exec "$l" ${q(bash)} "$@" ;;`,
+    "esac",
+    'echo "codeoid: this line has no sandbox to run in, so it was not run" >&2',
+    "exit 126",
+    "",
+  ].join("\n");
+}
+
+/** Write {@link opencodeShellShim} as `<dir>/codeoid-shell` (0700) and return its path. */
+export function writeOpencodeShellShim(dir: string, bash: string, launcherRoot: string): string {
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, "codeoid-shell");
+  writeFileSync(path, opencodeShellShim(bash, launcherRoot), { mode: 0o700 });
+  chmodSync(path, 0o700);
+  return path;
 }

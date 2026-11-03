@@ -33,6 +33,7 @@
  *     authoritative for files.
  */
 
+import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
 import type { McpTenant } from "../../mcp/oauth.js";
@@ -83,6 +84,7 @@ import {
   hostedModelInfo,
   mcpNamespace,
   opencodeShellEnv,
+  SANDBOX_LAUNCHER_VAR,
   ownMountPrefix,
   runnableCommand,
   sessionRules,
@@ -142,6 +144,8 @@ const REMEMBERED = 4_096;
 const UNASKED_TOOLS: Record<string, string> = { execute: "opencode_execute" };
 
 export interface OpencodeProviderInit {
+  /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448): each shell line runs inside it. */
+  sandbox?: () => SandboxRuntime | null;
   sessionId: string;
   /** `ses_…` from a previous run, or the codeoid session id on first run. */
   initialBackingId: string;
@@ -486,7 +490,32 @@ export class OpencodeProvider implements SessionProvider {
    */
   #fences = new Map<string, Map<string, string | null>>();
 
+  /** The session's OS sandbox (#448), read each time its shell environment is set. */
+  readonly #sandbox: (() => SandboxRuntime | null) | null;
+  /** The launcher made for the sandbox as last resolved (a new resolution makes a new one). */
+  #launcher: { rt: SandboxRuntime; path: string } | null = null;
+
+  /**
+   * A session's (and its subagents') shell environment: the bare one, and
+   * the launcher the server's shell shim runs each line through — inside the
+   * session's sandbox, or `off` (writeOpencodeShellShim).
+   */
+  #shellEnv(): Record<string, string> {
+    return { ...opencodeShellEnv(), [SANDBOX_LAUNCHER_VAR]: this.#launcherPath() };
+  }
+
+  #launcherPath(): string {
+    const rt = this.#sandbox?.() ?? null;
+    if (!rt || rt.plan.kind !== "command") return "off";
+    if (this.#launcher?.rt === rt) return this.#launcher.path;
+    const handle = rt.openSync([]);
+    const path = rt.launcher(handle, []);
+    this.#launcher = { rt, path };
+    return path;
+  }
+
   constructor(init: OpencodeProviderInit) {
+    this.#sandbox = init.sandbox ?? null;
     this.#sessionId = init.sessionId;
     this.#backingSessionId = init.initialBackingId;
     this.#server = init.server;
@@ -1206,7 +1235,7 @@ export class OpencodeProvider implements SessionProvider {
     // Its shell runs without the server's environment (its password, the
     // injected config): a line with no command in it runs unasked. Kept in
     // the server's memory only, so set on every turn; a failure fails it.
-    await conn.client.setEnvironment(ses, opencodeShellEnv());
+    await conn.client.setEnvironment(ses, this.#shellEnv());
     await this.#sweepSaved(conn, workdir);
     await this.#server.checkPlugins(conn, workdir);
     if (!this.#modelsReported) await this.#reportModelsOnce();
@@ -2238,7 +2267,7 @@ export class OpencodeProvider implements SessionProvider {
    */
   #setUpChild(conn: OpencodeConnection | null, id: string): Promise<boolean> {
     if (!conn) return Promise.resolve(false);
-    const env = conn.client.setEnvironment(id, opencodeShellEnv()).then(
+    const env = conn.client.setEnvironment(id, this.#shellEnv()).then(
       () => true,
       (err: unknown) => {
         console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] couldn't set subagent ${id}'s shell environment: ${err instanceof Error ? err.message : String(err)}`);

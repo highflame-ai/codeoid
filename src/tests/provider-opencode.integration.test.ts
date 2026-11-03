@@ -53,7 +53,7 @@
  *   I26 (scripted only) a background shell finishing after its backend was torn down: its wake is stopped, the rebuilt backend's turn answers
  *   I27 (scripted only) a native fork into a worktree of its own runs its tools there
  *   I28 (scripted only) a session whose server died mid-turn answers its next turns
- *   I29 (scripted only) a subagent created in a feed gap runs a line unasked with the server's environment: no key is in it
+ *   I29 (scripted only) a subagent created in a feed gap tries a line unasked with the server's environment: codeoid's shell shim runs nothing (#448)
  *   I30 (scripted only) a subagent running when its server died isn't picked up again by a later feed gap
  *   I31 (scripted only) codeoid's credentials reach opencode from 0600 files (built-in, Qwen and endpoint providers), never its environment; its files stay in codeoid's data dir; a session's shell keeps the user's own dirs
  *   I32 the user's own opencode data, state, cache and temp (`$TMPDIR/opencode`) dirs are untouched by the whole run
@@ -116,6 +116,9 @@
  *   I67 (round 25) a provider whose base URL only opencode's `{file:}` substitution shows: the user's is dropped while
  *       hosted models are off; one that still reaches the server (codeoid's own here, standing in for `/etc/opencode`)
  *       is listed by real 2.2.5 with its substituted opencode.ai URL, and the server is refused at start
+ *   I69 (scripted only, bubblewrap) a session's shell lines run inside its OS sandbox (#448) through codeoid's shell shim:
+ *       a planted credential is unreadable, a planted dir outside the workspace survives `rm -rf`, the workspace is
+ *       writable, the daemon's processes aren't in its /proc; a session whose sandbox is off runs bash as before
  *   I68 (round 26) a host spliced into a Bedrock `region` (`x@opencode.ai/zen/v1?`): the user's provider is dropped while
  *       hosted models are off, one whose region only `{file:}` shows is refused at start from real 2.2.5's substituted
  *       listing, and a Bedrock provider whose keys come from `{file:}` is carried; nothing connects to opencode.ai
@@ -136,6 +139,9 @@ import { opencodeRefusedPaths, opencodeSecretLocations, opencodeVersionProblem, 
 import type { ProviderEvent, ToolApprovalFn, TurnOpts, TurnRun, UiRequest } from "../daemon/providers/interface.js";
 import { registerSecretPaths, secretPathVerdict } from "../daemon/secret-paths.js";
 import { Session } from "../daemon/session.js";
+import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
+import { SandboxRegistry } from "../daemon/sandbox/registry.js";
+import { SessionSandbox } from "../daemon/sandbox/session-sandbox.js";
 import { loadShellParser } from "../daemon/shell/parse.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
@@ -1148,10 +1154,61 @@ describe("opencode (real binary)", () => {
     }
   }, 180_000);
 
+  maybeScripted("I69 a session's shell lines run inside its OS sandbox through codeoid's shell shim; off runs bash as before", async () => {
+    const bwrap = new BwrapSandboxProvider();
+    if (!(await bwrap.probe()).available) return;
+    // Outside the host's /tmp, which the sandbox replaces with the session's own.
+    const parent = [join(homedir(), ".cache"), "/var/tmp"].find((d) => {
+      try {
+        mkdirSync(d, { recursive: true });
+        rmSync(mkdtempSync(join(d, "codeoid-probe-")), { recursive: true });
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    const root = realpathSync(mkdtempSync(join(parent ?? tmpdir(), "codeoid-oc-sandbox-")));
+    const ws = join(root, "ws");
+    const outside = join(root, "outside-target");
+    for (const d of [ws, outside, join(root, "secrets")]) mkdirSync(d, { recursive: true });
+    writeFileSync(join(root, "secrets", "token"), "PLANTED\n");
+    writeFileSync(join(outside, "keep.txt"), "keep\n");
+    const registry = new SandboxRegistry("linux");
+    registry.register(bwrap);
+    const sbx = new SessionSandbox({ sessionId: "it-sbx", workdir: ws, registry, config: { sandbox: { provider: "bwrap", network: "off", allowedHosts: [], hiddenPaths: [join(root, "secrets")], docker: { image: "x" } } } as never });
+    await sbx.refresh("opencode");
+    expect(sbx.info).toMatchObject({ state: "on", confinement: "command", network: "off" });
+    const shell = (command: string) => `[[tool:shell ${JSON.stringify({ command, description: "probe" })}]]`;
+    const output = (events: ProviderEvent[]) => (events.find((e) => e.type === "tool_complete") as Extract<ProviderEvent, { type: "tool_complete" }> | undefined)?.output ?? "";
+    try {
+      const p = provider({ sandbox: () => sbx.runtime });
+      const line = `cat ${join(root, "secrets", "token")} 2>&1; rm -rf ${outside} 2>&1; echo rm=$?; echo hi > made.txt && echo WROTE; test -e /proc/${process.pid} && echo DAEMON-VISIBLE; echo cwd=$PWD`;
+      const out = output(await collect(p.runTurn(opts(shell(line), { workdir: ws }))));
+      expect(out).not.toContain("PLANTED");
+      expect(out).toContain("rm=1");
+      expect(out).toContain("Read-only file system");
+      expect(out).toContain("WROTE");
+      expect(out).toContain(`cwd=${ws}`);
+      expect(out).not.toContain("DAEMON-VISIBLE");
+      expect(readFileSync(join(outside, "keep.txt"), "utf8")).toBe("keep\n");
+      expect(readFileSync(join(ws, "made.txt"), "utf8")).toBe("hi\n");
+      await p.teardown();
+      // The sandbox off: the same shell, unsandboxed (only a harmless look).
+      const off = provider({ sandbox: () => null });
+      const offOut = output(await collect(off.runTurn(opts(shell(`test -e /proc/${process.pid} && echo DAEMON-VISIBLE; echo "[$BASH_VERSION]"`), { workdir: ws }))));
+      expect(offOut).toContain("DAEMON-VISIBLE");
+      expect(offOut).toMatch(/\[\d+\./);
+      await off.teardown();
+    } finally {
+      await sbx.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 180_000);
+
   maybeScripted("I29 a subagent created in a feed gap that ran a line unasked, with the server's environment, stops the server once read back; codeoid shows nothing of it", async () => {
-    // Known gap (docs/opencode.md): the child's shell has the server's
-    // environment until codeoid learns of it, so the line itself still runs —
-    // but that environment holds no credential.
+    // The child's shell has the server's environment until codeoid learns of
+    // it: no launcher named there, so codeoid's shell shim runs nothing (#448;
+    // before it, the line ran, with an environment that holds no credential).
     const asked: string[] = [];
     const gate: ToolApprovalFn = async (_t, _a, name, _input, _signal, agentId) => {
       asked.push(agentId ? `${name}@child` : name);
@@ -1172,11 +1229,11 @@ describe("opencode (real binary)", () => {
     expect(JSON.stringify(events)).not.toContain(PROBE_VALUE);
     const ses = p.backingSessionId;
     await p.teardown();
-    // What the line printed, as opencode stored it: the server's environment holds no key.
+    // What the line printed, as opencode stored it: the shim's refusal, nothing of the server's environment.
     const conn = await server!.ensure();
     const [child] = await conn.client.childSessions(ses);
     const stored = (await conn.client.messages(child!.id)).data.flatMap((m) => m.content ?? []).find((b) => b.type === "tool" && b.name === "shell");
-    expect(JSON.stringify(stored?.state?.content)).toContain("UNSET_IT_VAR");
+    expect(JSON.stringify(stored?.state?.content)).toContain("no sandbox to run in");
     expect(JSON.stringify(stored)).not.toContain(PROBE_VALUE);
   }, 180_000);
 

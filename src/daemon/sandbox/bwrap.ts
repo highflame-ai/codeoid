@@ -72,8 +72,8 @@ export function bwrapNetwork(mode: NetworkMode): "on" | "off" {
 
 /**
  * bwrap's arguments (everything before the program) for `spec`, the program
- * starting in `cwd`. Pure but for `kind` (what exists at a path), which tests
- * replace.
+ * starting in `cwd` (empty: wherever it is started from). Pure but for
+ * `kind` (what exists at a path), which tests replace.
  */
 export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => PathKind = pathKind): string[] {
   const args = ["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try"];
@@ -129,7 +129,9 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   // A hidden directory's tmpfs is read-only like the rest (its mount points are made by now).
   for (const m of mounts) if (m.kind === "hide-dir") args.push("--remount-ro", m.path);
   for (const name of spec.unsetEnv) args.push("--unsetenv", name);
-  args.push("--setenv", "TMPDIR", "/tmp", "--chdir", cwd);
+  args.push("--setenv", "TMPDIR", "/tmp");
+  // No cwd: the caller's own (a launcher run from wherever its caller is; bwrap keeps it).
+  if (cwd) args.push("--chdir", cwd);
   return args;
 }
 

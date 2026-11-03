@@ -32,6 +32,7 @@
  * stream: it carries the sessions' durable events as well.
  */
 
+import { launcherRoot } from "../../sandbox/session-sandbox.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmdirSync } from "node:fs";
@@ -54,6 +55,7 @@ import {
   opencodeServerDirs,
   OPENCODE_HG_ENV,
   opencodeServerShell,
+  writeOpencodeShellShim,
   serverEnv,
   unsafeAgents,
   userModelConfig,
@@ -423,7 +425,8 @@ export class OpencodeServer {
     const base = this.#opts.env?.() ?? buildOpencodeEnv();
     const env = {
       ...base,
-      ...serverEnv({ password, dbPath: this.#opts.dbPath, configDir: this.configDir, dataDir: this.dataDir, config, shell: opencodeServerShell(base.PATH), path: base.PATH, hostedModels }),
+      // Its lines run through codeoid's shim: each in its session's OS sandbox (#448), with bash.
+      ...serverEnv({ password, dbPath: this.#opts.dbPath, configDir: this.configDir, dataDir: this.dataDir, config, shell: writeOpencodeShellShim(join(this.dataDir, "bin"), opencodeServerShell(base.PATH), launcherRoot()), path: base.PATH, hostedModels }),
     };
     this.#home = homeOf(env);
     // Requests name their directory; the server's own cwd is only its default.
