@@ -582,12 +582,20 @@ function validWorktree(gitDir: string, common: string, dotgit: string): boolean 
 export const PROJECT_CONFIG_DIRS: readonly string[] = [".claude", ".gemini", ".qwen", ".codex", ".pi", ".opencode"];
 export const PROJECT_CONFIG_FILES: readonly string[] = [".mcp.json", "opencode.json", "opencode.jsonc"];
 
-/** {@link PROJECT_CONFIG_DIRS} and {@link PROJECT_CONFIG_FILES} of `workspace`, the dirs made when missing. */
-export function projectConfigPaths(workspace: string): string[] {
+/**
+ * {@link PROJECT_CONFIG_DIRS} and {@link PROJECT_CONFIG_FILES} of
+ * `workspace`, the dirs made when missing — but only in a project's own
+ * directory: in the home itself (where `~/.claude`, `~/.codex`, … are the
+ * CLIs' own config dirs), a directory holding it, a temp root or `/`, what
+ * is there is held and nothing is made.
+ */
+export function projectConfigPaths(workspace: string, home: string = process.env.HOME ?? homedir()): string[] {
   const out: string[] = [];
+  const ws = realOr(resolve(workspace));
+  const shared = ws === "/" || within(realOr(resolve(home)), ws) || [tmpdir(), "/tmp", "/var/tmp"].some((t) => realOr(resolve(t)) === ws);
   for (const name of PROJECT_CONFIG_DIRS) {
     const at = join(workspace, name);
-    makeIfMissing(at, "dir");
+    if (!shared) makeIfMissing(at, "dir");
     // A link can't be held by a bind (it can be replaced); a dir it leads to outside the workspace is out of reach anyway.
     if (lexists(at) && !isLink(at)) out.push(at);
   }
@@ -650,7 +658,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const home = inputs.hidden?.home ?? env.HOME ?? homedir();
   const workspace = resolve(inputs.workspace);
   const git = inputs.git === false ? { writable: [], readOnly: [], gitDirs: [] } : gitWorkspacePaths(workspace, home);
-  const projectConfig = inputs.projectConfig === false ? [] : projectConfigPaths(workspace);
+  const projectConfig = inputs.projectConfig === false ? [] : projectConfigPaths(workspace, home);
   const cache = inputs.cache === false ? null : sandboxCacheDir(home, env);
   const own = [...(inputs.backendState ?? []).map((p) => resolve(p)), ...git.writable, ...(cache ? [cache] : [])];
   const ownReal = own.map(realOr);

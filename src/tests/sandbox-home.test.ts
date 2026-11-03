@@ -208,6 +208,16 @@ describe("the workspace's git repository", () => {
     expect(buildSandboxSpec({ sessionId: "s", workspace: ws, tempDir: join(root, "tc-t"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home, XDG_CACHE_HOME: xdg }, daemonTmp: "/tmp" } }).env?.XDG_CACHE_HOME).toBe(join(xdg, "codeoid-sandbox"));
   });
 
+  test("in a workspace that is the home itself or holds it, or a temp root, project settings are held where they exist but nothing is made (~/.codex is the CLI's own) (#448 round 2)", () => {
+    const home = join(root, "pcs", "u");
+    mkdirSync(join(home, ".claude"), { recursive: true });
+    for (const ws of [home, join(root, "pcs")]) {
+      const spec = buildSandboxSpec({ sessionId: "s", workspace: ws, tempDir: join(root, "pcs-t"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+      for (const d of [".codex", ".gemini", ".qwen", ".pi", ".opencode"]) expect(existsSync(join(ws, d))).toBe(false);
+      if (ws === home) expect(spec.readOnly).toContain(join(home, ".claude"));
+    }
+  });
+
   test("placeholders are never made through a link", () => {
     const home = join(root, "gp");
     const repo = join(home, "repo");
