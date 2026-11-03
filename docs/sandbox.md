@@ -27,6 +27,8 @@ With the default policy (workspace-write):
 | **Environment** | `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GPG_AGENT_INFO`, `DBUS_SESSION_BUS_ADDRESS`, `DOCKER_HOST`, `CONTAINER_HOST`, `KUBECONFIG` are unset inside. On Claude, every credential-named variable the CLI runs with is denied to its commands. |
 | **Network** | `on` (default), `off`, or `allowlist` (hosts in `sandbox.allowedHosts`), per session and in config. |
 | **Processes** | no new privileges; under bubblewrap a pid namespace (the sandbox sees only its own processes, so not the daemon's or the CLI's environment) and processes die with the session. |
+| **Hidden stays hidden** | every directory between the workspace and a hidden path inside it (a workspace of `~` holding `~/.config/gh`) is read-only, so it can't be renamed to move the hidden path out from under its rule. The daemon's own sandbox dir (each session's temp dir, the launchers) is hidden from every session, a session whose workspace is `/tmp` or `/` included. |
+| **Loop checks** | a loop's acceptance checks judge agent-written code, so they run in the loop's sandbox too (the check's checkout writable, credentials hidden), recorded `isolation: "sandbox"`; one whose sandbox can't run is an `error`, not a pass. |
 
 A command that needs more fails inside the sandbox and the agent sees why
 (`Read-only file system`, `No such file or directory`, a refused connection;
@@ -58,12 +60,15 @@ Per session:
   `session.create`'s `sandbox: { provider?, network?, allowedHosts? }`;
 - later, by the session's owner: `codeoid sandbox set <session> <provider> [--network …]`,
   `/sandbox <auto|off|id> [on|off|allow:host,…]`, or `session.set_sandbox`.
-  Narrowing (on, the network off) applies at once. **Widening — turning it off,
-  a wider network, another provider — is a confirm shown on the session to its
-  owner, in every mode, and audited** (`session.sandbox_widen_ask`, `…_denied`,
-  `session.set_sandbox`); it never lands on an unattended turn. The backend
-  picks the change up when it next starts (at once when idle). Creating a
-  session with `off` needs `session:approve`; a delegated token can't turn it off;
+  Narrowing (on, the network off) is applied without asking. **Widening —
+  turning it off, a wider network, another provider — is a confirm shown on the
+  session to its owner, in every mode, and audited** (`session.sandbox_widen_ask`,
+  `…_denied`, `session.set_sandbox`); it never lands on an unattended turn, and a
+  delegated token can't ask for it. Either reaches the backend when it next
+  starts: an idle one is stopped at once, a busy one after its turn (opencode:
+  its next turn; Claude: its next query). Creating a session with `off`, or a
+  routine whose runs are `off`, needs `session:approve`. A provider named
+  explicitly that can't run here is refused (choose another, or `off`);
 - routines (`codeoid routine add … --sandbox …`, the spec's `sandbox`) and loops
   (`codeoid loop start … --sandbox …`, `loop.start`'s `sandbox`) take one too.
 - A fork, and a collaboration's children, keep their parent's setting.
@@ -111,14 +116,24 @@ What each leaves open:
 
 - **Claude (native)**: its file tools (Read, Edit, Write, Grep, Glob) run in the
   CLI, outside the sandbox — codeoid's gate judges them (credential paths are
-  refused, writes outside the workspace ask in autonomous mode). The CLI's own
-  login and key are not visible to its commands (its credentials file is
-  denied, its key variables are denied to commands, and it has its own pid
-  namespace). Network `on` means hosts the CLI's proxy asks about are allowed
-  by codeoid's gate (`SandboxNetworkAccess`).
+  refused, writes outside the workspace ask in autonomous mode, a write to
+  `.claude/settings*.json` asks in every mode: a hook or an excluded command
+  there would run outside the sandbox). Its commands can't write the project's
+  `.claude/` or the user's Claude config dir at all. The CLI's own login and key
+  are not visible to its commands (its credentials file is denied, its key
+  variables are denied to commands, and it has its own pid namespace). Network
+  `on` means hosts the CLI's proxy asks about are allowed by codeoid's gate
+  (`SandboxNetworkAccess`). Hooks and MCP servers already in the project's
+  settings run in the CLI, outside the sandbox, as they always did (#395
+  approves a project's MCP servers).
 - **Codex (bubblewrap)**: codex's own home (`CODEX_HOME`, with `auth.json`) stays
   readable by its commands — the app-server needs it, and codex's sandbox
-  doesn't hide reads. Everything else is hidden by codeoid's bubblewrap.
+  doesn't hide reads. Everything else is hidden by codeoid's bubblewrap. The
+  network `off` is codex's own sandbox's (codeoid's bubblewrap keeps it on for
+  the app-server): in guarded or interactive mode, a command codex asks to rerun
+  outside its sandbox arrives as an ordinary command approval and, approved,
+  runs with the network inside codeoid's bubblewrap (in autonomous mode codex
+  asks nothing and nothing leaves its sandbox).
 - **Process backends (pi, the Gemini CLI, Qwen; Claude and Codex under Docker)**:
   the backend's own home (its login, settings, sessions) is reachable and
   writable by its commands, the API key in its environment is visible to them
@@ -167,6 +182,14 @@ to the workspace.
   Seatbelt and Docker run an allowlist with the network off.
 - **Seatbelt has no pid namespace**: a sandboxed command can list other
   processes (verify on a Mac whether it can read their environment, below).
+  And its profile allows by default what it doesn't name: the keychain service
+  (`securityd`) stays reachable, so `~/Library/Keychains` being unreadable
+  doesn't stop the Security framework (`git credential-osxkeychain`) from
+  handing out items a prompt-free ACL allows.
+- **A routine's gate check** (`--check`) runs your command as before, outside
+  the sandbox: gates usually need your credentials (`gh run list`). If it runs a
+  script from the workdir, an earlier run's agent may have changed it — keep the
+  gate to commands you trust, or run with `--worktree`.
 - Credentials in **project files** (`.env` in the workspace) are the workspace's:
   add them to `sandbox.hiddenPaths` or keep them out of the workdir.
   Registry tokens in `~/.npmrc`, `~/.gradle/gradle.properties` and
@@ -187,14 +210,19 @@ works, and skip where it doesn't):
   writable; with the network off a server on the host's loopback can't be
   reached (on: it can); a planted listening socket named as a container socket
   can't be connected to, even with the network on; the daemon's processes aren't
-  in the sandbox's `/proc`; closing the handle ends what runs inside.
+  in the sandbox's `/proc`; closing the handle ends what runs inside. With the
+  workspace a fake home: renaming `~/.config` (or `~/.config/gh`) away fails and
+  the planted token stays hidden in the next sandbox; with the workspace `/tmp`,
+  another session's launcher is neither listed nor writable; a loop check
+  reading a planted credential runs sandboxed and gets nothing.
 - `src/tests/sandbox-claude-real.test.ts`: the Agent SDK's real CLI, driven by a
   localhost stand-in for the Messages API (no model): with codeoid's policy a
   planted credential is unreadable, `rm -rf` outside fails, the workspace and
   temp dir are writable, `ANTHROPIC_API_KEY` is empty in the command, network
   off is refused by its proxy, and a `dangerouslyDisableSandbox` retry reaches
   the gate and, denied, never runs. (Manually also: network on reaches a host;
-  the command sees 5 processes and no environment carrying the key.)
+  the command sees 5 processes and no environment carrying the key; a command
+  can't create `.claude/settings.json` in the workspace.)
 - `src/tests/sandbox-codex.test.ts`: the app-server started inside real
   bubblewrap can't read a planted credential and can read its own home; codex's
   own sandbox (0.166) works nested inside codeoid's bubblewrap.
@@ -217,6 +245,9 @@ works, and skip where it doesn't):
 4. Connecting to `/var/run/docker.sock` (Docker Desktop's link included) fails.
 5. Whether a sandboxed command can read another process's environment
    (`ps eww`, `sysctl KERN_PROCARGS2`); if it can, add a `process-info` denial.
+   Likewise whether it can get keychain items (`security find-generic-password`,
+   `git credential-osxkeychain get`); if so, deny the `securityd` mach lookup.
+   And that `mv` of a read-only ancestor (`readOnly`) is refused.
 6. Claude's native Seatbelt sandbox with codeoid's settings (the
    `sandbox-claude-real` probe with Seatbelt).
 7. Codex's app-server, pi, the Gemini CLI and Qwen launched under `sandbox-exec`

@@ -266,7 +266,14 @@ pi, Gemini CLI, Qwen via a launcher, Claude/Codex under Docker), `command`
 (opencode's shell shim), `no-shell` (HTTP backends). session-sandbox.ts:
 `SessionSandbox` (setting over `sandbox.*`, `resolveSandbox` → `SessionInfo.sandbox`
 with `enforced`, lazy 0700 temp dir, handles, launchers) and
-`ProviderSessionInit.sandbox()` hands the `SandboxRuntime` to the backend.
+`ProviderSessionInit.sandbox()` hands the `SandboxRuntime` to the backend
+(`runtimeFor`: the last resolution stands until a changed setting's replaces
+it, never nothing in between). root.ts: one private dir per daemon for temp
+dirs and launchers, hidden from every sandbox. `protectedAncestors`: dirs
+between a writable root and a hidden path in it are read-only (no rename
+bypass). Loop acceptance checks run in the loop's sandbox (`openCheckSandbox`,
+evidence `isolation: "sandbox"`); routine gate checks don't (they need the
+owner's credentials).
 Fallback: `Session#sendInner` refuses an autonomous / unattended / `requireSandbox`
 (routine, loop, dispatch worker) turn while `sandboxRefusalOf` says so;
 set_mode autonomous and loop.start refuse up front; interactive runs, and every

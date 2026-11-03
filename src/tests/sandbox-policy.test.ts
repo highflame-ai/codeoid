@@ -17,6 +17,7 @@ import {
   containerSocketPaths,
   hiddenPathsFor,
   networkPolicyOf,
+  protectedAncestors,
   sandboxConfigOf,
   validAllowedHost,
 } from "../daemon/sandbox/policy.js";
@@ -351,5 +352,27 @@ describe("bwrap probe", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("protected ancestors (#448 review)", () => {
+  test("every dir strictly between a writable root and an existing hidden path in it", () => {
+    const exists = (p: string) => p !== "/home/u/.gone";
+    expect(protectedAncestors(["/home/u/.config/gh", "/home/u/.ssh", "/home/u/.gone", "/srv/other"], ["/home/u"], exists).sort()).toEqual(["/home/u/.config"]);
+    expect(protectedAncestors(["/w/a/b/c/.env"], ["/w"], () => true).sort()).toEqual(["/w/a", "/w/a/b", "/w/a/b/c"]);
+    expect(protectedAncestors(["/w"], ["/w"], () => true)).toEqual([]);
+  });
+
+  test("bwrap: they are read-only mount points, laid between the workspace and the hidden path; the temp dir's own-path bind isn't covered by a hidden dir above it", () => {
+    const fsKinds: Record<string, PathKind> = { "/home/u": "dir", "/home/u/.config": "dir", "/home/u/.config/gh": "dir", "/var/tmp/d": "dir", "/var/tmp/d/codeoid-sandbox-x/tmp-s": "dir" };
+    const m = mounts(
+      bwrapArgs(spec({ workspace: "/home/u", tempDir: "/var/tmp/d/codeoid-sandbox-x/tmp-s", hidden: ["/home/u/.config/gh", "/var/tmp/d"], readOnly: ["/home/u/.config"] }), "", (p) => fsKinds[p] ?? null),
+    );
+    const at = (op: string[]) => m.findIndex((x) => x.join(" ") === op.join(" "));
+    expect(at(["--bind", "/home/u", "/home/u"])).toBeLessThan(at(["--ro-bind", "/home/u/.config", "/home/u/.config"]));
+    expect(at(["--ro-bind", "/home/u/.config", "/home/u/.config"])).toBeLessThan(at(["--tmpfs", "/home/u/.config/gh"]));
+    expect(at(["--tmpfs", "/var/tmp/d"])).toBeLessThan(at(["--bind", "/var/tmp/d/codeoid-sandbox-x/tmp-s", "/var/tmp/d/codeoid-sandbox-x/tmp-s"]));
+    // No cwd: a launcher starts where its caller is.
+    expect(m.some((x) => x[0] === "--chdir")).toBe(false);
   });
 });

@@ -120,6 +120,11 @@ export function dockerRunArgs(spec: SandboxSpec, argv: readonly string[], o: Doc
     const at = realOr(r);
     if (kind(at) && !mounted.some((m) => within(at, m))) bind(at, at, true);
   }
+  // Every dir between a mounted writable root and a hidden path in it: read-only (Docker mounts parents first).
+  for (const p of spec.readOnly ?? []) {
+    const at = realOr(p);
+    if (kind(at) === "dir" && mounted.some((m) => m !== "/tmp" && within(at, m) && at !== m)) bind(at, at, true);
+  }
   // A hidden path inside something mounted is covered again.
   for (const h of [...spec.hidden, ...spec.containerSockets]) {
     const at = realOr(h);

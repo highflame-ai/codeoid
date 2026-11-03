@@ -65,6 +65,11 @@ describe("dockerRunArgs", () => {
     expect(args.join(" ")).not.toContain("docker.sock");
   });
 
+  test("a dir between the workspace and a hidden path in it is mounted read-only", () => {
+    const args = dockerRunArgs(spec({ readOnly: ["/work/repo/config"] }), ["x"], { ...base, kind: (p: string) => (p === "/work/repo/config" ? "dir" : (kinds[p] ?? null)) });
+    expect(flags(args, "-v")).toContain("/work/repo/config:/work/repo/config:ro");
+  });
+
   test("network: on is the bridge, off and an allowlist (Docker can't hold one) are none", () => {
     expect(flags(dockerRunArgs(spec(), ["x"], base), "--network")).toEqual(["bridge"]);
     expect(dockerNetwork("off")).toBe("none");

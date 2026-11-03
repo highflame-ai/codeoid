@@ -492,8 +492,6 @@ export class OpencodeProvider implements SessionProvider {
 
   /** The session's OS sandbox (#448), read each time its shell environment is set. */
   readonly #sandbox: (() => SandboxRuntime | null) | null;
-  /** The launcher made for the sandbox as last resolved (a new resolution makes a new one). */
-  #launcher: { rt: SandboxRuntime; path: string } | null = null;
 
   /**
    * A session's (and its subagents') shell environment: the bare one, and
@@ -504,14 +502,12 @@ export class OpencodeProvider implements SessionProvider {
     return { ...opencodeShellEnv(), [SANDBOX_LAUNCHER_VAR]: this.#launcherPath() };
   }
 
+  /** Written afresh each time (every turn, every subagent): it lays the sandbox over the filesystem as it is now. */
   #launcherPath(): string {
     const rt = this.#sandbox?.() ?? null;
     if (!rt || rt.plan.kind !== "command") return "off";
-    if (this.#launcher?.rt === rt) return this.#launcher.path;
     const handle = rt.openSync([]);
-    const path = rt.launcher(handle, [], [...Object.keys(opencodeShellEnv()), SANDBOX_LAUNCHER_VAR]);
-    this.#launcher = { rt, path };
-    return path;
+    return rt.launcher(handle, [], [...Object.keys(opencodeShellEnv()), SANDBOX_LAUNCHER_VAR], "opencode-shell");
   }
 
   constructor(init: OpencodeProviderInit) {

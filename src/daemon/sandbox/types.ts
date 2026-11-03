@@ -77,6 +77,13 @@ export interface SandboxSpec {
   hidden: readonly string[];
   /** Locations inside a hidden one that stay readable (a backend's own login, when its whole process is inside). */
   reexposed: readonly string[];
+  /**
+   * Directories inside a writable location that must stay read-only: each
+   * one between a writable root and a hidden path inside it. A mount point
+   * (or a denied path) can't be renamed, so `mv ~/.config ~/c` can't move a
+   * hidden `~/.config/gh` out from under the rule that hides it.
+   */
+  readOnly?: readonly string[];
   /** Container runtime sockets (and their dirs): never reachable, they are root-equivalent. */
   containerSockets: readonly string[];
   network: NetworkPolicy;

@@ -20,6 +20,8 @@
  *     its commands.
  */
 
+import { homedir } from "node:os";
+import { join } from "node:path";
 import type { SandboxSettings } from "@anthropic-ai/claude-agent-sdk";
 import type { SandboxRuntime } from "./session-sandbox.js";
 
@@ -49,6 +51,10 @@ export function claudeSandboxSettings(rt: Pick<SandboxRuntime, "spec" | "config"
     allowUnsandboxedCommands: true,
     filesystem: {
       allowWrite: [spec.workspace, spec.tempDir, ...spec.writable],
+      // The CLI's own settings: a hook or an excluded command written there
+      // would run outside the sandbox from the CLI's next start. And every dir
+      // between the workspace and a hidden path in it (nothing renames it away).
+      denyWrite: [...new Set([...claudeSettingsPaths(spec.workspace, env), ...(spec.readOnly ?? [])])],
       denyRead: [...new Set([...spec.hidden, ...spec.containerSockets])],
     },
     network,
@@ -60,4 +66,15 @@ export function claudeSandboxSettings(rt: Pick<SandboxRuntime, "spec" | "config"
 /** Whether a tool call asks to run outside the sandbox (Claude's Bash `dangerouslyDisableSandbox`). */
 export function asksUnsandboxed(input: unknown): boolean {
   return !!input && typeof input === "object" && (input as Record<string, unknown>).dangerouslyDisableSandbox === true;
+}
+
+/**
+ * Where the Claude CLI reads settings that can run code or loosen its
+ * sandbox (hooks, `sandbox.excludedCommands`, permissions): the project's
+ * `.claude` dir in the workspace, and the user's config dir. A command must
+ * not write them; the CLI itself still can (it runs outside its sandbox).
+ */
+export function claudeSettingsPaths(workspace: string, env: Record<string, string | undefined>): string[] {
+  const home = env.HOME || homedir();
+  return [join(workspace, ".claude"), env.CLAUDE_CONFIG_DIR || join(home, ".claude")];
 }

@@ -87,7 +87,7 @@ export function seatbeltProfile(
   };
 
   const writable = [...new Set([spec.workspace, spec.tempDir, ...spec.writable].map(real))];
-  type Rule = { path: string; kind: "hide" | "write" | "read" };
+  type Rule = { path: string; kind: "hide" | "write" | "read" | "read-only" };
   const rules: Rule[] = [];
   const seen = new Set<string>();
   for (const p of [...spec.hidden, ...spec.containerSockets].map(real)) {
@@ -100,6 +100,8 @@ export function seatbeltProfile(
   for (const p of spec.reexposed.map(real)) {
     if (hidden.some((h) => within(p, h) && h !== p)) rules.push({ path: p, kind: "read" });
   }
+  // Every dir between a writable root and a hidden path in it: no writes (so no rename of it either).
+  for (const p of (spec.readOnly ?? []).map(real)) rules.push({ path: p, kind: "read-only" });
   const rank = (r: Rule) => (r.kind === "hide" ? 0 : 1);
   rules.sort((a, b) => depth(a.path) - depth(b.path) || rank(a) - rank(b));
 
@@ -113,6 +115,7 @@ export function seatbeltProfile(
   for (const r of rules) {
     if (r.kind === "hide") lines.push(`(deny file-read* file-write* ${filter(r.path)})`);
     else if (r.kind === "write") lines.push(`(allow file-read* file-write* ${filter(r.path)})`);
+    else if (r.kind === "read-only") lines.push(`(deny file-write* ${filter(r.path)})`);
     else lines.push(`(allow file-read* ${filter(r.path)})`);
   }
   // Container runtimes: nothing connects to their sockets.

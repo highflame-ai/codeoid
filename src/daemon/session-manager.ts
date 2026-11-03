@@ -137,7 +137,7 @@ import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
-import { resolveSandbox, sandboxRefusalOf, sandboxSettingProblem } from "./sandbox/session-sandbox.js";
+import { openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem } from "./sandbox/session-sandbox.js";
 import { sandboxConfigOf } from "./sandbox/policy.js";
 import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
@@ -4329,7 +4329,7 @@ mcpHub: this.#mcpHub,
       if (!this.#sandboxRegistry) {
         return { type: "response.error", requestId: msg.id, error: "This daemon has no OS sandbox", code: "invalid_request" };
       }
-      const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry);
+      const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry) ?? (await this.#sandboxUnavailable(msg.sandbox));
       if (problem) return { type: "response.error", requestId: msg.id, error: problem, code: "invalid_request" };
       if (msg.sandbox.provider === "off" && !hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)) {
         return { type: "response.error", requestId: msg.id, error: "Missing scope: session:approve (needed to create a session with its sandbox off)", code: "forbidden" };
@@ -6231,11 +6231,13 @@ mcpHub: this.#mcpHub,
       }
     }
     /** Autonomy, a host command, or a loop (whose worker is autonomous) needs the approval scope as well. */
-    const needsApprove = (spec: { approvals?: string | null; check?: unknown; loop?: unknown } | undefined, current?: RoutineRow): boolean => {
+    const needsApprove = (spec: { approvals?: string | null; check?: unknown; loop?: unknown; sandbox?: unknown } | undefined, current?: RoutineRow): boolean => {
       const approvals = spec?.approvals !== undefined ? spec.approvals : current?.spec.approvals;
       const check = spec && "check" in spec ? spec.check : current?.spec.check;
       const loop = spec && "loop" in spec ? spec.loop : current?.spec.loop;
-      return (approvals ?? "autonomous") === "autonomous" || !!check || !!loop;
+      // Its runs' commands unsandboxed (#448): as `off` at session create.
+      const sandbox = (spec && "sandbox" in spec ? spec.sandbox : current?.spec.sandbox) as { provider?: string } | null | undefined;
+      return (approvals ?? "autonomous") === "autonomous" || !!check || !!loop || sandbox?.provider === "off";
     };
     // A routine is its owner's alone: its runs act as them, so nobody else in
     // the tenant may read, steer, fire, or delete it. Others get "not found".
@@ -6646,6 +6648,12 @@ mcpHub: this.#mcpHub,
       projectId: run.projectId,
     });
     return buildLoopHost({
+      ...(this.#sandboxRegistry
+        ? {
+            checkSandbox: (run: LoopRunRow, dir: string) =>
+              openCheckSandbox({ registry: this.#sandboxRegistry as SandboxRegistry, config: this.#config, setting: run.contract.worker.sandbox, workspace: dir, label: run.id }),
+          }
+        : {}),
       normalizeWorkdir: (p) => normalizeWorkdir(p),
       hasProvider: (id) => this.#providers.has(id),
       dispatcher: this.#dispatcher,
@@ -6937,7 +6945,11 @@ mcpHub: this.#mcpHub,
       audit: (subject, action, sessionId, detail) => this.#store.audit(subject, action, sessionId, detail),
       hasProvider: (id) => this.#providers.has(id),
       providerIds: () => this.#providers.ids(),
-      ...(this.#sandboxRegistry ? { sandboxProblem: (s: SessionSandboxSetting) => sandboxSettingProblem(s, this.#sandboxRegistry as SandboxRegistry) } : {}),
+      ...(this.#sandboxRegistry
+        ? {
+            sandboxProblem: (s: SessionSandboxSetting) => sandboxSettingProblem(s, this.#sandboxRegistry as SandboxRegistry),
+          }
+        : {}),
       normalizeWorkdir: (p) => normalizeWorkdir(p),
       ...(this.#loops ? { loops: this.#makeRoutineLoopPort(this.#loops) } : {}),
     };
@@ -8943,6 +8955,18 @@ mcpHub: this.#mcpHub,
   }
 
   /**
+   * Why a setting naming a provider explicitly can't be used: it can't run
+   * here (#448). Naming one is a choice of sandbox; one that can't run is no
+   * sandbox at all, which takes `off`'s route. `auto` and `off` pass.
+   */
+  async #sandboxUnavailable(setting: SessionSandboxSetting): Promise<string | null> {
+    const id = setting.provider;
+    if (!id || id === "auto" || id === "off" || !this.#sandboxRegistry) return null;
+    const probe = await this.#sandboxRegistry.probe(id);
+    return probe.available ? null : `the ${id} sandbox can't run here: ${probe.reason} (choose another, or off)`;
+  }
+
+  /**
    * `session.set_sandbox` (#448): owner only, with session:approve. A
    * widening change is asked of the owner on the session and lands on a yes.
    */
@@ -8956,9 +8980,12 @@ mcpHub: this.#mcpHub,
     if (session.createdBy !== auth.sub) {
       return { type: "response.error", requestId: msg.id, error: "Only the session's owner can change its sandbox", code: "forbidden" };
     }
-    if (auth.delegationDepth > 0 && msg.sandbox.provider === "off") {
-      return { type: "response.error", requestId: msg.id, error: "A delegated token cannot turn a session's sandbox off", code: "forbidden" };
+    // Widening is the owner's own decision, never a delegated token's (it could answer its own confirm).
+    if (auth.delegationDepth > 0 && session.widensSandbox(msg.sandbox)) {
+      return { type: "response.error", requestId: msg.id, error: "A delegated token cannot turn a session's sandbox off or widen it", code: "forbidden" };
     }
+    const unavailable = this.#sandboxRegistry ? await this.#sandboxUnavailable(msg.sandbox) : null;
+    if (unavailable) return { type: "response.error", requestId: msg.id, error: unavailable, code: "invalid_request" };
     const result = await session.setSandbox(msg.sandbox, auth);
     if (!result.ok) return { type: "response.error", requestId: msg.id, error: result.error, code: "invalid_request" };
     return { type: "response.ok", requestId: msg.id, data: { ...(result.pending ? { pending: true } : {}), sandbox: session.sandboxInfo } };

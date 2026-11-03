@@ -6,6 +6,7 @@
  * supplies them; everything loop-specific about using them lives here.
  */
 
+import type { CheckSandbox } from "../sandbox/session-sandbox.js";
 import { randomUUID } from "node:crypto";
 import { closeSync, constants as fsConstants, copyFileSync, createReadStream, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -306,6 +307,12 @@ async function refuseIncompleteClone(repo: string, commonDir: string): Promise<v
 }
 
 export interface LoopHostDeps {
+  /**
+   * The OS sandbox a run's checks run in (#448): its worker's setting, the
+   * check's checkout as the workspace. A check judges agent-written code, so
+   * it runs where that code can't reach credentials. Absent: as is.
+   */
+  checkSandbox?(run: LoopRunRow, dir: string): Promise<CheckSandbox>;
   normalizeWorkdir(path: string): string | null;
   hasProvider(id: string): boolean;
   dispatcher: Dispatcher;
@@ -830,6 +837,7 @@ export function buildLoopHost(d: LoopHostDeps): LoopHost {
       const mine = realpathSync(scratch().mine);
       const top = relative(mine, realpathSync(dir)).split("/")[0];
       const root = top && !top.startsWith("..") ? join(mine, top) : dir;
+      const sandbox: CheckSandbox = d.checkSandbox ? await d.checkSandbox(run, dir).catch((err: unknown) => ({ kind: "refused" as const, reason: err instanceof Error ? err.message : String(err) })) : { kind: "off" };
       try {
         return await d.evidence.run({ ...spec, env: { ...(spec.env ?? {}), CODEOID_LOOP_CHECK: marker } }, dir, {
           tenant: { accountId: run.accountId, projectId: run.projectId },
@@ -837,8 +845,10 @@ export function buildLoopHost(d: LoopHostDeps): LoopHost {
           ownerId: run.id,
           candidateDigest: tree,
           signal,
+          ...(sandbox.kind === "on" ? { sandbox: { wrap: sandbox.wrap } } : sandbox.kind === "refused" ? { sandbox: { refused: sandbox.reason } } : {}),
         });
       } finally {
+        if (sandbox.kind === "on") await sandbox.close().catch(() => {});
         killMarked("CODEOID_LOOP_CHECK", marker, root, since);
       }
     },

@@ -21,6 +21,7 @@ import type { CodeoidConfig } from "../../config.js";
 import { getConfigDir } from "../../config.js";
 import { daemonOwnedDirs } from "../data-lock.js";
 import { cliCredentialFiles, registeredSecretLocations } from "../secret-paths.js";
+import { sandboxRootIfMade } from "./root.js";
 import type { NetworkMode, NetworkPolicy, SandboxSpec } from "./types.js";
 
 /** `sandbox.*` in the config (config.ts `SandboxSchema`). */
@@ -226,21 +227,51 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     }
   });
   const workspace = resolve(inputs.workspace);
-  const hidden = hiddenPathsFor(inputs.config, inputs.hidden).filter(
+  const root = sandboxRootIfMade();
+  const hidden = [...hiddenPathsFor(inputs.config, inputs.hidden), ...(root ? [root] : [])].filter(
     // The backend's own state stays reachable by it; nothing it holds is taken out otherwise.
     (h) => ![...own, ...ownReal].some((o) => within(h, o)),
   );
+  const tempDir = resolve(inputs.tempDir);
   return {
     sessionId: inputs.sessionId,
     workspace,
-    tempDir: resolve(inputs.tempDir),
+    tempDir,
     writable: own,
     hidden,
+    readOnly: protectedAncestors(hidden, [workspace, tempDir, ...own]),
     reexposed: (inputs.backendReadable ?? []).map((p) => resolve(p)),
     containerSockets: containerSocketPaths(home, env),
     network: inputs.network,
     unsetEnv: SANDBOX_UNSET_ENV,
   };
+}
+
+function realOr(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+/**
+ * The directories strictly between a writable root and a hidden path that
+ * exists inside it: kept read-only, so none can be renamed to carry the
+ * hidden path out from under its rule. Real paths.
+ */
+export function protectedAncestors(hidden: readonly string[], writableRoots: readonly string[], exists: (p: string) => boolean = existsSync): string[] {
+  const roots = writableRoots.map(realOr);
+  const out = new Set<string>();
+  for (const h of hidden) {
+    const at = realOr(h);
+    if (!exists(at)) continue;
+    for (const w of roots) {
+      if (at === w || !within(at, w)) continue;
+      for (let a = dirname(at); a !== w && within(a, w); a = dirname(a)) out.add(a);
+    }
+  }
+  return [...out];
 }
 
 /** The network policy a session asks for: its own, else the config's. */

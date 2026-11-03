@@ -56,6 +56,12 @@ describe("seatbeltProfile", () => {
     expect(at('(allow file-read* file-write* (subpath "/Users/u/.codeoid/worktree"))')).toBeLessThan(at('"/Users/u/.codeoid/worktree/.ssh"'));
   });
 
+  test("a dir between the workspace and a hidden path in it can't be written (so not renamed)", () => {
+    const { text } = readable(spec({ workspace: "/Users/u", hidden: ["/Users/u/.codeoid/worktree"], readOnly: ["/Users/u/.codeoid"] }));
+    const at = (n: string) => text.indexOf(n);
+    expect(at('(deny file-write* (subpath "/Users/u/.codeoid"))')).toBeGreaterThan(at('(allow file-read* file-write* (subpath "/Users/u"))'));
+  });
+
   test("network: on adds nothing; off and an allowlist (Seatbelt can't hold one by host) deny it all", () => {
     expect(readable(spec()).text).not.toContain("(deny network*)");
     expect(readable(spec({ network: { mode: "off" } })).text).toContain("(deny network*)");

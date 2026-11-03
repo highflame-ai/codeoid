@@ -102,6 +102,22 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
     seen.add(`w:${at}`);
     mounts.push({ kind: "bind", src: at, path: at });
   }
+  // The session's temp dir at its own path too, when that is outside the
+  // host's /tmp: a program that finds where its /tmp really is (codex's own
+  // sandbox does) can write there. In the sorted list, so a hidden dir above
+  // it (the daemon's temp dir) doesn't cover it.
+  const temp = realOr(spec.tempDir);
+  if (!within(temp, "/tmp") && kind(temp) && !seen.has(`w:${temp}`)) {
+    seen.add(`w:${temp}`);
+    mounts.push({ kind: "bind", src: temp, path: temp });
+  }
+  // Every dir between a writable root and a hidden path in it: read-only, a mount point nothing can rename.
+  for (const p of spec.readOnly ?? []) {
+    const at = realOr(p);
+    if (kind(at) !== "dir" || seen.has(`o:${at}`)) continue;
+    seen.add(`o:${at}`);
+    mounts.push({ kind: "ro-bind", path: at });
+  }
   for (const p of spec.reexposed) {
     const at = realOr(p);
     // Only what a hidden directory, or the sandbox's own /tmp, covers needs showing again.
@@ -115,11 +131,7 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   mounts.sort((a, b) => depth(a.path) - depth(b.path) || rank(a) - rank(b));
 
   // The private /tmp first: a workspace below the host's /tmp is bound into it.
-  const temp = realOr(spec.tempDir);
   args.push("--bind", temp, "/tmp");
-  // Also at its own path when that is outside the host's /tmp: a program that
-  // finds where its /tmp really is (codex's own sandbox does) can write there too.
-  if (!within(temp, "/tmp")) args.push("--bind", temp, temp);
   for (const m of mounts) {
     if (m.kind === "hide-dir") args.push("--tmpfs", m.path);
     else if (m.kind === "hide-file") args.push("--ro-bind", "/dev/null", m.path);

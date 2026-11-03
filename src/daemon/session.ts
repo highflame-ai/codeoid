@@ -207,7 +207,7 @@ import { isShellTool, runsNoCommand, shellCallOf, shellCommandOf } from "./shell
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import { asksOutsideSandbox } from "./sandbox/confinement.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
-import { SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -1825,8 +1825,8 @@ export class Session {
       isFork: () => this.#forkIsolation !== null,
       isOwnTask: (taskId) => this.#isOwnTask(taskId),
       onForeignAgentDenied: (agentId, toolName) => this.#noteForeignAgentRefused(agentId, toolName),
-      // Read each time the backend starts, and only when resolved for THIS backend.
-      sandbox: () => (this.#sandbox?.resolvedFor(factory.id) ? this.#sandbox.runtime : null),
+      // Read each time the backend starts, and only what was resolved for THIS backend.
+      sandbox: () => this.#sandbox?.runtimeFor(factory.id) ?? null,
       ...(this.#extraEnv ? { extraEnv: this.#extraEnv } : {}),
     });
   }
@@ -2081,6 +2081,9 @@ export class Session {
     const o = input as Record<string, unknown>;
     const target = typeof o.file_path === "string" ? o.file_path : typeof o.notebook_path === "string" ? o.notebook_path : null;
     if (!target || !/(^|[\\/])\.claude[\\/]settings(\.local)?\.json$/i.test(target)) return false;
+    // Under Claude's own OS sandbox (#448) a hook or an excluded command
+    // written there would run outside it from the CLI's next start.
+    if (this.#sandbox?.runtime?.plan.kind === "native") return true;
     try {
       return this.#claudeAccounts?.resolve(this.#accountChoices.claude ?? null) != null;
     } catch {
@@ -3038,11 +3041,13 @@ export class Session {
     // Widening: the owner answers on the session, whatever the mode. Never
     // answered by an unattended turn (requestUserInput cancels it there).
     this.#store.audit(sender.sub, "session.sandbox_widen_ask", this.id, change);
-    const title = after.choice === "off" ? `Turn the sandbox off for "${this.name}"?` : `Widen the sandbox for "${this.name}"?`;
-    const message =
-      after.choice === "off"
-        ? "The agent's commands would run with your full rights: they could read your credentials and change any file you can."
-        : `Commands would run with: ${describe(after)} (now: ${describe(before)}).`;
+    // What it would really be here: a provider that can't run is no sandbox at all.
+    const resolvedAfter = await resolveSandbox({ registry: sbx.registry, config: sbx.config, setting: next, backendId: this.#provider.id }).catch(() => null);
+    const unsandboxed = after.choice === "off" || (resolvedAfter !== null && resolvedAfter.info.state !== "on" && resolvedAfter.info.state !== "no-shell");
+    const title = unsandboxed ? `Turn the sandbox off for "${this.name}"?` : `Widen the sandbox for "${this.name}"?`;
+    const message = unsandboxed
+      ? `The agent's commands would run with your full rights${after.choice === "off" ? "" : ` (${resolvedAfter?.info.reason ?? "the sandbox can't run here"})`}: they could read your credentials and change any file you can.`
+      : `Commands would run with: ${describe(after)} (now: ${describe(before)}).`;
     void this.requestUserInput({ method: "confirm", title, message }).then(
       async (answer) => {
         if (answer.cancelled || answer.confirmed !== true) {
@@ -3058,9 +3063,21 @@ export class Session {
     return { ok: true, pending: {} };
   }
 
-  /** A call that asks to run outside the sandbox or widen it (asksOutsideSandbox), on a session whose sandbox is on. */
+  /**
+   * A call that asks to run outside the backend's own sandbox or widen it
+   * (asksOutsideSandbox), on a session whose sandbox is the backend's own
+   * (native). Where codeoid's sandbox is around the whole process (Docker,
+   * Seatbelt for Codex) such a flag leaves nothing: the call stays inside.
+   */
   #unsandboxedRequest(toolName: string, input: unknown): boolean {
-    return this.#sandbox?.info?.state === "on" && asksOutsideSandbox(toolName, input);
+    return this.#sandbox?.info?.state === "on" && this.#sandbox.runtime?.plan.kind === "native" && asksOutsideSandbox(toolName, input);
+  }
+
+  /** Whether `setting` would widen this session's sandbox (turn it off, a wider network, another provider): asked of its owner. */
+  widensSandbox(setting: SessionSandboxSetting): boolean {
+    const sbx = this.#sandbox;
+    if (!sbx) return false;
+    return widens(sbx.effective(), sbx.effective({ ...(sbx.setting ?? {}), ...setting }));
   }
 
   /** What an approval card says of the sandbox (#448): whether the call runs inside, and why not. */

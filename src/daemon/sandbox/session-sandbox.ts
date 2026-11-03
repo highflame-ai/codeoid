@@ -13,8 +13,7 @@
  * starts on it.
  */
 
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
 import type { CodeoidConfig } from "../../config.js";
@@ -22,6 +21,7 @@ import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinem
 import { CWD_FROM_CALLER } from "./docker.js";
 import { buildSandboxSpec, networkPolicyOf, type SandboxConfig, sandboxConfigOf, validAllowedHost } from "./policy.js";
 import type { SandboxRegistry } from "./registry.js";
+import { launcherRoot, sandboxRoot } from "./root.js";
 import { type NetworkMode, type NetworkPolicy, SANDBOX_AUTO, SANDBOX_OFF, type SandboxHandle, type SandboxProvider, type SandboxSpec } from "./types.js";
 
 /** A session's sandbox can't satisfy what an unattended or autonomous run needs. */
@@ -78,9 +78,11 @@ export interface SandboxRuntime {
    * shell). Written to a daemon-private dir outside anything the sandbox can
    * write; removed with the session. `envNames`: the variables its caller
    * passes that must reach the program (a provider that copies them by name,
-   * Docker's `-e NAME`).
+   * Docker's `-e NAME`). `name`: rewrite that launcher in place (atomically)
+   * rather than add one — a caller that refreshes it as the filesystem
+   * changes (a hidden path that appeared or went).
    */
-  launcher(handle: SandboxHandle, argv: readonly string[], envNames?: readonly string[]): string;
+  launcher(handle: SandboxHandle, argv: readonly string[], envNames?: readonly string[], name?: string): string;
 }
 
 /** The setting a session ends up with: its own fields over the config's. */
@@ -201,6 +203,8 @@ export class SessionSandbox {
   #tempDir: string | null = null;
   #handles = new Set<SandboxHandle>();
   #resolvedFor: string | null = null;
+  /** The setting changed since the last resolution (which still stands until the next one replaces it). */
+  #stale = false;
   #closed = false;
   #launcherDir: string | null = null;
   #launchers = 0;
@@ -244,13 +248,23 @@ export class SessionSandbox {
 
   /** Whether the last resolution was for `backendId` with the current setting. */
   resolvedFor(backendId: string): boolean {
-    return this.#resolvedFor === backendId;
+    return this.#resolvedFor === backendId && !this.#stale;
   }
 
-  /** Change the setting; the next {@link refresh} resolves it. Handles opened under the old one are closed. */
+  /**
+   * The runtime for `backendId`: the last resolution's, kept while a changed
+   * setting is being resolved (never nothing in between: that would read as
+   * "off" to a backend starting meanwhile). Null when that resolution was for
+   * another backend, or isn't on.
+   */
+  runtimeFor(backendId: string): SandboxRuntime | null {
+    return this.#resolvedFor === backendId ? this.#runtime : null;
+  }
+
+  /** Change the setting; the next {@link refresh} resolves it and replaces the runtime. Handles opened under the old one are closed. */
   async set(setting: SessionSandboxSetting | undefined): Promise<void> {
     this.#setting = setting && Object.keys(setting).length > 0 ? { ...setting } : undefined;
-    this.#resolvedFor = null;
+    this.#stale = true;
     await this.#closeHandles();
   }
 
@@ -263,6 +277,7 @@ export class SessionSandbox {
     }
     this.#info = r.info;
     this.#resolvedFor = backendId;
+    this.#stale = false;
     if (r.info.state !== "on" || !r.provider || !r.plan) {
       this.#runtime = null;
       return r.info;
@@ -290,12 +305,12 @@ export class SessionSandbox {
         if (!provider.openSync) throw new Error(`${provider.displayName} can't be opened synchronously`);
         return this.#track(provider.openSync(open(backendState, o)));
       },
-      launcher: (handle, argv, envNames) => this.#writeLauncher(handle, argv, envNames ?? []),
+      launcher: (handle, argv, envNames, name) => this.#writeLauncher(handle, argv, envNames ?? [], name),
     };
     return r.info;
   }
 
-  #writeLauncher(handle: SandboxHandle, argv: readonly string[], envNames: readonly string[]): string {
+  #writeLauncher(handle: SandboxHandle, argv: readonly string[], envNames: readonly string[], name?: string): string {
     if (!handle.wrap) throw new Error(`${handle.providerId} can't start a local program inside`);
     if (!this.#launcherDir) {
       const safe = this.#sessionId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "session";
@@ -303,8 +318,11 @@ export class SessionSandbox {
     }
     // Started from wherever its caller is: the cwd is the caller's, not fixed here.
     const wrapped = handle.wrap(argv, { cwd: "", env: Object.fromEntries(envNames.map((n) => [n, ""])) });
-    const path = join(this.#launcherDir, `launch-${++this.#launchers}`);
-    writeFileSync(path, launcherScript(wrapped.argv), { mode: 0o700 });
+    const path = join(this.#launcherDir, `launch-${name ? name.replace(/[^A-Za-z0-9_-]/g, "") : ++this.#launchers}`);
+    // Written beside it and renamed over it: a caller running it meanwhile gets the old one or the new one, whole.
+    const part = `${path}.${++this.#launchers}.part`;
+    writeFileSync(part, launcherScript(wrapped.argv), { mode: 0o700 });
+    renameSync(part, path);
     return path;
   }
 
@@ -329,7 +347,7 @@ export class SessionSandbox {
   #ensureTempDir(): string {
     if (!this.#tempDir) {
       const safe = this.#sessionId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "session";
-      this.#tempDir = mkdtempSync(join(tmpdir(), `codeoid-sandbox-${safe}-`));
+      this.#tempDir = mkdtempSync(join(sandboxRoot(), `tmp-${safe}-`));
     }
     return this.#tempDir;
   }
@@ -371,7 +389,61 @@ export function launcherScript(argv: readonly string[]): string {
   return `#!/bin/sh\n# Written by codeoid (#448): starts a backend inside its session's sandbox.\nexec ${words.join(" ")} "$@"\n`;
 }
 
-/** Where every session's launchers live: `<this prefix><session>-<random>/launch-<n>` (the opencode shell shim checks it). */
-export function launcherRoot(): string {
-  return join(tmpdir(), "codeoid-launch-");
+export { launcherRoot } from "./root.js";
+
+/** How a check runs (#448): inside a sandbox, refused (the one asked for can't run), or as is (off / no sandboxing). */
+export type CheckSandbox =
+  | { kind: "on"; wrap: NonNullable<SandboxHandle["wrap"]>; close(): Promise<void> }
+  | { kind: "refused"; reason: string }
+  | { kind: "off" };
+
+/**
+ * A sandbox for a daemon-run check over agent-written code (a loop's
+ * acceptance checks, a routine's gate): the same setting a session would
+ * resolve, the check's directory as the workspace, a fresh private temp dir.
+ * Off (by setting) runs as is; one that can't run here, or can't hold its
+ * network, is refused (the check doesn't run).
+ */
+export async function openCheckSandbox(opts: {
+  registry: SandboxRegistry;
+  config: CodeoidConfig | undefined;
+  setting: SessionSandboxSetting | undefined;
+  workspace: string;
+  label: string;
+}): Promise<CheckSandbox> {
+  const cfg = sandboxConfigOf(opts.config);
+  const { choice, network } = effectiveSetting(cfg, opts.setting);
+  if (choice === SANDBOX_OFF) return { kind: "off" };
+  const resolved = await opts.registry.resolve(choice);
+  if (resolved.kind === "off") return { kind: "off" };
+  if (resolved.kind === "unknown") return { kind: "refused", reason: resolved.reason };
+  if (!resolved.probe.available) return { kind: "refused", reason: resolved.probe.reason };
+  const provider = resolved.provider;
+  if (!provider.capabilities.commands || !provider.capabilities.wrapsArgv) {
+    return { kind: "refused", reason: `${provider.displayName} can't run a local command` };
+  }
+  const mode: NetworkMode = provider.capabilities.network.includes(network.mode) ? network.mode : "off";
+  const safe = opts.label.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "check";
+  const tempDir = mkdtempSync(join(sandboxRoot(), `check-${safe}-`));
+  const spec = buildSandboxSpec({
+    sessionId: `check-${safe}`,
+    workspace: opts.workspace,
+    tempDir,
+    network: mode === "allowlist" ? network : { mode },
+    ...(opts.config ? { config: opts.config } : {}),
+  });
+  const handle = await provider.open(spec);
+  if (!handle.wrap) {
+    await handle.close();
+    rmSync(tempDir, { recursive: true, force: true });
+    return { kind: "refused", reason: `${provider.displayName} can't run a local command` };
+  }
+  return {
+    kind: "on",
+    wrap: handle.wrap.bind(handle),
+    close: async () => {
+      await handle.close();
+      rmSync(tempDir, { recursive: true, force: true });
+    },
+  };
 }

@@ -151,6 +151,24 @@ describe("SessionManager and the OS sandbox", () => {
     expect(await m.handle({ type: "session.set_sandbox", id: "x", sessionId: id, sandbox: { provider: "nope" } }, AUTH, CLIENT)).toMatchObject({ code: "invalid_request" });
   });
 
+  it("a provider named explicitly that can't run here is refused (it would be no sandbox at all); auto still runs, and says so", async () => {
+    const m = newManager();
+    const r = await create(m, { sandbox: { provider: "docker" } });
+    expect(r).toMatchObject({ type: "response.error", code: "invalid_request" });
+    expect((r as { error: string }).error).toContain("the docker sandbox can't run here: the Docker daemon isn't reachable");
+    const id = infoOf(await create(m))?.id as string;
+    expect(await m.handle({ type: "session.set_sandbox", id: "x", sessionId: id, sandbox: { provider: "docker" } }, AUTH, CLIENT)).toMatchObject({ code: "invalid_request" });
+  });
+
+  it("a delegated token can't widen a session's sandbox (it could answer its own confirm); it can narrow it", async () => {
+    const m = newManager();
+    const id = infoOf(await create(m))?.id as string;
+    const delegated: AuthContext = { ...AUTH, delegationDepth: 1, delegatedBy: AUTH.sub } as AuthContext;
+    expect(await m.handle({ type: "session.set_sandbox", id: "x", sessionId: id, sandbox: { network: "off" } }, delegated, { ...CLIENT, auth: delegated })).toMatchObject({ type: "response.ok" });
+    const wider = await m.handle({ type: "session.set_sandbox", id: "x", sessionId: id, sandbox: { network: "on" } }, delegated, { ...CLIENT, auth: delegated });
+    expect(wider).toMatchObject({ type: "response.error", code: "forbidden" });
+  });
+
   it("sandbox.providers: each provider, whether it runs here and why not, and the default", async () => {
     const m = newManager();
     const r = (await m.handle({ type: "sandbox.providers", id: "p" }, AUTH, CLIENT)) as { data: Record<string, unknown> };

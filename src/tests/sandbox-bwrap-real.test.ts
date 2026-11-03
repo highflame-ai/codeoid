@@ -17,8 +17,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { createServer, type Server } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { runCheck } from "../daemon/evidence/runner.js";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
 import { buildSandboxSpec } from "../daemon/sandbox/policy.js";
+import { SandboxRegistry } from "../daemon/sandbox/registry.js";
+import { sandboxRoot } from "../daemon/sandbox/root.js";
+import { openCheckSandbox } from "../daemon/sandbox/session-sandbox.js";
 import type { SandboxHandle, SandboxSpec } from "../daemon/sandbox/types.js";
 
 const provider = new BwrapSandboxProvider();
@@ -243,5 +247,95 @@ describe.skipIf(!probe.available)("bubblewrap, for real", () => {
     await h.close();
     await exited;
     expect(child.exitCode !== null || child.signalCode !== null).toBe(true);
+  });
+});
+
+describe.skipIf(!probe.available)("bubblewrap, for real: what the review found (#448)", () => {
+  let root: string;
+  beforeAll(() => {
+    root = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-review-")));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  test("a hidden path inside the workspace can't be carried out by renaming its parent", async () => {
+    // The workspace is a fake home: ~/.config/gh/hosts.yml is hidden in it.
+    const home = join(root, "home");
+    mkdirSync(join(home, ".config", "gh"), { recursive: true });
+    mkdirSync(join(home, ".config", "other"), { recursive: true });
+    writeFileSync(join(home, ".config", "gh", "hosts.yml"), "PLANTED-GH-TOKEN\n");
+    const tmp = join(root, "tmp-a");
+    mkdirSync(tmp);
+    const spec = buildSandboxSpec({
+      sessionId: "rename",
+      workspace: home,
+      tempDir: tmp,
+      network: { mode: "off" },
+      hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" },
+    });
+    expect(spec.readOnly).toContain(join(home, ".config"));
+    const sh = (h: SandboxHandle, script: string) => h.exec(["/bin/sh", "-c", script], { cwd: home, env: { PATH: "/usr/bin:/bin" }, timeoutMs: 20_000 });
+    const first = await provider.open(spec);
+    try {
+      const r = await sh(first, `mv ${join(home, ".config")} ${join(home, "c")}; echo "mv=$?"; mv ${join(home, ".config", "gh")} ${join(home, "g")}; echo "mv2=$?"; echo x > ${join(home, "made")} && echo HOME-WRITABLE`);
+      expect(r.stdout).toContain("mv=1");
+      expect(r.stdout).toContain("mv2=1");
+      expect(r.stdout).toContain("HOME-WRITABLE");
+    } finally {
+      await first.close();
+    }
+    // Still where it was, so the next sandbox hides it again.
+    expect(existsSync(join(home, ".config", "gh", "hosts.yml"))).toBe(true);
+    const second = await provider.open(spec);
+    try {
+      const r = await sh(second, `cat ${join(home, ".config", "gh", "hosts.yml")} ${join(home, "c", "gh", "hosts.yml")} 2>&1; echo done`);
+      expect(r.stdout).not.toContain("PLANTED-GH-TOKEN");
+    } finally {
+      await second.close();
+    }
+  });
+
+  test("a workspace that holds the daemon's sandbox root (a session in /tmp) can't reach other sessions' launchers or temp dirs", async () => {
+    const sandboxes = sandboxRoot();
+    const other = mkdtempSync(join(sandboxes, "launch-other-"));
+    writeFileSync(join(other, "launch-1"), "#!/bin/sh\necho ORIGINAL\n", { mode: 0o700 });
+    const ws = realpathSync(tmpdir());
+    const mine = mkdtempSync(join(sandboxes, "tmp-mine-"));
+    const spec = buildSandboxSpec({ sessionId: "in-tmp", workspace: ws, tempDir: mine, network: { mode: "off" }, hidden: { home: join(root, "nohome"), configDir: join(root, "nocfg"), env: {}, daemonTmp: ws } });
+    const h = await provider.open(spec);
+    try {
+      const r = await h.exec(["/bin/sh", "-c", `ls ${sandboxes} 2>&1; echo PWNED > ${join(other, "launch-1")} 2>&1; echo "w=$?"`], { cwd: ws, env: { PATH: "/usr/bin:/bin" }, timeoutMs: 20_000 });
+      expect(r.stdout).not.toContain("launch-other");
+      expect(r.stdout).toContain("w=");
+      expect(r.stdout).not.toContain("w=0");
+    } finally {
+      await h.close();
+    }
+    expect(readFileSync(join(other, "launch-1"), "utf8")).toBe("#!/bin/sh\necho ORIGINAL\n");
+    rmSync(other, { recursive: true, force: true });
+    rmSync(mine, { recursive: true, force: true });
+  });
+
+  test("a loop's check runs in its sandbox: agent-written code in it can't read a credential", async () => {
+    const ws = join(root, "check-ws");
+    const secrets = join(root, "check-secrets");
+    mkdirSync(ws, { recursive: true });
+    mkdirSync(secrets, { recursive: true });
+    writeFileSync(join(secrets, "token"), "PLANTED-CHECK\n");
+    const registry = new SandboxRegistry("linux");
+    registry.register(provider);
+    const config = { sandbox: { provider: "bwrap", network: "off", allowedHosts: [], hiddenPaths: [secrets], docker: { image: "x" } } } as never;
+    const sbx = await openCheckSandbox({ registry, config, setting: undefined, workspace: ws, label: "loop_x" });
+    expect(sbx.kind).toBe("on");
+    if (sbx.kind !== "on") return;
+    const art = join(root, "artifacts");
+    try {
+      const out = await runCheck({ id: "exit:test", command: `cat ${join(secrets, "token")}; exit 0`, timeoutMs: 20_000 }, { cwd: ws, artifactDir: art, sandbox: { wrap: sbx.wrap } });
+      expect(out.isolation).toBe("sandbox");
+      expect(out.stdoutExcerpt).not.toContain("PLANTED-CHECK");
+    } finally {
+      await sbx.close();
+    }
+    const refused = await runCheck({ id: "exit:test", command: "exit 0", timeoutMs: 5_000 }, { cwd: ws, artifactDir: art, sandbox: { refused: "bubblewrap is not installed" } });
+    expect(refused).toMatchObject({ result: "error", reason: "not run: not sandboxed: bubblewrap is not installed" });
   });
 });

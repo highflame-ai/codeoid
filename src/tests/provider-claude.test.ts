@@ -3550,7 +3550,9 @@ describe("ClaudeProvider — the OS sandbox", () => {
     await collectTurnEvents(p);
     const sb = options().sandbox as Record<string, unknown>;
     expect(sb).toMatchObject({ enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: true });
-    expect(sb.filesystem).toEqual({ allowWrite: ["/work/repo", "/tmp/codeoid-sandbox-x"], denyRead: ["/home/u/.ssh", "/home/u/.codeoid", "/run/docker.sock"] });
+    expect(sb.filesystem).toMatchObject({ allowWrite: ["/work/repo", "/tmp/codeoid-sandbox-x"], denyRead: ["/home/u/.ssh", "/home/u/.codeoid", "/run/docker.sock"] });
+    // The CLI's settings (hooks, excluded commands) aren't its commands' to write.
+    expect((sb.filesystem as { denyWrite: string[] }).denyWrite).toContain("/work/repo/.claude");
     expect(sb.network).toEqual({});
     // The CLI's credential variables aren't its commands'.
     const denied = (sb.credentials as { envVars: Array<{ name: string; mode: string }> } | undefined)?.envVars ?? [];

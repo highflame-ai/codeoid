@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
@@ -18,6 +18,7 @@ import { LocalSandboxHandle } from "../daemon/sandbox/local-handle.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
 import { resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, widens } from "../daemon/sandbox/session-sandbox.js";
 import { sandboxConfigOf } from "../daemon/sandbox/policy.js";
+import { sandboxRoot } from "../daemon/sandbox/root.js";
 import type { NetworkMode, SandboxProbe, SandboxProvider, SandboxSpec } from "../daemon/sandbox/types.js";
 import { Session, type SessionCreateOptions } from "../daemon/session.js";
 import { loadShellParser } from "../daemon/shell/parse.js";
@@ -365,16 +366,71 @@ describe("changing a session's sandbox", () => {
   test("the session's private temp dir is made when a backend first needs it (0700) and removed when the session goes", async () => {
     const sbx = new SessionSandbox({ sessionId: "s/../1", workdir, registry: registry() });
     await sbx.refresh("pi");
-    const mine = () => readdirSync(tmpdir()).filter((n) => n.startsWith("codeoid-sandbox-s1-"));
-    expect(mine()).toHaveLength(0);
     const dir = sbx.runtime?.spec.tempDir ?? "";
-    expect(mine()).toHaveLength(1);
+    // Under the daemon's private sandbox root, which every sandbox hides.
+    expect(dir.startsWith(join(sandboxRoot(), "tmp-s1-"))).toBe(true);
     expect(statSync(dir).mode & 0o777).toBe(0o700);
+    expect(statSync(sandboxRoot()).mode & 0o777).toBe(0o700);
+    expect(sbx.runtime?.spec.hidden).toContain(sandboxRoot());
     const h = await sbx.runtime?.open([join(root, "pi-home")]);
     expect(h?.spec.writable).toEqual([join(root, "pi-home")]);
     await sbx.close();
     await sbx.close();
-    expect(mine()).toHaveLength(0);
+    expect(existsSync(dir)).toBe(false);
     expect(() => h?.wrap?.(["true"], { cwd: "/", env: {} })).toThrow(/closed/);
+  });
+});
+
+describe("review fixes (#448)", () => {
+  test("a changed setting keeps the last runtime until the new one is resolved: never nothing in between", async () => {
+    const sbx = new SessionSandbox({ sessionId: "keep", workdir, registry: registry() });
+    await sbx.refresh("claude");
+    const before = sbx.runtimeFor("claude");
+    expect(before).not.toBeNull();
+    await sbx.set({ network: "off" });
+    expect(sbx.resolvedFor("claude")).toBe(false);
+    expect(sbx.runtimeFor("claude")).toBe(before);
+    expect(sbx.runtimeFor("codex")).toBeNull();
+    await sbx.refresh("claude");
+    expect(sbx.runtimeFor("claude")?.spec.network).toEqual({ mode: "off" });
+    await sbx.close();
+  });
+
+  test("a named launcher is rewritten in place, whole", async () => {
+    const sbx = new SessionSandbox({ sessionId: "launch", workdir, registry: registry() });
+    await sbx.refresh("opencode");
+    const rt = sbx.runtime;
+    if (!rt) throw new Error("no runtime");
+    const a = rt.launcher(await rt.open([]), ["/bin/echo", "one"], [], "shell");
+    const b = rt.launcher(await rt.open([]), ["/bin/echo", "two"], [], "shell");
+    expect(a).toBe(b);
+    expect(readFileSync(b, "utf8")).toContain("'two'");
+    expect(a.startsWith(join(sandboxRoot(), "launch-"))).toBe(true);
+    await sbx.close();
+  });
+
+  test("Claude under Docker: a dangerouslyDisableSandbox flag leaves nothing, so it isn't the always-ask", async () => {
+    const r = await gateCall("Bash", { command: "ls", dangerouslyDisableSandbox: true }, { mode: "autonomous", sandbox: { provider: "docker" } });
+    expect(r.asked).toBe(false);
+    expect(r.behavior).toBe("allow");
+  });
+
+  test("Claude (native): a file-tool write to the project's Claude settings asks in every mode", async () => {
+    const r = await gateCall("Write", { file_path: join(workdir, ".claude", "settings.json"), content: "{}" }, { mode: "autonomous" });
+    expect(r.asked).toBe(true);
+  });
+
+  test("widening is told from what it would really be: a provider that can't run is no sandbox", async () => {
+    const reg = new SandboxRegistry("linux");
+    reg.register(fakeProvider("bwrap", { available: true }));
+    reg.register(fakeProvider("docker", { available: false, reason: "no daemon" }));
+    const { session, dialogs } = makeSession(new MockSessionProvider("claude", [[DONE]]), { registry: reg });
+    await session.ensureSandbox();
+    expect(session.widensSandbox({ provider: "docker" })).toBe(true);
+    expect(session.widensSandbox({ network: "off" })).toBe(false);
+    await session.setSandbox({ provider: "docker" }, AUTH);
+    await until(() => dialogs.length > 0);
+    expect(dialogs[0]?.title).toContain("Turn the sandbox off");
+    expect(dialogs[0]?.message).toContain("no daemon");
   });
 });
