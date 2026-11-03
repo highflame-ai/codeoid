@@ -307,7 +307,7 @@ private homes, launchers and every temp entry of the daemon's own
 (`daemonTempDir`: sign-in homes, check artifacts, loop index, pi's bridge),
 hidden from every sandbox (Claude's own, which keeps the host's `/tmp`, too).
 The daemon's own git in a repository an agent can write runs with
-`safeGitEnv` (git-env.ts): no hook, fsmonitor, signing, editor; drivers and
+`safeGitEnv` (git-env.ts): no hook (the hooks dir's or `hook.<name>.command`, off per event), fsmonitor, alternates' ref command, signing or signature check, editor, pager, git-protocol proxy, auto gc (each config key `git help -c` lists as running a program; git-env.test.ts's table); drivers and
 credential helpers from agent-writable scopes reset to the user's own;
 https/ssh only. `protectedAncestors` → `SandboxSpec.pinned`:
 dirs between a writable root and a hidden path in it can't be renamed (bwrap

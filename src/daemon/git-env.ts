@@ -44,21 +44,44 @@ export function gitEnv(extra: Record<string, string> = {}, opts: { network?: boo
 /** Driver names git config may define that we can neutralize safely. */
 const SAFE_DRIVER_NAME = /^[A-Za-z0-9._-]{1,100}$/;
 
+/** Every hook event git knows (githooks(5)): each turned off by name, which config-defined hooks (`hook.<name>.command`) obey too. */
+export const GIT_HOOK_EVENTS: readonly string[] = [
+  "applypatch-msg", "pre-applypatch", "post-applypatch", "pre-commit", "pre-merge-commit", "prepare-commit-msg",
+  "commit-msg", "post-commit", "pre-rebase", "post-checkout", "post-merge", "pre-push", "pre-receive", "update",
+  "proc-receive", "post-receive", "post-update", "reference-transaction", "push-to-checkout", "pre-auto-gc",
+  "post-rewrite", "sendemail-validate", "fsmonitor-watchman", "p4-changelist", "p4-prepare-changelist",
+  "p4-post-changelist", "p4-pre-submit", "post-index-change",
+];
+
 /**
  * What every git the daemon runs in a repository an agent can write gets,
- * whatever the repository's config says: no hook, no fsmonitor, no external
- * diff, no signing, no editor or pager, no submodule recursion, ssh as
- * itself (`core.sshCommand`), no askpass program from config. Each is read
- * last-wins, so these (command scope, `GIT_CONFIG_COUNT`) outrank the
- * repository's.
+ * whatever the repository's config says. Each key git's config documents as
+ * naming a program it runs (`git help -c`), turned off: hooks (the hooks dir
+ * and config-defined ones, by event), fsmonitor, the alternates' ref command,
+ * the editors and pager, an external diff, signing and verifying (gpg's
+ * programs and ssh's key command), the git protocol's proxy, auto gc (and the
+ * hook it runs), submodule recursion; ssh as itself (`core.sshCommand`), no
+ * askpass program from config. Drivers and credential helpers, named per
+ * repository, are {@link driverOverrides}'; remote helpers, `ext::`,
+ * `file://` (`remote.*.uploadpack`) and `git://` are refused by the
+ * protocol allowlist (`GIT_ALLOW_PROTOCOL`, which outranks `protocol.*`).
+ * Not reached by the daemon's git: `trailer.*.cmd` (no `--trailer`),
+ * `submodule.*.update` (no `submodule update`), tools (`difftool`,
+ * `mergetool`, `guitool`, `sendemail`), aliases (builtins win), and
+ * `uploadpack.packObjectsHook` (read from the user's own config only). Each
+ * is read last-wins, so these (command scope, `GIT_CONFIG_COUNT`) outrank
+ * the repository's.
  */
 const BASE_OVERRIDES: ReadonlyArray<readonly [string, string]> = [
   ["core.hooksPath", "/dev/null"],
+  ...GIT_HOOK_EVENTS.map((e) => [`hook.${e}.enabled`, "false"] as const),
   ["core.fsmonitor", "false"],
   ["core.untrackedCache", "false"],
+  ["core.alternateRefsCommand", ""],
   ["core.protectHFS", "true"],
   ["core.protectNTFS", "true"],
   ["core.sshCommand", "ssh"],
+  ["core.gitProxy", ""],
   ["core.askPass", ""],
   ["core.editor", ":"],
   ["sequence.editor", ":"],
@@ -67,8 +90,19 @@ const BASE_OVERRIDES: ReadonlyArray<readonly [string, string]> = [
   ["commit.gpgSign", "false"],
   ["tag.gpgSign", "false"],
   ["log.showSignature", "false"],
+  ["merge.verifySignatures", "false"],
+  ["gpg.program", "false"],
+  ["gpg.openpgp.program", "false"],
+  ["gpg.x509.program", "false"],
+  ["gpg.ssh.program", "false"],
+  ["gpg.ssh.defaultKeyCommand", ""],
+  ["gc.auto", "0"],
+  ["maintenance.auto", "false"],
   ["submodule.recurse", "false"],
 ];
+
+/** The environment's own say over editors and pagers, which outranks config (`pager.<cmd>` included). */
+const PROGRAM_ENV = { GIT_EDITOR: ":", GIT_SEQUENCE_EDITOR: ":", GIT_PAGER: "cat" } as const;
 
 /** The protocols a daemon git that may reach a remote may use: no `file`/`ext` (they run programs here), no `git` (`core.gitProxy`). */
 export const REMOTE_PROTOCOLS = "https:ssh";
@@ -201,7 +235,7 @@ async function scopedDrivers(cwd: string, env: Record<string, string>, timeout: 
  */
 export async function safeGitEnv(cwd: string, opts: { network?: boolean; timeoutMs?: number } = {}): Promise<Record<string, string>> {
   const base = {
-    ...gitEnv({ LANG: "C" }, { network: opts.network === true }),
+    ...gitEnv({ LANG: "C", ...PROGRAM_ENV }, { network: opts.network === true }),
     ...(opts.network ? { GIT_ALLOW_PROTOCOL: REMOTE_PROTOCOLS } : {}),
   };
   return { ...base, ...overrideEnv(driverOverrides(await scopedDrivers(cwd, base, opts.timeoutMs ?? 30_000), false)) };
@@ -236,7 +270,7 @@ export async function hardenedGit(
   opts: { timeoutMs?: number; maxBuffer?: number; input?: string | Buffer | Readable; network?: "https" | "file" } = {},
 ): Promise<string> {
   const base = {
-    ...gitEnv({ LANG: "C", GIT_CONFIG_NOSYSTEM: "1", ...extraEnv }, { network: opts.network !== undefined }),
+    ...gitEnv({ LANG: "C", GIT_CONFIG_NOSYSTEM: "1", ...PROGRAM_ENV, ...extraEnv }, { network: opts.network !== undefined }),
     // Outranks any protocol.* config: this protocol and no other.
     ...(opts.network !== undefined ? { GIT_ALLOW_PROTOCOL: opts.network } : {}),
   };
