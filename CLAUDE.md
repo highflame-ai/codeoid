@@ -64,6 +64,7 @@ src/
 │   ├── shutdown.ts               # Cleanup registry, signal handlers, grace period
 │   ├── data-lock.ts              # One daemon per data dir: lock files taken at `codeoid start`
 │   ├── outside-writes.ts         # Autonomous mode asks before a write outside the workdir, every backend
+│   ├── sandbox/                  # OS sandbox for agents' commands (#448): providers (bwrap, seatbelt, docker), policy, per-backend confinement
 │   └── index.ts
 ├── protocol/                     # re-export shims for @highflame/codeoid-protocol (packages/protocol)
 │   ├── types.ts                  # Client<->Daemon message protocol
@@ -212,6 +213,8 @@ codeoid interrupt <n>
 codeoid approve <n> [--deny] [--pick N | --id <approvalId>] [--yes]
 codeoid account ls|login <name>|add-key <name>|add-gateway|add-token|add-bedrock|default <name>|use <session> <name>|--follow-default|rm <name> [--backend <id>]  # accounts for every backend (docs/backend-accounts-design.md)
 codeoid destroy <n>
+codeoid new <n> <d> --sandbox auto|bwrap|seatbelt|docker|off [--network on|off|allowlist] [--allow-host h]  # the session's OS sandbox (#448, docs/sandbox.md)
+codeoid sandbox providers | set <session> <provider> [--network …]  # what runs here; change a session's (widening asks its owner)
 codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
 codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
 codeoid mcp reconnect <session> <server>            # redial a backend MCP server that's down (#389)
@@ -244,6 +247,35 @@ dispatcher (`kind: "attempt"`). A worker's `loop_report` is a request to verify,
 never a verdict. Every transition is a compare-and-set on the run's
 `state_version`. loop.* is authorized in `SessionManager.#loopHandle`
 (owner-only; session:create + session:send, plus session:approve to start).
+
+**OS sandbox** (#448, docs/sandbox.md, docs/sandbox-providers.md): on by default.
+`src/daemon/sandbox/`: a `SandboxProvider` (types.ts: capabilities — isolation
+tier, local/remote, mount/sync, stdio process, commands, argv wrap, enforced
+network modes, platforms — `probe()`, `open(spec)` → `SandboxHandle` with
+spawn/exec/wrap/close) per backend of isolation: `bwrap` (bwrap.ts, pure
+`bwrapArgs`), `seatbelt` (seatbelt.ts, pure `seatbeltProfile`, paths as `-D`
+params), `docker` (docker.ts, pure `dockerRunArgs`); registry.ts resolves
+`auto | off | <id>` with cached probes. policy.ts builds the spec: workspace +
+a private temp dir writable; hidden: config dir, `daemonOwnedDirs`, the CLIs'
+logins and `registeredSecretLocations` (secret-paths.ts), `HOME_CREDENTIAL_PATHS`,
+`$XDG_RUNTIME_DIR`, the daemon's temp dir, `sandbox.hiddenPaths`; container
+sockets; network. confinement.ts picks per (backend, provider): `native`
+(Claude's SDK `sandbox` option, claude-native.ts; Codex workspace-write inside
+codeoid's bwrap around the app-server), `process` (the whole backend inside:
+pi, Gemini CLI, Qwen via a launcher, Claude/Codex under Docker), `command`
+(opencode's shell shim), `no-shell` (HTTP backends). session-sandbox.ts:
+`SessionSandbox` (setting over `sandbox.*`, `resolveSandbox` → `SessionInfo.sandbox`
+with `enforced`, lazy 0700 temp dir, handles, launchers) and
+`ProviderSessionInit.sandbox()` hands the `SandboxRuntime` to the backend.
+Fallback: `Session#sendInner` refuses an autonomous / unattended / `requireSandbox`
+(routine, loop, dispatch worker) turn while `sandboxRefusalOf` says so;
+set_mode autonomous and loop.start refuse up front; interactive runs, and every
+card carries `sandboxed`/`sandboxNote`. A run-outside request
+(`asksOutsideSandbox`: Claude's `dangerouslyDisableSandbox`, `codex_permissions`)
+asks in every mode, routed past allow rules by the PreToolUse hook;
+`SandboxNetworkAccess` follows the session's network. `session.set_sandbox` is
+owner-only; widening is a confirm on the session (`widens`), never on an
+unattended turn. Forks and collaboration children inherit the setting.
 
 Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell/`
 parses a command line with tree-sitter-bash (WASM, vendored `tree-sitter-bash.wasm`;
@@ -291,6 +323,8 @@ CODEOID_MCP_CONTROL_ENABLED=false   # mount /mcp/control (docs/mcp-control.md)
 CODEOID_MCP_CONTROL_ACTIONS=false   # also allow create / send / interrupt / destroy there
 CODEOID_ROUTINES_ENABLED=true       # scheduler + routine commands (docs/routines.md)
 CODEOID_DEFAULT_EFFORT=             # thinking effort for new sessions: off|minimal|low|medium|high|xhigh|max (docs/thinking-effort.md)
+CODEOID_SANDBOX=auto                # OS sandbox for agents' commands: auto|bwrap|seatbelt|docker|off (docs/sandbox.md)
+CODEOID_SANDBOX_NETWORK=on          # on|off|allowlist (CODEOID_SANDBOX_ALLOWED_HOSTS); hiddenPaths: CODEOID_SANDBOX_HIDDEN_PATHS
 
 # Claude auth: uses your existing `claude login` session (Pro/Max subscription).
 # No ANTHROPIC_API_KEY needed if you're logged in via Claude Code CLI.
@@ -458,8 +492,13 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   (`opencodeShellEnv`, `PUT …/environment` before every turn and as a child is
   learned; a child's requests are allowed only once it's set): the server's
   model keys and injected config never reach it. The server's own `SHELL`,
-  which opencode runs every line with (any but fish and nu), is pinned to
-  bash (`opencodeServerShell`: absolute `PATH` entries only), the shell #431 judges lines as.
+  which opencode runs every line with (any but fish and nu), is codeoid's
+  shim (`writeOpencodeShellShim`, `<dataDir>/bin/codeoid-shell`), which runs
+  bash (`opencodeServerShell`: absolute `PATH` entries only, the shell #431
+  judges lines as) through the launcher the session's own shell environment
+  names (`CODEOID_SANDBOX_LAUNCHER`, set with the bare env: inside its OS
+  sandbox, #448), or bash itself for `off`; with neither (the server's own
+  environment, a gap child) the line runs nothing.
 - **Version control** opencode runs unasked (repo discovery, snapshots,
   `hg log` for a project id) runs none of a repository's code: the server's
   environment gives every git `OPENCODE_GIT_OVERRIDES` through

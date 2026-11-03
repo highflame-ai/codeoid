@@ -6,7 +6,10 @@ Every shell command an agent wants to run is parsed, wrappers and all, and given
 **The levels are guidance drawn from reading the command line. They are not a sandbox.**
 High and not-understood commands ask, and codeoid's credential files are refused when the reader recognises them, but both are a best effort: a command can be written in ways the reader doesn't recognise, and then it is rated medium.
 Only "low" is a promise, and it is kept by being a strict allow-list (below): anything unusual simply isn't low.
-The real protection for your credentials and for files outside the workspace is running the agent's commands in a sandbox ([#448](https://github.com/highflame-ai/codeoid/issues/448)).
+
+The boundary is the OS sandbox ([sandbox.md](sandbox.md), #448), on by default: the agent's commands run where only the workspace and a private temp dir are writable and credential stores aren't there, however a command is written.
+The levels are guidance inside that boundary — what a command would do to your workspace — and every approval card says whether the command runs sandboxed ("🛡 sandboxed: bubblewrap, network on"), or why not ("⚠️ not sandboxed: …").
+A request to run a command **outside** the sandbox (Claude's `dangerouslyDisableSandbox` retry, Codex asking to widen its sandbox) is its own approval, asked in every mode, autonomous included, and audited; so is turning a session's sandbox off.
 
 ## The levels
 

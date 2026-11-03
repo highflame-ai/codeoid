@@ -106,6 +106,13 @@ CODEOID_MCP_CONTROL_ACTIONS=false       # also allow create / send / interrupt /
 CODEOID_ROUTINES_ENABLED=true           # run the scheduler and accept routine commands
 CODEOID_ROUTINES_MAX_CONCURRENT=2       # routine runs executing at once, across all routines
 
+# OS sandbox for agents' commands — see docs/sandbox.md. On by default.
+CODEOID_SANDBOX=auto                    # auto | bwrap | seatbelt | docker | off
+CODEOID_SANDBOX_NETWORK=on              # on | off | allowlist
+CODEOID_SANDBOX_ALLOWED_HOSTS=          # with allowlist: github.com,*.npmjs.org
+CODEOID_SANDBOX_HIDDEN_PATHS=           # more paths to hide: ~/.npmrc,~/work/.env
+CODEOID_SANDBOX_DOCKER_IMAGE=node:22-bookworm-slim
+
 # Forks, backend switches and rewinds (docs/FEATURES.md#how-a-fork-switch-or-rewind-carries-the-conversation)
 CODEOID_NATIVE_CONTINUATION=true        # hand Claude/Codex the conversation in their own form; false = text transcript
 
@@ -215,6 +222,30 @@ The opencode backend (opencode 2.2.5 or a later 2.2.x) is on by default when an 
 - `hostedModels` (`CODEOID_OPENCODE_HOSTED_MODELS`) — offer opencode's own hosted models (provider `opencode`: opencode.ai / Zen, its free no-key models included) and let opencode fetch its model catalog from opencode.ai. Default `false`: they aren't offered, listed or picked as a default, your opencode config can't enable them, and a session's code only goes to providers codeoid or your opencode config gave a credential for (docs/opencode.md, *opencode's hosted models*).
 - Credentials are codeoid's own: its `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `GOOGLE_API_KEY` (or `GEMINI_API_KEY`), each sent to the gateway its `*_BASE_URL` names when one does, its Qwen backend on an API key or its default account (`providers.qwen`, as provider `qwen`), and its OpenAI-compatible endpoints (as `oai-<name>`). codeoid writes each to a file only it can read and names the file in opencode's config; the files are removed when the server stops, and a daemon that's gone has its files removed when another starts (each daemon keeps its own). The opencode server's environment carries no key, nor a proxy URL with credentials in it. Sign-ins stored in codeoid's opencode database (`OPENCODE_DB=<that path> opencode auth login`) work too. `codeoid account` doesn't apply to it.
 - Every setting here is read when the daemon starts; change one, then restart the daemon (the settings UI says so).
+
+### OS sandbox
+
+Agents' commands run in an OS sandbox, on by default ([sandbox.md](sandbox.md)): the workspace and a private temp dir writable, everything else read-only, credential stores hidden, container sockets unreachable.
+
+```json
+{
+  "sandbox": {
+    "provider": "auto",
+    "network": "on",
+    "allowedHosts": [],
+    "hiddenPaths": ["~/.npmrc"],
+    "bwrapPath": "/usr/bin/bwrap",
+    "docker": { "image": "node:22-bookworm-slim", "runtime": "runsc" }
+  }
+}
+```
+
+- `provider` (`CODEOID_SANDBOX`) — `auto` (bubblewrap on Linux, Seatbelt on macOS), `bwrap`, `seatbelt`, `docker`, or `off`. The default for new sessions; each session can choose its own (`codeoid new --sandbox …`, the new-session dialog, `/sandbox`), and turning one off is asked of its owner.
+- `network` (`CODEOID_SANDBOX_NETWORK`) — `on`, `off` or `allowlist`; `allowedHosts` (`CODEOID_SANDBOX_ALLOWED_HOSTS`) for the allowlist. Only Claude's own sandbox enforces an allowlist; elsewhere it means no network, and the session says so.
+- `hiddenPaths` (`CODEOID_SANDBOX_HIDDEN_PATHS`) — more paths to hide, on top of codeoid's data, the agent CLIs' logins and the usual credential stores (`~` expands).
+- `bwrapPath` — the bubblewrap binary (default: on `PATH`). Claude Code's own sandbox on Linux also needs `socat`.
+- `docker.image` (`CODEOID_SANDBOX_DOCKER_IMAGE`) and `docker.runtime` — what a Docker sandbox runs, and `runsc` for gVisor.
+- Where the sandbox can't run, interactive sessions run unsandboxed and say so on every approval; autonomous sessions, routines and loops refuse to start. `codeoid sandbox providers` shows what runs here.
 
 ### One daemon per data directory
 
