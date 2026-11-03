@@ -597,6 +597,15 @@ describe("round 1 of the #448 audit", () => {
     expect(() => b.wrap?.(["true"], { cwd: "/", env: {} })).toThrow(/closed/);
   });
 
+  test("a backend's warning (a login not saved back) reaches the session's warning line (#448 round 3)", async () => {
+    const said: string[] = [];
+    const sbx = new SessionSandbox({ sessionId: "warn", workdir, registry: registry(), onWarning: (t) => said.push(t) });
+    await sbx.refresh("pi");
+    (sbx.runtime as SandboxRuntime).warn("login not saved");
+    expect(said).toEqual(["login not saved"]);
+    await sbx.close();
+  });
+
   test("a private home is fresh at each start, and Claude's temp dirs are the session's own, gone with it", async () => {
     const sbx = new SessionSandbox({ sessionId: "homes", workdir, registry: registry() });
     await sbx.refresh("pi");

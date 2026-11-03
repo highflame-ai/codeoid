@@ -2875,7 +2875,7 @@ export function claudeSandboxOptions(
         });
         configDir = own.home;
         // Closed when the query is replaced or torn down: a login the CLI refreshed is written back then.
-        handle = withLoginsSynced(rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(o.command, [])] }), own);
+        handle = withLoginsSynced(rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(o.command, [])] }), own, rt.warn);
         track?.(handle);
       }
       const childEnv: Record<string, string> = {};

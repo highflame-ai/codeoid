@@ -214,12 +214,18 @@ What each leaves open:
   it, and written back to the real file by the daemon when the backend's
   process ends (or its query is replaced): only that file (Claude's
   `.credentials.json`, Codex's and pi's `auth.json`, the Gemini CLI's and
-  Qwen's `oauth_creds.json`), only when it parses as that backend's
-  credential, only when the real file is still what was copied (your own
-  CLI's refresh meanwhile isn't overwritten), atomically (a temp file
-  renamed over it). A command can still replace it with another valid
-  credential of that backend, which would then be written back: the token
-  was already readable to it. Not verified with the real vendor CLIs here
+  Qwen's `oauth_creds.json`), and of it **only the token fields a refresh
+  writes** (the access and refresh tokens, their expiry and scope; pi's only
+  in its `oauth` entries), put into the real file's own content. A copy
+  changed anywhere else is not written back, your real login is kept, and the
+  session says so: an entry added or removed, an api key (pi runs one that
+  starts with `!` as a command), an account id, a URL a token is sent to
+  (Qwen's `resource_url`, an MCP server's `serverUrl`), or a token field
+  holding anything but a plain token. Only when the real file is still what
+  was copied (your own CLI's refresh meanwhile isn't overwritten),
+  atomically (a temp file renamed over it). A command can still put another
+  account's tokens of the same backend in those fields, which would then be
+  written back: the token was already readable to it. Not verified with the real vendor CLIs here
   (no network): a fake that rotates its refresh token, saving it in place
   and by a rename, is.
 - **Conversations across a sandbox change.** A process backend's native

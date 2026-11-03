@@ -963,7 +963,7 @@ export class CodexProvider implements SessionProvider {
         const own = preparePrivateHome(defaultCodexHome(env), rt.privateHome("codex"), CODEX_HOME_LAYOUT, { state: rt.stateDir("codex") });
         procEnv = { ...env, CODEX_HOME: own.home };
         // Closed when the app-server exits: a login it refreshed is written back then.
-        handle = withLoginsSynced(await rt.open(own.writable, { backendNetwork: true, readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix)] }), own);
+        handle = withLoginsSynced(await rt.open(own.writable, { backendNetwork: true, readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix)] }), own, rt.warn);
       }
       const opened = handle;
       this.#proc = new CodexRpcProcess({

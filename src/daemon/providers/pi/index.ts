@@ -367,7 +367,7 @@ export class PiProvider implements SessionProvider {
       const own = preparePrivateHome(piAgentDirOf(env), rt.privateHome("pi"), PI_HOME_LAYOUT, { state: rt.stateDir("pi") });
       env = { ...env, PI_CODING_AGENT_DIR: own.home };
       // Closed when pi exits: a login it refreshed is written back then.
-      handle = withLoginsSynced(await rt.open(own.writable, { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix), dirname(bridge)] }), own);
+      handle = withLoginsSynced(await rt.open(own.writable, { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix), dirname(bridge)] }), own, rt.warn);
     }
     const opened = handle;
     this.#proc = new PiRpcProcess({

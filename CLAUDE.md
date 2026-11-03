@@ -286,8 +286,9 @@ Docker), `command` (opencode's shell shim), `no-shell` (HTTP backends). A
 backend whose process is inside runs in a private copy of its home
 (backend-home.ts `preparePrivateHome` into `SandboxRuntime.privateHome`,
 afresh each start: its refreshable login a private copy written back on its
-handle's close, `withLoginsSynced`, only a valid credential over an unchanged
-real one; conversations the session's own, `SandboxRuntime.stateDir`, removed
+handle's close, `withLoginsSynced`, only its token fields into the real
+file's content (`refreshedLogin`: anything else changed is refused and said on
+the session, `SandboxRuntime.warn`), over an unchanged real one; conversations the session's own, `SandboxRuntime.stateDir`, removed
 on destroy; code read-only, small files copied), never its real home
 writable; its handle is closed when its process ends. session-sandbox.ts: `SessionSandbox` (setting
 over `sandbox.*`, `resolveSandbox` → `SessionInfo.sandbox` with `enforced`,

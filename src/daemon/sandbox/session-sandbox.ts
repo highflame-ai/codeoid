@@ -110,6 +110,8 @@ export interface SandboxRuntime {
   stateDir(key: string): string;
   /** Claude's native sandbox: where its CLI and its commands keep temp files (claude-native.ts). */
   claudeTemp(): ClaudeTempDirs;
+  /** Say something on the session (a warning line): a login not written back from the sandbox (backend-home.ts). */
+  warn(text: string): void;
 }
 
 /** The setting a session ends up with: its own fields over the config's. */
@@ -251,7 +253,18 @@ export class SessionSandbox {
   #homesDir: string | null = null;
   #claudeTemp: ClaudeTempDirs | null = null;
 
-  constructor(opts: { sessionId: string; workdir: string; registry: SandboxRegistry; config?: CodeoidConfig; setting?: SessionSandboxSetting }) {
+  readonly #onWarning: ((text: string) => void) | undefined;
+
+  constructor(opts: {
+    sessionId: string;
+    workdir: string;
+    registry: SandboxRegistry;
+    config?: CodeoidConfig;
+    setting?: SessionSandboxSetting;
+    /** A warning line on the session (SandboxRuntime.warn). */
+    onWarning?: (text: string) => void;
+  }) {
+    this.#onWarning = opts.onWarning;
     this.#sessionId = opts.sessionId;
     this.#workdir = opts.workdir;
     this.#registry = opts.registry;
@@ -371,6 +384,13 @@ export class SessionSandbox {
       privateHome: (key) => this.#privateHome(key),
       stateDir: (key) => this.#stateDir(key),
       claudeTemp: () => this.#ensureClaudeTemp(),
+      warn: (text) => {
+        try {
+          this.#onWarning?.(text);
+        } catch {
+          /* a session gone meanwhile: the daemon's log has it */
+        }
+      },
     };
     return r.info;
   }

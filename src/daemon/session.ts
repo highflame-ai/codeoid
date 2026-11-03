@@ -1533,6 +1533,7 @@ export class Session {
         registry: opts.sandboxRegistry,
         ...(opts.config ? { config: opts.config } : {}),
         ...(opts.sandbox ? { setting: opts.sandbox } : {}),
+        onWarning: (text) => this.#sandboxWarning(text, "sandbox.login_not_saved"),
       });
     }
     this.#requireSandbox = opts.requireSandbox === true;
@@ -3142,6 +3143,14 @@ export class Session {
     const sbx = this.#sandbox;
     if (!sbx) return false;
     return widens(sbx.effective(), sbx.effective({ ...(sbx.setting ?? {}), ...setting }));
+  }
+
+  /** A warning line on the session about its sandbox (#448), persisted and shown to every client. */
+  #sandboxWarning(text: string, event: string): void {
+    if (this.#destroyed) return;
+    const msg = this.#makeMessage("info", `⚠ ${text}`, SYSTEM_IDENTITY, undefined, undefined, { event });
+    this.#persistAndBuffer(msg);
+    this.#broadcastRaw(msg);
   }
 
   /** What an approval card says of the sandbox (#448): whether the call runs inside, and why not. */

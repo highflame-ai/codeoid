@@ -12,7 +12,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import { loadConfig } from "../config.js";
-import { COPY_LIMIT, claudeCredentials, codexCredentials, oauthCredentials, PI_HOME_LAYOUT, piCredentials, preparePrivateHome } from "../daemon/sandbox/backend-home.js";
+import {
+  CLAUDE_HOME_LAYOUT,
+  CODEX_HOME_LAYOUT,
+  COPY_LIMIT,
+  claudeCredentials,
+  codexCredentials,
+  GEMINI_CLI_HOME_LAYOUT,
+  oauthCredentials,
+  PI_HOME_LAYOUT,
+  piCredentials,
+  preparePrivateHome,
+  QWEN_HOME_LAYOUT,
+  refreshedLogin,
+  withLoginsSynced,
+} from "../daemon/sandbox/backend-home.js";
 import { bwrapArgs, type PathKind } from "../daemon/sandbox/bwrap.js";
 import { claudeCacheEnv, claudeSandboxSettings, claudeTempEnv, physicalOf } from "../daemon/sandbox/claude-native.js";
 import { buildSandboxSpec, DEFAULT_HOME_READABLE, gitWorkspacePaths, homeCredentialFilesIn, programLocations, sandboxConfigOf } from "../daemon/sandbox/policy.js";
@@ -358,34 +372,34 @@ describe("a login refreshed inside, written back (#448 round 2)", () => {
     writeFileSync(join(target, "auth.json"), valid("ROTATED"));
     writeFileSync(join(target, "settings.json"), '{"changed":true}');
     writeFileSync(join(target, "new-file.json"), "{}");
-    expect(own.syncLogins()).toEqual(["auth.json"]);
+    expect(own.syncLogins()).toEqual({ written: ["auth.json"], refused: [] });
     expect(readFileSync(join(real, "auth.json"), "utf8")).toBe(valid("ROTATED"));
     expect(statSync(join(real, "auth.json")).mode & 0o777).toBe(0o600);
     expect(readFileSync(join(real, "settings.json"), "utf8")).toBe("{}");
     expect(existsSync(join(real, "new-file.json"))).toBe(false);
     // No temp file left beside it; again is a no-op.
     expect(readdirSync(real).sort()).toEqual(["auth.json", "settings.json"]);
-    expect(own.syncLogins()).toEqual([]);
+    expect(own.syncLogins()).toEqual({ written: [], refused: [] });
   });
 
   test("not written back: what isn't that backend's credential, a link where the copy was, or over a newer real one", () => {
     const a = setup("lw-bad");
     writeFileSync(join(a.target, "auth.json"), "not json");
-    expect(a.own.syncLogins()).toEqual([]);
+    expect(a.own.syncLogins().written).toEqual([]);
     writeFileSync(join(a.target, "auth.json"), '{"anthropic":"no type"}');
-    expect(a.own.syncLogins()).toEqual([]);
+    expect(a.own.syncLogins().written).toEqual([]);
     expect(readFileSync(join(a.real, "auth.json"), "utf8")).toBe(valid("OLD"));
     const b = setup("lw-link");
     const elsewhere = join(root, "lw-elsewhere.json");
     writeFileSync(elsewhere, valid("FROM-ELSEWHERE"));
     rmSync(join(b.target, "auth.json"));
     symlinkSync(elsewhere, join(b.target, "auth.json"));
-    expect(b.own.syncLogins()).toEqual([]);
+    expect(b.own.syncLogins()).toEqual({ written: [], refused: [] });
     expect(readFileSync(join(b.real, "auth.json"), "utf8")).toBe(valid("OLD"));
     const c = setup("lw-newer");
     writeFileSync(join(c.target, "auth.json"), valid("MINE"));
     writeFileSync(join(c.real, "auth.json"), valid("USERS-OWN"));
-    expect(c.own.syncLogins()).toEqual([]);
+    expect(c.own.syncLogins()).toEqual({ written: [], refused: [] });
     expect(readFileSync(join(c.real, "auth.json"), "utf8")).toBe(valid("USERS-OWN"));
   });
 
@@ -398,6 +412,103 @@ describe("a login refreshed inside, written back (#448 round 2)", () => {
     expect(oauthCredentials('{"access_token":"a","refresh_token":"r","expiry_date":1}')).toBe(true);
     expect(oauthCredentials('{"access_token":"a"}')).toBe(false);
     expect(piCredentials("{}")).toBe(false);
+  });
+});
+
+describe("a login written back is a token refresh and nothing else (#448 round 3)", () => {
+  // What a command inside could plant: a value pi runs as a command, a URL a token is sent to.
+  const COMMAND = "!planted-command --arg";
+  const rule = (layout: { refreshable?: Record<string, import("../daemon/sandbox/backend-home.js").LoginRefresh> }, name: string) => layout.refreshable?.[name]!;
+  const pi = rule(PI_HOME_LAYOUT, "auth.json");
+  const piHeld = `${JSON.stringify({ anthropic: { type: "oauth", access: "a1", refresh: "r1", expires: 1, enterpriseUrl: "https://example.invalid" }, google: { type: "api_key", key: "k" } }, null, 2)}\n`;
+
+  test("pi: an oauth entry's tokens are written into the real file's own content, in its layout; anything else is refused", () => {
+    const refreshed = JSON.parse(piHeld);
+    refreshed.anthropic.access = "a2";
+    refreshed.anthropic.refresh = "r2";
+    refreshed.anthropic.expires = 2;
+    const ok = refreshedLogin(piHeld, JSON.stringify(refreshed), pi);
+    expect("text" in ok && ok.text).toBe(`${JSON.stringify(refreshed, null, 2)}\n`);
+    const refuse = (mutate: (o: Record<string, Record<string, unknown>>) => void) => {
+      const o = JSON.parse(piHeld);
+      mutate(o);
+      const r = refreshedLogin(piHeld, JSON.stringify(o), pi);
+      expect("refused" in r).toBe(true);
+      return "refused" in r ? r.refused : "";
+    };
+    // The finding: an api_key entry added (pi runs a key starting with `!`), keeping the real oauth entry.
+    expect(refuse((o) => { o.openai = { type: "api_key", key: COMMAND }; })).toBe("openai was added, which a token refresh never does");
+    // An existing api key's value, an oauth entry's URL, its type, an entry removed.
+    expect(refuse((o) => { o.google!.key = COMMAND; })).toContain("google.key");
+    expect(refuse((o) => { o.anthropic!.enterpriseUrl = "https://elsewhere.invalid"; })).toContain("anthropic.enterpriseUrl");
+    expect(refuse((o) => { o.anthropic!.type = "api_key"; })).toContain("anthropic.type");
+    expect(refuse((o) => { delete o.google; })).toBe("google was removed, which a token refresh never does");
+    // A token field holding what isn't a token.
+    expect(refuse((o) => { o.anthropic!.access = COMMAND; })).toContain("anthropic.access isn't a token value");
+    expect(refuse((o) => { o.anthropic!.refresh = "https://elsewhere.invalid/x"; })).toContain("isn't a token value");
+    // An api_key entry's "tokens" are no tokens: pi's oauth fields only count in an oauth entry.
+    const apiOnly = `${JSON.stringify({ google: { type: "api_key", key: "k" } })}\n`;
+    const r = refreshedLogin(apiOnly, JSON.stringify({ google: { type: "api_key", key: "k", access: "x" } }), pi);
+    expect("refused" in r).toBe(true);
+  });
+
+  test("Claude: its OAuth tokens (and an MCP server's) are refreshed; a server's URL or a new entry is refused", () => {
+    const c = rule(CLAUDE_HOME_LAYOUT, ".credentials.json");
+    const held = JSON.stringify({ claudeAiOauth: { accessToken: "sk-ant-oat01-a", refreshToken: "sk-ant-ort01-r", expiresAt: 1, scopes: ["user:inference"] }, mcpOAuth: { srv: { serverUrl: "https://mcp.example.invalid", accessToken: "t", expiresAt: 1 } } });
+    const next = JSON.parse(held);
+    next.claudeAiOauth.accessToken = "sk-ant-oat01-b";
+    next.claudeAiOauth.refreshToken = "sk-ant-ort01-s";
+    next.claudeAiOauth.scopes = ["user:inference", "user:profile"];
+    next.mcpOAuth.srv.accessToken = "t2";
+    expect(refreshedLogin(held, JSON.stringify(next), c)).toEqual({ text: JSON.stringify(next) });
+    next.mcpOAuth.srv.serverUrl = "https://elsewhere.invalid";
+    expect(refreshedLogin(held, JSON.stringify(next), c)).toEqual({ refused: "mcpOAuth.srv.serverUrl changed, which a token refresh never does" });
+    const added = { ...JSON.parse(held), extra: { apiKeyHelper: COMMAND } };
+    expect("refused" in refreshedLogin(held, JSON.stringify(added), c)).toBe(true);
+  });
+
+  test("Codex: its ChatGPT tokens are refreshed; the api key or the account is never changed", () => {
+    const c = rule(CODEX_HOME_LAYOUT, "auth.json");
+    const held = JSON.stringify({ OPENAI_API_KEY: null, tokens: { id_token: "i", access_token: "a", refresh_token: "r", account_id: "acct-1" }, last_refresh: "2026-01-01T00:00:00Z" });
+    const next = JSON.parse(held);
+    next.tokens.access_token = "a2";
+    next.last_refresh = "2026-02-01T00:00:00Z";
+    expect(refreshedLogin(held, JSON.stringify(next), c)).toEqual({ text: JSON.stringify(next) });
+    expect("refused" in refreshedLogin(held, JSON.stringify({ ...next, OPENAI_API_KEY: "sk-planted" }), c)).toBe(true);
+    expect("refused" in refreshedLogin(held, JSON.stringify({ ...next, tokens: { ...next.tokens, account_id: "acct-2" } }), c)).toBe(true);
+  });
+
+  test("Qwen and the Gemini CLI: tokens refreshed; Qwen's resource_url (where its token is sent) never changes", () => {
+    const q = rule(QWEN_HOME_LAYOUT, "oauth_creds.json");
+    const g = rule(GEMINI_CLI_HOME_LAYOUT, "oauth_creds.json");
+    const held = JSON.stringify({ access_token: "a", refresh_token: "r", token_type: "Bearer", resource_url: "portal.qwen.ai", expiry_date: 1 });
+    const next = { ...JSON.parse(held), access_token: "a2", expiry_date: 2 };
+    expect(refreshedLogin(held, JSON.stringify(next), q)).toEqual({ text: JSON.stringify(next) });
+    expect(refreshedLogin(held, JSON.stringify({ ...next, resource_url: "elsewhere.invalid" }), q)).toEqual({ refused: "resource_url changed, which a token refresh never does" });
+    const gHeld = JSON.stringify({ access_token: "ya29.a", refresh_token: "1//r", scope: "openid", token_type: "Bearer", id_token: "i", expiry_date: 1 });
+    const gNext = { ...JSON.parse(gHeld), access_token: "ya29.b", id_token: "j", expiry_date: 2 };
+    expect(refreshedLogin(gHeld, JSON.stringify(gNext), g)).toEqual({ text: JSON.stringify(gNext) });
+  });
+
+  test("end to end: a copy carrying a planted entry isn't written back, the real login is kept, and the session is told", async () => {
+    const real = join(root, "r3-pi-real");
+    const target = join(root, "r3-pi-private");
+    mkdirSync(real, { recursive: true });
+    mkdirSync(target);
+    writeFileSync(join(real, "auth.json"), piHeld, { mode: 0o600 });
+    const own = preparePrivateHome(real, target, PI_HOME_LAYOUT);
+    const planted = JSON.parse(piHeld);
+    planted.openai = { type: "api_key", key: COMMAND };
+    writeFileSync(join(target, "auth.json"), JSON.stringify(planted));
+    const warnings: string[] = [];
+    let closed = false;
+    const handle = withLoginsSynced({ providerId: "fake", spec: {} as never, spawn: () => { throw new Error("unused"); }, exec: async () => { throw new Error("unused"); }, close: async () => { closed = true; } }, own, (t) => warnings.push(t));
+    await handle.close();
+    expect(closed).toBe(true);
+    expect(readFileSync(join(real, "auth.json"), "utf8")).toBe(piHeld);
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("auth.json");
+    expect(warnings[0]).toContain("openai");
   });
 });
 

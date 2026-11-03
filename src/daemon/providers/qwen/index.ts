@@ -1223,6 +1223,6 @@ export function qwenExecutableOption<E extends Record<string, string | undefined
   const own = preparePrivateHome(env.QWEN_HOME || join(env.HOME || homedir(), ".qwen"), rt.privateHome("qwen"), QWEN_HOME_LAYOUT, { state: rt.stateDir("qwen") });
   const withHome = { ...env, QWEN_HOME: own.home };
   // Closed when the query is replaced or torn down: a login the CLI refreshed is written back then.
-  const handle = withLoginsSynced(rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(argv[0] ?? "", argv.slice(1))] }), own);
+  const handle = withLoginsSynced(rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(argv[0] ?? "", argv.slice(1))] }), own, rt.warn);
   return { pathToQwenExecutable: rt.launcher(handle, argv, Object.keys(withHome), "qwen"), env: withHome, handle };
 }

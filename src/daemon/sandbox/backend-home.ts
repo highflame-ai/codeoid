@@ -14,9 +14,11 @@
  *   - its login: the credential file it refreshes ({@link BackendHomeLayout.refreshable})
  *     a private copy (0600), so a refresh is saved however the CLI writes it,
  *     and written back to the real file when the backend's process ends
- *     ({@link PrivateHome.syncLogins}): that one file only, only when it
- *     parses as that backend's credential, only when the real one is still
- *     what was copied (nobody refreshed it meanwhile), atomically. Its other
+ *     ({@link PrivateHome.syncLogins}): that one file only, and of it only
+ *     the token fields a refresh writes, into the real file's own content
+ *     ({@link refreshedLogin}: a copy changed anywhere else — an entry added,
+ *     an api key, a URL — is refused and said so), only when the real one is
+ *     still what was copied (nobody refreshed it meanwhile), atomically. Its other
  *     login files (an `.env`, an account list) linked, read-only;
  *   - conversations (its sessions dir; the Gemini CLI's `tmp/` and its
  *     checkpoint git repository `history/`): the session's own, never the
@@ -53,10 +55,29 @@ export interface BackendHomeLayout {
   always?: readonly string[];
   /**
    * Login files the backend refreshes in place (an OAuth token), each with
-   * what its content must be to be written back: a private copy inside,
-   * the real file updated from it when the backend's process ends.
+   * what a refresh may change in it ({@link LoginRefresh}): a private copy
+   * inside, the real file updated from it when the backend's process ends.
    */
-  refreshable?: Readonly<Record<string, (text: string) => boolean>>;
+  refreshable?: Readonly<Record<string, LoginRefresh>>;
+}
+
+/**
+ * What a refresh of one login file may change. The copy's commands could
+ * write anything there, and the real file is read later by the backend run
+ * outside any sandbox (the user's own CLI, a session with its sandbox off),
+ * some of whose fields it runs or follows (pi runs an api key starting with
+ * `!` as a command; a Qwen `resource_url` or an MCP server's `serverUrl` is
+ * where its token is sent). So only the token fields of entries the real
+ * file already had are taken from the copy, each a plain token value; every
+ * other field must be as it was.
+ */
+export interface LoginRefresh {
+  /** Its format (a credential of that backend at all). */
+  valid: (text: string) => boolean;
+  /** Where a refresh writes: dotted paths, `*` any key of an object. */
+  tokens: readonly string[];
+  /** A `*` at the top matches only entries whose `type` is this (pi: `oauth`, never an `api_key` entry). */
+  entryType?: string;
 }
 
 function jsonObject(text: string): Record<string, unknown> | null {
@@ -102,9 +123,108 @@ export function oauthCredentials(text: string): boolean {
 /** Larger files aren't copied (databases, logs): the backend starts without them. */
 export const COPY_LIMIT = 1024 * 1024;
 
+/** A value a token refresh writes: an opaque token, a time, a scope list. Never a command, path or URL. */
+function tokenValue(v: unknown): boolean {
+  if (typeof v === "number") return Number.isFinite(v);
+  if (typeof v === "string") return /^[A-Za-z0-9._~+/=:-]{1,16384}$/.test(v) && !v.includes("://");
+  if (Array.isArray(v)) return v.length <= 64 && v.every((s) => typeof s === "string" && /^[A-Za-z0-9._:-]{1,256}$/.test(s));
+  return false;
+}
+
+function same(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) || Array.isArray(b)) return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((x, i) => same(x, b[i]));
+  if (!obj(a) || !obj(b)) return false;
+  const ka = Object.keys(a);
+  return ka.length === Object.keys(b).length && ka.every((k) => Object.hasOwn(b, k) && same(a[k], b[k]));
+}
+
+/** The first place `b` differs from `a`, said (for the refusal). */
+function firstDifference(a: unknown, b: unknown, at: string[] = []): string {
+  if (obj(a) && obj(b)) {
+    for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) {
+      const path = [...at, k].join(".");
+      if (!Object.hasOwn(a, k)) return `${path} was added`;
+      if (!Object.hasOwn(b, k)) return `${path} was removed`;
+      if (!same(a[k], b[k])) return firstDifference(a[k], b[k], [...at, k]);
+    }
+  }
+  return `${at.join(".") || "the file"} changed`;
+}
+
+/** The concrete paths `pattern` names among `held`'s and `now`'s keys, where `held` has the object holding it. */
+function tokenPaths(pattern: readonly string[], held: unknown, now: unknown, entryType: string | undefined, at: string[] = []): string[][] {
+  if (pattern.length === 0) return [at];
+  if (!obj(held)) return [];
+  const [head, ...rest] = pattern as [string, ...string[]];
+  if (rest.length === 0) {
+    const keys = head === "*" ? new Set([...Object.keys(held), ...(obj(now) ? Object.keys(now) : [])]) : [head];
+    return [...keys].map((k) => [...at, k]);
+  }
+  const keys = head === "*" ? Object.keys(held) : Object.hasOwn(held, head) ? [head] : [];
+  return keys.flatMap((k) => {
+    if (head === "*" && at.length === 0 && entryType !== undefined && (!obj(held[k]) || held[k].type !== entryType)) return [];
+    return tokenPaths(rest, held[k], obj(now) ? now[k] : undefined, entryType, [...at, k]);
+  });
+}
+
+function getAt(o: unknown, path: readonly string[]): { found: boolean; value?: unknown } {
+  let cur: unknown = o;
+  for (const k of path) {
+    if (!obj(cur) || !Object.hasOwn(cur, k)) return { found: false };
+    cur = cur[k];
+  }
+  return { found: true, value: cur };
+}
+
+/**
+ * The real login file's new text after a refresh saved to the copy: `held`
+ * (what the real one held when copied) with only `rule`'s token fields taken
+ * from `now`, in `held`'s own layout. Refused (and why) when the copy isn't
+ * that backend's credential, or differs from `held` anywhere else: an entry
+ * added, removed or of another type, any other field changed, or a token
+ * field holding what isn't a plain token value.
+ */
+export function refreshedLogin(held: string, now: string, rule: LoginRefresh): { text: string } | { refused: string } {
+  const h = jsonObject(held);
+  const n = jsonObject(now);
+  if (!h || !n || !rule.valid(now)) return { refused: "it is no longer that backend's credential file" };
+  const out = structuredClone(h);
+  for (const pattern of rule.tokens) {
+    for (const path of tokenPaths(pattern.split("."), h, n, rule.entryType)) {
+      const was = getAt(h, path);
+      const is = getAt(n, path);
+      if (!is.found) continue;
+      if (was.found && same(was.value, is.value)) continue;
+      if (!tokenValue(is.value)) return { refused: `${path.join(".")} isn't a token value` };
+      const parent = getAt(out, path.slice(0, -1));
+      if (!parent.found || !obj(parent.value)) continue;
+      parent.value[path[path.length - 1] as string] = is.value;
+    }
+  }
+  if (!same(out, n)) return { refused: `${firstDifference(out, n)}, which a token refresh never does` };
+  const indent = /^\{\r?\n([ \t]+)"/.exec(held)?.[1] ?? "";
+  return { text: `${JSON.stringify(out, null, indent || undefined)}${held.endsWith("\n") ? "\n" : ""}` };
+}
+
 export const CLAUDE_HOME_LAYOUT: BackendHomeLayout = {
   login: [".credentials.json"],
-  refreshable: { ".credentials.json": claudeCredentials },
+  refreshable: {
+    ".credentials.json": {
+      valid: claudeCredentials,
+      tokens: [
+        "claudeAiOauth.accessToken",
+        "claudeAiOauth.refreshToken",
+        "claudeAiOauth.expiresAt",
+        "claudeAiOauth.scopes",
+        "claudeAiOauth.subscriptionType",
+        "claudeAiOauth.rateLimitTier",
+        "mcpOAuth.*.accessToken",
+        "mcpOAuth.*.refreshToken",
+        "mcpOAuth.*.expiresAt",
+      ],
+    },
+  },
   shared: ["projects"],
   code: ["plugins", "skills", "agents", "commands", "hooks", "output-styles"],
   always: [".claude.json"],
@@ -112,28 +232,28 @@ export const CLAUDE_HOME_LAYOUT: BackendHomeLayout = {
 
 export const CODEX_HOME_LAYOUT: BackendHomeLayout = {
   login: ["auth.json"],
-  refreshable: { "auth.json": codexCredentials },
+  refreshable: { "auth.json": { valid: codexCredentials, tokens: ["tokens.id_token", "tokens.access_token", "tokens.refresh_token", "last_refresh"] } },
   shared: ["sessions", "archived_sessions"],
   code: ["skills", "prompts", "plugins"],
 };
 
 export const PI_HOME_LAYOUT: BackendHomeLayout = {
   login: ["auth.json"],
-  refreshable: { "auth.json": piCredentials },
+  refreshable: { "auth.json": { valid: piCredentials, tokens: ["*.access", "*.refresh", "*.expires"], entryType: "oauth" } },
   shared: ["sessions"],
   code: ["extensions", "skills", "prompts", "themes", "tools", "agents", "bin"],
 };
 
 export const GEMINI_CLI_HOME_LAYOUT: BackendHomeLayout = {
   login: ["oauth_creds.json", "google_accounts.json", "gemini-credentials.json", ".env"],
-  refreshable: { "oauth_creds.json": oauthCredentials },
+  refreshable: { "oauth_creds.json": { valid: oauthCredentials, tokens: ["access_token", "refresh_token", "id_token", "expiry_date", "scope", "token_type"] } },
   shared: ["tmp", "history"],
   code: ["extensions", "commands", "skills", "agents", "policies"],
 };
 
 export const QWEN_HOME_LAYOUT: BackendHomeLayout = {
   login: ["oauth_creds.json", ".env"],
-  refreshable: { "oauth_creds.json": oauthCredentials },
+  refreshable: { "oauth_creds.json": { valid: oauthCredentials, tokens: ["access_token", "refresh_token", "id_token", "expiry_date", "token_type"] } },
   shared: ["projects", "tmp"],
   code: ["extensions", "commands", "skills", "agents"],
 };
@@ -148,10 +268,18 @@ export interface PrivateHome {
   readable: string[];
   /**
    * Write each refreshed login back to its real file (see the module's
-   * comment); the names written. Run when the backend's process has ended
+   * comment): the names written, and those refused with why (the real
+   * login is kept). Run when the backend's process has ended
    * ({@link withLoginsSynced}); safe to run again.
    */
-  syncLogins(): string[];
+  syncLogins(): LoginSync;
+}
+
+/** What a write-back did. */
+export interface LoginSync {
+  written: string[];
+  /** A copy changed beyond a token refresh ({@link refreshedLogin}): not written back. */
+  refused: Array<{ name: string; reason: string }>;
 }
 
 /** A refreshable login copied in: where it came from and what it held then. */
@@ -159,8 +287,11 @@ interface CopiedLogin {
   name: string;
   real: string;
   copy: string;
+  /** What the real file holds (as copied, or as last written back). */
   held: string;
-  valid: (text: string) => boolean;
+  /** The copy as last judged: unchanged since, nothing to do. */
+  judged: string;
+  rule: LoginRefresh;
 }
 
 /** Larger isn't a login. */
@@ -176,34 +307,43 @@ function readSmallFile(p: string): string | null {
   }
 }
 
-function syncLogins(copied: CopiedLogin[]): string[] {
-  const written: string[] = [];
+function syncLogins(copied: CopiedLogin[]): LoginSync {
+  const out: LoginSync = { written: [], refused: [] };
   for (const c of copied) {
     // A regular file only (a link the backend left there leads anywhere).
     const now = readSmallFile(c.copy);
-    if (now === null || now === c.held || !c.valid(now)) continue;
+    if (now === null || now === c.judged) continue;
+    const merged = refreshedLogin(c.held, now, c.rule);
+    if ("refused" in merged) {
+      out.refused.push({ name: c.name, reason: merged.refused });
+      continue;
+    }
+    c.judged = now;
+    if (merged.text === c.held) continue;
     // The real one must still be what was copied: a refresh someone else saved meanwhile isn't overwritten.
     if (readSmallFile(c.real) !== c.held) continue;
     const part = join(dirname(c.real), `.${basename(c.real)}.codeoid-${process.pid}-${randomBytes(4).toString("hex")}`);
     try {
-      writeFileSync(part, now, { mode: 0o600, flag: "wx" });
+      writeFileSync(part, merged.text, { mode: 0o600, flag: "wx" });
       renameSync(part, c.real);
     } catch {
       rmSync(part, { force: true });
       continue;
     }
-    c.held = now;
-    written.push(c.name);
+    c.held = merged.text;
+    out.written.push(c.name);
   }
-  return written;
+  return out;
 }
 
 /**
  * `handle`, whose close first writes the backend's refreshed logins back
  * ({@link PrivateHome.syncLogins}): each backend closes its handle when its
- * process has ended, or its query is replaced.
+ * process has ended, or its query is replaced. `warn`: told of a login not
+ * written back because its copy changed beyond a refresh (a session's
+ * warning line).
  */
-export function withLoginsSynced(handle: SandboxHandle, home: Pick<PrivateHome, "syncLogins">): SandboxHandle {
+export function withLoginsSynced(handle: SandboxHandle, home: Pick<PrivateHome, "syncLogins">, warn?: (text: string) => void): SandboxHandle {
   let synced = false;
   return {
     get providerId() {
@@ -219,7 +359,11 @@ export function withLoginsSynced(handle: SandboxHandle, home: Pick<PrivateHome, 
       if (!synced) {
         synced = true;
         try {
-          home.syncLogins();
+          for (const r of home.syncLogins().refused) {
+            const text = `The backend's login (${r.name}) was not saved back from its sandbox: ${r.reason}. Your own login is unchanged; sign in again if this session's refreshed token is needed.`;
+            console.warn(`[codeoid/sandbox] ${text}`);
+            warn?.(text);
+          }
         } catch {
           /* the login stays as it was: the next start reads the real one */
         }
@@ -298,7 +442,7 @@ export function preparePrivateHome(
       if (held !== null) {
         try {
           writeFileSync(join(target, name), held, { mode: 0o600, flag: "wx" });
-          copied.push({ name, real, copy: join(target, name), held, valid: refresh });
+          copied.push({ name, real, copy: join(target, name), held, judged: held, rule: refresh });
           continue;
         } catch {
           /* not copied: linked read-only below */

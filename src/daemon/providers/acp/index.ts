@@ -347,7 +347,7 @@ export class GeminiAcpProvider implements SessionProvider {
         const own = preparePrivateHome(join(defaultGeminiCliRoot(env), ".gemini"), join(root, ".gemini"), GEMINI_CLI_HOME_LAYOUT, { state: rt.stateDir("gemini-cli") });
         env = { ...env, GEMINI_CLI_HOME: root };
         // Closed when the CLI exits: a login it refreshed is written back then.
-        handle = withLoginsSynced(await rt.open([root, ...own.writable], { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix)] }), own);
+        handle = withLoginsSynced(await rt.open([root, ...own.writable], { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix)] }), own, rt.warn);
       }
       const opened = handle;
       this.#proc = new StdioJsonRpcProcess({
