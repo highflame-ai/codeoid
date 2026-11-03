@@ -171,6 +171,24 @@ async function runPrompt(message: string): Promise<void> {
       text = `UNWRITABLE:${err instanceof Error ? err.message : String(err)}`;
     }
     emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } });
+  } else if (message.startsWith("refresh-login:")) {
+    // A token refresh that rotates the refresh token, saved as real CLIs do (#448 round 2):
+    // `refresh-login:<path>` writes in place; `refresh-login:<path>|rename` writes a temp file and renames it over.
+    const [path = "", how] = message.slice("refresh-login:".length).trim().split("|");
+    const rotated = `${JSON.stringify({ anthropic: { type: "oauth", access: "NEW-ACCESS", refresh: "ROTATED-REFRESH", expires: 1 } })}\n`;
+    let text: string;
+    try {
+      if (how === "rename") {
+        await Bun.write(`${path}.tmp`, rotated);
+        require("node:fs").renameSync(`${path}.tmp`, path);
+      } else {
+        await Bun.write(path, rotated);
+      }
+      text = "REFRESHED";
+    } catch (err) {
+      text = `UNSAVED:${err instanceof Error ? err.message : String(err)}`;
+    }
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } });
   } else if (message.includes("echo-env:")) {
     // One variable of this process's environment (`echo-env:<NAME>`).
     const text = `ENV:${process.env[message.slice(message.indexOf("echo-env:") + "echo-env:".length).trim()] ?? ""}`;

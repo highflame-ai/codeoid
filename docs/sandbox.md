@@ -180,9 +180,9 @@ What each leaves open:
   settings run in the CLI, outside the sandbox, as they always did (#395
   approves a project's MCP servers).
 - **Codex (bubblewrap)**: the app-server runs in a private copy of its home
-  (below): its `auth.json` stays readable by its commands (codex's sandbox
-  doesn't hide reads), but neither it nor anything else of the real
-  `CODEX_HOME` can be written. Everything else is hidden by codeoid's
+  (below): its `auth.json` (a private copy) stays readable by its commands
+  (codex's sandbox doesn't hide reads), and nothing of the real `CODEX_HOME`
+  can be written (a refreshed login is written back by the daemon, below). Everything else is hidden by codeoid's
   bubblewrap. The network `off` is codex's own sandbox's (codeoid's bubblewrap
   keeps it on for the app-server): in guarded or interactive mode, a command
   codex asks to rerun outside its sandbox arrives as an ordinary command
@@ -192,8 +192,9 @@ What each leaves open:
   Codex under Seatbelt)**: the backend runs in a **private copy of its home**,
   made afresh at each start (`src/daemon/sandbox/backend-home.ts`) and pointed
   at by the variable it reads (`PI_CODING_AGENT_DIR`, `GEMINI_CLI_HOME`,
-  `QWEN_HOME`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`): its login linked and shown
-  read-only, its conversations (`sessions/`, `projects/`, the Gemini CLI's
+  `QWEN_HOME`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`): its login a private copy
+  (the credential file it refreshes; its other login files, an `.env` or an
+  account list, linked read-only), its conversations (`sessions/`, `projects/`, the Gemini CLI's
   `tmp/` and `history/`, Qwen's `tmp/`) the **session's own**, kept in
   `<transcriptDir>/sandbox-state/<session>/<backend>/` across restarts and
   removed when the session is destroyed — never the real dirs, which hold
@@ -207,11 +208,20 @@ What each leaves open:
   `config.toml`) reaches the real home, where your own CLI, or a session with
   the sandbox off, would run it. Its login is readable by its commands, the
   API key in its environment is visible to them (`env`, `/proc/<backend>/environ`
-  in the same sandbox), and they have the network (the backend needs it). A
-  token the backend refreshes can't be saved from inside (its login is
-  read-only); the next start reads the host's again. Not verified with the
-  real vendor CLIs here: whether each tolerates that save failing (the fakes
-  do).
+  in the same sandbox), and they have the network (the backend needs it).
+  **A login the backend refreshes** (an OAuth token, whose refresh token the
+  provider may rotate) is saved to its private copy, however the CLI writes
+  it, and written back to the real file by the daemon when the backend's
+  process ends (or its query is replaced): only that file (Claude's
+  `.credentials.json`, Codex's and pi's `auth.json`, the Gemini CLI's and
+  Qwen's `oauth_creds.json`), only when it parses as that backend's
+  credential, only when the real file is still what was copied (your own
+  CLI's refresh meanwhile isn't overwritten), atomically (a temp file
+  renamed over it). A command can still replace it with another valid
+  credential of that backend, which would then be written back: the token
+  was already readable to it. Not verified with the real vendor CLIs here
+  (no network): a fake that rotates its refresh token, saving it in place
+  and by a rename, is.
 - **Conversations across a sandbox change.** A process backend's native
   conversation lives in the session's own dir while sandboxed and in your real
   home while not: switching a session's sandbox off or on, a fork, and a

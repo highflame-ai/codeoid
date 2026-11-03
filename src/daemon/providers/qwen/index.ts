@@ -59,7 +59,7 @@ import { buildQwenEnv, withExtraEnv } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { ResolvedAccount } from "../../accounts.js";
 import { qwenAccountEnv } from "../../account-apply.js";
-import { preparePrivateHome, QWEN_HOME_LAYOUT } from "../../sandbox/backend-home.js";
+import { preparePrivateHome, QWEN_HOME_LAYOUT, withLoginsSynced } from "../../sandbox/backend-home.js";
 import { programLocations } from "../../sandbox/policy.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../../sandbox/types.js";
@@ -1208,8 +1208,8 @@ export function qwenCliArgv(configured: string | undefined): string[] {
 /**
  * The SDK's `pathToQwenExecutable` (#448): with the session's sandbox
  * around the process, a launcher that starts the CLI inside it, in a private
- * copy of its home (backend-home.ts: its login read-only, its sessions
- * shared; `env` gets `QWEN_HOME`), and the handle it runs in (the caller
+ * copy of its home (backend-home.ts: its login a private copy written back
+ * when the handle closes, its sessions the session's own; `env` gets `QWEN_HOME`), and the handle it runs in (the caller
  * closes it when the query is replaced); else the configured command, or
  * none (the bundled CLI). One launcher per session, rewritten in place.
  */
@@ -1222,6 +1222,7 @@ export function qwenExecutableOption<E extends Record<string, string | undefined
   const argv = qwenCliArgv(configured);
   const own = preparePrivateHome(env.QWEN_HOME || join(env.HOME || homedir(), ".qwen"), rt.privateHome("qwen"), QWEN_HOME_LAYOUT, { state: rt.stateDir("qwen") });
   const withHome = { ...env, QWEN_HOME: own.home };
-  const handle = rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(argv[0] ?? "", argv.slice(1))] });
+  // Closed when the query is replaced or torn down: a login the CLI refreshed is written back then.
+  const handle = withLoginsSynced(rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(argv[0] ?? "", argv.slice(1))] }), own);
   return { pathToQwenExecutable: rt.launcher(handle, argv, Object.keys(withHome), "qwen"), env: withHome, handle };
 }

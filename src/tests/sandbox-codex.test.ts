@@ -160,7 +160,11 @@ describe.skipIf(!real.available)("codex's app-server inside real bubblewrap", ()
     process.env.CODEX_HOME = join(root, "codex-home");
     try {
       expect(await textOf(p, turnOpts(`read-file:${join(root, "secrets", "token")}`, join(root, "ws")))).toStartWith("UNREADABLE:");
-      expect(await textOf(p, turnOpts(`read-file:${join(root, "codex-home", "auth.json")}`, join(root, "ws")))).toBe("CONTENT:OWN-LOGIN");
+      // Its login through its own CODEX_HOME (a private copy, written back when it exits: #448 round 2); the real file isn't shown.
+      const home = (JSON.parse(await textOf(p, turnOpts("echo-env", join(root, "ws")))) as Record<string, string>).CODEX_HOME ?? "";
+      expect(home).not.toBe(join(root, "codex-home"));
+      expect(await textOf(p, turnOpts(`read-file:${join(home, "auth.json")}`, join(root, "ws")))).toBe("CONTENT:OWN-LOGIN");
+      expect(await textOf(p, turnOpts(`read-file:${join(root, "codex-home", "auth.json")}`, join(root, "ws")))).toStartWith("UNREADABLE:");
       // Its real home isn't writable: a config.toml planted there would run in the user's own codex (#448 round 1).
       expect(await textOf(p, turnOpts(`write-file:${join(root, "codex-home", "config.toml")}`, join(root, "ws")))).toStartWith("UNWRITABLE:");
       expect(await textOf(p, turnOpts(`write-file:${join(root, "codex-home", "auth.json")}`, join(root, "ws")))).toStartWith("UNWRITABLE:");

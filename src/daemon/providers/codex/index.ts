@@ -80,7 +80,7 @@ import { codexKeySafe, codexShellEnvExcludeArgs } from "./shell-env.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import type { ResolvedAccount } from "../../accounts.js";
 import { applyCodexAccount, defaultCodexHome } from "../../account-apply.js";
-import { CODEX_HOME_LAYOUT, preparePrivateHome } from "../../sandbox/backend-home.js";
+import { CODEX_HOME_LAYOUT, preparePrivateHome, withLoginsSynced } from "../../sandbox/backend-home.js";
 import { programLocations } from "../../sandbox/policy.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../../sandbox/types.js";
@@ -962,7 +962,8 @@ export class CodexProvider implements SessionProvider {
       if (rt?.plan.wrapsBackend) {
         const own = preparePrivateHome(defaultCodexHome(env), rt.privateHome("codex"), CODEX_HOME_LAYOUT, { state: rt.stateDir("codex") });
         procEnv = { ...env, CODEX_HOME: own.home };
-        handle = await rt.open(own.writable, { backendNetwork: true, readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix)] });
+        // Closed when the app-server exits: a login it refreshed is written back then.
+        handle = withLoginsSynced(await rt.open(own.writable, { backendNetwork: true, readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix)] }), own);
       }
       const opened = handle;
       this.#proc = new CodexRpcProcess({

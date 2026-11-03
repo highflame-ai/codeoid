@@ -10,7 +10,7 @@
  *   - `process`: the backend's whole process starts inside (pi, the Gemini
  *     CLI, Qwen; Claude and Codex under Docker; Codex under Seatbelt, which
  *     doesn't nest). It runs in a private copy of its home (backend-home.ts),
- *     its login read-only and its conversations shared, so nothing its
+ *     its login a private copy written back and its conversations its own, so nothing its
  *     commands write there runs later outside a sandbox; it needs the network
  *     to reach its model, so the network can't be turned off for its commands.
  *   - `command`: each shell command starts inside (opencode: one server
@@ -46,7 +46,7 @@ const HTTP_BACKENDS = new Set(["openai", "gemini", "llamacpp"]);
 const NO_COMMAND_BACKENDS = new Set(["scripted", "mock"]);
 
 const PROCESS_LIMITS = (backend: string) => [
-  `${backend}'s login is readable (not writable) by its commands; its settings are a private copy, made afresh at each start`,
+  `${backend}'s login is readable by its commands (a private copy, a refresh written back); its settings are a private copy, made afresh at each start`,
   `${backend} needs the network to reach its model, so its commands have the network too`,
 ];
 
@@ -126,7 +126,7 @@ export function confinementFor(backendId: string, provider: SandboxProvider | nu
             network: ["on", "off"],
             fileTools: true,
             wrapsBackend: true,
-            limits: ["codex's login is readable (not writable) by its commands; its settings are a private copy, made afresh at each start"],
+            limits: ["codex's login is readable by its commands (a private copy, a refresh written back); its settings are a private copy, made afresh at each start"],
           },
         };
       }

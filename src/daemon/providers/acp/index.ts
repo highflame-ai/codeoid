@@ -49,7 +49,7 @@ import type { ResolvedAccount } from "../../accounts.js";
 import { applyGeminiCliAccount, applyGeminiCliEffort, defaultGeminiCliRoot } from "../../account-apply.js";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { GEMINI_CLI_HOME_LAYOUT, preparePrivateHome } from "../../sandbox/backend-home.js";
+import { GEMINI_CLI_HOME_LAYOUT, preparePrivateHome, withLoginsSynced } from "../../sandbox/backend-home.js";
 import { programLocations } from "../../sandbox/policy.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../../sandbox/types.js";
@@ -338,7 +338,7 @@ export class GeminiAcpProvider implements SessionProvider {
       );
       // The OS sandbox (#448): the CLI's whole process starts inside the
       // session's, in a private copy of its ~/.gemini (backend-home.ts: its
-      // login read-only, its chats shared), its program readable.
+      // login a private copy written back, its chats the session's own), its program readable.
       const rt = this.#sandbox?.() ?? null;
       let handle: SandboxHandle | null = null;
       if (rt?.plan.wrapsBackend) {
@@ -346,7 +346,8 @@ export class GeminiAcpProvider implements SessionProvider {
         mkdirSync(join(root, ".gemini"), { mode: 0o700 });
         const own = preparePrivateHome(join(defaultGeminiCliRoot(env), ".gemini"), join(root, ".gemini"), GEMINI_CLI_HOME_LAYOUT, { state: rt.stateDir("gemini-cli") });
         env = { ...env, GEMINI_CLI_HOME: root };
-        handle = await rt.open([root, ...own.writable], { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix)] });
+        // Closed when the CLI exits: a login it refreshed is written back then.
+        handle = withLoginsSynced(await rt.open([root, ...own.writable], { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix)] }), own);
       }
       const opened = handle;
       this.#proc = new StdioJsonRpcProcess({

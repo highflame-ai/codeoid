@@ -8,7 +8,7 @@
  *   - Qwen's real bundled CLI starts through its launcher inside bubblewrap.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { GeminiAcpProvider } from "../daemon/providers/acp/index.js";
@@ -85,6 +85,11 @@ afterEach(() => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
+/** Wait for `cond` (polled), up to `ms`. */
+async function until(cond: () => boolean, ms = 5_000): Promise<void> {
+  for (const end = Date.now() + ms; Date.now() < end; await Bun.sleep(25)) if (cond()) return;
+}
+
 function makePi(rt: SandboxRuntime | null, workdir: string): PiProvider {
   store.createSession({ id: "sess-pi", name: "pi", workdir, status: "idle", createdBy: "u", createdAt: new Date().toISOString(), attachedClients: 0, accountId: "a", projectId: "p" });
   return new PiProvider({ sessionId: "sess-pi", initialBackingId: "sess-pi", command: process.execPath, argsPrefix: [PI], store, sandbox: () => rt });
@@ -113,7 +118,10 @@ describe("each backend's own state, and how it is started", () => {
       for (const w of state) expect(w.startsWith(realpathSync(join(tmp, "pi-agent")))).toBe(false);
       expect(readFileSync(join(privateHome, "settings.json"), "utf8")).toBe('{"theme":"dark"}');
       const readable = (opened[0]?.opts as { readable: string[] }).readable;
-      expect(readable).toContain(realpathSync(join(tmp, "pi-agent", "auth.json")));
+      // Its login a private copy (round 2: a refresh is written back), the real file not shown at all.
+      expect(readable).not.toContain(realpathSync(join(tmp, "pi-agent", "auth.json")));
+      expect(lstatSync(join(privateHome, "auth.json")).isFile()).toBe(true);
+      expect(readFileSync(join(privateHome, "auth.json"), "utf8")).toBe("{}");
       expect(readable).toEqual(expect.arrayContaining(programLocations(process.execPath, [PI])));
       expect(readable.some((d) => d.includes("codeoid-pi-bridge-"))).toBe(true);
     } finally {
@@ -196,7 +204,7 @@ describe.skipIf(!real.available)("inside real bubblewrap", () => {
     rmSync(root, { recursive: true, force: true });
   });
 
-  test("pi: a planted credential is unreadable, its own login is readable and not writable, its settings a private copy (#448 round 1)", async () => {
+  test("pi: a planted credential is unreadable, its own login readable through its home (a private copy), the real one not writable, its settings a private copy (#448 round 1)", async () => {
     await sbx.refresh("pi");
     expect(sbx.info).toMatchObject({ state: "on", confinement: "process" });
     process.env.PI_CODING_AGENT_DIR = join(root, "pi-agent");
@@ -204,12 +212,15 @@ describe.skipIf(!real.available)("inside real bubblewrap", () => {
     const p = makePi(sbx.runtime, join(root, "ws"));
     try {
       expect(await textOf(p.runTurn(turn(`read-file:${join(root, "secrets", "token")}`, join(root, "ws"))))).toStartWith("UNREADABLE:");
-      expect(await textOf(p.runTurn(turn(`read-file:${join(root, "pi-agent", "auth.json")}`, join(root, "ws"))))).toBe("CONTENT:PI-LOGIN");
+      // The real login isn't shown (round 2): its private copy is.
+      expect(await textOf(p.runTurn(turn(`read-file:${join(root, "pi-agent", "auth.json")}`, join(root, "ws"))))).toStartWith("UNREADABLE:");
       const home = (await textOf(p.runTurn(turn("echo-env:PI_CODING_AGENT_DIR", join(root, "ws"))))).slice("ENV:".length);
       expect(home).not.toBe(join(root, "pi-agent"));
-      // Its login, read through its home, can't be rewritten; the real agent dir can't be written at all.
+      // Its login, read through its home, is a private copy (round 2: a refresh is saved there and written back,
+      // below); what isn't a pi credential never reaches the real one. The real agent dir can't be written at all.
       expect(await textOf(p.runTurn(turn(`read-file:${join(home, "auth.json")}`, join(root, "ws"))))).toBe("CONTENT:PI-LOGIN");
-      expect(await textOf(p.runTurn(turn(`write-file:${join(home, "auth.json")}`, join(root, "ws"))))).toStartWith("UNWRITABLE:");
+      expect(await textOf(p.runTurn(turn(`write-file:${join(home, "auth.json")}`, join(root, "ws"))))).toBe("WROTE");
+      expect(await textOf(p.runTurn(turn(`write-file:${join(root, "pi-agent", "auth.json")}`, join(root, "ws"))))).toStartWith("UNWRITABLE:");
       expect(await textOf(p.runTurn(turn(`write-file:${join(root, "pi-agent", "settings.json")}`, join(root, "ws"))))).toStartWith("UNWRITABLE:");
       expect(await textOf(p.runTurn(turn(`write-file:${join(root, "pi-agent", "extensions", "evil.ts")}`, join(root, "ws"))))).toStartWith("UNWRITABLE:");
       // Its own settings it may change: in the private copy only.
@@ -222,6 +233,54 @@ describe.skipIf(!real.available)("inside real bubblewrap", () => {
     expect(existsSync(join(root, "pi-agent", "extensions", "evil.ts"))).toBe(false);
   }, 60_000);
 
+  test("a login the backend refreshes inside (in place, or a temp file renamed over it) is written back to the real one when its process ends; only that file, only a valid one, never over a newer one (#448 round 2)", async () => {
+    await sbx.refresh("pi");
+    const real = join(root, "pi-agent", "auth.json");
+    const before = `${JSON.stringify({ anthropic: { type: "oauth", access: "OLD", refresh: "OLD-REFRESH", expires: 0 } })}\n`;
+    process.env.PI_CODING_AGENT_DIR = join(root, "pi-agent");
+    for (const how of ["", "|rename"]) {
+      writeFileSync(real, before, { mode: 0o600 });
+      writeFileSync(join(root, "pi-agent", "settings.json"), '{"real":true}\n');
+      const p = makePi(sbx.runtime, join(root, "ws"));
+      try {
+        const home = (await textOf(p.runTurn(turn("echo-env:PI_CODING_AGENT_DIR", join(root, "ws"))))).slice("ENV:".length);
+        expect(await textOf(p.runTurn(turn(`refresh-login:${join(home, "auth.json")}${how}`, join(root, "ws"))))).toBe("REFRESHED");
+        // Something else of its home changed too: never written back.
+        expect(await textOf(p.runTurn(turn(`write-file:${join(home, "settings.json")}`, join(root, "ws"))))).toBe("WROTE");
+        // Not yet: the process still runs.
+        expect(readFileSync(real, "utf8")).toBe(before);
+      } finally {
+        await p.teardown();
+      }
+      await until(() => readFileSync(real, "utf8").includes("ROTATED-REFRESH"));
+      expect(JSON.parse(readFileSync(real, "utf8")).anthropic.refresh).toBe("ROTATED-REFRESH");
+      expect(statSync(real).mode & 0o777).toBe(0o600);
+      expect(readFileSync(join(root, "pi-agent", "settings.json"), "utf8")).toBe('{"real":true}\n');
+    }
+    // What isn't a pi credential, or would overwrite a refresh saved meanwhile, isn't written back.
+    writeFileSync(real, before, { mode: 0o600 });
+    const p = makePi(sbx.runtime, join(root, "ws"));
+    try {
+      const home = (await textOf(p.runTurn(turn("echo-env:PI_CODING_AGENT_DIR", join(root, "ws"))))).slice("ENV:".length);
+      expect(await textOf(p.runTurn(turn(`write-file:${join(home, "auth.json")}`, join(root, "ws"))))).toBe("WROTE");
+    } finally {
+      await p.teardown();
+    }
+    await Bun.sleep(300);
+    expect(readFileSync(real, "utf8")).toBe(before);
+    const p2 = makePi(sbx.runtime, join(root, "ws"));
+    try {
+      const home = (await textOf(p2.runTurn(turn("echo-env:PI_CODING_AGENT_DIR", join(root, "ws"))))).slice("ENV:".length);
+      expect(await textOf(p2.runTurn(turn(`refresh-login:${join(home, "auth.json")}`, join(root, "ws"))))).toBe("REFRESHED");
+      // The user's own pi refreshed it meanwhile.
+      writeFileSync(real, `${JSON.stringify({ anthropic: { type: "oauth", access: "USER", refresh: "USER-REFRESH", expires: 2 } })}\n`);
+    } finally {
+      await p2.teardown();
+    }
+    await Bun.sleep(300);
+    expect(readFileSync(real, "utf8")).toContain("USER-REFRESH");
+  }, 120_000);
+
   test("the Gemini CLI: a planted credential is unreadable, its own .gemini isn't", async () => {
     await sbx.refresh("gemini-cli");
     const prev = process.env.GEMINI_CLI_HOME;
@@ -229,7 +288,10 @@ describe.skipIf(!real.available)("inside real bubblewrap", () => {
     const p = new GeminiAcpProvider({ sessionId: "s", initialBackingId: "s", command: process.execPath, argsPrefix: [ACP], store: {} as never, sandbox: () => sbx.runtime });
     try {
       expect(await textOf(p.runTurn(turn(`read-file:${join(root, "secrets", "token")}`, join(root, "ws"))))).toStartWith("UNREADABLE:");
-      expect(await textOf(p.runTurn(turn(`read-file:${join(root, "gemini-home", ".gemini", "oauth_creds.json")}`, join(root, "ws"))))).toBe("CONTENT:GEMINI-LOGIN");
+      // Its login through its own home (a private copy, round 2); the real file isn't shown.
+      const gemini = (await textOf(p.runTurn(turn("echo-env:GEMINI_CLI_HOME", join(root, "ws"))))).slice("ENV:".length);
+      expect(await textOf(p.runTurn(turn(`read-file:${join(gemini, ".gemini", "oauth_creds.json")}`, join(root, "ws"))))).toBe("CONTENT:GEMINI-LOGIN");
+      expect(await textOf(p.runTurn(turn(`read-file:${join(root, "gemini-home", ".gemini", "oauth_creds.json")}`, join(root, "ws"))))).toStartWith("UNREADABLE:");
       // Its real settings can't be written (a hook or an extension planted there would run in the user's own gemini).
       expect(await textOf(p.runTurn(turn(`write-file:${join(root, "gemini-home", ".gemini", "settings.json")}`, join(root, "ws"))))).toStartWith("UNWRITABLE:");
     } finally {

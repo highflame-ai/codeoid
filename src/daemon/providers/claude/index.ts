@@ -76,7 +76,7 @@ import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.js";
 import { listProcesses } from "../../process-tree.js";
-import { CLAUDE_HOME_LAYOUT, preparePrivateHome } from "../../sandbox/backend-home.js";
+import { CLAUDE_HOME_LAYOUT, preparePrivateHome, withLoginsSynced } from "../../sandbox/backend-home.js";
 import { asksUnsandboxed, claudeCacheEnv, claudeSandboxSettings, claudeTempEnv } from "../../sandbox/claude-native.js";
 import { programLocations } from "../../sandbox/policy.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
@@ -2874,7 +2874,8 @@ export function claudeSandboxOptions(
           ...(o.env.CLAUDE_CONFIG_DIR ? {} : { extraFiles: { ".claude.json": join(home, ".claude.json") } }),
         });
         configDir = own.home;
-        handle = rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(o.command, [])] });
+        // Closed when the query is replaced or torn down: a login the CLI refreshed is written back then.
+        handle = withLoginsSynced(rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(o.command, [])] }), own);
         track?.(handle);
       }
       const childEnv: Record<string, string> = {};

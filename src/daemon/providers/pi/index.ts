@@ -56,7 +56,7 @@ import type { ResolvedAccount } from "../../accounts.js";
 import { applyPiAccount, applyPiSettingsOverlay, piAgentDirOf, piDefaultThinkingLevel } from "../../account-apply.js";
 import { realpathSync } from "node:fs";
 import { dirname } from "node:path";
-import { PI_HOME_LAYOUT, preparePrivateHome } from "../../sandbox/backend-home.js";
+import { PI_HOME_LAYOUT, preparePrivateHome, withLoginsSynced } from "../../sandbox/backend-home.js";
 import { programLocations } from "../../sandbox/policy.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../../sandbox/types.js";
@@ -366,7 +366,8 @@ export class PiProvider implements SessionProvider {
     if (rt?.plan.wrapsBackend) {
       const own = preparePrivateHome(piAgentDirOf(env), rt.privateHome("pi"), PI_HOME_LAYOUT, { state: rt.stateDir("pi") });
       env = { ...env, PI_CODING_AGENT_DIR: own.home };
-      handle = await rt.open(own.writable, { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix), dirname(bridge)] });
+      // Closed when pi exits: a login it refreshed is written back then.
+      handle = withLoginsSynced(await rt.open(own.writable, { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix), dirname(bridge)] }), own);
     }
     const opened = handle;
     this.#proc = new PiRpcProcess({

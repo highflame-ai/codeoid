@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import { loadConfig } from "../config.js";
-import { COPY_LIMIT, PI_HOME_LAYOUT, preparePrivateHome } from "../daemon/sandbox/backend-home.js";
+import { COPY_LIMIT, claudeCredentials, codexCredentials, oauthCredentials, PI_HOME_LAYOUT, piCredentials, preparePrivateHome } from "../daemon/sandbox/backend-home.js";
 import { bwrapArgs, type PathKind } from "../daemon/sandbox/bwrap.js";
 import { claudeCacheEnv, claudeSandboxSettings, claudeTempEnv, physicalOf } from "../daemon/sandbox/claude-native.js";
 import { buildSandboxSpec, DEFAULT_HOME_READABLE, gitWorkspacePaths, homeCredentialFilesIn, programLocations, sandboxConfigOf } from "../daemon/sandbox/policy.js";
@@ -306,8 +306,11 @@ describe("a backend's private home", () => {
     const state = join(root, "pi-state");
     const own = preparePrivateHome(overlay, target, PI_HOME_LAYOUT, { state });
     expect(own.home).toBe(target);
-    expect(readlinkSync(join(target, "auth.json"))).toBe(join(real, "auth.json"));
-    expect(own.readable).toEqual(expect.arrayContaining([join(real, "auth.json"), join(real, "extensions")]));
+    // Its login a private copy (0600; round 2: a refresh is written back), its code linked read-only.
+    expect(lstatSync(join(target, "auth.json")).isFile()).toBe(true);
+    expect(readFileSync(join(target, "auth.json"), "utf8")).toBe("LOGIN");
+    expect(statSync(join(target, "auth.json")).mode & 0o777).toBe(0o600);
+    expect(own.readable).toEqual([join(real, "extensions")]);
     expect(lstatSync(join(target, "settings.json")).isFile()).toBe(true);
     expect(readFileSync(join(target, "settings.json"), "utf8")).toBe('{"a":1}');
     expect(statSync(join(target, "settings.json")).mode & 0o777).toBe(0o600);
@@ -325,6 +328,66 @@ describe("a backend's private home", () => {
     const none = preparePrivateHome(overlay, bare, PI_HOME_LAYOUT);
     expect(lstatSync(join(bare, "sessions")).isDirectory()).toBe(true);
     expect(none.writable).toEqual([bare]);
+  });
+});
+
+describe("a login refreshed inside, written back (#448 round 2)", () => {
+  const valid = (refresh: string) => `${JSON.stringify({ anthropic: { type: "oauth", access: "a", refresh, expires: 1 } })}\n`;
+  const setup = (name: string) => {
+    const real = join(root, `${name}-real`);
+    const target = join(root, `${name}-private`);
+    mkdirSync(real, { recursive: true });
+    mkdirSync(target);
+    writeFileSync(join(real, "auth.json"), valid("OLD"), { mode: 0o600 });
+    writeFileSync(join(real, "settings.json"), "{}");
+    return { real, target, own: preparePrivateHome(real, target, PI_HOME_LAYOUT) };
+  };
+
+  test("a valid refresh is written back atomically (the real file replaced whole, 0600); nothing else of the home is", () => {
+    const { real, target, own } = setup("lw-ok");
+    writeFileSync(join(target, "auth.json"), valid("ROTATED"));
+    writeFileSync(join(target, "settings.json"), '{"changed":true}');
+    writeFileSync(join(target, "new-file.json"), "{}");
+    expect(own.syncLogins()).toEqual(["auth.json"]);
+    expect(readFileSync(join(real, "auth.json"), "utf8")).toBe(valid("ROTATED"));
+    expect(statSync(join(real, "auth.json")).mode & 0o777).toBe(0o600);
+    expect(readFileSync(join(real, "settings.json"), "utf8")).toBe("{}");
+    expect(existsSync(join(real, "new-file.json"))).toBe(false);
+    // No temp file left beside it; again is a no-op.
+    expect(readdirSync(real).sort()).toEqual(["auth.json", "settings.json"]);
+    expect(own.syncLogins()).toEqual([]);
+  });
+
+  test("not written back: what isn't that backend's credential, a link where the copy was, or over a newer real one", () => {
+    const a = setup("lw-bad");
+    writeFileSync(join(a.target, "auth.json"), "not json");
+    expect(a.own.syncLogins()).toEqual([]);
+    writeFileSync(join(a.target, "auth.json"), '{"anthropic":"no type"}');
+    expect(a.own.syncLogins()).toEqual([]);
+    expect(readFileSync(join(a.real, "auth.json"), "utf8")).toBe(valid("OLD"));
+    const b = setup("lw-link");
+    const elsewhere = join(root, "lw-elsewhere.json");
+    writeFileSync(elsewhere, valid("FROM-ELSEWHERE"));
+    rmSync(join(b.target, "auth.json"));
+    symlinkSync(elsewhere, join(b.target, "auth.json"));
+    expect(b.own.syncLogins()).toEqual([]);
+    expect(readFileSync(join(b.real, "auth.json"), "utf8")).toBe(valid("OLD"));
+    const c = setup("lw-newer");
+    writeFileSync(join(c.target, "auth.json"), valid("MINE"));
+    writeFileSync(join(c.real, "auth.json"), valid("USERS-OWN"));
+    expect(c.own.syncLogins()).toEqual([]);
+    expect(readFileSync(join(c.real, "auth.json"), "utf8")).toBe(valid("USERS-OWN"));
+  });
+
+  test("each backend's format", () => {
+    expect(claudeCredentials('{"claudeAiOauth":{"accessToken":"a","refreshToken":"r","expiresAt":1}}')).toBe(true);
+    expect(claudeCredentials('{"claudeAiOauth":{"accessToken":"a"}}')).toBe(false);
+    expect(codexCredentials('{"tokens":{"access_token":"a","refresh_token":"r","id_token":"i"}}')).toBe(true);
+    expect(codexCredentials('{"OPENAI_API_KEY":"sk-x"}')).toBe(true);
+    expect(codexCredentials('{"tokens":{}}')).toBe(false);
+    expect(oauthCredentials('{"access_token":"a","refresh_token":"r","expiry_date":1}')).toBe(true);
+    expect(oauthCredentials('{"access_token":"a"}')).toBe(false);
+    expect(piCredentials("{}")).toBe(false);
   });
 });
 
