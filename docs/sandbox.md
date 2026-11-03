@@ -103,8 +103,9 @@ Per session:
   session with such a sandbox is made only by its owner, undelegated (anyone
   in the tenant may fork one whose sandbox is the daemon's or narrower). A
   session whose sandbox is off is switched to autonomous only by its owner's
-  own token. A routine whose runs are `off` needs `session:approve` (routine
-  changes are refused to delegated tokens). A provider named explicitly that
+  own token. A routine whose runs' sandbox is off or wider than the daemon's
+  (the same rule) needs `session:approve` (routine changes are refused to
+  delegated tokens). A provider named explicitly that
   can't run here is refused (choose another, or `off`);
 - routines (`codeoid routine add … --sandbox …`, the spec's `sandbox`) and loops
   (`codeoid loop start … --sandbox …`, `loop.start`'s `sandbox`) take one too.

@@ -6244,9 +6244,11 @@ mcpHub: this.#mcpHub,
       const approvals = spec?.approvals !== undefined ? spec.approvals : current?.spec.approvals;
       const check = spec && "check" in spec ? spec.check : current?.spec.check;
       const loop = spec && "loop" in spec ? spec.loop : current?.spec.loop;
-      // Its runs' commands unsandboxed (#448): as `off` at session create.
-      const sandbox = (spec && "sandbox" in spec ? spec.sandbox : current?.spec.sandbox) as { provider?: string } | null | undefined;
-      return (approvals ?? "autonomous") === "autonomous" || !!check || !!loop || sandbox?.provider === "off";
+      // Its runs' commands unsandboxed, or in a sandbox wider than the daemon's (#448): as at session create.
+      const sandbox = (spec && "sandbox" in spec ? spec.sandbox : current?.spec.sandbox) as SessionSandboxSetting | null | undefined;
+      const cfg = sandboxConfigOf(this.#config);
+      const wider = !!sandbox && Object.keys(sandbox).length > 0 && widens(effectiveSetting(cfg, undefined), effectiveSetting(cfg, sandbox));
+      return (approvals ?? "autonomous") === "autonomous" || !!check || !!loop || wider;
     };
     // A routine is its owner's alone: its runs act as them, so nobody else in
     // the tenant may read, steer, fire, or delete it. Others get "not found".

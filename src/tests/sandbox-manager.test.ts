@@ -283,3 +283,33 @@ describe("round 1 of the #448 audit: wider than the daemon's sandbox is the owne
     expect(await m.handle({ type: "session.set_mode", id: "m", sessionId: id, mode: "autonomous" }, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
   });
 });
+
+describe("routines (#448 round 2)", () => {
+  it("a routine whose sandbox is wider than the daemon's (off, another provider, a wider network, more hosts) needs session:approve, as a session's create does", async () => {
+    const registry = new ProviderRegistry("claude");
+    registry.register({ id: "claude", displayName: "claude", create: () => new MockSessionProvider("claude", [[DONE]]) });
+    const sandboxRegistry = new SandboxRegistry("linux", HOST_HAS);
+    sandboxRegistry.register(fake("bwrap", { available: true }));
+    sandboxRegistry.register(fake("seatbelt-like", { available: true }));
+    const config = {
+      ...mkConfig(tmp),
+      sandbox: { provider: "auto", network: "allowlist", allowedHosts: ["a.example"], hiddenPaths: [], homeReadable: [], docker: { image: "x" } },
+      routines: { enabled: true, tickMs: 600_000, maxConcurrentRuns: 2, minIntervalSeconds: 60, apiFiresPerHour: 30, missedGraceSeconds: 120 },
+    } as CodeoidConfig;
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, { config, providers: registry, sandboxRegistry });
+    managers.push(m);
+    const call = (spec: Record<string, unknown>, auth: AuthContext) =>
+      m.handle({ type: "routine.create", spec: { prompt: "p", workdir, approvals: "guarded", ...spec } } as never, auth, CLIENT) as Promise<DaemonMessage>;
+    for (const [i, sandbox] of [{ provider: "off" }, { provider: "seatbelt-like" }, { network: "on" }, { allowedHosts: ["a.example", "b.example"] }].entries()) {
+      const res = await call({ name: `wide-${i}`, sandbox }, NO_APPROVE);
+      expect(res).toMatchObject({ type: "response.error", code: "forbidden" });
+      expect(res.type === "response.error" && res.error).toContain("session:approve");
+    }
+    // The daemon's, or narrower: nothing granted beyond the holder's own send.
+    for (const [i, sandbox] of [{ network: "off" }, { allowedHosts: ["a.example"] }].entries()) {
+      expect(await call({ name: `narrow-${i}`, sandbox }, NO_APPROVE)).toMatchObject({ type: "routine.snapshot" });
+    }
+    // With the scope, the owner may.
+    expect(await call({ name: "wide-ok", sandbox: { network: "on" } }, AUTH)).toMatchObject({ type: "routine.snapshot" });
+  });
+});
