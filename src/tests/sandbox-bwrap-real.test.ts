@@ -883,4 +883,31 @@ describe.skipIf(!probe.available)("bubblewrap, for real: round 2 of the #448 aud
       await h.close();
     }
   });
+
+  test("a link in the allowlist shows only what is itself allowlisted: one into a project of yours shows nothing of it, .env and keys included (#448 round 3)", async () => {
+    const home = join(root, "home3");
+    const ws = join(home, "proj");
+    const project = join(home, "code", "billing-api");
+    for (const d of [ws, join(project, "bin"), join(project, "deploy"), join(home, ".local", "bin"), join(root, "tmp3")]) mkdirSync(d, { recursive: true });
+    writeFileSync(join(project, "package.json"), '{"name":"billing-api"}\n');
+    writeFileSync(join(project, ".env"), "STRIPE_SECRET_KEY=PLANTED-ENV\n");
+    writeFileSync(join(project, "deploy", "prod-key.pem"), "PLANTED-PEM\n");
+    writeFileSync(join(project, "bin", "bctl.js"), "#!/bin/sh\necho PROJECT-TOOL-RAN\n", { mode: 0o755 });
+    symlinkSync(join(project, "bin", "bctl.js"), join(home, ".local", "bin", "bctl"));
+    const spec = buildSandboxSpec({ sessionId: "local3", workspace: ws, tempDir: join(root, "tmp3"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    expect(spec.reexposed.filter((p) => p.startsWith(join(home, "code")))).toEqual([]);
+    const h = await provider.open(spec);
+    try {
+      const r = await h.exec(["/bin/sh", "-c", `cat ${join(project, ".env")} ${join(project, "deploy", "prod-key.pem")} ${join(project, "bin", "bctl.js")} 2>/dev/null; ${join(home, ".local", "bin", "bctl")} 2>/dev/null; echo DONE`], {
+        cwd: ws,
+        env: { PATH: "/usr/bin:/bin", HOME: home },
+        timeoutMs: 20_000,
+      });
+      expect(r.stdout).not.toContain("PLANTED");
+      expect(r.stdout).not.toContain("PROJECT-TOOL-RAN");
+      expect(r.stdout).toContain("DONE");
+    } finally {
+      await h.close();
+    }
+  });
 });

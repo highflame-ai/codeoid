@@ -273,8 +273,9 @@ file tool writing them asks in every mode while sandboxed
 (`projectSettingsWriteOf`). Toolchain caches point at
 `~/.cache/codeoid-sandbox` (`SandboxSpec.env`, `toolchainCacheEnv`), set only inside a sandbox, never
 for a CLI or what it runs outside one (Claude native: `claudeNativeEnv`, a
-`CLAUDE_ENV_FILE` exporting them only under `SANDBOX_RUNTIME=1`); links in
-the allowlist are followed (`linkedPrograms`). Hidden besides: config dir,
+`CLAUDE_ENV_FILE` exporting them only under `SANDBOX_RUNTIME=1`); a link in
+the allowlist leads only into the allowlist (never shows its target elsewhere
+in the home). Hidden besides: config dir,
 `daemonOwnedDirs`, the CLIs' logins and `registeredSecretLocations`
 (secret-paths.ts), `HOME_CREDENTIAL_PATHS`, `$XDG_RUNTIME_DIR`, the daemon's
 temp dir, `sandbox.hiddenPaths` (beats the allowlist); container sockets;
