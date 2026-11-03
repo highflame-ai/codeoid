@@ -19,18 +19,18 @@
  *       · autonomous → `never`: codex runs unattended with NO per-action
  *         approval round-trip. codeoid records each action retrospectively at
  *         item/completed (see below) so scrollback + history stay honest.
- *   - the sandbox mode `danger-full-access` is pinned (as codex's
- *     internally-tagged `{type:"dangerFullAccess"}` wire value, via
- *     sandboxPolicyWire()) so codex EXECUTES actions with full access
- *     (including network) instead of re-sandboxing them. codeoid's mode is the
- *     trust authority; codex's own bundled-bubblewrap sandbox is redundant with
- *     it AND non-portable — it needs unprivileged user namespaces that
- *     containers and hardened hosts (`apparmor_restrict_unprivileged_userns=1`)
- *     forbid, and when bwrap can't initialize even an APPROVED command dies
- *     inside codex with "command execution rejected / cannot escalate".
- *     Operators on a bwrap-capable host who want defense-in-depth can override
- *     both the mode-derived approval policy and the sandbox via
- *     CODEX_APPROVAL_POLICY / CODEX_SANDBOX_POLICY (see codexPolicies()).
+ *   - the OS sandbox (#448, codexSandboxPolicy()): with codeoid's sandbox on
+ *     (bubblewrap), codex runs its own `workspace-write` (the workspace and
+ *     the session's temp dir writable, the network per the session) and the
+ *     app-server itself starts inside codeoid's bubblewrap, which hides the
+ *     credentials codex's own leaves readable. In autonomous mode (approval
+ *     `never`, #442) that sandbox is the only boundary. Under a provider
+ *     codex's sandbox can't nest in (Seatbelt, Docker) the whole app-server
+ *     runs inside codeoid's with full access there. With codeoid's sandbox
+ *     off or unavailable, as before: `danger-full-access`, codeoid's mode the
+ *     trust authority (codex's own bubblewrap needs unprivileged user
+ *     namespaces that containers and hardened hosts forbid), overridable by
+ *     CODEX_SANDBOX_POLICY; the approval policy by CODEX_APPROVAL_POLICY.
  *   - `item/tool/requestUserInput` → requestUserInput (session.ui_request)
  *   - text/reasoning deltas stream; command/fileChange/mcp items surface
  *     as tool records; usage from turn/completed
@@ -78,7 +78,9 @@ import { MCP_PROXY_TOKEN_ENV, McpProxyLease, type McpProxyMount } from "../../mc
 import { codexKeySafe, codexShellEnvExcludeArgs } from "./shell-env.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import type { ResolvedAccount } from "../../accounts.js";
-import { applyCodexAccount } from "../../account-apply.js";
+import { applyCodexAccount, defaultCodexHome } from "../../account-apply.js";
+import { programLocations } from "../../sandbox/policy.js";
+import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 
 /** codex `tokenUsage.last` / `.total` shape (thread/tokenUsage/updated). */
 interface CodexTokenUsage {
@@ -90,6 +92,8 @@ interface CodexTokenUsage {
 }
 
 export interface CodexProviderInit {
+  /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448). */
+  sandbox?: () => SandboxRuntime | null;
   sessionId: string;
   /** codex thread id from a previous run, or the codeoid session id on first run. */
   initialBackingId: string;
@@ -206,14 +210,38 @@ function codexPolicies(mode?: SessionMode): { approvalPolicy: string; sandboxMod
  * @openai/codex@0.144.1 `generate-ts` + a real turn.
  */
 /** What a new thread (started or forked) is created with: cwd, policies, the turn's instructions. */
-function threadConfig(opts: TurnOpts): Record<string, unknown> {
+function threadConfig(opts: TurnOpts, rt: SandboxRuntime | null): Record<string, unknown> {
   const { approvalPolicy, sandboxMode } = codexPolicies(opts.mode);
   return {
     cwd: opts.workdir,
     approvalPolicy,
-    sandboxPolicy: sandboxPolicyWire(sandboxMode, opts.workdir),
+    sandboxPolicy: codexSandboxPolicy(rt, sandboxMode, opts.workdir),
     ...(opts.systemPromptAppend ? { developerInstructions: opts.systemPromptAppend } : {}),
   };
+}
+
+/**
+ * The sandbox codex runs a session's commands in (#448). With codeoid's
+ * sandbox on and native (bubblewrap): codex's own workspace-write — the
+ * workspace and the session's temp dir writable, the network per the
+ * session — inside codeoid's bubblewrap around the app-server, which hides
+ * what codex's own leaves readable. With codeoid's sandbox around the whole
+ * process instead (Seatbelt, Docker; nested sandboxes don't work there):
+ * full access inside it, which is the boundary. Without codeoid's sandbox
+ * (off, unavailable): as before, CODEX_SANDBOX_POLICY or full access.
+ */
+export function codexSandboxPolicy(rt: SandboxRuntime | null, fallback: SandboxMode, workdir: string): Record<string, unknown> {
+  if (rt?.plan.kind === "native") {
+    return {
+      type: "workspaceWrite",
+      writableRoots: [...new Set([workdir, rt.spec.tempDir])],
+      networkAccess: rt.spec.network.mode === "on",
+      excludeTmpdirEnvVar: false,
+      excludeSlashTmp: false,
+    };
+  }
+  if (rt?.plan.kind === "process") return { type: "dangerFullAccess" };
+  return sandboxPolicyWire(fallback, workdir);
 }
 
 function sandboxPolicyWire(mode: SandboxMode, workdir: string): Record<string, unknown> {
@@ -325,6 +353,12 @@ export class CodexProvider implements SessionProvider {
   #argsPrefix: string[];
   #resolveAccount: (() => ResolvedAccount | null) | null;
   readonly #extraEnv: Readonly<Record<string, string>> | undefined;
+  /** The session's OS sandbox, read each time the app-server starts and each turn (#448). */
+  readonly #sandbox: (() => SandboxRuntime | null) | null;
+
+  #sandboxRuntime(): SandboxRuntime | null {
+    return this.#sandbox?.() ?? null;
+  }
   #onModels?: CodexProviderInit["onModels"];
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
@@ -428,6 +462,7 @@ export class CodexProvider implements SessionProvider {
     this.#command = init.command;
     this.#resolveAccount = init.resolveAccount ?? null;
     this.#extraEnv = init.extraEnv;
+    this.#sandbox = init.sandbox ?? null;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#onModels = init.onModels;
     this.#workspaceId = init.workspaceId ?? init.sessionId;
@@ -520,7 +555,7 @@ export class CodexProvider implements SessionProvider {
     const pending = this.#pendingNative;
     this.#pendingNative = null;
     if (!pending || !this.#proc) return null;
-    const config = threadConfig(opts);
+    const config = threadConfig(opts, this.#sandboxRuntime());
     try {
       if (pending.kind === "fork") {
         const forked = (await this.#proc.request("thread/fork", {
@@ -846,7 +881,7 @@ export class CodexProvider implements SessionProvider {
       // instead of re-sandboxing them (which fails wherever bubblewrap can't
       // init). See codexPolicies().
       approvalPolicy,
-      sandboxPolicy: sandboxPolicyWire(sandboxMode, opts.workdir),
+      sandboxPolicy: codexSandboxPolicy(this.#sandboxRuntime(), sandboxMode, opts.workdir),
       ...(opts.model ? { model: opts.model } : {}),
       // Thinking effort (#417). codex keeps a turn's effort for the turns
       // after it (a resumed thread too), and null there means "no override" —
@@ -879,23 +914,33 @@ export class CodexProvider implements SessionProvider {
           "[codeoid] codex: its config.toml couldn't be read here, so codeoid can't add its token variables to shell_environment_policy.exclude — OAuth MCP servers aren't mounted, and codeoid's memory/blackboard tokens rely on Codex's default excludes",
         );
       }
+      // The account's own CODEX_HOME (an overlay sharing everything but its
+      // auth.json), applied last so nothing re-adds a daemon key.
+      // The caller's extra env goes on last (withExtraEnv refuses anything
+      // credential- or home-shaped, so the account stays the account).
+      const env = withExtraEnv(
+        await applyCodexAccount(
+          this.#resolveAccount?.() ?? null,
+          { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
+          { command: this.#command, argsPrefix: this.#argsPrefix },
+        ),
+        this.#extraEnv,
+      );
+      // The OS sandbox (#448): the app-server starts inside the session's,
+      // its own home reachable and the network on (it talks to its model);
+      // what its commands may reach is codex's own sandbox's business
+      // (codexSandboxPolicy) or, run whole inside, this one's.
+      const rt = this.#sandboxRuntime();
+      const handle = rt?.plan.wrapsBackend
+        ? await rt.open(codexOwnState(env), { backendNetwork: true, readable: programLocations(this.#command, this.#argsPrefix) })
+        : null;
       this.#proc = new CodexRpcProcess({
         command: this.#command,
         argsPrefix: this.#argsPrefix,
         args: [...mcp.args, ...bb.args, ...reg.args, ...oauth.args, ...(shellEnv ?? [])],
         cwd: opts.workdir,
-        // The account's own CODEX_HOME (an overlay sharing everything but its
-        // auth.json), applied last so nothing re-adds a daemon key.
-        // The caller's extra env goes on last (withExtraEnv refuses anything
-        // credential- or home-shaped, so the account stays the account).
-        env: withExtraEnv(
-          await applyCodexAccount(
-            this.#resolveAccount?.() ?? null,
-            { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
-            { command: this.#command, argsPrefix: this.#argsPrefix },
-          ),
-          this.#extraEnv,
-        ),
+        env,
+        ...(handle?.wrap ? { wrap: handle.wrap.bind(handle) } : {}),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {
@@ -956,7 +1001,7 @@ export class CodexProvider implements SessionProvider {
         this.onHistoryLost?.();
       }
     }
-    const started = (await this.#proc.request("thread/start", threadConfig(opts))) as { thread?: { id?: string }; model?: string };
+    const started = (await this.#proc.request("thread/start", threadConfig(opts, this.#sandboxRuntime()))) as { thread?: { id?: string }; model?: string };
     if (!started.thread?.id) throw new Error("codex thread/start returned no thread id");
     this.#threadModel = started.model ?? null;
     // codex reads its config afresh for each thread; so does Default's baseline.
@@ -1620,4 +1665,10 @@ function usageDelta(to: CodexTokenUsage, from: CodexTokenUsage | null): CodexTok
     outputTokens: d("outputTokens"),
     reasoningOutputTokens: d("reasoningOutputTokens"),
   };
+}
+
+/** What codex's own process must still reach inside a sandbox: its home (CODEX_HOME, and the default one an account's links lead to). */
+export function codexOwnState(env: Record<string, string | undefined>): string[] {
+  const own = env.CODEX_HOME || defaultCodexHome(env);
+  return [...new Set([own, defaultCodexHome({ ...env, CODEX_HOME: undefined })])];
 }

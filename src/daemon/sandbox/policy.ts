@@ -254,3 +254,22 @@ export function networkPolicyOf(config: SandboxConfig, override?: { mode?: Netwo
 export function validAllowedHost(h: string): boolean {
   return /^(\*\.)?[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)*$/.test(h) && h.length <= 253;
 }
+
+/**
+ * Where a backend's program lives (its binary, and each absolute script
+ * path before its own arguments), by directory: shown read-only inside a
+ * sandbox that would otherwise hide it (an install under the host's /tmp).
+ */
+export function programLocations(command: string, argsPrefix: readonly string[] = []): string[] {
+  const out: string[] = [];
+  for (const p of [command, ...argsPrefix]) {
+    if (!isAbsolute(p)) continue;
+    out.push(dirname(p));
+    try {
+      out.push(dirname(realpathSync(p)));
+    } catch {
+      /* not there: nothing to show */
+    }
+  }
+  return [...new Set(out)];
+}

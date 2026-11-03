@@ -104,8 +104,9 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   }
   for (const p of spec.reexposed) {
     const at = realOr(p);
-    // Only what a hidden directory covers needs showing again.
-    if (!kind(at) || seen.has(`r:${at}`) || !hiddenDirs.some((d) => within(at, d) && d !== at)) continue;
+    // Only what a hidden directory, or the sandbox's own /tmp, covers needs showing again.
+    const covered = hiddenDirs.some((d) => within(at, d) && d !== at) || (within(at, "/tmp") && at !== "/tmp" && !writable.some((w) => within(at, w)));
+    if (!kind(at) || seen.has(`r:${at}`) || !covered) continue;
     seen.add(`r:${at}`);
     mounts.push({ kind: "ro-bind", path: at });
   }
@@ -114,7 +115,11 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   mounts.sort((a, b) => depth(a.path) - depth(b.path) || rank(a) - rank(b));
 
   // The private /tmp first: a workspace below the host's /tmp is bound into it.
-  args.push("--bind", realOr(spec.tempDir), "/tmp");
+  const temp = realOr(spec.tempDir);
+  args.push("--bind", temp, "/tmp");
+  // Also at its own path when that is outside the host's /tmp: a program that
+  // finds where its /tmp really is (codex's own sandbox does) can write there too.
+  if (!within(temp, "/tmp")) args.push("--bind", temp, temp);
   for (const m of mounts) {
     if (m.kind === "hide-dir") args.push("--tmpfs", m.path);
     else if (m.kind === "hide-file") args.push("--ro-bind", "/dev/null", m.path);

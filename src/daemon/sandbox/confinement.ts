@@ -137,3 +137,14 @@ export function confinementFor(backendId: string, provider: SandboxProvider | nu
       return { ok: false, reason: `codeoid doesn't know how to sandbox the ${backendId} backend` };
   }
 }
+
+/**
+ * A tool call that asks to run outside the session's sandbox, or to widen
+ * it: Claude's Bash with `dangerouslyDisableSandbox`, Codex asking for more
+ * permissions than its sandbox gives (`codex_permissions`, an
+ * `item/permissions/requestApproval`). Asked in every mode (Session).
+ */
+export function asksOutsideSandbox(toolName: string, input: unknown): boolean {
+  if (toolName === "codex_permissions") return true;
+  return !!input && typeof input === "object" && (input as Record<string, unknown>).dangerouslyDisableSandbox === true;
+}

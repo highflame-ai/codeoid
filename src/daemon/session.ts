@@ -205,7 +205,7 @@ import { assessShellCommandSync, type ShellRisk, UNREADABLE_SHELL_CALL } from ".
 import { loadShellParser, shellParserReady } from "./shell/parse.js";
 import { isShellTool, runsNoCommand, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
-import { asksUnsandboxed } from "./sandbox/claude-native.js";
+import { asksOutsideSandbox } from "./sandbox/confinement.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
 import { SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import {
@@ -3058,16 +3058,18 @@ export class Session {
     return { ok: true, pending: {} };
   }
 
-  /** A call that asks to run outside the sandbox (Claude's `dangerouslyDisableSandbox`), on a session whose sandbox is on. */
-  #unsandboxedRequest(input: unknown): boolean {
-    return this.#sandbox?.info?.state === "on" && asksUnsandboxed(input);
+  /** A call that asks to run outside the sandbox or widen it (asksOutsideSandbox), on a session whose sandbox is on. */
+  #unsandboxedRequest(toolName: string, input: unknown): boolean {
+    return this.#sandbox?.info?.state === "on" && asksOutsideSandbox(toolName, input);
   }
 
   /** What an approval card says of the sandbox (#448): whether the call runs inside, and why not. */
   #cardSandbox(toolName: string, input: unknown): { sandboxed?: boolean; sandboxNote?: string } {
     const info = this.#sandbox?.info;
     if (!info) return {};
-    if (this.#unsandboxedRequest(input)) return { sandboxed: false, sandboxNote: "asks to run outside the sandbox" };
+    if (this.#unsandboxedRequest(toolName, input)) {
+      return { sandboxed: false, sandboxNote: toolName === "codex_permissions" ? "asks to widen codex's sandbox" : "asks to run outside the sandbox" };
+    }
     switch (info.state) {
       case "on": {
         const runner = this.#sandbox?.runtime?.plan;
@@ -7969,7 +7971,7 @@ export class Session {
       const outside = this.#outsideWrite(toolName, effectiveInput, shellCwd);
       // A command asking to run outside the OS sandbox (#448) is its own
       // approval, asked in every mode: no budget spent, an unattended run parks.
-      const unsandboxed = this.#unsandboxedRequest(effectiveInput);
+      const unsandboxed = this.#unsandboxedRequest(toolName, effectiveInput);
       if (unsandboxed) this.#store.audit(sender.sub, "session.unsandboxed_ask", this.id, `tool=${toolName}`);
       const autoApprove =
         !unsandboxed &&
@@ -8629,7 +8631,7 @@ export class Session {
         const networkAsk = event.name === SANDBOX_NETWORK_TOOL && this.#sandbox?.info?.state === "on";
         const autoApprove = networkAsk
           ? this.#sandbox?.info?.network === "on"
-          : !this.#unsandboxedRequest(event.input) &&
+          : !this.#unsandboxedRequest(event.name, event.input) &&
           secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir(), cwd: event.shellCwd }) === null &&
           !risk?.secret &&
           !this.#riskAsks(risk) &&

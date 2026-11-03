@@ -562,6 +562,7 @@ export function createDefaultProviderRegistry(
             onModels: init.onModels,
             resolveAccount: init.resolveAccount,
             extraEnv: init.extraEnv,
+            sandbox: init.sandbox,
           }),
       });
     } else {

@@ -43,6 +43,17 @@ export function sandboxRefusalOf(info: SessionSandboxInfo): string | null {
   return null;
 }
 
+export interface OpenOptions {
+  /**
+   * The backend's own process talks to its model from inside: the network is
+   * on for the handle, while the backend's own sandbox holds its commands to
+   * the session's network (Codex's).
+   */
+  backendNetwork?: boolean;
+  /** Read-only locations the backend's process needs that would otherwise be hidden or under the host's /tmp (its own program). */
+  readable?: readonly string[];
+}
+
 /** What a resolved, running sandbox gives a backend. */
 export interface SandboxRuntime {
   readonly info: SessionSandboxInfo;
@@ -56,9 +67,9 @@ export interface SandboxRuntime {
    * (`backendState`: its home, login, sessions). Closed with the session or
    * when the sandbox is changed.
    */
-  open(backendState?: readonly string[]): Promise<SandboxHandle>;
+  open(backendState?: readonly string[], opts?: OpenOptions): Promise<SandboxHandle>;
   /** The same, for a caller that can't wait (a spawn callback); local providers only. */
-  openSync(backendState?: readonly string[]): SandboxHandle;
+  openSync(backendState?: readonly string[], opts?: OpenOptions): SandboxHandle;
 }
 
 /** The setting a session ends up with: its own fields over the config's. */
@@ -246,9 +257,9 @@ export class SessionSandbox {
     const provider = r.provider;
     const plan = r.plan;
     const config = this.config;
-    const open = (backendState: readonly string[] = []) => {
+    const open = (backendState: readonly string[] = [], o: OpenOptions = {}) => {
       if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
-      return this.#spec(r.network, backendState);
+      return this.#spec(o.backendNetwork ? { mode: "on" } : r.network, backendState, o.readable ?? []);
     };
     // Built (and the temp dir made) when a backend first needs it.
     let spec: SandboxSpec | null = null;
@@ -261,10 +272,10 @@ export class SessionSandbox {
         spec ??= open([]);
         return spec;
       },
-      open: async (backendState) => this.#track(await provider.open(open(backendState))),
-      openSync: (backendState) => {
+      open: async (backendState, o) => this.#track(await provider.open(open(backendState, o))),
+      openSync: (backendState, o) => {
         if (!provider.openSync) throw new Error(`${provider.displayName} can't be opened synchronously`);
-        return this.#track(provider.openSync(open(backendState)));
+        return this.#track(provider.openSync(open(backendState, o)));
       },
     };
     return r.info;
@@ -275,8 +286,9 @@ export class SessionSandbox {
     return h;
   }
 
-  #spec(network: NetworkPolicy, backendState: readonly string[]): SandboxSpec {
+  #spec(network: NetworkPolicy, backendState: readonly string[], readable: readonly string[] = []): SandboxSpec {
     return buildSandboxSpec({
+      backendReadable: readable,
       sessionId: this.#sessionId,
       workspace: this.#workdir,
       tempDir: this.#ensureTempDir(),

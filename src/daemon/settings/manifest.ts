@@ -507,7 +507,7 @@ const codex: SettingsTab = {
             { value: "never", label: "Never", description: "Autonomous." },
           ],
         }),
-        env("CODEX_SANDBOX_POLICY", "Sandbox policy", "Filesystem/network sandbox Codex runs under. codeoid pins full access by default (it is the trust authority).", {
+        env("CODEX_SANDBOX_POLICY", "Sandbox policy (without codeoid's sandbox)", "Codex's own sandbox when codeoid's OS sandbox is off or can't run. With it on, codex runs workspace-write inside codeoid's sandbox and this is ignored (see the Sandbox tab).", {
           kind: "enum",
           default: "danger-full-access",
           advanced: true,
