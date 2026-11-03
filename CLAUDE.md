@@ -273,7 +273,8 @@ dir (its `core.worktree` names it back) is the repository's (`gitLayoutOf`);
 any other `.git` file is held read-only and said in the sandbox's limits
 (`gitLayoutProblem`); a link among them makes the git dir read-only whole; `SandboxSpec.gitDirs` are
 Codex's extra writable roots. The project settings agent CLIs run code from
-(`PROJECT_CONFIG_DIRS`/`_FILES`: `.claude/`, `.mcp.json`, …) read-only, and a
+(`PROJECT_CONFIG_DIRS`/`_FILES`: `.claude/`, `.mcp.json`, …; missing ones made
+first, files as an empty config listed in `info/exclude`) read-only, and a
 file tool writing them asks in every mode while sandboxed
 (`projectSettingsWriteOf`). Toolchain caches point at
 `~/.cache/codeoid-sandbox` (`SandboxSpec.env`, `toolchainCacheEnv`), set only inside a sandbox, never
