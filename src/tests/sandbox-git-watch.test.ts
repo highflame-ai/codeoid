@@ -47,6 +47,8 @@ describe("what of a repository git runs at your next command, and what changed (
     const changed = gitControlChanges(before, gitControlSnapshot(r, root));
     expect(changed).toEqual([".git/config", ".git/hooks/pre-commit", ".git/info/attributes", ".gitattributes"]);
     expect(gitControlWarning(changed)).toContain(".git/hooks/pre-commit");
+    // #448 round 4: what runs them is the user's git and other host tools, not the CLIs codeoid starts (git-shim.ts).
+    expect(gitControlWarning(changed)).toContain("the backends codeoid starts run theirs contained");
     // An ordinary edit isn't one.
     const now = gitControlSnapshot(r, root);
     writeFileSync(join(r, "a"), "changed\n");

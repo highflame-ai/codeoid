@@ -138,5 +138,5 @@ export function gitControlChanges(before: GitControlSnapshot, after: GitControlS
 export function gitControlWarning(changed: readonly string[]): string {
   const shown = changed.slice(0, 8).join(", ");
   const more = changed.length > 8 ? ` and ${changed.length - 8} more` : "";
-  return `While this session ran, the repository's git settings changed: ${shown}${more}. git runs or obeys these at your next git command here, outside any sandbox (a hook, core.fsmonitor, a filter), and git status doesn't show them — look before you run git in this repository.`;
+  return `While this session ran, the repository's git settings changed: ${shown}${more}. git runs or obeys these (a hook, core.fsmonitor, a filter) at your next git command here, and in any other tool that runs git here outside a sandbox (an editor's, another CLI's; the backends codeoid starts run theirs contained), and git status doesn't show them — look before you run git in this repository.`;
 }
