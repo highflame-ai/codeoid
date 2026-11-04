@@ -71,8 +71,8 @@
  *   I46 (scripted only) an interrupt in a feed gap longer than the interrupt's settle wait: the turn is read back, its card settled and its step billed to it
  *   I47 (scripted only) a provider error opencode retries: the first retry is attempt 1, and the failed request bills nothing
  *   I48 (scripted only) a model opencode prices at $0: the turn's $0 isn't a price (no cost source: Session prices the tokens), as on Claude
- *   I49 (scripted only) through a Session, a shell call is judged by risk as Claude's Bash: `rm -rf ~` asks in autonomous mode,
- *       `git status` runs unasked in guarded mode with autoAllowLowRisk, a credential read is refused; the shell's `$PPID`
+ *   I49 (scripted only) through a Session, a shell call is judged by risk as Claude's Bash: `rm -rf ~` asks in guarded mode;
+ *       in autonomous mode a high-risk line is allowed (#448) and `rm -rf ~`, reaching credentials, refused; `git status` runs unasked in guarded mode with autoAllowLowRisk, a credential read is refused; the shell's `$PPID`
  *       is the server, and a line that could read its environment (`/proc/$PPID/environ`, `PS_FORMAT=environ ps`) is refused
  *   I50 (scripted only) the daemon user's `$SHELL` isn't the shell opencode runs a line with: it's bash, the shell codeoid judges
  *       lines as; the session's own commands still see the user's `$SHELL`
@@ -1947,7 +1947,7 @@ describe("opencode (real binary)", () => {
     await p.teardown();
   }, 180_000);
 
-  maybeScripted("I49 through a Session, a shell call is judged by risk as Claude's Bash: high asks in autonomous mode, a low read runs unasked when allowed, a credential read is refused", async () => {
+  maybeScripted("I49 through a Session, a shell call is judged by risk as Claude's Bash: high asks in guarded mode and runs in autonomous mode (#448), a low read runs unasked when allowed, a credential read is refused", async () => {
     await loadShellParser();
     const root = mkdtempSync(join(WORK, "risk-"));
     const workdir = join(root, "work");
@@ -2007,12 +2007,22 @@ describe("opencode (real binary)", () => {
       return { pending, card: cards[0], verdict: verdicts[before], tool: reply?.toolCalls?.[0], said: String(reply?.content ?? "") };
     };
     try {
-      // High risk asks even in autonomous mode; the card and the pending approval say so.
-      const rm = await run("rm -rf ~", "autonomous");
+      // High risk asks in guarded mode; the card and the pending approval say so.
+      const rm = await run("rm -rf ~", "guarded");
       expect(rm.pending).toHaveLength(1);
       expect(rm.pending[0]?.risk?.level).toBe("high");
       expect(rm.card).toMatchObject({ phase: "waiting_confirmation", risk: { level: "high" } });
       expect(rm.verdict?.behavior).toBe("deny");
+      // In autonomous mode the gate runs it, unasked, inside the OS sandbox (#448): its verdict is
+      // `allow` (the guard above still keeps this line from running here).
+      const high = await run("rm -rf build/cache", "autonomous");
+      expect(high.pending).toHaveLength(0);
+      expect(high.verdict).toEqual({ command: "rm -rf build/cache", behavior: "allow" });
+      // ...but `rm -rf ~` reaches a directory holding credentials: refused at once, the model told why.
+      const home = await run("rm -rf ~", "autonomous");
+      expect(home.pending).toHaveLength(0);
+      expect(home.verdict?.behavior).toBe("deny");
+      expect(home.said).toContain("Refused: autonomous mode doesn't allow a command reaching");
       // A low read runs unasked in guarded mode with autoAllowLowRisk.
       const status = await run("git status", "guarded", { autoAllowLowRisk: true, askOnUnknown: true });
       expect(status.pending).toHaveLength(0);
