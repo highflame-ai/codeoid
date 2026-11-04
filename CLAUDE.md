@@ -331,11 +331,14 @@ private homes, launchers and every temp entry of the daemon's own
 hidden from every sandbox (Claude's own, which keeps the host's `/tmp`, too).
 A backend CLI that runs outside the sandbox finds codeoid's `git` first on its
 `PATH` (git-shim.ts): Claude native's (`SandboxRuntime.gitShim`) runs the real
-git inside the session's sandbox, read-only and offline, its Bash commands'
-`PATH` without it (claude-native.ts's env file); opencode's server's, and one
+git inside the session's command sandbox, offline, with a fresh `/tmp` per
+git (`SandboxSpec.privateTemp`) and the CLI's worktree dirs writable
+(`cliWorktrees`), its Bash commands' `PATH` without it (claude-native.ts's env
+file); opencode's server's, and one
 whose provider is gone, run git defused (BASE_OVERRIDES appended to the
 caller's `GIT_CONFIG_COUNT`, agent-scope drivers and helpers reset by name,
-`attr.tree` empty). In local mode no route hands the token to a loopback
+`attr.tree` empty). Either way git's
+environment is an allowlist (`SHIM_ENV_NAMES`), never the caller's credentials. In local mode no route hands the token to a loopback
 request (a sandboxed command is one): the web UI exchanges a one-time code
 from the banner's link or `codeoid ui` (`LocalUiLinks`, `/ui/local-session`).
 The daemon's own git in a repository an agent can write runs with

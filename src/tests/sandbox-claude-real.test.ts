@@ -277,6 +277,32 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     }, 300_000);
   }
 
+  // #448 round 5: the CLI's own git, through the shim, runs a planted driver in the command sandbox with an environment
+  // of its own: the CLI's API key (the stand-in's `sk-test-…`, in the CLI's environment) never reaches it.
+  test("a driver a command plants, run by the CLI's own git at its next start, gets none of the CLI's credentials (#448 round 5)", async () => {
+    const id = Math.random().toString(36).slice(2, 8);
+    const ws = join(root, `envdump-${id}`);
+    mkdirSync(ws, { recursive: true });
+    const script = join(ws, "f.sh");
+    const dump = join(ws, "ENV-DUMP");
+    const plant = [
+      `printf '#!/bin/sh\\n{ env; echo ----; } >> ${dump} 2>/dev/null\\ncat\\n' > ${script}`,
+      `chmod +x ${script}`,
+      `git init -q . && git config filter.x.clean ${script} && echo 'a.txt filter=x' > .gitattributes && echo a > a.txt && git add a.txt .gitattributes && touch -d 2001-01-01 a.txt && echo PLANT-OK`,
+    ].join("; ");
+    const r = await probe("off", plant, ["policy-env-git"], { CODEOID_PROBE_WORKSPACE: ws });
+    expect(r.result).toBe("success");
+    expect(r.toolResult).toContain("PLANT-OK");
+    expect(r.second).toBe("success");
+    const runs = readFileSync(dump, "utf8").split("----\n").filter((s) => s.trim());
+    // The shim's run (its git's PATH starts with the shim's dir) is among them: it ran, in the workspace it may write.
+    const shimRuns = runs.filter((s) => /^PATH=[^\n]*git-bin:/m.test(s));
+    expect(shimRuns.length).toBeGreaterThan(0);
+    // No run has the key (inside Claude's command sandbox the CLI denies it); the shim's has nothing of the CLI's own.
+    for (const s of runs) expect(s).not.toContain("sk-test-not-a-real-key");
+    for (const s of shimRuns) expect(s).not.toMatch(/^(?:ANTHROPIC_|CLAUDE_|CLAUDECODE=)/m);
+  }, 300_000);
+
   test("a command asking to run outside the sandbox reaches the gate, and a denial means it never runs", async () => {
     const r = await probe("off", `rm -rf ${outside}; echo RAN`, ["unsandboxed"]);
     expect(r.asked).toEqual(["Bash"]);

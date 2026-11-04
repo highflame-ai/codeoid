@@ -14,6 +14,7 @@
  */
 
 import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
 import type { CodeoidConfig } from "../../config.js";
@@ -23,7 +24,7 @@ import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
 import { buildSandboxSpec, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, validAllowedHost } from "./policy.js";
 import type { SandboxRegistry } from "./registry.js";
-import { gitProgramLocations, gitShimSpec, writeGitShim } from "./git-shim.js";
+import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "./git-shim.js";
 import { launcherRoot, sandboxRoot } from "./root.js";
 import {
   type NetworkMode,
@@ -117,7 +118,8 @@ export interface SandboxRuntime {
   /**
    * A dir to put first on the `PATH` of a backend CLI that runs outside the
    * sandbox (Claude's, under its own sandbox): its `git` runs the real one
-   * inside this sandbox, read-only and offline (git-shim.ts), so a
+   * inside this sandbox, offline, with an environment of its own and a
+   * fresh temp dir per git (git-shim.ts), so a
    * repository a command planted runs nothing on the host. The same dir for
    * the runtime's life; `caller` names the CLI in the script.
    */
@@ -264,6 +266,7 @@ export class SessionSandbox {
   #launchers = 0;
   #homesDir: string | null = null;
   #claudeTemp: ClaudeTempDirs | null = null;
+  #gitTempDir: string | null = null;
 
   readonly #onWarning: ((text: string) => void) | undefined;
 
@@ -466,8 +469,9 @@ export class SessionSandbox {
 
   /**
    * The git shim's dir (git-shim.ts) in the session's launcher dir: a
-   * launcher for the read-only, offline spec when the provider can start a
-   * local program inside, else git defused.
+   * launcher for the shim's spec (the command sandbox, offline, a fresh temp
+   * dir per git, the CLI's worktree dirs writable) when the provider can
+   * start a local program inside, else git defused.
    */
   #writeGitShim(provider: SandboxProvider, caller: string): string {
     if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
@@ -475,12 +479,20 @@ export class SessionSandbox {
     let launcher: string | null = null;
     let program: string | null = null;
     if (provider.openSync && provider.capabilities.wrapsArgv && provider.capabilities.placement === "local") {
-      const handle = this.#track(provider.openSync(gitShimSpec(this.#spec({ mode: "off" }, [], gitProgramLocations()))));
+      const spec = gitShimSpec(this.#spec({ mode: "off" }, [], gitProgramLocations()), { tempParent: this.#ensureGitTempDir(), worktrees: cliWorktrees(this.#workdir) });
+      const handle = this.#track(provider.openSync(spec));
       // In the caller's own directory, or not at all: one the sandbox hides isn't swapped for another (bwrap's `$HOME`).
       launcher = this.#writeLauncher(handle, [GIT_BIN], [], "git", CWD_FROM_CALLER);
       program = handle.wrap?.([GIT_BIN], { cwd: "", env: {} }).argv[0] ?? null;
     }
-    return writeGitShim(dir, { launcher, provider: program, caller });
+    return writeGitShim(dir, { launcher, provider: program, caller, home: homedir() });
+  }
+
+  /** Where the shim's git gets a fresh temp dir per run where the provider needs a real one (Seatbelt): its own, not the session's. */
+  #ensureGitTempDir(): string {
+    if (!this.#gitTempDir) this.#gitTempDir = mkdtempSync(join(sandboxRoot(), `git-tmp-${this.#sessionSlug()}-`));
+    mkdirSync(this.#gitTempDir, { recursive: true, mode: 0o700 });
+    return this.#gitTempDir;
   }
 
   #writeLauncher(handle: SandboxHandle, argv: readonly string[], envNames: readonly string[], name?: string, cwd = ""): string {
@@ -543,10 +555,11 @@ export class SessionSandbox {
       rmSync(this.#tempDir, { recursive: true, force: true });
       this.#tempDir = null;
     }
-    for (const dir of [this.#launcherDir, this.#homesDir, this.#claudeTemp ? join(this.#claudeTemp.cli, "..") : null]) {
+    for (const dir of [this.#launcherDir, this.#homesDir, this.#gitTempDir, this.#claudeTemp ? join(this.#claudeTemp.cli, "..") : null]) {
       if (dir) rmSync(dir, { recursive: true, force: true });
     }
     this.#launcherDir = null;
+    this.#gitTempDir = null;
     this.#homesDir = null;
     this.#claudeTemp = null;
   }

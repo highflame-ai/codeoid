@@ -320,7 +320,7 @@ export interface GitPaths {
  * `remotes/` and `branches/` remotes defined as files, `worktrees/` the
  * linked worktrees' git dirs (each naming its repository in `commondir`).
  */
-const GIT_CONTROL = ["config", "config.worktree", "commondir", "hooks", "info", "modules", "remotes", "branches", "worktrees"] as const;
+export const GIT_CONTROL = ["config", "config.worktree", "commondir", "hooks", "info", "modules", "remotes", "branches", "worktrees"] as const;
 /** In a linked worktree's own git dir: what names its repository and its checkout, and its own config. */
 const WORKTREE_CONTROL = ["commondir", "gitdir", "config.worktree"] as const;
 /** Made when missing, so there is something to hold read-only: empty dirs, and an empty `config.worktree` (read only where the config turns it on). */

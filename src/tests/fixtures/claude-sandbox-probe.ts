@@ -20,7 +20,7 @@
  * that, with the call asking to run outside the sandbox and allowed (the
  * owner's yes). `policy-env-git` / `policy-env-nogit`: `policy-env` with the
  * CLI's own git the session's shim (git-shim.ts: git inside the sandbox,
- * read-only and offline) or not, and a second query after the first (a new
+ * offline, with an environment of its own) or not, and a second query after the first (a new
  * CLI start in the same workspace, the one that runs its `git status`);
  * the second one's system prompt is told as `system`. A workspace of the
  * test's own: `CODEOID_PROBE_WORKSPACE`. Run in its own
@@ -34,7 +34,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { type ClaudeTempDirs, claudeNativeEnv, claudeSandboxSettings, claudeTempEnv } from "../../daemon/sandbox/claude-native.js";
 import { BwrapSandboxProvider } from "../../daemon/sandbox/bwrap.js";
 import { CWD_FROM_CALLER } from "../../daemon/sandbox/docker.js";
-import { gitProgramLocations, gitShimSpec, writeGitShim } from "../../daemon/sandbox/git-shim.js";
+import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "../../daemon/sandbox/git-shim.js";
 import { buildSandboxSpec } from "../../daemon/sandbox/policy.js";
 import { daemonTempDir } from "../../daemon/sandbox/root.js";
 import { launcherScript } from "../../daemon/sandbox/session-sandbox.js";
@@ -131,7 +131,7 @@ const spec = policy
       unsetEnv: [],
     };
 const sandbox = claudeSandboxSettings({ spec, config } as never, env, policy ? temp : undefined);
-/** The session's git shim, as SessionSandbox makes it: a launcher for the read-only, offline spec, in a daemon-private dir. */
+/** The session's git shim, as SessionSandbox makes it: a launcher for its spec (the command sandbox, offline, a fresh temp dir per git), in a daemon-private dir. */
 function gitShim(): string {
   const handle = new BwrapSandboxProvider().openSync(gitShimSpec(buildSandboxSpec({
     sessionId: "probe",
@@ -141,13 +141,13 @@ function gitShim(): string {
     config: { sandbox: config } as never,
     hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" },
     backendReadable: gitProgramLocations(),
-  })));
+  }), { tempParent: daemonTempDir("git-tmp-probe-"), worktrees: cliWorktrees(workspace, home) }));
   const dir = daemonTempDir("launch-probe-");
   const wrapped = handle.wrap?.([GIT_BIN], { cwd: CWD_FROM_CALLER, env: {} });
   if (!wrapped) throw new Error("no wrap");
   const launcher = join(dir, "launch-git");
   writeFileSync(launcher, launcherScript(wrapped.argv), { mode: 0o700 });
-  return writeGitShim(join(dir, "git-bin"), { launcher, provider: wrapped.argv[0] ?? null, caller: "the Claude CLI" });
+  return writeGitShim(join(dir, "git-bin"), { launcher, provider: wrapped.argv[0] ?? null, caller: "the Claude CLI", home });
 }
 const cliEnv = nativeEnv ? claudeNativeEnv(spec as never, temp, { ...env, SANDBOX_RUNTIME: "1" }, gitMode === "shim" ? gitShim() : undefined) : env;
 // A sign-in started after the session's sandbox was built (#448 round 2): its home where the daemon makes it, the

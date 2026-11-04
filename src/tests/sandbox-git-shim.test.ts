@@ -11,14 +11,15 @@
  * is `cat` (a filter that changes nothing).
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { GIT_BIN } from "../daemon/git-env.js";
-import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
-import { claudeNativeEnv } from "../daemon/sandbox/claude-native.js";
-import { EMPTY_TREE, gitShimScript, gitShimSpec, pathWithShim, writeGitShim } from "../daemon/sandbox/git-shim.js";
+import { BwrapSandboxProvider, bwrapArgs } from "../daemon/sandbox/bwrap.js";
+import { claudeNativeEnv, credentialEnvNames } from "../daemon/sandbox/claude-native.js";
+import { dockerRunArgs } from "../daemon/sandbox/docker.js";
+import { cliWorktrees, EMPTY_TREE, gitShimScript, gitShimSpec, pathWithShim, SHIM_ENV_NAMES, writeGitShim } from "../daemon/sandbox/git-shim.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
 import { sandboxRoot } from "../daemon/sandbox/root.js";
 import { SessionSandbox } from "../daemon/sandbox/session-sandbox.js";
@@ -101,38 +102,141 @@ function runShim(dir: string, args: string[], cwd: string, opts: { stdin?: strin
   return { code: r.exitCode, out: r.stdout.toString(), err: r.stderr.toString() };
 }
 
+/**
+ * A caller's environment as the Claude CLI's or opencode's server's can be:
+ * its credentials, a program or two of its own, and what git may have.
+ * Every value that must not reach git holds `PLANTED`.
+ */
+const CALLER_ENV: Record<string, string> = {
+  ANTHROPIC_API_KEY: "sk-ant-PLANTED",
+  ANTHROPIC_AUTH_TOKEN: "PLANTED-AUTH",
+  CLAUDE_CODE_OAUTH_TOKEN: "PLANTED-OAUTH",
+  ANTHROPIC_BASE_URL: "https://u:PLANTED@gateway.example",
+  OPENAI_API_KEY: "PLANTED-OPENAI",
+  OPENCODE_SERVER_PASSWORD: "PLANTED-PW",
+  CODEOID_API_KEY: "zid_sk_PLANTED",
+  SOME_SERVICE_SECRET: "PLANTED-S",
+  GIT_ASKPASS: "/PLANTED/askpass",
+  GIT_SSH_COMMAND: "PLANTED-ssh",
+  GIT_EXEC_PATH: "/PLANTED/exec",
+  GIT_TEMPLATE_DIR: "/PLANTED/templates",
+  GIT_AUTHOR_NAME: "caller",
+  GIT_ALLOW_PROTOCOL: "none",
+  LC_ALL: "C",
+  // The caller's own `-c` list: an alias showing what git runs things with, an empty reset, a header with a credential.
+  GIT_CONFIG_COUNT: "3",
+  GIT_CONFIG_KEY_0: "alias.e",
+  GIT_CONFIG_VALUE_0: "!env",
+  GIT_CONFIG_KEY_1: "credential.helper",
+  GIT_CONFIG_VALUE_1: "",
+  GIT_CONFIG_KEY_2: "http.extraHeader",
+  GIT_CONFIG_VALUE_2: "Authorization: Bearer PLANTED-HEADER",
+};
+
+/** `env` output as variables (a value with a newline in it isn't one of these). */
+function envOf(out: string): Record<string, string> {
+  const seen: Record<string, string> = {};
+  for (const line of out.split("\n")) {
+    const at = line.indexOf("=");
+    if (at > 0) seen[line.slice(0, at)] = line.slice(at + 1);
+  }
+  return seen;
+}
+
+function expectNoCredential(seen: Record<string, string>): void {
+  expect(Object.entries(seen).filter(([, v]) => v.includes("PLANTED"))).toEqual([]);
+  for (const n of ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY", "OPENCODE_SERVER_PASSWORD", "CODEOID_API_KEY", "GIT_ASKPASS", "GIT_SSH_COMMAND"]) {
+    expect(seen[n]).toBeUndefined();
+  }
+}
+
 const STATUS = ["--no-optional-locks", "status", "--short", "--ignore-submodules=dirty"];
 /** What it says of a planted workspace: `a.txt` (stat-dirty, its filter a pass-through or off) unchanged. */
 const STATUS_OUT = " M b.txt\n?? f.sh\n";
 
 describe("git shim: the script", () => {
-  test("the spec its git runs under: every writable location read-only, nothing pinned, no network", () => {
-    const spec: SandboxSpec = {
-      sessionId: "s",
-      workspace: "/w",
-      tempDir: "/t",
-      writable: ["/g/.git"],
-      hidden: ["/home/u"],
-      reexposed: [],
-      readOnly: ["/w/.claude"],
-      pinned: ["/w/p"],
-      containerSockets: [],
-      network: { mode: "on" },
-      unsetEnv: [],
-    };
-    const s = gitShimSpec(spec);
-    expect(s.readOnly).toEqual(["/w/.claude", "/w", "/g/.git"]);
-    expect(s.pinned).toEqual([]);
-    expect(s.network).toEqual({ mode: "off" });
+  const spec: SandboxSpec = {
+    sessionId: "s",
+    workspace: "/w",
+    tempDir: "/t",
+    writable: ["/w/.git"],
+    hidden: ["/home/u"],
+    reexposed: [],
+    readOnly: ["/w/.claude", "/w/.git/config", "/w/.git/worktrees", "/w/.claude/worktrees/x/.git", "/w/.git/worktrees/own/commondir"],
+    pinned: ["/w/p"],
+    containerSockets: [],
+    network: { mode: "on" },
+    unsetEnv: [],
+  };
+
+  test("the spec its git runs under (#448 round 5): the session's command sandbox, no network, a fresh temp dir per git, the CLI's worktree dirs writable", () => {
+    const s = gitShimSpec(spec, { tempParent: "/g-tmp", worktrees: { open: ["/w/.git/worktrees", "/w/.claude/worktrees"], keep: ["/w/.git/worktrees/own/commondir"] } });
+    // The workspace stays writable (a commit, a worktree), the git structure and project settings held as for a command.
+    expect(s.workspace).toBe("/w");
+    expect(s.writable).toEqual(["/w/.git", "/w/.git/worktrees", "/w/.claude/worktrees"]);
+    expect(s.readOnly).toEqual(["/w/.claude", "/w/.git/config", "/w/.git/worktrees/own/commondir"]);
+    expect(s.pinned).toEqual(["/w/p"]);
     expect(s.hidden).toEqual(["/home/u"]);
+    expect(s.network).toEqual({ mode: "off" });
+    // Never the session's temp dir.
+    expect(s.tempDir).toBe("/g-tmp");
+    expect(s.privateTemp).toBe(true);
+    // No worktree dirs: exactly the command spec's paths.
+    expect(gitShimSpec(spec, { tempParent: "/g-tmp" }).readOnly).toEqual(spec.readOnly as string[]);
   });
 
-  test("with a launcher it execs it when the launcher and its provider are there; every program-running key is turned off on the other path", () => {
-    const script = gitShimScript({ git: "/usr/bin/git", launcher: "/p/launch-git", provider: "/usr/bin/bwrap", caller: "the Claude CLI" });
-    expect(script).toContain(`if [ -f '/p/launch-git' ] && [ -x '/p/launch-git' ] && [ -x '/usr/bin/bwrap' ]; then exec '/p/launch-git' "$@"; fi`);
-    for (const k of ["core.hooksPath", "core.fsmonitor", "core.sshCommand", "diff.external", "gpg.program"]) expect(script).toContain(`c '${k}'`);
-    expect(script).toContain(`c attr.tree ${EMPTY_TREE}`);
-    expect(gitShimScript({ git: "/usr/bin/git", launcher: null, caller: "opencode" })).not.toContain("exec '/p");
+  test("the CLI's worktree dirs: the repository's worktrees/ and the workspace's .claude/worktrees, real dirs only, never in a git dir held whole", () => {
+    const w = join(root, "cliwt");
+    mkdirSync(join(w, ".claude"), { recursive: true });
+    setup(w, ["init", "-q", "."]);
+    mkdirSync(join(w, ".git", "worktrees"), { recursive: true });
+    expect(cliWorktrees(w, home)).toEqual({ open: [join(w, ".git", "worktrees"), join(w, ".claude", "worktrees")] });
+    // `.claude/worktrees` a link: not opened (a bind would follow it).
+    rmSync(join(w, ".claude", "worktrees"), { recursive: true });
+    symlinkSync(outside, join(w, ".claude", "worktrees"));
+    expect(cliWorktrees(w, home).open).toEqual([join(w, ".git", "worktrees")]);
+    // A link among the git dir's control: held read-only whole, nothing opened in it.
+    rmSync(join(w, ".git", "hooks"), { recursive: true, force: true });
+    symlinkSync(outside, join(w, ".git", "hooks"));
+    expect(cliWorktrees(w, home).open).toEqual([]);
+    // No repository: nothing.
+    const plain = join(root, "cliwt-none");
+    mkdirSync(plain, { recursive: true });
+    expect(cliWorktrees(plain, home).open).toEqual([]);
+  });
+
+  test("a private-temp spec's /tmp is a tmpfs of the sandbox's own (bubblewrap, Docker), never the temp dir bound", () => {
+    const s = gitShimSpec(spec, { tempParent: "/g-tmp" });
+    const kind = (p: string) => (p === "/w" || p === "/w/.git" || p === "/t" || p === "/g-tmp" ? "dir" : null);
+    const b = bwrapArgs(s, "", kind);
+    expect(b.join(" ")).toContain("--tmpfs /tmp");
+    expect(b).not.toContain("/g-tmp");
+    expect(b).not.toContain("/t");
+    expect(bwrapArgs(spec, "", kind).join(" ")).toContain("--bind /t /tmp");
+    const d = dockerRunArgs(s, ["git"], { image: "i", cwd: "/w", envNames: [], uid: 1, gid: 1, kind });
+    expect(d).toContain("type=tmpfs,destination=/tmp");
+    expect(d.some((a) => a.includes("source=/g-tmp"))).toBe(false);
+  });
+
+  test("with a launcher it starts it, with a clean environment, when the launcher and its provider are there; every program-running key is turned off on the other path", () => {
+    const script = gitShimScript({ git: "/usr/bin/git", launcher: "/p/launch-git", provider: "/usr/bin/bwrap", caller: "the Claude CLI", home: "/home/u" });
+    expect(script).toContain(`if [ -f '/p/launch-git' ] && [ -x '/p/launch-git' ] && [ -x '/usr/bin/bwrap' ]; then`);
+    expect(script).toContain(`set -- "$@" 'HOME=/home/u'`);
+    expect(script).toContain(`set -- "$@" "GIT_CONFIG_COUNT=$j" '/p/launch-git'`);
+    expect(script).toContain(`exec /usr/bin/env -i "$@"`);
+    for (const k of ["core.hooksPath", "core.fsmonitor", "core.sshCommand", "diff.external", "gpg.program"]) {
+      expect(script).toContain(`"GIT_CONFIG_KEY_$j="'${k}'`);
+    }
+    expect(script).toContain(`"GIT_CONFIG_KEY_$j="'attr.tree' "GIT_CONFIG_VALUE_$j="'${EMPTY_TREE}'`);
+    expect(gitShimScript({ git: "/usr/bin/git", launcher: null, caller: "opencode" })).not.toContain("/p/launch-git");
+  });
+
+  test("what of the caller's environment git may get is never a credential, a program to run, or git's own programs", () => {
+    for (const n of SHIM_ENV_NAMES) {
+      expect(credentialEnvNames({ [n]: "x" })).toEqual([]);
+      expect(n).not.toMatch(/^(?:ANTHROPIC_|OPENAI_|CLAUDE_|CODEOID_|ZEROID_|TELEGRAM_|GEMINI_|GOOGLE_|AWS_|OPENCODE_)/);
+      expect(["GIT_ASKPASS", "SSH_ASKPASS", "GIT_SSH", "GIT_SSH_COMMAND", "GIT_EXEC_PATH", "GIT_TEMPLATE_DIR", "GIT_EXTERNAL_DIFF", "GIT_PROXY_COMMAND", "GIT_CONFIG_PARAMETERS", "PATH", "HOME"]).not.toContain(n);
+    }
   });
 
   test("PATH: the shim first, once", () => {
@@ -188,6 +292,22 @@ describe("git shim: defused (no sandbox to run it in)", () => {
     expect(runShim(dir, ["rev-parse", "--show-prefix"], join(ws, "sub")).out.trim()).toBe("sub/");
   });
 
+  test("git gets an environment of its own (#448 round 5): no credential, password or program the caller had; its repository, identity and narrowing knobs kept", () => {
+    const { ws } = plant("defused-env");
+    // `alias.e=!env`, in the caller's own `-c` list: what git hands what it runs.
+    const r = runShim(dir, ["e"], ws, { env: CALLER_ENV });
+    expect(r.code).toBe(0);
+    const seen = envOf(r.out);
+    expectNoCredential(seen);
+    expect(seen.GIT_AUTHOR_NAME).toBe("caller");
+    expect(seen.GIT_ALLOW_PROTOCOL).toBe("none");
+    expect(seen.LC_ALL).toBe("C");
+    expect(seen.HOME).toBe(home);
+    expect(seen.PATH?.split(":").every((p) => p.startsWith("/"))).toBe(true);
+    // The caller's `-c` list: the alias and an empty reset kept, the header with a credential not.
+    expect(runShim(dir, ["config", "--get", "http.extraHeader"], ws, { env: CALLER_ENV }).out).toBe("");
+  });
+
   test("a config git can't read runs nothing (fails closed)", () => {
     const ws = join(root, "defused-broken");
     mkdirSync(ws, { recursive: true });
@@ -239,19 +359,131 @@ describe.skipIf(!bwrapProbe.available)("git shim: inside the session's sandbox (
   test("its dir is the daemon's (hidden from every sandbox), the same for the runtime's life", () => {
     expect(shim.startsWith(join(sandboxRoot(), "launch-"))).toBe(true);
     expect(sbx.runtime?.gitShim("again")).toBe(shim);
-    expect(readFileSync(join(shim, "git"), "utf8")).toContain("exec '");
+    expect(readFileSync(join(shim, "git"), "utf8")).toContain("exec /usr/bin/env -i");
   });
 
-  test("the planted filter, fsmonitor and textconv run inside: nothing reaches the host or writes the workspace, and git's output is right", () => {
+  test("the planted filter, fsmonitor and textconv run inside: nothing reaches the host outside the workspace, and git's output is right", () => {
     const st = runShim(shim, STATUS, ws);
     expect(st.err).not.toContain("failed");
     expect(st.code).toBe(0);
-    expect(st.out).toBe(STATUS_OUT);
+    // What the filter wrote in the workspace (it may) aside.
+    expect(st.out.replace("?? WROTE-INSIDE\n", "")).toBe(STATUS_OUT);
     const diff = runShim(shim, ["--no-pager", "diff", "--", "b.txt"], ws);
     expect(diff.code).toBe(0);
     expect(diff.out).toContain("b2");
     expect(existsSync(mark)).toBe(false);
-    expect(existsSync(inside)).toBe(false);
+    // The workspace is writable to it, as to any sandboxed command (#448 round 5: the CLI's own commits and worktrees need it).
+    expect(existsSync(inside)).toBe(true);
+  });
+
+  test("a planted driver sees no credential of the CLI's, can't write outside the workspace or its git structure, and leaves nothing in a /tmp that is kept (#448 round 5)", () => {
+    const id = "envws";
+    const w = join(root, id);
+    mkdirSync(w, { recursive: true });
+    const dump = join(w, "ENV-DUMP");
+    const tmpList = join(w, "TMP-LIST");
+    const outMark = join(outside, `MARK-${id}`);
+    const script = join(w, "f.sh");
+    writeFileSync(
+      script,
+      [
+        "#!/bin/sh",
+        `env > '${dump}' 2>/dev/null`,
+        // And on stderr, which git passes on: seen whatever the driver may write.
+        "env >&2",
+        `ls -A /tmp > '${tmpList}' 2>/dev/null`,
+        "echo kept > /tmp/LEAK 2>/dev/null",
+        `echo kept > "\${TMPDIR:-/tmp}/LEAK2" 2>/dev/null`,
+        `{ echo ran >> '${outMark}'; } 2>/dev/null`,
+        `{ echo '[planted]' >> '${join(w, ".git", "config")}'; } 2>/dev/null`,
+        `{ echo planted > '${join(w, ".git", "hooks", "pre-commit")}'; } 2>/dev/null`,
+        "cat",
+        "",
+      ].join("\n"),
+    );
+    chmodSync(script, 0o755);
+    setup(w, ["init", "-q", "."]);
+    setup(w, ["config", "filter.x.clean", script]);
+    writeFileSync(join(w, ".gitattributes"), "a.txt filter=x\n");
+    writeFileSync(join(w, "a.txt"), "a\n");
+    setup(w, ["-c", "filter.x.clean=", "add", "a.txt", ".gitattributes"]);
+    setup(w, ["-c", "filter.x.clean=", "commit", "-qm", "init"]);
+    const configBefore = readFileSync(join(w, ".git", "config"), "utf8");
+    const reg = new SandboxRegistry("linux");
+    reg.register(bwrap);
+    const s2 = new SessionSandbox({ sessionId: "git-shim-env", workdir: w, registry: reg, config: { sandbox: { provider: "bwrap", network: "on", allowedHosts: [], hiddenPaths: [home], homeReadable: [], docker: { image: "x" } } } as never });
+    return (async () => {
+      try {
+        await s2.refresh("claude");
+        const rt = s2.runtime;
+        if (!rt) throw new Error("no runtime");
+        const sh = rt.gitShim("the Claude CLI");
+        const { alias: _a, ...callerEnv } = { alias: 0, ...CALLER_ENV, GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_0: "credential.helper", GIT_CONFIG_VALUE_0: "", GIT_CONFIG_KEY_1: "http.extraHeader", GIT_CONFIG_VALUE_1: "Authorization: Bearer PLANTED-HEADER" };
+        for (const round of [1, 2]) {
+          Bun.spawnSync(["touch", "-d", `200${round}-01-01`, join(w, "a.txt")]);
+          const st = runShim(sh, ["--no-optional-locks", "status", "--porcelain"], w, { env: callerEnv });
+          expect(st.code).toBe(0);
+          expectNoCredential(envOf(st.err));
+          expect(envOf(st.err).HOME).toBe(homedir());
+          expect(existsSync(dump)).toBe(true);
+          const seen = envOf(readFileSync(dump, "utf8"));
+          expectNoCredential(seen);
+          // Its home is the sandbox's view of the home (hidden); its repository selection and identity the caller's.
+          expect(seen.HOME).toBe(homedir());
+          expect(seen.GIT_AUTHOR_NAME).toBe("caller");
+          // A fresh /tmp each time: what the first run left isn't there for the second.
+          expect(readFileSync(tmpList, "utf8")).not.toContain("LEAK");
+        }
+        // Nothing of it in the session's temp dir (which the session's commands share), nor outside the workspace.
+        expect(readdirSync(rt.spec.tempDir).filter((n) => n.includes("LEAK"))).toEqual([]);
+        expect(existsSync(outMark)).toBe(false);
+        expect(readFileSync(join(w, ".git", "config"), "utf8")).toBe(configBefore);
+        expect(existsSync(join(w, ".git", "hooks", "pre-commit"))).toBe(false);
+      } finally {
+        await s2.close();
+      }
+    })();
+  });
+
+  test("the CLI's own writing git works through it (#448 round 5): a worktree added and removed as the CLI does, a commit", async () => {
+    const w = join(root, "wt-ws");
+    mkdirSync(w, { recursive: true });
+    setup(w, ["init", "-q", "."]);
+    writeFileSync(join(w, "a.txt"), "a\n");
+    setup(w, ["add", "a.txt"]);
+    setup(w, ["commit", "-qm", "init"]);
+    const reg = new SandboxRegistry("linux");
+    reg.register(bwrap);
+    const s2 = new SessionSandbox({ sessionId: "git-shim-wt", workdir: w, registry: reg, config: { sandbox: { provider: "bwrap", network: "on", allowedHosts: [], hiddenPaths: [home], homeReadable: [], docker: { image: "x" } } } as never });
+    try {
+      await s2.refresh("claude");
+      const sh = s2.runtime?.gitShim("the Claude CLI") ?? "";
+      const id = { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t", LC_ALL: "C" };
+      // EnterWorktree's: `git -c checkout.workers=N worktree add --no-track -B <branch> <top>/.claude/worktrees/<name> <base>`.
+      const at = join(w, ".claude", "worktrees", "feature");
+      const add = runShim(sh, ["-c", "checkout.workers=1", "worktree", "add", "--no-track", "-B", "worktree-feature", at, "HEAD"], w, { env: id });
+      expect(add.err).not.toContain("Read-only");
+      expect(add.code).toBe(0);
+      expect(readFileSync(join(at, "a.txt"), "utf8")).toBe("a\n");
+      // An agent's worktree isolation: `git worktree add --detach <path> <base>`.
+      const detached = join(w, ".claude", "worktrees", "agent-1");
+      expect(runShim(sh, ["worktree", "add", "--detach", detached, "HEAD"], w, { env: id }).code).toBe(0);
+      expect(runShim(sh, ["worktree", "list", "--porcelain", "-z"], w).out).toContain(detached);
+      // A commit in the worktree, then the worktrees removed.
+      writeFileSync(join(at, "b.txt"), "b\n");
+      expect(runShim(sh, ["add", "b.txt"], at).code).toBe(0);
+      expect(runShim(sh, ["commit", "-qm", "in worktree"], at, { env: id }).code).toBe(0);
+      expect(runShim(sh, ["worktree", "remove", "--force", detached], w).code).toBe(0);
+      expect(runShim(sh, ["worktree", "remove", "--force", at], w).code).toBe(0);
+      expect(existsSync(at)).toBe(false);
+      // A commit in the workspace itself.
+      expect(runShim(sh, ["commit", "--allow-empty", "-qm", "empty"], w, { env: id }).code).toBe(0);
+      expect(runShim(sh, ["log", "--oneline", "worktree-feature"], w).out).toContain("in worktree");
+      // Still held: the repository's config and hooks, its other project settings.
+      expect(runShim(sh, ["config", "core.planted", "x"], w).code).not.toBe(0);
+    } finally {
+      await s2.close();
+    }
   });
 
   test("stdin, exit code, cwd and arguments are the caller's", () => {
@@ -281,12 +513,13 @@ describe.skipIf(!bwrapProbe.available)("git shim: inside the session's sandbox (
   });
 
   test("with the launcher's provider gone, git runs defused instead: still nothing planted runs", () => {
-    const launcher = readFileSync(join(shim, "git"), "utf8").match(/exec '([^']+launch-git)'/)?.[1] ?? "";
+    const launcher = readFileSync(join(shim, "git"), "utf8").match(/\[ -f '([^']+launch-git)' \]/)?.[1] ?? "";
     expect(launcher).not.toBe("");
     const gone = writeGitShim(join(root, "gone", "git-bin"), { git: GIT_BIN, launcher, provider: join(root, "no-such-bwrap"), caller: "the Claude CLI" });
     const st = runShim(gone, STATUS, ws);
     expect(st.code).toBe(0);
-    expect(st.out).toBe(STATUS_OUT);
+    // WROTE-INSIDE: left by the sandboxed runs above, in the workspace.
+    expect(st.out.replace("?? WROTE-INSIDE\n", "")).toBe(STATUS_OUT);
     expect(existsSync(mark)).toBe(false);
   });
 });

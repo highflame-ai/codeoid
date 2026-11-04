@@ -302,18 +302,42 @@ caches, so nothing inside can rewrite it (opencode's file tools are refused
 it, as its shell shim's `bin/`).
 
 - **Claude (native)**: the shim runs the real git **inside the session's
-  sandbox** — the same provider (bubblewrap, Seatbelt), the same hidden
-  home and paths, the workspace and every other writable location
-  read-only, no network — with the CLI's stdio, exit code, working
-  directory, arguments and environment (its own `-c` list in
-  `GIT_CONFIG_COUNT` included). A driver a planted config names runs there,
-  contained, and the CLI's git status is still right. The CLI's Bash
-  commands get the CLI's `PATH` without the shim (its env file takes it off),
-  so a command's git is the real one: inside the sandbox as before, and a
-  command the owner let run outside (a `git push`) runs as it would.
-  What the CLI starts with its own environment finds the shim too: a hook or
-  a stdio MCP server that runs git in the workspace runs it read-only and
-  offline; give it its own `PATH` in its config if it must write.
+  sandbox** — the same provider (bubblewrap, Seatbelt), the session's command
+  sandbox (the workspace writable, its git structure and project settings held
+  read-only, the home and every hidden path hidden), no network, and a fresh,
+  empty `/tmp` for each git, gone when it exits (a tmpfs under bubblewrap; under
+  Seatbelt a dir of its own made in a daemon-private dir, the only part of it
+  writable, removed when git exits), never the session's temp dir — with the
+  CLI's stdio, exit code, working directory and arguments. A driver a planted
+  config names runs there, contained: it can do what a sandboxed command can
+  and no more, and nothing it writes outlives it outside the workspace. So the
+  CLI's own writing git works: its commits, and its worktree features
+  (`EnterWorktree`, a sub-agent's worktree isolation: `git worktree add`,
+  `git worktree remove`), for which the repository's `worktrees/` and the
+  workspace's `.claude/worktrees` are writable too (only to the CLI's git,
+  never to a command; only when they are real dirs, never in a git dir held
+  read-only whole). Its `git fetch origin <base>` before a worktree fails
+  (no network), and the CLI bases the worktree on the local branch instead,
+  with a warning.
+  git gets **an environment of its own**, built from a short allowlist
+  (`SHIM_ENV_NAMES`), never the CLI's: who you are, the locale, the terminal
+  and clock, `PATH`'s absolute entries, `HOME` as the sandbox shows it
+  (hidden, its allowlist such as `~/.gitconfig` shown), git's choice of
+  repository, worktree, index, pathspec and identity (`GIT_DIR`,
+  `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_AUTHOR_*`, …), and the CLI's own `-c`
+  list (`GIT_CONFIG_COUNT`) less any entry with a value whose key can carry a
+  credential (`http.*`, `credential.*`, `url.*`, `remote.*`, a token, a
+  password) or whose value is a URL with a user in it. Never the CLI's API key,
+  OAuth token or gateway credential, any `ANTHROPIC_*`/`CLAUDE_*`/codeoid
+  variable, `GIT_ASKPASS`, `GIT_SSH*`, `GIT_EXEC_PATH`, `GIT_TEMPLATE_DIR` or
+  `GIT_CONFIG_PARAMETERS`.
+  The CLI's Bash commands get the CLI's `PATH` without the shim (its env file
+  takes it off), so a command's git is the real one: inside the sandbox as
+  before, and a command the owner let run outside (a `git push`) runs as it
+  would. What the CLI starts with its own environment finds the shim too:
+  a hook or a stdio MCP server that runs git in the workspace runs it in the
+  sandbox, offline, without its credentials; give it its own `PATH` in its
+  config if it must push.
 - **When the shim can't sandbox** (its provider's program is gone), and for
   **opencode's server** (one server for every session, so no one session's
   sandbox fits; the git it runs is the one its `PATH` found): git runs with
@@ -321,8 +345,10 @@ it, as its shell shim's `bin/`).
   appended to the caller's `GIT_CONFIG_COUNT`), every filter, diff and merge
   driver and credential helper a config other than your global and system
   one defines reset by name, the working tree's attributes not read
-  (`attr.tree` naming the empty tree, git 2.46+), and only https and ssh as
-  protocols unless the caller's own list is narrower (opencode's is none).
+  (`attr.tree` naming the empty tree, git 2.46+), the same environment
+  allowlist as above (with the caller's own `HOME` and `TMPDIR`: opencode's
+  server's password never reaches git), and only https and ssh as protocols
+  unless the caller's own list is narrower (opencode's is none).
   A config git can't read runs nothing; a diff through a textconv or
   external diff the repository names fails rather than run it. A shim on
   `PATH` covers git run as a program, not a git library inside a backend:
@@ -405,7 +431,13 @@ to the workspace.
 - **Git**: with a repository's structure read-only, `git config …` (writing
   the repository's config), installing a hook, `git submodule update --init`,
   `git worktree add`/`remove`, `git sparse-checkout` and editing
-  `.git/info/exclude` fail inside; run them yourself. A repository whose `.git`
+  `.git/info/exclude` fail inside a command; run them yourself. The Claude
+  CLI's own worktree features (`EnterWorktree`, worktree isolation) work: its
+  git may write `worktrees/` and `.claude/worktrees` ([above](#a-backend-clis-own-git)).
+  A driver a planted config names, run by that git, may write them too: a
+  worktree checked out or planted there is the agent's content like the rest
+  of the workspace (its `.claude/` settings included), not something the
+  sandbox vouches for. A repository whose `.git`
   names a git dir git's own records don't name back (`--separate-git-dir`)
   is read-only inside: commits there fail. The placeholders (`commondir`
   holding `.`, the empty `remotes/`, `branches/`, `worktrees/` in the git
