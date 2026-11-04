@@ -1325,6 +1325,11 @@ export class ClaudeProvider implements SessionProvider {
               // this hook sees every call.
               const foreign = this.#refuseForeignCall(input);
               if (foreign) return foreign;
+              // The CLI's own worktrees aren't sandboxed (#448 round 6): its
+              // EnterWorktree (which it runs without asking canUseTool) and
+              // ExitWorktree are refused while the session is.
+              const worktree = cliWorktreeDecision(input.tool_name, sandbox !== null);
+              if (worktree) return worktree;
               // A command the model asks to run outside the OS sandbox (#448)
               // never runs on an allow rule: canUseTool, where codeoid asks
               // the owner in every mode.
@@ -1462,6 +1467,9 @@ export class ClaudeProvider implements SessionProvider {
           // didn't. Before tool_start, so nothing of it is shown.
           const foreign = this.#refuseForeignCall({ tool_name: toolName, tool_input: input, ...(sdkAgentId ? { agent_id: sdkAgentId } : {}) });
           if (foreign) return { behavior: "deny" as const, message: foreign.hookSpecificOutput.permissionDecisionReason };
+          // The CLI's own worktree tools, again (cliWorktreeDecision).
+          const worktree = cliWorktreeDecision(toolName, sandbox !== null);
+          if (worktree) return { behavior: "deny" as const, message: worktree.hookSpecificOutput.permissionDecisionReason };
 
           // A shell call is judged from where the CLI's Bash is now, as its
           // PreToolUse hook reported; not known (null) when it didn't.
@@ -2857,6 +2865,33 @@ export function heldWriteDecision(
     reason = "codeoid couldn't tell whether this write reaches what the sandbox holds read-only, so it needs the owner's approval.";
   }
   return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: reason } };
+}
+
+/**
+ * The Claude CLI's own worktree tools (#448 round 6). EnterWorktree checks a
+ * worktree out from HEAD under `.claude/worktrees/` and moves the session
+ * there, re-rooting the CLI's project settings at it; HEAD may carry settings
+ * (hooks) an agent committed from inside the sandbox. ExitWorktree moves the
+ * session back to where it was before it entered, which can be another
+ * worktree.
+ */
+export const CLI_WORKTREE_TOOLS: ReadonlySet<string> = new Set(["EnterWorktree", "ExitWorktree"]);
+
+export const CLI_WORKTREE_DENY =
+  "Refused in a sandboxed session: use codeoid's --worktree; the CLI's own worktrees aren't sandboxed " +
+  "(a worktree checked out from HEAD carries whatever project settings were committed, hooks included).";
+
+/**
+ * The PreToolUse hook's (and canUseTool's) refusal of the CLI's own worktree
+ * tools while the session is sandboxed (#448 round 6), or null. The CLI runs
+ * EnterWorktree without asking canUseTool, so the hook is where it's stopped.
+ */
+export function cliWorktreeDecision(
+  toolName: unknown,
+  sandboxed: boolean,
+): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "deny"; permissionDecisionReason: string } } | null {
+  if (!sandboxed || typeof toolName !== "string" || !CLI_WORKTREE_TOOLS.has(toolName)) return null;
+  return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny", permissionDecisionReason: CLI_WORKTREE_DENY } };
 }
 
 /** What the running query's OS sandbox was built from (#448): a change rebuilds it. */

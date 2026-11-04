@@ -259,7 +259,12 @@ in a `core.hooksPath` inside it); the git-structure protection is defence in
 depth, best effort, its known limits listed in docs/sandbox.md. At each turn's
 end and at destroy a session warns when the repository's config, hooks (and
 `core.hooksPath`'s), attributes or git-dir links changed (sandbox/git-watch.ts,
-`Session#checkGitControl`, event `sandbox.git_changed`).
+`Session#checkGitControl`, event `sandbox.git_changed`). Starting a Claude
+session trusts the repository's committed settings, which the sandbox can't
+vouch for. In a
+sandboxed Claude session the CLI's `EnterWorktree`/`ExitWorktree` are refused
+in the PreToolUse hook and `canUseTool` (`cliWorktreeDecision`: the CLI runs
+EnterWorktree without asking `canUseTool`); `--worktree` is codeoid's.
 `src/daemon/sandbox/`: a `SandboxProvider` (types.ts: capabilities — isolation
 tier, local/remote, mount/sync, stdio process, commands, argv wrap, enforced
 network modes, platforms — `probe()`, `open(spec)` → `SandboxHandle` with

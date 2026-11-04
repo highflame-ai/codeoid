@@ -311,14 +311,15 @@ it, as its shell shim's `bin/`).
   CLI's stdio, exit code, working directory and arguments. A driver a planted
   config names runs there, contained: it can do what a sandboxed command can
   and no more, and nothing it writes outlives it outside the workspace. So the
-  CLI's own writing git works: its commits, and its worktree features
-  (`EnterWorktree`, a sub-agent's worktree isolation: `git worktree add`,
-  `git worktree remove`), for which the repository's `worktrees/` and the
-  workspace's `.claude/worktrees` are writable too (only to the CLI's git,
-  never to a command; only when they are real dirs, never in a git dir held
-  read-only whole). Its `git fetch origin <base>` before a worktree fails
-  (no network), and the CLI bases the worktree on the local branch instead,
-  with a warning.
+  CLI's own writing git works: its commits, and a sub-agent's worktree
+  isolation (`git worktree add`, `git worktree remove`), for which the
+  repository's `worktrees/` and the workspace's `.claude/worktrees` are
+  writable too (only to the CLI's git, never to a command; only when they are
+  real dirs, never in a git dir held read-only whole). Its
+  `git fetch origin <base>` before a worktree fails (no network), and the CLI
+  bases the worktree on the local branch instead, with a warning. The CLI's
+  `EnterWorktree` and `ExitWorktree` are refused in a sandboxed session
+  ([below](#the-claude-clis-own-worktrees)).
   git gets **an environment of its own**, built from a short allowlist
   (`SHIM_ENV_NAMES`), never the CLI's: who you are, the locale, the terminal
   and clock, `PATH`'s absolute entries, `HOME` as the sandbox shows it
@@ -388,6 +389,52 @@ it, as its shell shim's `bin/`).
   nothing, #442: its sandbox is the boundary.) Under codeoid's bubblewrap a
   command codex runs unsandboxed is still inside codeoid's.
 
+## The Claude CLI's own worktrees
+
+In a sandboxed Claude session the CLI's own worktree tools, `EnterWorktree`
+and `ExitWorktree`, are **refused** at codeoid's gate, saying "use codeoid's
+--worktree; the CLI's own worktrees aren't sandboxed". For a session in a
+worktree of its own, start it with `codeoid new … --worktree`: codeoid makes
+the worktree and sandboxes the session there. The CLI runs `EnterWorktree`
+without asking for permission (it never reaches `canUseTool`), so the refusal
+is in codeoid's PreToolUse hook, which sees every call, and again in
+`canUseTool`. `ExitWorktree` is refused too: it moves the session back to
+where it was before it entered, which can itself be a worktree.
+
+Why: `EnterWorktree` checks a worktree out from HEAD under
+`.claude/worktrees/` and moves the session into it, and HEAD can carry project
+settings an agent committed from inside the sandbox
+([below](#committed-project-settings)). What the CLI does with them, checked
+in its binary and against the real CLI (Agent SDK 0.3.281, Claude Code
+2.1.281; `sandbox-claude-real.test.ts`): entering re-roots the CLI's project
+settings at the worktree (its `originalCwd` becomes the worktree, and the
+`projectSettings`/`localSettings` sources are read from there), but it doesn't
+reload them. Run against a localhost stand-in for the API, with a
+`.claude/settings.json` carrying a hook committed to HEAD and absent from the
+working tree, the hook did not run after `EnterWorktree`: not in that query,
+not after a settings file written in the worktree, not in a resumed query
+(codeoid passes the workspace as `cwd`). It would run as soon as anything
+made the CLI reload its settings in that query. codeoid refuses the tools
+either way rather than depend on that. Not refused: a sub-agent's worktree
+isolation (the `Agent` tool's `isolation: "worktree"`), whose sub-agent runs
+in the CLI's process with the session's settings.
+
+## Committed project settings
+
+**Starting a Claude session in a repository trusts its committed project
+settings**: `.claude/settings.json` (its hooks run on this machine, as the
+CLI's own process, outside any sandbox), `.mcp.json`'s servers once
+approved. That is Claude Code's own model, and every agent CLI has its
+equivalent (opencode's `opencode.json` and `.opencode/` plugins, the Gemini
+CLI's and Qwen's `settings.json`, Codex's `.codex/`, pi's `.pi/`). The sandbox
+holds those files read-only in the working tree, but it can't vouch for what
+an agent **committed**: git's object store and refs must stay writable for
+commits, so an agent can commit a `.claude/settings.json` with hooks through
+git plumbing (`hash-object`, `commit-tree`, `update-ref`) without it ever
+being in the working tree. A worktree checked out from that commit, a clone,
+or your own checkout after a merge then carries it, and the next session
+started there runs its hooks.
+
 ## Approval cards
 
 Every card carries `sandboxed` and `sandboxNote` (web, TUI/CLI, Telegram,
@@ -445,8 +492,9 @@ to the workspace.
   the repository's config), installing a hook, `git submodule update --init`,
   `git worktree add`/`remove`, `git sparse-checkout` and editing
   `.git/info/exclude` fail inside a command; run them yourself. The Claude
-  CLI's own worktree features (`EnterWorktree`, worktree isolation) work: its
-  git may write `worktrees/` and `.claude/worktrees` ([above](#a-backend-clis-own-git)).
+  CLI's sub-agent worktree isolation works: its git may write `worktrees/`
+  and `.claude/worktrees` ([above](#a-backend-clis-own-git)); its
+  `EnterWorktree` is refused ([above](#the-claude-clis-own-worktrees)).
   A driver a planted config names, run by that git, may write them too: a
   worktree checked out or planted there is the agent's content like the rest
   of the workspace (its `.claude/` settings included), not something the
@@ -600,6 +648,11 @@ works, and skip where it doesn't):
   scripted local model, `CODEOID_OPENCODE_INTEGRATION=1`): a session's shell
   lines run inside its bubblewrap; a session whose sandbox is off runs bash as
   before.
+- Round 6, the real Claude CLI (`sandbox-claude-real.test.ts`, "the Claude
+  CLI's own worktrees"): `EnterWorktree` runs without reaching `canUseTool`
+  and makes a worktree; with codeoid's PreToolUse refusal it makes none and
+  the model is told why. Whether the CLI loads a worktree's committed hooks
+  after entering it: see [The Claude CLI's own worktrees](#the-claude-clis-own-worktrees).
 
 **To verify on a real Mac** (Seatbelt; profile generation is unit-tested only):
 

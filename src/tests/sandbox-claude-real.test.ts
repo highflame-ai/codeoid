@@ -310,3 +310,43 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(existsSync(join(outside, "keep.txt"))).toBe(true);
   }, 120_000);
 });
+
+/**
+ * The CLI's own worktree tool (#448 round 6), for real: EnterWorktree never
+ * asks canUseTool (the CLI allows it itself), so codeoid's PreToolUse hook is
+ * what stops it in a sandboxed session. Needs only the CLI; the repository is
+ * the test's own, in its scratch dir.
+ */
+describe.skipIf(cli === null || process.env.CODEOID_TEST_CLAUDE_SANDBOX === "0")("the Claude CLI's own worktrees, for real", () => {
+  const WORKTREE_PROBE = join(import.meta.dir, "fixtures", "claude-worktree-probe.ts");
+  async function enter(mode: "refuse" | "none"): Promise<{ result: string; asked: string[]; toolResult: string | null; worktrees: string[] }> {
+    const root = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-wt-claude-")));
+    try {
+      const repo = join(root, "repo");
+      mkdirSync(repo, { recursive: true });
+      mkdirSync(join(root, "home"));
+      writeFileSync(join(repo, "README"), "hello\n");
+      const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: join(root, "home"), GIT_CONFIG_NOSYSTEM: "1" };
+      for (const args of [["init", "-q"], ["add", "-A"], ["-c", "user.name=t", "-c", "user.email=t@x", "commit", "-q", "-m", "init"]]) {
+        expect(Bun.spawnSync(["git", ...args], { cwd: repo, env }).exitCode).toBe(0);
+      }
+      const p = Bun.spawn([process.execPath, WORKTREE_PROBE, repo, mode], { stdout: "pipe", stderr: "pipe", timeout: 150_000 });
+      const out = await new Response(p.stdout).text();
+      await p.exited;
+      return JSON.parse(out.trim().split("\n").at(-1) ?? "{}");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
+  test("EnterWorktree runs without asking canUseTool, and codeoid's hook refuses it: no worktree is made, the model is told why", async () => {
+    const control = await enter("none");
+    expect(control.result).toBe("success");
+    expect(control.asked).not.toContain("EnterWorktree");
+    expect(control.worktrees).toEqual(["probe"]);
+    const refused = await enter("refuse");
+    expect(refused.result).toBe("success");
+    expect(refused.worktrees).toEqual([]);
+    expect(refused.toolResult ?? "").toContain("the CLI's own worktrees aren't sandboxed");
+  }, 300_000);
+});

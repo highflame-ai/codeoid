@@ -124,6 +124,7 @@ import {
   isTaskNotRunningError,
   stopTaskTarget,
   sandboxFingerprint,
+  CLI_WORKTREE_DENY,
   type ClaudeProviderInit,
 } from "../daemon/providers/claude/index.js";
 import { credentialEnvNames, physicalOf } from "../daemon/sandbox/claude-native.js";
@@ -3666,6 +3667,57 @@ describe("ClaudeProvider — the OS sandbox", () => {
     await drain;
     await p.teardown();
     rmSync(ws, { recursive: true, force: true });
+  });
+
+  it("the CLI's own worktree tools are refused while sandboxed, in the hook (EnterWorktree never asks canUseTool) and in canUseTool (#448 round 6)", async () => {
+    type Hook = (i: unknown) => Promise<unknown>;
+    type Gate = (n: string, i: unknown, o: { toolUseID: string; signal: AbortSignal }) => Promise<{ behavior: string; message?: string }>;
+    const deny = { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: CLI_WORKTREE_DENY } };
+    const asked: string[] = [];
+    for (const kind of ["native", "process", "none"] as const) {
+      const p = providerWith(() => (kind === "none" ? null : runtime(kind).rt));
+      let release: () => void = () => {};
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      const run = p.runTurn({
+        history: [],
+        userMessage: "go",
+        workdir: "/tmp",
+        canUseTool: async (_id, _a, name) => {
+          asked.push(`${kind}:${name}`);
+          return { behavior: "allow" as const };
+        },
+      });
+      const drain = (async () => {
+        await gate;
+        for await (const _ of run.events) {
+          /* drain */
+        }
+      })();
+      const opts = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Hook[] }> }; canUseTool: Gate } }).options;
+      const hook = opts.hooks.PreToolUse[0]!.hooks[0]!;
+      for (const [tool, input] of [["EnterWorktree", { name: "feature" }], ["EnterWorktree", { path: "/tmp/.claude/worktrees/x" }], ["ExitWorktree", { action: "keep" }]] as const) {
+        const decided = await hook({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, tool_use_id: `tu-${tool}`, cwd: "/tmp" });
+        const gated = await opts.canUseTool(tool, input, { toolUseID: `tu-${tool}-g`, signal: new AbortController().signal });
+        if (kind === "none") {
+          // Unsandboxed, they are the CLI's as before: no refusal, the gate decides.
+          expect(decided).not.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+          expect(gated.behavior).toBe("allow");
+        } else {
+          expect(decided).toEqual(deny);
+          expect(gated).toEqual({ behavior: "deny", message: CLI_WORKTREE_DENY });
+        }
+      }
+      // Anything else is untouched.
+      expect(await hook({ hook_event_name: "PreToolUse", tool_name: "Read", tool_input: { file_path: "/tmp/a" }, tool_use_id: "tu-r", cwd: "/tmp" })).not.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      release();
+      await drain;
+      await p.teardown();
+    }
+    // A refused call never reaches Session's gate (nothing of it is shown as an approval).
+    expect(asked).toEqual(["none:EnterWorktree", "none:EnterWorktree", "none:ExitWorktree"]);
+    expect(CLI_WORKTREE_DENY).toContain("use codeoid's --worktree; the CLI's own worktrees aren't sandboxed");
   });
 
   it("what the query was built with: a changed sandbox is a different build", () => {
