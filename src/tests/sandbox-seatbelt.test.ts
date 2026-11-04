@@ -4,8 +4,11 @@
  * loads, and holds) is listed in docs/sandbox.md.
  */
 import { describe, expect, test } from "bun:test";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
-import { SANDBOX_EXEC, SeatbeltSandboxProvider, seatbeltArgs, seatbeltEnvPrefix, seatbeltProfile } from "../daemon/sandbox/seatbelt.js";
+import { PRIVATE_TEMP_WORD, SANDBOX_EXEC, SeatbeltSandboxProvider, seatbeltArgs, seatbeltEnvPrefix, seatbeltProfile } from "../daemon/sandbox/seatbelt.js";
 import type { SandboxSpec } from "../daemon/sandbox/types.js";
 
 function spec(over: Partial<SandboxSpec> = {}): SandboxSpec {
@@ -149,5 +152,47 @@ describe("seatbeltProfile", () => {
     r.register(new SeatbeltSandboxProvider());
     expect(r.autoId()).toBe("seatbelt");
     if (process.platform !== "darwin") expect(await new SeatbeltSandboxProvider().probe()).toEqual({ available: false, reason: "Seatbelt runs on macOS only" });
+  });
+
+  // #448 round 5: the git shim's spec gives each program a temp dir of its own. Seatbelt has no mount namespace, so a
+  // wrapper makes it, names it in the profile and TMPDIR, and removes it. Run here with a stand-in for sandbox-exec
+  // that ignores the profile and runs the program, so the wrapper itself is what is tested.
+  test("a private-temp spec: each program gets a fresh dir made in the temp dir, the only part of it writable, removed when it exits", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-sb-private-")));
+    try {
+      const parent = join(root, "git-tmp");
+      mkdirSync(parent);
+      const params = join(root, "params");
+      const stub = join(root, "sandbox-exec");
+      // Writes each `-D` parameter it is given to `params`, then runs the program.
+      writeFileSync(stub, `#!/bin/sh\nwhile [ "$#" -gt 0 ]; do case "$1" in -p) shift 2 ;; -D) printf '%s\\n' "$2" >> '${params}'; shift 2 ;; *) break ;; esac; done\nexec "$@"\n`);
+      chmodSync(stub, 0o755);
+      const h = new SeatbeltSandboxProvider({ sandboxExec: stub }).openSync(spec({ tempDir: parent, privateTemp: true, unsetEnv: [] }));
+      const run = async () => {
+        rmSync(params, { force: true });
+        const r = await h.exec(["/bin/sh", "-c", 'printf %s "$TMPDIR"; ls -A "$TMPDIR"; echo kept > "$TMPDIR/LEAK"; exit 3'], { cwd: root, env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
+        return { r, params: readFileSync(params, "utf8").trim().split("\n") };
+      };
+      const first = await run();
+      expect(first.r.exitCode).toBe(3);
+      const dir = first.r.stdout;
+      expect(dir.startsWith(`${parent}/t.`)).toBe(true);
+      // The profile's parameter for the temp dir is that dir, not the parent.
+      expect(first.params.some((p) => p.endsWith(`=${dir}`))).toBe(true);
+      expect(first.params.some((p) => p.endsWith(`=${parent}`))).toBe(false);
+      // Gone when the program exits, and nothing of it seen by the next.
+      expect(readdirSync(parent)).toEqual([]);
+      const second = await run();
+      expect(second.r.stdout).not.toContain("LEAK");
+      expect(second.r.stdout).not.toBe(dir);
+      expect(readdirSync(parent)).toEqual([]);
+      // The profile itself: the dir's parameter, never the parent's path.
+      const { profile, params: p } = seatbeltProfile({ ...spec({ privateTemp: true }), tempDir: PRIVATE_TEMP_WORD }, fs);
+      expect(Object.values(p)).toContain(PRIVATE_TEMP_WORD);
+      expect(profile).not.toContain(parent);
+      await h.close();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

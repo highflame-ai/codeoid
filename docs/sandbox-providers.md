@@ -34,6 +34,8 @@ interface SandboxSpec {
   sessionId: string;
   workspace: string;          // writable
   tempDir: string;            // writable, private; the sandbox's /tmp where it can be
+  privateTemp?: boolean;      // a fresh temp dir per program, gone when it exits, never tempDir itself (the git shim's):
+                              //   bwrap/Docker a tmpfs /tmp; Seatbelt a dir the wrapper makes in tempDir and removes
   writable: string[];         // the backend's private home (when its whole process is inside); a git repository's dirs; the cache dir
                               // (each bound at its own path: none may be renamed, as a mount point can't)
   hidden: string[];           // not readable at all (the user's home first, whole)

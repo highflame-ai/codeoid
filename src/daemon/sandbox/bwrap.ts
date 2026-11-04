@@ -5,7 +5,8 @@
  *
  *   --ro-bind / /            everything read-only
  *   --dev /dev, --proc /proc a minimal /dev, and a /proc of the sandbox's own processes only
- *   --bind <temp> /tmp       a private /tmp (the host's, with other sessions' files and sockets, isn't there)
+ *   --bind <temp> /tmp       a private /tmp (the host's, with other sessions' files and sockets, isn't there);
+ *                            --tmpfs /tmp for a spec whose temp is per program (privateTemp)
  *   --tmpfs <home>           the home hidden whole, then (read-only) the allowlist and the workspace in it shown again
  *   --bind <workspace>       the workspace writable (and any other writable location)
  *   --tmpfs <dir>            a hidden directory: empty, then read-only again (--remount-ro)
@@ -112,7 +113,7 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   // sandbox does) can write there. In the sorted list, so a hidden dir above
   // it (the daemon's temp dir) doesn't cover it.
   const temp = realOr(spec.tempDir);
-  if (!within(temp, "/tmp") && kind(temp) && !seen.has(`w:${temp}`)) {
+  if (!spec.privateTemp && !within(temp, "/tmp") && kind(temp) && !seen.has(`w:${temp}`)) {
     seen.add(`w:${temp}`);
     mounts.push({ kind: "bind", src: temp, path: temp });
   }
@@ -151,8 +152,10 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   const rank = (m: Mount) => (m.kind === "hide-dir" || m.kind === "hide-file" ? 0 : 1);
   mounts.sort((a, b) => depth(a.path) - depth(b.path) || rank(a) - rank(b));
 
-  // The private /tmp first: a workspace below the host's /tmp is bound into it.
-  args.push("--bind", temp, "/tmp");
+  // The private /tmp first: a workspace below the host's /tmp is bound into it. A
+  // private-temp spec's is a tmpfs of this sandbox's own, gone when it exits.
+  if (spec.privateTemp) args.push("--tmpfs", "/tmp");
+  else args.push("--bind", temp, "/tmp");
   for (const m of mounts) {
     if (m.kind === "hide-dir") args.push("--tmpfs", m.path);
     else if (m.kind === "hide-file") args.push("--ro-bind", "/dev/null", m.path);

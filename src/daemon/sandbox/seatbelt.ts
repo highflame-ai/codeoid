@@ -158,6 +158,43 @@ export function seatbeltEnvPrefix(spec: SandboxSpec): string[] {
   return ["/usr/bin/env", ...spec.unsetEnv.flatMap((n) => ["-u", n]), ...Object.entries(spec.env ?? {}).map(([k, v]) => `${k}=${v}`), `TMPDIR=${spec.tempDir}`];
 }
 
+/**
+ * In a privateTemp spec's argv (#448 round 5), the per-program temp dir:
+ * {@link PRIVATE_TEMP_SCRIPT} puts the dir it made where a word of the
+ * prefix ends with this (the profile's parameter for it, `TMPDIR=`).
+ */
+export const PRIVATE_TEMP_WORD = "@codeoid-private-temp@";
+
+/**
+ * sh, run as `sh -c <this> codeoid-temp <parent> <k> <argv…>`: a fresh dir
+ * in `<parent>` (the only part of it the profile lets the program write),
+ * named in the first `<k>` words where they end with {@link PRIVATE_TEMP_WORD},
+ * the program run, the dir removed when it exits (or the wrapper is
+ * signalled), its exit status the program's. Seatbelt has no mount
+ * namespace, so this is how a program gets a temp dir nothing else shares
+ * and nothing outlives.
+ */
+export const PRIVATE_TEMP_SCRIPT = [
+  'd=$(mktemp -d "$1/t.XXXXXX") || exit 125',
+  'trap \'rm -rf "$d"; exit 129\' HUP',
+  'trap \'rm -rf "$d"; exit 130\' INT',
+  'trap \'rm -rf "$d"; exit 143\' TERM',
+  'k=$2',
+  "shift 2",
+  "n=$#",
+  'while [ "$n" -gt 0 ]; do',
+  "  a=$1",
+  "  shift",
+  "  n=$((n - 1))",
+  `  if [ "$k" -gt 0 ]; then k=$((k - 1)); case "$a" in *${PRIVATE_TEMP_WORD}) a="\${a%${PRIVATE_TEMP_WORD}}$d" ;; esac; fi`,
+  '  set -- "$@" "$a"',
+  "done",
+  '"$@"',
+  "r=$?",
+  'rm -rf "$d"',
+  'exit "$r"',
+].join("\n");
+
 export class SeatbeltSandboxProvider implements SandboxProvider {
   readonly id = SEATBELT_PROVIDER_ID;
   readonly displayName = "Seatbelt (macOS)";
@@ -203,6 +240,21 @@ export class SeatbeltSandboxProvider implements SandboxProvider {
       }
     };
     // The cwd is the spawn's (sandbox-exec keeps it): a launcher runs where its caller is.
+    if (spec.privateTemp) {
+      // The temp dir is made per program, in the spec's (a real path: Seatbelt sees `/private/…`).
+      let parent = spec.tempDir;
+      try {
+        parent = realpathSync(parent);
+      } catch {
+        /* made later: as given */
+      }
+      const inner: SandboxSpec = { ...spec, tempDir: PRIVATE_TEMP_WORD };
+      const prefix = [...seatbeltEnvPrefix(inner), bin, ...seatbeltArgs(inner, { isDir })];
+      return new LocalSandboxHandle(this.id, spec, (argv: readonly string[], opts: SandboxSpawnOptions) => ({
+        argv: ["/bin/sh", "-c", PRIVATE_TEMP_SCRIPT, "codeoid-temp", parent, String(prefix.length), ...prefix, ...argv],
+        env: opts.env,
+      }));
+    }
     return new LocalSandboxHandle(this.id, spec, (argv: readonly string[], opts: SandboxSpawnOptions) => ({
       argv: [...seatbeltEnvPrefix(spec), bin, ...seatbeltArgs(spec, { isDir }), ...argv],
       env: opts.env,

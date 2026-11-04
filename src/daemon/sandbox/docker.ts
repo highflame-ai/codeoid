@@ -8,7 +8,7 @@
  *     --user <uid>:<gid> --cap-drop ALL --security-opt no-new-privileges --pids-limit 4096
  *     --network none | bridge            off (and an allowlist it can't hold) | on
  *     --mount type=bind,source=<w>,target=<w>               the workspace, writable, at the same path
- *     --mount type=bind,source=<temp>,target=/tmp           the session's temp dir
+ *     --mount type=bind,source=<temp>,target=/tmp           the session's temp dir (a tmpfs for a privateTemp spec)
  *     --mount type=bind,source=<state>,target=<state>       the backend's private home, when its whole process is inside
  *     --mount type=bind,…,readonly        the backend's own program (it must run on the image), the home allowlist
  *     --mount type=tmpfs,…  /  …source=/dev/null,…,readonly  a hidden path inside something mounted
@@ -121,7 +121,9 @@ export function dockerRunArgs(spec: SandboxSpec, argv: readonly string[], o: Doc
   const inMounted = (at: string) => mounted.some((m) => m !== "/tmp" && within(at, m) && at !== m);
   const workspace = realOr(spec.workspace);
   bind(workspace, workspace, false);
-  bind(realOr(spec.tempDir), "/tmp", false);
+  // A private-temp spec's /tmp is the container's own tmpfs, gone with it (--rm).
+  if (spec.privateTemp) args.push("--mount", mountSpec([["type", "tmpfs"], ["destination", "/tmp"]], false));
+  else bind(realOr(spec.tempDir), "/tmp", false);
   for (const w of spec.writable) {
     const at = realOr(w);
     if (kind(at) && !mounted.includes(at)) bind(at, at, false);

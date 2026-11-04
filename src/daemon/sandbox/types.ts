@@ -71,6 +71,14 @@ export interface SandboxSpec {
   workspace: string;
   /** A private temp dir for this session: writable, and the sandbox's `/tmp` where the provider can place it there. */
   tempDir: string;
+  /**
+   * Each program started gets a fresh, empty temp dir of its own, gone when
+   * it exits, never {@link tempDir} itself: nothing written there outlives
+   * it (a tmpfs `/tmp` under bubblewrap and Docker; under Seatbelt, a dir
+   * made in {@link tempDir} by the wrapper, the only part of it writable, and
+   * removed when the program exits). The git shim's (git-shim.ts).
+   */
+  privateTemp?: boolean;
   /** Other writable locations (a backend's own state dir when its whole process is inside). */
   writable: readonly string[];
   /** Locations that must not be readable at all (directories and files). */
