@@ -5,7 +5,7 @@
  * frontend's.
  */
 
-import type { SessionSandboxInfo, ToolWaitingConfirmationState } from "@highflame/codeoid-protocol";
+import type { SessionInfo, SessionSandboxInfo, ToolWaitingConfirmationState } from "@highflame/codeoid-protocol";
 
 export type SandboxTone = "on" | "warn" | "off" | "neutral";
 
@@ -59,6 +59,18 @@ export function sandboxSummary(info: SessionSandboxInfo | undefined): string | n
     default:
       return "sandbox: not needed (runs no commands)";
   }
+}
+
+/**
+ * One line for a list (`codeoid ls`) on a session's mode, when there's
+ * something to say: autonomous (the sandbox is its boundary; what budget is
+ * left), or guarded because the autonomous budget ran out. Null otherwise.
+ */
+export function modeSummary(s: Pick<SessionInfo, "mode" | "turnsRemaining" | "autonomousBudgetSpent" | "budgetExhausted">): string | null {
+  if (s.budgetExhausted) return "mode: guarded — autonomous budget spent, this attempt ended";
+  if (s.autonomousBudgetSpent) return "mode: guarded — autonomous budget spent: writes and commands will ask; raise the budget or switch back";
+  if (s.mode !== "autonomous") return null;
+  return s.turnsRemaining === undefined ? "mode: autonomous" : `mode: autonomous, ${s.turnsRemaining} tool call${s.turnsRemaining === 1 ? "" : "s"} left`;
 }
 
 /** The approval card's sandbox line, or null when the daemon said nothing of it. */

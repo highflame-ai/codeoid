@@ -102,6 +102,7 @@ Autonomous mode never waits on a person. The OS sandbox is its boundary: an auto
   - a call whose path a backend couldn't resolve for certain: opencode's `opencode_unresolved_path` (`unresolved_path`).
 - **Still refused, as in every mode:** a read of a credential file or of another process's environment.
 - **Still asks:** a question to you (`AskUserQuestion` and other elicitation tools), and a fleet dispatch (`fleet_send`, `fleet_spawn`, `fleet_interrupt`), which you confirm with its full input shown.
+- **The budget.** When the autonomous tool budget runs out, the session goes back to guarded mode and writes and commands ask again. It says so at once: an info line in the transcript (`⚠ Autonomous budget spent: now guarded, writes and commands will ask; raise the budget or switch back to autonomous.`, event `budget.spent`), `autonomousBudgetSpent` on the session's info until a mode is set, and `codeoid ls` shows `mode: guarded — autonomous budget spent …`. A worker started with `onBudgetExhausted: "end_attempt"` (a loop attempt) ends its attempt instead, as before.
 - **Unattended runs** (routines, loops, dispatched workers) therefore park on nothing but those two asks: a question for you, or a fleet dispatch.
 - Codex in autonomous mode asks codeoid about nothing (#442), so none of this reaches its calls; its own sandbox, and codeoid's around it, hold.
 

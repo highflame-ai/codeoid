@@ -842,6 +842,10 @@ interface TurnCounts {
   unreported?: boolean;
 }
 
+/** What the session says when its autonomous tool budget runs out and it reverts to guarded (park). */
+export const AUTONOMOUS_BUDGET_SPENT =
+  "Autonomous budget spent: now guarded, writes and commands will ask; raise the budget or switch back to autonomous.";
+
 /** Why autonomous mode refused a call outright (Session#autonomousRefusal, #448). */
 interface AutonomousRefusal {
   kind: "unsandboxed" | "held_write" | "claude_settings" | "credential_dir" | "unresolved_path";
@@ -1198,6 +1202,8 @@ export class Session {
    * (setMode). Only an explicit re-arm clears it, never a turn boundary.
    */
   #budgetExhausted = false;
+  /** park: the autonomous budget ran out and the session reverted to guarded; cleared when a mode is set again. */
+  #autonomousBudgetSpent = false;
   /** This turn's end-attempt interrupt has been scheduled (once per turn). */
   #endAttemptInterruptQueued = false;
   /** See SessionCreateOptions.extraEnv (validated in the constructor). */
@@ -2984,7 +2990,13 @@ export class Session {
       this.#budgetExhausted = false;
       this.#broadcastInfoUpdate();
     }
+    // Choosing a mode answers the spent-budget notice.
+    if (this.#autonomousBudgetSpent && sender) {
+      this.#autonomousBudgetSpent = false;
+      this.#broadcastInfoUpdate();
+    }
     if (this.#mode === mode && this.#turnsRemaining === maxTurns) return;
+    this.#autonomousBudgetSpent = false;
     this.#mode = mode;
     this.#turnsRemaining = mode === "autonomous" ? maxTurns : undefined;
     // A fresh autonomous budget is a new attempt's: the spent flag is the old one's.
@@ -6455,6 +6467,7 @@ export class Session {
       ...(this.#sandbox?.info ? { sandbox: this.#sandbox.info } : {}),
       turnsRemaining: this.#turnsRemaining,
       ...(this.#budgetExhausted ? { budgetExhausted: true as const } : {}),
+      ...(this.#autonomousBudgetSpent ? { autonomousBudgetSpent: true as const } : {}),
       pinnedFiles: [...this.#pinnedFiles],
       agentUri: this.#agentIdentity.sub,
       subagents: this.subagentSnapshot,
@@ -7637,8 +7650,10 @@ export class Session {
       if (this.#turnsRemaining === undefined) return true;
       if (this.#turnsRemaining <= 0) {
         // Budget exhausted — revert to guarded (reads stay frictionless,
-        // writes/exec start prompting again) and fall through to ask.
+        // writes/exec start prompting again) and fall through to ask. Said
+        // on the session and in the transcript the moment it happens.
         this.setMode("guarded");
+        this.#noteAutonomousBudgetSpent(toolName);
         return false;
       }
       this.#turnsRemaining -= 1;
@@ -7647,6 +7662,23 @@ export class Session {
     }
 
     return false;
+  }
+
+  /**
+   * The autonomous tool budget ran out and the session is guarded now (park):
+   * an info line in the transcript, the audit, and `autonomousBudgetSpent` on
+   * the session's info until a mode is set again.
+   */
+  #noteAutonomousBudgetSpent(toolName: string): void {
+    this.#autonomousBudgetSpent = true;
+    this.#store.audit(SYSTEM_IDENTITY.sub, "session.budget_spent", this.id, `tool=${toolName}`);
+    const infoMsg = this.#makeMessage("info", `⚠ ${AUTONOMOUS_BUDGET_SPENT}`, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "budget.spent",
+      tool: toolName,
+    });
+    this.#persistAndBuffer(infoMsg);
+    this.#broadcastRaw(infoMsg);
+    this.#broadcastInfoUpdate();
   }
 
   /**

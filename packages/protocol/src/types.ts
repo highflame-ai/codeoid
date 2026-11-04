@@ -517,6 +517,12 @@ export interface SessionInfo {
    * mode or sends a message, or its controller sets a new budget. Absent = not.
    */
   budgetExhausted?: true;
+  /**
+   * The autonomous tool budget ran out and the session reverted to guarded
+   * mode (the default "park"): writes and commands ask again. Cleared when a
+   * mode is set. Absent = not (and on older daemons).
+   */
+  autonomousBudgetSpent?: true;
   /** Files pinned to the session — prepended to every turn's prompt. */
   pinnedFiles?: string[];
   /** SPIFFE/WIMSE URI of the primary session agent (falls back to anonymous:session:<id>). */

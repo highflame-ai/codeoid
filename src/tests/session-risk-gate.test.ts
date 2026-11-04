@@ -5,7 +5,8 @@
  * a low-risk read runs unasked in guarded mode only when the config says so,
  * and what the gate decides is what the approval card shows. Autonomous mode
  * waits on no one (#448): a command of any level runs (the OS sandbox holds
- * it), and a credential search is refused with its reason.
+ * it), a credential search is refused with its reason, and a spent budget
+ * says so the moment it reverts the session to guarded.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
@@ -16,7 +17,7 @@ import type { CodeoidConfig } from "../config.js";
 import { getConfigDir } from "../config.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
-import { Session, type SessionCreateOptions } from "../daemon/session.js";
+import { AUTONOMOUS_BUDGET_SPENT, Session, type SessionCreateOptions } from "../daemon/session.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import type { AuthContext, SessionMessage, SessionMode } from "../protocol/types.js";
@@ -227,5 +228,25 @@ describe("autonomous mode waits on no one: the OS sandbox is its boundary (#448)
   test("a question to the owner still asks", async () => {
     const r = await gate({ questions: [{ question: "which?", options: [] }] }, "autonomous", undefined, { name: "AskUserQuestion" });
     expect(r.asked).toBe(true);
+  });
+
+  test("the budget running out says so at once, on the session and in the transcript, and the session is guarded from then on", async () => {
+    const call = (id: string): ProviderEvent => ({ type: "tool_start", toolId: id, sdkToolUseId: `sdk-${id}`, name: "Bash", input: { command: "npm test" }, approvalId: `ap-${id}` });
+    const done = bash("x").at(-1)!;
+    const provider = new MockSessionProvider("mock", [[call("1"), call("2"), done]]);
+    const { session, infos } = makeSession(provider, "autonomous", undefined, 1);
+    void session.send("go", AUTH);
+    await until(() => session.pendingToolApprovals().length > 0);
+    expect(provider.canUseToolResults[0]?.behavior).toBe("allow");
+    expect(session.mode).toBe("guarded");
+    const notice = infos.find((m) => (m.metadata as { event?: string } | undefined)?.event === "budget.spent");
+    expect(notice?.content).toBe(`⚠ ${AUTONOMOUS_BUDGET_SPENT}`);
+    expect(AUTONOMOUS_BUDGET_SPENT).toContain("now guarded, writes and commands will ask");
+    expect(session.toInfo()).toMatchObject({ mode: "guarded", autonomousBudgetSpent: true });
+    expect(audits.some((a) => a.action === "session.budget_spent")).toBe(true);
+    await session.interrupt(AUTH);
+    // Choosing a mode answers it.
+    session.setMode("autonomous", 5, AUTH);
+    expect(session.toInfo().autonomousBudgetSpent).toBeUndefined();
   });
 });

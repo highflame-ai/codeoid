@@ -6,7 +6,7 @@
 
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
-import { approvalSandboxLine, formatToolRisk, mcpRefreshSummary, sandboxSummary } from "@highflame/codeoid-core";
+import { approvalSandboxLine, formatToolRisk, mcpRefreshSummary, modeSummary, sandboxSummary } from "@highflame/codeoid-core";
 import type { CodeoidConfig } from "../config.js";
 import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
@@ -363,6 +363,8 @@ export class TerminalClient {
         console.log(`  ${"".padEnd(20)} id: ${s.id}  clients: ${s.attachedClients}`);
         const sandbox = sandboxSummary(s.sandbox);
         if (sandbox) console.log(`  ${"".padEnd(20)} ${sandbox}`);
+        const mode = modeSummary(s);
+        if (mode) console.log(`  ${"".padEnd(20)} ${mode}`);
         const effective = s.effectiveAccount ?? s.effectiveClaudeAccount;
         if (effective) {
           // Which account it bills on its backend, and whether that is its own choice.

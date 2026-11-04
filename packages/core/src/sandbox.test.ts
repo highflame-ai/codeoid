@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { SessionSandboxInfo } from "@highflame/codeoid-protocol";
-import { approvalSandboxLine, sandboxBadge, sandboxSummary } from "./sandbox.js";
+import { approvalSandboxLine, modeSummary, sandboxBadge, sandboxSummary } from "./sandbox.js";
 import { dispatchSlash, parseSlash } from "./slash.js";
 
 const on: SessionSandboxInfo = { choice: "auto", state: "on", provider: "bwrap", providerName: "bubblewrap", network: "off", confinement: "native", via: "Claude Code's sandbox (bubblewrap) with codeoid's policy", enforced: true };
@@ -42,5 +42,20 @@ describe("sandbox display (#448)", () => {
     const sent: unknown[] = [];
     dispatchSlash({ kind: "sandbox", sandbox: { network: "off" } }, { sessionId: "s1", newRequestId: () => "r1", send: (m: unknown) => sent.push(m) } as never);
     expect(sent).toEqual([{ type: "session.set_sandbox", id: "r1", sessionId: "s1", sandbox: { network: "off" } }]);
+  });
+});
+
+describe("the mode line in a list (#448)", () => {
+  it("says autonomous with what budget is left, and guarded because the autonomous budget ran out; nothing for a plain mode", () => {
+    expect(modeSummary({ mode: "autonomous" })).toBe("mode: autonomous");
+    expect(modeSummary({ mode: "autonomous", turnsRemaining: 3 })).toBe("mode: autonomous, 3 tool calls left");
+    expect(modeSummary({ mode: "autonomous", turnsRemaining: 1 })).toBe("mode: autonomous, 1 tool call left");
+    expect(modeSummary({ mode: "guarded", autonomousBudgetSpent: true })).toBe(
+      "mode: guarded — autonomous budget spent: writes and commands will ask; raise the budget or switch back",
+    );
+    expect(modeSummary({ mode: "guarded", budgetExhausted: true })).toContain("this attempt ended");
+    expect(modeSummary({ mode: "guarded" })).toBeNull();
+    expect(modeSummary({ mode: "interactive" })).toBeNull();
+    expect(modeSummary({})).toBeNull();
   });
 });
