@@ -337,7 +337,9 @@ it, as its shell shim's `bin/`).
   would. What the CLI starts with its own environment finds the shim too:
   a hook or a stdio MCP server that runs git in the workspace runs it in the
   sandbox, offline, without its credentials; give it its own `PATH` in its
-  config if it must push.
+  config if it must push. The shim is checked at each query and written again
+  when it is gone (a temp cleaner removing the daemon's dir); one removed while
+  a query runs leaves that query's CLI the next `git` on its `PATH`.
 - **When the shim can't sandbox** (its provider's program is gone), and for
   **opencode's server** (one server for every session, so no one session's
   sandbox fits; the git it runs is the one its `PATH` found): git runs with

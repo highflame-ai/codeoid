@@ -13,7 +13,7 @@
  * starts on it.
  */
 
-import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
@@ -401,7 +401,8 @@ export class SessionSandbox {
       stateDir: (key) => this.#stateDir(key),
       claudeTemp: () => this.#ensureClaudeTemp(),
       gitShim: (caller) => {
-        gitShim ??= this.#writeGitShim(provider, caller);
+        // Checked at each query: one removed meanwhile (a temp cleaner) is written again rather than leave the CLI the host's git.
+        if (!gitShim || !existsSync(join(gitShim, "git"))) gitShim = this.#writeGitShim(provider, caller);
         return gitShim;
       },
       warn: (text) => {
@@ -475,7 +476,10 @@ export class SessionSandbox {
    */
   #writeGitShim(provider: SandboxProvider, caller: string): string {
     if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
-    const dir = join(this.#ensureLauncherDir(), "git-bin");
+    const launcherDir = this.#ensureLauncherDir();
+    // Gone (a temp cleaner, #448 round 5): made again, so a CLI started now finds the shim, not the host's git.
+    mkdirSync(launcherDir, { recursive: true, mode: 0o700 });
+    const dir = join(launcherDir, "git-bin");
     let launcher: string | null = null;
     let program: string | null = null;
     if (provider.openSync && provider.capabilities.wrapsArgv && provider.capabilities.placement === "local") {

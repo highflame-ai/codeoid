@@ -549,6 +549,19 @@ describe.skipIf(!bwrapProbe.available)("git shim: inside the session's sandbox (
     }
   });
 
+  test("a shim removed meanwhile (a temp cleaner) is written again at the next query, rather than leave the CLI the host's git (#448 round 5)", () => {
+    const rt = sbx.runtime;
+    if (!rt) throw new Error("no runtime");
+    const before = rt.gitShim("the Claude CLI");
+    // The whole launcher dir gone: the shim and its launcher.
+    rmSync(join(before, ".."), { recursive: true, force: true });
+    const after = rt.gitShim("the Claude CLI");
+    expect(existsSync(join(after, "git"))).toBe(true);
+    const st = runShim(after, STATUS, ws);
+    expect(st.code).toBe(0);
+    expect(existsSync(mark)).toBe(false);
+  });
+
   test("stdin, exit code, cwd and arguments are the caller's", () => {
     mkdirSync(join(ws, "sub"), { recursive: true });
     expect(runShim(shim, ["hash-object", "--stdin"], ws, { stdin: "hello\n" }).out.trim()).toBe("ce013625030ba8dba906f756967f9e9ca394464a");
