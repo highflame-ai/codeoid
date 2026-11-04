@@ -25,8 +25,9 @@
  *     driver and credential helper defined outside the user's global and
  *     system config reset (read from `git config --show-scope`, which runs
  *     nothing; a listing that fails runs nothing), the working tree's
- *     attributes not read (`attr.tree`: an empty tree), and only https and
- *     ssh as protocols.
+ *     attributes not read (`attr.tree`: an empty tree), no nested
+ *     repository gone into (its own config's drivers can't be reset by name:
+ *     {@link SUBMODULE_OVERRIDES}), and only https and ssh as protocols.
  *
  * Either way git gets an environment built from {@link SHIM_ENV_NAMES}, never
  * the caller's: the Claude CLI's has its API key or OAuth token, a gateway's
@@ -90,6 +91,25 @@ const SECRET_CONFIG_KEYS = [
 
 /** The caller's `-c` list is read up to this many entries; a longer one runs nothing. */
 const MAX_CALLER_CONFIG = 1000;
+
+/**
+ * What the defused git gets besides {@link BASE_OVERRIDES} (#448 round 5):
+ * git runs a git of its own inside a nested repository (the status and diff
+ * of a gitlink check its dirt there, a summary or a `diff=diff` shows its
+ * log), and that one reads the nested repository's config and
+ * `info/attributes`, whose drivers can't be reset by a name the shim never
+ * saw. So it never goes into one: submodules ignored (with
+ * `submodule.<name>.ignore` set for every name the repository's config and
+ * `.gitmodules` know, which outranks `diff.ignoreSubmodules`), no summary,
+ * no recursing fetch or push.
+ */
+export const SUBMODULE_OVERRIDES: ReadonlyArray<readonly [string, string]> = [
+  ["diff.ignoreSubmodules", "all"],
+  ["diff.submodule", "short"],
+  ["status.submoduleSummary", "false"],
+  ["fetch.recurseSubmodules", "false"],
+  ["push.recurseSubmodules", "no"],
+];
 
 /** What git a CLI runs for itself needs writable beyond a command's: the dirs its worktree features write. */
 export interface GitShimWorktrees {
@@ -240,12 +260,11 @@ function execClean(program: string): string[] {
 
 /**
  * Lines setting `L`, the start of a command line (for `eval`) running `git`
- * with the environment
+ * with git's own options before its command (`$o`) and the environment
  * gathered so far (the words after git's arguments, `n0`, and the count of
  * `-c` entries now), never the caller's: reading the index runs
  * `core.fsmonitor`, and these must run nothing. At the top level, never in
- * a function (whose `${1}` is its own): words are named by position. `$o`:
- * none yet.
+ * a function (whose `${1}` is its own): words are named by position.
  */
 function listingCommand(git: string): string[] {
   const run = git.includes("=") ? `/bin/sh -c 'exec "$0" "$@"' ${q(git)}` : '\\"\\$g\\"';
@@ -306,7 +325,22 @@ export function gitShimScript(opts: GitShimOptions): string {
     `g=${q(git)}`,
     ...BASE_OVERRIDES.map(([k, v]) => configWord(k, v)),
     configWord("attr.tree", EMPTY_TREE),
+    ...SUBMODULE_OVERRIDES.map(([k, v]) => configWord(k, v)),
+    // git's options before its command (`-C`, `--git-dir`, `-c`): the listings below read the repository git will.
+    // Never a pager's (`-p`): nothing here runs one.
     'o=""',
+    "i=1",
+    'while [ "$i" -le "$n0" ]; do',
+    '  eval "a=\\${$i}"',
+    '  case "$a" in',
+    '    -C|-c|--git-dir|--work-tree|--namespace|--config-env|--attr-source) o="$o \\"\\${$i}\\""; i=$((i + 1)); [ "$i" -gt "$n0" ] || o="$o \\"\\${$i}\\"" ;;',
+    '    --git-dir=*|--work-tree=*|--namespace=*|--config-env=*|--attr-source=*|--bare|--no-replace-objects|--literal-pathspecs|--glob-pathspecs|--noglob-pathspecs|--icase-pathspecs|--no-optional-locks|--no-lazy-fetch|--no-advice|-P|--no-pager) o="$o \\"\\${$i}\\"" ;;',
+    // Any other (`--version`, `--exec-path`, `-p`): not one that picks a repository, and some are a command of their own.
+    "    -*) ;;",
+    "    *) break ;;",
+    "  esac",
+    "  i=$((i + 1))",
+    "done",
     ...listingCommand(git),
     // Every key git reads here, as `scope<TAB>key` per line (a name holds no newline): those of drivers and helpers are picked below.
     'd=$(eval "$L config --show-scope --name-only --list" </dev/null 2>/dev/null)',
@@ -320,6 +354,7 @@ export function gitShimScript(opts: GitShimOptions): string {
     '  [ -n "$e" ] || continue',
     '  s="${e%%"$t"*}"',
     '  k="${e#*"$t"}"',
+    '  case "$k" in submodule.*.*) m="${k#submodule.}"; m="${m%.*}"; set -- "$@" "GIT_CONFIG_KEY_$j=submodule.$m.ignore" "GIT_CONFIG_VALUE_$j=all"; j=$((j + 1)) ;; esac',
     '  case "$s" in system|global) continue ;; esac',
     '  case "$k" in',
     '    credential.*helper) set -- "$@" "GIT_CONFIG_KEY_$j=$k" "GIT_CONFIG_VALUE_$j="; j=$((j + 1)) ;;',
@@ -330,6 +365,18 @@ export function gitShimScript(opts: GitShimOptions): string {
     "done <<CODEOID_GIT_SHIM_DRIVERS",
     "$d",
     "CODEOID_GIT_SHIM_DRIVERS",
+    // The submodules `.gitmodules` names, where git reads it: the working tree's, else the index's, else HEAD's
+    // (reading the index runs `core.fsmonitor`: these with every override so far, the drivers' included).
+    ...listingCommand(git),
+    'w=$(eval "$L rev-parse --show-toplevel" </dev/null 2>/dev/null)',
+    'if [ -n "$w" ] && [ -f "$w/.gitmodules" ]; then u=$(eval "$L config -f \\"\\$w/.gitmodules\\" --name-only --list" </dev/null 2>/dev/null)',
+    'else u=$(eval "$L config --blob :.gitmodules --name-only --list" </dev/null 2>/dev/null) || u=$(eval "$L config --blob HEAD:.gitmodules --name-only --list" </dev/null 2>/dev/null)',
+    "fi",
+    'while IFS= read -r k; do',
+    '  case "$k" in submodule.*.*) m="${k#submodule.}"; m="${m%.*}"; set -- "$@" "GIT_CONFIG_KEY_$j=submodule.$m.ignore" "GIT_CONFIG_VALUE_$j=all"; j=$((j + 1)) ;; esac',
+    "done <<CODEOID_GIT_SHIM_SUBMODULES",
+    "$u",
+    "CODEOID_GIT_SHIM_SUBMODULES",
     ...Object.entries(PROGRAM_ENV).map(([k, v]) => `set -- "$@" ${q(`${k}=${v}`)}`),
     // The caller's own protocol list stands (opencode's is none); else https and ssh only.
     `set -- "$@" GIT_NO_REPLACE_OBJECTS=1 GIT_TERMINAL_PROMPT=0 "GIT_ALLOW_PROTOCOL=\${GIT_ALLOW_PROTOCOL-${REMOTE_PROTOCOLS}}"`,

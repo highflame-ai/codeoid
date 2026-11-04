@@ -336,8 +336,9 @@ git (`SandboxSpec.privateTemp`) and the CLI's worktree dirs writable
 (`cliWorktrees`), its Bash commands' `PATH` without it (claude-native.ts's env
 file); opencode's server's, and one
 whose provider is gone, run git defused (BASE_OVERRIDES appended to the
-caller's `GIT_CONFIG_COUNT`, agent-scope drivers and helpers reset by name,
-`attr.tree` empty). Either way git's
+caller's `GIT_CONFIG_COUNT`, agent-scope drivers and helpers reset by name in
+the repository the caller's `-C`/`--git-dir` names, `attr.tree` empty, no
+nested repository gone into: `SUBMODULE_OVERRIDES`). Either way git's
 environment is an allowlist (`SHIM_ENV_NAMES`), never the caller's credentials. In local mode no route hands the token to a loopback
 request (a sandboxed command is one): the web UI exchanges a one-time code
 from the banner's link or `codeoid ui` (`LocalUiLinks`, `/ui/local-session`).

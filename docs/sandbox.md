@@ -344,11 +344,20 @@ it, as its shell shim's `bin/`).
   every program-running key turned off (the daemon's own list, `safeGitEnv`'s,
   appended to the caller's `GIT_CONFIG_COUNT`), every filter, diff and merge
   driver and credential helper a config other than your global and system
-  one defines reset by name, the working tree's attributes not read
-  (`attr.tree` naming the empty tree, git 2.46+), the same environment
-  allowlist as above (with the caller's own `HOME` and `TMPDIR`: opencode's
-  server's password never reaches git), and only https and ssh as protocols
-  unless the caller's own list is narrower (opencode's is none).
+  one defines reset by name (read from the repository git will use: the
+  caller's `-C`, `--git-dir` and `--work-tree` are followed), the working
+  tree's attributes not read (`attr.tree` naming the empty tree, git 2.46+),
+  no nested repository gone into (a gitlink's dirt, summary or diff would run
+  a git inside it, with that repository's own config and `info/attributes`,
+  whose drivers can't be reset by a name the shim never saw: submodules are
+  ignored, `diff.ignoreSubmodules=all` and `submodule.<name>.ignore=all` for
+  every name the repository's config and `.gitmodules` know, which outranks
+  a `.gitmodules` `ignore = none`; no submodule summary, no recursing fetch or
+  push), the same environment allowlist as above (with the caller's own
+  `HOME` and `TMPDIR`: opencode's server's password never reaches git), and
+  only https and ssh as protocols unless the caller's own list is narrower
+  (opencode's is none). A submodule's changes therefore don't show in such a
+  git's status.
   A config git can't read runs nothing; a diff through a textconv or
   external diff the repository names fails rather than run it. A shim on
   `PATH` covers git run as a program, not a git library inside a backend:

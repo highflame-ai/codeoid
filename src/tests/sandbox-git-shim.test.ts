@@ -224,7 +224,7 @@ describe("git shim: the script", () => {
     expect(script).toContain(`set -- "$@" 'HOME=/home/u'`);
     expect(script).toContain(`set -- "$@" "GIT_CONFIG_COUNT=$j" '/p/launch-git'`);
     expect(script).toContain(`exec /usr/bin/env -i "$@"`);
-    for (const k of ["core.hooksPath", "core.fsmonitor", "core.sshCommand", "diff.external", "gpg.program"]) {
+    for (const k of ["core.hooksPath", "core.fsmonitor", "core.sshCommand", "diff.external", "gpg.program", "diff.ignoreSubmodules", "status.submoduleSummary"]) {
       expect(script).toContain(`"GIT_CONFIG_KEY_$j="'${k}'`);
     }
     expect(script).toContain(`"GIT_CONFIG_KEY_$j="'attr.tree' "GIT_CONFIG_VALUE_$j="'${EMPTY_TREE}'`);
@@ -292,6 +292,15 @@ describe("git shim: defused (no sandbox to run it in)", () => {
     expect(runShim(dir, ["rev-parse", "--show-prefix"], join(ws, "sub")).out.trim()).toBe("sub/");
   });
 
+  test("an option that is a command of its own (`--version`, opencode's first git) answers, as do git's global options before a command", () => {
+    const { ws } = plant("defused-opts");
+    const v = runShim(dir, ["--version"], ws);
+    expect(v.code).toBe(0);
+    expect(v.out).toStartWith("git version ");
+    expect(runShim(dir, ["--exec-path"], ws).code).toBe(0);
+    expect(runShim(dir, ["--no-pager", "--literal-pathspecs", "-c", "core.quotePath=false", "rev-parse", "--is-inside-work-tree"], ws).out.trim()).toBe("true");
+  });
+
   test("git gets an environment of its own (#448 round 5): no credential, password or program the caller had; its repository, identity and narrowing knobs kept", () => {
     const { ws } = plant("defused-env");
     // `alias.e=!env`, in the caller's own `-c` list: what git hands what it runs.
@@ -306,6 +315,60 @@ describe("git shim: defused (no sandbox to run it in)", () => {
     expect(seen.PATH?.split(":").every((p) => p.startsWith("/"))).toBe(true);
     // The caller's `-c` list: the alias and an empty reset kept, the header with a credential not.
     expect(runShim(dir, ["config", "--get", "http.extraHeader"], ws, { env: CALLER_ENV }).out).toBe("");
+  });
+
+  test("a nested repository's own filter runs nothing (#448 round 5): git never goes into a gitlink, a .gitmodules `ignore = none` included", () => {
+    const sup = join(root, "defused-nested");
+    const sub = join(sup, "sub");
+    const mark = join(outside, "MARK-nested");
+    mkdirSync(sub, { recursive: true });
+    setup(sup, ["init", "-q", "."]);
+    setup(sub, ["init", "-q", "."]);
+    const script = join(root, "nested-f.sh");
+    writeFileSync(script, `#!/bin/sh\n{ echo ran >> '${mark}'; } 2>/dev/null\ncat\n`);
+    chmodSync(script, 0o755);
+    writeFileSync(join(sub, "s.txt"), "s\n");
+    setup(sub, ["add", "s.txt"]);
+    setup(sub, ["commit", "-qm", "s"]);
+    // Defined in the nested repository's own config, applied by its own `info/attributes`.
+    setup(sub, ["config", "filter.evil.clean", script]);
+    writeFileSync(join(sub, ".git", "info", "attributes"), "* filter=evil\n");
+    const head = Bun.spawnSync([GIT_BIN, "rev-parse", "HEAD"], { cwd: sub }).stdout.toString().trim();
+    setup(sup, ["update-index", "--add", "--cacheinfo", `160000,${head},sub`]);
+    setup(sup, ["commit", "-qm", "gitlink"]);
+    const dirty = () => Bun.spawnSync(["touch", "-d", "2001-01-01", join(sub, "s.txt")]);
+    for (const args of [["status", "--porcelain"], ["status"], ["diff"], ["diff", "--submodule=diff"]]) {
+      dirty();
+      expect(runShim(dir, args, sup).code).toBe(0);
+      expect(existsSync(mark)).toBe(false);
+    }
+    // A `.gitmodules` asking for the submodule's dirt, in the working tree, then only in the index.
+    writeFileSync(join(sup, ".gitmodules"), '[submodule "sub"]\n\tpath = sub\n\tignore = none\n');
+    dirty();
+    expect(runShim(dir, ["status", "--porcelain"], sup).code).toBe(0);
+    expect(existsSync(mark)).toBe(false);
+    setup(sup, ["add", ".gitmodules"]);
+    rmSync(join(sup, ".gitmodules"));
+    dirty();
+    expect(runShim(dir, ["status", "--porcelain"], sup).code).toBe(0);
+    expect(existsSync(mark)).toBe(false);
+    // Without the shim (the test's own check): the same status does run it.
+    dirty();
+    Bun.spawnSync([GIT_BIN, "status", "--porcelain"], { cwd: sup, env: { PATH: process.env.PATH ?? "", HOME: home, GIT_CONFIG_NOSYSTEM: "1" } });
+    expect(existsSync(mark)).toBe(true);
+  });
+
+  test("a repository named by the caller's `-C` (or `--git-dir`) has its drivers reset, as the one it's started in does", () => {
+    const { ws, mark } = plant("defused-dash-c");
+    const st = runShim(dir, ["-C", ws, ...STATUS], root);
+    expect(st.code).toBe(0);
+    expect(st.out).toBe(STATUS_OUT);
+    const gd = runShim(dir, [`--git-dir=${join(ws, ".git")}`, `--work-tree=${ws}`, ...STATUS], root);
+    expect(gd.code).toBe(0);
+    // The textconv `info/attributes` applies (attr.tree doesn't cover it): reset by name, read from the repository `-C` names.
+    expect(runShim(dir, ["-C", ws, "--no-pager", "diff", "--no-ext-diff", "--", "b.txt"], root).code).toBe(128);
+    expect(runShim(dir, ["--git-dir", join(ws, ".git"), "--work-tree", ws, "--no-pager", "diff", "--no-ext-diff", "--", "b.txt"], root).code).toBe(128);
+    expect(existsSync(mark)).toBe(false);
   });
 
   test("a config git can't read runs nothing (fails closed)", () => {
