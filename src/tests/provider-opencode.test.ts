@@ -401,8 +401,12 @@ describe("opencode server lifecycle", () => {
       expect(err?.message).toContain(`opencode would run git in ${ws} without asking`);
       expect(err?.message).toContain(version ? "is 2.30: before 2.31 it ignores the overrides" : "didn't say its version");
       // Only codeoid's own `git --version`, in the server's empty cwd: nothing in the repository. (Through the
-      // git shim, which reads the config's key names first: that runs nothing.)
-      expect(m.calls().filter((l) => l.startsWith("git|") && !l.includes("|config --show-scope --name-only --list ")).map((l) => l.split("|").slice(0, 3).join("|"))).toEqual([`git|${server.cwd}|--version `]);
+      // git shim, which first reads, with `--no-pager`, the config's key names and the submodules `.gitmodules`
+      // names, in that same cwd: that runs nothing.)
+      const calls = m.calls().filter((l) => l.startsWith("git|"));
+      const shimOwn = calls.filter((l) => l.split("|")[2]?.startsWith("--no-pager "));
+      expect(shimOwn.every((l) => l.split("|")[1] === server.cwd && /\|--no-pager (?:config|rev-parse) /.test(l))).toBe(true);
+      expect(calls.filter((l) => !shimOwn.includes(l)).map((l) => l.split("|").slice(0, 3).join("|"))).toEqual([`git|${server.cwd}|--version `]);
       // A workdir outside any repository still works on that server.
       const plain = realpathSync(tmp());
       expect(done(await collect(makeProvider(server, { sessionId: "sess-2" }).runTurn(opts("hi", { workdir: plain }))))).toBeTruthy();
