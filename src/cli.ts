@@ -246,6 +246,7 @@ program
     } catch (err) {
       // Its port taken (another daemon runs there), or anything else: not started.
       console.error(`\n[codeoid] the daemon couldn't start: ${err instanceof Error ? err.message : String(err)}\n`);
+      await daemon.abortStart();
       process.exit(1);
     }
 

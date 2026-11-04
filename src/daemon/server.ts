@@ -1097,6 +1097,23 @@ export class DaemonServer {
     await this.#shutdown.shutdown("manual");
   }
 
+  /**
+   * After a {@link start} that failed (its port taken, say): close what start
+   * opened before it failed, memory above all, whose embedding worker torn
+   * down with native work pending crashes Bun (#453), and nothing else. Not
+   * {@link stop}: its steps remove this port's local-mode token, which on a
+   * taken port is the running daemon's.
+   */
+  async abortStart(): Promise<void> {
+    const memory = this.#memory;
+    this.#memory = null;
+    try {
+      await memory?.close();
+    } catch (err) {
+      console.error(`[codeoid] closing memory after a failed start failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   /** Complete an MCP server sign-in from the provider's redirect, and tell
    *  the user in the tab it landed in. */
   async #mcpOAuthCallback(req: Request, url: URL): Promise<Response> {
