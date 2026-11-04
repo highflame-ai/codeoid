@@ -2015,9 +2015,9 @@ describe("opencode (real binary)", () => {
       expect(rm.verdict?.behavior).toBe("deny");
       // In autonomous mode the gate runs it, unasked, inside the OS sandbox (#448): its verdict is
       // `allow` (the guard above still keeps this line from running here).
-      const high = await run("rm -rf build/cache", "autonomous");
+      const high = await run("git push --force origin main", "autonomous");
       expect(high.pending).toHaveLength(0);
-      expect(high.verdict).toEqual({ command: "rm -rf build/cache", behavior: "allow" });
+      expect(high.verdict).toEqual({ command: "git push --force origin main", behavior: "allow" });
       // ...but `rm -rf ~` reaches a directory holding credentials: refused at once, the model told why.
       const home = await run("rm -rf ~", "autonomous");
       expect(home.pending).toHaveLength(0);

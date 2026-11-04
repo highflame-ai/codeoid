@@ -145,8 +145,9 @@ describe("an opencode shell call is judged by risk as a Claude Bash call is (#43
   });
 
   test("in autonomous mode a high-risk command runs unasked on both backends (#448); `rm -rf ~`, which reaches a dir holding credentials, is refused on both with the same reason", async () => {
-    expect((await opencodeCall({ command: "rm -rf build/cache" }, "autonomous")).reply).toBe("ran it");
-    expect((await claudeCall({ command: "rm -rf build/cache" }, "autonomous")).behavior).toBe("allow");
+    const push = await opencodeCall({ command: "git push --force origin main" }, "autonomous");
+    expect([push.asked, push.reply]).toEqual([false, "ran it"]);
+    expect((await claudeCall({ command: "git push --force origin main" }, "autonomous")).behavior).toBe("allow");
     const oc = await opencodeCall({ command: "rm -rf ~", description: "clean up" }, "autonomous");
     const claude = await claudeCall({ command: "rm -rf ~" }, "autonomous");
     expect([oc.asked, claude.asked, claude.behavior]).toEqual([false, false, "deny"]);
