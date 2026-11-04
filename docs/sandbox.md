@@ -47,7 +47,9 @@ config, hooks (the hooks dir's, or `core.hooksPath`'s when it points into
 the repository), attributes (`.gitattributes`, `info/attributes`) or what
 names its git dirs (`commondir`, a worktree's `gitdir`, the `.git` file)
 changed, a warning line names them (event `sandbox.git_changed`, audited
-`session.git_control_changed`). Look before you run git there.
+`session.git_control_changed`). Look before you run git there. It also
+says when **a commit made while it ran changed project settings an agent
+CLI runs code from** ([below](#committed-project-settings)).
 
 ## What is protected
 
@@ -434,6 +436,25 @@ git plumbing (`hash-object`, `commit-tree`, `update-ref`) without it ever
 being in the working tree. A worktree checked out from that commit, a clone,
 or your own checkout after a merge then carries it, and the next session
 started there runs its hooks.
+
+That is why a session says so: at the end of each turn and when it is
+destroyed, a commit that became reachable from any ref or HEAD since the
+last look (HEAD moved, a branch or tag added or moved; counted from the
+session's first turn) and that changes one of
+`.claude/settings*.json`, `.claude/hooks/`, `.mcp.json`, `opencode.json`,
+`opencode.jsonc`, `.opencode/`, `.gemini/settings.json`,
+`.qwen/settings.json`, `.codex/`, `.pi/` (at any depth: a session may start
+in a subdirectory; against each parent, a root commit against nothing) is
+named in a warning line, with its files (event `sandbox.settings_committed`,
+audited `session.settings_committed`). **Review those commits
+(`git show <commit>`) before a session runs where they are checked out.**
+The look runs the daemon's hardened git (nothing the repository's config
+names runs; only names are compared) and reads at most 500 new commits per
+look (the line says when there were more). A commit the session's agent
+didn't make, if made in the same repository meanwhile (by you, or another
+session there), is named too. A commit no ref or HEAD names isn't (nothing
+checks it out). Best effort: when git can't say, the next look covers the
+time since the last one that could.
 
 ## Approval cards
 

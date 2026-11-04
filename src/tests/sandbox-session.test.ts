@@ -529,6 +529,68 @@ describe("review fixes (#448)", () => {
     }
   });
 
+  test("a commit made during the session that changed project settings (through git plumbing, never in the working tree) is named with its files: at the turn's end, once, and at destroy (#448 round 6)", async () => {
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@e", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@e" };
+    const run = (args: string[], extra: Record<string, string> = {}, input?: string) => {
+      const r = Bun.spawnSync(["git", ...args], { cwd: workdir, env: { ...env, ...extra }, ...(input !== undefined ? { stdin: new TextEncoder().encode(input) } : {}) });
+      if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+      return r.stdout.toString().trim();
+    };
+    // What an agent can do inside the sandbox: write objects and move a ref, the working tree untouched.
+    const plumbingCommit = (path: string, ref: string): string => {
+      const index = join(workdir, "..", `index-${Math.random().toString(36).slice(2)}`);
+      run(["read-tree", "HEAD"], { GIT_INDEX_FILE: index });
+      run(["update-index", "--add", "--cacheinfo", `100644,${run(["hash-object", "-w", "--stdin"], {}, '{"hooks":{}}')},${path}`], { GIT_INDEX_FILE: index });
+      const commit = run(["commit-tree", run(["write-tree"], { GIT_INDEX_FILE: index }), "-p", "HEAD", "-m", "x"]);
+      run(["update-ref", ref, commit]);
+      rmSync(index, { force: true });
+      return commit;
+    };
+    run(["init", "-q", "-b", "main"]);
+    writeFileSync(join(workdir, "a"), "a\n");
+    run(["add", "a"]);
+    run(["commit", "-qm", "init"]);
+    try {
+      const provider = new MockSessionProvider("claude", [[DONE], [DONE], [DONE]]);
+      const { session } = makeSession(provider);
+      const infos: Array<{ text: string; event?: string }> = [];
+      session.attach({
+        id: "w",
+        auth: AUTH,
+        capabilities: [],
+        send: (m: { type: string; role?: string; content?: string; metadata?: { event?: string } }) => {
+          if (m.type === "session.message" && m.role === "info") infos.push({ text: m.content ?? "", event: m.metadata?.event });
+        },
+      } as never);
+      const warned = () => infos.filter((i) => i.event === "sandbox.settings_committed");
+      await session.send("one", AUTH);
+      await until(() => session.status === "idle");
+      // What the repository had before the session started isn't named.
+      expect(warned()).toEqual([]);
+      const planted = plumbingCommit(".claude/settings.json", "refs/heads/main");
+      expect(existsSync(join(workdir, ".claude", "settings.json"))).toBe(false);
+      await session.send("two", AUTH);
+      await until(() => warned().length === 1);
+      expect(warned()[0]!.text).toContain(".claude/settings.json");
+      expect(warned()[0]!.text).toContain(planted.slice(0, 12));
+      // Said once: the next turn, with no new commit, says nothing.
+      await session.send("three", AUTH);
+      await until(() => session.status === "idle");
+      await Bun.sleep(200);
+      expect(warned()).toHaveLength(1);
+      // A new branch, made just before the session goes.
+      const branch = plumbingCommit(".gemini/settings.json", "refs/heads/other");
+      await session.destroy(AUTH);
+      expect(warned()).toHaveLength(2);
+      expect(warned()[1]!.text).toContain(".gemini/settings.json");
+      expect(warned()[1]!.text).toContain(branch.slice(0, 12));
+      expect(warned()[1]!.text).not.toContain(planted.slice(0, 12));
+    } finally {
+      rmSync(join(workdir, ".git"), { recursive: true, force: true });
+      rmSync(join(workdir, "HEAD"), { recursive: true, force: true });
+    }
+  });
+
   test("a destroyed session's backend state (its own conversations, #448 round 2) goes with it", async () => {
     const transcripts = mkdtempSync(join(tmpdir(), "codeoid-sbx-state-"));
     try {

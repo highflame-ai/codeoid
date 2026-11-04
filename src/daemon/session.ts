@@ -208,7 +208,7 @@ import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import { asksOutsideSandbox } from "./sandbox/confinement.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
 import { resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
-import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning } from "./sandbox/git-watch.js";
+import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
 import { protectedWriteTargets } from "./sandbox/policy.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -258,6 +258,8 @@ const SUBAGENT_REGISTRATION_FENCE_MS = 5_000;
 const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
 /** How long a send waits for an ended run's last events before its own turn replaces it. */
 const ENDED_RUN_DRAIN_MS = 5_000;
+/** How long a destroy waits for its look at the session's commits (#checkSettingsCommits) before it goes on without it. */
+const DESTROY_COMMIT_CHECK_MS = 15_000;
 
 /**
  * A fork's parent's task asked to stop that the backend still lists after
@@ -1195,6 +1197,10 @@ export class Session {
   #sandbox: SessionSandbox | null = null;
   /** The repository's git settings as last looked at (#448: #checkGitControl), from the first turn on. */
   #gitBaseline: GitControlSnapshot | null = null;
+  /** Every commit a ref or HEAD named as last looked at (#448 round 6: #checkSettingsCommits), from the first turn on; null inside: git couldn't say. */
+  #refBaseline: Promise<string[] | null> | null = null;
+  /** The commit look in flight: one at a time, each from where the last one left the baseline. */
+  #settingsCheck: Promise<void> = Promise.resolve();
   /** Started for unattended work: turns need an enforced sandbox (SessionCreateOptions.requireSandbox). */
   #requireSandbox = false;
   /** The sandbox changed while the backend process ran: it runs in the old one until it is restarted. */
@@ -3150,21 +3156,57 @@ export class Session {
    * The end-of-turn and destroy check (#448, sandbox/git-watch.ts): when the
    * repository's config, hooks (the hooks dir's, `core.hooksPath`'s),
    * attributes or git-dir links changed since the last look, a warning line
-   * says which, so the owner looks before running git there. Best effort.
+   * says which, so the owner looks before running git there; and commits
+   * made meanwhile that changed project settings are named
+   * (#checkSettingsCommits), which the returned promise settles after.
+   * Best effort.
    */
-  #checkGitControl(sub: string): void {
+  #checkGitControl(sub: string): Promise<void> {
+    const commits = this.#checkSettingsCommits(sub);
     const before = this.#gitBaseline;
-    if (!before) return;
+    if (!before) return commits;
     try {
       const now = gitControlSnapshot(this.workdir);
       const changed = gitControlChanges(before, now);
       this.#gitBaseline = now;
-      if (changed.length === 0) return;
-      this.#store.audit(sub, "session.git_control_changed", this.id, changed.slice(0, 20).join(","));
-      this.#sandboxWarning(gitControlWarning(changed), "sandbox.git_changed");
+      if (changed.length > 0) {
+        this.#store.audit(sub, "session.git_control_changed", this.id, changed.slice(0, 20).join(","));
+        this.#sandboxWarning(gitControlWarning(changed), "sandbox.git_changed");
+      }
     } catch (err) {
       console.error(`[codeoid/session ${this.id}] checking the repository's git settings failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+    return commits;
+  }
+
+  /**
+   * The commit half of the end-of-turn and destroy check (#448 round 6,
+   * sandbox/git-watch.ts): a commit that became reachable from a ref or HEAD
+   * since the last look and that changed project settings a backend runs
+   * code from (a Claude hook, `.mcp.json`, an opencode plugin) is named,
+   * with its files, so the owner reviews it before a session runs where it
+   * is checked out. An agent can commit those through git plumbing without
+   * them ever being in the working tree. Serialized; when git can't say,
+   * the baseline stands for the next look. Best effort, never throws.
+   */
+  #checkSettingsCommits(sub: string): Promise<void> {
+    const look = async (): Promise<void> => {
+      const baseline = this.#refBaseline;
+      if (!baseline) return;
+      const before = await baseline;
+      const now = await refTips(this.workdir);
+      if (now === null) return;
+      const found = before === null ? { commits: [], more: false } : await settingsCommits(this.workdir, before, now);
+      if (found === null) return;
+      this.#refBaseline = Promise.resolve(now);
+      if (found.commits.length === 0) return;
+      this.#store.audit(sub, "session.settings_committed", this.id, found.commits.slice(0, 20).map((c) => `${c.commit.slice(0, 12)}:${c.files.slice(0, 5).join("|")}`).join(",").slice(0, 2000));
+      this.#sandboxWarning(settingsCommitWarning(found.commits, found.more), "sandbox.settings_committed");
+    };
+    this.#settingsCheck = this.#settingsCheck.then(look).catch((err) => {
+      console.error(`[codeoid/session ${this.id}] checking the session's commits failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    return this.#settingsCheck;
   }
 
   /** A warning line on the session about its sandbox (#448), persisted and shown to every client. */
@@ -3891,6 +3933,9 @@ export class Session {
     this.#store.audit(sender.sub, "session.send", this.id);
     // What of the repository git runs at the user's next command, as it is before the agent works (#448).
     if (this.#sandbox && !this.#gitBaseline) this.#gitBaseline = gitControlSnapshot(this.workdir);
+    // And the commits its refs name, so a commit made from here on can be told (#448 round 6).
+    if (this.#sandbox && !this.#refBaseline) this.#refBaseline = refTips(this.workdir);
+    await this.#refBaseline;
     // A new turn is starting — clear any interrupt from the previous one.
     this.#turnInterrupted = false;
     this.#lastTurnError = null;
@@ -5377,8 +5422,9 @@ export class Session {
   }
 
   async destroy(sender: AuthContext, opts: { deleteBranch?: boolean } = {}): Promise<void> {
-    // Said to whoever is attached (and audited) before the session goes.
-    this.#checkGitControl(sender.sub);
+    // Said to whoever is attached (and audited) before the session goes;
+    // the commit look's git is bounded, and a destroy waits no longer.
+    await Promise.race([this.#checkGitControl(sender.sub), new Promise<void>((r) => setTimeout(r, DESTROY_COMMIT_CHECK_MS).unref?.())]);
     this.#destroyed = true;
     // This session's own servers' clients in the hub: let go (the last user closes them).
     for (const spec of [...this.#mcpRetained.values(), ...this.#mcpToRelease.values()]) this.#mcpHub?.release(spec, this.#mcpTenant());
@@ -9049,7 +9095,7 @@ export class Session {
         this.#hookBus?.emit("after_turn", this.#hookContext(), {
           result: event.result,
         });
-        this.#checkGitControl(SYSTEM_IDENTITY.sub);
+        void this.#checkGitControl(SYSTEM_IDENTITY.sub);
         if (event.result.isError) {
           const errText = event.result.errorMessage ?? "Turn ended with an error";
           // The CLI reports an overflow as the turn's assistant text and ends
