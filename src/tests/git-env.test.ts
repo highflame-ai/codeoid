@@ -139,15 +139,17 @@ describe("the daemon's own git in a user's repository (#448 round 2)", () => {
   });
 
   test("a driver the user defined in their own config (git lfs, globally) still runs; a repository redefining it, or defining its own, doesn't", async () => {
+    // A driver name of its own: a machine with git-lfs installed system-wide
+    // (GitHub's runners) has `filter.lfs.process`, which git prefers to `clean`.
     const home = join(tmp, "home");
     mkdirSync(home);
     const own = join(tmp, "own.sh");
     const ownMarker = join(tmp, "own-ran");
     writeFileSync(own, `#!/bin/sh\necho own >> '${ownMarker}'\ncat\n`, { mode: 0o755 });
-    writeFileSync(join(home, ".gitconfig"), `[filter "lfs"]\n\tclean = ${own}\n`);
-    git("config", "filter.lfs.clean", evil);
+    writeFileSync(join(home, ".gitconfig"), `[filter "ownlfs"]\n\tclean = ${own}\n`);
+    git("config", "filter.ownlfs.clean", evil);
     git("config", "filter.y.clean", evil);
-    writeFileSync(join(repo, ".gitattributes"), "a.txt filter=lfs\nb.txt filter=y\n");
+    writeFileSync(join(repo, ".gitattributes"), "a.txt filter=ownlfs\nb.txt filter=y\n");
     writeFileSync(join(repo, "a.txt"), "changed\n");
     writeFileSync(join(repo, "b.txt"), "b\n");
     const prev = process.env.HOME;
