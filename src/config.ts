@@ -242,9 +242,9 @@ const ApprovalsSchema = z
      */
     autoAllowLowRisk: z.boolean().default(false),
     /**
-     * Ask about a command the gate can't understand, in autonomous mode too.
-     * One nothing could be read of (no parser, no command) asks regardless.
-     * Levels are read from the command line, not enforced: a best effort, not a sandbox.
+     * No effect since autonomous mode relies on the OS sandbox (#448):
+     * guarded mode asks about every command that isn't low, and autonomous
+     * mode asks about none. Kept so a config that sets it still loads.
      */
     askOnUnknown: z.boolean().default(true),
   })

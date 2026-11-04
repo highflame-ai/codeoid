@@ -127,7 +127,7 @@ What the approver sees, in codeoid's terms (so the same rules, hooks and roles a
 | an MCP tool of a codeoid mount | `mcp__<server>__<tool>` |
 | `question` | `opencode_question` — then the questions themselves |
 | `external_directory` | `opencode_external_directory` |
-| any call with a path codeoid can't resolve for certain | `opencode_unresolved_path` (`tool`, `path`, `paths` it might lead to, `reason`, `call`: the tool's input) — always asked |
+| any call with a path codeoid can't resolve for certain | `opencode_unresolved_path` (`tool`, `path`, `paths` it might lead to, `reason`, `call`: the tool's input) — asked in guarded and interactive mode, refused in autonomous mode |
 
 Because every call reaches the gate under these names, a pipeline phase's capability role is enforced on opencode, as on Claude.
 

@@ -63,7 +63,7 @@ src/
 │   ├── rate-limit.ts             # Per-user session creation + concurrency limits
 │   ├── shutdown.ts               # Cleanup registry, signal handlers, grace period
 │   ├── data-lock.ts              # One daemon per data dir: lock files taken at `codeoid start`
-│   ├── outside-writes.ts         # Autonomous mode asks before a write outside the workdir, every backend
+│   ├── held-writes.ts            # A file tool writing what the sandbox holds read-only (git structure, project settings), every backend
 │   ├── sandbox/                  # OS sandbox for agents' commands (#448): providers (bwrap, seatbelt, docker), policy, per-backend confinement
 │   └── index.ts
 ├── protocol/                     # re-export shims for @highflame/codeoid-protocol (packages/protocol)
@@ -294,9 +294,9 @@ Codex's extra writable roots. The project settings agent CLIs run code from
 (`PROJECT_CONFIG_DIRS`/`_FILES`: `.claude/`, `.mcp.json`, …; missing ones made
 first, files as an empty config listed in `info/exclude`) read-only, and a
 file tool writing them, or the repository's git structure (its git dirs,
-`.git` files: `protectedWriteTargets`), asks in every mode while sandboxed
-(`heldWriteOf`; on Claude the PreToolUse hook routes it past allow rules,
-`heldWriteDecision`). Toolchain caches point at
+`.git` files: `protectedWriteTargets`), asks while sandboxed (refused in
+autonomous mode; `heldWriteOf` in held-writes.ts; on Claude the PreToolUse
+hook routes it past allow rules, `heldWriteDecision`). Toolchain caches point at
 `~/.cache/codeoid-sandbox` (`SandboxSpec.env`, `toolchainCacheEnv`), set only inside a sandbox, never
 for a CLI or what it runs outside one (Claude native: `claudeNativeEnv`, a
 `CLAUDE_ENV_FILE` exporting them only under `SANDBOX_RUNTIME=1`); a link in
@@ -364,7 +364,8 @@ Fallback: `Session#sendInner` refuses an autonomous / unattended / `requireSandb
 set_mode autonomous and loop.start refuse up front; interactive runs, and every
 card carries `sandboxed`/`sandboxNote`. A run-outside request
 (`asksOutsideSandbox`: Claude's `dangerouslyDisableSandbox`, `codex_permissions`)
-asks in every mode, routed past allow rules by the PreToolUse hook;
+asks in guarded and interactive mode and is refused in autonomous mode, routed
+past allow rules by the PreToolUse hook;
 `SandboxNetworkAccess` follows the session's network. `session.set_sandbox` is
 owner-only; widening is a confirm on the session (`widens`), never on an
 unattended turn. Forks and collaboration children inherit the setting.
@@ -373,11 +374,11 @@ Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell
 parses a command line with tree-sitter-bash (WASM, vendored `tree-sitter-bash.wasm`;
 the daemon loads it at start, so the gate judges synchronously and the approval
 card always matches the decision), and `src/daemon/risk/` gives it a level. The
-levels are guidance, not a sandbox: high and not-understood commands ask in every
-mode and a recognised credential path is refused, as a best effort. Low is a strict
+levels are guidance, not a sandbox: high and not-understood commands ask in guarded
+mode and a recognised credential path is refused in every mode, as a best effort. Low is a strict
 allow-list (`notLow` in shell-risk.ts); keep it one, never widen it by rules.
 On Claude the PreToolUse hook routes high and not-understood ones to the gate past any allow rule.
-In autonomous mode a write, edit, delete or move whose target provably resolves outside the session's workdir (and the temp dir), or can't be resolved, asks on every backend (`outside-writes.ts`: each backend's write tool names and every path key, judged where the kernel writes them through `physicalPath` (physical-path.ts, the resolver opencode's `realTarget` uses: dangling links followed, a loop or a file with several hard links unresolved; codeoid's own `codeoid*` temp entries outside). That is a HARD rule for file tools; for shell it is BEST-EFFORT guidance like #431's levels, and the real boundary for shell is the OS sandbox (#448). `shellWriteTargets` in risk/effects.ts places a target only as a plain literal word (`expansionIn`), a writing program only with the options in its allow-list (`OPTIONS`; `sedScriptWrites`), a removal or rename judged by its name (`name`), raw `..` kept, `ln` counting what it links to, a `cd` followed only when it surely moves the shell (parse.ts's `subshell`/`conditional`; a bare name only when the backend's shell has `CDPATH` unset, `SessionProvider.shellCdpathUnset`: Claude's CLI gets `CDPATH=`, opencode's shells have none, and the line sets none); an unplaced target asks only when it is marked `leaves` (`wordLeaves`: absolute, `~`, `..` or a pattern matching it, `$`/backquote/substitution, run-time input; the line sets HOME; a cwd that may be anywhere, `cdLeaves`; `find -L`/`-files0-from`), so `rm -f *.log`, `cp -r src dist`, `cd sub && touch x` run unasked; relative targets are judged from the cwd the backend reports (`ToolApprovalFn`'s `shellCwd`: Claude's PreToolUse hook `cwd`, kept for every tool, since the CLI resolves Bash's targets and a Grep/Glob relative `path` from its persisted cwd, and the secret-path gate uses it too; null = unknown, asks); Claude's `Monitor` command is a shell call, `PowerShell` never understood; the card's `risk` says why; the shell reader's known limits are listed in docs/approvals.md); it spends no budget, parks an unattended run like a high-risk command, and on Claude the PreToolUse hook routes it to the gate past allow rules (`ProviderSessionInit.sessionMode`). Codex autonomous asks nothing (#442).
+Autonomous mode never waits on a person: the OS sandbox (#448) is its boundary (it doesn't start without one that runs, or the owner's own off). So in autonomous mode a shell command of any level runs (`#riskAsks` is false there; the level goes to the audit, `session.auto_approve … risk=high`), and a write runs wherever it leads (there is no outside-write rule any more). What the sandbox can't be left to hold is refused at once, never asked (`Session#autonomousRefusal`, shared by the gate and the tool_start card; `#refuseAutonomous`: the reason to the agent and on the card, an info line `autonomous.refused`, audit `session.autonomous_refuse kind=…`, no budget spent): `unsandboxed` (`#unsandboxedRequest`), `held_write` (`#heldWrite`), `claude_settings` (`#writesClaudeSettingsOnNamedAccount`), `credential_dir` (a secret-path `ask`, or a shell risk carrying one), `unresolved_path` (`isUnresolvedPathTool`). Credential reads stay refused in every mode. Elicitation tools and fleet send-class dispatch still ask (so they are all an unattended run parks on). Guarded and interactive are unchanged. `approvals.askOnUnknown` is inert. Relative paths are judged from the cwd the backend reports (`ToolApprovalFn`'s `shellCwd`: Claude's PreToolUse hook `cwd`, kept for every tool, since the CLI resolves Bash's targets and a Grep/Glob relative `path` from its persisted cwd; null = unknown, asks). Claude's `Monitor` command is a shell call, `PowerShell` never understood. Claude's CLI gets `CDPATH=` and opencode's shells have none, so a bare `cd` goes where the shell reader places it. Codex autonomous asks nothing (#442).
 A command that could read another process's environment (a `/proc/<pid>/environ` however written, what a search of /proc hands on, `ps` unless its options and the line's variables prove it shows none) is refused as a credential read on every backend, failing closed (`refuseEnvironRead`, shell-risk.ts); a word's possible values are its `shape` (parse.ts).
 
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
@@ -611,7 +612,8 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   (`/proc/self`, `/dev/fd`, any procfs link) gets an `unshowable` card; any
   step it can't be sure of (`..` after a missing component, the two readings
   differing, `ENOTDIR`/`EACCES`, a loop) gets `opencode_unresolved_path`,
-  which `isUnresolvedPathTool` keeps asked in every mode.
+  which `isUnresolvedPathTool` keeps asked in guarded and interactive mode
+  and refused in autonomous mode.
 - **Location**: opencode runs a session's tools in its location, and a fork
   keeps its source's. A fork (or a resumed session) whose location isn't the
   workdir is moved there (`#moveInto`, `POST …/move`; the move's own

@@ -4,12 +4,13 @@ codeoid decides whether a shell command needs your approval from what the comman
 Every shell command an agent wants to run is parsed, wrappers and all, and given a risk level.
 
 **The levels are guidance drawn from reading the command line. They are not a sandbox.**
-High and not-understood commands ask, and codeoid's credential files are refused when the reader recognises them, but both are a best effort: a command can be written in ways the reader doesn't recognise, and then it is rated medium.
+In guarded mode high and not-understood commands ask, and in every mode codeoid's credential files are refused when the reader recognises them, but both are a best effort: a command can be written in ways the reader doesn't recognise, and then it is rated medium.
 Only "low" is a promise, and it is kept by being a strict allow-list (below): anything unusual simply isn't low.
 
 The boundary is the OS sandbox ([sandbox.md](sandbox.md), #448), on by default: the agent's commands run where only the workspace and a private temp dir are writable and credential stores aren't there, however a command is written.
 The levels are guidance inside that boundary — what a command would do to your workspace — and every approval card says whether the command runs sandboxed ("🛡 sandboxed: bubblewrap, network on"), or why not ("⚠️ not sandboxed: …").
-A request to run a command **outside** the sandbox (Claude's `dangerouslyDisableSandbox` retry, Codex asking to widen its sandbox) is its own approval, asked in every mode, autonomous included, and audited; so is turning a session's sandbox off.
+**Autonomous mode relies on that boundary and waits on no one** (below): there the levels are information (on the card, in the audit log), and a command of any level runs.
+A request to run a command **outside** the sandbox (Claude's `dangerouslyDisableSandbox` retry, Codex asking to widen its sandbox) is its own approval in guarded and interactive mode, refused outright in autonomous mode, and audited either way; turning a session's sandbox off asks its owner.
 
 ## The levels
 
@@ -55,25 +56,25 @@ Within what it recognises, the reader over-states rather than under-states:
 
 ## What each level does
 
-- **High** asks in every mode, autonomous included, and doesn't use up an autonomous tool budget.
-- **Not understood** asks in every mode too, unless you set `approvals.askOnUnknown` to `false`. A command nothing could be read of (the parser isn't loaded, the line is over 100,000 characters, the tool call holds no command) asks whatever that setting says.
-- **Low** runs without asking in guarded mode if you set `approvals.autoAllowLowRisk` to `true` (off by default). Never in interactive mode.
-- Otherwise each mode does what it always did: guarded asks about every shell command, autonomous runs them within its budget. Medium runs unasked in autonomous mode, and on Claude a `permissions.allow` rule in your Claude settings runs it unasked too.
+- **Guarded mode** asks about every shell command, and says its level and why on the card. **Low** runs without asking there if you set `approvals.autoAllowLowRisk` to `true` (off by default). On Claude a `permissions.allow` rule in your Claude settings runs a medium one unasked; a high or not-understood one (or one nothing could be read of: the parser isn't loaded, the line is over 100,000 characters, the tool call holds no command) never runs on such a rule, it is handed to codeoid's gate.
+- **Interactive mode** asks about every call.
+- **Autonomous mode** runs every shell command, whatever its level, high and not understood included, within its tool budget (below). The level stays on the card and in the audit log (`session.auto_approve … risk=high`).
+- `approvals.askOnUnknown` has no effect any more: guarded mode asks about every command that isn't low, and autonomous mode asks about none. It is still accepted, so a config that sets it loads.
 
-A command that names one of codeoid's own credential files, or another agent's login (`~/.codeoid/config.json`, `~/.claude/.credentials.json`, `~/.codex/auth.json`, …), in a way the reader recognises, is refused, in any mode, as reading the file with a file tool is.
+A command that names one of codeoid's own credential files, or another agent's login (`~/.codeoid/config.json`, `~/.claude/.credentials.json`, `~/.codex/auth.json`, …), in a way the reader recognises, is refused, in every mode, as reading the file with a file tool is.
 That includes a file a wrapper reads itself (`xargs -a FILE`, `dd if=FILE`).
-On Claude a file tool's relative path is resolved where the CLI resolves it: a `Grep` or `Glob` `path` (or none, the search root) is relative to the directory its Bash has `cd`'d into, which the PreToolUse hook reports, so `../../.codeoid/config.json` from there is refused as its absolute form is; a relative path when the hook reported no directory asks.
+On Claude a file tool's relative path is resolved where the CLI resolves it: a `Grep` or `Glob` `path` (or none, the search root) is relative to the directory its Bash has `cd`'d into, which the PreToolUse hook reports, so `../../.codeoid/config.json` from there is refused as its absolute form is; a relative path when the hook reported no directory asks (is refused in autonomous mode).
 
 So is a command that could read another process's environment: the daemon's keys, a backend server's password (an opencode shell's `$PPID` is its server). This rule fails closed: the command is refused unless what the line shows proves it can't reach one. On every backend, that covers:
 
 - **A path that could be `/proc/<pid>/environ`** (or `mem`, `fd/…`), however the pid or the name is written: `$PPID`, `$$`, `self`, `$(pgrep …)`, a glob (`/proc/*/environ`, `env*`), a value set earlier on the line, a path relative to `/proc`, or a process's `root` link back to `/` (`/proc/<pid>/root/…` is judged as the path after it). Under `/proc`, a path whose last part is only known at run time is refused (`cat /proc/$PPID/$f`, `for p in /proc/[0-9]*`). One whose last part is fixed and none of those files runs as before (`cat /proc/$PPID/status`). A program that only lists or stats what it's given (`ls`, `stat`, `readlink`, `realpath`, not recursing) reads no file, so its operands aren't refused by this rule (`ls -l /proc/$$/fd`, `ls /proc/$PPID`); a credential file still is, and so is anything a line reads after listing `/proc` (`ls /proc/$PPID | xargs cat`).
-- **What a search of `/proc` hands on**: `find /proc … -exec cat {} +`, `find / | xargs grep`, or a loop reading `find`'s output. A `find` whose `-name` can't match those files is only asked, as a search of a directory holding credentials is.
+- **What a search of `/proc` hands on**: `find /proc … -exec cat {} +`, `find / | xargs grep`, or a loop reading `find`'s output. A `find` whose `-name` can't match those files is only asked (refused in autonomous mode), as a search of a directory holding credentials is.
 - **A recursive read of `/` or `/proc`**: `grep -r`, `rg`, `ag`, `tar`, `cp -r`, `rsync -r`.
 - **A debugger or tracer attached to a process** (`gdb -p`, `lldb -p`, `strace -p`, `gcore`), however the pid is written (`--pid=$PPID`, `-p$PPID`, `-ex "attach $PPID"`), and **`top`**, whose columns come from a configuration file that can name the environment. A debugger whose words could attach without showing it (`gdb -ex "$CMD"`, `gdb PROG $PID`, `lldb $OPTS`) is not understood.
 - **Inline code** (`python3 -c`, `node -e`, `perl -e`, an `awk` or `sed` script) whose text names `/proc/…/environ`.
 - **`ps`, unless it provably shows no environment.** Every option must be one ps documents as showing none, every `-o` format and any `PS_FORMAT` the line sets must name no `environ` field, and every word must be known before it runs. A single quoted value such as `-p "$PID"`, a variable the line doesn't set (`-p $PID`), or `$$` / `$PPID` also counts as known, and so does a plain `$(pgrep …)` or `$(pidof …)` (`ps -p $(pgrep node)`), which prints pids only: not with an option that changes what it prints (`-l`, `-a`, `-d`, pidof's `-S`), or anything in it only known at run time. The line also must set no other variable ps reads (`PS_PERSONALITY`, `UNIX95`, `POSIXLY_CORRECT`, …) and no variable whose name is only known at run time. So `ps eww`, `ps auxe`, macOS's `ps -E`, `ps -o pid,environ`, `PS_FORMAT=environ ps` and `x="1 e"; ps -p $x` are refused. A plain `ps` (`ps aux`, `ps -ef`, `ps -o pid,cmd -p "$PID"`) stays medium.
 
-One that searches a directory holding them (`grep -r token ~`) asks.
+One that searches a directory holding them (`grep -r token ~`), or otherwise reaches one (`ls ~`, `rm -rf ~`), asks in guarded mode and is refused in autonomous mode.
 Spellings the reader doesn't follow are medium instead (see Limits).
 
 The approval prompt says the level and why, in the web UI, the terminal UI, Telegram, the line client and `codeoid approve`.
@@ -81,43 +82,30 @@ The approval prompt says the level and why, in the web UI, the terminal UI, Tele
 ```json
 {
   "approvals": {
-    "autoAllowLowRisk": false,
-    "askOnUnknown": true
+    "autoAllowLowRisk": false
   }
 }
 ```
 
 Rewinding uses the same reading of a command for its "not undone by going back" list: it lists commands with effects outside the workspace's files (a push, an install, a write outside the workspace, `sudo`), not every command whose text mentions one. A command is read in the directory it ran in, as the gate read it: one opencode ran with a `workdir` outside the workspace is listed when it writes there, and one in a directory opencode couldn't resolve for certain is judged in each place it may have run.
 
-## Writes outside the working directory
+## Autonomous mode
 
-In autonomous mode, a write, edit, delete or move whose target resolves outside the session's working directory asks, on every backend, as a high-risk command does; the card says why (`writes outside the working directory: /home/u/other/file`) and names where the write really lands.
-Reads, searches and listings outside it run as before (credential files are refused in every mode), and guarded and interactive mode are unchanged: they ask about every write already.
+Autonomous mode never waits on a person. The OS sandbox is its boundary: an autonomous session, routine, loop or dispatched worker doesn't start (or switch to autonomous) while its sandbox can't run, and an owner who turns a session's sandbox off has chosen that ([sandbox.md](sandbox.md)). So:
 
-- **Inside** is the session's working directory (a worktree session's is its worktree; codeoid gives a session no other directories) and the system temp dir (`$TMPDIR`, and `/tmp`), where scratch files are routine — less codeoid's own entries there (anything named `codeoid…` at the temp dir's top: sign-in homes, the pi bridge, loop indexes), which are outside.
-- **File tools** are judged by the paths they name, whatever the backend calls them: Claude's `Write`, `Edit`, `MultiEdit` and `NotebookEdit`; opencode's write, edit and patch (every file a patch changes or moves); Codex's file changes (each path, and a move's destination); pi's `write` and `edit`; Qwen Code's `write_file`, `edit` and `notebook_edit`; the Gemini CLI's edits, by the files its approval request names (`locations`, and its diffs' paths). Every path key a call carries is judged, so a call naming two (pi's `path` beside a `file_path`) is judged by both.
-- **Where a write lands** is resolved as the kernel resolves it, with the resolver opencode's paths use: against the working directory, `~` expanded, one component at a time, a symlink's target spliced in (a dangling link leads to its target, which a write creates), `..` the parent of what the path so far really is; and also with `..` collapsed first, as a tool that normalizes its path reads it. Either reading outside is outside. A path that can't be resolved for certain counts as outside: none given (a Gemini CLI edit whose request names no file), a path under `/proc`, another user's `~name`, `..` after a directory that doesn't exist, a link loop or too many links, and an existing file with more than one hard link (another of its names may be anywhere).
-- **File tools are a hard rule; shell commands are best-effort guidance.** What the file tools above write is judged as described, failing closed. A shell command is judged by what the reader can see of it, like the risk levels: it helps, it isn't a boundary. The real boundary for a shell command is the OS sandbox ([#448](https://github.com/highflame-ai/codeoid/issues/448)).
-  - The reader names redirects (`> file`, `>> file`, `2> file`, not `/dev/null` or the terminal), what `rm`, `rmdir`, `unlink`, `mv`, `cp`, `tee`, `install`, `touch`, `mkdir`, `chmod`, `chown`, `truncate`, `shred`, `dd of=`, `sed -i` and `find -delete` / `-fprint` write, and what `ln` links: the link, and what it leads to — a hard link's source, a symlink's target from the link's directory — since a write through it writes there. `..` is kept for the kernel's reading (`link/../f` is beside the link's target). A target it can place is judged as a file tool's is: one that lands outside asks.
-  - A target it can't place for certain — a word that expands (a brace, a pattern, a variable, a substitution, what `xargs` or `find -exec` hands a command), a writing program's option it isn't sure of (`cp -r`, `-a`, `-P`, `-T`, backups, a `sed` script that may write or that comes from a file, …), a relative target after a `cd` it can't follow, every other target of a line that makes or moves a link — asks only when its text could plausibly leave the working directory: it is absolute, starts with `~`, has a `..` component (or a pattern that may match one, `.*`), or holds `$`, a backquote, `$(…)` or a process substitution; or the line sets `HOME` (then every `~` target, and a bare `cd`, asks); or the directory it is relative to may be anywhere (a `cd` to such a word, `cd -`, `popd`, a line that sets `CDPATH`, a backend that didn't say where its shell is); or `find` follows links (`-L`, `-H`, `-follow`) or reads its starting points from a file (`-files0-from`). A relative word with at most a pattern or a brace in it doesn't ask: `rm -f *.log`, `rm -rf dist/*`, `touch {a,b}.txt`, `cp -r src dist`, `cp -a src dist`, `cp --preserve=mode a b`, `find src -name '*.ts' -exec sed -i 's/a/b/' {} \;`.
-  - `rm`, `rmdir`, `unlink` and `mv`'s sources remove or rename the name itself: only the directory it is in is resolved, so deleting or renaming a link inside the workdir that leads out doesn't ask (nor a file with another hard link); `rm -r link/` (a trailing `/` or `/.`) goes through it and is judged by where it leads.
-  - A relative target is judged from where the shell really runs: the directory the call names, else the one the backend reports (Claude's Bash keeps a `cd` between calls; its PreToolUse hook reports where it is now, and that is used in the hook and at codeoid's gate), else the working directory (the other backends' shells start there for each call). A shell the backend says nothing about for a call that may have moved makes a relative target ask; one outside the working directory (say Claude's allowed `~/.claude/skills`) makes every relative target outside.
-  - A `cd` is followed where it surely moves the shell: run on no condition, in the line's own shell, into a directory that exists, by an absolute path or one starting `./`, `../` or `~` — or by a bare name (`cd src && …`) when the backend's shell has no `CDPATH` (Claude's CLI gets `CDPATH=` in its environment; opencode's shells get codeoid's bare one) and the line sets none. After any other `cd` the directory is unknown, which asks only as said above: `cd build && make > log 2>&1` and `mkdir -p a/b && cd a/b && touch x` run unasked.
-  - Claude's `Monitor` runs a shell command (its `command`) and is judged as `Bash` is, for risk, credential paths and these writes; a `Monitor` watching a WebSocket runs no command. Claude's `PowerShell` (Windows) isn't a language the reader reads, so it always asks.
-  - **Known limits of the shell reader** (best effort; #448 is the boundary). These aren't asked about, and aren't chased one by one:
-    - Code that runs later than where it is written: a function's body (and a redirect on the function's definition, `f() { …; } > file`), a `trap` action, a loop's next pass. Each is judged in the directory it is written in, not where it runs after a later `cd`.
-    - `find -execdir` / `-okdir` run their command in each match's directory, but it is judged from the line's.
-    - `/dev/stdout`, `/dev/stderr` and `/dev/fd/N` are taken as the process's own output; a line that first points that descriptor at a file (`1< file`, `exec 2< file`) reopens that file for writing.
-    - A `cd` into a directory the same line removes first (`rmdir a/b; cd ./a/b; …`) is followed though it fails at run time.
-    - `cp` into an existing directory writes `DIR/<name>`, through a link of that name already there; it is judged by the directory.
-    - A statement chained after a here-document (`cat <<EOT || cd ./a`) isn't marked as conditional, so its `cd` is followed.
-    - A write through a link the same line copies or moves (`cp -a link r; echo x >> r/f`), or through a relative pattern (`echo x > ou?-link/f`), whose text stays inside.
-    - A `CDPATH` set by a project's `.claude/settings.json` `env`, or a `cd` function from the shell's start-up files, which Claude's shell snapshot keeps.
-    - A program the reader doesn't model as a writer (see Limits).
-- It doesn't use up the autonomous tool budget.
-- **Unattended runs** (routines, loops, dispatched workers) follow the rule a high-risk command follows there: nobody answers in the moment, so the call parks the run on your approval (a routine run shows `needs_attention`, a loop run `waiting`) until you approve or deny it from any device.
-- On Claude, such a write never runs on a `permissions.allow` rule in your Claude settings: the PreToolUse hook hands it to codeoid's gate.
-- Codex in autonomous mode asks codeoid about nothing (#442), so its writes aren't covered there; in guarded mode every file change asks anyway.
+- **It runs, unasked:** shell commands of every level, not understood and unreadable ones included; and writes, edits, deletes and moves wherever they lead, outside the working directory too. Each spends one call of the autonomous tool budget.
+- **It refuses at once, never asks** — the agent reads what was refused and that the owner can do it, or switch the session to guarded mode to be asked; the transcript gets an info line (`⛔ Refused <tool> in autonomous mode: …`, event `autonomous.refused`) and the audit log a `session.autonomous_refuse` with its kind. No budget is spent:
+  - a request to run a command outside the OS sandbox, or to widen it (`unsandboxed`);
+  - a file tool writing the repository's git structure or the project settings an agent CLI runs code from, which the sandbox holds read-only for commands while the tool runs outside it ([sandbox.md](sandbox.md); `held_write`);
+  - a write to a Claude settings file on a session on a named Claude account, or under Claude's own sandbox (`claude_settings`);
+  - a search or command reaching a directory that holds credentials, `~/.claude.json`, or a relative path whose directory the backend didn't report (`credential_dir`);
+  - a call whose path a backend couldn't resolve for certain: opencode's `opencode_unresolved_path` (`unresolved_path`).
+- **Still refused, as in every mode:** a read of a credential file or of another process's environment.
+- **Still asks:** a question to you (`AskUserQuestion` and other elicitation tools), and a fleet dispatch (`fleet_send`, `fleet_spawn`, `fleet_interrupt`), which you confirm with its full input shown.
+- **Unattended runs** (routines, loops, dispatched workers) therefore park on nothing but those two asks: a question for you, or a fleet dispatch.
+- Codex in autonomous mode asks codeoid about nothing (#442), so none of this reaches its calls; its own sandbox, and codeoid's around it, hold.
+
+Guarded and interactive mode are unchanged: they ask about every write already, and the cases above are asked there, never run unasked.
 
 ## Which backends
 
@@ -126,19 +114,19 @@ Reads, searches and listings outside it run as before (credential files are refu
 | Claude | Every shell command, including ones a `permissions.allow` rule in your Claude settings would run unasked: a high-risk or not-understood one is handed to codeoid's gate first. A medium one still runs on such a rule. |
 | Gemini CLI, pi | Every shell command that asks for approval. |
 | Qwen Code | Commands Qwen Code itself judges read-only run without asking codeoid (see CLAUDE.md, "Known gap"); everything else is covered. |
-| opencode | Every shell command, its subagents' too, judged in the directory the call names (`workdir`); where that directory can't be resolved for certain, the call is asked in every mode and its command judged in each place it may lead. A line with no command in it (only `cd`, assignments, `export` / `unset` / `readonly`, comments) runs without asking, as opencode 2.2.5 runs it: it can't act outside its own shell, and rates medium at most ([docs/opencode.md](opencode.md)). |
+| opencode | Every shell command, its subagents' too, judged in the directory the call names (`workdir`); where that directory can't be resolved for certain, the call is asked in guarded mode (refused in autonomous mode) and its command judged in each place it may lead. A line with no command in it (only `cd`, assignments, `export` / `unset` / `readonly`, comments) runs without asking, as opencode 2.2.5 runs it: it can't act outside its own shell, and rates medium at most ([docs/opencode.md](opencode.md)). |
 | Codex | Guarded mode only. Its `untrusted` policy runs commands it judges safe without asking; in autonomous mode codeoid runs Codex with no approvals at all, so no command reaches the gate (#442). |
 | OpenAI, Gemini API, llama.cpp | These backends have no shell tool. |
 
 ## Limits
 
-These are the ways a command gets past "high" or "refused" and is rated **medium**, so it runs unasked in autonomous mode (and on a Claude allow rule). None of them is low.
+These are the ways a command gets past "high" or "refused" and is rated **medium**, so it runs on a Claude allow rule in guarded mode (in autonomous mode every level runs; what matters there is getting past "refused"). None of them is low.
 
 - **A `cd` is followed as if it happened.** A `cd` that fails, or runs in a subshell, `$(…)` or behind `false &&`, still moves the paths after it: `cd nowhere 2>/dev/null; cat ../.codeoid/config.json` from a workspace under `~` is medium, not refused, and the same shape writes `../.bashrc` or deletes `../Documents` at medium.
 - **Paths are judged as written**, but for `..`, which is taken after the links before it. A symlink inside the workspace that points outside it is not otherwise seen through when the level is chosen. Another user's `~name`, `~-`, a `file://` URL, an attached option value (`tar -C/x`) and option values a downloader reads (`wget -e`, `curl --variable`, `curl -K`) aren't matched against the credential files.
 - **Globs over credential files** (`cat ~/.ssh/id_*`, `cat ~/.codeoid/c*`) are judged by their fixed directory: medium (codeoid's own files ask), not high or refused.
 - **Programs and builtins the reader doesn't model** run what they're given unseen: `fakeroot`, `ssh-agent`, `tmux`, `screen`, `vim -c`, `gdb -ex` with a fixed command that doesn't attach, `git -c alias.x='!…'` and similar are "runs X", medium. A variable can be set in ways that aren't assignments (`declare -n`, `${X:=…}`), so a steering variable set that way is medium, not not-understood.
-- **Writes through programs not modelled as writers** (`sort -o`, `uniq IN OUT`, `git diff --output=`, `find -fprintf`, `tar -x -C`, `unzip -d`, `patch`, `split`, sed's `w`) are medium wherever they write, start-up files included (in autonomous mode a `find -fprint…` file is judged as a write, and a `sed` script that may write asks). `rsync --remove-source-files` is judged by its target, not the files it deletes, and moving a directory from outside the workspace into it (`mv ~/Documents ./x`) is medium.
+- **Writes through programs not modelled as writers** (`sort -o`, `uniq IN OUT`, `git diff --output=`, `find -fprintf`, `tar -x -C`, `unzip -d`, `patch`, `split`, sed's `w`) are medium wherever they write, start-up files included. `rsync --remove-source-files` is judged by its target, not the files it deletes, and moving a directory from outside the workspace into it (`mv ~/Documents ./x`) is medium.
 - **Arithmetic on a value from outside the line** (the environment, a file `read` reads, a `$(…)` whose output isn't known) is medium, though bash would run a `$(…)` such a value holds in a subscript.
 - **What a program does is not read**: `npm test` runs whatever the project's scripts say, `python3 script.py` and inline code (`python3 -c '…'`, `node -e '…'`) are medium whatever they do. A git read runs what the repository's own config names (`core.fsmonitor`, a diff driver, a pager), and the shell may have functions, aliases or a `PATH` from its start-up the line doesn't show.
 - A `CDPATH` set in the environment the shell inherits, not on the line, isn't seen: `cd name` is judged as `./name`. The same goes for `ps`: a `PS_FORMAT` or `PS_PERSONALITY` the shell inherits isn't seen (an opencode shell's environment is codeoid's bare one).

@@ -195,11 +195,11 @@ import type { McpHub } from "./mcp/hub.js";
 import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
 import { type CodeoidConfig, getConfigDir } from "../config.js";
-import { secretPathVerdict } from "./secret-paths.js";
+import { type SecretPathVerdict, secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir } from "./compress/spill.js";
 import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
-import { type HeldPath, heldWriteOf, heldWriteReason, type OutsideWrite, outsideWriteOf, outsideWriteReason, writeTargets } from "./outside-writes.js";
+import { type HeldPath, heldWriteOf, heldWriteReason, writeTargets } from "./held-writes.js";
 import { outsideEffects } from "./risk/effects.js";
 import { assessShellCommandSync, type ShellRisk, UNREADABLE_SHELL_CALL } from "./risk/shell-risk.js";
 import { loadShellParser, shellParserReady } from "./shell/parse.js";
@@ -840,6 +840,15 @@ interface TurnCounts {
   reports: number;
   /** The model streamed output after the last usage report: a request whose usage hasn't come yet (#430). */
   unreported?: boolean;
+}
+
+/** Why autonomous mode refused a call outright (Session#autonomousRefusal, #448). */
+interface AutonomousRefusal {
+  kind: "unsandboxed" | "held_write" | "claude_settings" | "credential_dir" | "unresolved_path";
+  /** What was refused, for the transcript's info line. */
+  what: string;
+  /** What the agent reads. */
+  reason: string;
 }
 
 /** How serious a shell call's verdict is: a refusal, then a credential ask, then its level (#431). */
@@ -1837,7 +1846,6 @@ export class Session {
       // Read per query: a fork is primed after its provider is built.
       forkBoundary: () => this.#forkIsolation?.boundaryAt,
       isForeignAgent: (agentId) => this.#isForeignAgent(agentId),
-      sessionMode: () => this.#mode,
       isForeignTask: (taskId) => this.#forkIsolation?.foreignTasks.has(taskId) === true,
       isFork: () => this.#forkIsolation !== null,
       isOwnTask: (taskId) => this.#isOwnTask(taskId),
@@ -2115,9 +2123,10 @@ export class Session {
    * `.git` files) or the project settings agent CLIs run code from
    * (`.claude/`, `.mcp.json`, `opencode.json`, …). Its commands can't
    * write them; a file tool runs in the backend's own process, outside the
-   * sandbox (Claude's, opencode's), so it is asked in every mode, as running
-   * a command outside the sandbox is. Fail closed: a judgement that throws
-   * asks. Null when it writes none.
+   * sandbox (Claude's, opencode's), so it is asked in guarded and interactive
+   * mode and refused in autonomous mode, as running a command outside the
+   * sandbox is. Fail closed: a judgement that throws counts as one. Null when
+   * it writes none.
    */
   #heldWrite(toolName: string, input: unknown): { path: string; what: HeldPath["what"] | "unresolved" } | null {
     if (this.#sandbox?.info?.state !== "on" || !input || typeof input !== "object") return null;
@@ -5336,8 +5345,7 @@ export class Session {
       const gated = this.#approvalInputs.get(approvalId);
       if (!gated) continue;
       const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
-      const outside = this.#outsideWrite(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
-      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, outside, this.#heldWrite(gated.toolName, gated.input)), ...this.#cardSandbox(gated.toolName, gated.input) });
+      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, this.#heldWrite(gated.toolName, gated.input)), ...this.#cardSandbox(gated.toolName, gated.input) });
     }
     return out;
   }
@@ -7873,7 +7881,7 @@ export class Session {
   /**
    * A shell call whose directory can't be resolved for certain (opencode's
    * `opencode_unresolved_path` card: `tool`, `paths` it may lead to, `call`):
-   * asked in every mode already, its command is judged in each of those
+   * never run unasked already, its command is judged in each of those
    * places and the worst verdict stands, so a credential read is refused
    * there as anywhere (#431). Null for a card wrapping any other tool.
    */
@@ -7892,12 +7900,16 @@ export class Session {
     return worst;
   }
 
-  /** A shell call that asks whatever the mode: high risk, a credential search, or not understood (#431). */
+  /**
+   * A shell call that asks in guarded and interactive mode, past an allow
+   * rule: high risk, a credential search, or not understood (#431). Never in
+   * autonomous mode, which waits on no one (#448): the OS sandbox contains
+   * such a command, so it runs; a credential search there is refused
+   * (#autonomousRefusal).
+   */
   #riskAsks(risk: ShellRisk | null): boolean {
-    if (!risk) return false;
-    // Unreadable (no parser, no command): askOnUnknown doesn't cover it.
-    if (risk.level === "high" || risk.secret || risk.unreadable) return true;
-    return risk.level === "unknown" && (this.#config?.approvals?.askOnUnknown ?? true);
+    if (!risk || this.#mode === "autonomous") return false;
+    return risk.level === "high" || risk.level === "unknown" || risk.secret !== undefined || risk.unreadable === true;
   }
 
   /** A low-risk shell call that guarded mode runs unasked, when the config says so (#431);
@@ -7908,37 +7920,73 @@ export class Session {
   }
 
   /**
-   * In autonomous mode, a write, edit, delete or move whose target provably
-   * resolves outside the working directory, or can't be resolved for certain
-   * (outside-writes.ts): asked, not run. Null in every other mode, and for a
-   * call that writes nowhere outside. Fail closed: a judgement that throws
-   * asks.
+   * In autonomous mode, a call that would have asked and that the OS sandbox
+   * can't be left to contain (#448): refused at once, never asked, since
+   * autonomous mode waits on no one. A command asking to run outside the
+   * sandbox; a host-side file tool writing the repository's git structure or
+   * project settings; a write to a Claude settings file on a named account;
+   * a search or command reaching a directory that holds credentials; a path the backend
+   * couldn't resolve for certain. Null in every other mode, and for any
+   * other call. Side-effect free: the gate and the tool_start card read the
+   * same verdict.
    */
-  #outsideWrite(toolName: string, input: Record<string, unknown>, shellCwd?: string | null): OutsideWrite | null {
+  #autonomousRefusal(
+    toolName: string,
+    input: Record<string, unknown>,
+    risk: ShellRisk | null,
+    secret: SecretPathVerdict,
+    held: { path: string; what: HeldPath["what"] | "unresolved" } | null,
+  ): AutonomousRefusal | null {
     if (this.#mode !== "autonomous") return null;
-    try {
-      return outsideWriteOf(toolName, input, this.workdir, shellCwd, { cdpathUnset: this.#provider.shellCdpathUnset === true });
-    } catch (err) {
-      console.error(`[codeoid/session ${this.id}] judging where ${toolName} writes failed, asking: ${err instanceof Error ? err.message : String(err)}`);
-      return { path: "(couldn't be judged)", resolved: false };
+    const owner = "The owner can do it, or switch this session to guarded mode to be asked.";
+    if (this.#unsandboxedRequest(toolName, input)) {
+      const what = toolName === "codex_permissions" ? "widening the OS sandbox" : "running a command outside the OS sandbox";
+      return { kind: "unsandboxed", what, reason: `Refused: autonomous mode doesn't allow ${what}; run it inside the sandbox instead. ${owner}` };
     }
+    if (held) {
+      const where = held.what === "git" ? "the repository's git structure" : held.what === "settings" ? "project settings an agent CLI runs code from" : "a path that can't be resolved for certain";
+      const what = `a file-tool write to ${where} (${held.path}), outside the OS sandbox`;
+      return { kind: "held_write", what, reason: `Refused: autonomous mode doesn't allow ${what}. ${owner}` };
+    }
+    if (this.#writesClaudeSettingsOnNamedAccount(toolName, input)) {
+      const what = "a write to a Claude settings file on this session (the CLI applies it outside the sandbox)";
+      return { kind: "claude_settings", what, reason: `Refused: autonomous mode doesn't allow ${what}. ${owner}` };
+    }
+    const reach = secret?.action === "ask" ? secret : risk?.secret?.action === "ask" ? risk.secret : null;
+    if (reach) {
+      const what = `a ${risk ? "command" : "call"} reaching ${reach.path}, which may lead to credentials`;
+      return { kind: "credential_dir", what, reason: `Refused: autonomous mode doesn't allow ${what}; keep to the working directory instead. ${owner}` };
+    }
+    if (isUnresolvedPathTool(toolName)) {
+      const what = "a call whose path couldn't be resolved for certain";
+      return { kind: "unresolved_path", what, reason: `Refused: autonomous mode doesn't allow ${what}. ${owner}` };
+    }
+    return null;
+  }
+
+  /** Refuse a call in autonomous mode (#autonomousRefusal): its card, the audit, and an info line in the transcript. */
+  #refuseAutonomous(approvalId: string, toolName: string, refusal: AutonomousRefusal, sender: AuthContext): { behavior: "deny"; message: string } {
+    this.#approvalPatchKeys.delete(approvalId);
+    this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: refusal.reason });
+    this.#store.audit(sender.sub, "session.autonomous_refuse", this.id, `tool=${toolName} kind=${refusal.kind}`);
+    const infoMsg = this.#makeMessage("info", `⛔ Refused ${toolName} in autonomous mode: ${refusal.what}`, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "autonomous.refused",
+      tool: toolName,
+      kind: refusal.kind,
+    });
+    this.#persistAndBuffer(infoMsg);
+    this.#broadcastRaw(infoMsg);
+    return { behavior: "deny", message: refusal.reason };
   }
 
   /**
    * What the approval card says of a call's risk: a shell command's (#431),
-   * and an outside write's reason — first when it is what makes the call ask,
-   * after a high or not-understood command's own.
+   * and a held write's reason first, when it is what makes the call ask.
    */
-  #cardRisk(risk: ShellRisk | null, outside: OutsideWrite | null, held: { path: string; what: HeldPath["what"] | "unresolved" } | null = null): { risk?: { level: ShellRisk["level"]; reasons: string[] } } {
-    if (held) {
-      const why = heldWriteReason(held);
-      const rest = [...(outside ? [outsideWriteReason(outside)] : []), ...(risk?.reasons ?? [])];
-      if (risk && riskWeight(risk) > 1) return { risk: { level: risk.level, reasons: [why, ...rest] } };
-      return { risk: { level: "medium", reasons: [why, ...rest] } };
-    }
-    if (!outside) return risk ? { risk: { level: risk.level, reasons: risk.reasons } } : {};
-    const why = outsideWriteReason(outside);
-    if (risk && riskWeight(risk) > 1) return { risk: { level: risk.level, reasons: [...risk.reasons, why] } };
+  #cardRisk(risk: ShellRisk | null, held: { path: string; what: HeldPath["what"] | "unresolved" } | null = null): { risk?: { level: ShellRisk["level"]; reasons: string[] } } {
+    if (!held) return risk ? { risk: { level: risk.level, reasons: risk.reasons } } : {};
+    const why = heldWriteReason(held);
+    if (risk && riskWeight(risk) > 1) return { risk: { level: risk.level, reasons: [why, ...risk.reasons] } };
     return { risk: { level: "medium", reasons: [why, ...(risk?.reasons ?? [])] } };
   }
 
@@ -8113,7 +8161,8 @@ export class Session {
 
       // Secret-path gate (secret-paths.ts), every mode: a call naming one of the
       // daemon's credential files or a process environment is refused; one
-      // searching a directory that holds them is asked about, never auto-run.
+      // searching a directory that holds them is asked about (refused in
+      // autonomous mode), never auto-run.
       const secret = secretPathVerdict(toolName, effectiveInput, { workdir: this.workdir, configDir: getConfigDir(), cwd: shellCwd });
       // A shell command is judged by what it runs (#431): one naming a
       // credential file is refused like the file tools; a risky one asks.
@@ -8141,37 +8190,35 @@ export class Session {
       // it mid-turn and applies its env, after the turn-start check
       // (assertClaudeAccountUsable) — so it never runs unasked, in any mode.
       const held = this.#heldWrite(toolName, effectiveInput);
-      if (held) {
-        this.#store.audit(sender.sub, held.what === "git" ? "session.git_structure_write_ask" : "session.project_settings_write_ask", this.id, `tool=${toolName} path=${held.path}`);
-      }
       const settingsWrite = this.#writesClaudeSettingsOnNamedAccount(toolName, effectiveInput) || held !== null;
       // end_attempt: a call the spent budget would have parked is denied and
       // ends the attempt instead — whatever else would have asked about it.
       if (this.#budgetSpentFor(toolName)) return this.#endAttemptOnBudget(approvalId, toolName, sender);
+      // Autonomous mode waits on no one (#448): what would have asked and the
+      // OS sandbox can't be left to contain is refused at once, with its reason.
+      const refusal = this.#autonomousRefusal(toolName, effectiveInput, risk, secret, held);
+      if (refusal) return this.#refuseAutonomous(approvalId, toolName, refusal, sender);
+      if (held) {
+        this.#store.audit(sender.sub, held.what === "git" ? "session.git_structure_write_ask" : "session.project_settings_write_ask", this.id, `tool=${toolName} path=${held.path}`);
+      }
       const riskAsks = this.#riskAsks(risk);
-      // Autonomous mode asks before writing outside the working directory, as
-      // a high-risk command asks: no budget spent, an unattended run parks.
-      const outside = this.#outsideWrite(toolName, effectiveInput, shellCwd);
       // A command asking to run outside the OS sandbox (#448) is its own
-      // approval, asked in every mode: no budget spent, an unattended run parks.
+      // approval, asked in guarded and interactive mode.
       const unsandboxed = this.#unsandboxedRequest(toolName, effectiveInput);
       if (unsandboxed) this.#store.audit(sender.sub, "session.unsandboxed_ask", this.id, `tool=${toolName}`);
       const autoApprove =
         !unsandboxed &&
         !riskAsks &&
-        !outside &&
         secret?.action !== "ask" &&
         !settingsWrite &&
         (this.#riskAllows(toolName, risk) || this.#shouldAutoApprove(toolName));
-      if (riskAsks && this.#mode === "autonomous") {
-        this.#store.audit(sender.sub, "session.risk_ask", this.id, `tool=${toolName} risk=${risk?.level} ${risk?.reasons[0] ?? ""}`.trim());
-      }
-      if (outside) this.#store.audit(sender.sub, "session.outside_write_ask", this.id, `tool=${toolName} path=${outside.path}`);
 
       if (autoApprove) {
         this.#approvalIdToMessageId.delete(approvalId); // clean up — no manual approval will reference this
         this.#approvalPatchKeys.delete(approvalId);
-        this.#store.audit(sender.sub, "session.auto_approve", this.id, `tool=${toolName} mode=${this.#mode}`);
+        // A risky command autonomous mode ran (the sandbox holds it, #448) says so in the audit.
+        const level = risk && (risk.level === "high" || risk.level === "unknown" || risk.unreadable) ? ` risk=${risk.unreadable ? "unreadable" : risk.level}` : "";
+        this.#store.audit(sender.sub, "session.auto_approve", this.id, `tool=${toolName} mode=${this.#mode}${level}`);
         // Turn status only. A background agent's call between turns must not
         // move an idle session to tool_running: nothing would ever move it
         // back, and the background wake (gated on idle) would never fire.
@@ -8809,21 +8856,23 @@ export class Session {
         // twice per tool call (this handler runs in the same microtask batch
         // as canUseTool's synchronous section, always after it).
         const risk = this.#shellRisk(event.name, event.input, event.shellCwd);
-        const outside = this.#outsideWrite(event.name, event.input, event.shellCwd);
         const held = this.#heldWrite(event.name, event.input);
+        const secret = secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir(), cwd: event.shellCwd });
         // Claude's sandbox asking for a host: decided by the session's network alone (#448).
         const networkAsk = event.name === SANDBOX_NETWORK_TOOL && this.#sandbox?.info?.state === "on";
         const autoApprove = networkAsk
           ? this.#sandbox?.info?.network === "on"
           : !this.#unsandboxedRequest(event.name, event.input) &&
-          secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir(), cwd: event.shellCwd }) === null &&
+          secret === null &&
           !risk?.secret &&
           !this.#riskAsks(risk) &&
-          !outside &&
           !held &&
+          !this.#writesClaudeSettingsOnNamedAccount(event.name, event.input) &&
           (this.#riskAllows(event.name, risk) || this.#peekAutoApprove(event.name));
         // end_attempt: the gate will refuse this call outright — no approval card.
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
+        // Autonomous mode refuses it outright (#autonomousRefusal): no approval card either.
+        const refused = networkAsk || budgetDenied || secret?.action === "deny" || risk?.secret?.action === "deny" ? null : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
         const toolMsg = this.#makeMessage(
           "tool_call",
           `${event.name}(${Object.keys(event.input).join(", ")})`,
@@ -8835,6 +8884,8 @@ export class Session {
             input: event.input,
             state: budgetDenied
               ? { phase: "cancelled", reason: "denied", message: "autonomous tool budget spent" }
+              : refused
+              ? { phase: "cancelled", reason: "denied", message: refused.reason }
               : autoApprove
               ? ({ phase: "executing", input: event.input } as unknown as ToolState)
               : ({
@@ -8843,7 +8894,7 @@ export class Session {
                   description: `${event.name}(${Object.keys(event.input).join(", ")})`,
                   approvalId: event.approvalId,
                   ...this.#collaborationCostFor(event.name),
-                  ...this.#cardRisk(risk, outside, held),
+                  ...this.#cardRisk(risk, held),
                   ...this.#cardSandbox(event.name, event.input),
                 } as unknown as ToolState),
           },
@@ -8861,7 +8912,7 @@ export class Session {
         this.#persistAndBuffer(toolMsg);
         this.#broadcastRaw(toolMsg);
         this.#maybeInjectRepeatReminder(event.name, event.input, event.sdkAgentId);
-        if (!autoApprove && !budgetDenied) this.#setStatus("waiting_approval");
+        if (!autoApprove && !budgetDenied && !refused) this.#setStatus("waiting_approval");
         break;
       }
 

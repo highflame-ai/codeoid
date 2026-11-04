@@ -596,8 +596,8 @@ export class GeminiAcpProvider implements SessionProvider {
  * What the gate (and the card) is shown of an ACP tool call: its `rawInput`
  * (the Gemini CLI sends none), plus the files the call says it touches —
  * its `locations` (`{path, line?}`) and its diffs' `path` — as `locations`,
- * so an edit is judged by where it writes (outside-writes.ts). A call with
- * neither names no path, and an edit then asks in autonomous mode.
+ * so an edit is judged by where it writes (held-writes.ts). A call with
+ * neither names no path.
  */
 function acpToolInput(toolCall: Record<string, unknown>, withTitle = true): Record<string, unknown> {
   const raw = toolCall.rawInput && typeof toolCall.rawInput === "object" ? (toolCall.rawInput as Record<string, unknown>) : null;

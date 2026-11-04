@@ -29,7 +29,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import type { CodeoidConfig } from "../../config.js";
 import { getConfigDir } from "../../config.js";
 import { daemonOwnedDirs } from "../data-lock.js";
-import type { HeldPath } from "../outside-writes.js";
+import type { HeldPath } from "../held-writes.js";
 import { cliCredentialFiles, registeredSecretLocations } from "../secret-paths.js";
 import { DEFAULT_HOME_READABLE } from "./home-readable.js";
 import { validAllowedHost } from "./hosts.js";

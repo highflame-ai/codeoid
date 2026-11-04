@@ -62,8 +62,8 @@ export type ToolApprovalFn = (
    * The directory the backend reports this call runs in (Claude's Bash keeps
    * a `cd` between calls, and the CLI resolves a Grep or Glob's relative
    * `path` from there too; its PreToolUse hook's `cwd`): a shell call's
-   * relative write targets and a tool's relative paths are judged from there
-   * (outside-writes.ts, secret-paths.ts). Null: the backend's cwd may have
+   * risk and a tool's relative paths are judged from there (#431,
+   * secret-paths.ts). Null: the backend's cwd may have
    * moved and it didn't say where. Absent: the backend runs in the workdir.
    */
   shellCwd?: string | null,
@@ -770,14 +770,6 @@ export interface AgentProvider {
    * A loop controller falls back to wall-time limits (supervisor.ts) there.
    */
   readonly enforcesToolBudget?: boolean;
-  /**
-   * True when the backend's shell runs with `CDPATH` unset or empty, because
-   * codeoid gives it its environment (Claude's CLI: `CDPATH=` in its env;
-   * opencode: a bare `PUT …/environment`, run non-login). The outside-write
-   * check then follows a `cd` by a bare name (`cd src && …`) to where it
-   * really leads. Absent = not known: such a `cd` isn't followed.
-   */
-  readonly shellCdpathUnset?: boolean;
   /**
    * Pids of the processes this backend spawned itself (its CLI / app-server)
    * that are alive now. Session.terminateBackend snapshots their whole tree

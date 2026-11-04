@@ -1049,16 +1049,17 @@ export interface ToolWaitingConfirmationState {
    */
   collaborationCost?: CollaborationCost;
   /**
-   * A shell command's risk, judged from what it runs (#431); in autonomous
-   * mode also a write outside the working directory, its reason first
-   * ("writes outside the working directory: <path>"). Absent otherwise.
+   * A shell command's risk, judged from what it runs (#431); for a file-tool
+   * write into what the OS sandbox holds read-only, that reason first
+   * ("writes the repository's git structure …"). Absent otherwise.
    */
   risk?: ToolRisk;
   /**
    * Whether this call runs inside the session's OS sandbox (#448). False for
    * a session that isn't sandboxed, a tool that runs in the backend's own
-   * process outside it, and a request to run a command unsandboxed (which
-   * asks in every mode). Absent on a daemon without sandboxing.
+   * process outside it, and a request to run a command unsandboxed (asked in
+   * guarded and interactive mode, refused in autonomous mode). Absent on a
+   * daemon without sandboxing.
    */
   sandboxed?: boolean;
   /** Why not, or what's asked: "not sandboxed: bubblewrap is not installed", "asks to run outside the sandbox". */

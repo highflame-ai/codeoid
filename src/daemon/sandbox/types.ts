@@ -1,7 +1,7 @@
 /**
  * OS sandboxing for what agents run (#448): the provider contract.
  *
- * #431's risk levels and the outside-write check read shell text, which can't
+ * #431's risk levels read shell text, which can't
  * be made complete. The boundary is the operating system: a command run inside
  * a sandbox can't read what it can't see, or write what is read-only, however
  * it is spelled.

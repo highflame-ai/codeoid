@@ -10,7 +10,8 @@
  *   - `allowUnsandboxedCommands: true` with codeoid deciding: a command the
  *     model asks to run outside (`dangerouslyDisableSandbox`) is routed to
  *     the gate by the PreToolUse hook past any allow rule, and asked about
- *     in every mode (Session#unsandboxedRequest);
+ *     in guarded and interactive mode, refused in autonomous mode
+ *     (Session#unsandboxedRequest, #autonomousRefusal);
  *   - filesystem: the home denied whole and its allowlist allowed back
  *     (`denyRead` / `allowRead`, which the CLI enforces as a tmpfs home with
  *     binds: a credential made or replaced later isn't there), the workspace

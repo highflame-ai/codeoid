@@ -165,7 +165,7 @@ per line) — and the session says why. What Forge needs to add, in order:
    back by `workspace diff/pull`. codeoid's sessions work in a host directory, so
    the provider needs, at least, push-in at open (the worktree, untracked files
    included) and pull-back before a turn ends or a checkpoint is taken — or
-   codeoid's checkpoints and outside-write checks run against a stale tree.
+   codeoid's checkpoints and file-tool checks run against a stale tree.
    A file upload/download endpoint (or a sync session over the SSH transport)
    would do both.
 4. **Per-session credential handling for codeoid**: the credential sidecar

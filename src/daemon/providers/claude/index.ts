@@ -51,11 +51,11 @@ import { LOOP_MCP_SERVER_NAME, LOOP_REPORT_TOOL_FQ } from "../../loops/tools.js"
 import { rewriteBashToolInput } from "../../compress/index.js";
 import { type CodeoidConfig, getConfigDir } from "../../../config.js";
 import { assessShellCommandSync } from "../../risk/shell-risk.js";
-import { heldWriteOf, heldWriteReason, outsideWriteOf, outsideWriteReason } from "../../outside-writes.js";
+import { heldWriteOf, heldWriteReason } from "../../held-writes.js";
 import { secretPathVerdict } from "../../secret-paths.js";
 import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "../../fork-isolation.js";
 import { isShellTool, runsNoCommand, shellCallOf } from "../../shell/tool-call.js";
-import { type AuthContext, EFFORT_LEVELS, type EffortLevel, type SessionMode, SYSTEM_IDENTITY } from "../../../protocol/types.js";
+import { type AuthContext, EFFORT_LEVELS, type EffortLevel, SYSTEM_IDENTITY } from "../../../protocol/types.js";
 import type {
   BackendMcpServerState,
   SessionProvider,
@@ -152,8 +152,6 @@ export interface ClaudeProviderInit {
   forkBoundary?: () => string | undefined;
   /** An agent id that is a fork's parent's (ProviderSessionInit.isForeignAgent): its every tool call is denied. */
   isForeignAgent?: (agentId: string) => boolean;
-  /** The session's mode now (ProviderSessionInit.sessionMode): an outside write in autonomous mode goes to the gate. */
-  sessionMode?: () => SessionMode;
   /** A task id that is a fork's parent's (ProviderSessionInit.isForeignTask). */
   isForeignTask?: (taskId: string) => boolean;
   /** This session is a fork (ProviderSessionInit.isFork). */
@@ -263,8 +261,6 @@ export const MAX_CARRYOVER_EVENTS = 100;
 export class ClaudeProvider implements SessionProvider {
   /** The Agent SDK runs the permission result's `updatedInput` (see AgentProvider.appliesToolInputRewrite). */
   readonly appliesToolInputRewrite = true;
-  /** The CLI's env has `CDPATH=` (withShellBasics), and its shell snapshot carries no variables. */
-  readonly shellCdpathUnset = true;
   readonly id = "claude";
   /** The CLI runs the main agent itself when background work settles (#adoptTurn). */
   readonly continuesAfterBackgroundWork = true;
@@ -349,7 +345,7 @@ export class ClaudeProvider implements SessionProvider {
    * until canUseTool takes it: Claude's Bash keeps a `cd` between calls, and
    * the CLI resolves a shell call's relative targets and a Grep or Glob's
    * relative `path` (or its missing one, the search root) from there, so the
-   * gate judges them from there too (outside-writes.ts, secret-paths.ts).
+   * gate judges them from there too (shell risk, secret-paths.ts).
    * Bounded: a call the CLI allows itself never reaches canUseTool.
    */
   #shellCwds = new Map<string, string>();
@@ -649,24 +645,6 @@ export class ClaudeProvider implements SessionProvider {
     if (!cwd || !input.tool_use_id) return;
     this.#shellCwds.set(input.tool_use_id, cwd);
     if (this.#shellCwds.size > 256) this.#shellCwds.delete(this.#shellCwds.keys().next().value!);
-  }
-
-  /** `ask` for a write outside the working directory in autonomous mode, so it reaches codeoid's gate; null otherwise. */
-  #outsideWriteDecision(
-    input: PreToolUseHookInput,
-    workdir: string,
-  ): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "ask"; permissionDecisionReason: string } } | null {
-    let reason: string;
-    try {
-      if (this.#init.sessionMode?.() !== "autonomous") return null;
-      const outside = outsideWriteOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, workdir, hookShellCwd(input), { cdpathUnset: this.shellCdpathUnset });
-      if (!outside) return null;
-      reason = outsideWriteReason(outside);
-    } catch (err) {
-      console.error(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] judging where a write leads failed, asking the owner: ${err instanceof Error ? err.message : String(err)}`);
-      reason = "codeoid couldn't tell where this write leads, so it needs the owner's approval.";
-    }
-    return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: reason } };
   }
 
   #shellRiskDecision(
@@ -1332,7 +1310,7 @@ export class ClaudeProvider implements SessionProvider {
               if (worktree) return worktree;
               // A command the model asks to run outside the OS sandbox (#448)
               // never runs on an allow rule: canUseTool, where codeoid asks
-              // the owner in every mode.
+              // the owner (refuses it in autonomous mode).
               if (sandbox?.plan.kind === "native" && asksUnsandboxed(input.tool_input)) {
                 return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask" as const, permissionDecisionReason: "asks to run outside the sandbox" } };
               }
@@ -1355,13 +1333,9 @@ export class ClaudeProvider implements SessionProvider {
               // Fail-closed (#shellRiskDecision).
               const shellRisk = this.#shellRiskDecision(input, opts.workdir);
               if (shellRisk) return shellRisk;
-              // In autonomous mode a write outside the working directory asks
-              // (outside-writes.ts): never on an allow rule either. Fail-closed.
-              const outside = this.#outsideWriteDecision(input, opts.workdir);
-              if (outside) return outside;
               // While sandboxed (#448) a file tool writing the repository's git structure or the
-              // project settings (read-only to commands; this tool runs outside the sandbox) asks
-              // in every mode: never on an allow rule. Fail-closed.
+              // project settings (read-only to commands; this tool runs outside the sandbox) goes
+              // to codeoid's gate (asked, or refused in autonomous mode): never on an allow rule. Fail-closed.
               if (sandbox) {
                 const held = heldWriteDecision(input, opts.workdir);
                 if (held) return held;
@@ -2718,9 +2692,10 @@ export function buildAgentEnv(
  * `CDPATH=` (empty: bash then looks a bare name up in the cwd only) on the
  * CLI's env, after everything else: its Bash tool inherits it, and the shell
  * snapshot it sources carries functions, options and aliases, not
- * variables. So the outside-write check follows `cd src && …` where it
- * really leads (`shellCdpathUnset`). A project's `.claude/settings.json`
- * `env` can still set one: shell judgement is best effort (#448).
+ * variables. So `cd .codeoid && cat config.json` goes where the shell
+ * reader (#431) places it, under the cwd, and a credential read is judged
+ * where it really is. A project's `.claude/settings.json` `env` can still
+ * set one: shell judgement is best effort (#448).
  */
 export function withShellBasics(env: Record<string, string>): Record<string, string> {
   return { ...env, CDPATH: "" };
@@ -2848,7 +2823,7 @@ export function claudeCatalogEntry(m: {
 
 /**
  * The PreToolUse hook's decision for a file-tool write into what the OS
- * sandbox holds read-only (#448: outside-writes.ts `heldWriteOf`): `ask`,
+ * sandbox holds read-only (#448: held-writes.ts `heldWriteOf`): `ask`,
  * so it reaches codeoid's gate past any allow rule; null for one that
  * writes none. A judgement that throws asks.
  */

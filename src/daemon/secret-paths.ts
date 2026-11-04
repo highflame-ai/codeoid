@@ -16,7 +16,8 @@
  * hop removed: the backend's process carries its credential in its
  * environment, and a file tool runs INSIDE that process.
  *
- * `~/.claude.json` is asked about, in every mode, rather than refused: it holds
+ * `~/.claude.json` is asked about (refused in autonomous mode, which waits on
+ * no one: Session#autonomousRefusal) rather than refused outright: it holds
  * MCP servers' literal tokens, and it is where the user's approvals of a
  * project's MCP servers live (#395) — an unprompted write could approve a
  * repo's servers for every backend, or add a global server for every

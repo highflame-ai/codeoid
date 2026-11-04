@@ -130,6 +130,7 @@ function makeSession(
   const session = new Session(o);
   sessions.push(session);
   const cards: SessionMessage[] = [];
+  const infos: SessionMessage[] = [];
   const dialogs: SessionUiRequestMsg[] = [];
   session.attach({
     id: "c",
@@ -137,10 +138,11 @@ function makeSession(
     capabilities: [CAPABILITIES.UI_DIALOGS],
     send: (m: { type: string; role?: string }) => {
       if (m.type === "session.message" && m.role === "tool_call") cards.push(structuredClone(m) as SessionMessage);
+      if (m.type === "session.message" && m.role === "info") infos.push(m as SessionMessage);
       if (m.type === "session.ui_request") dialogs.push(structuredClone(m) as SessionUiRequestMsg);
     },
   } as never);
-  return { session, cards, dialogs };
+  return { session, cards, infos, dialogs };
 }
 
 async function until(cond: () => boolean, ms = 5_000): Promise<void> {
@@ -151,17 +153,29 @@ async function until(cond: () => boolean, ms = 5_000): Promise<void> {
   }
 }
 
-type Card = { phase: string; sandboxed?: boolean; sandboxNote?: string };
+type Card = { phase: string; sandboxed?: boolean; sandboxNote?: string; message?: string; risk?: { reasons: string[] } };
 
-async function gateCall(name: string, input: Record<string, unknown>, opts: Parameters<typeof makeSession>[1] = {}) {
-  const provider = new MockSessionProvider("claude", [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name, input, approvalId: "ap-1" }, DONE]]);
-  const { session, cards } = makeSession(provider, opts);
+async function gateCall(name: string, input: Record<string, unknown>, opts: Parameters<typeof makeSession>[1] & { backend?: string } = {}) {
+  const provider = new MockSessionProvider(opts.backend ?? "claude", [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name, input, approvalId: "ap-1" }, DONE]]);
+  const { session, cards, infos } = makeSession(provider, opts);
   void session.send("go", AUTH).catch(() => {});
   await until(() => provider.canUseToolResults.length > 0 || session.pendingToolApprovals().length > 0);
   const pending = session.pendingToolApprovals();
   const card = cards[0]?.tool?.state as Card | undefined;
   if (pending.length > 0) await session.interrupt(AUTH);
-  return { session, asked: pending.length > 0, card, behavior: provider.canUseToolResults[0]?.behavior };
+  const result = provider.canUseToolResults[0] as { behavior?: string; message?: string } | undefined;
+  const refusal = infos.find((m) => (m.metadata as { event?: string } | undefined)?.event === "autonomous.refused");
+  return { session, asked: pending.length > 0, pending, card, behavior: result?.behavior, message: result?.message, refusal };
+}
+
+/** Autonomous mode refused the call outright (#448): never asked, its reason to the agent and on the card, an info line, audited. */
+function expectRefused(r: Awaited<ReturnType<typeof gateCall>>, kind: string): void {
+  expect([r.asked, r.behavior]).toEqual([false, "deny"]);
+  expect(r.message).toStartWith("Refused: autonomous mode doesn't allow ");
+  expect(r.message).toContain("The owner can do it, or switch this session to guarded mode to be asked.");
+  expect(r.card).toMatchObject({ phase: "cancelled", message: r.message });
+  expect(r.refusal?.metadata).toMatchObject({ kind });
+  expect(audits.some((a) => a.action === "session.autonomous_refuse" && a.sessionId === r.session.id && a.detail?.endsWith(`kind=${kind}`))).toBe(true);
 }
 
 describe("what a session's sandbox resolves to", () => {
@@ -307,10 +321,14 @@ describe("the approval card and the gate", () => {
     expect(r.card).toMatchObject({ sandboxed: false, sandboxNote: "runs in the backend's own process, outside the sandbox" });
   });
 
-  test("a command asking to run outside the sandbox is asked about even in autonomous mode, and audited", async () => {
+  test("a command asking to run outside the sandbox is refused in autonomous mode, never asked; guarded mode asks, audited", async () => {
     const r = await gateCall("Bash", { command: "ls", dangerouslyDisableSandbox: true }, { mode: "autonomous" });
-    expect(r.asked).toBe(true);
-    expect(r.card).toMatchObject({ phase: "waiting_confirmation", sandboxed: false, sandboxNote: "asks to run outside the sandbox" });
+    expectRefused(r, "unsandboxed");
+    expect(r.message).toContain("running a command outside the OS sandbox");
+    expect(audits.some((a) => a.action === "session.unsandboxed_ask")).toBe(false);
+    const guarded = await gateCall("Bash", { command: "ls", dangerouslyDisableSandbox: true }, { mode: "guarded" });
+    expect(guarded.asked).toBe(true);
+    expect(guarded.card).toMatchObject({ phase: "waiting_confirmation", sandboxed: false, sandboxNote: "asks to run outside the sandbox" });
     expect(audits.some((a) => a.action === "session.unsandboxed_ask")).toBe(true);
     // The same command, sandboxed, runs unasked in autonomous mode.
     const plain = await gateCall("Bash", { command: "ls" }, { mode: "autonomous" });
@@ -431,58 +449,61 @@ describe("review fixes (#448)", () => {
     expect(r.behavior).toBe("allow");
   });
 
-  test("Claude (native): a file-tool write to the project's Claude settings asks in every mode", async () => {
-    const r = await gateCall("Write", { file_path: join(workdir, ".claude", "settings.json"), content: "{}" }, { mode: "autonomous" });
-    expect(r.asked).toBe(true);
+  test("Claude (native): a file-tool write to the project's Claude settings is refused in autonomous mode, asked in guarded", async () => {
+    const write = { file_path: join(workdir, ".claude", "settings.json"), content: "{}" };
+    expectRefused(await gateCall("Write", write, { mode: "autonomous" }), "held_write");
+    expect((await gateCall("Write", write, { mode: "guarded" })).asked).toBe(true);
   });
 
-  test("every backend's file tools (they run outside the sandbox): a write into the project settings agent CLIs run code from asks in every mode while the sandbox is on (#448 round 2)", async () => {
-    const call = async (backend: string, name: string, input: Record<string, unknown>, sandbox?: { provider: string }) => {
-      const provider = new MockSessionProvider(backend, [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name, input, approvalId: "ap-1" }, DONE]]);
-      const { session } = makeSession(provider, { mode: "autonomous", ...(sandbox ? { sandbox } : {}) });
-      void session.send("go", AUTH).catch(() => {});
-      await until(() => provider.canUseToolResults.length > 0 || session.pendingToolApprovals().length > 0);
-      const asked = session.pendingToolApprovals().length > 0;
-      if (asked) await session.interrupt(AUTH);
-      return asked;
-    };
-    expect(await call("opencode", "Write", { file_path: join(workdir, ".claude", "settings.json"), content: "{}" })).toBe(true);
-    expect(await call("opencode", "Edit", { file_path: join(workdir, "a.ts"), files: [join(workdir, ".gemini", "settings.json")] })).toBe(true);
-    expect(await call("opencode", "Write", { file_path: join(workdir, ".mcp.json"), content: "{}" })).toBe(true);
-    expect(await call("pi", "write", { path: ".pi/extensions/x.ts", content: "" })).toBe(true);
-    expect(await call("opencode", "Write", { file_path: join(workdir, "src.ts"), content: "" })).toBe(false);
+  test("Claude (native): a write to a Claude settings file outside the held ones is refused in autonomous mode as a settings write", async () => {
+    const r = await gateCall("Write", { file_path: join(root, "elsewhere", ".claude", "settings.local.json"), content: "{}" }, { mode: "autonomous" });
+    expectRefused(r, "claude_settings");
+    expect(r.message).toContain("a Claude settings file");
+  });
+
+  test("every backend's file tools (they run outside the sandbox): a write into the project settings agent CLIs run code from is refused in autonomous mode while the sandbox is on (#448 round 2)", async () => {
+    for (const [backend, name, input] of [
+      ["opencode", "Write", { file_path: join(workdir, ".claude", "settings.json"), content: "{}" }],
+      ["opencode", "Edit", { file_path: join(workdir, "a.ts"), files: [join(workdir, ".gemini", "settings.json")] }],
+      ["opencode", "Write", { file_path: join(workdir, ".mcp.json"), content: "{}" }],
+      ["pi", "write", { path: ".pi/extensions/x.ts", content: "" }],
+    ] as const) {
+      const r = await gateCall(name, input as Record<string, unknown>, { mode: "autonomous", backend });
+      expectRefused(r, "held_write");
+      expect(r.message).toContain("project settings an agent CLI runs code from");
+    }
+    // Guarded mode asks, the card saying why.
+    const guarded = await gateCall("Write", { file_path: join(workdir, ".mcp.json"), content: "{}" }, { mode: "guarded", backend: "opencode" });
+    expect(guarded.asked).toBe(true);
+    expect(guarded.pending[0]?.risk?.reasons[0]).toContain("project settings an agent CLI runs code from");
+    const plain = await gateCall("Write", { file_path: join(workdir, "src.ts"), content: "" }, { mode: "autonomous", backend: "opencode" });
+    expect([plain.asked, plain.behavior]).toEqual([false, "allow"]);
     // The sandbox off: the owner's choice, nothing is held.
-    expect(await call("opencode", "Write", { file_path: join(workdir, ".claude", "settings.json"), content: "{}" }, { provider: "off" })).toBe(false);
+    const off = await gateCall("Write", { file_path: join(workdir, ".claude", "settings.json"), content: "{}" }, { mode: "autonomous", backend: "opencode", sandbox: { provider: "off" } });
+    expect([off.asked, off.behavior]).toEqual([false, "allow"]);
   });
 
-  test("file tools writing the repository's git structure ask in every mode while the sandbox is on, the card saying why (#448 round 3)", async () => {
+  test("file tools writing the repository's git structure are refused in autonomous mode while the sandbox is on; guarded mode asks, the card saying why (#448 round 3)", async () => {
     const execFile = (args: string[], cwd: string) => Bun.spawnSync(["git", ...args], { cwd, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
     execFile(["init", "-q", "-b", "main"], workdir);
     try {
-      const call = async (backend: string, name: string, input: Record<string, unknown>) => {
-        const provider = new MockSessionProvider(backend, [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name, input, approvalId: "ap-1" }, DONE]]);
-        const { session, cards } = makeSession(provider, { mode: "autonomous" });
-        void session.send("go", AUTH).catch(() => {});
-        await until(() => provider.canUseToolResults.length > 0 || session.pendingToolApprovals().length > 0);
-        const pending = session.pendingToolApprovals();
-        const card = cards[0]?.tool?.state as { risk?: { reasons: string[] } } | undefined;
-        if (pending.length > 0) await session.interrupt(AUTH);
-        return { asked: pending.length > 0, reason: pending[0]?.risk?.reasons[0] ?? "", card: card?.risk?.reasons[0] ?? "" };
-      };
-      const hook = await call("claude", "Write", { file_path: join(workdir, ".git", "hooks", "pre-commit"), content: "x" });
+      const hook = await gateCall("Write", { file_path: join(workdir, ".git", "hooks", "pre-commit"), content: "x" }, { mode: "guarded" });
       expect(hook.asked).toBe(true);
-      expect(hook.reason).toContain("the repository's git structure");
-      expect(hook.card).toContain("the repository's git structure");
+      expect(hook.pending[0]?.risk?.reasons[0]).toContain("the repository's git structure");
+      expect(hook.card?.risk?.reasons[0]).toContain("the repository's git structure");
       for (const [backend, name, input] of [
+        ["claude", "Write", { file_path: join(workdir, ".git", "hooks", "pre-commit"), content: "x" }],
         ["claude", "Edit", { file_path: join(workdir, ".git", "config"), old_string: "[core]", new_string: "[core]" }],
         ["claude", "Write", { file_path: join(workdir, ".git", "commondir"), content: "x" }],
         ["claude", "NotebookEdit", { notebook_path: join(workdir, ".git", "info", "attributes.ipynb") }],
         ["opencode", "Edit", { file_path: join(workdir, "a.ts"), files: [join(workdir, ".git", "info", "attributes")] }],
         ["pi", "write", { path: ".git/HEAD", content: "x" }],
       ] as const) {
-        expect(await call(backend, name, input as Record<string, unknown>)).toMatchObject({ asked: true });
+        const r = await gateCall(name, input as Record<string, unknown>, { mode: "autonomous", backend });
+        expectRefused(r, "held_write");
+        expect(r.message).toContain("the repository's git structure");
       }
-      expect((await call("claude", "Write", { file_path: join(workdir, "src.ts"), content: "" })).asked).toBe(false);
+      expect((await gateCall("Write", { file_path: join(workdir, "src.ts"), content: "" }, { mode: "autonomous" })).behavior).toBe("allow");
     } finally {
       rmSync(join(workdir, ".git"), { recursive: true, force: true });
       rmSync(join(workdir, "HEAD"), { recursive: true, force: true });
