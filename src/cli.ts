@@ -426,7 +426,7 @@ program
   .description("Open the web UI; on a local-mode daemon, with a one-time link that signs this browser in")
   .option("--no-open", "print the link, don't open a browser")
   .action(async (opts) => {
-    const { webUiLink } = await import("./terminal/ui-link.js");
+    const { browserOpener, webUiLink } = await import("./terminal/ui-link.js");
     const link = await webUiLink(loadConfig().daemonUrl);
     if ("error" in link) {
       console.error(`codeoid ui: ${link.error}`);
@@ -435,11 +435,14 @@ program
     console.log(link.url);
     if (link.signsIn) console.log(`  (signs one browser in, once, within ${Math.round((link.expiresInMs ?? 0) / 1000)} seconds)`);
     if (opts.open === false) return;
-    const opener = process.platform === "darwin" ? "open" : process.platform === "win32" ? null : "xdg-open";
-    const bin = opener ? Bun.which(opener) : null;
-    if (!bin) return;
+    // Never with the code in a program's argv where a sandboxed command could read it (browserOpener).
+    const opener = browserOpener(link.url);
+    if (!opener) return;
     try {
-      Bun.spawn([bin, link.url], { stdin: "ignore", stdout: "ignore", stderr: "ignore" }).unref();
+      const proc = Bun.spawn(opener.argv, { stdin: opener.stdin !== undefined ? Buffer.from(opener.stdin) : "ignore", stdout: "ignore", stderr: "ignore" });
+      // What reads the link from stdin is waited for (briefly), so it gets all of it; a browser xdg-open runs isn't.
+      if (opener.stdin !== undefined) await Promise.race([proc.exited, Bun.sleep(10_000)]);
+      proc.unref();
     } catch {
       /* the link is printed */
     }

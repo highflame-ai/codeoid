@@ -6,7 +6,7 @@
  */
 import { describe, expect, it } from "bun:test";
 import { UI_LINK_FRAGMENT } from "../daemon/local-auth.js";
-import { webUiLink } from "../terminal/ui-link.js";
+import { browserOpener, webUiLink } from "../terminal/ui-link.js";
 
 const TOKEN = "codeoid_local_TEST";
 
@@ -43,5 +43,24 @@ describe("codeoid ui", () => {
       throw new Error("ECONNREFUSED");
     }) as unknown as typeof fetch);
     expect(down).toEqual({ error: expect.stringContaining("is it running?") });
+  });
+});
+
+describe("codeoid ui: opening the link (#448 round 5)", () => {
+  const url = `http://127.0.0.1:7400/ui/#${UI_LINK_FRAGMENT}=SECRETCODE`;
+
+  it("macOS: the link reaches the browser by AppleScript on stdin, in no program's argv (Seatbelt has no pid namespace)", () => {
+    const o = browserOpener(url, "darwin");
+    expect(o?.argv).toEqual(["/usr/bin/osascript", "-"]);
+    expect(o?.argv.join(" ")).not.toContain("SECRETCODE");
+    expect(o?.stdin).toBe(`open location "${url}"\n`);
+    // One that isn't plain isn't spliced into the script: printed only.
+    expect(browserOpener('http://127.0.0.1:7400/ui/#x="; do shell script "id', "darwin")).toBeNull();
+  });
+
+  it("Linux: xdg-open (every sandbox there has its own pid namespace); none: nothing; Windows: nothing", () => {
+    expect(browserOpener(url, "linux", () => "/usr/bin/xdg-open")).toEqual({ argv: ["/usr/bin/xdg-open", url] });
+    expect(browserOpener(url, "linux", () => null)).toBeNull();
+    expect(browserOpener(url, "win32")).toBeNull();
   });
 });
