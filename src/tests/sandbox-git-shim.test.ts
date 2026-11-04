@@ -239,22 +239,25 @@ describe("git shim: the script", () => {
     }
   });
 
-  test("PATH: the shim first, once", () => {
+  test("PATH: the shim first, once, and only absolute entries (#448 round 5)", () => {
     expect(pathWithShim("/s", "/usr/bin:/s:/bin")).toBe("/s:/usr/bin:/bin");
     expect(pathWithShim("/s", undefined)).toBe("/s");
+    expect(pathWithShim("/s", "node_modules/.bin:.::/usr/bin:bin:./x")).toBe("/s:/usr/bin");
   });
 
-  test("Claude's CLI gets the shim first on PATH; every Bash command it runs gets its PATH without it", () => {
+  test("Claude's CLI gets the shim first on PATH, and no relative entry; every Bash command it runs gets its PATH without the shim", () => {
     const temp = { cli: join(root, "cc", "cli"), root: join(root, "cc", "cmd"), commands: join(root, "cc", "cmd", "claude-1") };
     mkdirSync(temp.cli, { recursive: true });
     const shim = join(root, "shim dir's", "git-bin");
-    const env = claudeNativeEnv({ env: {} }, temp, { PATH: "/usr/bin:/bin", HOME: home }, shim);
+    const env = claudeNativeEnv({ env: {} }, temp, { PATH: ".:/usr/bin:node_modules/.bin:/bin", HOME: home }, shim);
     expect(env.PATH).toBe(`${shim}:/usr/bin:/bin`);
     const file = env.CLAUDE_ENV_FILE ?? "";
     const r = Bun.spawnSync(["/bin/sh", "-c", '. "$1"; printf %s "$PATH"', "sh", file], { env: { PATH: env.PATH } });
     expect(r.stdout.toString()).toBe("/usr/bin:/bin");
-    // Without a shim, nothing about PATH.
+    // Without a shim: the absolute entries, nothing else changed.
     expect(claudeNativeEnv({ env: {} }, temp, { PATH: "/usr/bin" }).PATH).toBe("/usr/bin");
+    expect(claudeNativeEnv({ env: {} }, temp, { PATH: "./bin:/usr/bin:." }).PATH).toBe("/usr/bin");
+    expect(claudeNativeEnv({ env: {} }, temp, {}).PATH).toBeUndefined();
   });
 });
 

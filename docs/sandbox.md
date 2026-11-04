@@ -334,7 +334,9 @@ it, as its shell shim's `bin/`).
   The CLI's Bash commands get the CLI's `PATH` without the shim (its env file
   takes it off), so a command's git is the real one: inside the sandbox as
   before, and a command the owner let run outside (a `git push`) runs as it
-  would. What the CLI starts with its own environment finds the shim too:
+  would. The CLI's `PATH` has only absolute entries: a relative one (`.`,
+  `node_modules/.bin`) would find a program the CLI starts on the host in the
+  workspace. What the CLI starts with its own environment finds the shim too:
   a hook or a stdio MCP server that runs git in the workspace runs it in the
   sandbox, offline, without its credentials; give it its own `PATH` in its
   config if it must push. The shim is checked at each query and written again

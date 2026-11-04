@@ -39,7 +39,7 @@
  */
 
 import { chmodSync, lstatSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { BASE_OVERRIDES, GIT_BIN, PROGRAM_ENV, REMOTE_PROTOCOLS } from "../git-env.js";
 import { GIT_CONTROL, gitLayoutOf, programLocations } from "./policy.js";
 import type { SandboxSpec } from "./types.js";
@@ -397,8 +397,12 @@ export function writeGitShim(dir: string, opts: GitShimOptions): string {
   return dir;
 }
 
-/** `PATH` with `dir` first (and nowhere else). */
+/** A `PATH`'s absolute entries: a relative one (`.`, `node_modules/.bin`) names a file in each directory a program is started in, the workspace among them. */
+export function absolutePathEntries(path: string | undefined): string[] {
+  return (path ?? "").split(":").filter((p) => isAbsolute(p));
+}
+
+/** `PATH` with `dir` first (and nowhere else), and only absolute entries. */
 export function pathWithShim(dir: string, path: string | undefined): string {
-  const rest = (path ?? "").split(":").filter((p) => p !== "" && p !== dir);
-  return [dir, ...rest].join(":");
+  return [dir, ...absolutePathEntries(path).filter((p) => p !== dir)].join(":");
 }

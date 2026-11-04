@@ -334,7 +334,7 @@ A backend CLI that runs outside the sandbox finds codeoid's `git` first on its
 git inside the session's command sandbox, offline, with a fresh `/tmp` per
 git (`SandboxSpec.privateTemp`) and the CLI's worktree dirs writable
 (`cliWorktrees`), its Bash commands' `PATH` without it (claude-native.ts's env
-file); opencode's server's, and one
+file; the CLI's `PATH` absolute entries only); opencode's server's, and one
 whose provider is gone, run git defused (BASE_OVERRIDES appended to the
 caller's `GIT_CONFIG_COUNT`, agent-scope drivers and helpers reset by name in
 the repository the caller's `-C`/`--git-dir` names, `attr.tree` empty, no
