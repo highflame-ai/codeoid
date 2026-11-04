@@ -324,7 +324,13 @@ it, as its shell shim's `bin/`).
   (`attr.tree` naming the empty tree, git 2.46+), and only https and ssh as
   protocols unless the caller's own list is narrower (opencode's is none).
   A config git can't read runs nothing; a diff through a textconv or
-  external diff the repository names fails rather than run it.
+  external diff the repository names fails rather than run it. A shim on
+  `PATH` covers git run as a program, not a git library inside a backend:
+  opencode 2.2.5 bundles a file finder (`fff-core`) that reads git status
+  itself; with a planted `* filter=…` in a repository's config and both
+  attribute files, its glob, grep, write, edit and turns ran nothing
+  (`provider-opencode.integration.test.ts` I58), and codeoid never calls its
+  file picker.
 - **Process-confined backends** (pi, the Gemini CLI, Qwen, Claude and Codex
   under Docker) and **Codex under bubblewrap** run their git inside the
   sandbox already, with everything else they do.
