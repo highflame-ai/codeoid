@@ -47,7 +47,8 @@ test("autonomous mode runs a high-risk command unasked, and refuses a read of co
   await send(page, "tidy up");
   await expect(messages(page).filter({ hasText: "Done." })).toHaveCount(1);
   await expect(messages(page).filter({ hasText: "holds credentials" }).first()).toBeVisible();
-  await expect(messages(page).filter({ hasText: "completed" })).toHaveCount(1);
+  // The high-risk command ran (its output shows); the refused read is answered with the reason, never run.
+  await expect(messages(page).filter({ hasText: "pushed" })).toHaveCount(1);
   await expect(page.getByText("Approval needed")).toHaveCount(0);
   await waitIdle(page);
 });
