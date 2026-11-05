@@ -22,7 +22,7 @@ import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
-import { buildSandboxSpec, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, validAllowedHost } from "./policy.js";
+import { buildSandboxSpec, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, validAllowedHost } from "./policy.js";
 import type { SandboxRegistry } from "./registry.js";
 import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "./git-shim.js";
 import { launcherRoot, sandboxRoot } from "./root.js";
@@ -222,7 +222,10 @@ export async function resolveSandbox(opts: {
   const net = enforcedNetwork(c.plan, network.mode, provider.displayName);
   // A repository whose `.git` names a git dir codeoid can't verify: held read-only, said (policy.ts gitWorkspacePaths).
   const gitNote = opts.workspace !== undefined && c.plan.kind !== "no-shell" ? gitLayoutProblem(opts.workspace) : null;
-  const limits = [...c.plan.limits, ...(net.note ? [net.note] : []), ...(gitNote ? [gitNote] : [])];
+  // A monorepo's package: what its commands may write is the whole repository (#448 round 9).
+  const top = opts.workspace !== undefined && c.plan.kind !== "no-shell" ? sandboxWorkspaceOf(opts.workspace) : null;
+  const topNote = top && opts.workspace !== undefined && top !== resolve(opts.workspace) ? `the workspace is the repository's top (${top}), which the working directory is inside: all of it is readable and writable, its git structure and every project settings dir on the way held read-only` : null;
+  const limits = [...c.plan.limits, ...(net.note ? [net.note] : []), ...(gitNote ? [gitNote] : []), ...(topNote ? [topNote] : [])];
   const applied: NetworkPolicy = net.mode === "allowlist" ? network : { mode: net.mode };
   return {
     info: {
@@ -529,7 +532,9 @@ export class SessionSandbox {
     return buildSandboxSpec({
       backendReadable: readable,
       sessionId: this.#sessionId,
-      workspace: this.#workdir,
+      // A monorepo's package: the repository's top (#448 round 9); the session's cwd stays the workdir.
+      workspace: sandboxWorkspaceOf(this.#workdir),
+      workdir: this.#workdir,
       tempDir: this.#ensureTempDir(),
       network,
       ...(this.#config ? { config: this.#config } : {}),
@@ -659,7 +664,8 @@ export async function openCheckSandbox(opts: {
   try {
     const spec = buildSandboxSpec({
       sessionId: `check-${safe}`,
-      workspace: opts.workspace,
+      workspace: sandboxWorkspaceOf(opts.workspace),
+      workdir: opts.workspace,
       tempDir,
       network: mode === "allowlist" ? network : { mode },
       ...(opts.config ? { config: opts.config } : {}),

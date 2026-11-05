@@ -238,6 +238,12 @@ function within(child: string, parent: string): boolean {
 export interface SpecInputs {
   sessionId: string;
   workspace: string;
+  /**
+   * The session's cwd, when it is below `workspace` (a monorepo's package,
+   * sandboxWorkspaceOf): project settings are held read-only in every dir
+   * from it up to the workspace (projectDirsOf).
+   */
+  workdir?: string;
   tempDir: string;
   network: NetworkPolicy;
   config?: CodeoidConfig;
@@ -263,6 +269,11 @@ export interface SpecInputs {
 function hiddenHome(home: string): string | null {
   const h = resolve(home);
   return isAbsolute(home) && h !== "/" ? h : null;
+}
+
+/** `sandbox.hiddenPaths`, absolute (`~` expanded). */
+export function userHiddenPaths(config: Pick<CodeoidConfig, "sandbox"> | undefined, home: string = process.env.HOME ?? homedir()): string[] {
+  return sandboxConfigOf(config).hiddenPaths.map((p) => resolve(expandHome(p, home))).filter(isAbsolute);
 }
 
 /** `sandbox.homeReadable`, absolute (`~` expanded). */
@@ -392,6 +403,44 @@ export function gitLayoutOf(workspace: string, home: string = process.env.HOME ?
 }
 
 /**
+ * The sandbox's workspace for a session working in `workdir` (#448 round
+ * 9): the top of the git working tree the workdir is in, when that isn't the
+ * workdir itself (a monorepo's package: its sibling packages, the root's
+ * `package.json` and `tsconfig`, and git work as without a sandbox, git's
+ * own discovery included, which a mount at the package would stop), else the
+ * workdir. Only a repository {@link gitLayoutOf} finds and git's own records
+ * vouch for (a plain `.git`, a linked worktree, a submodule): below the home,
+ * never the home's own, `/`, a temp root or a dir holding the home. The
+ * session's cwd stays the workdir.
+ */
+export function sandboxWorkspaceOf(workdir: string, home: string = process.env.HOME ?? homedir()): string {
+  const ws = resolve(workdir);
+  const layout = gitLayoutOf(ws, home);
+  if (!layout || layout.kind === "unknown") return ws;
+  const top = dirname(layout.dotgit);
+  if (top === ws || !within(ws, top) || top === "/" || within(resolve(home), top)) return ws;
+  if ([tmpdir(), "/tmp", "/var/tmp"].some((t) => resolve(t) === top || realOr(resolve(t)) === realOr(top))) return ws;
+  return top;
+}
+
+/**
+ * Every dir from `workdir` up to `workspace` (both included), where the
+ * agent CLIs look for project settings: Claude's in its cwd, opencode's
+ * `opencode.json` and `.opencode/` from its cwd up to the worktree's top,
+ * Codex's, Gemini's and Qwen's alike. Just the workspace when the workdir
+ * isn't inside it.
+ */
+export function projectDirsOf(workdir: string, workspace: string): string[] {
+  const ws = resolve(workspace);
+  const out: string[] = [];
+  for (let dir = resolve(workdir); within(dir, ws); dir = dirname(dir)) {
+    out.push(dir);
+    if (dir === ws || dirname(dir) === dir) break;
+  }
+  return out.length > 0 && out[out.length - 1] === ws ? out : [ws];
+}
+
+/**
  * What a sandbox makes of the workspace's git repository ({@link gitLayoutOf}).
  *
  * A commit writes the worktree's git dir (index, HEAD, logs, lock files)
@@ -501,8 +550,8 @@ export function gitWorkspacePaths(workspace: string, home: string = process.env.
  * sandbox holds them read-only for commands; a file tool isn't one. No side
  * effects (nothing is made).
  */
-export function protectedWriteTargets(workspace: string, home: string = process.env.HOME ?? homedir()): HeldPath[] {
-  const ws = resolve(workspace);
+export function protectedWriteTargets(workdir: string, home: string = process.env.HOME ?? homedir()): HeldPath[] {
+  const ws = sandboxWorkspaceOf(workdir, home);
   const out: HeldPath[] = [];
   const layout = gitLayoutOf(ws, home);
   if (layout) {
@@ -512,8 +561,11 @@ export function protectedWriteTargets(workspace: string, home: string = process.
       for (const f of [...others, ...submoduleCheckouts(join(layout.common, "modules"))]) if (f && within(f, ws)) out.push({ at: f, whole: true, what: "git" });
     }
   }
-  for (const d of PROJECT_CONFIG_DIRS) out.push({ at: join(ws, d), whole: true, what: "settings" });
-  for (const f of PROJECT_CONFIG_FILES) out.push({ at: join(ws, f), whole: false, what: "settings" });
+  // Each dir from the workdir up to the workspace's top: where the CLIs look for project settings.
+  for (const dir of projectDirsOf(workdir, ws)) {
+    for (const d of PROJECT_CONFIG_DIRS) out.push({ at: join(dir, d), whole: true, what: "settings" });
+    for (const f of PROJECT_CONFIG_FILES) out.push({ at: join(dir, f), whole: false, what: "settings" });
+  }
   return out;
 }
 
@@ -775,7 +827,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const home = inputs.hidden?.home ?? env.HOME ?? homedir();
   const workspace = resolve(inputs.workspace);
   const git = inputs.git === false ? { writable: [], readOnly: [], gitDirs: [] } : gitWorkspacePaths(workspace, home);
-  const projectConfig = inputs.projectConfig === false ? [] : projectConfigPaths(workspace, home);
+  const projectConfig = inputs.projectConfig === false ? [] : projectDirsOf(inputs.workdir ?? workspace, workspace).flatMap((dir) => projectConfigPaths(dir, home));
   const cache = inputs.cache === false ? null : sandboxCacheDir(home, env);
   const own = [...(inputs.backendState ?? []).map((p) => resolve(p)), ...git.writable, ...(cache ? [cache] : [])];
   const ownReal = own.map(realOr);
@@ -784,7 +836,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const tempDir = resolve(inputs.tempDir);
   // A workspace that is the home itself: the home is what the session works on (the hidden list still applies in it).
   const homeHidden = hiddenHome(home) === workspace ? null : hiddenHome(home);
-  const userHidden = sandboxConfigOf(inputs.config).hiddenPaths.map((p) => resolve(expandHome(p, home))).filter(isAbsolute);
+  const userHidden = userHiddenPaths(inputs.config, home);
   const allowed = homeHidden ? homeReadablePaths(inputs.config, homeHidden).filter((r) => !userHidden.some((u) => within(r, u))) : [];
   // A link in the allowlist leads only where the allowlist (or what is outside the home) shows: what it
   // leads to elsewhere in the home stays hidden (a project of yours, with its `.env`), and the link dangles.

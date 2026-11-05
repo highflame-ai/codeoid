@@ -20,7 +20,7 @@ import { dirname, join } from "node:path";
 import { runCheck } from "../daemon/evidence/runner.js";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
 import { hostToolBoundsFor, sandboxReads, sandboxWrites } from "../daemon/sandbox/host-file-tools.js";
-import { buildSandboxSpec, programLocations } from "../daemon/sandbox/policy.js";
+import { buildSandboxSpec, programLocations, sandboxWorkspaceOf } from "../daemon/sandbox/policy.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
 import { sandboxRoot } from "../daemon/sandbox/root.js";
 import { openCheckSandbox } from "../daemon/sandbox/session-sandbox.js";
@@ -1097,5 +1097,81 @@ describe.skipIf(!probe.available)("bubblewrap, for real: round 2 of the #448 aud
     } finally {
       await h.close();
     }
+  });
+});
+
+describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: round 9 of the #448 audit (a monorepo's package)", () => {
+  let root: string;
+  beforeAll(() => {
+    root = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-round9-")));
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  const sh = (h: SandboxHandle, cwd: string, script: string, env: Record<string, string>) => h.exec(["/bin/sh", "-c", script], { cwd, env, timeoutMs: 30_000 });
+
+  test("a session in a package: git status and commit work, a sibling package is readable and writable, nothing above the repository is; project settings stay held in the package, on the way and at the top", async () => {
+    const home = join(root, "home");
+    const mono = join(home, "src", "mono");
+    const web = join(mono, "packages", "web");
+    mkdirSync(web, { recursive: true });
+    mkdirSync(join(mono, "packages", "shared"), { recursive: true });
+    writeFileSync(join(mono, "package.json"), '{"workspaces":["packages/*"]}\n');
+    writeFileSync(join(mono, "tsconfig.base.json"), "{}\n");
+    writeFileSync(join(mono, "packages", "shared", "index.ts"), "export const a = 1;\n");
+    writeFileSync(join(web, "index.ts"), "export const b = 2;\n");
+    writeFileSync(join(home, "above.txt"), "above\n");
+    git(["init", "-q", "-b", "main"], mono, home);
+    git(["add", "-A"], mono, home);
+    git(["commit", "-qm", "init"], mono, home);
+    const workspace = sandboxWorkspaceOf(web, home);
+    expect(workspace).toBe(mono);
+    const tmp = join(root, "tmp");
+    mkdirSync(tmp);
+    const spec = buildSandboxSpec({ sessionId: "mono", workspace, workdir: web, tempDir: tmp, network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" } });
+    const h = await provider.open(spec);
+    try {
+      const env = gitEnv(home);
+      const status = await sh(h, web, "git status --porcelain && echo STATUS-OK", env);
+      expect(status.stdout).toContain("STATUS-OK");
+      expect(status.stderr).not.toContain("not a git repository");
+      const reads = await sh(h, web, "cat ../../package.json ../../tsconfig.base.json ../shared/index.ts", env);
+      expect(reads.stdout).toContain("workspaces");
+      expect(reads.stdout).toContain("export const a");
+      const writes = await sh(h, web, "echo 'export const c = 3;' > ../shared/c.ts && echo SIBLING-WRITTEN; echo x > ../../../../above.txt 2>/dev/null || echo ABOVE-READ-ONLY; cat ../../../../above.txt", env);
+      expect(writes.stdout).toContain("SIBLING-WRITTEN");
+      expect(writes.stdout).toContain("ABOVE-READ-ONLY");
+      const commit = await sh(h, web, "git add -A && git commit -qm in && echo COMMITTED && git show --stat --format= HEAD", env);
+      expect(commit.stdout).toContain("COMMITTED");
+      expect(commit.stdout).toContain("packages/shared/c.ts");
+      // Nothing else of the repository looked deleted to the commit.
+      expect(commit.stdout).not.toContain("package.json");
+      // Project settings: the package's own, the dir on the way, the top's.
+      const held = await sh(h, web, "for f in .claude/settings.json ../.claude/settings.json ../../.claude/settings.json ../opencode.json .mcp.json; do (echo '{}' > $f) 2>/dev/null && echo WROTE $f || echo HELD $f; done", env);
+      for (const f of [".claude/settings.json", "../.claude/settings.json", "../../.claude/settings.json", "../opencode.json", ".mcp.json"]) expect(held.stdout).toContain(`HELD ${f}`);
+      const hooks = await sh(h, web, "echo bad > ../../.git/hooks/pre-commit 2>/dev/null || echo HOOKS-READ-ONLY", env);
+      expect(hooks.stdout).toContain("HOOKS-READ-ONLY");
+    } finally {
+      await h.close();
+    }
+    expect(readFileSync(join(home, "above.txt"), "utf8")).toBe("above\n");
+    expect(existsSync(join(mono, ".git", "hooks", "pre-commit"))).toBe(false);
+    // The gate's host-side bounds agree: the sibling and the root are within, the home above isn't.
+    const rt = { spec, plan: { kind: "native", fileTools: false }, claudeTemp: () => ({ commands: tmp, cli: tmp, root: tmp }), provider: { id: "bwrap" } } as never;
+    const bounds = hostToolBoundsFor(rt, "claude");
+    expect(sandboxWrites(bounds, join(mono, "packages", "shared", "index.ts"))).toBe(true);
+    expect(sandboxReads(bounds, join(mono, "package.json"))).toBe(true);
+    expect(sandboxReads(bounds, join(home, "above.txt"))).toBe(false);
+  });
+
+  test("the workspace isn't widened past the home: a dotfiles repository in the home, or a workdir that is the repository's top", () => {
+    const home = join(root, "home2");
+    const proj = join(home, "proj", "sub");
+    mkdirSync(proj, { recursive: true });
+    git(["init", "-q", "-b", "main"], home, home);
+    expect(sandboxWorkspaceOf(proj, home)).toBe(proj);
+    const repo = join(home, "repo");
+    mkdirSync(repo);
+    git(["init", "-q", "-b", "main"], repo, home);
+    expect(sandboxWorkspaceOf(repo, home)).toBe(repo);
   });
 });
