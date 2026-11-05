@@ -7973,8 +7973,9 @@ export class Session {
    * autonomous mode waits on no one. A command asking to run outside the
    * sandbox; a host-side file tool writing the repository's git structure or
    * project settings; a write to a Claude settings file on a named account;
-   * a search or command reaching a directory that holds credentials; a path the backend
-   * couldn't resolve for certain. Null in every other mode, and for any
+   * a search reaching a directory that holds credentials, or a command doing
+   * so on a session that isn't sandboxed; a path the backend couldn't resolve
+   * for certain. Null in every other mode, and for any
    * other call. Side-effect free: the gate and the tool_start card read the
    * same verdict.
    */
@@ -8000,7 +8001,10 @@ export class Session {
       const what = "a write to a Claude settings file on this session (the CLI applies it outside the sandbox)";
       return { kind: "claude_settings", what, reason: `Refused: autonomous mode doesn't allow ${what}. ${owner}` };
     }
-    const reach = secret?.action === "ask" ? secret : risk?.secret?.action === "ask" ? risk.secret : null;
+    // A command reaching a directory that holds credentials runs inside the
+    // sandbox, which hides them (#448 round 8: `ls ~`, `echo $HOME`, `df -h /`):
+    // refused only where it doesn't run inside one.
+    const reach = secret?.action === "ask" ? secret : risk?.secret?.action === "ask" && this.#sandbox?.info?.state !== "on" ? risk.secret : null;
     if (reach) {
       const what = `a ${risk ? "command" : "call"} reaching ${reach.path}, which may lead to credentials`;
       return { kind: "credential_dir", what, reason: `Refused: autonomous mode doesn't allow ${what}; keep to the working directory instead. ${owner}` };

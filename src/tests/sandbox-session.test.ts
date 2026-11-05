@@ -8,7 +8,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
@@ -844,3 +844,17 @@ describe("round 1 of the #448 audit", () => {
     expect(session.sandboxInfo?.state).toBe("off");
   });
 });
+
+describe("round 8 of the #448 audit", () => {
+  test("a command reaching the home runs in a sandboxed autonomous session (the sandbox hides the credentials), and is refused where it isn't sandboxed; a named credential stays refused everywhere", async () => {
+    for (const command of ["ls ~", "echo $HOME", "df -h /", "stat ~", "test -d ~ && echo yes"]) {
+      for (const backend of ["claude", "opencode", "pi"]) {
+        const r = await gateCall("Bash", { command }, { mode: "autonomous", backend });
+        expect([command, backend, r.asked, r.behavior]).toEqual([command, backend, false, "allow"]);
+      }
+      expectRefused(await gateCall("Bash", { command }, { mode: "autonomous", sandbox: { provider: "off" } }), "credential_dir");
+    }
+    const named = await gateCall("Bash", { command: `cat ${join(homedir(), ".codeoid", "config.json")}` }, { mode: "autonomous" });
+    expect([named.asked, named.behavior]).toEqual([false, "deny"]);
+    expect(named.message).toContain("holds credentials");
+  });});
