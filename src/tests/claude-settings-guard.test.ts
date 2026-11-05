@@ -161,13 +161,27 @@ describe("a session on a named account", () => {
     makeSession(new MockSessionProvider("claude", []), "sub").assertClaudeAccountUsable();
   });
 
-  test("a write to a Claude settings file waits for the owner, even in autonomous mode", async () => {
+  test("a write to a Claude settings file waits for the owner in guarded mode", async () => {
     const provider = new MockSessionProvider("claude", [toolTurn(join(workdir, ".claude", "settings.local.json"))]);
     const session = makeSession(provider, "br");
+    session.setMode("guarded");
     await session.send("configure the project", AUTH);
     await settle();
     // Not auto-approved: still pending.
     expect(provider.canUseToolResults).toHaveLength(0);
+    expect(session.pendingToolApprovals()).toHaveLength(1);
+  });
+
+  test("in autonomous mode it is refused at once, never waited on, the agent told why (#448)", async () => {
+    const provider = new MockSessionProvider("claude", [toolTurn(join(workdir, ".claude", "settings.local.json"))]);
+    const session = makeSession(provider, "br");
+    await session.send("configure the project", AUTH);
+    await settle();
+    const result = provider.canUseToolResults[0] as { behavior: string; message?: string } | undefined;
+    expect(result?.behavior).toBe("deny");
+    expect(result?.message).toContain("a write to a Claude settings file");
+    expect(result?.message).toContain("switch this session to guarded mode");
+    expect(session.pendingToolApprovals()).toHaveLength(0);
   });
 
   test("other writes, and the default account, are unchanged", async () => {
