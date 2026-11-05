@@ -296,7 +296,9 @@ first, files as an empty config listed in `info/exclude`) read-only, and a
 file tool writing them, or the repository's git structure (its git dirs,
 `.git` files: `protectedWriteTargets`), asks while sandboxed (refused in
 autonomous mode; `heldWriteOf` in held-writes.ts; on Claude the PreToolUse
-hook routes it past allow rules, `heldWriteDecision`). Toolchain caches point at
+hook routes it past allow rules, `heldWriteDecision`), when the file tool runs
+outside the sandbox (Claude native's, opencode's): backends whose file tools
+run inside it are held by the sandbox alone. Toolchain caches point at
 `~/.cache/codeoid-sandbox` (`SandboxSpec.env`, `toolchainCacheEnv`), set only inside a sandbox, never
 for a CLI or what it runs outside one (Claude native: `claudeNativeEnv`, a
 `CLAUDE_ENV_FILE` exporting them only under `SANDBOX_RUNTIME=1`); a link in

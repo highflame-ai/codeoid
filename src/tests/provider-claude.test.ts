@@ -3653,6 +3653,35 @@ describe("ClaudeProvider — the OS sandbox", () => {
     rmSync(ws, { recursive: true, force: true });
   });
 
+  it("a backend whose file tools run inside the sandbox (the CLI under Docker) leaves its file tools to it: no held-write routing (#448 round 8)", async () => {
+    const ws = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-claude-inside-")));
+    mkdirSync(join(ws, ".git", "hooks"), { recursive: true });
+    mkdirSync(join(ws, ".git", "objects"));
+    writeFileSync(join(ws, ".git", "HEAD"), "ref: refs/heads/main\n");
+    const rt = runtime("process").rt;
+    const p = providerWith(() => rt);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const run = p.runTurn({ history: [], userMessage: "go", workdir: ws, canUseTool: async () => ({ behavior: "allow" as const }) });
+    const drain = (async () => {
+      await gate;
+      for await (const _ of run.events) {
+        /* drain */
+      }
+    })();
+    const hook = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }> } } }).options.hooks.PreToolUse[0]!.hooks[0]!;
+    const out = (await hook({ hook_event_name: "PreToolUse", tool_name: "Write", tool_input: { file_path: join(ws, ".git", "hooks", "pre-commit"), content: "x" }, tool_use_id: "tu-d", cwd: ws })) as {
+      hookSpecificOutput?: { permissionDecision?: string };
+    };
+    expect(out.hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    release();
+    await drain;
+    await p.teardown();
+    rmSync(ws, { recursive: true, force: true });
+  });
+
   it("the CLI's own worktree tools are refused while sandboxed, in the hook (EnterWorktree never asks canUseTool) and in canUseTool (#448 round 6)", async () => {
     type Hook = (i: unknown) => Promise<unknown>;
     type Gate = (n: string, i: unknown, o: { toolUseID: string; signal: AbortSignal }) => Promise<{ behavior: string; message?: string }>;

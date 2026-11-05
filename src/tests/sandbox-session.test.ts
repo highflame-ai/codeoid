@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
@@ -461,17 +461,19 @@ describe("review fixes (#448)", () => {
     expect(r.message).toContain("a Claude settings file");
   });
 
-  test("every backend's file tools (they run outside the sandbox): a write into the project settings agent CLIs run code from is refused in autonomous mode while the sandbox is on (#448 round 2)", async () => {
+  test("a host-side file tool (opencode's) writing the project settings agent CLIs run code from is refused in autonomous mode while the sandbox is on; a backend whose file tools run inside it is held by the sandbox itself (#448 rounds 2, 8)", async () => {
     for (const [backend, name, input] of [
       ["opencode", "Write", { file_path: join(workdir, ".claude", "settings.json"), content: "{}" }],
       ["opencode", "Edit", { file_path: join(workdir, "a.ts"), files: [join(workdir, ".gemini", "settings.json")] }],
       ["opencode", "Write", { file_path: join(workdir, ".mcp.json"), content: "{}" }],
-      ["pi", "write", { path: ".pi/extensions/x.ts", content: "" }],
     ] as const) {
       const r = await gateCall(name, input as Record<string, unknown>, { mode: "autonomous", backend });
       expectRefused(r, "held_write");
       expect(r.message).toContain("project settings an agent CLI runs code from");
     }
+    // pi's write runs inside the sandbox, which holds `.pi/` read-only: nothing for the gate to refuse.
+    const pi = await gateCall("write", { path: ".pi/extensions/x.ts", content: "" }, { mode: "autonomous", backend: "pi" });
+    expect([pi.asked, pi.behavior]).toEqual([false, "allow"]);
     // Guarded mode asks, the card saying why.
     const guarded = await gateCall("Write", { file_path: join(workdir, ".mcp.json"), content: "{}" }, { mode: "guarded", backend: "opencode" });
     expect(guarded.asked).toBe(true);
@@ -497,12 +499,13 @@ describe("review fixes (#448)", () => {
         ["claude", "Write", { file_path: join(workdir, ".git", "commondir"), content: "x" }],
         ["claude", "NotebookEdit", { notebook_path: join(workdir, ".git", "info", "attributes.ipynb") }],
         ["opencode", "Edit", { file_path: join(workdir, "a.ts"), files: [join(workdir, ".git", "info", "attributes")] }],
-        ["pi", "write", { path: ".git/HEAD", content: "x" }],
       ] as const) {
         const r = await gateCall(name, input as Record<string, unknown>, { mode: "autonomous", backend });
         expectRefused(r, "held_write");
         expect(r.message).toContain("the repository's git structure");
       }
+      // pi's write runs inside the sandbox, which holds the git structure itself.
+      expect((await gateCall("write", { path: ".git/HEAD", content: "x" }, { mode: "autonomous", backend: "pi" })).behavior).toBe("allow");
       expect((await gateCall("Write", { file_path: join(workdir, "src.ts"), content: "" }, { mode: "autonomous" })).behavior).toBe("allow");
     } finally {
       rmSync(join(workdir, ".git"), { recursive: true, force: true });
@@ -857,4 +860,22 @@ describe("round 8 of the #448 audit", () => {
     const named = await gateCall("Bash", { command: `cat ${join(homedir(), ".codeoid", "config.json")}` }, { mode: "autonomous" });
     expect([named.asked, named.behavior]).toEqual([false, "deny"]);
     expect(named.message).toContain("holds credentials");
+  });
+
+  test("a pnpm-style hard-linked file in node_modules: edited unasked by a backend whose file tools run inside the sandbox (codex, pi); a host-side tool's edit is still held", async () => {
+    mkdirSync(join(workdir, "node_modules", "dep"), { recursive: true });
+    mkdirSync(join(root, "store"));
+    writeFileSync(join(root, "store", "index.js"), "module.exports = 1;\n");
+    linkSync(join(root, "store", "index.js"), join(workdir, "node_modules", "dep", "index.js"));
+    const file = join(workdir, "node_modules", "dep", "index.js");
+    for (const [backend, name, input] of [
+      ["codex", "codex_file_change", { changes: [{ path: file, kind: "update" }] }],
+      ["pi", "edit", { path: "node_modules/dep/index.js", oldText: "1", newText: "2" }],
+      ["qwen", "edit", { file_path: file, old_string: "1", new_string: "2" }],
+    ] as const) {
+      const r = await gateCall(name, input as Record<string, unknown>, { mode: "autonomous", backend });
+      expect([backend, r.asked, r.behavior]).toEqual([backend, false, "allow"]);
+    }
+    const claude = await gateCall("Edit", { file_path: file, old_string: "1", new_string: "2" }, { mode: "autonomous" });
+    expectRefused(claude, "held_write");
   });});

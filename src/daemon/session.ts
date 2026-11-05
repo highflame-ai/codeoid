@@ -2147,16 +2147,29 @@ export class Session {
    * write them; a file tool runs in the backend's own process, outside the
    * sandbox (Claude's, opencode's), so it is asked in guarded and interactive
    * mode and refused in autonomous mode, as running a command outside the
-   * sandbox is. Fail closed: a judgement that throws counts as one. Null when
-   * it writes none.
+   * sandbox is. Only where the file tools run outside (#448 round 8): a
+   * backend whose file tools run inside (Codex, pi, the Gemini CLI, Qwen) is
+   * held by the sandbox itself, a hard-linked file in `node_modules` too.
+   * Fail closed: a judgement that throws counts as one. Null when it writes
+   * none.
    */
   #heldWrite(toolName: string, input: unknown): { path: string; what: HeldPath["what"] | "unresolved" } | null {
-    if (this.#sandbox?.info?.state !== "on" || !input || typeof input !== "object") return null;
+    if (!this.#hostSideFileTools() || !input || typeof input !== "object") return null;
     try {
       return heldWriteOf(toolName, input as Record<string, unknown>, this.workdir, protectedWriteTargets(this.workdir));
     } catch {
       return writeTargets(toolName, input as Record<string, unknown>) ? { path: "(couldn't be judged)", what: "unresolved" } : null;
     }
+  }
+
+  /**
+   * The session is sandboxed and its backend's file tools run outside the
+   * sandbox, in its own process (Claude's native plan, opencode's server):
+   * they are held to the sandbox's policy at the gate (#448 round 8). True
+   * too when the sandbox is on and its plan isn't known (fail closed).
+   */
+  #hostSideFileTools(): boolean {
+    return this.#sandbox?.info?.state === "on" && this.#sandbox.runtime?.plan.fileTools !== true;
   }
 
   /**

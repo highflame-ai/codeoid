@@ -1336,7 +1336,7 @@ export class ClaudeProvider implements SessionProvider {
               // While sandboxed (#448) a file tool writing the repository's git structure or the
               // project settings (read-only to commands; this tool runs outside the sandbox) goes
               // to codeoid's gate (asked, or refused in autonomous mode): never on an allow rule. Fail-closed.
-              if (sandbox) {
+              if (sandbox?.plan.fileTools === false) {
                 const held = heldWriteDecision(input, opts.workdir);
                 if (held) return held;
               }

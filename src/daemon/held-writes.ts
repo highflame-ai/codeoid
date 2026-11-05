@@ -2,11 +2,13 @@
  * File-tool writes into what a session's OS sandbox holds read-only (#448):
  * the repository's git structure (its git dirs, `.git` files) and the
  * project settings agent CLIs run code from (sandbox/policy.ts
- * `protectedWriteTargets`). A file tool runs in the backend's own process,
- * outside the sandbox, so such a write asks in guarded and interactive mode
- * and is refused in autonomous mode (Session's `#heldWrite`), on every
- * backend; Claude's PreToolUse hook routes it to codeoid's gate past an
- * allow rule (`heldWriteDecision`).
+ * `protectedWriteTargets`). A file tool that runs in the backend's own
+ * process, outside the sandbox (Claude native's, opencode's), writing them
+ * asks in guarded and interactive mode and is refused in autonomous mode
+ * (Session's `#heldWrite`); one that runs inside the sandbox (Codex, pi, the
+ * Gemini CLI, Qwen) is held by the sandbox itself and isn't judged here.
+ * Claude's PreToolUse hook routes it to codeoid's gate past an allow rule
+ * (`heldWriteDecision`).
  *
  * Each backend names its file tools its own way ({@link writeTargets}):
  * Claude's Write/Edit/MultiEdit/NotebookEdit, opencode's Write/Edit (a
