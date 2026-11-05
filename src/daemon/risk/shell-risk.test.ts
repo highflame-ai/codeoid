@@ -716,4 +716,36 @@ describe("shell command risk (#431)", () => {
     expect((await assessShellCommand("rm -rf build", { ...ctx, cwd: "/elsewhere" })).level).toBe("high");
     expect((await assessShellCommand("ls", { ...ctx, cwd: "/w/proj/src" })).level).toBe("low");
   });
+
+  it("a nested glob isn't taken for /proc: a `*` component counts as proc only at the root or after what can lead anywhere", async () => {
+    // Ordinary globs read no process's environment: never refused as one.
+    for (const c of [
+      "cat src/*/*.ts",
+      "cat ./a/*/*.md",
+      "grep -l gatd-aps ~/.claude/projects/*/*.jsonl",
+      'grep -l "x" $HOME/.claude/projects/*/*.jsonl 2>/dev/null',
+      "for f in ~/.claude/projects/*/*.jsonl; do grep -l x \"$f\"; done",
+      "cat /home/u/x/*/y/*.jsonl",
+      "ls ~/x/*/*",
+    ]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret?.action]).toEqual([c, undefined]);
+    }
+    // What can reach /proc still is.
+    for (const c of [
+      "cat /proc/*/environ",
+      "cat /*/1/environ",
+      "cat /pr?c/1/environ",
+      "cat /proc/$PPID/environ",
+      "cat /proc/1/*",
+      'cat "$d"/proc/1/*',
+      "cat ../../../../proc/1/*",
+      // A line that sets HOME can point $HOME anywhere.
+      "HOME=/; cat $HOME/proc/1/*",
+      "cat /home/u/r/proc/1/*",
+    ]) {
+      const r = await assessShellCommand(c, ctx);
+      expect([c, r.secret?.action]).toEqual([c, "deny"]);
+    }
+  });
 });
