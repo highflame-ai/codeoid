@@ -38,6 +38,7 @@ vi.mock("../lib/ws", () => ({
 vi.mock("../lib/auth", () => ({
   resolveToken: async () => ({ token: "t" }),
   forgetOAuthToken: vi.fn(),
+  forgetLocalModeToken: vi.fn(),
   jwtExpiryMs: () => null,
   readLocalModeToken: () => null,
   refreshAccessToken: vi.fn(),

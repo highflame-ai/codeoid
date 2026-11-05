@@ -73,6 +73,7 @@ import type {
   McpReconnectResult,
 } from "../protocol/types.js";
 import { basename, dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
+import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
@@ -102,7 +103,7 @@ import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js
 import type { EffortChangeResult, EffortLevel, RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
 import { LIMITS } from "../protocol/types.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
-import type { PendingToolApproval, SessionApproveOutcome } from "../protocol/types.js";
+import type { PendingToolApproval, SessionApproveOutcome, SessionSandboxInfo, SessionSandboxSetting } from "../protocol/types.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -195,16 +196,22 @@ import type { McpHub } from "./mcp/hub.js";
 import type { Attachment } from "../protocol/types.js";
 import { resolveAttachments } from "./attachments.js";
 import { type CodeoidConfig, getConfigDir } from "../config.js";
-import { secretPathVerdict } from "./secret-paths.js";
+import { type SecretPathVerdict, secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir } from "./compress/spill.js";
 import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
-import { type OutsideWrite, outsideWriteOf, outsideWriteReason } from "./outside-writes.js";
+import { type HeldPath, heldWriteOf, heldWriteReason, writeLandings, writeTargets } from "./held-writes.js";
 import { outsideEffects } from "./risk/effects.js";
 import { assessShellCommandSync, type ShellRisk, UNREADABLE_SHELL_CALL } from "./risk/shell-risk.js";
 import { loadShellParser, shellParserReady } from "./shell/parse.js";
 import { isShellTool, runsNoCommand, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
+import { asksOutsideSandbox } from "./sandbox/confinement.js";
+import { type HostToolBreach, hostFileBreachNote, hostFileBreachReason, hostFileToolBreach, hostToolBoundsFor, isHostFileTool } from "./sandbox/host-file-tools.js";
+import type { SandboxRegistry } from "./sandbox/registry.js";
+import { resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
+import { protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -253,6 +260,8 @@ const SUBAGENT_REGISTRATION_FENCE_MS = 5_000;
 const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
 /** How long a send waits for an ended run's last events before its own turn replaces it. */
 const ENDED_RUN_DRAIN_MS = 5_000;
+/** How long a destroy waits for its look at the session's commits (#checkSettingsCommits) before it goes on without it. */
+const DESTROY_COMMIT_CHECK_MS = 15_000;
 
 /**
  * A fork's parent's task asked to stop that the backend still lists after
@@ -618,6 +627,19 @@ export interface SessionCreateOptions {
    */
   hooks?: HookBus;
   /**
+   * The daemon's OS sandbox providers (#448). Absent (unit tests building a
+   * Session directly): no sandboxing, and `SessionInfo.sandbox` is absent.
+   */
+  sandboxRegistry?: SandboxRegistry;
+  /** This session's sandbox setting (absent fields follow `sandbox.*`). Restored on resume. */
+  sandbox?: SessionSandboxSetting;
+  /**
+   * Started for unattended work (a routine run, a loop worker, a dispatch
+   * worker): its turns refuse to start while its sandbox can't run, as an
+   * autonomous session's do (#448).
+   */
+  requireSandbox?: boolean;
+  /**
    * Provider override for testing. When present, replaces the registry
    * lookup so integration tests run without the Claude Agent SDK subprocess.
    * Name prefix signals this is test-only infrastructure — do not use in production.
@@ -807,6 +829,20 @@ export class SendStoppedError extends Error {
 /** Claude's file tools that write. */
 const CLAUDE_FILE_WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 
+/** `.claude/settings.json` or `settings.local.json` at the end of `p`, case-insensitively (a case-insensitive filesystem opens either spelling). */
+const CLAUDE_SETTINGS_FILE = /(^|[\\/])\.claude[\\/]settings(\.local)?\.json$/i;
+
+/**
+ * A write to `target` lands in a Claude settings file: as written, with `.`,
+ * `//` and `..` collapsed, and where the kernel resolves it
+ * (`writeLandings`: `~`, every link on the way, against the workdir).
+ */
+export function writesClaudeSettingsFile(target: string, workdir: string): boolean {
+  const abs = target === "~" || target.startsWith("~/") ? `${homedir()}${target.slice(1)}` : isAbsolute(target) ? target : join(workdir, target);
+  const forms = [target, resolvePath(abs), ...(writeLandings(target, workdir, { hardLinks: false }) ?? [])];
+  return forms.some((p) => CLAUDE_SETTINGS_FILE.test(p));
+}
+
 /**
  * Background task kinds that make no model calls while they run (#430): a
  * shell (a command Monitor is one), a WebSocket Monitor, a backgrounded MCP
@@ -820,6 +856,19 @@ interface TurnCounts {
   reports: number;
   /** The model streamed output after the last usage report: a request whose usage hasn't come yet (#430). */
   unreported?: boolean;
+}
+
+/** What the session says when its autonomous tool budget runs out and it reverts to guarded (park). */
+export const AUTONOMOUS_BUDGET_SPENT =
+  "Autonomous budget spent: now guarded, writes and commands will ask; raise the budget or switch back to autonomous.";
+
+/** Why autonomous mode refused a call outright (Session#autonomousRefusal, #448). */
+interface AutonomousRefusal {
+  kind: "unsandboxed" | "held_write" | "claude_settings" | "credential_dir" | "unresolved_path";
+  /** What was refused, for the transcript's info line. */
+  what: string;
+  /** What the agent reads. */
+  reason: string;
 }
 
 /** How serious a shell call's verdict is: a refusal, then a credential ask, then its level (#431). */
@@ -837,6 +886,9 @@ const SHELL_TASK_KINDS: ReadonlySet<string> = new Set(["local_bash", "bash", "sh
 
 /** Events that mean the model did work in a turn — so the turn spent something (#430). */
 const MODEL_ACTIVITY: ReadonlySet<ProviderEvent["type"]> = new Set(["model_request", "model_output", "text_delta", "text_done", "thinking_delta", "tool_start", "llm_call"]);
+
+/** Claude Code's sandbox asking whether a command may reach a host (#448). */
+const SANDBOX_NETWORK_TOOL = "SandboxNetworkAccess";
 
 export class Session {
   readonly id: string;
@@ -1166,10 +1218,24 @@ export class Session {
    * (setMode). Only an explicit re-arm clears it, never a turn boundary.
    */
   #budgetExhausted = false;
+  /** park: the autonomous budget ran out and the session reverted to guarded; cleared when a mode is set again. */
+  #autonomousBudgetSpent = false;
   /** This turn's end-attempt interrupt has been scheduled (once per turn). */
   #endAttemptInterruptQueued = false;
   /** See SessionCreateOptions.extraEnv (validated in the constructor). */
   #extraEnv: Readonly<Record<string, string>> | undefined;
+  /** The session's OS sandbox (#448); null on a Session built without a sandbox registry. */
+  #sandbox: SessionSandbox | null = null;
+  /** The repository's git settings as last looked at (#448: #checkGitControl), from the first turn on. */
+  #gitBaseline: GitControlSnapshot | null = null;
+  /** Every commit a ref or HEAD named as last looked at (#448 round 6: #checkSettingsCommits), from the first turn on; null inside: git couldn't say. */
+  #refBaseline: Promise<string[] | null> | null = null;
+  /** The commit look in flight: one at a time, each from where the last one left the baseline. */
+  #settingsCheck: Promise<void> = Promise.resolve();
+  /** Started for unattended work: turns need an enforced sandbox (SessionCreateOptions.requireSandbox). */
+  #requireSandbox = false;
+  /** The sandbox changed while the backend process ran: it runs in the old one until it is restarted. */
+  #sandboxRestartPending = false;
   /** Why the last finished turn failed, when a usage or rate limit was the cause; null after a success. */
   #lastTurnInfraError: TurnInfraError | null = null;
   /**
@@ -1415,6 +1481,10 @@ export class Session {
       timer?: ReturnType<typeof setTimeout>;
       /** Stops listening for the provider's withdrawal (`UiRequest.signal`). */
       unlisten?: () => void;
+      /** Only the session's owner, with an undelegated token, may answer (a sandbox widening, #448). */
+      ownerOnly?: boolean;
+      /** Who answered (for the audit of what it decided). */
+      onAnswer?: (sub: string) => void;
     }
   >();
 
@@ -1496,6 +1566,17 @@ export class Session {
       }
       this.#extraEnv = Object.freeze({ ...opts.extraEnv });
     }
+    if (opts.sandboxRegistry) {
+      this.#sandbox = new SessionSandbox({
+        sessionId: this.id,
+        workdir: opts.workdir,
+        registry: opts.sandboxRegistry,
+        ...(opts.config ? { config: opts.config } : {}),
+        ...(opts.sandbox ? { setting: opts.sandbox } : {}),
+        onWarning: (text) => this.#sandboxWarning(text, "sandbox.login_not_saved"),
+      });
+    }
+    this.#requireSandbox = opts.requireSandbox === true;
     if (opts.initialMode) {
       this.#mode = opts.initialMode.mode;
       this.#turnsRemaining =
@@ -1706,6 +1787,7 @@ export class Session {
         role: this.role,
         providerId: this.#provider.id,
         ...this.#accountMeta(),
+        ...(this.#sandbox?.setting ? { sandbox: this.#sandbox.setting } : {}),
         forkedFrom: this.forkedFrom,
         ...this.#backgroundMeta(),
         worktree: this.worktree,
@@ -1714,6 +1796,14 @@ export class Session {
         // Fire-and-forget: saveMeta's write chain owns the failure log; an
         // unconsumed rejection here would be an unhandled-rejection crash.
       }).catch(() => {});
+    }
+
+    // The OS sandbox resolves in the background (a cached probe), so every
+    // session's info says it soon after it exists; a turn awaits it anyway.
+    if (this.#sandbox) {
+      void this.ensureSandbox().catch((err: unknown) => {
+        console.error(`[codeoid/session ${this.id}] resolving the sandbox failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
     }
 
     // Hook seam: session lifecycle. `resume` = rebuilt from persisted state
@@ -1778,11 +1868,13 @@ export class Session {
       // Read per query: a fork is primed after its provider is built.
       forkBoundary: () => this.#forkIsolation?.boundaryAt,
       isForeignAgent: (agentId) => this.#isForeignAgent(agentId),
-      sessionMode: () => this.#mode,
       isForeignTask: (taskId) => this.#forkIsolation?.foreignTasks.has(taskId) === true,
       isFork: () => this.#forkIsolation !== null,
       isOwnTask: (taskId) => this.#isOwnTask(taskId),
       onForeignAgentDenied: (agentId, toolName) => this.#noteForeignAgentRefused(agentId, toolName),
+      isAutonomous: () => this.#mode === "autonomous",
+      // Read each time the backend starts, and only what was resolved for THIS backend.
+      sandbox: () => this.#sandbox?.runtimeFor(factory.id) ?? null,
       ...(this.#extraEnv ? { extraEnv: this.#extraEnv } : {}),
     });
   }
@@ -1934,6 +2026,7 @@ export class Session {
           return;
         }
         this.#releaseProviderWhenIdle = false;
+        this.#sandboxRestartPending = false;
         // Before the teardown, as terminateBackend does: codex and the Gemini
         // CLI are stopped with a bare SIGKILL, and what they started (MCP
         // servers, commands) would otherwise be left running, out of reach.
@@ -2028,7 +2121,8 @@ export class Session {
 
   /**
    * Is this a file-tool write to a Claude settings file (`.claude/settings.json`
-   * or `settings.local.json`, anywhere) while the session runs on a named
+   * or `settings.local.json`, anywhere, however spelled: judged where it
+   * lands, `writesClaudeSettingsFile`) while the session runs on a named
    * Claude account? Shell commands can't be judged this way (see
    * secret-paths.ts).
    */
@@ -2036,12 +2130,101 @@ export class Session {
     if (this.#provider.id !== "claude" || !CLAUDE_FILE_WRITE_TOOLS.has(toolName) || !input || typeof input !== "object") return false;
     const o = input as Record<string, unknown>;
     const target = typeof o.file_path === "string" ? o.file_path : typeof o.notebook_path === "string" ? o.notebook_path : null;
-    if (!target || !/(^|[\\/])\.claude[\\/]settings(\.local)?\.json$/i.test(target)) return false;
+    if (!target || !writesClaudeSettingsFile(target, this.workdir)) return false;
+    // Under Claude's own OS sandbox (#448) a hook or an excluded command
+    // written there would run outside it from the CLI's next start.
+    if (this.#sandbox?.runtime?.plan.kind === "native") return true;
     try {
       return this.#claudeAccounts?.resolve(this.#accountChoices.claude ?? null) != null;
     } catch {
       return true; // an account that can't be resolved won't run anyway; don't wave this through
     }
+  }
+
+  /**
+   * A file-tool write into what the session's OS sandbox holds read-only
+   * (#448) while it is on: the repository's git structure (its git dirs,
+   * `.git` files) or the project settings agent CLIs run code from
+   * (`.claude/`, `.mcp.json`, `opencode.json`, …). Its commands can't
+   * write them; a file tool runs in the backend's own process, outside the
+   * sandbox (Claude's, opencode's), so it is asked in guarded and interactive
+   * mode and refused in autonomous mode, as running a command outside the
+   * sandbox is. Only where the file tools run outside (#448 round 8): a
+   * backend whose file tools run inside (Codex, pi, the Gemini CLI, Qwen) is
+   * held by the sandbox itself, a hard-linked file in `node_modules` too.
+   * Fail closed: a judgement that throws counts as one. Null when it writes
+   * none.
+   */
+  #heldWrite(toolName: string, input: unknown): { path: string; what: HeldPath["what"] | "unresolved" } | null {
+    if (!this.#hostSideFileTools() || !input || typeof input !== "object") return null;
+    try {
+      return heldWriteOf(toolName, input as Record<string, unknown>, this.workdir, protectedWriteTargets(this.workdir));
+    } catch {
+      return writeTargets(toolName, input as Record<string, unknown>) ? { path: "(couldn't be judged)", what: "unresolved" } : null;
+    }
+  }
+
+  /**
+   * The session is sandboxed and its backend's file tools run outside the
+   * sandbox, in its own process (Claude's native plan, opencode's server):
+   * they are held to the sandbox's policy at the gate (#448 round 8). True
+   * too when the sandbox is on and its plan isn't known (fail closed).
+   */
+  #hostSideFileTools(): boolean {
+    return this.#sandbox?.info?.state === "on" && this.#sandbox.runtime?.plan.fileTools !== true;
+  }
+
+  /**
+   * Where a host-side file tool (Claude's Read, Write, Edit, Glob, Grep, LSP;
+   * opencode's) goes beyond what the session's sandbox allows its commands
+   * (sandbox/host-file-tools.ts), judged against the spec the sandbox is
+   * built from, with what the backend's own file tools keep outside
+   * (SessionProvider.hostFiles: its memory, plans, task output, scratch).
+   * Refused in autonomous mode, never asked (#448 round 9: guarded and
+   * interactive mode ask or run as without a sandbox, the card saying so,
+   * #hostBoundsNote). Null when a sandboxed command could do the same, when
+   * the backend's file tools run inside the sandbox, or when it is off. Fail
+   * closed: a judgement that throws counts as one.
+   */
+  #outsideSandbox(toolName: string, input: Record<string, unknown>, shellCwd: string | null | undefined): HostToolBreach | null {
+    if (!isHostFileTool(toolName) || !this.#hostSideFileTools()) return null;
+    const rt = this.#sandbox?.runtime;
+    try {
+      if (!rt) throw new Error("no runtime");
+      const own = this.#provider.hostFiles?.() ?? {};
+      const bounds = hostToolBoundsFor(rt, this.#provider.id, this.#provider.hostReadable?.() ?? [], own, userHiddenPaths(this.#config));
+      return hostFileToolBreach(toolName, input, { bounds, workdir: this.workdir, ...(shellCwd !== undefined ? { cwd: shellCwd } : {}) });
+    } catch {
+      return { path: "(couldn't be judged)", access: "read", why: "unresolved" };
+    }
+  }
+
+  /** A host-side file tool beyond the sandbox, in autonomous mode: refused (#outsideSandbox). Null in every other mode. */
+  #outsideSandboxRefusal(toolName: string, input: Record<string, unknown>, shellCwd: string | null | undefined): HostToolBreach | null {
+    return this.#mode === "autonomous" ? this.#outsideSandbox(toolName, input, shellCwd) : null;
+  }
+
+  /** What an approval card says of a host-side file tool beyond the sandbox in guarded or interactive mode, where the owner decides. */
+  #hostBoundsNote(toolName: string, input: unknown, shellCwd: string | null | undefined): string | null {
+    if (this.#mode === "autonomous" || !input || typeof input !== "object") return null;
+    const breach = this.#outsideSandbox(toolName, input as Record<string, unknown>, shellCwd);
+    return breach ? hostFileBreachNote(breach) : null;
+  }
+
+  /** Refuse a host-side file tool that goes beyond the sandbox (#outsideSandbox): its card, the audit, and an info line in the transcript. */
+  #refuseOutsideSandbox(approvalId: string, toolName: string, breach: HostToolBreach, sender: AuthContext): { behavior: "deny"; message: string } {
+    const reason = hostFileBreachReason(breach);
+    this.#approvalPatchKeys.delete(approvalId);
+    this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: reason });
+    this.#store.audit(sender.sub, "session.sandbox_bounds_refuse", this.id, `tool=${toolName} access=${breach.access} why=${breach.why}`);
+    const infoMsg = this.#makeMessage("info", `⛔ Refused ${toolName}: outside what this session's sandbox allows (${breach.path})`, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "sandbox.refused",
+      tool: toolName,
+      access: breach.access,
+    });
+    this.#persistAndBuffer(infoMsg);
+    this.#broadcastRaw(infoMsg);
+    return { behavior: "deny", message: reason };
   }
 
   /**
@@ -2180,6 +2363,15 @@ export class Session {
 
     const previous = this.#provider.id;
 
+    // An autonomous or unattended session can't move to a backend its sandbox can't hold (#448).
+    if (this.#sandbox && this.#sandboxRequired()) {
+      const refusal = sandboxRefusalOf(await this.#sandbox.refresh(requested));
+      if (refusal) {
+        await this.#sandbox.refresh(previous);
+        return { ok: false, code: "invalid_request", error: `${requested} can't be sandboxed here, and this session needs it: ${refusal}` };
+      }
+    }
+
     await this.#teardownProvider();
 
     // Fresh backing id BEFORE building the new provider — the incoming
@@ -2209,6 +2401,8 @@ export class Session {
       // Non-fatal: the in-memory reset governs this lifetime.
     }
 
+    // Resolved for the incoming backend before it is built (it may start at once to take the history).
+    await this.#sandbox?.refresh(requested);
     this.#provider = this.#createProvider(requested);
     this.#warnIfBudgetUnenforced();
     this.#effortRestartPending = false; // the new backend starts with the session's effort
@@ -2880,7 +3074,13 @@ export class Session {
       this.#budgetExhausted = false;
       this.#broadcastInfoUpdate();
     }
+    // Choosing a mode answers the spent-budget notice.
+    if (this.#autonomousBudgetSpent && sender) {
+      this.#autonomousBudgetSpent = false;
+      this.#broadcastInfoUpdate();
+    }
     if (this.#mode === mode && this.#turnsRemaining === maxTurns) return;
+    this.#autonomousBudgetSpent = false;
     this.#mode = mode;
     this.#turnsRemaining = mode === "autonomous" ? maxTurns : undefined;
     // A fresh autonomous budget is a new attempt's: the spent flag is the old one's.
@@ -2889,6 +3089,263 @@ export class Session {
       this.#store.audit(sender.sub, "session.set_mode", this.id, `mode=${mode}`);
     }
     this.#broadcastInfoUpdate();
+  }
+
+  // ── OS sandbox (#448) ─────────────────────────────────────────────────
+
+  /** Whether this session's turns need a sandbox that holds: autonomous mode, an unattended run, or started for unattended work. */
+  #sandboxRequired(): boolean {
+    return this.#mode === "autonomous" || this.#unattended > 0 || this.#requireSandbox;
+  }
+
+  /**
+   * The session's sandbox resolved for its current backend (a provider
+   * switch, a setting change, the first turn re-resolve it). Null on a
+   * Session without sandboxing. Announces a change.
+   */
+  async ensureSandbox(): Promise<SessionSandboxInfo | null> {
+    const sbx = this.#sandbox;
+    if (!sbx) return null;
+    if (sbx.resolvedFor(this.#provider.id) && sbx.info) return sbx.info;
+    const before = JSON.stringify(sbx.info);
+    const info = await sbx.refresh(this.#provider.id);
+    if (JSON.stringify(info) !== before) this.#broadcastInfoUpdate();
+    return info;
+  }
+
+  /** The session's own sandbox setting (persisted; a fork and a collaboration's children inherit it). */
+  get sandboxSetting(): SessionSandboxSetting | undefined {
+    return this.#sandbox?.setting;
+  }
+
+  /** The resolved sandbox, if any (SessionInfo.sandbox). */
+  get sandboxInfo(): SessionSandboxInfo | null {
+    return this.#sandbox?.info ?? null;
+  }
+
+  /** Whether the session was started for unattended work (SessionCreateOptions.requireSandbox). */
+  get requiresSandbox(): boolean {
+    return this.#requireSandbox;
+  }
+
+  /**
+   * Why an autonomous or unattended turn can't start on this session's
+   * sandbox now, or null (it holds, it's turned off by the owner, the
+   * backend runs no commands, or no turn here needs it). Reads the last
+   * resolution: call {@link ensureSandbox} first.
+   */
+  sandboxRefusal(opts: { forMode?: SessionMode } = {}): string | null {
+    const info = this.#sandbox?.info;
+    if (!info) return null;
+    const required = opts.forMode === "autonomous" || this.#sandboxRequired();
+    return required ? sandboxRefusalOf(info) : null;
+  }
+
+  /**
+   * Why the sandbox can't be changed now, or null: a turn running, an
+   * approval or dialog waiting, or background work the backend holds. What
+   * runs must match what the session reports, and a running backend is
+   * restarted to take a new sandbox: never in the middle of work.
+   */
+  #sandboxBusyReason(): string | null {
+    if (this.#switchBusyReason() || this.#turnActive()) return "the session is busy — change its sandbox once its turn is over";
+    if (this.#hasAgentBackgroundWork()) return "the session has background work running — stop it (or let it finish), then change its sandbox";
+    return null;
+  }
+
+  /**
+   * Change the session's sandbox setting (owner only: SessionManager checks).
+   * Only while idle (#sandboxBusyReason). Narrowing applies at once;
+   * widening — the sandbox off, the network wider, another provider — is
+   * asked of the owner on the session, in every mode, and applies only on
+   * the owner's own yes (not a delegated token's, not another member's). A
+   * backend already running is restarted in the new sandbox before its next
+   * turn; until it is, a turn that needs the sandbox is refused.
+   */
+  async setSandbox(
+    setting: SessionSandboxSetting,
+    sender: AuthContext,
+    opts: { onDecided?: (applied: boolean, reason?: string) => void } = {},
+  ): Promise<{ ok: true; pending?: { requestId?: string } } | { ok: false; error: string }> {
+    const sbx = this.#sandbox;
+    if (!sbx) return { ok: false, error: "this daemon has no OS sandbox" };
+    const problem = sandboxSettingProblem(setting, sbx.registry);
+    if (problem) return { ok: false, error: problem };
+    const busy = this.#sandboxBusyReason();
+    if (busy) return { ok: false, error: busy };
+    const next: SessionSandboxSetting = { ...(sbx.setting ?? {}), ...setting };
+    if (setting.network && setting.network !== "allowlist" && setting.allowedHosts === undefined) delete next.allowedHosts;
+    const before = sbx.effective();
+    const after = sbx.effective(next);
+    const describe = (e: { choice: string; network: { mode: string; allow?: readonly string[] } }) =>
+      `${e.choice === "off" ? "off" : e.choice}, network ${e.network.mode}${e.network.mode === "allowlist" ? ` (${(e.network.allow ?? []).join(", ")})` : ""}`;
+    const change = `${describe(before)} → ${describe(after)}`;
+    const apply = async (answeredBy?: string): Promise<boolean> => {
+      // A confirm answered later: the session may have got busy meanwhile.
+      const nowBusy = this.#sandboxBusyReason();
+      if (nowBusy) {
+        this.#store.audit(answeredBy ?? sender.sub, "session.sandbox_change_busy", this.id, `${change} not applied: ${nowBusy}`);
+        const note = this.#makeMessage("info", `🛡 Sandbox not changed: ${nowBusy}`, SYSTEM_IDENTITY, undefined, undefined, { event: "sandbox.unchanged", setting: next });
+        this.#persistAndBuffer(note);
+        this.#broadcastRaw(note);
+        return false;
+      }
+      await sbx.set(next);
+      this.#store.audit(sender.sub, "session.set_sandbox", this.id, answeredBy && answeredBy !== sender.sub ? `${change} (confirmed by ${answeredBy})` : change);
+      this.#saveMetaNow();
+      // A backend running now runs in the old sandbox: restarted before its next turn.
+      if (PROCESS_BACKENDS.has(this.#provider.id) && this.#provider.hasQueried) this.#sandboxRestartPending = true;
+      await this.ensureSandbox();
+      this.#broadcastInfoUpdate();
+      const info = this.#makeMessage("info", `🛡 Sandbox: ${change}`, SYSTEM_IDENTITY, undefined, undefined, { event: "sandbox.changed", setting: next });
+      this.#persistAndBuffer(info);
+      this.#broadcastRaw(info);
+      // The backend picks it up when it next starts: stopped now (idle).
+      this.releaseIdleProvider({ idle: true });
+      return true;
+    };
+    if (!widens(before, after)) {
+      await apply();
+      return { ok: true };
+    }
+    // Widening: the owner answers on the session, whatever the mode. Never
+    // answered by an unattended turn (requestUserInput cancels it there).
+    this.#store.audit(sender.sub, "session.sandbox_widen_ask", this.id, change);
+    // What it would really be here: a provider that can't run is no sandbox at all.
+    const resolvedAfter = await resolveSandbox({ registry: sbx.registry, config: sbx.config, setting: next, backendId: this.#provider.id }).catch(() => null);
+    const unsandboxed = after.choice === "off" || (resolvedAfter !== null && resolvedAfter.info.state !== "on" && resolvedAfter.info.state !== "no-shell");
+    const title = unsandboxed ? `Turn the sandbox off for "${this.name}"?` : `Widen the sandbox for "${this.name}"?`;
+    const message = unsandboxed
+      ? `The agent's commands would run with your full rights${after.choice === "off" ? "" : ` (${resolvedAfter?.info.reason ?? "the sandbox can't run here"})`}: they could read your credentials and change any file you can.`
+      : `Commands would run with: ${describe(after)} (now: ${describe(before)}).`;
+    // Answered by the owner alone, undelegated: what bounds the owner's agent is the owner's call.
+    let answeredBy: string | undefined;
+    void this.requestUserInput({ method: "confirm", title, message }, {
+        ownerOnly: true,
+        onAnswer: (sub) => {
+          answeredBy = sub;
+        },
+      }).then(
+      async (answer) => {
+        if (answer.cancelled || answer.confirmed !== true) {
+          this.#store.audit(answeredBy ?? sender.sub, "session.sandbox_widen_denied", this.id, `${change} ${answer.reason ?? "declined"}`);
+          opts.onDecided?.(false, answer.reason ?? "declined");
+          return;
+        }
+        const applied = await apply(answeredBy);
+        opts.onDecided?.(applied, applied ? undefined : "busy");
+      },
+      () => opts.onDecided?.(false, "failed"),
+    );
+    return { ok: true, pending: {} };
+  }
+
+  /**
+   * A call that asks to run outside the backend's own sandbox or widen it
+   * (asksOutsideSandbox), on a session whose sandbox is the backend's own
+   * (native). Where codeoid's sandbox is around the whole process (Docker,
+   * Seatbelt for Codex) such a flag leaves nothing: the call stays inside.
+   */
+  #unsandboxedRequest(toolName: string, input: unknown): boolean {
+    return this.#sandbox?.info?.state === "on" && this.#sandbox.runtime?.plan.kind === "native" && asksOutsideSandbox(toolName, input);
+  }
+
+  /** Whether `setting` would widen this session's sandbox (turn it off, a wider network, another provider): asked of its owner. */
+  widensSandbox(setting: SessionSandboxSetting): boolean {
+    const sbx = this.#sandbox;
+    if (!sbx) return false;
+    return widens(sbx.effective(), sbx.effective({ ...(sbx.setting ?? {}), ...setting }));
+  }
+
+  /**
+   * The end-of-turn and destroy check (#448, sandbox/git-watch.ts): when the
+   * repository's config, hooks (the hooks dir's, `core.hooksPath`'s),
+   * attributes or git-dir links changed since the last look, a warning line
+   * says which, so the owner looks before running git there; and commits
+   * made meanwhile that changed project settings are named
+   * (#checkSettingsCommits), which the returned promise settles after.
+   * Best effort.
+   */
+  #checkGitControl(sub: string): Promise<void> {
+    const commits = this.#checkSettingsCommits(sub);
+    const before = this.#gitBaseline;
+    if (!before) return commits;
+    try {
+      const now = gitControlSnapshot(this.workdir);
+      const changed = gitControlChanges(before, now);
+      this.#gitBaseline = now;
+      if (changed.length > 0) {
+        this.#store.audit(sub, "session.git_control_changed", this.id, changed.slice(0, 20).join(","));
+        this.#sandboxWarning(gitControlWarning(changed), "sandbox.git_changed");
+      }
+    } catch (err) {
+      console.error(`[codeoid/session ${this.id}] checking the repository's git settings failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return commits;
+  }
+
+  /**
+   * The commit half of the end-of-turn and destroy check (#448 round 6,
+   * sandbox/git-watch.ts): a commit that became reachable from a ref or HEAD
+   * since the last look and that changed project settings a backend runs
+   * code from (a Claude hook, `.mcp.json`, an opencode plugin) is named,
+   * with its files, so the owner reviews it before a session runs where it
+   * is checked out. An agent can commit those through git plumbing without
+   * them ever being in the working tree. Serialized; when git can't say,
+   * the baseline stands for the next look. Best effort, never throws.
+   */
+  #checkSettingsCommits(sub: string): Promise<void> {
+    const look = async (): Promise<void> => {
+      const baseline = this.#refBaseline;
+      if (!baseline) return;
+      const before = await baseline;
+      const now = await refTips(this.workdir);
+      if (now === null) return;
+      const found = before === null ? { commits: [], more: false } : await settingsCommits(this.workdir, before, now);
+      if (found === null) return;
+      this.#refBaseline = Promise.resolve(now);
+      if (found.commits.length === 0) return;
+      this.#store.audit(sub, "session.settings_committed", this.id, found.commits.slice(0, 20).map((c) => `${c.commit.slice(0, 12)}:${c.files.slice(0, 5).join("|")}`).join(",").slice(0, 2000));
+      this.#sandboxWarning(settingsCommitWarning(found.commits, found.more), "sandbox.settings_committed");
+    };
+    this.#settingsCheck = this.#settingsCheck.then(look).catch((err) => {
+      console.error(`[codeoid/session ${this.id}] checking the session's commits failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+    return this.#settingsCheck;
+  }
+
+  /** A warning line on the session about its sandbox (#448), persisted and shown to every client. */
+  #sandboxWarning(text: string, event: string): void {
+    if (this.#destroyed) return;
+    const msg = this.#makeMessage("info", `⚠ ${text}`, SYSTEM_IDENTITY, undefined, undefined, { event });
+    this.#persistAndBuffer(msg);
+    this.#broadcastRaw(msg);
+  }
+
+  /** What an approval card says of the sandbox (#448): whether the call runs inside, and why not. */
+  #cardSandbox(toolName: string, input: unknown, shellCwd?: string | null): { sandboxed?: boolean; sandboxNote?: string } {
+    const info = this.#sandbox?.info;
+    if (!info) return {};
+    if (this.#unsandboxedRequest(toolName, input)) {
+      return { sandboxed: false, sandboxNote: toolName === "codex_permissions" ? "asks to widen codex's sandbox" : "asks to run outside the sandbox" };
+    }
+    switch (info.state) {
+      case "on": {
+        const runner = this.#sandbox?.runtime?.plan;
+        const shell = isShellTool(toolName) || isUnresolvedPathTool(toolName);
+        const inside = shell || runner?.fileTools === true;
+        if (inside) return { sandboxed: true, sandboxNote: `sandboxed: ${info.providerName ?? info.provider}, network ${info.network}` };
+        // Beyond what the sandbox lets its commands do: the owner decides, told so (#448 round 9).
+        const beyond = this.#hostBoundsNote(toolName, input, shellCwd);
+        return { sandboxed: false, sandboxNote: beyond ?? "runs in the backend's own process, outside the sandbox" };
+      }
+      case "no-shell":
+        return {};
+      case "off":
+        return { sandboxed: false, sandboxNote: "not sandboxed: the sandbox is off for this session" };
+      default:
+        return { sandboxed: false, sandboxNote: `not sandboxed: ${info.reason ?? "unavailable"}` };
+    }
   }
 
   /**
@@ -3172,7 +3629,7 @@ export class Session {
    * info (`pendingDialog`) so any surface can see what it is waiting on. A
    * cancelled answer carries `reason`. An unattended turn never waits.
    */
-  requestUserInput(req: UiRequest): Promise<UiResponse> {
+  requestUserInput(req: UiRequest, own: { ownerOnly?: boolean; onAnswer?: (sub: string) => void } = {}): Promise<UiResponse> {
     if (this.#unattended > 0) return Promise.resolve({ cancelled: true, reason: "unattended" });
     if (req.signal?.aborted) return Promise.resolve({ cancelled: true, reason: "withdrawn" });
     const requestId = randomUUID();
@@ -3201,7 +3658,7 @@ export class Session {
       const withdraw = () => this.#settleUiRequest(requestId, { cancelled: true }, "withdrawn");
       signal?.addEventListener("abort", withdraw, { once: true });
       const unlisten = signal ? () => signal.removeEventListener("abort", withdraw) : undefined;
-      this.#pendingUiRequests.set(requestId, { msg, resolve, timer, ...(unlisten ? { unlisten } : {}) });
+      this.#pendingUiRequests.set(requestId, { msg, resolve, timer, ...(unlisten ? { unlisten } : {}), ...(own.ownerOnly ? { ownerOnly: true } : {}), ...(own.onAnswer ? { onAnswer: own.onAnswer } : {}) });
       this.#broadcastToCapable(CAPABILITIES.UI_DIALOGS, msg);
       this.#broadcastInfoUpdate(); // pendingDialog
     });
@@ -3241,8 +3698,14 @@ export class Session {
     requestId: string,
     response: { value?: string; confirmed?: boolean; cancelled?: boolean },
     sender: AuthContext,
-  ): boolean {
-    if (!this.#pendingUiRequests.has(requestId)) return false;
+  ): boolean | "forbidden" {
+    const pending = this.#pendingUiRequests.get(requestId);
+    if (!pending) return false;
+    if (pending.ownerOnly && (sender.sub !== this.createdBy || sender.delegationDepth > 0)) {
+      this.#store.audit(sender.sub, "session.ui_response_refused", this.id, `requestId=${requestId} owner-only`);
+      return "forbidden";
+    }
+    pending.onAnswer?.(sender.sub);
     const cancelled = response.cancelled === true;
     this.#store.audit(
       sender.sub,
@@ -3562,7 +4025,23 @@ export class Session {
     // Tool calls are judged as they're decided (#431); the daemon loads the
     // shell parser at start, and a turn never begins without it.
     if (!shellParserReady()) await loadShellParser().catch(() => {});
+    // The OS sandbox (#448), resolved for this backend before it starts. An
+    // autonomous or unattended turn doesn't start without one that holds.
+    await this.ensureSandbox();
+    const sandboxRefused =
+      this.sandboxRefusal() ??
+      // Its backend still runs in the sandbox it had before a change: not what the session reports.
+      (this.#sandboxRestartPending && this.#sandboxRequired() ? "its backend still runs in its previous sandbox (it restarts once the session is idle)" : null);
+    if (sandboxRefused) {
+      this.#store.audit(sender.sub, "session.sandbox_refused", this.id, sandboxRefused);
+      throw new SandboxRequiredError(`Not started: ${sandboxRefused}`);
+    }
     this.#store.audit(sender.sub, "session.send", this.id);
+    // What of the repository git runs at the user's next command, as it is before the agent works (#448).
+    if (this.#sandbox && !this.#gitBaseline) this.#gitBaseline = gitControlSnapshot(this.workdir);
+    // And the commits its refs name, so a commit made from here on can be told (#448 round 6).
+    if (this.#sandbox && !this.#refBaseline) this.#refBaseline = refTips(this.workdir);
+    await this.#refBaseline;
     // A new turn is starting — clear any interrupt from the previous one.
     this.#turnInterrupted = false;
     this.#lastTurnError = null;
@@ -4963,8 +5442,7 @@ export class Session {
       const gated = this.#approvalInputs.get(approvalId);
       if (!gated) continue;
       const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
-      const outside = this.#outsideWrite(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
-      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, outside) });
+      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, this.#heldWrite(gated.toolName, gated.input)), ...this.#cardSandbox(gated.toolName, gated.input, gated.shellCwd) });
     }
     return out;
   }
@@ -5049,6 +5527,9 @@ export class Session {
   }
 
   async destroy(sender: AuthContext, opts: { deleteBranch?: boolean } = {}): Promise<void> {
+    // Said to whoever is attached (and audited) before the session goes;
+    // the commit look's git is bounded, and a destroy waits no longer.
+    await Promise.race([this.#checkGitControl(sender.sub), new Promise<void>((r) => setTimeout(r, DESTROY_COMMIT_CHECK_MS).unref?.())]);
     this.#destroyed = true;
     // This session's own servers' clients in the hub: let go (the last user closes them).
     for (const spec of [...this.#mcpRetained.values(), ...this.#mcpToRelease.values()]) this.#mcpHub?.release(spec, this.#mcpTenant());
@@ -5072,6 +5553,9 @@ export class Session {
     // Tear down the streamInput loop cleanly before wiping storage so we
     // don't leave a zombie SDK subprocess alive holding the transcript file.
     await this.#teardownProvider();
+    await this.#sandbox?.close();
+    // What its backends kept across starts (their conversations, #448): gone with it.
+    this.#sandbox?.removeState();
     // Events the pump emitted while winding down could re-arm the fallback;
     // clear it again and stop listening — this session is gone.
     this.#provider.onSessionEvent = undefined;
@@ -6065,8 +6549,10 @@ export class Session {
       providerId: this.#provider.id,
       ...this.#accountInfo(),
       mode: this.#mode,
+      ...(this.#sandbox?.info ? { sandbox: this.#sandbox.info } : {}),
       turnsRemaining: this.#turnsRemaining,
       ...(this.#budgetExhausted ? { budgetExhausted: true as const } : {}),
+      ...(this.#autonomousBudgetSpent ? { autonomousBudgetSpent: true as const } : {}),
       pinnedFiles: [...this.#pinnedFiles],
       agentUri: this.#agentIdentity.sub,
       subagents: this.subagentSnapshot,
@@ -7249,8 +7735,10 @@ export class Session {
       if (this.#turnsRemaining === undefined) return true;
       if (this.#turnsRemaining <= 0) {
         // Budget exhausted — revert to guarded (reads stay frictionless,
-        // writes/exec start prompting again) and fall through to ask.
+        // writes/exec start prompting again) and fall through to ask. Said
+        // on the session and in the transcript the moment it happens.
         this.setMode("guarded");
+        this.#noteAutonomousBudgetSpent(toolName);
         return false;
       }
       this.#turnsRemaining -= 1;
@@ -7259,6 +7747,23 @@ export class Session {
     }
 
     return false;
+  }
+
+  /**
+   * The autonomous tool budget ran out and the session is guarded now (park):
+   * an info line in the transcript, the audit, and `autonomousBudgetSpent` on
+   * the session's info until a mode is set again.
+   */
+  #noteAutonomousBudgetSpent(toolName: string): void {
+    this.#autonomousBudgetSpent = true;
+    this.#store.audit(SYSTEM_IDENTITY.sub, "session.budget_spent", this.id, `tool=${toolName}`);
+    const infoMsg = this.#makeMessage("info", `⚠ ${AUTONOMOUS_BUDGET_SPENT}`, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "budget.spent",
+      tool: toolName,
+    });
+    this.#persistAndBuffer(infoMsg);
+    this.#broadcastRaw(infoMsg);
+    this.#broadcastInfoUpdate();
   }
 
   /**
@@ -7493,7 +7998,7 @@ export class Session {
   /**
    * A shell call whose directory can't be resolved for certain (opencode's
    * `opencode_unresolved_path` card: `tool`, `paths` it may lead to, `call`):
-   * asked in every mode already, its command is judged in each of those
+   * never run unasked already, its command is judged in each of those
    * places and the worst verdict stands, so a credential read is refused
    * there as anywhere (#431). Null for a card wrapping any other tool.
    */
@@ -7512,12 +8017,16 @@ export class Session {
     return worst;
   }
 
-  /** A shell call that asks whatever the mode: high risk, a credential search, or not understood (#431). */
+  /**
+   * A shell call that asks in guarded and interactive mode, past an allow
+   * rule: high risk, a credential search, or not understood (#431). Never in
+   * autonomous mode, which waits on no one (#448): the OS sandbox contains
+   * such a command, so it runs; a credential search there is refused
+   * (#autonomousRefusal).
+   */
   #riskAsks(risk: ShellRisk | null): boolean {
-    if (!risk) return false;
-    // Unreadable (no parser, no command): askOnUnknown doesn't cover it.
-    if (risk.level === "high" || risk.secret || risk.unreadable) return true;
-    return risk.level === "unknown" && (this.#config?.approvals?.askOnUnknown ?? true);
+    if (!risk || this.#mode === "autonomous") return false;
+    return risk.level === "high" || risk.level === "unknown" || risk.secret !== undefined || risk.unreadable === true;
   }
 
   /** A low-risk shell call that guarded mode runs unasked, when the config says so (#431);
@@ -7528,31 +8037,78 @@ export class Session {
   }
 
   /**
-   * In autonomous mode, a write, edit, delete or move whose target provably
-   * resolves outside the working directory, or can't be resolved for certain
-   * (outside-writes.ts): asked, not run. Null in every other mode, and for a
-   * call that writes nowhere outside. Fail closed: a judgement that throws
-   * asks.
+   * In autonomous mode, a call that would have asked and that the OS sandbox
+   * can't be left to contain (#448): refused at once, never asked, since
+   * autonomous mode waits on no one. A command asking to run outside the
+   * sandbox; a host-side file tool writing the repository's git structure or
+   * project settings; a write to a Claude settings file on a named account;
+   * a search reaching a directory that holds credentials, or a command doing
+   * so on a session that isn't sandboxed; a path the backend couldn't resolve
+   * for certain. (A host-side file tool beyond the sandbox is refused in every
+   * mode before this: #outsideSandbox.) Null in every other mode, and for any
+   * other call. Side-effect free: the gate and the tool_start card read the
+   * same verdict.
    */
-  #outsideWrite(toolName: string, input: Record<string, unknown>, shellCwd?: string | null): OutsideWrite | null {
+  #autonomousRefusal(
+    toolName: string,
+    input: Record<string, unknown>,
+    risk: ShellRisk | null,
+    secret: SecretPathVerdict,
+    held: { path: string; what: HeldPath["what"] | "unresolved" } | null,
+  ): AutonomousRefusal | null {
     if (this.#mode !== "autonomous") return null;
-    try {
-      return outsideWriteOf(toolName, input, this.workdir, shellCwd, { cdpathUnset: this.#provider.shellCdpathUnset === true });
-    } catch (err) {
-      console.error(`[codeoid/session ${this.id}] judging where ${toolName} writes failed, asking: ${err instanceof Error ? err.message : String(err)}`);
-      return { path: "(couldn't be judged)", resolved: false };
+    const owner = "The owner can do it, or switch this session to guarded mode to be asked.";
+    if (this.#unsandboxedRequest(toolName, input)) {
+      const what = toolName === "codex_permissions" ? "widening the OS sandbox" : "running a command outside the OS sandbox";
+      return { kind: "unsandboxed", what, reason: `Refused: autonomous mode doesn't allow ${what}; run it inside the sandbox instead. ${owner}` };
     }
+    if (held) {
+      const where = held.what === "git" ? "the repository's git structure" : held.what === "settings" ? "project settings an agent CLI runs code from" : "a path that can't be resolved for certain";
+      const what = `a file-tool write to ${where} (${held.path}), outside the OS sandbox`;
+      return { kind: "held_write", what, reason: `Refused: autonomous mode doesn't allow ${what}. ${owner}` };
+    }
+    if (this.#writesClaudeSettingsOnNamedAccount(toolName, input)) {
+      const what = "a write to a Claude settings file on this session (the CLI applies it outside the sandbox)";
+      return { kind: "claude_settings", what, reason: `Refused: autonomous mode doesn't allow ${what}. ${owner}` };
+    }
+    // A command reaching a directory that holds credentials runs inside the
+    // sandbox, which hides them (#448 round 8: `ls ~`, `echo $HOME`, `df -h /`):
+    // refused only where it doesn't run inside one.
+    const reach = secret?.action === "ask" ? secret : risk?.secret?.action === "ask" && this.#sandbox?.info?.state !== "on" ? risk.secret : null;
+    if (reach) {
+      const what = `a ${risk ? "command" : "call"} reaching ${reach.path}, which may lead to credentials`;
+      return { kind: "credential_dir", what, reason: `Refused: autonomous mode doesn't allow ${what}; keep to the working directory instead. ${owner}` };
+    }
+    if (isUnresolvedPathTool(toolName)) {
+      const what = "a call whose path couldn't be resolved for certain";
+      return { kind: "unresolved_path", what, reason: `Refused: autonomous mode doesn't allow ${what}. ${owner}` };
+    }
+    return null;
+  }
+
+  /** Refuse a call in autonomous mode (#autonomousRefusal): its card, the audit, and an info line in the transcript. */
+  #refuseAutonomous(approvalId: string, toolName: string, refusal: AutonomousRefusal, sender: AuthContext): { behavior: "deny"; message: string } {
+    this.#approvalPatchKeys.delete(approvalId);
+    this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: refusal.reason });
+    this.#store.audit(sender.sub, "session.autonomous_refuse", this.id, `tool=${toolName} kind=${refusal.kind}`);
+    const infoMsg = this.#makeMessage("info", `⛔ Refused ${toolName} in autonomous mode: ${refusal.what}`, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "autonomous.refused",
+      tool: toolName,
+      kind: refusal.kind,
+    });
+    this.#persistAndBuffer(infoMsg);
+    this.#broadcastRaw(infoMsg);
+    return { behavior: "deny", message: refusal.reason };
   }
 
   /**
    * What the approval card says of a call's risk: a shell command's (#431),
-   * and an outside write's reason — first when it is what makes the call ask,
-   * after a high or not-understood command's own.
+   * and a held write's reason first, when it is what makes the call ask.
    */
-  #cardRisk(risk: ShellRisk | null, outside: OutsideWrite | null): { risk?: { level: ShellRisk["level"]; reasons: string[] } } {
-    if (!outside) return risk ? { risk: { level: risk.level, reasons: risk.reasons } } : {};
-    const why = outsideWriteReason(outside);
-    if (risk && riskWeight(risk) > 1) return { risk: { level: risk.level, reasons: [...risk.reasons, why] } };
+  #cardRisk(risk: ShellRisk | null, held: { path: string; what: HeldPath["what"] | "unresolved" } | null = null): { risk?: { level: ShellRisk["level"]; reasons: string[] } } {
+    if (!held) return risk ? { risk: { level: risk.level, reasons: risk.reasons } } : {};
+    const why = heldWriteReason(held);
+    if (risk && riskWeight(risk) > 1) return { risk: { level: risk.level, reasons: [why, ...risk.reasons] } };
     return { risk: { level: "medium", reasons: [why, ...(risk?.reasons ?? [])] } };
   }
 
@@ -7708,9 +8264,27 @@ export class Session {
         }
       }
 
+      // Claude's sandbox asking whether a sandboxed command may reach a host
+      // (#448): yes when the session's network is on, never otherwise (an
+      // allowlist the CLI holds itself, without asking).
+      if (toolName === SANDBOX_NETWORK_TOOL && this.#sandbox?.info?.state === "on") {
+        this.#approvalPatchKeys.delete(approvalId);
+        const host = typeof effectiveInput.host === "string" ? effectiveInput.host : "";
+        if (this.#sandbox.info.network === "on") {
+          this.#approvalIdToMessageId.delete(approvalId);
+          this.#store.audit(sender.sub, "session.sandbox_network_allow", this.id, host);
+          return { behavior: "allow" as const, updatedInput: effectiveInput };
+        }
+        const message = `The sandbox's network is ${this.#sandbox.info.network} for this session`;
+        this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message });
+        this.#store.audit(sender.sub, "session.sandbox_network_deny", this.id, host);
+        return { behavior: "deny" as const, message };
+      }
+
       // Secret-path gate (secret-paths.ts), every mode: a call naming one of the
       // daemon's credential files or a process environment is refused; one
-      // searching a directory that holds them is asked about, never auto-run.
+      // searching a directory that holds them is asked about (refused in
+      // autonomous mode), never auto-run.
       const secret = secretPathVerdict(toolName, effectiveInput, { workdir: this.workdir, configDir: getConfigDir(), cwd: shellCwd });
       // A shell command is judged by what it runs (#431): one naming a
       // credential file is refused like the file tools; a risky one asks.
@@ -7734,32 +8308,46 @@ export class Session {
         return { behavior: "deny" as const, message: reason };
       }
 
+      // A file tool running outside the OS sandbox (Claude's, opencode's) is
+      // held to the sandbox's own policy in autonomous mode (#448 rounds 8, 9):
+      // beyond it, refused, never asked. Guarded and interactive mode decide
+      // as without a sandbox, the card saying it is outside its bounds.
+      const outside = this.#outsideSandboxRefusal(toolName, effectiveInput, shellCwd);
+      if (outside) return this.#refuseOutsideSandbox(approvalId, toolName, outside, sender);
+
       // A write to a Claude settings file on a named account: the CLI reloads
       // it mid-turn and applies its env, after the turn-start check
       // (assertClaudeAccountUsable) — so it never runs unasked, in any mode.
-      const settingsWrite = this.#writesClaudeSettingsOnNamedAccount(toolName, effectiveInput);
+      const held = this.#heldWrite(toolName, effectiveInput);
+      const settingsWrite = this.#writesClaudeSettingsOnNamedAccount(toolName, effectiveInput) || held !== null;
       // end_attempt: a call the spent budget would have parked is denied and
       // ends the attempt instead — whatever else would have asked about it.
       if (this.#budgetSpentFor(toolName)) return this.#endAttemptOnBudget(approvalId, toolName, sender);
+      // Autonomous mode waits on no one (#448): what would have asked and the
+      // OS sandbox can't be left to contain is refused at once, with its reason.
+      const refusal = this.#autonomousRefusal(toolName, effectiveInput, risk, secret, held);
+      if (refusal) return this.#refuseAutonomous(approvalId, toolName, refusal, sender);
+      if (held) {
+        this.#store.audit(sender.sub, held.what === "git" ? "session.git_structure_write_ask" : "session.project_settings_write_ask", this.id, `tool=${toolName} path=${held.path}`);
+      }
       const riskAsks = this.#riskAsks(risk);
-      // Autonomous mode asks before writing outside the working directory, as
-      // a high-risk command asks: no budget spent, an unattended run parks.
-      const outside = this.#outsideWrite(toolName, effectiveInput, shellCwd);
+      // A command asking to run outside the OS sandbox (#448) is its own
+      // approval, asked in guarded and interactive mode.
+      const unsandboxed = this.#unsandboxedRequest(toolName, effectiveInput);
+      if (unsandboxed) this.#store.audit(sender.sub, "session.unsandboxed_ask", this.id, `tool=${toolName}`);
       const autoApprove =
+        !unsandboxed &&
         !riskAsks &&
-        !outside &&
         secret?.action !== "ask" &&
         !settingsWrite &&
         (this.#riskAllows(toolName, risk) || this.#shouldAutoApprove(toolName));
-      if (riskAsks && this.#mode === "autonomous") {
-        this.#store.audit(sender.sub, "session.risk_ask", this.id, `tool=${toolName} risk=${risk?.level} ${risk?.reasons[0] ?? ""}`.trim());
-      }
-      if (outside) this.#store.audit(sender.sub, "session.outside_write_ask", this.id, `tool=${toolName} path=${outside.path}`);
 
       if (autoApprove) {
         this.#approvalIdToMessageId.delete(approvalId); // clean up — no manual approval will reference this
         this.#approvalPatchKeys.delete(approvalId);
-        this.#store.audit(sender.sub, "session.auto_approve", this.id, `tool=${toolName} mode=${this.#mode}`);
+        // A risky command autonomous mode ran (the sandbox holds it, #448) says so in the audit.
+        const level = risk && (risk.level === "high" || risk.level === "unknown" || risk.unreadable) ? ` risk=${risk.unreadable ? "unreadable" : risk.level}` : "";
+        this.#store.audit(sender.sub, "session.auto_approve", this.id, `tool=${toolName} mode=${this.#mode}${level}`);
         // Turn status only. A background agent's call between turns must not
         // move an idle session to tool_running: nothing would ever move it
         // back, and the background wake (gated on idle) would never fire.
@@ -7819,6 +8407,7 @@ export class Session {
 
       if (approved) {
         this.#store.audit(sender.sub, "session.approve", this.id, `tool=${toolName} approvalId=${approvalId}`);
+        if (unsandboxed) this.#store.audit(sender.sub, "session.unsandboxed_approve", this.id, `tool=${toolName} approvalId=${approvalId}`);
         const merged: Record<string, unknown> = sanitizedPatch ? { ...effectiveInput, ...sanitizedPatch } : effectiveInput;
         return { behavior: "allow" as const, updatedInput: merged };
       }
@@ -7841,6 +8430,9 @@ export class Session {
     });
     const toolMsg = this.#toolCallMessages.get(msgId);
     if (toolMsg?.tool) {
+      // The live copy too: a backend reporting the call finished afterwards
+      // (tool_complete) must not turn a refused call into a completed one.
+      toolMsg.tool.state = resolvedState;
       const resolvedMsg: SessionMessage = { ...toolMsg, tool: { ...toolMsg.tool, state: resolvedState }, timestamp: new Date().toISOString() };
       this.#transcriptStore.append(this.id, resolvedMsg, this.#seq++).catch(() => {});
       this.#broadcastRaw({
@@ -8396,15 +8988,26 @@ export class Session {
         // twice per tool call (this handler runs in the same microtask batch
         // as canUseTool's synchronous section, always after it).
         const risk = this.#shellRisk(event.name, event.input, event.shellCwd);
-        const outside = this.#outsideWrite(event.name, event.input, event.shellCwd);
-        const autoApprove =
-          secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir(), cwd: event.shellCwd }) === null &&
+        const held = this.#heldWrite(event.name, event.input);
+        const secret = secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir(), cwd: event.shellCwd });
+        // Claude's sandbox asking for a host: decided by the session's network alone (#448).
+        const networkAsk = event.name === SANDBOX_NETWORK_TOOL && this.#sandbox?.info?.state === "on";
+        const autoApprove = networkAsk
+          ? this.#sandbox?.info?.network === "on"
+          : !this.#unsandboxedRequest(event.name, event.input) &&
+          secret === null &&
           !risk?.secret &&
           !this.#riskAsks(risk) &&
-          !outside &&
+          !held &&
+          !this.#writesClaudeSettingsOnNamedAccount(event.name, event.input) &&
           (this.#riskAllows(event.name, risk) || this.#peekAutoApprove(event.name));
         // end_attempt: the gate will refuse this call outright — no approval card.
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
+        // Autonomous mode refuses it outright (#autonomousRefusal): no approval card either.
+        const deniedFirst = networkAsk || budgetDenied || secret?.action === "deny" || risk?.secret?.action === "deny";
+        // Beyond the sandbox, a host-side file tool is refused in autonomous mode (#outsideSandbox).
+        const outside = deniedFirst ? null : this.#outsideSandboxRefusal(event.name, event.input, event.shellCwd);
+        const refused = deniedFirst ? null : outside ? { reason: hostFileBreachReason(outside) } : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
         const toolMsg = this.#makeMessage(
           "tool_call",
           `${event.name}(${Object.keys(event.input).join(", ")})`,
@@ -8416,6 +9019,8 @@ export class Session {
             input: event.input,
             state: budgetDenied
               ? { phase: "cancelled", reason: "denied", message: "autonomous tool budget spent" }
+              : refused
+              ? { phase: "cancelled", reason: "denied", message: refused.reason }
               : autoApprove
               ? ({ phase: "executing", input: event.input } as unknown as ToolState)
               : ({
@@ -8424,7 +9029,8 @@ export class Session {
                   description: `${event.name}(${Object.keys(event.input).join(", ")})`,
                   approvalId: event.approvalId,
                   ...this.#collaborationCostFor(event.name),
-                  ...this.#cardRisk(risk, outside),
+                  ...this.#cardRisk(risk, held),
+                  ...this.#cardSandbox(event.name, event.input, event.shellCwd),
                 } as unknown as ToolState),
           },
         );
@@ -8441,7 +9047,9 @@ export class Session {
         this.#persistAndBuffer(toolMsg);
         this.#broadcastRaw(toolMsg);
         this.#maybeInjectRepeatReminder(event.name, event.input, event.sdkAgentId);
-        if (!autoApprove && !budgetDenied) this.#setStatus("waiting_approval");
+        // waiting_approval is the gate's to set, when it parks the call
+        // (#makeCanUseToolFn): set here it showed before the approval
+        // existed, and a client reading the pending approvals saw none.
         break;
       }
 
@@ -8494,11 +9102,19 @@ export class Session {
         if (msgId) {
           const toolMsg = this.#toolCallMessages.get(msgId);
           if (toolMsg?.tool) {
-            const completedState = {
+            // A call codeoid refused (or one interrupted) stays as it was
+            // settled: the backend reporting it finished, with the refusal as
+            // its output, doesn't make it a completed call.
+            // Its reason from the backend's report when the settling gave none ("Denied by user").
+            const cancelled = toolMsg.tool.state.phase === "cancelled" ? (toolMsg.tool.state as { message?: string }) : null;
+            const settled = cancelled
+              ? { ...cancelled, ...(cancelled.message === undefined && typeof output === "string" && output !== "" ? { message: output } : {}) }
+              : null;
+            const completedState = (settled ?? {
               phase: "completed",
               success: event.success,
               output,
-            } as unknown as ToolState;
+            }) as unknown as ToolState;
             this.#scrollback.updateMessage(msgId, (m) => {
               const sm = m as SessionMessage;
               if (sm.tool) sm.tool.state = completedState;
@@ -8675,6 +9291,7 @@ export class Session {
         this.#hookBus?.emit("after_turn", this.#hookContext(), {
           result: event.result,
         });
+        void this.#checkGitControl(SYSTEM_IDENTITY.sub);
         if (event.result.isError) {
           const errText = event.result.errorMessage ?? "Turn ended with an error";
           // The CLI reports an overflow as the turn's assistant text and ends
@@ -10074,6 +10691,7 @@ export class Session {
       providerId: this.#provider.id,
       // In BOTH meta writes: each overwrites the whole file (see below).
       ...this.#accountMeta(),
+      ...(this.#sandbox?.setting ? { sandbox: this.#sandbox.setting } : {}),
       ...(this.#backingFresh ? { backingFresh: true } : {}),
       ...(this.#redactedBackings.size > 0 ? { redactedBackings: [...this.#redactedBackings] } : {}),
       forkedFrom: this.forkedFrom,

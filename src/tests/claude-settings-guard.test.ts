@@ -9,13 +9,13 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClaudeAccountError, ClaudeAccountStore, projectCredentialOverride, userCredentialOverride } from "../daemon/claude-accounts.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
-import { Session } from "../daemon/session.js";
+import { Session, writesClaudeSettingsFile } from "../daemon/session.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import type { AuthContext } from "../protocol/types.js";
@@ -161,13 +161,46 @@ describe("a session on a named account", () => {
     makeSession(new MockSessionProvider("claude", []), "sub").assertClaudeAccountUsable();
   });
 
-  test("a write to a Claude settings file waits for the owner, even in autonomous mode", async () => {
+  test("a write to a Claude settings file waits for the owner in guarded mode", async () => {
     const provider = new MockSessionProvider("claude", [toolTurn(join(workdir, ".claude", "settings.local.json"))]);
     const session = makeSession(provider, "br");
+    session.setMode("guarded");
     await session.send("configure the project", AUTH);
     await settle();
     // Not auto-approved: still pending.
     expect(provider.canUseToolResults).toHaveLength(0);
+    expect(session.pendingToolApprovals()).toHaveLength(1);
+  });
+
+  test("in autonomous mode it is refused at once, never waited on, the agent told why (#448)", async () => {
+    const provider = new MockSessionProvider("claude", [toolTurn(join(workdir, ".claude", "settings.local.json"))]);
+    const session = makeSession(provider, "br");
+    await session.send("configure the project", AUTH);
+    await settle();
+    const result = provider.canUseToolResults[0] as { behavior: string; message?: string } | undefined;
+    expect(result?.behavior).toBe("deny");
+    expect(result?.message).toContain("a write to a Claude settings file");
+    expect(result?.message).toContain("switch this session to guarded mode");
+    expect(session.pendingToolApprovals()).toHaveLength(0);
+  });
+
+  test("however the path is spelled (`./`, `//`, `..`, a link to the dir): refused in autonomous mode, waited on in guarded (#448 round 8)", async () => {
+    mkdirSync(join(workdir, ".claude"), { recursive: true });
+    symlinkSync(join(workdir, ".claude"), join(workdir, "conf"));
+    for (const target of [`${workdir}/.claude/./settings.local.json`, `${workdir}/.claude//settings.json`, `${workdir}/src/../.claude/settings.json`, join(workdir, "conf", "settings.json")]) {
+      const provider = new MockSessionProvider("claude", [toolTurn(target)]);
+      await makeSession(provider, "br").send("configure", AUTH);
+      await settle();
+      const result = provider.canUseToolResults[0] as { behavior: string; message?: string } | undefined;
+      expect([target, result?.behavior]).toEqual([target, "deny"]);
+      expect(result?.message).toContain("a write to a Claude settings file");
+      const waited = new MockSessionProvider("claude", [toolTurn(target)]);
+      const guarded = makeSession(waited, "br");
+      guarded.setMode("guarded");
+      await guarded.send("configure", AUTH);
+      await settle();
+      expect([target, waited.canUseToolResults.length, guarded.pendingToolApprovals().length]).toEqual([target, 0, 1]);
+    }
   });
 
   test("other writes, and the default account, are unchanged", async () => {
@@ -180,5 +213,32 @@ describe("a session on a named account", () => {
     await makeSession(onDefault).send("edit", AUTH);
     await settle();
     expect(onDefault.canUseToolResults[0]?.behavior).toBe("allow");
+  });
+});
+
+describe("a Claude settings file, however it is spelled (#448 round 8)", () => {
+  test("`.`, `//`, `..`, `~`, a link to the dir or to the file: each is one", () => {
+    const home = join(tmp, "home");
+    const ws = workdir;
+    const claude = join(home, ".claude");
+    mkdirSync(claude, { recursive: true });
+    writeFileSync(join(claude, "settings.json"), "{}");
+    symlinkSync(claude, join(ws, "c"));
+    symlinkSync(join(claude, "settings.json"), join(ws, "conf.json"));
+    for (const p of [
+      join(claude, "settings.json"),
+      `${claude}/./settings.json`,
+      `${claude}//settings.local.json`,
+      `${claude}/x/../settings.json`,
+      `${ws}/../.claude/settings.json`,
+      join(ws, "c", "settings.json"),
+      join(ws, "conf.json"),
+      "c/settings.local.json",
+            join(home, ".CLAUDE", "Settings.json"),
+      "~/.claude/./settings.json",
+    ]) {
+      expect([p, writesClaudeSettingsFile(p, ws)]).toEqual([p, true]);
+    }
+    for (const p of [join(ws, "src", "settings.json"), join(claude, "settings.json.bak"), join(ws, "a.ts")]) expect([p, writesClaudeSettingsFile(p, ws)]).toEqual([p, false]);
   });
 });

@@ -123,8 +123,12 @@ import {
   modelOptions,
   isTaskNotRunningError,
   stopTaskTarget,
+  sandboxFingerprint,
+  CLI_WORKTREE_DENY,
   type ClaudeProviderInit,
 } from "../daemon/providers/claude/index.js";
+import { claudeProjectDirName } from "../daemon/providers/claude/native-history.js";
+import { credentialEnvNames, physicalOf } from "../daemon/sandbox/claude-native.js";
 import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "../daemon/fork-isolation.js";
 import { getConfigDir } from "../config.js";
 import { mcpToolPrefix } from "../daemon/mcp/types.js";
@@ -136,7 +140,7 @@ import { applyAccountEnv, bedrockModel, type ResolvedClaudeAccount, type StoredC
 import { SqliteEpisodeStore } from "../daemon/memory/store.js";
 import { MEMORY_TOOL_NAMES } from "../daemon/memory/index.js";
 import type { Embedder } from "../daemon/memory/embedder.js";
-import type { EffortLevel, SessionMode } from "../protocol/types.js";
+import type { EffortLevel } from "../protocol/types.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -2762,27 +2766,19 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
     await p.teardown();
   });
 
-  it("in autonomous mode a write outside the working directory goes to codeoid's gate, past any allow rule; not in guarded mode (#447)", async () => {
-    let mode: SessionMode = "autonomous";
-    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => mode });
+  it("a write outside the working directory gets no opinion from the hook, in any mode: autonomous mode runs it, the OS sandbox its boundary (#448)", async () => {
+    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false });
     turnOn(p);
     const outside = "/opt/codeoid-elsewhere/a.ts";
-    expect(await hookCall("Write", { file_path: outside, content: "x" })).toEqual({
-      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: `writes outside the working directory: ${outside}` },
-    });
-    expect(await hookCall("NotebookEdit", { notebook_path: "/opt/codeoid-elsewhere/n.ipynb" })).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask" } });
-    // Inside the working directory (the turn's is the temp dir), and a read outside: no opinion.
-    expect(await hookCall("Write", { file_path: "/tmp/codeoid-inside.ts", content: "x" })).toEqual({});
-    expect(await hookCall("Read", { file_path: outside })).toEqual({});
-    mode = "guarded";
     expect(await hookCall("Write", { file_path: outside, content: "x" })).toEqual({});
+    expect(await hookCall("NotebookEdit", { notebook_path: "/opt/codeoid-elsewhere/n.ipynb" })).toEqual({});
     openGate();
     await p.teardown();
   });
 
-  it("a shell call's relative writes are judged from the cwd the CLI reports, in the hook and at codeoid's gate (round 25)", async () => {
+  it("a shell call's relative paths are judged from the cwd the CLI reports, in the hook and at codeoid's gate (round 25)", async () => {
     await loadShellParser();
-    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => "autonomous" });
+    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false });
     const gated: Array<{ name: string; shellCwd: string | null | undefined }> = [];
     const events: ProviderEvent[] = [];
     const run = p.runTurn({
@@ -2797,19 +2793,17 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
     const drain = (async () => {
       for await (const e of run.events) events.push(e);
     })();
-    // Claude's Bash kept a `cd` into a directory outside the workdir: a relative target there is outside.
-    const elsewhere = join(homedir(), "codeoid-r25-elsewhere");
+    // Claude's Bash kept a `cd` into codeoid's config dir: a bare name there is its credential file.
+    const elsewhere = getConfigDir();
     const hook = (command: string, cwd: string, tool_use_id: string) =>
       preToolUseOf()({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command }, tool_use_id, cwd });
-    expect(await hook("echo planted > my-skill/NOTE.md", elsewhere, "tu-out")).toEqual({
-      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: `writes outside the working directory: ${elsewhere}/my-skill/NOTE.md` },
-    });
-    expect(await hook("echo x > notes.txt", "/tmp", "tu-in")).toEqual({});
+    expect(await hook("cat config.json", elsewhere, "tu-out")).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    expect(await hook("cat config.json", "/tmp", "tu-in")).toEqual({});
     // canUseTool hands the hook's cwd to the gate (and to tool_start); a shell call it has none for is unknown; a file tool has none.
     const gate = (capturedQueryOpts as { options: { canUseTool: (n: string, i: unknown, o: { toolUseID: string; signal: AbortSignal }) => Promise<unknown> } }).options.canUseTool;
     const signal = new AbortController().signal;
-    await gate("Bash", { command: "echo planted > my-skill/NOTE.md" }, { toolUseID: "tu-out", signal });
-    await gate("Bash", { command: "echo x > notes.txt" }, { toolUseID: "tu-unseen", signal });
+    await gate("Bash", { command: "cat config.json" }, { toolUseID: "tu-out", signal });
+    await gate("Bash", { command: "cat config.json" }, { toolUseID: "tu-unseen", signal });
     await gate("Write", { file_path: "/tmp/a", content: "x" }, { toolUseID: "tu-w", signal });
     // Round 26: every tool's call carries the cwd the hook reported (null when it reported none).
     expect(gated).toEqual([
@@ -2823,7 +2817,7 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
     await p.teardown();
   });
 
-  it("the CLI's shell runs with CDPATH empty, over the daemon's, so a `cd` by a bare name is followed where it leads (round 26)", async () => {
+  it("the CLI's shell runs with CDPATH empty, over the daemon's, so a `cd` by a bare name goes where the shell reader places it (round 26)", async () => {
     await loadShellParser();
     const saved = { CDPATH: process.env.CDPATH, ALLOW: process.env.CODEOID_AGENT_ENV_ALLOW };
     process.env.CDPATH = "/";
@@ -2834,12 +2828,10 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
       mkdirSync(join(workdir, "sub"), { recursive: true });
       mkdirSync(join(root, "elsewhere"));
       symlinkSync(join(root, "elsewhere"), join(workdir, "away"));
-      const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => "autonomous" });
+      const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false });
       void p.runTurn({ history: [], userMessage: "go", workdir, canUseTool: async () => ({ behavior: "allow" as const }) });
       expect(envOf().CDPATH).toBe("");
-      expect(p.shellCdpathUnset).toBe(true);
       const hook = (command: string) => preToolUseOf()({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command }, tool_use_id: `tu-${Math.random()}`, cwd: workdir });
-      expect(await hook("cd away && touch planted")).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask", permissionDecisionReason: `writes outside the working directory: ${join(root, "elsewhere", "planted")}` } });
       expect(await hook("cd sub && touch x")).toEqual({});
       openGate();
       await p.teardown();
@@ -2853,7 +2845,7 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
   });
 
   it("a Grep or Glob's relative path is judged from the cwd the CLI reports, which it resolves it from (round 26)", async () => {
-    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => "autonomous" });
+    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false });
     turnOn(p);
     // The CLI's Bash ran `cd` into a directory beside codeoid's config; a relative path from there reaches its key.
     const moved = join(getConfigDir(), "moved-into");
@@ -2871,15 +2863,11 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
     await p.teardown();
   });
 
-  it("Monitor's command is a shell command: judged by risk, credential paths and where it writes; a WebSocket watch isn't (round 26)", async () => {
+  it("Monitor's command is a shell command: judged by risk and credential paths; a WebSocket watch isn't (round 26)", async () => {
     await loadShellParser();
-    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false, sessionMode: () => "autonomous" });
+    const { provider: p } = makeForeignAwareProvider({ isFork: () => false, forkBoundary: () => undefined, isForeignAgent: () => false });
     turnOn(p);
     const call = (tool_input: unknown) => preToolUseOf()({ hook_event_name: "PreToolUse", tool_name: "Monitor", tool_input, tool_use_id: `tu-${Math.random()}`, cwd: "/tmp" });
-    const outside = join(homedir(), "codeoid-r26-elsewhere", "notes.txt");
-    expect(await call({ description: "d", timeout_ms: 1000, command: `echo pwned >> ${outside}` })).toMatchObject({
-      hookSpecificOutput: { permissionDecision: "ask", permissionDecisionReason: `writes outside the working directory: ${outside}` },
-    });
     expect(await call({ description: "d", timeout_ms: 1000, command: "echo pwned >> /etc/profile" })).toMatchObject({ hookSpecificOutput: { permissionDecision: "ask", permissionDecisionReason: expect.stringContaining("high risk") } });
     expect(await call({ description: "d", timeout_ms: 1000, command: `tail -f ${join(getConfigDir(), "config.json")}` })).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
     expect(await call({ description: "d", timeout_ms: 1000, command: "tail -f log.txt" })).toEqual({});
@@ -3484,5 +3472,427 @@ describe("thinking effort", () => {
     expect(claudeCatalogEntry({ value: "haiku", displayName: "Haiku", supportsEffort: false }).efforts).toEqual(["off"]);
     expect(claudeCatalogEntry({ value: "x", displayName: "X" }).efforts).toBeUndefined(); // not said: unknown
     expect(claudeEffortOptions("minimal")).toMatchObject({ effort: "low" }); // no Minimal on Claude
+  });
+});
+
+// ── OS sandbox (#448) ─────────────────────────────────────────────────────────
+
+describe("ClaudeProvider — the OS sandbox", () => {
+  const spec = (network: { mode: "on" | "off" | "allowlist"; allow?: string[] }) => ({
+    sessionId: "test-session",
+    workspace: "/work/repo",
+    tempDir: "/tmp/codeoid-sandbox-x",
+    writable: [],
+    hidden: ["/home/u/.ssh", "/home/u/.codeoid"],
+    reexposed: [],
+    containerSockets: ["/run/docker.sock"],
+    network,
+    unsetEnv: ["SSH_AUTH_SOCK"],
+  });
+  function runtime(kind: "native" | "process", network: Parameters<typeof spec>[0] = { mode: "on" }) {
+    const spawned: Array<{ command: string; args: readonly string[]; env: Record<string, string> }> = [];
+    const opened: string[][] = [];
+    const rt = {
+      info: { choice: "auto", state: "on", network: network.mode, enforced: true },
+      plan: { kind, via: "", network: ["on", "off", "allowlist"], fileTools: kind === "process", wrapsBackend: kind === "process", limits: [] },
+      provider: { id: kind === "native" ? "bwrap" : "docker" },
+      config: { provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], docker: { image: "x" } },
+      spec: spec(network),
+      open: async () => {
+        throw new Error("not used");
+      },
+      openSync: (state: readonly string[] = []) => {
+        opened.push([...state]);
+        return {
+          spawn: (command: string, args: readonly string[], o: { env: Record<string, string> }) => {
+            spawned.push({ command, args, env: o.env });
+            return { stdin: null, stdout: null, kill: () => true, on: () => {}, once: () => {}, off: () => {} };
+          },
+          close: async () => {},
+        };
+      },
+      privateHome: () => home,
+      stateDir: () => mkdtempSync(join(tmpdir(), "codeoid-claude-state-")),
+      claudeTemp: () => temp,
+      gitShim: () => "/codeoid/launch-test/git-bin",
+    };
+    return { rt, spawned, opened, home, temp };
+  }
+  const home = mkdtempSync(join(tmpdir(), "codeoid-claude-home-"));
+  const tempBase = mkdtempSync(join(tmpdir(), "codeoid-claude-temp-"));
+  const temp = { cli: join(tempBase, "cli"), root: join(tempBase, "cmd"), commands: join(tempBase, "cmd", "claude-1") };
+  mkdirSync(temp.cli);
+  mkdirSync(temp.commands, { recursive: true });
+  function providerWith(get: () => unknown, audits: Array<{ action: string }> = [], isAutonomous?: () => boolean): ClaudeProvider {
+    return new ClaudeProvider({
+      ...(isAutonomous ? { isAutonomous } : {}),
+      sessionId: "test-session",
+      initialBackingId: "test-backing",
+      workspaceId: "ws_test",
+      store: {
+        audit: (_s: string, action: string) => audits.push({ action }),
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+      sandbox: get as never,
+    });
+  }
+  const options = () => (capturedQueryOpts as { options: Record<string, unknown> }).options;
+
+  it("a native sandbox: Claude Code's own, failing closed, every command still asked, codeoid's paths and network", async () => {
+    const { rt } = runtime("native");
+    const p = providerWith(() => rt);
+    await collectTurnEvents(p);
+    const sb = options().sandbox as Record<string, unknown>;
+    expect(sb).toMatchObject({ enabled: true, failIfUnavailable: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: true });
+    // Its commands' temp dir is the session's (#448 round 1), the CLI's own elsewhere.
+    expect(sb.filesystem).toMatchObject({ allowWrite: ["/work/repo", temp.commands].map(physicalOf), denyRead: ["/home/u/.ssh", "/home/u/.codeoid", "/run/docker.sock"].map(physicalOf) });
+    expect((options().env as Record<string, string>).TMPDIR).toBe(temp.root);
+    expect((options().env as Record<string, string>).CLAUDE_CODE_TMPDIR).toBe(temp.cli);
+    // The CLI's own git is the session's shim (#448 round 4: its `git status` at every start runs inside the sandbox).
+    expect((options().env as Record<string, string>).PATH?.split(":")[0]).toBe("/codeoid/launch-test/git-bin");
+    // The CLI's settings (hooks, excluded commands) aren't its commands' to write.
+    expect((sb.filesystem as { denyWrite: string[] }).denyWrite).toContain("/work/repo/.claude");
+    expect(sb.network).toEqual({});
+    // The CLI's credential variables aren't its commands'.
+    const denied = (sb.credentials as { envVars: Array<{ name: string; mode: string }> } | undefined)?.envVars ?? [];
+    expect(denied.every((v) => v.mode === "deny")).toBe(true);
+    expect(options().spawnClaudeCodeProcess).toBeUndefined();
+    await p.teardown();
+  });
+
+  it("network off denies every host without asking; an allowlist allows only its hosts", async () => {
+    const off = providerWith(() => runtime("native", { mode: "off" }).rt);
+    await collectTurnEvents(off);
+    expect((options().sandbox as { network: unknown }).network).toEqual({ allowedDomains: [], deniedDomains: ["*"], strictAllowlist: true });
+    await off.teardown();
+    const list = providerWith(() => runtime("native", { mode: "allowlist", allow: ["github.com", "*.npmjs.org"] }).rt);
+    await collectTurnEvents(list);
+    expect((options().sandbox as { network: unknown }).network).toEqual({ allowedDomains: ["github.com", "*.npmjs.org"], strictAllowlist: true });
+    await list.teardown();
+  });
+
+  it("no sandbox (off, unavailable, or a Session without one): no option at all", async () => {
+    const p = providerWith(() => null);
+    await collectTurnEvents(p);
+    expect(options().sandbox).toBeUndefined();
+    expect(options().spawnClaudeCodeProcess).toBeUndefined();
+    await p.teardown();
+  });
+
+  it("a process sandbox (Docker): the whole CLI is spawned inside, its own config reachable", async () => {
+    const { rt, spawned, opened } = runtime("process");
+    const p = providerWith(() => rt);
+    await collectTurnEvents(p);
+    expect(options().sandbox).toBeUndefined();
+    const spawn = options().spawnClaudeCodeProcess as (o: unknown) => unknown;
+    spawn({ command: "/x/claude", args: ["--a"], cwd: "/work/repo", env: { A: "1", B: undefined, HOME: "/home/u" } });
+    // A private copy of its config dir (#448 round 1): never the real ~/.claude writable.
+    expect(spawned).toEqual([{ command: "/x/claude", args: ["--a"], env: { A: "1", HOME: "/home/u", CLAUDE_CONFIG_DIR: home } }]);
+    expect(opened[0]?.[0]).toBe(home);
+    expect(opened[0]).not.toContain("/home/u/.claude");
+    expect(opened[0]).not.toContain("/home/u/.claude.json");
+    await p.teardown();
+  });
+
+  it("a command asking to run outside the sandbox goes to codeoid's gate past any allow rule", async () => {
+    const p = providerWith(() => runtime("native").rt);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const run = p.runTurn({ history: [], userMessage: "go", workdir: "/tmp", canUseTool: async () => ({ behavior: "allow" as const }) });
+    const drain = (async () => {
+      await gate;
+      for await (const _ of run.events) {
+        /* drain */
+      }
+    })();
+    const hook = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }> } } }).options.hooks.PreToolUse[0]!.hooks[0]!;
+    expect(await hook({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls", dangerouslyDisableSandbox: true }, tool_use_id: "tu-1" })).toEqual({
+      hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "ask", permissionDecisionReason: "asks to run outside the sandbox" },
+    });
+    expect(await hook({ hook_event_name: "PreToolUse", tool_name: "Bash", tool_input: { command: "ls" }, tool_use_id: "tu-2" })).not.toMatchObject({
+      hookSpecificOutput: { permissionDecisionReason: "asks to run outside the sandbox" },
+    });
+    release();
+    await drain;
+    await p.teardown();
+  });
+
+  it("a file tool writing the repository's git structure or the project settings goes to codeoid's gate past any allow rule while sandboxed, in every mode (#448 round 3)", async () => {
+    const ws = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-claude-held-")));
+    mkdirSync(join(ws, ".git", "hooks"), { recursive: true });
+    mkdirSync(join(ws, ".git", "objects"));
+    writeFileSync(join(ws, ".git", "HEAD"), "ref: refs/heads/main\n");
+    const rt = runtime("native").rt;
+    rt.spec = { ...rt.spec, workspace: ws };
+    const p = providerWith(() => rt);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const run = p.runTurn({ history: [], userMessage: "go", workdir: ws, canUseTool: async () => ({ behavior: "allow" as const }) });
+    const drain = (async () => {
+      await gate;
+      for await (const _ of run.events) {
+        /* drain */
+      }
+    })();
+    const hook = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }> } } }).options.hooks.PreToolUse[0]!.hooks[0]!;
+    const decision = async (input: Record<string, unknown>, id: string) =>
+      (await hook({ hook_event_name: "PreToolUse", tool_name: "Write", tool_input: input, tool_use_id: id, cwd: ws })) as { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } };
+    const git = await decision({ file_path: join(ws, ".git", "hooks", "pre-commit"), content: "x" }, "tu-g");
+    expect(git.hookSpecificOutput?.permissionDecision).toBe("ask");
+    expect(git.hookSpecificOutput?.permissionDecisionReason).toContain("the repository's git structure");
+    const settings = await decision({ file_path: join(ws, "opencode.json"), content: "{}" }, "tu-s");
+    expect(settings.hookSpecificOutput?.permissionDecisionReason).toContain("project settings");
+    const plain = await decision({ file_path: join(ws, "a.ts"), content: "" }, "tu-p");
+    expect(plain.hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    release();
+    await drain;
+    await p.teardown();
+    rmSync(ws, { recursive: true, force: true });
+  });
+
+  it("a file tool beyond what the sandbox allows its commands goes to codeoid's gate past any allow rule (a read in the workdir or an added dir is the CLI's own to allow); the CLI's saved output for this session and its skills are readable (#448 round 8)", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-claude-bounds-")));
+    const ws = join(base, "ws");
+    const fakeHome = join(base, "home");
+    mkdirSync(ws, { recursive: true });
+    mkdirSync(join(fakeHome, ".ssh"), { recursive: true });
+    const rt = runtime("native").rt;
+    const projectDir = join(fakeHome, ".claude", "projects", "p");
+    rt.spec = { ...rt.spec, workspace: ws, hidden: [fakeHome] };
+    const p = providerWith(() => rt);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const run = p.runTurn({ history: [], userMessage: "go", workdir: ws, canUseTool: async () => ({ behavior: "allow" as const }) });
+    const drain = (async () => {
+      await gate;
+      for await (const _ of run.events) {
+        /* drain */
+      }
+    })();
+    const hook = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }> } } }).options.hooks.PreToolUse[0]!.hooks[0]!;
+    const decision = async (tool: string, input: Record<string, unknown>, id: string) =>
+      (await hook({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, tool_use_id: id, cwd: ws, session_id: "sid-1", transcript_path: join(projectDir, "sid-1.jsonl") })) as {
+        hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string };
+      };
+    const key = await decision("Read", { file_path: join(fakeHome, ".ssh", "id_ed25519") }, "tu-1");
+    expect(key.hookSpecificOutput?.permissionDecision).toBe("ask");
+    expect(key.hookSpecificOutput?.permissionDecisionReason).toStartWith("Refused: outside what this session's sandbox allows");
+    expect((await decision("Grep", { pattern: "x", path: fakeHome }, "tu-2")).hookSpecificOutput?.permissionDecision).toBe("ask");
+    expect((await decision("Write", { file_path: join(base, "x.sh"), content: "x" }, "tu-3")).hookSpecificOutput?.permissionDecision).toBe("ask");
+    expect((await decision("Read", { file_path: join(ws, "a.ts") }, "tu-4")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    expect((await decision("Grep", { pattern: "x" }, "tu-5")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    // Where the CLI saves this session's large output, beside the transcript the hook names.
+    const results = join(projectDir, "sid-1", "tool-results");
+    expect(p.hostReadable()).toContain(results);
+    expect((await decision("Read", { file_path: join(results, "r.txt") }, "tu-6")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    expect((await decision("Write", { file_path: join(results, "r.txt"), content: "" }, "tu-7")).hookSpecificOutput?.permissionDecision).toBe("ask");
+    expect((await decision("Read", { file_path: join(projectDir, "other.jsonl") }, "tu-8")).hookSpecificOutput?.permissionDecision).toBe("ask");
+    release();
+    await drain;
+    await p.teardown();
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it("the bounds routing is autonomous mode's alone (#448 round 9): in guarded or interactive mode a call the CLI allows itself (its memory, a read it lets through) is left to it, as without a sandbox; the held-write routing stays", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-claude-mode-")));
+    const ws = join(base, "ws");
+    const fakeHome = join(base, "home");
+    mkdirSync(join(ws, ".git", "objects"), { recursive: true });
+    mkdirSync(join(ws, ".git", "refs"), { recursive: true });
+    writeFileSync(join(ws, ".git", "HEAD"), "ref: refs/heads/main\n");
+    mkdirSync(join(fakeHome, ".ssh"), { recursive: true });
+    const rt = runtime("native").rt;
+    rt.spec = { ...rt.spec, workspace: ws, hidden: [fakeHome] };
+    let autonomous = false;
+    const p = providerWith(() => rt, [], () => autonomous);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const run = p.runTurn({ history: [], userMessage: "go", workdir: ws, mode: "guarded", canUseTool: async () => ({ behavior: "allow" as const }) });
+    const drain = (async () => {
+      await gate;
+      for await (const _ of run.events) {
+        /* drain */
+      }
+    })();
+    const hook = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }> } } }).options.hooks.PreToolUse[0]!.hooks[0]!;
+    const decision = async (tool: string, input: Record<string, unknown>, id: string) =>
+      (await hook({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, tool_use_id: id, cwd: ws })) as { hookSpecificOutput?: { permissionDecision?: string } };
+    const outside = { file_path: join(fakeHome, "Downloads", "error.log") };
+    expect((await decision("Read", outside, "tu-1")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    expect((await decision("Write", { file_path: join(base, "x.sh"), content: "x" }, "tu-2")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    // A write to the git structure is held as before (asked at the gate, round 7).
+    expect((await decision("Write", { file_path: join(ws, ".git", "HEAD"), content: "x" }, "tu-3")).hookSpecificOutput?.permissionDecision).toBe("ask");
+    autonomous = true;
+    expect((await decision("Read", outside, "tu-4")).hookSpecificOutput?.permissionDecision).toBe("ask");
+    release();
+    await drain;
+    await p.teardown();
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it("the CLI's own context files are where its query's CLI keeps them (its config dir, CLAUDE_CODE_TMPDIR), and the hook leaves them to it in autonomous mode; an autonomous query's Grep and Glob leave out what the sandbox hides inside the workspace, by Read deny rules, rebuilt on a mode switch (#448 round 9)", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-claude-own-")));
+    const ws = join(base, "ws");
+    const fakeHome = join(base, "home");
+    mkdirSync(ws, { recursive: true });
+    writeFileSync(join(ws, ".env"), "SECRET=planted\n");
+    const rt = runtime("native").rt;
+    rt.spec = { ...rt.spec, workspace: ws, hidden: [fakeHome, join(ws, ".env")] };
+    const prevHome = process.env.HOME;
+    const prevCfg = process.env.CLAUDE_CONFIG_DIR;
+    process.env.HOME = fakeHome;
+    delete process.env.CLAUDE_CONFIG_DIR;
+    try {
+      const p = providerWith(() => rt, [], () => true);
+      let release: () => void = () => {};
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      const run = p.runTurn({ history: [], userMessage: "go", workdir: ws, mode: "autonomous", canUseTool: async () => ({ behavior: "allow" as const }) });
+      const drain = (async () => {
+        await gate;
+        for await (const _ of run.events) {
+          /* drain */
+        }
+      })();
+      const settings = (options().settings ?? {}) as { permissions?: { deny?: string[] } };
+      expect(settings.permissions?.deny).toEqual([`Read(/${join(ws, ".env")})`, `Read(/${join(ws, ".env")}/**)`]);
+      const own = p.hostFiles();
+      const cfg = join(fakeHome, ".claude");
+      const memory = join(cfg, "projects", claudeProjectDirName(ws), "memory");
+      expect(own.markdown).toContain(memory);
+      expect(own.writable).toContain(join(temp.cli, `claude-${process.getuid?.() ?? 0}`, claudeProjectDirName(ws)));
+      expect(own.searchExcluded).toEqual([join(ws, ".env")]);
+      const hook = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }> } } }).options.hooks.PreToolUse[0]!.hooks[0]!;
+      const decision = async (tool: string, input: Record<string, unknown>, id: string) =>
+        (await hook({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, tool_use_id: id, cwd: ws })) as { hookSpecificOutput?: { permissionDecision?: string } };
+      expect((await decision("Write", { file_path: join(memory, "MEMORY.md"), content: "x" }, "tu-1")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+      expect((await decision("Write", { file_path: join(cfg, "settings.json"), content: "{}" }, "tu-2")).hookSpecificOutput?.permissionDecision).toBe("ask");
+      expect((await decision("Grep", { pattern: "x" }, "tu-3")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+      release();
+      await drain;
+      // A guarded query has no such rules: the next turn's loop is rebuilt without them.
+      capturedQueryOpts = null;
+      const again = p.runTurn({ history: [], userMessage: "go", workdir: ws, mode: "guarded", canUseTool: async () => ({ behavior: "allow" as const }) });
+      for await (const _ of again.events) {
+        /* drain */
+      }
+      expect(capturedQueryOpts).not.toBeNull();
+      expect((options().settings as { permissions?: unknown } | undefined)?.permissions).toBeUndefined();
+      expect(p.hostFiles().searchExcluded).toEqual([]);
+      await p.teardown();
+    } finally {
+      process.env.HOME = prevHome;
+      if (prevCfg !== undefined) process.env.CLAUDE_CONFIG_DIR = prevCfg;
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  it("a backend whose file tools run inside the sandbox (the CLI under Docker) leaves its file tools to it: no held-write or bounds routing (#448 round 8)", async () => {
+    const ws = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-claude-inside-")));
+    mkdirSync(join(ws, ".git", "hooks"), { recursive: true });
+    mkdirSync(join(ws, ".git", "objects"));
+    writeFileSync(join(ws, ".git", "HEAD"), "ref: refs/heads/main\n");
+    const rt = runtime("process").rt;
+    const p = providerWith(() => rt);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const run = p.runTurn({ history: [], userMessage: "go", workdir: ws, canUseTool: async () => ({ behavior: "allow" as const }) });
+    const drain = (async () => {
+      await gate;
+      for await (const _ of run.events) {
+        /* drain */
+      }
+    })();
+    const hook = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }> } } }).options.hooks.PreToolUse[0]!.hooks[0]!;
+    const out = (await hook({ hook_event_name: "PreToolUse", tool_name: "Write", tool_input: { file_path: join(ws, ".git", "hooks", "pre-commit"), content: "x" }, tool_use_id: "tu-d", cwd: ws })) as {
+      hookSpecificOutput?: { permissionDecision?: string };
+    };
+    expect(out.hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    release();
+    await drain;
+    await p.teardown();
+    rmSync(ws, { recursive: true, force: true });
+  });
+
+  it("the CLI's own worktree tools are refused while sandboxed, in the hook (EnterWorktree never asks canUseTool) and in canUseTool (#448 round 6)", async () => {
+    type Hook = (i: unknown) => Promise<unknown>;
+    type Gate = (n: string, i: unknown, o: { toolUseID: string; signal: AbortSignal }) => Promise<{ behavior: string; message?: string }>;
+    const deny = { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: CLI_WORKTREE_DENY } };
+    const asked: string[] = [];
+    for (const kind of ["native", "process", "none"] as const) {
+      const p = providerWith(() => (kind === "none" ? null : runtime(kind).rt));
+      let release: () => void = () => {};
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      const run = p.runTurn({
+        history: [],
+        userMessage: "go",
+        workdir: "/tmp",
+        canUseTool: async (_id, _a, name) => {
+          asked.push(`${kind}:${name}`);
+          return { behavior: "allow" as const };
+        },
+      });
+      const drain = (async () => {
+        await gate;
+        for await (const _ of run.events) {
+          /* drain */
+        }
+      })();
+      const opts = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Hook[] }> }; canUseTool: Gate } }).options;
+      const hook = opts.hooks.PreToolUse[0]!.hooks[0]!;
+      for (const [tool, input] of [["EnterWorktree", { name: "feature" }], ["EnterWorktree", { path: "/tmp/.claude/worktrees/x" }], ["ExitWorktree", { action: "keep" }]] as const) {
+        const decided = await hook({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, tool_use_id: `tu-${tool}`, cwd: "/tmp" });
+        const gated = await opts.canUseTool(tool, input, { toolUseID: `tu-${tool}-g`, signal: new AbortController().signal });
+        if (kind === "none") {
+          // Unsandboxed, they are the CLI's as before: no refusal, the gate decides.
+          expect(decided).not.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+          expect(gated.behavior).toBe("allow");
+        } else {
+          expect(decided).toEqual(deny);
+          expect(gated).toEqual({ behavior: "deny", message: CLI_WORKTREE_DENY });
+        }
+      }
+      // Anything else is untouched.
+      expect(await hook({ hook_event_name: "PreToolUse", tool_name: "Read", tool_input: { file_path: "/tmp/a" }, tool_use_id: "tu-r", cwd: "/tmp" })).not.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+      release();
+      await drain;
+      await p.teardown();
+    }
+    // A refused call never reaches Session's gate (nothing of it is shown as an approval).
+    expect(asked).toEqual(["none:EnterWorktree", "none:EnterWorktree", "none:ExitWorktree"]);
+    expect(CLI_WORKTREE_DENY).toContain("use codeoid's --worktree; the CLI's own worktrees aren't sandboxed");
+  });
+
+  it("what the query was built with: a changed sandbox is a different build", () => {
+    const a = runtime("native").rt;
+    expect(sandboxFingerprint(a as never)).toBe(sandboxFingerprint(runtime("native").rt as never));
+    expect(sandboxFingerprint(a as never)).not.toBe(sandboxFingerprint(runtime("native", { mode: "off" }).rt as never));
+    expect(sandboxFingerprint(a as never)).not.toBe(sandboxFingerprint(runtime("process").rt as never));
+    expect(sandboxFingerprint(null)).toBe("");
+  });
+
+  it("the credential variables a sandboxed command doesn't see", () => {
+    expect(credentialEnvNames({ ANTHROPIC_API_KEY: "k", CLAUDE_CODE_OAUTH_TOKEN: "t", AWS_SECRET_ACCESS_KEY: "s", PATH: "/bin", HOME: "/h", GIT_AUTHOR_NAME: "x", SSH_AUTH_SOCK: "/s" }, ["SSH_AUTH_SOCK"])).toEqual([
+      "ANTHROPIC_API_KEY",
+      "AWS_SECRET_ACCESS_KEY",
+      "CLAUDE_CODE_OAUTH_TOKEN",
+      "SSH_AUTH_SOCK",
+    ]);
   });
 });

@@ -26,6 +26,9 @@ import { type Command, program } from "commander";
 // string to drift). release-smoke asserts these two stay equal.
 import pkg from "../package.json" with { type: "json" };
 import { acquireDaemonLocks, type DaemonLocks, DataDirLockError, daemonOwnedDirs } from "./daemon/data-lock.js";
+import { sandboxConfigOf } from "./daemon/sandbox/policy.js";
+import { createDefaultSandboxRegistry } from "./daemon/sandbox/registry.js";
+import { sandboxRoot } from "./daemon/sandbox/root.js";
 import { DaemonServer } from "./daemon/server.js";
 import { DefaultProviderError } from "./daemon/providers/registry.js";
 import { clearStaleOpencodeCredentials } from "./daemon/providers/opencode/credentials.js";
@@ -36,8 +39,11 @@ import {
   assertLocalBindAllowed,
   isLoopbackHost,
   LOCAL_TOKEN_ENV,
+  LocalUiLinks,
   mintLocalToken,
   removeLocalTokenFile,
+  UI_LINK_START_TTL_MS,
+  uiLinkUrl,
 } from "./daemon/local-auth.js";
 import {
   CAPABILITIES,
@@ -50,7 +56,7 @@ import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
 import { bedrockFromSettings, formatAccounts, formatClaudeAccounts, parseHeaderFlags, parseSettingFlags } from "./terminal/claude-accounts.js";
 import { formatEndpoints, importPiModels, parseModelFlags, parseTokens } from "./terminal/endpoints.js";
-import type { ClientMessage, DaemonMessage, EffortLevel, SessionInfo } from "./protocol/types.js";
+import type { ClientMessage, DaemonMessage, EffortLevel, SessionInfo, SessionSandboxSetting } from "./protocol/types.js";
 import { parseEffort } from "@highflame/codeoid-core";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
 import { cleartextOffHost, controlUrl, MCP_SCOPE_PRESETS, TokenError } from "./terminal/token.js";
@@ -145,10 +151,24 @@ program
       process.exit(1);
     }
 
+    // The OS sandbox agents' commands run in (#448): on by default. The
+    // daemon's private temp root first: every sandbox hides it, so what the
+    // daemon makes there later (a sign-in's home) is hidden from each.
+    sandboxRoot();
+    const sandboxConfig = sandboxConfigOf(config);
+    const sandboxRegistry = createDefaultSandboxRegistry(sandboxConfig);
+    void sandboxRegistry.resolve(sandboxConfig.provider).then((r) => {
+      if (r.kind === "off") console.warn("[codeoid] sandbox: off (sandbox.provider) — agents' commands run with your full rights");
+      else if (r.kind === "unknown") console.warn(`[codeoid] sandbox: ${r.reason}`);
+      else if (r.probe.available) console.log(`[codeoid] sandbox: ${r.provider.displayName}, network ${sandboxConfig.network}`);
+      else console.warn(`[codeoid] sandbox: ${r.provider.displayName} can't run here (${r.probe.reason}) — interactive sessions run unsandboxed and say so; autonomous ones, routines and loops won't start`);
+    });
+
     let daemon: DaemonServer;
     try {
       daemon = new DaemonServer({
         dataLock,
+        sandboxRegistry,
         port: bindPort,
         host: bindHost,
         dbPath: config.dbPath,
@@ -183,17 +203,17 @@ program
 
     // Web UI (always enabled unless --no-web) — the SolidJS app at /ui,
     // single-origin so one HTTPS tunnel also serves as a Telegram Mini App.
+    // In local mode on a loopback bind, a one-time link signs a browser in:
+    // the banner's, then `codeoid ui`'s. The page itself never carries the
+    // token (a sandboxed command on the loopback could fetch it, #448 round 4).
+    // On a wide bind there is no link: the operator pastes the token.
+    let uiLinks: LocalUiLinks | undefined;
     if (opts.web !== false) {
       const { WebUiFrontend } = await import("./frontends/web-ui/index.js");
-      // In local mode on a loopback bind, hand the browser the token directly so
-      // /ui needs no sign-in at all. On a wide bind we deliberately do NOT — the
-      // HTML would be readable by anything that can reach the port — so the
-      // operator pastes the token into the sign-in box instead.
-      const injectToken =
-        localMode && isLoopbackHost(bindHost) ? localMode.token : undefined;
+      if (localMode && isLoopbackHost(bindHost)) uiLinks = new LocalUiLinks();
       // Thread the embed-SSO allowlist so the served index.html publishes it to
       // the web UI's trusted-framing-origin gate. Empty ⇒ hash handoff disabled.
-      daemon.use(new WebUiFrontend(config.embed?.allowedOrigins ?? [], injectToken));
+      daemon.use(new WebUiFrontend(config.embed?.allowedOrigins ?? [], localMode && uiLinks ? { token: localMode.token, links: uiLinks } : undefined));
     }
 
     // Telegram (enabled when TELEGRAM_BOT_TOKEN is set)
@@ -226,6 +246,7 @@ program
     } catch (err) {
       // Its port taken (another daemon runs there), or anything else: not started.
       console.error(`\n[codeoid] the daemon couldn't start: ${err instanceof Error ? err.message : String(err)}\n`);
+      await daemon.abortStart();
       process.exit(1);
     }
 
@@ -258,6 +279,7 @@ program
         port: String(opts.port),
         loopback: isLoopbackHost(bindHost),
         web: opts.web !== false,
+        ...(uiLinks ? { link: uiLinkUrl(`http://${displayHost}:${opts.port}`, uiLinks.mint(UI_LINK_START_TTL_MS)) } : {}),
       });
     }
   });
@@ -277,6 +299,8 @@ function printLocalModeBanner(o: {
   port: string;
   loopback: boolean;
   web: boolean;
+  /** The one-time link that signs a browser in (loopback local mode). */
+  link?: string;
 }): void {
   const lines: string[] = [
     "",
@@ -289,8 +313,8 @@ function printLocalModeBanner(o: {
   ];
   if (o.web) {
     lines.push(
-      o.loopback
-        ? `  Or open the web UI — already signed in:  http://${o.host}:${o.port}/ui/`
+      o.link
+        ? `  Or open the web UI — this link signs one browser in (once, within ${Math.round(UI_LINK_START_TTL_MS / 60_000)} minutes):\n      ${o.link}\n    later, a new link:  codeoid ui`
         : `  Or open the web UI and paste the token below:  http://${o.host}:${o.port}/ui/`,
       "",
     );
@@ -397,6 +421,33 @@ function writeConfigKeys(updates: Record<string, unknown>): string {
   writeFileSync(path, `${JSON.stringify(merged, null, 2)}\n`, { mode: 0o600 });
   return path;
 }
+
+program
+  .command("ui")
+  .description("Open the web UI; on a local-mode daemon, with a one-time link that signs this browser in")
+  .option("--no-open", "print the link, don't open a browser")
+  .action(async (opts) => {
+    const { browserOpener, webUiLink } = await import("./terminal/ui-link.js");
+    const link = await webUiLink(loadConfig().daemonUrl);
+    if ("error" in link) {
+      console.error(`codeoid ui: ${link.error}`);
+      process.exit(1);
+    }
+    console.log(link.url);
+    if (link.signsIn) console.log(`  (signs one browser in, once, within ${Math.round((link.expiresInMs ?? 0) / 1000)} seconds)`);
+    if (opts.open === false) return;
+    // Never with the code in a program's argv where a sandboxed command could read it (browserOpener).
+    const opener = browserOpener(link.url);
+    if (!opener) return;
+    try {
+      const proc = Bun.spawn(opener.argv, { stdin: opener.stdin !== undefined ? Buffer.from(opener.stdin) : "ignore", stdout: "ignore", stderr: "ignore" });
+      // What reads the link from stdin is waited for (briefly), so it gets all of it; a browser xdg-open runs isn't.
+      if (opener.stdin !== undefined) await Promise.race([proc.exited, Bun.sleep(10_000)]);
+      proc.unref();
+    } catch {
+      /* the link is printed */
+    }
+  });
 
 program
   .command("login [apiKey]")
@@ -1024,6 +1075,12 @@ program
     "Thinking effort: off | minimal | low | medium | high | xhigh | max, or default for the backend's own (omitted: session.defaultEffort, else the backend's own). Change it later with /effort.",
   )
   .option(
+    "--sandbox <provider>",
+    "OS sandbox for its commands: auto (bubblewrap on Linux, Seatbelt on macOS) | bwrap | seatbelt | docker | off. Default: sandbox.provider. off needs session:approve.",
+  )
+  .option("--network <mode>", "What a sandboxed command may reach: on | off | allowlist (with --allow-host). Default: sandbox.network.")
+  .option("--allow-host <host>", "A host the allowlist lets through, repeatable (example.com, *.example.com).", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .option(
     "--pack <id>",
     "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents). With --collaborate, the collaboration ADOPTS the pack: role names bind strictly to the pack's declared roles.",
   )
@@ -1057,9 +1114,19 @@ program
         packRole?: string;
         collaborate?: string;
         role: string[];
+        sandbox?: string;
+        network?: string;
+        allowHost: string[];
       },
     ) => {
       const config = loadConfig();
+      let sandbox: SessionSandboxSetting | undefined;
+      try {
+        sandbox = sandboxSettingFromFlags(opts);
+      } catch (e) {
+        console.error(e instanceof Error ? e.message : String(e));
+        process.exit(1);
+      }
       let resolvedWorkdir = workdir;
       if (opts.worktree) {
         const { createWorktree } = await import("./worktree.js");
@@ -1121,10 +1188,64 @@ program
         pack: opts.pack,
         packRole: opts.packRole,
         collaboration,
+        ...(sandbox ? { sandbox } : {}),
       });
       client.disconnect();
     },
   );
+
+/** A session's sandbox setting from `--sandbox` / `--network` / `--allow-host` (#448); undefined when none is given. */
+function sandboxSettingFromFlags(o: { sandbox?: string; network?: string; allowHost?: string[] }): SessionSandboxSetting | undefined {
+  const out: SessionSandboxSetting = {};
+  if (o.sandbox) out.provider = o.sandbox;
+  if (o.network) {
+    if (o.network !== "on" && o.network !== "off" && o.network !== "allowlist") throw new Error("--network is on, off or allowlist");
+    out.network = o.network;
+  }
+  if (o.allowHost && o.allowHost.length > 0) {
+    if (out.network && out.network !== "allowlist") throw new Error("--allow-host goes with --network allowlist");
+    out.network = "allowlist";
+    out.allowedHosts = o.allowHost;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+const sandboxCmd = program
+  .command("sandbox")
+  .description("The OS sandbox agents' commands run in (docs/sandbox.md): see what this daemon has, or change a session's");
+
+sandboxCmd
+  .command("providers")
+  .description("List the sandbox providers, whether each runs here, and the default")
+  .action(async () => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    await client.sandboxProviders();
+    client.disconnect();
+  });
+
+sandboxCmd
+  .command("set <session> [provider]")
+  .description("Change a session's sandbox: auto | bwrap | seatbelt | docker | off, and/or --network. Turning it off or widening it is asked of the owner on the session")
+  .option("--network <mode>", "on | off | allowlist")
+  .option("--allow-host <host>", "a host the allowlist lets through, repeatable", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .action(async (session: string, provider: string | undefined, o: { network?: string; allowHost: string[] }) => {
+    let setting: SessionSandboxSetting | undefined;
+    try {
+      setting = sandboxSettingFromFlags({ ...(provider ? { sandbox: provider } : {}), ...o });
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
+    if (!setting) {
+      console.error("Give a provider (auto | bwrap | seatbelt | docker | off) or --network.");
+      process.exit(1);
+    }
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    await client.setSandbox(session, setting);
+    client.disconnect();
+  });
 
 program
   .command("attach <session>")
@@ -1553,6 +1674,9 @@ function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
     .option("--check-timeout <s>", "check timeout in seconds (default 60)")
     .option("--provider <id>", "backend: claude, codex, gemini, qwen, …")
     .option("--model <name>", "model for the backend")
+    .option("--sandbox <provider>", "OS sandbox for its runs: auto | bwrap | seatbelt | docker | off (default: sandbox.provider); a run whose sandbox can't run here doesn't start")
+    .option("--network <mode>", "what a sandboxed command may reach: on | off | allowlist")
+    .option("--allow-host <host>", "a host the allowlist lets through (repeatable)", collect, [])
     .option("--guarded", "every non-read tool waits for your approval")
     .option("--autonomous", "tools auto-approve within --tool-budget (default)")
     .option("--tool-budget <n>", "autonomous tool calls per run (default 50)")
@@ -1614,6 +1738,9 @@ loop
   .option("--budget <n>", "Autonomous tool calls per attempt (default 60)")
   .option("--provider <id>", "Backend for the worker (default: the daemon's)")
   .option("--model <id>", "Model for the worker")
+  .option("--sandbox <provider>", "The worker's OS sandbox: auto | bwrap | seatbelt | docker | off (default: sandbox.provider); the run is refused where it can't run")
+  .option("--network <mode>", "What the worker's commands may reach: on | off | allowlist")
+  .option("--allow-host <host>", "A host the allowlist lets through (repeatable)", collect, [])
   .option("--wait", "Follow the run until it ends")
   .action(
     (
@@ -1628,10 +1755,21 @@ loop
         budget?: string;
         provider?: string;
         model?: string;
+        sandbox?: string;
+        network?: string;
+        allowHost: string[];
         wait?: boolean;
       },
     ) =>
       withClient(async (c) => {
+        let sandbox: SessionSandboxSetting | undefined;
+        try {
+          sandbox = sandboxSettingFromFlags(f);
+        } catch (e) {
+          console.error(e instanceof Error ? e.message : String(e));
+          process.exitCode = 1;
+          return;
+        }
         if (f.check.length === 0) {
           console.error("Give at least one --check: the command that must pass.");
           process.exitCode = 1;
@@ -1651,6 +1789,7 @@ loop
           checks: f.check.map((raw) => ({ ...parseCheckFlag(raw), ...(f.test ? { expectTests: true } : {}) })),
           ...(f.provider ? { provider: f.provider } : {}),
           ...(f.model ? { model: f.model } : {}),
+          ...(sandbox ? { sandbox } : {}),
           ...(f.budget ? { toolBudget: int(f.budget) } : {}),
           ...(Object.keys(limits).length > 0 ? { limits: limits as never } : {}),
         });

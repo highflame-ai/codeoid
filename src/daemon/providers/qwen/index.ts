@@ -34,7 +34,8 @@ import { query, type Query, type SDKMessage, type SDKUserMessage } from "@qwen-c
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
 import { buildMemoryMcpServer, MEMORY_TOOL_NAMES, type MemoryEngine } from "../../memory/index.js";
@@ -58,6 +59,10 @@ import { buildQwenEnv, withExtraEnv } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { ResolvedAccount } from "../../accounts.js";
 import { qwenAccountEnv } from "../../account-apply.js";
+import { preparePrivateHome, QWEN_HOME_LAYOUT, withLoginsSynced } from "../../sandbox/backend-home.js";
+import { programLocations } from "../../sandbox/policy.js";
+import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
+import type { SandboxHandle } from "../../sandbox/types.js";
 
 /** Where qwen-code persists a qwen.ai subscription login. */
 const QWEN_OAUTH_CREDS = join(homedir(), ".qwen", "oauth_creds.json");
@@ -73,6 +78,8 @@ interface PendingTool {
 }
 
 export interface QwenProviderInit {
+  /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448): the CLI the SDK spawns starts inside it. */
+  sandbox?: () => SandboxRuntime | null;
   sessionId: string;
   /** Persisted backing id from Store, or the session id itself on first run. */
   initialBackingId: string;
@@ -127,6 +134,8 @@ export class QwenProvider implements SessionProvider {
   #builtAccount = "";
   /** The thinking effort the live query runs at (#417); "" = the SDK's default. */
   #builtEffort = "";
+  /** The OS sandbox the running query's CLI starts in (#448): closed when the query is replaced. */
+  #sandboxHandle: SandboxHandle | null = null;
   /** Bumped on every (re)build so an orphaned consumer can't clobber the new loop. */
   #loopGeneration = 0;
 
@@ -320,6 +329,9 @@ export class QwenProvider implements SessionProvider {
   async teardown(): Promise<void> {
     this.#inputQueue?.close();
     this.#abortController?.abort();
+    // The CLI's sandbox goes with it (#448).
+    void this.#sandboxHandle?.close();
+    this.#sandboxHandle = null;
     if (this.#query) {
       try {
         await this.#query.close();
@@ -438,6 +450,22 @@ export class QwenProvider implements SessionProvider {
     this.#currentApiKey = account ? (account.account.token ?? null) : (process.env.OPENAI_API_KEY ?? null);
     this.#onAccount = account !== null;
 
+    const qwenEnv = withExtraEnv(
+      {
+        ...buildQwenEnv(),
+        // An account's key, and none of the daemon's (blanked: the SDK merges over process.env).
+        // An account: its key and its own home, and none of the daemon's keys.
+        ...(account ? qwenAccountEnv(account, buildQwenEnv()) : {}),
+        ...(baseUrl ? { OPENAI_BASE_URL: baseUrl } : {}),
+        ...(model ? { OPENAI_MODEL: model } : {}),
+      },
+      init.extraEnv,
+    );
+    // The OS sandbox (#448): the SDK spawns a launcher that starts its CLI
+    // inside the session's sandbox. The last query's sandbox goes with it.
+    const sandboxed = qwenExecutableOption(init.sandbox?.() ?? null, qwenCfg?.command, qwenEnv);
+    void this.#sandboxHandle?.close();
+    this.#sandboxHandle = sandboxed.handle ?? null;
     this.#query = query({
       prompt: this.#inputQueue,
       options: {
@@ -447,24 +475,14 @@ export class QwenProvider implements SessionProvider {
         // this over process.env rather than replacing it (see buildQwenEnv).
         // The caller's extra env goes on last; withExtraEnv refuses every
         // OPENAI_/QWEN_/DASHSCOPE_ and credential-shaped key, so it can't
-        // undo the blanking or the account.
-        env: withExtraEnv(
-          {
-            ...buildQwenEnv(),
-            // An account's key, and none of the daemon's (blanked: the SDK merges over process.env).
-            // An account: its key and its own home, and none of the daemon's keys.
-            ...(account ? qwenAccountEnv(account, buildQwenEnv()) : {}),
-            ...(baseUrl ? { OPENAI_BASE_URL: baseUrl } : {}),
-            ...(model ? { OPENAI_MODEL: model } : {}),
-          },
-          init.extraEnv,
-        ),
+        // undo the blanking or the account. Sandboxed: its private home.
+        env: sandboxed.env ?? qwenEnv,
         authType,
         ...(model ? { model } : {}),
         // qwen-code takes a LIST of capacity fallbacks (max 3), where the
         // Claude SDK takes a single id; codeoid tracks one, so wrap it.
         ...(opts.fallbackModel ? { fallbackModel: [opts.fallbackModel] } : {}),
-        ...(qwenCfg?.command ? { pathToQwenExecutable: qwenCfg.command } : {}),
+        ...(sandboxed.pathToQwenExecutable ? { pathToQwenExecutable: sandboxed.pathToQwenExecutable } : {}),
         // codeoid's gate is the only approval authority. `default` keeps
         // read-only tools uncontrolled and routes every write through
         // canUseTool; qwen-code's own `auto` mode would silently auto-approve
@@ -1170,4 +1188,41 @@ export function extractToolResultText(content: unknown): string {
 /** codeoid's effort scale on qwen-code's (#417): it has no Off or Minimal — both are its lowest, Low. */
 export function qwenEffort(effort: EffortLevel): "low" | "medium" | "high" | "xhigh" | "max" {
   return effort === "off" || effort === "minimal" ? "low" : effort;
+}
+
+/**
+ * The argv the Qwen SDK would spawn its CLI with (its `pathToQwenExecutable`
+ * rules): the bundled CLI run by this runtime when none is configured, a
+ * script run by it, a name looked up on PATH, a native binary as is.
+ */
+export function qwenCliArgv(configured: string | undefined): string[] {
+  if (!configured) {
+    const pkg = createRequire(import.meta.url).resolve("@qwen-code/sdk/package.json");
+    return [process.execPath, join(dirname(pkg), "dist", "cli", "cli.js")];
+  }
+  if (!configured.includes("/")) return [Bun.which(configured) ?? configured];
+  const abs = resolvePath(configured);
+  return /\.(?:m?js|cjs)$/i.test(abs) ? [process.execPath, abs] : [abs];
+}
+
+/**
+ * The SDK's `pathToQwenExecutable` (#448): with the session's sandbox
+ * around the process, a launcher that starts the CLI inside it, in a private
+ * copy of its home (backend-home.ts: its login a private copy written back
+ * when the handle closes, its sessions the session's own; `env` gets `QWEN_HOME`), and the handle it runs in (the caller
+ * closes it when the query is replaced); else the configured command, or
+ * none (the bundled CLI). One launcher per session, rewritten in place.
+ */
+export function qwenExecutableOption<E extends Record<string, string | undefined>>(
+  rt: SandboxRuntime | null,
+  configured: string | undefined,
+  env: E,
+): { pathToQwenExecutable?: string; env?: E & { QWEN_HOME: string }; handle?: SandboxHandle } {
+  if (!rt?.plan.wrapsBackend) return configured ? { pathToQwenExecutable: configured } : {};
+  const argv = qwenCliArgv(configured);
+  const own = preparePrivateHome(env.QWEN_HOME || join(env.HOME || homedir(), ".qwen"), rt.privateHome("qwen"), QWEN_HOME_LAYOUT, { state: rt.stateDir("qwen") });
+  const withHome = { ...env, QWEN_HOME: own.home };
+  // Closed when the query is replaced or torn down: a login the CLI refreshed is written back then.
+  const handle = withLoginsSynced(rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(argv[0] ?? "", argv.slice(1))] }), own, rt.warn);
+  return { pathToQwenExecutable: rt.launcher(handle, argv, Object.keys(withHome), "qwen"), env: withHome, handle };
 }

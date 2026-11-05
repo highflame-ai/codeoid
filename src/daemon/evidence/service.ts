@@ -8,12 +8,12 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdtempSync, readdirSync, rmSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readdirSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
-import { runCheck } from "./runner.js";
+import { type RunCheckOptions, runCheck } from "./runner.js";
 import type { EvidenceStore, EvidenceTenant } from "./store.js";
 import type { CheckOutcome, CheckSpec, EvidenceOwnerKind, EvidenceRecord } from "./types.js";
+import { daemonTempDir } from "../sandbox/root.js";
 
 /** Who the evidence is for and what it judged. */
 export interface EvidenceContext {
@@ -23,6 +23,8 @@ export interface EvidenceContext {
   /** The tree the check judged, when the caller pinned one. */
   candidateDigest?: string | null;
   signal?: AbortSignal;
+  /** The OS sandbox the check runs in, or why it can't (#448; RunCheckOptions.sandbox). */
+  sandbox?: RunCheckOptions["sandbox"];
 }
 
 /** A check run through the service: its outcome, and the stored record when
@@ -83,7 +85,7 @@ export class EvidenceService {
     this.#live.set(key, live);
     this.#liveDirs.add(relDir);
     try {
-      const outcome = await runCheck(spec, { cwd, artifactDir, signal: ac.signal });
+      const outcome = await runCheck(spec, { cwd, artifactDir, signal: ac.signal, ...(ctx.sandbox ? { sandbox: ctx.sandbox } : {}) });
       const record = this.#store.insert(relDir, {
         ...outcome,
         accountId: ctx.tenant.accountId,
@@ -205,7 +207,7 @@ function safeReaddir(dir: string): string[] {
  * artifact paths do not.
  */
 export const ephemeralCheck: CheckRunner = async (spec, cwd) => {
-  const artifactDir = mkdtempSync(join(tmpdir(), "codeoid-evidence-"));
+  const artifactDir = daemonTempDir("codeoid-evidence-");
   try {
     return { outcome: await runCheck(spec, { cwd, artifactDir }) };
   } finally {

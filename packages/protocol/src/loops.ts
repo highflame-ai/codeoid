@@ -15,6 +15,8 @@
  * theirs, by id or in a list.
  */
 
+import type { SessionSandboxSetting } from "./types.js";
+
 export interface LoopCheckWire {
   /** Stable id within the run (defaults to `check1`, `check2`, …). */
   id?: string;
@@ -144,6 +146,8 @@ export interface LoopStartMsg {
   checks: LoopCheckWire[];
   provider?: string;
   model?: string;
+  /** The worker's OS sandbox (#448); absent = the daemon's. A worker whose sandbox can't hold doesn't start. */
+  sandbox?: SessionSandboxSetting;
   toolBudget?: number;
   limits?: Partial<LoopLimitsWire>;
 }

@@ -8,6 +8,7 @@
  *   - ZeroID JWT verification on every connection
  */
 
+import type { SandboxRegistry } from "./sandbox/registry.js";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { ZeroIdVerifier, type AuthConfig } from "./auth.js";
@@ -205,6 +206,12 @@ export interface DaemonConfig {
    * Absent or `enabled: false` = not mounted (the path 404s).
    */
   mcpControl?: McpControlConfig;
+  /**
+   * The OS sandbox providers sessions run their commands in (#448).
+   * `codeoid start` passes the daemon's; absent (tests, embedders) =
+   * sessions aren't sandboxed and carry no `sandbox` in their info.
+   */
+  sandboxRegistry?: SandboxRegistry;
 }
 
 interface AuthenticatedSocket {
@@ -357,6 +364,7 @@ export class DaemonServer {
         // it is what distinguishes two daemons on one machine, and it survives
         // restarts so a daemon still recognises its own crashed run.
         daemonId: `${this.#config.host}:${this.#config.port}`,
+        ...(config.sandboxRegistry ? { sandboxRegistry: config.sandboxRegistry } : {}),
       },
     );
 
@@ -1087,6 +1095,23 @@ export class DaemonServer {
 
   async stop(): Promise<void> {
     await this.#shutdown.shutdown("manual");
+  }
+
+  /**
+   * After a {@link start} that failed (its port taken, say): close what start
+   * opened before it failed, memory above all, whose embedding worker torn
+   * down with native work pending crashes Bun (#453), and nothing else. Not
+   * {@link stop}: its steps remove this port's local-mode token, which on a
+   * taken port is the running daemon's.
+   */
+  async abortStart(): Promise<void> {
+    const memory = this.#memory;
+    this.#memory = null;
+    try {
+      await memory?.close();
+    } catch (err) {
+      console.error(`[codeoid] closing memory after a failed start failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /** Complete an MCP server sign-in from the provider's redirect, and tell

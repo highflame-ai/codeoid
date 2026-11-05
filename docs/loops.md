@@ -83,7 +83,8 @@ A run id can be shortened to any unambiguous prefix.
 The worker is an ordinary session you can attach to and watch.
 It has one driver, its run: anything you type into it becomes steering for the run instead of a second conversation.
 While the run is in progress its mode, model, backend, account and effort can't be changed, and it can't be rewound, rotated or destroyed; that holds while the run is paused too, and ends when the run ends (cancel it to end it now).
-Approving a tool call in it works as usual, but not with a delegated token; while an approval waits, the run is `waiting` and its attempt clock is stopped.
+An attempt runs autonomously in the loop's sandbox and waits on no one ([approvals.md](approvals.md#autonomous-mode)): a command of any risk level runs, and what the sandbox can't be left to hold (a command asking to run outside it, a file tool writing the repository's git structure or project settings, a search reaching a credential directory) is refused at once, the worker told why. Only a question the worker asks you, or a fleet dispatch, waits for an answer.
+Approving such a call works as usual, but not with a delegated token; while an approval waits, the run is `waiting` and its attempt clock is stopped.
 Once the run ends the worker becomes an ordinary session again; destroying it removes the run's worktree without committing what's left in it (the branch stays).
 After a daemon restart the run continues with a new worker session, which is told the objective and the rules again; the old one is kept but can't remove the worktree while the run is in progress.
 

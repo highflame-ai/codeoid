@@ -10,7 +10,7 @@
 
 import { Component, Show, createEffect, createSignal, on, onCleanup, onMount } from "solid-js";
 
-import { readLocalModeToken, rememberedApiKey, rememberedOAuthToken } from "./lib/auth";
+import { readLocalModeToken, redeemLocalLink, rememberedApiKey, rememberedOAuthToken } from "./lib/auth";
 import { consumeHandoffCredential, readEmbedAllowedOrigins } from "./lib/handoff";
 import { installEmbedSessionRefresh } from "./lib/embed-refresh";
 import SignIn from "./components/SignIn";
@@ -20,6 +20,7 @@ import {
   bootstrap,
   connectionStatus,
   newRequestId,
+  reportBootError,
   send,
   ZEROID_URL,
 } from "./state/connection";
@@ -42,6 +43,16 @@ const App: Component = () => {
   installApprovalNotifications();
 
   onMount(async () => {
+    // Local mode: a one-time link (the daemon's start banner, `codeoid ui`)
+    // signs this browser in — its code is exchanged once for the token, which
+    // the page never carries (#448 round 4). Taken out of the URL either way.
+    let linked: string | null = null;
+    try {
+      linked = await redeemLocalLink();
+    } catch (err) {
+      reportBootError(err instanceof Error ? err.message : String(err));
+    }
+
     // Embed SSO: an embedding parent (e.g. Highflame Studio) may pre-authenticate
     // this UI by handing a SHORT-LIVED credential via the URL hash. Consume it
     // FIRST — the helper persists it to storage and strips it from the URL — so
@@ -54,11 +65,12 @@ const App: Component = () => {
 
     const savedKey = rememberedApiKey();
     const savedToken = rememberedOAuthToken();
-    // A daemon in local mode injected its token into this page. That is
-    // authoritative about which credential the daemon will accept, so it beats
-    // everything else — including a stored ZeroID key from a previous session,
-    // which would exchange successfully and then be rejected on the handshake.
-    const localToken = readLocalModeToken();
+    // A local-mode daemon's token (just signed in by a link, or kept from one).
+    // That is authoritative about which credential the daemon will accept, so
+    // it beats everything else — including a stored ZeroID key from a previous
+    // session, which would exchange successfully and then be rejected on the
+    // handshake.
+    const localToken = linked ?? readLocalModeToken();
 
     // A freshly handed-in credential beats a stored one: a handed-in api key
     // exchanges for a fresh JWT; a handed-in token is used directly. Otherwise

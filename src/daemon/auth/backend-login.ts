@@ -37,7 +37,6 @@ import {
   constants as fsConstants,
   createWriteStream,
   existsSync,
-  mkdtempSync,
   openSync,
   readdirSync,
   readFileSync,
@@ -50,6 +49,7 @@ import { stripClaudeCredentials } from "../claude-accounts.js";
 import { buildSubprocessEnv } from "../providers/env.js";
 import { resolveCodexCommand } from "../providers/codex/resolve.js";
 import { isCodexCredentialVar } from "../account-apply.js";
+import { daemonTempDir, sandboxRootsIn } from "../sandbox/root.js";
 
 /** Longest we hold a started attempt open before killing it. */
 const ATTEMPT_TTL_MS = 10 * 60_000;
@@ -348,7 +348,8 @@ export class BackendLoginBroker {
     const superseded = this.#byBackend.get(backend);
     if (superseded) this.cancel(superseded);
 
-    const isolatedDir = opts.isolated ? mkdtempSync(join(tmpdir(), ISOLATED_DIR_PREFIX)) : undefined;
+    // Under the daemon's private root, which every sandbox hides (Claude's own, which keeps the host's /tmp, too).
+    const isolatedDir = opts.isolated ? daemonTempDir(ISOLATED_DIR_PREFIX) : undefined;
     let child: ChildProcess;
     let input: PtyInput;
     try {
@@ -665,7 +666,11 @@ export class BackendLoginBroker {
  * never touched.
  */
 function sweepStaleIsolatedDirs(): void {
-  const root = tmpdir();
+  // In the temp dir (where they were made before #448 round 2) and in every daemon's private root.
+  for (const root of [tmpdir(), ...sandboxRootsIn()]) sweepStaleIn(root);
+}
+
+function sweepStaleIn(root: string): void {
   let names: string[];
   try {
     names = readdirSync(root);
@@ -737,7 +742,7 @@ function spawnUnderPty(file: string, args: string[], flow: LoginFlow, isolatedHo
     process.platform === "darwin"
       ? ["-q", "/dev/null", ...sized]
       : ["-q", "-e", "-c", shellQuote(sized), "/dev/null"];
-  const pipeDir = mkdtempSync(join(tmpdir(), INPUT_DIR_PREFIX));
+  const pipeDir = daemonTempDir(INPUT_DIR_PREFIX);
   const fifo = join(pipeDir, "in");
   const made = spawnSync("mkfifo", ["-m", "600", fifo]);
   if (made.status !== 0) {

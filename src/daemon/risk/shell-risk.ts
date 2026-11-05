@@ -50,8 +50,7 @@ export interface ShellRisk {
   secret?: { action: "deny" | "ask"; path: string };
   /**
    * Nothing of the command could be read (the parser isn't there, the line is
-   * too long, the call holds no command): it asks even where `unknown` is
-   * let through (`approvals.askOnUnknown: false`).
+   * too long, the call holds no command): not understood, as `unknown` is.
    */
   unreadable?: true;
 }

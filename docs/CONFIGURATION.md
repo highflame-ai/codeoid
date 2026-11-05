@@ -106,6 +106,14 @@ CODEOID_MCP_CONTROL_ACTIONS=false       # also allow create / send / interrupt /
 CODEOID_ROUTINES_ENABLED=true           # run the scheduler and accept routine commands
 CODEOID_ROUTINES_MAX_CONCURRENT=2       # routine runs executing at once, across all routines
 
+# OS sandbox for agents' commands — see docs/sandbox.md. On by default.
+CODEOID_SANDBOX=auto                    # auto | bwrap | seatbelt | docker | off
+CODEOID_SANDBOX_NETWORK=on              # on | off | allowlist
+CODEOID_SANDBOX_ALLOWED_HOSTS=          # with allowlist: github.com,*.npmjs.org
+CODEOID_SANDBOX_HIDDEN_PATHS=           # more paths to hide: ~/work/.env
+CODEOID_SANDBOX_HOME_READABLE=          # replaces the home allowlist: ~/.bun,~/.cargo/bin,~/.gitconfig
+CODEOID_SANDBOX_DOCKER_IMAGE=node:22-bookworm-slim
+
 # Forks, backend switches and rewinds (docs/FEATURES.md#how-a-fork-switch-or-rewind-carries-the-conversation)
 CODEOID_NATIVE_CONTINUATION=true        # hand Claude/Codex the conversation in their own form; false = text transcript
 
@@ -215,6 +223,33 @@ The opencode backend (opencode 2.2.5 or a later 2.2.x) is on by default when an 
 - `hostedModels` (`CODEOID_OPENCODE_HOSTED_MODELS`) — offer opencode's own hosted models (provider `opencode`: opencode.ai / Zen, its free no-key models included) and let opencode fetch its model catalog from opencode.ai. Default `false`: they aren't offered, listed or picked as a default, your opencode config can't enable them, and a session's code only goes to providers codeoid or your opencode config gave a credential for (docs/opencode.md, *opencode's hosted models*).
 - Credentials are codeoid's own: its `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `GOOGLE_API_KEY` (or `GEMINI_API_KEY`), each sent to the gateway its `*_BASE_URL` names when one does, its Qwen backend on an API key or its default account (`providers.qwen`, as provider `qwen`), and its OpenAI-compatible endpoints (as `oai-<name>`). codeoid writes each to a file only it can read and names the file in opencode's config; the files are removed when the server stops, and a daemon that's gone has its files removed when another starts (each daemon keeps its own). The opencode server's environment carries no key, nor a proxy URL with credentials in it. Sign-ins stored in codeoid's opencode database (`OPENCODE_DB=<that path> opencode auth login`) work too. `codeoid account` doesn't apply to it.
 - Every setting here is read when the daemon starts; change one, then restart the daemon (the settings UI says so).
+
+### OS sandbox
+
+Agents' commands run in an OS sandbox, on by default ([sandbox.md](sandbox.md)): the workspace and a private temp dir writable, everything else read-only, your home hidden whole but for a read-only allowlist, credential stores hidden, container sockets unreachable.
+
+```json
+{
+  "sandbox": {
+    "provider": "auto",
+    "network": "on",
+    "allowedHosts": [],
+    "hiddenPaths": ["~/work/.env"],
+    "homeReadable": ["~/.bun", "~/.cargo/bin", "~/.gitconfig", "~/.volta"],
+    "bwrapPath": "/usr/bin/bwrap",
+    "docker": { "image": "node:22-bookworm-slim", "runtime": "runsc" }
+  }
+}
+```
+
+- `provider` (`CODEOID_SANDBOX`) — `auto` (bubblewrap on Linux, Seatbelt on macOS), `bwrap`, `seatbelt`, `docker`, or `off`. The default for new sessions; each session can choose its own (`codeoid new --sandbox …`, the new-session dialog, `/sandbox`), and turning one off is asked of its owner.
+- `network` (`CODEOID_SANDBOX_NETWORK`) — `on`, `off` or `allowlist`; `allowedHosts` (`CODEOID_SANDBOX_ALLOWED_HOSTS`) for the allowlist. Only Claude's own sandbox enforces an allowlist; elsewhere it means no network, and the session says so.
+- `hiddenPaths` (`CODEOID_SANDBOX_HIDDEN_PATHS`) — more paths to hide, on top of codeoid's data, the agent CLIs' logins and the usual credential stores (`~` expands). An entry here also beats `homeReadable`.
+- `homeReadable` (`CODEOID_SANDBOX_HOME_READABLE`, comma separated) — what of your home a sandboxed command may read (read-only); the rest of the home isn't there. Default: toolchains and tool settings that hold no secret (`~/.bun`, `~/.cargo/bin`, `~/.cargo/registry`, `~/.cargo/git`, `~/.rustup`, `~/.nvm`, `~/.npm`, `~/.local/bin`, `~/.local/lib`, `~/.local/share/{pnpm,uv,pipx,mise}`, `~/.local/share/claude/versions`, `~/.pyenv`, `~/go/pkg`, `~/go/bin`, `~/.gitconfig`, `~/.config/git/{config,ignore,attributes}`); a link in one of these works only where it leads into the list (or outside the home): what it leads to elsewhere in the home stays hidden. Setting it replaces the list: never add a file holding a token (`~/.npmrc`).
+- Every `sandbox.*` change through `settings.set` needs an undelegated token, and is audited old → new.
+- `bwrapPath` — the bubblewrap binary (default: on `PATH`). Claude Code's own sandbox on Linux also needs `socat`.
+- `docker.image` (`CODEOID_SANDBOX_DOCKER_IMAGE`) and `docker.runtime` — what a Docker sandbox runs, and `runsc` for gVisor.
+- Where the sandbox can't run, interactive sessions run unsandboxed and say so on every approval; autonomous sessions, routines and loops refuse to start. `codeoid sandbox providers` shows what runs here.
 
 ### One daemon per data directory
 
@@ -397,7 +432,7 @@ Choosing `default` explicitly pins a session to the built-in account, so it stay
 Applying an account removes every competing Claude credential or provider variable before setting its own (all of `ANTHROPIC_*` except model settings, every `CLAUDE_CODE_USE_*` provider switch, token file descriptors, and the like), so a stray `ANTHROPIC_API_KEY` can't take over a subscription session.
 A named account also refuses to run in a workdir whose own Claude settings (`.claude/settings.json` or `settings.local.json`, in the workdir or a parent below your home directory) set a credential variable such as `ANTHROPIC_BASE_URL` or `ANTHROPIC_BEDROCK_BASE_URL`, or a credential helper (`apiKeyHelper`, `awsAuthRefresh`, `otelHeadersHelper`, …), since a cloned repo could otherwise send the account's token to a host of its choosing.
 Those files are read as the Claude CLI reads them (a byte-order mark or UTF-16 makes no difference), and one codeoid can't parse is refused rather than skipped.
-The CLI also re-reads them while a turn runs, so on a named account an agent's edit to a Claude settings file always waits for your approval, in every mode; a shell command that writes one can't be checked this way.
+The CLI also re-reads them while a turn runs, so on a named account an agent's edit to a Claude settings file always waits for your approval, and is refused in autonomous mode, which waits on no one; a shell command that writes one can't be checked this way.
 A Bedrock account also refuses every `AWS_*` variable there but the region (a repo's own AWS config file can name an endpoint that receives the token) and every `OTEL_*` variable (where its telemetry, and the telemetry key, go and what they carry).
 Switching a session's account, or replacing or removing the account it runs on, stops the session's Claude process if it is idle, so no process keeps running on the old credential.
 A session whose account was removed refuses to run until you switch it, rather than falling back to another credential.

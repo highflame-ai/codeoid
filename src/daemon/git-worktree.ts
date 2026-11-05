@@ -34,26 +34,28 @@ import { execFile } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, realpathSync, type Stats, unlinkSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
-import { GIT_BIN, gitEnv, hardenedGit } from "./git-env.js";
+import { GIT_BIN, hardenedGit, safeGitEnv } from "./git-env.js";
 
 const execFileP = promisify(execFile);
 
 /**
- * Run git in `cwd`. Generous buffer for large `worktree list` output. Hooks
- * and fsmonitor are off: the daemon runs these on the user's behalf, and a
- * repo the agent can write to must not get code run by them (a
- * `post-checkout` hook would fire on every fork).
+ * Run git in `cwd`. Generous buffer for large `worktree list` output. Nothing
+ * the repository's config names runs (git-env.ts `safeGitEnv`): the daemon
+ * runs these on the user's behalf, and a repo the agent can write to must
+ * not get code run by them — a `post-checkout` hook on every fork, a filter
+ * driver or fsmonitor when a session is destroyed and its work snapshotted.
  */
 async function git(args: string[], cwd: string): Promise<string> {
   return plainGit(args, cwd);
 }
 
 async function plainGit(args: string[], cwd: string): Promise<string> {
-  const { stdout } = await execFileP(GIT_BIN, ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args], {
+  const { stdout } = await execFileP(GIT_BIN, args, {
     cwd,
-    // An agent's config can make git run a command (a filter on checkout);
-    // it gets an agent's environment, never the daemon's.
-    env: gitEnv({}, { network: true }),
+    // An agent's config can make git run a command (a filter on checkout): none
+    // does, and git gets an agent's environment, never the daemon's. A remote
+    // over https or ssh only (a base branch fetched, a partial clone's objects).
+    env: await safeGitEnv(cwd, { network: true }),
     timeout: 120_000,
     maxBuffer: 64 * 1024 * 1024,
   });

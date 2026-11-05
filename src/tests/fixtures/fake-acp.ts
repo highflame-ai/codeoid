@@ -92,6 +92,33 @@ async function runTurn(sessionId: string, prompt: string): Promise<string> {
     return "end_turn";
   }
 
+  if (prompt.startsWith("read-file:")) {
+    // What this process can read at a path (the OS sandbox tests, #448).
+    let text: string;
+    try {
+      text = `CONTENT:${(await Bun.file(prompt.slice("read-file:".length).trim()).text()).trim()}`;
+    } catch (err) {
+      text = `UNREADABLE:${err instanceof Error ? err.message : String(err)}`;
+    }
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+    return "end_turn";
+  }
+  if (prompt.startsWith("write-file:")) {
+    // Whether this process can write a path (`write-file:<path>`; the OS sandbox tests, #448 round 1).
+    let text: string;
+    try {
+      await Bun.write(prompt.slice("write-file:".length).trim(), "WRITTEN-BY-BACKEND\n");
+      text = "WROTE";
+    } catch (err) {
+      text = `UNWRITABLE:${err instanceof Error ? err.message : String(err)}`;
+    }
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+    return "end_turn";
+  }
+  if (prompt.startsWith("echo-env:")) {
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `ENV:${process.env[prompt.slice("echo-env:".length).trim()] ?? ""}` } });
+    return "end_turn";
+  }
   if (prompt.includes("echo-prompt")) {
     update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `PROMPT:${prompt}` } });
     return "end_turn";

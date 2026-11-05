@@ -440,6 +440,7 @@ describe("driving a session end to end", () => {
     await call(ep, "tok-owner", "send_message", { session: s.id, text: "first", wait: true });
     const r = await call(ep, "tok-owner", "send_message", { session: s.id, text: "clean the build", wait: true });
     expect(r.data.outcome).toBe("waiting_approval");
+    // waiting_approval is set when the gate parks the call, so the approval is already there.
     const info = await call(ep, "tok-owner", "get_session", { session: s.id });
     expect(info.data.pendingApprovals).toEqual([{ approvalId: "appr-rm", tool: "Bash" }]);
     // The only way out is the owner's own approval flow — still parked.

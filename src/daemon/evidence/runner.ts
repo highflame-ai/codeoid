@@ -47,6 +47,12 @@ export interface RunCheckOptions {
   signal?: AbortSignal;
   killGraceMs?: number;
   maxArtifactBytes?: number;
+  /**
+   * The OS sandbox the check runs in (#448): the argv and env that run
+   * `sh -c <command>` inside it, or why the one asked for can't run (then the
+   * check doesn't, and is an `error`). Absent: an ordinary child process.
+   */
+  sandbox?: { wrap: (argv: readonly string[], o: { cwd: string; env: Record<string, string> }) => { argv: string[]; env: Record<string, string> } } | { refused: string };
 }
 
 /** sha256 of a check's definition. Two runs with the same digest ran the same
@@ -243,7 +249,7 @@ export async function runCheck(spec: CheckSpec, opts: RunCheckOptions): Promise<
     criterionId: spec.id,
     verifierDigest: verifierDigest(spec),
     environment: environmentOf(spec),
-    isolation: "process" as const,
+    isolation: opts.sandbox && "wrap" in opts.sandbox ? ("sandbox" as const) : ("process" as const),
     command: spec.command,
   };
   const finish = (
@@ -262,6 +268,7 @@ export async function runCheck(spec: CheckSpec, opts: RunCheckOptions): Promise<
     finish({ result, reason, exitCode: null, signal: null, timedOut: false });
 
   if (opts.signal?.aborted) return notRun("cancelled", "cancelled before it started");
+  if (opts.sandbox && "refused" in opts.sandbox) return notRun("error", `not run: not sandboxed: ${opts.sandbox.refused}`);
   if (!existsSync(opts.cwd) || !statSync(opts.cwd).isDirectory()) {
     return notRun("error", `the working directory does not exist: ${opts.cwd}`);
   }
@@ -277,9 +284,12 @@ export async function runCheck(spec: CheckSpec, opts: RunCheckOptions): Promise<
   const err = new CapturedStream("stderr", opts.artifactDir, max, scan);
   const grace = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
 
-  const child = spawn("sh", ["-c", spec.command], {
+  const env = { ...checkEnv(), ...(spec.env ?? {}) };
+  const run = opts.sandbox && "wrap" in opts.sandbox ? opts.sandbox.wrap(["sh", "-c", spec.command], { cwd: opts.cwd, env }) : { argv: ["sh", "-c", spec.command], env };
+  const [bin = "sh", ...args] = run.argv;
+  const child = spawn(bin, args, {
     cwd: opts.cwd,
-    env: { ...checkEnv(), ...(spec.env ?? {}) },
+    env: run.env,
     stdio: ["ignore", "pipe", "pipe"],
     // Its own process group, so killGroup reaches everything it spawns.
     detached: true,

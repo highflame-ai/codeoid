@@ -22,6 +22,7 @@
  */
 
 import type { LoopCheckWire, LoopLimitsWire, LoopStatusWire } from "./loops.js";
+import type { SessionSandboxSetting } from "./types.js";
 
 // ── Shapes ────────────────────────────────────────────────────────────────────
 
@@ -39,6 +40,8 @@ export interface RoutineSpecWire {
   workdir: string;
   provider?: string;
   model?: string;
+  /** OS sandbox for its runs (#448); absent = the daemon's. A run whose sandbox can't hold doesn't start. */
+  sandbox?: SessionSandboxSetting;
   /** Absent = runs only when fired (API or manual). */
   schedule?: RoutineScheduleWire;
   /** Pre-run gate: no output → silent run, no agent; non-zero exit → failed run, no agent. */
@@ -141,8 +144,8 @@ export interface RoutineWire {
   pausedReason?: string;
   ownerSub: string;
   /** The full configuration, defaults filled in. */
-  spec: Required<Omit<RoutineSpecWire, "provider" | "model" | "schedule" | "check" | "maxCostUsd" | "dailyCostUsd" | "loop">> &
-    Pick<RoutineSpecWire, "provider" | "model" | "schedule" | "check" | "maxCostUsd" | "dailyCostUsd"> & {
+  spec: Required<Omit<RoutineSpecWire, "provider" | "model" | "schedule" | "check" | "maxCostUsd" | "dailyCostUsd" | "loop" | "sandbox">> &
+    Pick<RoutineSpecWire, "provider" | "model" | "schedule" | "check" | "maxCostUsd" | "dailyCostUsd" | "sandbox"> & {
       /** Present on a loop routine. */
       loop?: RoutineLoopSpecWire;
     };

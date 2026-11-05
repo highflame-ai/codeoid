@@ -8,11 +8,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **Autonomous mode asks before writing outside the working directory** (#447).
-  A write, edit, delete or move whose target resolves outside the session's working directory (resolved as the kernel does, through dangling links too, `..` after a link taken physically; the temp dir counts as inside, less codeoid's own files there) asks in autonomous mode, on every backend, with the card saying where it lands.
-  For every backend's file tools this is a hard rule: a path that can't be resolved for certain counts as outside (none given, a file with several hard links, a link loop). For shell commands it is best-effort guidance, like the risk levels: a target the parser can name and place is judged the same way (`ln` counts what it links to), and one it can't place asks only when its text could plausibly leave the working directory (absolute, `~`, `..`, a variable or substitution, a line that sets `HOME`, a `cd` that may lead anywhere), so `rm -f *.log`, `cp -r src dist`, `cd src && sed -i … index.ts` and `find src -exec sed -i … {} \;` run unasked. The real boundary for a shell command is the OS sandbox (#448); docs/approvals.md lists what the shell reader doesn't see. On Claude and opencode, whose shells run with no `CDPATH`, `cd src && …` is followed to where it leads; Claude's `Monitor` command is judged as a shell command. The Gemini CLI's edits are judged by the files its approval request names.
-  Reads and searches outside it, and guarded and interactive mode, are unchanged; an unattended run parks on such a write for your approval, as on a high-risk command.
-  See [docs/approvals.md](docs/approvals.md#writes-outside-the-working-directory).
+- **Agents' commands run in an OS sandbox, on by default** (#448).
+  The workspace and a private temp dir are writable; everything else is read-only (`rm -rf ~` fails with "Read-only file system"); codeoid's config and data, every agent CLI's login, `~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.config/gh`, `~/.netrc`, `~/.git-credentials`, keyrings and the paths in `sandbox.hiddenPaths` aren't there at all; container runtime sockets can't be reached; the network is `on`, `off` or an `allowlist`, per session.
+  bubblewrap on Linux and Seatbelt on macOS (`auto`), or Docker when chosen, behind one pluggable provider interface ([docs/sandbox-providers.md](docs/sandbox-providers.md), with what Forge needs to slot in).
+  Claude runs its commands in Claude Code's own sandbox with codeoid's policy (it can hold a host allowlist); Codex runs its workspace-write sandbox inside codeoid's bubblewrap, so in autonomous mode its sandbox is the boundary; pi, the Gemini CLI and Qwen Code run whole inside the session's sandbox; opencode runs each shell line in the calling session's sandbox; HTTP backends run no commands.
+  A daemon-wide default (`sandbox.*`, `CODEOID_SANDBOX*`, the Sandbox settings tab), and per session: `codeoid new --sandbox`, the new-session dialog, `session.create`, `/sandbox`, `codeoid sandbox set`; routines and loops take one too, and forks keep their parent's. Turning a session's sandbox off or widening it is a confirm its owner answers on the session, in every mode, and audited; running one command outside it (Claude's unsandboxed retry, Codex asking for more) is asked in guarded and interactive mode and refused in autonomous mode.
+  Where the sandbox can't run, interactive sessions run and say "not sandboxed: <why>" on the session and on every approval; autonomous sessions, routines and loops refuse to start.
+  The session header, `codeoid ls`, approval cards (web, CLI, Telegram) show whether commands are sandboxed.
+  See [docs/sandbox.md](docs/sandbox.md): what is protected per provider and per backend, what isn't, and what remains to verify on macOS and with Docker.
+
+- **Autonomous mode never waits on approvals; the OS sandbox is its boundary** (#448).
+  An autonomous session, routine, loop or dispatched worker doesn't start without a sandbox that runs (or its owner's own choice to turn it off), so inside it a shell command of any risk level runs unasked, high and not understood included, and a write lands wherever it leads, outside the working directory too; risk levels are information there (on cards in guarded mode, in the audit log).
+  What the sandbox can't be left to hold is refused at once instead of asked, the agent told what was refused and that the owner can do it or switch the session to guarded mode, with an info line in the transcript and an audit entry (`session.autonomous_refuse`): a command asking to run outside the sandbox or to widen it, a file tool writing the repository's git structure or project settings, a write to a Claude settings file on a named account, a search or command reaching a directory that holds credentials, and a path a backend couldn't resolve for certain. Credential reads stay refused in every mode.
+  A question to the owner (`AskUserQuestion`) and a fleet dispatch still ask, so they are all an unattended run parks on.
+  When the autonomous tool budget runs out the session still goes back to guarded mode, and now says so at once: an info line ("Autonomous budget spent: now guarded, writes and commands will ask; raise the budget or switch back to autonomous."), `autonomousBudgetSpent` on the session's info, and a mode line in `codeoid ls`.
+  Guarded and interactive mode are unchanged. `approvals.askOnUnknown` no longer has an effect (still accepted).
+  See [docs/approvals.md](docs/approvals.md#autonomous-mode).
 
 - **A second daemon on the same data is refused** (#447).
   `codeoid start` locks each directory the daemon owns (its database's, transcripts and checkpoints, opencode's database and data dirs, memory's) before it opens anything, and a start on data another live daemon uses exits, naming that daemon (pid, host, port) and how to clear a stale lock, instead of running alongside it and corrupting both.
@@ -33,7 +44,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Approvals judge what a shell command does** (#431).
   Every shell command an agent wants to run is parsed (pipelines, chains, subshells, `bash -c`, `sudo`, `xargs`, `find -exec` and other wrappers seen through) and given a risk level: low, medium, high, or not understood.
   The levels are guidance drawn from reading the command line, not a sandbox.
-  High-risk commands (`rm -rf ~`, `git push --force`, `curl … | sh`, writes to start-up files, credential reads, `sudo`) and ones that can't be read ask in every mode, autonomous included, and a command naming one of codeoid's credential files is refused like the file tools, as a best effort: a command written in a way the reader doesn't recognise is medium instead.
+  High-risk commands (`rm -rf ~`, `git push --force`, `curl … | sh`, writes to start-up files, credential reads, `sudo`) and ones that can't be read ask in guarded mode (autonomous mode runs them in its OS sandbox, #448), and a command naming one of codeoid's credential files is refused like the file tools, as a best effort: a command written in a way the reader doesn't recognise is medium instead.
   Low is a strict allow-list (vetted read-only programs, no options that run or write, no `cd`, variables, assignments, loops or writing redirects, every path inside the workspace), so `approvals.autoAllowLowRisk`, which lets guarded mode run low-risk reads without asking, can't be tricked into running anything unusual.
   Everyday idioms (`IFS= read -r`, `PATH=…:$PATH`, `EDITOR=vim`, arithmetic on loop counters) are medium, not not-understood, so they don't stall unattended runs.
   The approval prompt shows the level and the reason on every surface, and rewind's "not undone by going back" list uses the same reading.
@@ -58,7 +69,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Now each session sees, on every backend, its directory's servers too: your own always, a project's once approved — in Claude Code (read only from your `~/.claude.json`), or in codeoid after reviewing the entry in full (the drawer's **Review & approve**, or `codeoid mcp approve`, which prints it and approves only with `--yes <fingerprint>`), bound to exactly the entry shown.
   Changes apply when you ask: the drawer shows "MCP servers changed", and **Refresh MCP servers** (`/mcp refresh`, `codeoid mcp refresh`) restarts the backend, which resumes the conversation; it waits for a running turn or background work, and picks up global changes (`claude mcp add -s user`) too.
   A server that answers with the MCP sign-in challenge is held back from that account's backends that would only get 401s, and the drawer says to adopt it.
-  Agents' file tools now ask before reading or writing `~/.claude.json` in every mode, since that is where Claude Code's approvals live.
+  Agents' file tools now ask before reading or writing `~/.claude.json` (autonomous mode refuses it), since that is where Claude Code's approvals live.
   docs/mcp-backends.md says which server reaches which backend, and why.
 
 - **Codex, the Gemini CLI and Qwen use OAuth MCP servers** (#396).
@@ -231,6 +242,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   require a pack; an explicit-`phases` plan cannot declare one.
 
 ### Fixed
+
+- **A refused tool call no longer shows as completed.**
+  When codeoid refused a call (a credential, a denial) and the backend then reported it finished, the card turned "completed" with the refusal as its output. It stays cancelled now, with the reason; a refused Edit or Write says so under its diff.
+- **A session shows "waiting approval" only once there is an approval to answer.**
+  It was set as the tool call started, a moment before the gate had the approval, so a client reacting to it (MCP control's `wait`) could find nothing pending.
 
 - **Stopping the daemon with memory on no longer crashes Bun.**
   Shutdown terminated the embedding model's worker thread, and doing that while onnxruntime held it (loading the model, running a batch, or with its native finalizers still pending) made Bun panic (`NAPI FATAL ERROR`, the daemon dying with SIGILL) before memory's store was closed and the data-dir lock released.

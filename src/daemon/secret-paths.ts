@@ -16,7 +16,8 @@
  * hop removed: the backend's process carries its credential in its
  * environment, and a file tool runs INSIDE that process.
  *
- * `~/.claude.json` is asked about, in every mode, rather than refused: it holds
+ * `~/.claude.json` is asked about (refused in autonomous mode, which waits on
+ * no one: Session#autonomousRefusal) rather than refused outright: it holds
  * MCP servers' literal tokens, and it is where the user's approvals of a
  * project's MCP servers live (#395) — an unprompted write could approve a
  * repo's servers for every backend, or add a global server for every
@@ -89,7 +90,7 @@ function isSecretConfigFile(name: string): boolean {
 }
 
 /** The agent CLIs' own stored logins. */
-function cliCredentialFiles(): string[] {
+export function cliCredentialFiles(): string[] {
   const home = homedir();
   const claudeDir = process.env.CLAUDE_CONFIG_DIR || join(home, ".claude");
   return [
@@ -142,6 +143,23 @@ export function registerSecretPaths(paths: { dirs?: readonly string[]; files?: r
 }
 
 const SQLITE_SIDECARS = ["", "-wal", "-shm", "-journal"];
+
+/**
+ * The credential locations backends registered ({@link registerSecretPaths}):
+ * dirs, and files with their SQLite sidecars. The OS sandbox hides them
+ * (sandbox/policy.ts).
+ */
+export function registeredSecretLocations(): { dirs: string[]; files: string[] } {
+  return {
+    dirs: [...REGISTERED_DIRS.keys()],
+    files: [...REGISTERED_FILES.keys()].flatMap((f) => SQLITE_SIDECARS.map((s) => `${f}${s}`)),
+  };
+}
+
+/** The dirs inside registered credential dirs that stay readable ({@link registerSecretPaths}'s `open`: opencode's tool output). */
+export function registeredOpenDirs(): string[] {
+  return [...REGISTERED_OPEN.keys()];
+}
 
 /**
  * `/proc/<pid>/environ`, `/proc/self/mem`, `/proc/<pid>/task/<tid>/fd/3`, …:

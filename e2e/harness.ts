@@ -109,6 +109,14 @@ export class Codeoid {
     return `http://127.0.0.1:${this.port}/ui/`;
   }
 
+  /** A one-time link that signs a browser in, asked for with the token as `codeoid ui` does (the page never carries it). */
+  async signInUrl(): Promise<string> {
+    const res = await fetch(`http://127.0.0.1:${this.port}/ui/local-link`, { method: "POST", headers: { Authorization: `Bearer ${this.token}` } });
+    const { code } = (await res.json()) as { code?: string };
+    if (!res.ok || !code) throw new Error(`no sign-in link from the daemon (${res.status})`);
+    return `${this.uiUrl}#codeoid-local-code=${code}`;
+  }
+
   get log(): string {
     return this.#log;
   }
@@ -228,7 +236,7 @@ export class Codeoid {
 
 /** Open the web UI on `codeoid` and wait until it's connected. */
 export async function openUi(page: Page, codeoid: Codeoid): Promise<void> {
-  await page.goto(codeoid.uiUrl);
+  await page.goto(await codeoid.signInUrl());
   await expect(page.getByText("live", { exact: true })).toBeVisible();
 }
 

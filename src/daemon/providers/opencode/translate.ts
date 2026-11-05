@@ -27,7 +27,8 @@
  * credentials. Any other step that can't be resolved for certain (`..`
  * after a missing component, a path that reads differently as written and
  * as opencode normalizes it, one codeoid can't look at, too many links)
- * makes the call an `opencode_unresolved_path` card, asked in every mode.
+ * makes the call an `opencode_unresolved_path` card: asked in guarded and
+ * interactive mode, refused in autonomous mode (Session#autonomousRefusal).
  */
 
 import { statSync } from "node:fs";

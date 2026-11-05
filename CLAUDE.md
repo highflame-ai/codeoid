@@ -63,7 +63,8 @@ src/
 │   ├── rate-limit.ts             # Per-user session creation + concurrency limits
 │   ├── shutdown.ts               # Cleanup registry, signal handlers, grace period
 │   ├── data-lock.ts              # One daemon per data dir: lock files taken at `codeoid start`
-│   ├── outside-writes.ts         # Autonomous mode asks before a write outside the workdir, every backend
+│   ├── held-writes.ts            # A file tool writing what the sandbox holds read-only (git structure, project settings), every backend
+│   ├── sandbox/                  # OS sandbox for agents' commands (#448): providers (bwrap, seatbelt, docker), policy, per-backend confinement
 │   └── index.ts
 ├── protocol/                     # re-export shims for @highflame/codeoid-protocol (packages/protocol)
 │   ├── types.ts                  # Client<->Daemon message protocol
@@ -207,11 +208,14 @@ codeoid start        # daemon + all frontends
 codeoid ls           # list sessions
 codeoid new <n> [d]  # create session (workdir required unless --worktree); --model, --effort <level>
 codeoid attach <n>   # interactive attach (with scrollback replay)
+codeoid ui [--no-open]  # the web UI; local mode: a one-time link that signs a browser in (the page never carries the token)
 codeoid send <n> <m> # one-shot message
 codeoid interrupt <n>
 codeoid approve <n> [--deny] [--pick N | --id <approvalId>] [--yes]
 codeoid account ls|login <name>|add-key <name>|add-gateway|add-token|add-bedrock|default <name>|use <session> <name>|--follow-default|rm <name> [--backend <id>]  # accounts for every backend (docs/backend-accounts-design.md)
 codeoid destroy <n>
+codeoid new <n> <d> --sandbox auto|bwrap|seatbelt|docker|off [--network on|off|allowlist] [--allow-host h]  # the session's OS sandbox (#448, docs/sandbox.md)
+codeoid sandbox providers | set <session> <provider> [--network …]  # what runs here; change a session's (widening asks its owner)
 codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
 codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
 codeoid mcp reconnect <session> <server>            # redial a backend MCP server that's down (#389)
@@ -245,15 +249,157 @@ never a verdict. Every transition is a compare-and-set on the run's
 `state_version`. loop.* is authorized in `SessionManager.#loopHandle`
 (owner-only; session:create + session:send, plus session:approve to start).
 
+**OS sandbox** (#448, docs/sandbox.md, docs/sandbox-providers.md): on by default.
+Hard guarantees: (a) credentials and the hidden home unreadable; (b) nothing
+outside the workspace, the session's temp dir and the sandbox caches writable;
+(c) nothing a sandboxed command writes is run outside a sandbox by codeoid, a
+backend CLI, or anything codeoid starts. NOT guaranteed: that the workspace is
+safe to run after the agent touched it (it is code: scripts, tests, husky hooks
+in a `core.hooksPath` inside it); the git-structure protection is defence in
+depth, best effort, its known limits listed in docs/sandbox.md. At each turn's
+end and at destroy a session warns when the repository's config, hooks (and
+`core.hooksPath`'s), attributes or git-dir links changed (sandbox/git-watch.ts,
+`Session#checkGitControl`, event `sandbox.git_changed`), and when a commit
+newly reachable from a ref or HEAD changed project settings a backend runs
+code from (`settingsCommits`, `Session#checkSettingsCommits`, event
+`sandbox.settings_committed`): starting a Claude session trusts the
+repository's committed settings, which the sandbox can't vouch for. In a
+sandboxed Claude session the CLI's `EnterWorktree`/`ExitWorktree` are refused
+in the PreToolUse hook and `canUseTool` (`cliWorktreeDecision`: the CLI runs
+EnterWorktree without asking `canUseTool`); `--worktree` is codeoid's.
+`src/daemon/sandbox/`: a `SandboxProvider` (types.ts: capabilities — isolation
+tier, local/remote, mount/sync, stdio process, commands, argv wrap, enforced
+network modes, platforms — `probe()`, `open(spec)` → `SandboxHandle` with
+spawn/exec/wrap/close) per backend of isolation: `bwrap` (bwrap.ts, pure
+`bwrapArgs`), `seatbelt` (seatbelt.ts, pure `seatbeltProfile`, paths as `-D`
+params), `docker` (docker.ts, pure `dockerRunArgs`); registry.ts resolves
+`auto | off | <id>` with cached probes. policy.ts builds the spec: the home
+hidden whole (deny by default: a credential made or renamed in later isn't
+there), shown back read-only by `sandbox.homeReadable` (home-readable.ts,
+`DEFAULT_HOME_READABLE`: toolchains, git's settings; never a token file);
+workspace + a private temp dir writable; the workspace's git repository
+(`gitWorkspacePaths`, believed only in git's own back-linked layout): only
+what a commit writes is writable, its git dirs bound at their own paths (no
+rename), and what picks config, hooks or git dir read-only
+(`SandboxSpec.readOnly`: `config`, `config.worktree`, `commondir`, `hooks/`,
+`info/`, `modules/`, `remotes/`, `branches/`, `worktrees/` whole (the own
+worktree git dir writable over it; Claude native: `denyAround`), a worktree's
+`commondir`/`gitdir`, `.git` files, an empty `HEAD/` beside a plain `.git` at
+the workspace top so an invalidated `.git` can't fall through to a planted
+bare repo), made first where missing (a `commondir` of `.`); a submodule's git
+dir (its `core.worktree` names it back) is the repository's (`gitLayoutOf`);
+any other `.git` file is held read-only and said in the sandbox's limits
+(`gitLayoutProblem`); a link among them makes the git dir read-only whole; `SandboxSpec.gitDirs` are
+Codex's extra writable roots. The project settings agent CLIs run code from
+(`PROJECT_CONFIG_DIRS`/`_FILES`: `.claude/`, `.mcp.json`, …; missing ones made
+first, files as an empty config listed in `info/exclude`) read-only. File
+tools that run outside the sandbox (Claude native's, LSP included, opencode's: plan
+`fileTools: false`) are held to the sandbox's own spec at the gate in
+autonomous mode (sandbox/host-file-tools.ts, `Session#outsideSandbox`, rounds 8, 9): a write
+outside what it lets commands write, a read or search of what it hides, is
+refused there, never asked (event `sandbox.refused`, audit
+`session.sandbox_bounds_refuse`; the reason names the workdir and the temp
+dir's real path; on Claude the PreToolUse hook routes it past allow rules,
+`hostFileDecision`, only while `isAutonomous`); guarded and interactive
+decide as on a session without a sandbox, the card's `sandboxNote` saying
+"outside the sandbox's bounds" (`#hostBoundsNote`). The backend's own context
+files stay its tools' (`SessionProvider.hostReadable`, `hostFiles`:
+providers/claude/host-files.ts — memory, plans, agent memory as `.md`, its
+`CLAUDE_CODE_TMPDIR` project dir and tasks/todos writable, user-tier agents,
+commands, rules, CLAUDE.md, installed plugins' skills read; opencode's
+`<dataDir>/tmp/opencode`); a search past a hidden path inside them runs where
+the backend leaves it out (Claude: an autonomous query's Read deny rules,
+`claudeSearchExclusions`) or, on opencode, where it is the user's own
+`sandbox.hiddenPaths` in the workspace. A workdir below its repository's
+top (a monorepo's package) gets the top as the sandbox's workspace
+(`sandboxWorkspaceOf`; project settings held in each dir up to it,
+`projectDirsOf`), the cwd unchanged. Such a tool writing the rest of the
+repository's git dirs or `.git` files (`protectedWriteTargets`), or a
+hard-linked file, asks while sandboxed (refused in autonomous mode;
+`heldWriteOf` in held-writes.ts, `heldWriteDecision`); backends whose file
+tools run inside the sandbox get neither. Toolchain caches point at
+`~/.cache/codeoid-sandbox` (`SandboxSpec.env`, `toolchainCacheEnv`), set only inside a sandbox, never
+for a CLI or what it runs outside one (Claude native: `claudeNativeEnv`, a
+`CLAUDE_ENV_FILE` exporting them only under `SANDBOX_RUNTIME=1`); a link in
+the allowlist leads only into the allowlist (never shows its target elsewhere
+in the home). Hidden besides: config dir,
+`daemonOwnedDirs`, the CLIs' logins and `registeredSecretLocations`
+(secret-paths.ts), `HOME_CREDENTIAL_PATHS`, `$XDG_RUNTIME_DIR`, the daemon's
+temp dir, `sandbox.hiddenPaths` (beats the allowlist); container sockets;
+network. confinement.ts picks per (backend, provider): `native` (Claude's SDK
+`sandbox` option, claude-native.ts: `denyRead` home + `allowRead`, paths
+physical (`physicalOf`), its own `TMPDIR`/`CLAUDE_CODE_TMPDIR` per session
+(`claudeTemp`); refused without socat on Linux, `claudeNativeProblem`; Codex
+workspace-write inside codeoid's bwrap around the app-server), `process` (the
+whole backend inside: pi, Gemini CLI, Qwen via a launcher, Claude/Codex under
+Docker), `command` (opencode's shell shim), `no-shell` (HTTP backends). A
+backend whose process is inside runs in a private copy of its home
+(backend-home.ts `preparePrivateHome` into `SandboxRuntime.privateHome`,
+afresh each start: its refreshable login a private copy written back on its
+handle's close, `withLoginsSynced`, only its token fields into the real
+file's content (`refreshedLogin`: anything else changed is refused and said on
+the session, `SandboxRuntime.warn`), over an unchanged real one; conversations the session's own, `SandboxRuntime.stateDir`, removed
+on destroy; code read-only, small files copied), never its real home
+writable; its handle is closed when its process ends. session-sandbox.ts: `SessionSandbox` (setting
+over `sandbox.*`, `resolveSandbox` → `SessionInfo.sandbox` with `enforced`,
+`/` as a workspace unavailable, lazy 0700 temp dir, handles, launchers, the git shim;
+refreshes serialized, a `set` during one re-resolves) and
+`ProviderSessionInit.sandbox()` hands the `SandboxRuntime` to the backend
+(`runtimeFor`: the last resolution stands until a changed setting's replaces
+it, never nothing in between). `Session.setSandbox` only while idle (no turn,
+approval, dialog or background work); a process backend that ran is
+restarted, and until then a turn needing the sandbox is refused; the widen
+confirm is answered by the owner's own token only (`requestUserInput`
+`ownerOnly`). A wider-than-default sandbox at create, fork/compare or loop
+start needs session:approve, an undelegated token, and (fork) the parent's
+owner (`#widerSandboxRefusal`); `sandbox.*` settings refuse delegated tokens.
+root.ts: one private dir per daemon, made at `codeoid start`, for temp dirs,
+private homes, launchers and every temp entry of the daemon's own
+(`daemonTempDir`: sign-in homes, check artifacts, loop index, pi's bridge),
+hidden from every sandbox (Claude's own, which keeps the host's `/tmp`, too).
+A backend CLI that runs outside the sandbox finds codeoid's `git` first on its
+`PATH` (git-shim.ts): Claude native's (`SandboxRuntime.gitShim`) runs the real
+git inside the session's command sandbox, offline, with a fresh `/tmp` per
+git (`SandboxSpec.privateTemp`) and the CLI's worktree dirs writable
+(`cliWorktrees`), its Bash commands' `PATH` without it (claude-native.ts's env
+file; the CLI's `PATH` absolute entries only); opencode's server's, and one
+whose provider is gone, run git defused (BASE_OVERRIDES appended to the
+caller's `GIT_CONFIG_COUNT`, agent-scope drivers and helpers reset by name in
+the repository the caller's `-C`/`--git-dir` names, `attr.tree` empty, no
+nested repository gone into: `SUBMODULE_OVERRIDES`). Either way git's
+environment is an allowlist (`SHIM_ENV_NAMES`), never the caller's credentials. In local mode no route hands the token to a loopback
+request (a sandboxed command is one): the web UI exchanges a one-time code
+from the banner's link or `codeoid ui` (`LocalUiLinks`, `/ui/local-session`).
+The daemon's own git in a repository an agent can write runs with
+`safeGitEnv` (git-env.ts): no hook (the hooks dir's or `hook.<name>.command`, off per event), fsmonitor, alternates' ref command, signing or signature check, editor, pager, git-protocol proxy, auto gc (each config key `git help -c` lists as running a program; git-env.test.ts's table); drivers and
+credential helpers from agent-writable scopes reset to the user's own;
+https/ssh only. `protectedAncestors` → `SandboxSpec.pinned`:
+dirs between a writable root and a hidden path in it can't be renamed (bwrap
+self-bind, Seatbelt `literal`, Docker self-mount), still writable inside
+(Claude's `denyWrite`: the subtree). Docker binds are `--mount` with CSV
+quoting; a launcher names no container; each handle labels its own. Loop acceptance checks run in the loop's sandbox (`openCheckSandbox`,
+evidence `isolation: "sandbox"`); routine gate checks don't (they need the
+owner's credentials).
+Fallback: `Session#sendInner` refuses an autonomous / unattended / `requireSandbox`
+(routine, loop, dispatch worker) turn while `sandboxRefusalOf` says so;
+set_mode autonomous and loop.start refuse up front; interactive runs, and every
+card carries `sandboxed`/`sandboxNote`. A run-outside request
+(`asksOutsideSandbox`: Claude's `dangerouslyDisableSandbox`, `codex_permissions`)
+asks in guarded and interactive mode and is refused in autonomous mode, routed
+past allow rules by the PreToolUse hook;
+`SandboxNetworkAccess` follows the session's network. `session.set_sandbox` is
+owner-only; widening is a confirm on the session (`widens`), never on an
+unattended turn. Forks and collaboration children inherit the setting.
+
 Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell/`
 parses a command line with tree-sitter-bash (WASM, vendored `tree-sitter-bash.wasm`;
 the daemon loads it at start, so the gate judges synchronously and the approval
 card always matches the decision), and `src/daemon/risk/` gives it a level. The
-levels are guidance, not a sandbox: high and not-understood commands ask in every
-mode and a recognised credential path is refused, as a best effort. Low is a strict
+levels are guidance, not a sandbox: high and not-understood commands ask in guarded
+mode and a recognised credential path is refused in every mode, as a best effort. Low is a strict
 allow-list (`notLow` in shell-risk.ts); keep it one, never widen it by rules.
 On Claude the PreToolUse hook routes high and not-understood ones to the gate past any allow rule.
-In autonomous mode a write, edit, delete or move whose target provably resolves outside the session's workdir (and the temp dir), or can't be resolved, asks on every backend (`outside-writes.ts`: each backend's write tool names and every path key, judged where the kernel writes them through `physicalPath` (physical-path.ts, the resolver opencode's `realTarget` uses: dangling links followed, a loop or a file with several hard links unresolved; codeoid's own `codeoid*` temp entries outside). That is a HARD rule for file tools; for shell it is BEST-EFFORT guidance like #431's levels, and the real boundary for shell is the OS sandbox (#448). `shellWriteTargets` in risk/effects.ts places a target only as a plain literal word (`expansionIn`), a writing program only with the options in its allow-list (`OPTIONS`; `sedScriptWrites`), a removal or rename judged by its name (`name`), raw `..` kept, `ln` counting what it links to, a `cd` followed only when it surely moves the shell (parse.ts's `subshell`/`conditional`; a bare name only when the backend's shell has `CDPATH` unset, `SessionProvider.shellCdpathUnset`: Claude's CLI gets `CDPATH=`, opencode's shells have none, and the line sets none); an unplaced target asks only when it is marked `leaves` (`wordLeaves`: absolute, `~`, `..` or a pattern matching it, `$`/backquote/substitution, run-time input; the line sets HOME; a cwd that may be anywhere, `cdLeaves`; `find -L`/`-files0-from`), so `rm -f *.log`, `cp -r src dist`, `cd sub && touch x` run unasked; relative targets are judged from the cwd the backend reports (`ToolApprovalFn`'s `shellCwd`: Claude's PreToolUse hook `cwd`, kept for every tool, since the CLI resolves Bash's targets and a Grep/Glob relative `path` from its persisted cwd, and the secret-path gate uses it too; null = unknown, asks); Claude's `Monitor` command is a shell call, `PowerShell` never understood; the card's `risk` says why; the shell reader's known limits are listed in docs/approvals.md); it spends no budget, parks an unattended run like a high-risk command, and on Claude the PreToolUse hook routes it to the gate past allow rules (`ProviderSessionInit.sessionMode`). Codex autonomous asks nothing (#442).
+Autonomous mode never waits on a person: the OS sandbox (#448) is its boundary (it doesn't start without one that runs, or the owner's own off). So in autonomous mode a shell command of any level runs (`#riskAsks` is false there; the level goes to the audit, `session.auto_approve … risk=high`), and a write runs where the sandbox lets it land (a host-side file tool beyond its spec is refused there, `#outsideSandbox`). What the sandbox can't be left to hold is refused at once, never asked (`Session#autonomousRefusal`, shared by the gate and the tool_start card; `#refuseAutonomous`: the reason to the agent and on the card, an info line `autonomous.refused`, audit `session.autonomous_refuse kind=…`, no budget spent): `unsandboxed` (`#unsandboxedRequest`), `held_write` (`#heldWrite`), `claude_settings` (`#writesClaudeSettingsOnNamedAccount`), `credential_dir` (a secret-path `ask`, or a shell risk carrying one on a session that isn't sandboxed: `ls ~` runs inside one), `unresolved_path` (`isUnresolvedPathTool`). Credential reads stay refused in every mode. Elicitation tools and fleet send-class dispatch still ask (so they are all an unattended run parks on). When the budget runs out (park) the session reverts to guarded and says so (`#noteAutonomousBudgetSpent`: info line `budget.spent`, `SessionInfo.autonomousBudgetSpent` until a mode is set, `modeSummary` in `codeoid ls`). Guarded and interactive are unchanged. `approvals.askOnUnknown` is inert. Relative paths are judged from the cwd the backend reports (`ToolApprovalFn`'s `shellCwd`: Claude's PreToolUse hook `cwd`, kept for every tool, since the CLI resolves Bash's targets and a Grep/Glob relative `path` from its persisted cwd; null = unknown, asks). Claude's `Monitor` command is a shell call, `PowerShell` never understood. Claude's CLI gets `CDPATH=` and opencode's shells have none, so a bare `cd` goes where the shell reader places it. Codex autonomous asks nothing (#442).
 A command that could read another process's environment (a `/proc/<pid>/environ` however written, what a search of /proc hands on, `ps` unless its options and the line's variables prove it shows none) is refused as a credential read on every backend, failing closed (`refuseEnvironRead`, shell-risk.ts); a word's possible values are its `shape` (parse.ts).
 
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
@@ -291,6 +437,8 @@ CODEOID_MCP_CONTROL_ENABLED=false   # mount /mcp/control (docs/mcp-control.md)
 CODEOID_MCP_CONTROL_ACTIONS=false   # also allow create / send / interrupt / destroy there
 CODEOID_ROUTINES_ENABLED=true       # scheduler + routine commands (docs/routines.md)
 CODEOID_DEFAULT_EFFORT=             # thinking effort for new sessions: off|minimal|low|medium|high|xhigh|max (docs/thinking-effort.md)
+CODEOID_SANDBOX=auto                # OS sandbox for agents' commands: auto|bwrap|seatbelt|docker|off (docs/sandbox.md)
+CODEOID_SANDBOX_NETWORK=on          # on|off|allowlist (CODEOID_SANDBOX_ALLOWED_HOSTS); hiddenPaths: CODEOID_SANDBOX_HIDDEN_PATHS
 
 # Claude auth: uses your existing `claude login` session (Pro/Max subscription).
 # No ANTHROPIC_API_KEY needed if you're logged in via Claude Code CLI.
@@ -458,8 +606,13 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   (`opencodeShellEnv`, `PUT …/environment` before every turn and as a child is
   learned; a child's requests are allowed only once it's set): the server's
   model keys and injected config never reach it. The server's own `SHELL`,
-  which opencode runs every line with (any but fish and nu), is pinned to
-  bash (`opencodeServerShell`: absolute `PATH` entries only), the shell #431 judges lines as.
+  which opencode runs every line with (any but fish and nu), is codeoid's
+  shim (`writeOpencodeShellShim`, `<dataDir>/bin/codeoid-shell`), which runs
+  bash (`opencodeServerShell`: absolute `PATH` entries only, the shell #431
+  judges lines as) through the launcher the session's own shell environment
+  names (`CODEOID_SANDBOX_LAUNCHER`, set with the bare env: inside its OS
+  sandbox, #448), or bash itself for `off`; with neither (the server's own
+  environment, a gap child) the line runs nothing.
 - **Version control** opencode runs unasked (repo discovery, snapshots,
   `hg log` for a project id) runs none of a repository's code: the server's
   environment gives every git `OPENCODE_GIT_OVERRIDES` through
@@ -480,7 +633,8 @@ just needs a key from Studio's Code Agents screen. `ZEROID_PRESETS` +
   (`/proc/self`, `/dev/fd`, any procfs link) gets an `unshowable` card; any
   step it can't be sure of (`..` after a missing component, the two readings
   differing, `ENOTDIR`/`EACCES`, a loop) gets `opencode_unresolved_path`,
-  which `isUnresolvedPathTool` keeps asked in every mode.
+  which `isUnresolvedPathTool` keeps asked in guarded and interactive mode
+  and refused in autonomous mode.
 - **Location**: opencode runs a session's tools in its location, and a fork
   keeps its source's. A fork (or a resumed session) whose location isn't the
   workdir is moved there (`#moveInto`, `POST …/move`; the move's own

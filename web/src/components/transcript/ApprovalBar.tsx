@@ -47,6 +47,7 @@ import {
 import { sessionList } from "../../state/sessions";
 import type { CollaborationCost, SessionMessage, ToolRisk } from "../../protocol/types";
 import { formatCollaborationCost, formatToolRisk } from "../../lib/format";
+import { approvalSandboxLine } from "@highflame/codeoid-core";
 
 /**
  * Repo/branch/content preview for a send-class fleet dispatch, or null for any
@@ -139,6 +140,8 @@ const ApprovalBar: Component = () => {
       toolName: m.tool.name,
       collaborationCost: s.collaborationCost,
       risk: s.risk,
+      sandboxed: s.sandboxed,
+      sandboxNote: s.sandboxNote,
     };
   });
 
@@ -225,6 +228,8 @@ const ApprovalBar: Component = () => {
                 description={snap().description}
                 collaborationCost={snap().collaborationCost}
                 risk={snap().risk}
+                sandboxed={snap().sandboxed}
+                sandboxNote={snap().sandboxNote}
                 dispatch={dispatchFor(snap().toolName, snap().input)}
                 isPlanMode={isPlanMode()}
                 busy={busy()}
@@ -315,6 +320,9 @@ const BinaryBar: Component<{
   collaborationCost?: CollaborationCost;
   /** A shell command's risk (#431). */
   risk?: ToolRisk;
+  /** Whether it runs in the session's OS sandbox (#448). */
+  sandboxed?: boolean;
+  sandboxNote?: string;
   /** Present only for a send-class fleet dispatch — repo/branch/content (R3). */
   dispatch?: DispatchPreviewModel | null;
   isPlanMode: boolean;
@@ -348,6 +356,7 @@ const BinaryBar: Component<{
           {(d) => <DispatchDetails preview={d()} />}
         </Show>
         <RiskLine risk={props.risk} />
+        <SandboxLine sandboxed={props.sandboxed} sandboxNote={props.sandboxNote} />
         <Show when={props.collaborationCost}>
           {(c) => (
             <div class="mt-1 truncate font-mono text-[11px] text-warn" title="Rolled up across this collaboration's orchestrator and its live role-children">
@@ -397,6 +406,21 @@ export const RiskLine: Component<{ risk?: ToolRisk }> = (props) => (
         data-risk={props.risk?.level}
       >
         ▲ {text()}
+      </div>
+    )}
+  </Show>
+);
+
+/**
+ * Whether the call runs inside the session's OS sandbox (#448), in the same
+ * words as every other surface (approvalSandboxLine). Not sandboxed is a
+ * warning: the risk line above is guidance, the sandbox is the boundary.
+ */
+export const SandboxLine: Component<{ sandboxed?: boolean; sandboxNote?: string }> = (props) => (
+  <Show when={approvalSandboxLine(props)}>
+    {(text) => (
+      <div class={`mt-1 truncate text-[11px] ${props.sandboxed ? "text-success" : "font-semibold text-warn"}`} data-sandboxed={props.sandboxed ? "yes" : "no"}>
+        {text()}
       </div>
     )}
   </Show>

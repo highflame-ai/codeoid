@@ -545,6 +545,39 @@ describe("Telegram flows — attach, streaming turn, idle", () => {
   });
 });
 
+describe("Telegram flows — the OS sandbox on approvals (#448)", () => {
+  it("an approval says whether the command runs sandboxed, and why not", async () => {
+    const { drive, manager, texts } = await boot();
+    await drive("/attach alpha");
+    await until(() => texts().some((t) => t.startsWith("Attached to")));
+    const client = manager.attachClients.get("sess-a")!;
+    client.send(
+      toolCallMsg("sess-a", "tc-sbx-1", "Bash", {
+        phase: "waiting_confirmation",
+        input: { command: "make" },
+        description: "Bash(command)",
+        approvalId: "sbx00001-rest",
+        sandboxed: true,
+        sandboxNote: "sandboxed: bubblewrap, network off",
+      }),
+    );
+    client.send(
+      toolCallMsg("sess-a", "tc-sbx-2", "Bash", {
+        phase: "waiting_confirmation",
+        input: { command: "make", dangerouslyDisableSandbox: true },
+        description: "Bash(command)",
+        approvalId: "sbx00002-rest",
+        sandboxed: false,
+        sandboxNote: "asks to run outside the sandbox",
+      }),
+    );
+    await until(() => texts().filter((t) => t.startsWith("⚠️ Permission needed")).length >= 2);
+    const prompts = texts().filter((t) => t.startsWith("⚠️ Permission needed"));
+    expect(prompts[0]).toContain("🛡 sandboxed: bubblewrap, network off");
+    expect(prompts[1]).toContain("⚠️ asks to run outside the sandbox");
+  });
+});
+
 describe("Telegram flows — provider dialogs (session.ui_request)", () => {
   function uiRequest(
     sessionId: string,

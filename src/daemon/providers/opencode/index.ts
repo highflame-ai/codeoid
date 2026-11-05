@@ -33,6 +33,10 @@
  *     authoritative for files.
  */
 
+import { join } from "node:path";
+import type { BackendHostFiles } from "../../sandbox/host-file-tools.js";
+import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
+import type { SandboxHandle } from "../../sandbox/types.js";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
 import type { McpTenant } from "../../mcp/oauth.js";
@@ -82,7 +86,9 @@ import {
   fetchOrigin,
   hostedModelInfo,
   mcpNamespace,
+  opencodeServerDirs,
   opencodeShellEnv,
+  SANDBOX_LAUNCHER_VAR,
   ownMountPrefix,
   runnableCommand,
   sessionRules,
@@ -142,6 +148,8 @@ const REMEMBERED = 4_096;
 const UNASKED_TOOLS: Record<string, string> = { execute: "opencode_execute" };
 
 export interface OpencodeProviderInit {
+  /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448): each shell line runs inside it. */
+  sandbox?: () => SandboxRuntime | null;
   sessionId: string;
   /** `ses_…` from a previous run, or the codeoid session id on first run. */
   initialBackingId: string;
@@ -330,8 +338,6 @@ export class OpencodeProvider implements SessionProvider {
   readonly displayName = OPENCODE_DISPLAY_NAME;
   /** opencode's reply carries only a decision: it runs the input it proposed (#367). */
   readonly appliesToolInputRewrite = false;
-  /** Every shell runs `bash -c` with opencodeShellEnv, which has no `CDPATH`. */
-  readonly shellCdpathUnset = true;
   /** A background subagent's result is handed to the model by opencode, which then runs the main agent itself. */
   readonly continuesAfterBackgroundWork = true;
   readonly effortChange = "turn" as const;
@@ -486,7 +492,45 @@ export class OpencodeProvider implements SessionProvider {
    */
   #fences = new Map<string, Map<string, string | null>>();
 
+  /** The session's OS sandbox (#448), read each time its shell environment is set. */
+  readonly #sandbox: (() => SandboxRuntime | null) | null;
+
+  /**
+   * A session's (and its subagents') shell environment: the bare one, and
+   * the launcher the server's shell shim runs each line through — inside the
+   * session's sandbox, or `off` (writeOpencodeShellShim).
+   */
+  #shellEnv(): Record<string, string> {
+    return { ...opencodeShellEnv(), [SANDBOX_LAUNCHER_VAR]: this.#launcherPath() };
+  }
+
+  /**
+   * Written afresh each time (every turn, every subagent): it lays the
+   * sandbox over the filesystem as it is now. The handle is kept while what
+   * it lays is the same (one per change, not one per turn); an older one is
+   * never closed meanwhile, since a line it started (a background shell)
+   * may still be running in it. All go with the session.
+   */
+  #launcherPath(): string {
+    const rt = this.#sandbox?.() ?? null;
+    if (!rt || rt.plan.kind !== "command") return "off";
+    const opened = rt.openSync([]);
+    const last = this.#shellHandle;
+    let handle = opened;
+    if (last && last.runtime === rt && JSON.stringify(last.handle.spec) === JSON.stringify(opened.spec)) {
+      handle = last.handle;
+      void opened.close();
+    } else {
+      this.#shellHandle = { runtime: rt, handle: opened };
+    }
+    return rt.launcher(handle, [], [...Object.keys(opencodeShellEnv()), SANDBOX_LAUNCHER_VAR], "opencode-shell");
+  }
+
+  /** The handle the session's launcher runs lines in, and the runtime it was opened from. */
+  #shellHandle: { runtime: SandboxRuntime; handle: SandboxHandle } | null = null;
+
   constructor(init: OpencodeProviderInit) {
+    this.#sandbox = init.sandbox ?? null;
     this.#sessionId = init.sessionId;
     this.#backingSessionId = init.initialBackingId;
     this.#server = init.server;
@@ -502,6 +546,18 @@ export class OpencodeProvider implements SessionProvider {
       init.mcpProxy,
       init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
     );
+  }
+
+  /**
+   * opencode's own scratch dir, `$TMPDIR/opencode` of its server (its
+   * `Global.Path.tmp`, which `GET /api/info` reports as `paths.tmp` and its
+   * tools write into, an image tool's output among them): read and written by
+   * its file tools in a sandboxed autonomous session (#448 round 9). Its
+   * truncated tool and shell output are the registered open dirs.
+   */
+  hostFiles(): BackendHostFiles {
+    const dataDir = this.#server.dataDir;
+    return typeof dataDir === "string" && dataDir ? { writable: [join(opencodeServerDirs(dataDir).TMPDIR, "opencode")] } : {};
   }
 
   /** The memory endpoint is mounted on this session's opencode location (#ensureMounts). */
@@ -1206,7 +1262,7 @@ export class OpencodeProvider implements SessionProvider {
     // Its shell runs without the server's environment (its password, the
     // injected config): a line with no command in it runs unasked. Kept in
     // the server's memory only, so set on every turn; a failure fails it.
-    await conn.client.setEnvironment(ses, opencodeShellEnv());
+    await conn.client.setEnvironment(ses, this.#shellEnv());
     await this.#sweepSaved(conn, workdir);
     await this.#server.checkPlugins(conn, workdir);
     if (!this.#modelsReported) await this.#reportModelsOnce();
@@ -2238,7 +2294,7 @@ export class OpencodeProvider implements SessionProvider {
    */
   #setUpChild(conn: OpencodeConnection | null, id: string): Promise<boolean> {
     if (!conn) return Promise.resolve(false);
-    const env = conn.client.setEnvironment(id, opencodeShellEnv()).then(
+    const env = conn.client.setEnvironment(id, this.#shellEnv()).then(
       () => true,
       (err: unknown) => {
         console.error(`[opencode-provider ${this.#sessionId.slice(0, 8)}] couldn't set subagent ${id}'s shell environment: ${err instanceof Error ? err.message : String(err)}`);

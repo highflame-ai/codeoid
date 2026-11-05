@@ -17,7 +17,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { appendFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CanonicalHistoryChange, CanonicalToolCall, CanonicalTurn } from "./providers/canonical.js";
-import type { TurnSummary } from "../protocol/types.js";
+import type { SessionSandboxSetting, TurnSummary } from "../protocol/types.js";
 import type { ForkIsolation } from "./fork-isolation.js";
 
 /** One turn in a session's turn index (#354): what `session.turns` lists. */
@@ -153,6 +153,8 @@ const DEADLINE_CHECK_EVERY = 512;
 
 /** Session metadata stored alongside transcript for fast resume. */
 export interface TranscriptMeta {
+  /** The session's OS sandbox setting (#448); absent = the daemon's config. */
+  sandbox?: SessionSandboxSetting;
   sessionId: string;
   sessionName: string;
   workdir: string;

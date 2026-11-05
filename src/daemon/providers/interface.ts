@@ -19,6 +19,7 @@ import type {
   UiRequestMethod,
 } from "../../protocol/types.js";
 import type { CanonicalTurn, HistorySeedResult } from "./canonical.js";
+import type { BackendHostFiles } from "../sandbox/host-file-tools.js";
 import type { LLMCallUsage } from "../context-math.js";
 import type { PackSubagent } from "../pipeline/subagents.js";
 
@@ -62,8 +63,8 @@ export type ToolApprovalFn = (
    * The directory the backend reports this call runs in (Claude's Bash keeps
    * a `cd` between calls, and the CLI resolves a Grep or Glob's relative
    * `path` from there too; its PreToolUse hook's `cwd`): a shell call's
-   * relative write targets and a tool's relative paths are judged from there
-   * (outside-writes.ts, secret-paths.ts). Null: the backend's cwd may have
+   * risk and a tool's relative paths are judged from there (#431,
+   * secret-paths.ts). Null: the backend's cwd may have
    * moved and it didn't say where. Absent: the backend runs in the workdir.
    */
   shellCwd?: string | null,
@@ -771,14 +772,6 @@ export interface AgentProvider {
    */
   readonly enforcesToolBudget?: boolean;
   /**
-   * True when the backend's shell runs with `CDPATH` unset or empty, because
-   * codeoid gives it its environment (Claude's CLI: `CDPATH=` in its env;
-   * opencode: a bare `PUT …/environment`, run non-login). The outside-write
-   * check then follows a `cd` by a bare name (`cd src && …`) to where it
-   * really leads. Absent = not known: such a `cd` isn't followed.
-   */
-  readonly shellCdpathUnset?: boolean;
-  /**
    * Pids of the processes this backend spawned itself (its CLI / app-server)
    * that are alive now. Session.terminateBackend snapshots their whole tree
    * before the teardown and kills what outlives it (process-tree.ts). Absent
@@ -838,6 +831,22 @@ export interface SessionProvider extends AgentProvider {
    * proposed. Absent on a backend with no such check.
    */
   foreignCallRefusal?(toolName: string, input: unknown, agentId: string | undefined): string | null;
+  /**
+   * Where the backend's own file tools must read outside the sandbox while
+   * it is on (#448 round 8, sandbox/host-file-tools.ts): what it put there
+   * itself for the model (Claude's saved tool output for this session, its
+   * skills' own files). Read only, never written. Absent: nothing.
+   */
+  hostReadable?(): readonly string[];
+  /**
+   * What the backend's own file tools keep outside the sandbox as context,
+   * never as code (#448 round 9): readable (its user-tier agents, commands,
+   * rules, CLAUDE.md, installed plugins' skills), writable (its background
+   * tasks' output, its scratch dir), `.md` files writable (Claude's
+   * auto-memory and plan dirs), and the hidden paths its searches leave out.
+   * Held to in autonomous mode with the sandbox's own bounds. Absent: none.
+   */
+  hostFiles?(): BackendHostFiles;
   /** Underlying backing session ID (for display and Store persistence). */
   readonly backingSessionId: string;
   /** True once runTurn() has been called at least once (guards agent registration). */

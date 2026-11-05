@@ -130,9 +130,9 @@ async function claudeCall(input: Record<string, unknown>, mode: SessionMode, app
 }
 
 describe("an opencode shell call is judged by risk as a Claude Bash call is (#431)", () => {
-  test("`rm -rf ~` asks in autonomous mode, its card and the pending approval carry the same level and reasons as Claude's", async () => {
-    const oc = await opencodeCall({ command: "rm -rf ~", description: "clean up" }, "autonomous");
-    const claude = await claudeCall({ command: "rm -rf ~" }, "autonomous");
+  test("`rm -rf ~` asks in guarded mode, its card and the pending approval carry the same level and reasons as Claude's", async () => {
+    const oc = await opencodeCall({ command: "rm -rf ~", description: "clean up" }, "guarded");
+    const claude = await claudeCall({ command: "rm -rf ~" }, "guarded");
     expect(oc.asked).toBe(true);
     expect(oc.card?.phase).toBe("waiting_confirmation");
     expect(oc.card?.risk).toEqual(claude.card!.risk!);
@@ -142,6 +142,17 @@ describe("an opencode shell call is judged by risk as a Claude Bash call is (#43
     expect(oc.cardInput).toMatchObject({ command: "rm -rf ~" });
     // Denied: opencode's reject carries the reason, and the model carries on.
     expect(oc.reply).toStartWith("not allowed:");
+  });
+
+  test("in autonomous mode a high-risk command runs unasked on both backends (#448); `rm -rf ~`, which reaches a dir holding credentials, is refused on both with the same reason", async () => {
+    const push = await opencodeCall({ command: "git push --force origin main" }, "autonomous");
+    expect([push.asked, push.reply]).toEqual([false, "ran it"]);
+    expect((await claudeCall({ command: "git push --force origin main" }, "autonomous")).behavior).toBe("allow");
+    const oc = await opencodeCall({ command: "rm -rf ~", description: "clean up" }, "autonomous");
+    const claude = await claudeCall({ command: "rm -rf ~" }, "autonomous");
+    expect([oc.asked, claude.asked, claude.behavior]).toEqual([false, false, "deny"]);
+    expect(oc.reply).toStartWith("not allowed: Refused: autonomous mode doesn't allow a command reaching ");
+    expect(oc.reply).toContain("switch this session to guarded mode");
   });
 
   test("a low read (`git status`) runs unasked in guarded mode with autoAllowLowRisk — and asks without it", async () => {
@@ -213,8 +224,10 @@ describe("an opencode shell call is judged by risk as a Claude Bash call is (#43
       expect([line, oc.asked, oc.reply.includes("holds credentials") ? "refused" : oc.reply]).toEqual([line, false, "refused"]);
       expect([line, (await claudeCall({ command: line }, "autonomous")).behavior]).toEqual([line, "deny"]);
     }
-    // One whose words could attach is asked, autonomous mode included.
-    expect((await opencodeCall({ command: "gdb /usr/bin/opencode $PPID" }, "autonomous")).asked).toBe(true);
+    // One whose words could attach isn't understood: guarded mode asks; autonomous mode runs it in the
+    // sandbox (#448), whose own pid namespace (bwrap, Docker, Claude's) holds no other process to attach to.
+    expect((await opencodeCall({ command: "gdb /usr/bin/opencode $PPID" }, "guarded")).asked).toBe(true);
+    expect((await opencodeCall({ command: "gdb /usr/bin/opencode $PPID" }, "autonomous")).reply).toBe("ran it");
   });
 
   test("a listing of /proc and ps fed plain pgrep read no environment: they run in autonomous mode on both backends (round-19 audit)", async () => {
@@ -260,15 +273,23 @@ describe("an opencode shell call whose directory can't be resolved for certain (
   // `..` after a component that doesn't exist: where it leads in opencode's process isn't known.
   const unresolved = "nope/../elsewhere";
 
-  test("is asked in every mode, with its command's risk on the card", async () => {
-    const ls = await opencodeCall({ command: "ls", workdir: unresolved }, "autonomous");
+  test("is asked in guarded mode, with its command's risk on the card", async () => {
+    const ls = await opencodeCall({ command: "ls", workdir: unresolved }, "guarded");
     expect(ls.asked).toBe(true);
     expect(ls.pending[0]?.toolName).toBe("opencode_unresolved_path");
     expect(ls.card?.risk?.level).toBeDefined();
-    const rm = await opencodeCall({ command: "rm -rf ~", workdir: unresolved }, "autonomous");
+    const rm = await opencodeCall({ command: "rm -rf ~", workdir: unresolved }, "guarded");
     expect(rm.asked).toBe(true);
     expect(rm.card?.risk?.level).toBe("high");
     expect(rm.pending[0]?.risk?.level).toBe("high");
+  });
+
+  test("is refused at once in autonomous mode, never asked, the model told why (#448)", async () => {
+    const ls = await opencodeCall({ command: "ls", workdir: unresolved }, "autonomous");
+    expect(ls.asked).toBe(false);
+    expect(ls.card?.phase).toBe("cancelled");
+    expect(ls.reply).toStartWith("not allowed: Refused: autonomous mode doesn't allow a call whose path couldn't be resolved for certain.");
+    expect(ls.reply).toContain("switch this session to guarded mode");
   });
 
   test("a low command there is still asked in guarded mode with autoAllowLowRisk: the hard gate outranks a low rating", async () => {

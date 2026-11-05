@@ -136,6 +136,9 @@ import { roleEnforcement } from "./providers/tool-safety.js";
 import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
+import type { SandboxRegistry } from "./sandbox/registry.js";
+import { effectiveSetting, openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { sandboxConfigOf } from "./sandbox/policy.js";
 import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
@@ -181,6 +184,7 @@ import { RoutineStore } from "./routines/store.js";
 import type { RoutineRow } from "./routines/types.js";
 import { toRoutineWire, toRunWire } from "./routines/wire.js";
 import { routineFirePath } from "../protocol/types.js";
+import type { SandboxProviderWire, SessionSandboxSetting } from "../protocol/types.js";
 import {
   applyCarriedState,
   type CarriedState,
@@ -506,6 +510,8 @@ export class SessionManager {
   #packs: PackService;
   /** The daemon's provider catalog — one registry, shared by every session. */
   #providers: ProviderRegistry;
+  /** The OS sandbox providers (#448). Absent = no sandboxing (tests and embedders that pass none; `codeoid start` passes the daemon's). */
+  #sandboxRegistry: SandboxRegistry | undefined;
   /** The registry is this manager's own (not handed in): let go when it drains. */
   #ownsProviders = false;
   /** The daemon's hook bus — one instance, shared by every session. */
@@ -609,6 +615,8 @@ export class SessionManager {
       endpoints?: EndpointStore;
       /** Test-only: the `fetch` endpoint requests (model lists, tests) use. */
       _testEndpointFetch?: typeof fetch;
+      /** The OS sandbox providers (#448, sandbox/registry.ts). Absent = sessions aren't sandboxed. */
+      sandboxRegistry?: SandboxRegistry;
     },
   ) {
     this.#store = store;
@@ -618,6 +626,7 @@ export class SessionManager {
     this.#rateLimiter = rateLimiter ?? new RateLimiter();
     this.#memory = memory;
     this.#config = opts?.config;
+    this.#sandboxRegistry = opts?.sandboxRegistry;
     if (opts?.config?.worktree?.setup) this.#worktreeSetupPolicy = opts.config.worktree.setup;
     this.#compressionRegistry = opts?.compressionRegistry;
     this.#endpoints = opts?.endpoints ?? new EndpointStore();
@@ -983,10 +992,12 @@ export class SessionManager {
           store: this.#store,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
+          sandboxRegistry: this.#sandboxRegistry,
           claudeAccounts: this.#claudeAccounts,
           accounts: this.#accounts,
           claudeAccount: meta.claudeAccount ?? null,
           ...(meta.accounts ? { accountChoices: meta.accounts } : {}),
+          ...(meta.sandbox ? { sandbox: meta.sandbox } : {}),
           hooks: this.#hooks,
           identityManager: this.#identityManager,
           existingId: meta.sessionId,
@@ -1360,6 +1371,10 @@ mcpHub: this.#mcpHub,
         return this.#loopWorkerGuard(msg, "destroy") ?? this.#destroySession(msg, auth);
       case "session.set_mode":
         return this.#loopWorkerGuard(msg, "change the mode of") ?? this.#setMode(msg, auth);
+      case "session.set_sandbox":
+        return this.#loopWorkerGuard(msg, "change the sandbox of") ?? this.#setSandbox(msg, auth);
+      case "sandbox.providers":
+        return this.#sandboxProviders(msg, auth);
       case "session.pin":
         return this.#pin(msg, auth);
       case "session.unpin":
@@ -1755,6 +1770,7 @@ mcpHub: this.#mcpHub,
               store: this.#store,
               transcriptStore: this.#transcriptStore,
               providers: this.#providers,
+              sandboxRegistry: this.#sandboxRegistry,
               claudeAccounts: this.#claudeAccounts,
               hooks: this.#hooks,
               ...(this.#identityManager
@@ -2239,12 +2255,14 @@ mcpHub: this.#mcpHub,
         code: "forbidden",
       };
     }
-    // Worktree setup decides whether a repository's command runs unasked:
+    // Worktree setup decides whether a repository's command runs unasked,
+    // and the OS sandbox (#448) what every session's commands can reach:
     // an undelegated owner only, and every change audited old → new.
-    const setupPatches = msg.patches.filter((p) => p.key.startsWith("worktree.setup."));
+    const setupPatches = msg.patches.filter((p) => p.key.startsWith("worktree.setup.") || p.key.startsWith("sandbox."));
     if (setupPatches.length > 0 && auth.delegationDepth > 0) {
       this.#store.audit(auth.sub, "settings.set.denied", "", `keys=${setupPatches.map((p) => p.key).join(",")} reason=delegated`);
-      return { type: "response.error", requestId: msg.id, error: "A delegated token can't change worktree setup settings.", code: "forbidden" };
+      const what = setupPatches.some((p) => p.key.startsWith("sandbox.")) ? "sandbox" : "worktree setup";
+      return { type: "response.error", requestId: msg.id, error: `A delegated token can't change ${what} settings.`, code: "forbidden" };
     }
     const setupBefore = setupPatches.length > 0 ? getSnapshot().values : undefined;
     try {
@@ -2280,7 +2298,8 @@ mcpHub: this.#mcpHub,
       );
       if (result.ok && setupBefore) {
         for (const p of setupPatches) {
-          this.#store.audit(auth.sub, "settings.set.worktree_setup", "", `key=${p.key} old=${JSON.stringify(setupBefore[p.key]?.value ?? null)} new=${JSON.stringify(p.value)}`);
+          const event = p.key.startsWith("sandbox.") ? "settings.set.sandbox" : "settings.set.worktree_setup";
+          this.#store.audit(auth.sub, event, "", `key=${p.key} old=${JSON.stringify(setupBefore[p.key]?.value ?? null)} new=${JSON.stringify(p.value)}`);
           if (p.key === "worktree.setup.runCommands") {
             this.#worktreeSetupPolicy = { ...this.#worktreeSetupPolicy, runCommands: p.value === "trusted-repos" ? "trusted-repos" : "never" };
           }
@@ -4307,6 +4326,20 @@ mcpHub: this.#mcpHub,
     // children. Built BEFORE the session because `fleet` is a constructor
     // input; the id it scopes to is read lazily through the thunk, which is
     // only ever called from a tool handler mid-turn.
+    // The OS sandbox (#448): a setting the daemon can use, and one wider than
+    // the daemon's (off, a wider network, another provider) only as
+    // `session.set_sandbox` would allow it: the scope that approves what
+    // runs unasked, and never a delegated token.
+    if (msg.sandbox) {
+      if (!this.#sandboxRegistry) {
+        return { type: "response.error", requestId: msg.id, error: "This daemon has no OS sandbox", code: "invalid_request" };
+      }
+      const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry) ?? (await this.#sandboxUnavailable(msg.sandbox));
+      if (problem) return { type: "response.error", requestId: msg.id, error: problem, code: "invalid_request" };
+      const refused = this.#widerSandboxRefusal(msg.sandbox, auth, "create a session");
+      if (refused) return { type: "response.error", requestId: msg.id, error: refused, code: "forbidden" };
+    }
+
     let goalSessionId = "";
     const orchestratorFleet = collaboration
       ? this.#buildOrchestratorFleetServer(
@@ -4329,6 +4362,8 @@ mcpHub: this.#mcpHub,
       store: this.#store,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
+      sandboxRegistry: this.#sandboxRegistry,
+      ...(msg.sandbox && Object.keys(msg.sandbox).length > 0 ? { sandbox: msg.sandbox } : {}),
       claudeAccounts: this.#claudeAccounts,
       // The Claude choice also when the session lands elsewhere: it applies if it is switched to Claude.
       claudeAccount: msg.claudeAccount || null,
@@ -4360,6 +4395,11 @@ mcpHub: this.#mcpHub,
     goalSessionId = session.id;
     this.#sessions.set(session.id, session);
     this.#rateLimiter.recordCreation(auth.sub);
+    // What the sandbox resolves to here, said at once (#448).
+    const sandboxInfo = await session.ensureSandbox();
+    if (msg.sandbox?.provider === "off") this.#store.audit(auth.sub, "session.sandbox_off", session.id, "at create");
+    if (sandboxInfo?.state === "unavailable") warn(`not sandboxed: ${sandboxInfo.reason ?? "the sandbox can't run here"}`);
+    else if (sandboxInfo?.state === "on" && !sandboxInfo.enforced) warn(sandboxInfo.limits?.at(-1) ?? "the sandbox can't hold everything asked");
 
     if (collaboration) this.#attachOrchestratorBlackboard(session, collaboration);
 
@@ -4717,10 +4757,13 @@ mcpHub: this.#mcpHub,
           store: this.#store,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
+          sandboxRegistry: this.#sandboxRegistry,
           claudeAccounts: this.#claudeAccounts,
           // The collaboration runs on the accounts its lead was created on.
           claudeAccount: parent.claudeAccount,
           accountChoices: parent.accountChoices,
+          // ...and in its lead's sandbox (#448).
+          ...(parent.sandboxSetting ? { sandbox: parent.sandboxSetting } : {}),
           hooks: this.#hooks,
           providerId: child.providerId,
           defaultModel: child.model,
@@ -4838,6 +4881,11 @@ mcpHub: this.#mcpHub,
     if (!parent) {
       return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
     }
+    // The fork keeps its parent's sandbox (#448): one off or wider than the
+    // daemon's is carried over only by its owner, undelegated, as only they
+    // could have chosen it (a fork or a compare isn't a way around that).
+    const sandboxRefused = this.#widerSandboxRefusal(parent.sandboxSetting, auth, "fork this session", parent.createdBy);
+    if (sandboxRefused) return { type: "response.error", requestId: msg.id, error: sandboxRefused, code: "forbidden" };
     // Forking THE conductor would mint a second fleet supervisor — refuse.
     // The fork keeps running on the parent's Claude account, and choosing what
     // a session runs on (and bills) is `settings:write` — a fork or a compare
@@ -5128,11 +5176,14 @@ mcpHub: this.#mcpHub,
         store: this.#store,
         transcriptStore: this.#transcriptStore,
         providers: this.#providers,
+        sandboxRegistry: this.#sandboxRegistry,
         claudeAccounts: this.#claudeAccounts,
         // A fork continues the same conversation — on the same accounts,
         // thinking as hard (#417).
         claudeAccount: parent.claudeAccount,
         accountChoices: parent.accountChoices,
+        // A fork can't leave its parent's sandbox (#448).
+        ...(parent.sandboxSetting ? { sandbox: parent.sandboxSetting } : {}),
         effort: parentInfo.effort ?? null, // the parent's Default stays Default
         hooks: this.#hooks,
         providerId,
@@ -5381,6 +5432,7 @@ mcpHub: this.#mcpHub,
       store: this.#store,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
+      sandboxRegistry: this.#sandboxRegistry,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
@@ -5668,6 +5720,7 @@ mcpHub: this.#mcpHub,
       store: this.#store,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
+      sandboxRegistry: this.#sandboxRegistry,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
@@ -6187,11 +6240,15 @@ mcpHub: this.#mcpHub,
       }
     }
     /** Autonomy, a host command, or a loop (whose worker is autonomous) needs the approval scope as well. */
-    const needsApprove = (spec: { approvals?: string | null; check?: unknown; loop?: unknown } | undefined, current?: RoutineRow): boolean => {
+    const needsApprove = (spec: { approvals?: string | null; check?: unknown; loop?: unknown; sandbox?: unknown } | undefined, current?: RoutineRow): boolean => {
       const approvals = spec?.approvals !== undefined ? spec.approvals : current?.spec.approvals;
       const check = spec && "check" in spec ? spec.check : current?.spec.check;
       const loop = spec && "loop" in spec ? spec.loop : current?.spec.loop;
-      return (approvals ?? "autonomous") === "autonomous" || !!check || !!loop;
+      // Its runs' commands unsandboxed, or in a sandbox wider than the daemon's (#448): as at session create.
+      const sandbox = (spec && "sandbox" in spec ? spec.sandbox : current?.spec.sandbox) as SessionSandboxSetting | null | undefined;
+      const cfg = sandboxConfigOf(this.#config);
+      const wider = !!sandbox && Object.keys(sandbox).length > 0 && widens(effectiveSetting(cfg, undefined), effectiveSetting(cfg, sandbox));
+      return (approvals ?? "autonomous") === "autonomous" || !!check || !!loop || wider;
     };
     // A routine is its owner's alone: its runs act as them, so nobody else in
     // the tenant may read, steer, fire, or delete it. Others get "not found".
@@ -6373,6 +6430,16 @@ mcpHub: this.#mcpHub,
           if (!LOOP_WORKER_PROVIDERS.has(provider)) {
             return err(`Loops run on ${[...LOOP_WORKER_PROVIDERS].join(", ")} for now; "${provider}" cannot report an attempt's outcome yet`, "invalid_request");
           }
+          // The worker runs unattended: refused here when its sandbox can't hold (#448).
+          if (msg.sandbox) {
+            if (!this.#sandboxRegistry) return err("This daemon has no OS sandbox", "invalid_request");
+            const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry);
+            if (problem) return err(problem, "invalid_request");
+            const wider = this.#widerSandboxRefusal(msg.sandbox, auth, "start a loop");
+            if (wider) return err(wider, "forbidden");
+          }
+          const sandboxRefused = await this.#unattendedSandboxRefusal(provider, msg.sandbox);
+          if (sandboxRefused) return err(`The loop can't start: ${sandboxRefused}`, "invalid_request");
           const run = svc.startRun(
             {
               objective: msg.objective,
@@ -6380,6 +6447,7 @@ mcpHub: this.#mcpHub,
               checks: msg.checks,
               provider,
               ...(msg.model ? { model: msg.model } : {}),
+              ...(msg.sandbox ? { sandbox: msg.sandbox } : {}),
               ...(msg.toolBudget !== undefined ? { toolBudget: msg.toolBudget } : {}),
               ...(msg.limits ? { limits: msg.limits } : {}),
             },
@@ -6593,6 +6661,12 @@ mcpHub: this.#mcpHub,
       projectId: run.projectId,
     });
     return buildLoopHost({
+      ...(this.#sandboxRegistry
+        ? {
+            checkSandbox: (run: LoopRunRow, dir: string) =>
+              openCheckSandbox({ registry: this.#sandboxRegistry as SandboxRegistry, config: this.#config, setting: run.contract.worker.sandbox, workspace: dir, label: run.id }),
+          }
+        : {}),
       normalizeWorkdir: (p) => normalizeWorkdir(p),
       hasProvider: (id) => this.#providers.has(id),
       dispatcher: this.#dispatcher,
@@ -6648,12 +6722,16 @@ mcpHub: this.#mcpHub,
           ...(run.contract.worker.provider ? { providerId: run.contract.worker.provider } : {}),
           ...(run.contract.worker.model ? { defaultModel: run.contract.worker.model } : {}),
           initialMode: { mode: "autonomous", maxTurns: run.contract.toolBudget },
+          // Unattended: its turns need a sandbox that holds (#448).
+          requireSandbox: true,
+          ...(run.contract.worker.sandbox ? { sandbox: run.contract.worker.sandbox } : {}),
           // An attempt that spends its budget ends; the run decides what's next.
           onBudgetExhausted: "end_attempt",
           auth: owned(run, 0),
           store: this.#store,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
+          sandboxRegistry: this.#sandboxRegistry,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -6745,11 +6823,15 @@ mcpHub: this.#mcpHub,
           providerId: o.provider,
           defaultModel: o.model,
           initialMode: o.approvals === "autonomous" ? { mode: "autonomous", maxTurns: o.toolBudget } : { mode: "guarded" },
+          // Unattended: its turns need a sandbox that holds (#448).
+          requireSandbox: true,
+          ...(o.sandbox ? { sandbox: o.sandbox } : {}),
           ...(o.maxCostUsd !== undefined ? { maxBudgetUsd: o.maxCostUsd } : {}),
           auth: o.ownerAuth,
           store: this.#store,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
+          sandboxRegistry: this.#sandboxRegistry,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -6876,6 +6958,11 @@ mcpHub: this.#mcpHub,
       audit: (subject, action, sessionId, detail) => this.#store.audit(subject, action, sessionId, detail),
       hasProvider: (id) => this.#providers.has(id),
       providerIds: () => this.#providers.ids(),
+      ...(this.#sandboxRegistry
+        ? {
+            sandboxProblem: (s: SessionSandboxSetting) => sandboxSettingProblem(s, this.#sandboxRegistry as SandboxRegistry),
+          }
+        : {}),
       normalizeWorkdir: (p) => normalizeWorkdir(p),
       ...(this.#loops ? { loops: this.#makeRoutineLoopPort(this.#loops) } : {}),
     };
@@ -7025,10 +7112,12 @@ mcpHub: this.#mcpHub,
           // exhausts, then guarded → waiting_approval, which the dispatcher
           // treats as a wedge (lease stops renewing, reclaim handles it).
           initialMode: { mode: "autonomous", maxTurns: budget },
+          requireSandbox: true,
           auth: this.#dispatchSenderAuth(task),
           store: this.#store,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
+          sandboxRegistry: this.#sandboxRegistry,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -8765,6 +8854,9 @@ mcpHub: this.#mcpHub,
       { value: msg.value, confirmed: msg.confirmed, cancelled: msg.cancelled },
       auth,
     );
+    if (applied === "forbidden") {
+      return { type: "response.error", requestId: msg.id, error: "Only the session's owner can answer this (with their own token, not a delegated one)", code: "forbidden" };
+    }
     if (!applied) {
       // Already answered elsewhere, timed out, or never existed. Clients
       // treat this as "dismiss my copy" (the ui_resolved broadcast already
@@ -8831,10 +8923,10 @@ mcpHub: this.#mcpHub,
     };
   }
 
-  #setMode(
+  async #setMode(
     msg: Extract<ClientMessage, { type: "session.set_mode" }>,
     auth: AuthContext,
-  ): DaemonMessage {
+  ): Promise<DaemonMessage> {
     // Set-mode reuses the same scope gates as approve/send — the caller must
     // already be authorized to act on the session.
     if (!hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)) {
@@ -8854,8 +8946,126 @@ mcpHub: this.#mcpHub,
         code: "not_found",
       };
     }
+    // A session can't be made autonomous while its sandbox can't hold (#448).
+    if (msg.mode === "autonomous") {
+      await session.ensureSandbox();
+      const refused = session.sandboxRefusal({ forMode: "autonomous" });
+      if (refused) {
+        this.#store.audit(auth.sub, "session.sandbox_refused", session.id, `set_mode autonomous: ${refused}`);
+        return { type: "response.error", requestId: msg.id, error: `Can't switch to autonomous: ${refused}`, code: "invalid_request" };
+      }
+      // Its sandbox turned off is the owner's choice; running it unasked that way is theirs too.
+      if (session.sandboxInfo?.state === "off" && (auth.delegationDepth > 0 || auth.sub !== session.createdBy)) {
+        this.#store.audit(auth.sub, "session.sandbox_refused", session.id, "set_mode autonomous: sandbox off, not the owner's own token");
+        return { type: "response.error", requestId: msg.id, error: "This session's sandbox is off: only its owner, with their own token, can make it autonomous", code: "forbidden" };
+      }
+    }
     session.setMode(msg.mode, msg.maxTurns, auth);
     return { type: "response.ok", requestId: msg.id };
+  }
+
+  /**
+   * Why `auth` can't have a session with `setting` (#448), or null: one wider
+   * than the daemon's default (widens: off, a wider network, another
+   * provider) needs session:approve and an undelegated token, as widening a
+   * session's own does (`session.set_sandbox`). `owner`: the sub whose
+   * session's setting is being carried over (a fork, a compare, a
+   * collaboration child): only that owner may carry a wider one.
+   */
+  #widerSandboxRefusal(setting: SessionSandboxSetting | undefined, auth: AuthContext, what: string, owner?: string): string | null {
+    if (!setting || Object.keys(setting).length === 0) return null;
+    const cfg = sandboxConfigOf(this.#config);
+    if (!widens(effectiveSetting(cfg, undefined), effectiveSetting(cfg, setting))) return null;
+    const refusal = !hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)
+      ? `Missing scope: session:approve (needed to ${what} with a sandbox off or wider than the daemon's)`
+      : auth.delegationDepth > 0
+        ? `A delegated token can't ${what} with a sandbox off or wider than the daemon's`
+        : owner !== undefined && owner !== auth.sub
+          ? `Only the session's owner can ${what} with its sandbox (off or wider than the daemon's)`
+          : null;
+    if (refusal) this.#store.audit(auth.sub, "session.sandbox_wider_refused", "", `${what}: ${refusal}`);
+    return refusal;
+  }
+
+  /**
+   * Why an unattended run on `providerId` with `setting` can't start here
+   * (#448), or null. Resolved without a session: the same rules a session's
+   * turn applies.
+   */
+  async #unattendedSandboxRefusal(providerId: string, setting: SessionSandboxSetting | undefined): Promise<string | null> {
+    if (!this.#sandboxRegistry) return null;
+    const { info } = await resolveSandbox({ registry: this.#sandboxRegistry, config: sandboxConfigOf(this.#config), setting, backendId: providerId });
+    return sandboxRefusalOf(info);
+  }
+
+  /**
+   * Why a setting naming a provider explicitly can't be used: it can't run
+   * here (#448). Naming one is a choice of sandbox; one that can't run is no
+   * sandbox at all, which takes `off`'s route. `auto` and `off` pass.
+   */
+  async #sandboxUnavailable(setting: SessionSandboxSetting): Promise<string | null> {
+    const id = setting.provider;
+    if (!id || id === "auto" || id === "off" || !this.#sandboxRegistry) return null;
+    const probe = await this.#sandboxRegistry.probe(id);
+    return probe.available ? null : `the ${id} sandbox can't run here: ${probe.reason} (choose another, or off)`;
+  }
+
+  /**
+   * `session.set_sandbox` (#448): owner only, with session:approve. A
+   * widening change is asked of the owner on the session and lands on a yes.
+   */
+  async #setSandbox(msg: Extract<ClientMessage, { type: "session.set_sandbox" }>, auth: AuthContext): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:approve", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    // The owner's own: another member of the tenant can't change what bounds the owner's agent.
+    if (session.createdBy !== auth.sub) {
+      return { type: "response.error", requestId: msg.id, error: "Only the session's owner can change its sandbox", code: "forbidden" };
+    }
+    // Widening is the owner's own decision, never a delegated token's (it could answer its own confirm).
+    if (auth.delegationDepth > 0 && session.widensSandbox(msg.sandbox)) {
+      return { type: "response.error", requestId: msg.id, error: "A delegated token cannot turn a session's sandbox off or widen it", code: "forbidden" };
+    }
+    const unavailable = this.#sandboxRegistry ? await this.#sandboxUnavailable(msg.sandbox) : null;
+    if (unavailable) return { type: "response.error", requestId: msg.id, error: unavailable, code: "invalid_request" };
+    const result = await session.setSandbox(msg.sandbox, auth);
+    if (!result.ok) return { type: "response.error", requestId: msg.id, error: result.error, code: "invalid_request" };
+    return { type: "response.ok", requestId: msg.id, data: { ...(result.pending ? { pending: true } : {}), sandbox: session.sandboxInfo } };
+  }
+
+  /** `sandbox.providers` (#448): what the daemon has and whether each runs here. */
+  async #sandboxProviders(msg: Extract<ClientMessage, { type: "sandbox.providers" }>, auth: AuthContext): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_CREATE)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:create", code: "forbidden" };
+    }
+    const registry = this.#sandboxRegistry;
+    const config = sandboxConfigOf(this.#config);
+    const providers: SandboxProviderWire[] = [];
+    for (const p of registry?.list() ?? []) {
+      const probe = await registry?.probe(p.id);
+      providers.push({
+        id: p.id,
+        displayName: p.displayName,
+        available: probe?.available === true,
+        ...(probe && !probe.available ? { reason: probe.reason } : {}),
+        isolation: p.capabilities.isolation,
+        placement: p.capabilities.placement,
+        workspace: p.capabilities.workspace,
+        network: [...p.capabilities.network],
+      });
+    }
+    return {
+      type: "response.ok",
+      requestId: msg.id,
+      data: {
+        enabled: registry !== undefined,
+        default: { provider: config.provider, network: config.network, allowedHosts: config.allowedHosts },
+        auto: registry?.autoId() ?? null,
+        providers,
+      },
+    };
   }
 
   async #setProvider(

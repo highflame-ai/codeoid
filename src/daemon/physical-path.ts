@@ -2,8 +2,8 @@
  * Where a path really leads: resolved the way the kernel resolves it, one
  * component at a time from `/`, never lexically. One resolver for every
  * judge that must know where a path lands: opencode's `realTarget`
- * (providers/opencode/translate.ts) and the outside-writes rule
- * (outside-writes.ts).
+ * (providers/opencode/translate.ts) and the held-write check
+ * (held-writes.ts).
  */
 
 import { lstatSync, readlinkSync, statfsSync } from "node:fs";

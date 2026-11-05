@@ -187,6 +187,70 @@ const general: SettingsTab = {
   ],
 };
 
+const sandbox: SettingsTab = {
+  id: "sandbox",
+  title: "Sandbox",
+  icon: "🛡",
+  description:
+    "The OS sandbox agents' commands run in (docs/sandbox.md): the workspace and a private temp dir writable, everything else read-only, credential stores hidden, container sockets unreachable. Each session can choose its own; autonomous sessions, routines and loops don't start where it can't run.",
+  groups: [
+    {
+      id: "sandbox-default",
+      title: "Default for new sessions",
+      description: "What a session gets when it doesn't choose. A running session keeps its own until changed on it.",
+      fields: [
+        cfg("sandbox.provider", "Sandbox", "auto: bubblewrap on Linux, Seatbelt on macOS. docker: a container of the image below. off: agents' commands run with your full rights, unattended work too.", {
+          kind: "enum",
+          envVar: "CODEOID_SANDBOX",
+          default: "auto",
+          applies: "next-session",
+          options: [
+            { value: "auto", label: "Automatic", description: "bubblewrap on Linux, Seatbelt on macOS." },
+            { value: "bwrap", label: "bubblewrap (Linux)" },
+            { value: "seatbelt", label: "Seatbelt (macOS)" },
+            { value: "docker", label: "Docker", description: "A container per backend or command; the image must carry the backend's runtime." },
+            { value: "off", label: "Off", description: "No sandbox: commands can read your credentials and change any file you can." },
+          ],
+        }),
+        cfg("sandbox.network", "Network", "What a sandboxed command may reach. allowlist: only the hosts below — enforced by Claude's own sandbox only; elsewhere it means no network, and the session says so.", {
+          kind: "enum",
+          envVar: "CODEOID_SANDBOX_NETWORK",
+          default: "on",
+          applies: "next-session",
+          options: [
+            { value: "on", label: "On" },
+            { value: "off", label: "Off" },
+            { value: "allowlist", label: "Allowlist" },
+          ],
+        }),
+        cfg("sandbox.allowedHosts", "Allowed hosts", "With the allowlist: hosts a command may reach (example.com, *.example.com).", {
+          kind: "string[]",
+          envVar: "CODEOID_SANDBOX_ALLOWED_HOSTS",
+          applies: "next-session",
+        }),
+        cfg("sandbox.hiddenPaths", "More hidden paths", "Hidden on top of the built-in list (codeoid's data, ~/.ssh, ~/.aws, ~/.kube, ~/.docker, ~/.gnupg, ~/.config/gh, ~/.netrc, agent logins, keyrings, …). ~ expands.", {
+          kind: "string[]",
+          envVar: "CODEOID_SANDBOX_HIDDEN_PATHS",
+          applies: "next-session",
+        }),
+      ],
+    },
+    {
+      id: "sandbox-providers",
+      title: "Providers",
+      fields: [
+        cfg("sandbox.bwrapPath", "bubblewrap binary", "Absolute path to bwrap. Unset: the one on PATH.", { advanced: true, applies: "next-session", placeholder: "/usr/bin/bwrap" }),
+        cfg("sandbox.docker.image", "Docker image", "The image a Docker sandbox runs. It must carry what the backend runs (a shell; node for pi and the Gemini CLI).", {
+          envVar: "CODEOID_SANDBOX_DOCKER_IMAGE",
+          default: "node:22-bookworm-slim",
+          applies: "next-session",
+        }),
+        cfg("sandbox.docker.runtime", "Docker runtime", "runsc runs each container on gVisor (a separate kernel).", { advanced: true, applies: "next-session", placeholder: "runsc" }),
+      ],
+    },
+  ],
+};
+
 const memory: SettingsTab = {
   id: "memory",
   title: "Memory & Context",
@@ -507,7 +571,7 @@ const codex: SettingsTab = {
             { value: "never", label: "Never", description: "Autonomous." },
           ],
         }),
-        env("CODEX_SANDBOX_POLICY", "Sandbox policy", "Filesystem/network sandbox Codex runs under. codeoid pins full access by default (it is the trust authority).", {
+        env("CODEX_SANDBOX_POLICY", "Sandbox policy (without codeoid's sandbox)", "Codex's own sandbox when codeoid's OS sandbox is off or can't run. With it on, codex runs workspace-write inside codeoid's sandbox and this is ignored (see the Sandbox tab).", {
           kind: "enum",
           default: "danger-full-access",
           advanced: true,
@@ -764,7 +828,7 @@ const hooks: SettingsTab = {
 
 export const SETTINGS_MANIFEST: SettingsManifest = {
   version: MANIFEST_VERSION,
-  tabs: [general, memory, fleet, claude, codex, geminiCli, pi, opencode, openai, gemini, llamacpp, identity, frontends, hooks],
+  tabs: [general, sandbox, memory, fleet, claude, codex, geminiCli, pi, opencode, openai, gemini, llamacpp, identity, frontends, hooks],
 };
 
 // ── Derived accessors ─────────────────────────────────────────────────────────

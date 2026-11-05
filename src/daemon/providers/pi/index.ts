@@ -53,9 +53,25 @@ import type { McpHub } from "../../mcp/hub.js";
 import { PiRpcProcess, type PiFrame } from "./rpc.js";
 import { translatePiEvent } from "./translate.js";
 import type { ResolvedAccount } from "../../accounts.js";
-import { applyPiAccount, applyPiSettingsOverlay, piDefaultThinkingLevel } from "../../account-apply.js";
+import { applyPiAccount, applyPiSettingsOverlay, piAgentDirOf, piDefaultThinkingLevel } from "../../account-apply.js";
+import { realpathSync } from "node:fs";
+import { dirname } from "node:path";
+import { PI_HOME_LAYOUT, preparePrivateHome, withLoginsSynced } from "../../sandbox/backend-home.js";
+import { programLocations } from "../../sandbox/policy.js";
+import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
+import type { SandboxHandle } from "../../sandbox/types.js";
+
+function realOr(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
 
 export interface PiProviderInit {
+  /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448): pi starts inside it. */
+  sandbox?: () => SandboxRuntime | null;
   sessionId: string;
   /** pi session FILE from a previous run (absolute .jsonl path), or the
    *  codeoid session id on first run (nothing to resume). */
@@ -112,6 +128,8 @@ export class PiProvider implements SessionProvider {
   #backingSessionId: string;
   #command: string;
   #resolveAccount: (() => ResolvedAccount | null) | null;
+  /** The session's OS sandbox, read each time pi starts (#448). */
+  readonly #sandbox: (() => SandboxRuntime | null) | null;
   readonly #extraEnv: Readonly<Record<string, string>> | undefined;
   #argsPrefix: string[];
   #store: Store;
@@ -148,6 +166,7 @@ export class PiProvider implements SessionProvider {
     this.#command = init.command;
     this.#resolveAccount = init.resolveAccount ?? null;
     this.#extraEnv = init.extraEnv;
+    this.#sandbox = init.sandbox ?? null;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#store = init.store;
     this.#onModels = init.onModels;
@@ -326,25 +345,42 @@ export class PiProvider implements SessionProvider {
     if (this.#proc?.alive) return;
 
     const mcpTools = await this.#discoverMcpTools();
-    const args: string[] = ["-e", writeBridgeExtension({ memoryTools: this.#memory != null, mcpTools })];
+    const bridge = writeBridgeExtension({ memoryTools: this.#memory != null, mcpTools });
+    const args: string[] = ["-e", bridge];
     if (opts.systemPromptAppend) {
       args.push("--append-system-prompt", opts.systemPromptAppend);
     }
 
     this.#bridgeReady = false;
     this.#thinkingLevel = null; // a new pi reports its own (get_state, below)
+    // Allowlisted env (GHSA-38vh): pi gets its credentials (~/.pi via
+    // HOME, provider API keys), never codeoid's own secrets.
+    // pi's thinking-level writes stay in a copy of its settings (#417).
+    // Then the caller's extra env, which can't override the account (withExtraEnv).
+    let env = withExtraEnv(this.#piEnv(), this.#extraEnv);
+    // The OS sandbox (#448): pi's whole process starts inside the session's,
+    // in a private copy of its agent dir (backend-home.ts: its login
+    // read-only, its sessions the session's own), its program and codeoid's bridge readable.
+    const rt = this.#sandbox?.() ?? null;
+    let handle: SandboxHandle | null = null;
+    if (rt?.plan.wrapsBackend) {
+      const own = preparePrivateHome(piAgentDirOf(env), rt.privateHome("pi"), PI_HOME_LAYOUT, { state: rt.stateDir("pi") });
+      env = { ...env, PI_CODING_AGENT_DIR: own.home };
+      // Closed when pi exits: a login it refreshed is written back then.
+      handle = withLoginsSynced(await rt.open(own.writable, { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix), dirname(bridge)] }), own, rt.warn);
+    }
+    const opened = handle;
     this.#proc = new PiRpcProcess({
       command: this.#command,
       argsPrefix: this.#argsPrefix,
       args,
       cwd: opts.workdir,
-      // Allowlisted env (GHSA-38vh): pi gets its credentials (~/.pi via
-      // HOME, provider API keys), never codeoid's own secrets.
-      // pi's thinking-level writes stay in a copy of its settings (#417).
-      // Then the caller's extra env, which can't override the account (withExtraEnv).
-      env: withExtraEnv(this.#piEnv(), this.#extraEnv),
+      env,
+      ...(handle?.wrap ? { wrap: handle.wrap.bind(handle) } : {}),
       onEvent: (frame) => this.#onFrame(frame),
       onExit: ({ code, signal, stderrTail }) => {
+        // Its sandbox goes with it (#448).
+        void opened?.close();
         this.#bridgeReady = false;
         const tail = stderrTail ? ` — ${stderrTail.trim().slice(-300)}` : "";
         this.#failTurn(
@@ -375,7 +411,8 @@ export class PiProvider implements SessionProvider {
     const state = await this.#proc.request({ type: "get_state" });
     const data = state.data as { sessionFile?: string; sessionId?: string; thinkingLevel?: string } | undefined;
     if (typeof data?.thinkingLevel === "string") this.#thinkingLevel ??= data.thinkingLevel;
-    const file = data?.sessionFile;
+    // Where the file really is: inside the sandbox pi names it through its private home's link to its sessions dir.
+    const file = typeof data?.sessionFile === "string" && data.sessionFile.length > 0 ? realOr(data.sessionFile) : data?.sessionFile;
     if (typeof file === "string" && file.length > 0 && file !== this.#backingSessionId) {
       this.#backingSessionId = file;
       try {
@@ -847,3 +884,4 @@ export function piThinkingLevels(m: { reasoning?: unknown; thinkingLevelMap?: un
     return level === "xhigh" || level === "max" ? mapped !== undefined : true;
   });
 }
+

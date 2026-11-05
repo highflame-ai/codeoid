@@ -20,9 +20,9 @@
  * without depending on jiti transforms.
  */
 
-import { mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { daemonTempDir } from "../../sandbox/root.js";
 
 /** Reserved dialog title — the provider treats these as approval requests. */
 export const APPROVAL_TITLE = "codeoid:tool-approval";
@@ -170,7 +170,8 @@ ${mcpTools.length > 0 ? bridgeMcpBlock(mcpTools) : ""}
  * memory variant is written as `.mjs` to force ESM (the typebox import).
  */
 export function writeBridgeExtension(opts: { memoryTools?: boolean; mcpTools?: BridgeMcpTool[] } = {}): string {
-  const dir = mkdtempSync(join(tmpdir(), "codeoid-pi-bridge-"));
+  // Under the daemon's private root: no sandbox can rewrite it (pi's own is given it read-only).
+  const dir = daemonTempDir("codeoid-pi-bridge-");
   const memoryTools = opts.memoryTools ?? false;
   const path = join(dir, memoryTools ? "codeoid-bridge.mjs" : "codeoid-bridge.js");
   writeFileSync(path, buildBridgeSource(memoryTools, opts.mcpTools ?? []), "utf8");

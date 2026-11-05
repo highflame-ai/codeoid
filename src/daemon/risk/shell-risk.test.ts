@@ -295,8 +295,8 @@ const TABLE: Array<[string, RiskLevel]> = [
 
 /**
  * Everyday commands (the round-2 audit's lists and the commands agents run
- * most). None is "not understood", which would ask in every mode and stall an
- * unattended run; low is only the allow-listed shapes of a plain read.
+ * most). None is "not understood", which would ask in guarded mode even with
+ * autoAllowLowRisk; low is only the allow-listed shapes of a plain read.
  */
 const EVERYDAY_LOW = [
   "git status", "git log --oneline -20", "git diff HEAD~1 -- src", "git branch -a", "git show HEAD:src/a.ts", "git stash list",

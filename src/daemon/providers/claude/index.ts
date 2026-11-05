@@ -24,6 +24,9 @@ import {
   type SubagentStopHookInput,
   type McpServerConfig,
   type McpSdkServerConfigWithInstance,
+  type SandboxSettings,
+  type SpawnedProcess,
+  type SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "node:crypto";
 import { readFileSync, readdirSync, realpathSync } from "node:fs";
@@ -48,11 +51,11 @@ import { LOOP_MCP_SERVER_NAME, LOOP_REPORT_TOOL_FQ } from "../../loops/tools.js"
 import { rewriteBashToolInput } from "../../compress/index.js";
 import { type CodeoidConfig, getConfigDir } from "../../../config.js";
 import { assessShellCommandSync } from "../../risk/shell-risk.js";
-import { outsideWriteOf, outsideWriteReason } from "../../outside-writes.js";
+import { heldWriteOf, heldWriteReason } from "../../held-writes.js";
 import { secretPathVerdict } from "../../secret-paths.js";
 import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "../../fork-isolation.js";
 import { isShellTool, runsNoCommand, shellCallOf } from "../../shell/tool-call.js";
-import { type AuthContext, EFFORT_LEVELS, type EffortLevel, type SessionMode, SYSTEM_IDENTITY } from "../../../protocol/types.js";
+import { type AuthContext, EFFORT_LEVELS, type EffortLevel, SYSTEM_IDENTITY } from "../../../protocol/types.js";
 import type {
   BackendMcpServerState,
   SessionProvider,
@@ -73,6 +76,13 @@ import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
 import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.js";
 import { listProcesses } from "../../process-tree.js";
+import { CLAUDE_HOME_LAYOUT, preparePrivateHome, withLoginsSynced } from "../../sandbox/backend-home.js";
+import { asksUnsandboxed, claudeNativeEnv, claudeSandboxSettings } from "../../sandbox/claude-native.js";
+import { HOME_CREDENTIAL_PATHS, programLocations, protectedWriteTargets } from "../../sandbox/policy.js";
+import { type BackendHostFiles, hostFileBreachReason, hostFileToolBreach, hostToolBoundsFor } from "../../sandbox/host-file-tools.js";
+import { claudeHostFiles, claudeSearchExclusions } from "./host-files.js";
+import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
+import type { SandboxHandle } from "../../sandbox/types.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { PackSubagent } from "../../pipeline/subagents.js";
 
@@ -144,8 +154,6 @@ export interface ClaudeProviderInit {
   forkBoundary?: () => string | undefined;
   /** An agent id that is a fork's parent's (ProviderSessionInit.isForeignAgent): its every tool call is denied. */
   isForeignAgent?: (agentId: string) => boolean;
-  /** The session's mode now (ProviderSessionInit.sessionMode): an outside write in autonomous mode goes to the gate. */
-  sessionMode?: () => SessionMode;
   /** A task id that is a fork's parent's (ProviderSessionInit.isForeignTask). */
   isForeignTask?: (taskId: string) => boolean;
   /** This session is a fork (ProviderSessionInit.isFork). */
@@ -154,6 +162,10 @@ export interface ClaudeProviderInit {
   isOwnTask?: (taskId: string) => boolean;
   /** A foreign agent's tool call was denied (ProviderSessionInit.onForeignAgentDenied). */
   onForeignAgentDenied?: (agentId: string, toolName: string) => void;
+  /** The session is in autonomous mode now (ProviderSessionInit.isAutonomous); absent: treated as so. */
+  isAutonomous?: () => boolean;
+  /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448). */
+  sandbox?: () => SandboxRuntime | null;
   /** codeoid session id — used as the initial backing id and for audit/logging. */
   sessionId: string;
   /** Test seam for native continuation (#387); defaults to the real SDK. */
@@ -253,8 +265,6 @@ export const MAX_CARRYOVER_EVENTS = 100;
 export class ClaudeProvider implements SessionProvider {
   /** The Agent SDK runs the permission result's `updatedInput` (see AgentProvider.appliesToolInputRewrite). */
   readonly appliesToolInputRewrite = true;
-  /** The CLI's env has `CDPATH=` (withShellBasics), and its shell snapshot carries no variables. */
-  readonly shellCdpathUnset = true;
   readonly id = "claude";
   /** The CLI runs the main agent itself when background work settles (#adoptTurn). */
   readonly continuesAfterBackgroundWork = true;
@@ -294,6 +304,10 @@ export class ClaudeProvider implements SessionProvider {
   #builtAccount = "";
   /** The thinking effort the live query loop runs at (#417); "" = the SDK's default. Off is fixed at construction. */
   #builtEffort = "";
+  /** The OS sandbox the running query was built with (#448): rebuilt when it changes. */
+  #builtSandbox = "";
+  /** The sandbox the running query's CLI runs in, when the whole CLI is inside (#448): closed with the query. */
+  #sandboxHandle: SandboxHandle | null = null;
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
@@ -335,10 +349,27 @@ export class ClaudeProvider implements SessionProvider {
    * until canUseTool takes it: Claude's Bash keeps a `cd` between calls, and
    * the CLI resolves a shell call's relative targets and a Grep or Glob's
    * relative `path` (or its missing one, the search root) from there, so the
-   * gate judges them from there too (outside-writes.ts, secret-paths.ts).
+   * gate judges them from there too (shell risk, secret-paths.ts).
    * Bounded: a call the CLI allows itself never reaches canUseTool.
    */
   #shellCwds = new Map<string, string>();
+  /**
+   * What the CLI's file tools must read outside the sandbox (hostReadable,
+   * #448 round 8): the dirs its skills' own files are in (the user tier's
+   * and the session's plugins', as `additionalDirectories` grants them), and
+   * where it saves this session's large tool output for the model to read.
+   */
+  #skillReadable: string[] = [];
+  #toolResultsDir: string | null = null;
+  /**
+   * What the CLI's own file tools keep outside a native sandbox as context
+   * (hostFiles, #448 round 9, host-files.ts): its memory, plans, task
+   * output; its user-tier agents, commands, rules; and the hidden paths this
+   * query's Read deny rules leave out of its searches. Set per query.
+   */
+  #hostFiles: BackendHostFiles = {};
+  /** The Read deny rules this query was built with (an autonomous one's: claudeSearchExclusions). */
+  #builtSearchDeny = "";
   /** Id-keyed lifecycle events that arrived with no live queue, replayed into
    *  the next turn. See #handleUndeliverable. */
   #carryover: ProviderEvent[] = [];
@@ -521,6 +552,27 @@ export class ClaudeProvider implements SessionProvider {
   }
 
   /** SessionProvider.foreignCallRefusal: #refuseForeignCall on a call Session rewrote (audited and noted the same way). */
+  /**
+   * Where the CLI saves this session's large tool output for the model to
+   * Read (`<project dir>/<session id>/tool-results`, beside the transcript
+   * the hook names), noted from each call's hook input.
+   */
+  #noteToolResultsDir(input: PreToolUseHookInput): void {
+    const transcript = (input as { transcript_path?: unknown }).transcript_path;
+    const id = (input as { session_id?: unknown }).session_id;
+    if (typeof transcript !== "string" || !isAbsolute(transcript) || typeof id !== "string" || !/^[A-Za-z0-9-]+$/.test(id)) return;
+    if (transcript.slice(transcript.lastIndexOf("/") + 1) !== `${id}.jsonl`) return;
+    this.#toolResultsDir = join(dirname(transcript), id, "tool-results");
+  }
+
+  hostReadable(): readonly string[] {
+    return [...this.#skillReadable, ...(this.#toolResultsDir ? [this.#toolResultsDir] : [])];
+  }
+
+  hostFiles(): BackendHostFiles {
+    return this.#hostFiles;
+  }
+
   foreignCallRefusal(toolName: string, input: unknown, agentId: string | undefined): string | null {
     return this.#refuseForeignCall({ tool_name: toolName, tool_input: input, ...(agentId ? { agent_id: agentId } : {}) })?.hookSpecificOutput.permissionDecisionReason ?? null;
   }
@@ -635,24 +687,6 @@ export class ClaudeProvider implements SessionProvider {
     if (!cwd || !input.tool_use_id) return;
     this.#shellCwds.set(input.tool_use_id, cwd);
     if (this.#shellCwds.size > 256) this.#shellCwds.delete(this.#shellCwds.keys().next().value!);
-  }
-
-  /** `ask` for a write outside the working directory in autonomous mode, so it reaches codeoid's gate; null otherwise. */
-  #outsideWriteDecision(
-    input: PreToolUseHookInput,
-    workdir: string,
-  ): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "ask"; permissionDecisionReason: string } } | null {
-    let reason: string;
-    try {
-      if (this.#init.sessionMode?.() !== "autonomous") return null;
-      const outside = outsideWriteOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, workdir, hookShellCwd(input), { cdpathUnset: this.shellCdpathUnset });
-      if (!outside) return null;
-      reason = outsideWriteReason(outside);
-    } catch (err) {
-      console.error(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] judging where a write leads failed, asking the owner: ${err instanceof Error ? err.message : String(err)}`);
-      reason = "codeoid couldn't tell where this write leads, so it needs the owner's approval.";
-    }
-    return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: reason } };
   }
 
   #shellRiskDecision(
@@ -954,6 +988,9 @@ export class ClaudeProvider implements SessionProvider {
     if (this.#consumerTask) {
       try { await this.#consumerTask; } catch { /* consumer handles its own errors */ }
     }
+    // The CLI's sandbox, when the whole CLI ran inside one (#448).
+    void this.#sandboxHandle?.close();
+    this.#sandboxHandle = null;
     this.#currentTurnQueue?.close();
     this.#currentTurnQueue = null;
     this.#inputQueue = null;
@@ -1061,6 +1098,14 @@ export class ClaudeProvider implements SessionProvider {
     });
     const account = this.#init.resolveAccount?.() ?? null;
     const desiredAccount = account ? `${account.name}:${account.fingerprint}` : "";
+    // The session's OS sandbox (#448), read per build: a change reaches the next query.
+    const sandbox = this.#init.sandbox?.() ?? null;
+    const desiredSandbox = sandboxFingerprint(sandbox);
+    this.#skillReadable = sandbox ? skillReadableDirs(opts.pluginDirs) : [];
+    // Autonomous mode holds the CLI's searches to the sandbox's bounds (#448 round 9): what is hidden
+    // inside them is left out of its Grep and Glob by Read deny rules, fixed at the query's start.
+    const exclusions = sandbox?.plan.kind === "native" && opts.mode === "autonomous" ? claudeSearchExclusions(sandbox.spec, sandbox.claudeTemp().commands) : { paths: [], rules: [] };
+    const desiredSearchDeny = exclusions.rules.join("\n");
 
     // Exact tool names we hand the SDK as pre-approved. Kept as its own list
     // (rather than inlined into `allowedTools`) because the PreToolUse hook has
@@ -1083,7 +1128,9 @@ export class ClaudeProvider implements SessionProvider {
         this.#builtPluginDirs === desiredPlugins &&
         this.#builtOAuthMcp === oauthMcp.fingerprint &&
         this.#builtAccount === desiredAccount &&
-        this.#builtEffort === (opts.effort ?? "")
+        this.#builtEffort === (opts.effort ?? "") &&
+        this.#builtSandbox === desiredSandbox &&
+        this.#builtSearchDeny === desiredSearchDeny
       ) {
         return;
       }
@@ -1108,7 +1155,11 @@ export class ClaudeProvider implements SessionProvider {
                 ? "OAuth MCP servers changed"
                 : this.#builtAccount !== desiredAccount
                   ? `Claude account changed (now ${account?.name ?? "default"})`
-                  : `thinking effort changed (now ${opts.effort ?? "default"})`;
+                  : this.#builtSandbox !== desiredSandbox
+                    ? "OS sandbox changed"
+                    : this.#builtSearchDeny !== desiredSearchDeny
+                      ? "the sandbox's search exclusions changed (an autonomous mode switch)"
+                      : `thinking effort changed (now ${opts.effort ?? "default"})`;
       console.log(
         `[claude-provider ${this.#init.sessionId.slice(0, 8)}] ${reason} — rebuilding query loop`,
       );
@@ -1133,6 +1184,8 @@ export class ClaudeProvider implements SessionProvider {
     this.#builtOAuthMcp = oauthMcp.fingerprint;
     this.#builtAccount = desiredAccount;
     this.#builtEffort = opts.effort ?? "";
+    this.#builtSandbox = desiredSandbox;
+    this.#builtSearchDeny = desiredSearchDeny;
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
@@ -1150,6 +1203,33 @@ export class ClaudeProvider implements SessionProvider {
     // A rebuilt loop starts a new stream; an anchor from the old one (a turn
     // that ended without a result) must not be paired with the next result.
     this.#translateState.lastChainUuid = null;
+    const queryEnv = withForkBoundary(
+      withShellBasics(withExtraEnv(
+        account
+          ? account.apply(buildAgentEnv(process.env))
+          : buildAgentEnv(process.env, {
+              gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
+            }),
+        init.extraEnv,
+      )),
+      init.forkBoundary?.(),
+    );
+    // The OS sandbox (#448): Claude Code's own with codeoid's policy (and its
+    // temp dirs in the env), or the whole CLI inside the session's sandbox.
+    // The last query's sandbox goes with it.
+    void this.#sandboxHandle?.close();
+    this.#sandboxHandle = null;
+    const { env: sandboxEnv, ...sandboxOptions } = claudeSandboxOptions(sandbox, queryEnv, opts.workdir, (h) => {
+      this.#sandboxHandle = h;
+    });
+    // The CLI's own context files, where this query's CLI keeps them (its config dir, its temp dir).
+    const cliEnv = sandboxEnv ?? queryEnv;
+    this.#hostFiles = sandbox?.plan.fileTools === false
+      ? {
+          ...claudeHostFiles({ configDir: cliEnv.CLAUDE_CONFIG_DIR || join(cliEnv.HOME || homedir(), ".claude"), cliTempDir: cliEnv.CLAUDE_CODE_TMPDIR ?? null, workdir: opts.workdir }),
+          searchExcluded: exclusions.paths,
+        }
+      : {};
     this.#query = query({
       prompt: this.#inputQueue,
       options: {
@@ -1177,17 +1257,7 @@ export class ClaudeProvider implements SessionProvider {
         // can never undo the account or the gateway re-point.
         //
         // A fork's boundary goes on after all of it (withForkBoundary).
-        env: withForkBoundary(
-          withShellBasics(withExtraEnv(
-            account
-              ? account.apply(buildAgentEnv(process.env))
-              : buildAgentEnv(process.env, {
-                  gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
-                }),
-            init.extraEnv,
-          )),
-          init.forkBoundary?.(),
-        ),
+        env: sandboxEnv ?? queryEnv,
         allowedTools: [
           // Every EXACT TOOL NAME here is auto-approved by the SDK BEFORE
           // canUseTool is consulted, so it never reaches our gate — the SDK
@@ -1224,6 +1294,9 @@ export class ClaudeProvider implements SessionProvider {
         // An account may name models its own way (a Bedrock account's mappings).
         ...modelOptions(opts.model, opts.fallbackModel, account),
         ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
+        // The OS sandbox (#448): Claude Code's own with codeoid's policy, or
+        // the whole CLI started inside the session's (Docker).
+        ...sandboxOptions,
         stderr: (data: string) => {
           process.stderr.write(`[claude-subprocess ${sessionId.slice(0, 8)}] ${data}`);
         },
@@ -1263,8 +1336,15 @@ export class ClaudeProvider implements SessionProvider {
         // The CLI must not connect its own copy of a server codeoid signs in
         // to (from ~/.claude.json, a .mcp.json): the flag-settings denylist,
         // by URL, keeps it from dialing it at all (#390).
-        ...(oauthMcp.deniedUrls.length > 0
-          ? { settings: { deniedMcpServers: oauthMcp.deniedUrls.map((serverUrl) => ({ serverUrl })) } }
+        // And in autonomous mode a sandboxed CLI's Grep and Glob leave out what the sandbox hides
+        // inside what its commands see (#448 round 9, claudeSearchExclusions).
+        ...(oauthMcp.deniedUrls.length > 0 || exclusions.rules.length > 0
+          ? {
+              settings: {
+                ...(oauthMcp.deniedUrls.length > 0 ? { deniedMcpServers: oauthMcp.deniedUrls.map((serverUrl) => ({ serverUrl })) } : {}),
+                ...(exclusions.rules.length > 0 ? { permissions: { deny: exclusions.rules } } : {}),
+              },
+            }
           : {}),
         skills: "all",
         // Permission to RUN a skill's command is not permission to READ the
@@ -1276,6 +1356,7 @@ export class ClaudeProvider implements SessionProvider {
           join(opts.workdir, ".claude", "skills"),
           ...pluginSkillDirs(opts.pluginDirs),
         ]),
+        // (The same grant, less the workspace's own tier, is what the gate lets its file tools read outside a sandbox: hostReadable.)
 
         hooks: {
           PreToolUse: [{
@@ -1289,6 +1370,17 @@ export class ClaudeProvider implements SessionProvider {
               // this hook sees every call.
               const foreign = this.#refuseForeignCall(input);
               if (foreign) return foreign;
+              // The CLI's own worktrees aren't sandboxed (#448 round 6): its
+              // EnterWorktree (which it runs without asking canUseTool) and
+              // ExitWorktree are refused while the session is.
+              const worktree = cliWorktreeDecision(input.tool_name, sandbox !== null);
+              if (worktree) return worktree;
+              // A command the model asks to run outside the OS sandbox (#448)
+              // never runs on an allow rule: canUseTool, where codeoid asks
+              // the owner (refuses it in autonomous mode).
+              if (sandbox?.plan.kind === "native" && asksUnsandboxed(input.tool_input)) {
+                return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask" as const, permissionDecisionReason: "asks to run outside the sandbox" } };
+              }
               // Where the CLI says this call runs (its shell's persisted cwd,
               // which a Grep or Glob's relative path is resolved from too), for
               // the gate's own judgement in canUseTool (#shellCwds).
@@ -1308,10 +1400,21 @@ export class ClaudeProvider implements SessionProvider {
               // Fail-closed (#shellRiskDecision).
               const shellRisk = this.#shellRiskDecision(input, opts.workdir);
               if (shellRisk) return shellRisk;
-              // In autonomous mode a write outside the working directory asks
-              // (outside-writes.ts): never on an allow rule either. Fail-closed.
-              const outside = this.#outsideWriteDecision(input, opts.workdir);
-              if (outside) return outside;
+              // While sandboxed (#448) a file tool writing the repository's git structure or the
+              // project settings (read-only to commands; this tool runs outside the sandbox) goes
+              // to codeoid's gate (asked, or refused in autonomous mode): never on an allow rule. Fail-closed.
+              if (sandbox?.plan.fileTools === false) {
+                const held = heldWriteDecision(input, opts.workdir);
+                if (held) return held;
+                // And in autonomous mode any file tool beyond what the sandbox allows its commands
+                // (#448 rounds 8, 9): to the gate, which refuses it, never on an allow rule. Fail-closed.
+                // Guarded and interactive mode leave it to the CLI and the gate, as without a sandbox.
+                this.#noteToolResultsDir(input);
+                if (init.isAutonomous?.() ?? true) {
+                  const outside = hostFileDecision(input, opts.workdir, sandbox, this.hostReadable(), this.#hostFiles);
+                  if (outside) return outside;
+                }
+              }
               // Past this point a throw fails OPEN: the CLI takes a hook that
               // errors as having no opinion (its createHookCallback returns {}),
               // so a call it would allow itself goes ahead.
@@ -1413,6 +1516,9 @@ export class ClaudeProvider implements SessionProvider {
           // didn't. Before tool_start, so nothing of it is shown.
           const foreign = this.#refuseForeignCall({ tool_name: toolName, tool_input: input, ...(sdkAgentId ? { agent_id: sdkAgentId } : {}) });
           if (foreign) return { behavior: "deny" as const, message: foreign.hookSpecificOutput.permissionDecisionReason };
+          // The CLI's own worktree tools, again (cliWorktreeDecision).
+          const worktree = cliWorktreeDecision(toolName, sandbox !== null);
+          if (worktree) return { behavior: "deny" as const, message: worktree.hookSpecificOutput.permissionDecisionReason };
 
           // A shell call is judged from where the CLI's Bash is now, as its
           // PreToolUse hook reported; not known (null) when it didn't.
@@ -2661,9 +2767,10 @@ export function buildAgentEnv(
  * `CDPATH=` (empty: bash then looks a bare name up in the cwd only) on the
  * CLI's env, after everything else: its Bash tool inherits it, and the shell
  * snapshot it sources carries functions, options and aliases, not
- * variables. So the outside-write check follows `cd src && …` where it
- * really leads (`shellCdpathUnset`). A project's `.claude/settings.json`
- * `env` can still set one: shell judgement is best effort (#448).
+ * variables. So `cd .codeoid && cat config.json` goes where the shell
+ * reader (#431) places it, under the cwd, and a credential read is judged
+ * where it really is. A project's `.claude/settings.json` `env` can still
+ * set one: shell judgement is best effort (#448).
  */
 export function withShellBasics(env: Record<string, string>): Record<string, string> {
   return { ...env, CDPATH: "" };
@@ -2786,5 +2893,156 @@ export function claudeCatalogEntry(m: {
     displayName: m.displayName,
     ...(m.description ? { description: m.description } : {}),
     ...(efforts ? { efforts } : {}),
+  };
+}
+
+/**
+ * The PreToolUse hook's decision for a file-tool write into what the OS
+ * sandbox holds read-only (#448: held-writes.ts `heldWriteOf`): `ask`,
+ * so it reaches codeoid's gate past any allow rule; null for one that
+ * writes none. A judgement that throws asks.
+ */
+export function heldWriteDecision(
+  input: PreToolUseHookInput,
+  workdir: string,
+): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "ask"; permissionDecisionReason: string } } | null {
+  let reason: string;
+  try {
+    const held = heldWriteOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, workdir, protectedWriteTargets(workdir));
+    if (!held) return null;
+    reason = heldWriteReason(held);
+  } catch {
+    reason = "codeoid couldn't tell whether this write reaches what the sandbox holds read-only, so it needs the owner's approval.";
+  }
+  return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: reason } };
+}
+
+/**
+ * The dirs a sandboxed session's file tools may read for its skills (#448
+ * round 8, hostReadable): the user tier's and the session plugins' skills
+ * (`skillSandboxDirs`: where each links to), never one in a credential
+ * store. The workspace's own tier is readable already, and a link there is
+ * the repository's to plant.
+ */
+export function skillReadableDirs(pluginDirs?: readonly string[]): string[] {
+  const home = homedir();
+  const stores = HOME_CREDENTIAL_PATHS.map((rel) => join(home, rel));
+  return skillSandboxDirs([join(home, ".claude", "skills"), ...pluginSkillDirs(pluginDirs)]).filter(
+    (d) => !stores.some((c) => d === c || d.startsWith(`${c}/`)),
+  );
+}
+
+/**
+ * The PreToolUse hook's decision for a file tool beyond what the session's
+ * sandbox allows its commands (#448 rounds 8, 9, sandbox/host-file-tools.ts),
+ * taken in autonomous mode: `ask`, so it reaches codeoid's gate past any
+ * allow rule (the CLI allows a read in the workdir or an added dir itself),
+ * which refuses it; null for one within, the CLI's own context files
+ * (`own`, host-files.ts) included. A judgement that throws asks.
+ */
+export function hostFileDecision(
+  input: PreToolUseHookInput,
+  workdir: string,
+  sandbox: Pick<SandboxRuntime, "spec" | "plan" | "claudeTemp" | "provider">,
+  readable: readonly string[],
+  own: BackendHostFiles = {},
+): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "ask"; permissionDecisionReason: string } } | null {
+  let reason: string;
+  try {
+    const breach = hostFileToolBreach(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, {
+      bounds: hostToolBoundsFor(sandbox, "claude", readable, own),
+      workdir,
+      cwd: hookShellCwd(input),
+    });
+    if (!breach) return null;
+    reason = hostFileBreachReason(breach);
+  } catch {
+    reason = "codeoid couldn't tell whether this call stays within what the session's sandbox allows.";
+  }
+  return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: reason } };
+}
+
+/**
+ * The Claude CLI's own worktree tools (#448 round 6). EnterWorktree checks a
+ * worktree out from HEAD under `.claude/worktrees/` and moves the session
+ * there, re-rooting the CLI's project settings at it; HEAD may carry settings
+ * (hooks) an agent committed from inside the sandbox. ExitWorktree moves the
+ * session back to where it was before it entered, which can be another
+ * worktree.
+ */
+export const CLI_WORKTREE_TOOLS: ReadonlySet<string> = new Set(["EnterWorktree", "ExitWorktree"]);
+
+export const CLI_WORKTREE_DENY =
+  "Refused in a sandboxed session: use codeoid's --worktree; the CLI's own worktrees aren't sandboxed " +
+  "(a worktree checked out from HEAD carries whatever project settings were committed, hooks included).";
+
+/**
+ * The PreToolUse hook's (and canUseTool's) refusal of the CLI's own worktree
+ * tools while the session is sandboxed (#448 round 6), or null. The CLI runs
+ * EnterWorktree without asking canUseTool, so the hook is where it's stopped.
+ */
+export function cliWorktreeDecision(
+  toolName: unknown,
+  sandboxed: boolean,
+): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "deny"; permissionDecisionReason: string } } | null {
+  if (!sandboxed || typeof toolName !== "string" || !CLI_WORKTREE_TOOLS.has(toolName)) return null;
+  return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny", permissionDecisionReason: CLI_WORKTREE_DENY } };
+}
+
+/** What the running query's OS sandbox was built from (#448): a change rebuilds it. */
+export function sandboxFingerprint(rt: SandboxRuntime | null): string {
+  if (!rt) return "";
+  const { sessionId: _id, ...spec } = rt.spec;
+  return JSON.stringify({ provider: rt.provider.id, kind: rt.plan.kind, spec });
+}
+
+/**
+ * The query options that put a session's commands in its OS sandbox (#448):
+ * the SDK's `sandbox` (Claude Code's own, codeoid's policy) on a local OS
+ * provider, its CLI and its commands each with temp dirs of their own
+ * and the toolchains' caches in the sandbox's cache dir for its sandboxed
+ * commands only (`env`: claudeNativeEnv); or a spawner that starts the whole CLI inside the
+ * session's sandbox (Docker) in a private copy of its config dir
+ * (backend-home.ts), the handle it opens given to `track` (the caller
+ * closes it when the query is replaced). Nothing when the sandbox is off or
+ * unavailable: Session says so, and refuses an autonomous or unattended turn.
+ */
+export function claudeSandboxOptions(
+  rt: SandboxRuntime | null,
+  env: Record<string, string | undefined>,
+  workdir: string,
+  track?: (handle: SandboxHandle) => void,
+): { sandbox?: SandboxSettings; spawnClaudeCodeProcess?: (o: SpawnOptions) => SpawnedProcess; env?: Record<string, string | undefined> } {
+  if (!rt) return {};
+  if (rt.plan.kind === "native") {
+    const temp = rt.claudeTemp();
+    // The CLI's own git (its `git status` at every start) runs inside the sandbox too (git-shim.ts).
+    return { sandbox: claudeSandboxSettings(rt, env, temp), env: claudeNativeEnv(rt.spec, temp, env, rt.gitShim("the Claude CLI")) };
+  }
+  if (rt.plan.kind !== "process") return {};
+  let handle: SandboxHandle | null = null;
+  let configDir = "";
+  return {
+    spawnClaudeCodeProcess: (o: SpawnOptions): SpawnedProcess => {
+      if (!handle) {
+        const home = o.env.HOME || homedir();
+        const source = o.env.CLAUDE_CONFIG_DIR || join(home, ".claude");
+        // With CLAUDE_CONFIG_DIR set the CLI reads `.claude.json` from there: the user's own, copied in.
+        const own = preparePrivateHome(source, rt.privateHome("claude"), CLAUDE_HOME_LAYOUT, {
+          state: rt.stateDir("claude"),
+          ...(o.env.CLAUDE_CONFIG_DIR ? {} : { extraFiles: { ".claude.json": join(home, ".claude.json") } }),
+        });
+        configDir = own.home;
+        // Closed when the query is replaced or torn down: a login the CLI refreshed is written back then.
+        handle = withLoginsSynced(rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(o.command, [])] }), own, rt.warn);
+        track?.(handle);
+      }
+      const childEnv: Record<string, string> = {};
+      for (const [k, v] of Object.entries(o.env)) if (v !== undefined) childEnv[k] = v;
+      childEnv.CLAUDE_CONFIG_DIR = configDir;
+      const child = handle.spawn(o.command, o.args, { cwd: o.cwd ?? workdir, env: childEnv });
+      o.signal?.addEventListener("abort", () => child.kill("SIGTERM"), { once: true });
+      return child;
+    },
   };
 }

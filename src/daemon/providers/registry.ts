@@ -25,7 +25,6 @@ import type { CompressionRegistry } from "../compress/index.js";
 import type { CodeoidConfig } from "../../config.js";
 import type { SessionProvider, CatalogEntry } from "./interface.js";
 import { CLAUDE_PROVIDER_ID } from "../models.js";
-import type { SessionMode } from "../../protocol/types.js";
 import { ClaudeProvider } from "./claude/index.js";
 import { GeminiProvider } from "./gemini/index.js";
 import { OpenAIProvider } from "./openai/index.js";
@@ -47,6 +46,7 @@ import type { EndpointStore } from "../openai-endpoints.js";
 import { AccountError, type AccountStore, type ResolvedAccount } from "../accounts.js";
 import { type EndpointCatalog, syncEndpointProviders } from "./endpoint/index.js";
 import { registerSecretPaths } from "../secret-paths.js";
+import type { SandboxRuntime } from "../sandbox/session-sandbox.js";
 
 /**
  * Everything a factory may need to construct a provider for ONE session.
@@ -117,12 +117,6 @@ export interface ProviderSessionInit {
    */
   isForeignAgent?: (agentId: string) => boolean;
   /**
-   * The session's mode now (it can change mid-turn). Claude only: in
-   * autonomous mode its PreToolUse hook hands a write outside the working
-   * directory to codeoid's gate past an allow rule (outside-writes.ts).
-   */
-  sessionMode?: () => SessionMode;
-  /**
    * When this session is a fork: whether a task id is one of its parent's
    * (fork-isolation.ts). Claude only: a native fork's copy of the parent's
    * cloud-agent registrations is cleared by it.
@@ -138,6 +132,22 @@ export interface ProviderSessionInit {
   isOwnTask?: (taskId: string) => boolean;
   /** One of the parent's agents had a tool call denied (for the scrollback; the provider audits it). */
   onForeignAgentDenied?: (agentId: string, toolName: string) => void;
+  /**
+   * Whether the session is in autonomous mode now, read on every tool call
+   * (#448 round 9). Claude only: its PreToolUse hook routes a file tool
+   * beyond the sandbox's bounds to the gate (past the CLI's own allows) only
+   * then, since only autonomous mode holds a host-side file tool to them.
+   * Absent: treated as autonomous (routed).
+   */
+  isAutonomous?: () => boolean;
+  /**
+   * The session's OS sandbox while it is on (#448, sandbox/session-sandbox.ts),
+   * read each time the backend is started: null when it is off, unavailable,
+   * or the backend runs no commands. How a backend uses it is its own
+   * (sandbox/confinement.ts): Claude's own sandbox with codeoid's policy,
+   * the whole process started inside, or each command.
+   */
+  sandbox?: () => SandboxRuntime | null;
 }
 
 /** An HTTP backend's key from the session's account (accounts.ts), or null for the daemon's own. */
@@ -449,11 +459,12 @@ export function createDefaultProviderRegistry(
         extraEnv: init.extraEnv,
         forkBoundary: init.forkBoundary,
         isForeignAgent: init.isForeignAgent,
-        sessionMode: init.sessionMode,
         isForeignTask: init.isForeignTask,
         isFork: init.isFork,
         isOwnTask: init.isOwnTask,
         onForeignAgentDenied: init.onForeignAgentDenied,
+        ...(init.isAutonomous ? { isAutonomous: init.isAutonomous } : {}),
+        sandbox: init.sandbox,
       }),
   });
   // Stateless API backends: usable only with a key — in the environment (the
@@ -518,6 +529,7 @@ export function createDefaultProviderRegistry(
             onModels: init.onModels,
             resolveAccount: init.resolveAccount,
             extraEnv: init.extraEnv,
+            sandbox: init.sandbox,
           }),
       });
     } else {
@@ -552,6 +564,7 @@ export function createDefaultProviderRegistry(
             onModels: init.onModels,
             resolveAccount: init.resolveAccount,
             extraEnv: init.extraEnv,
+            sandbox: init.sandbox,
           }),
       });
     } else {
@@ -586,6 +599,7 @@ export function createDefaultProviderRegistry(
             onModels: init.onModels,
             resolveAccount: init.resolveAccount,
             extraEnv: init.extraEnv,
+            sandbox: init.sandbox,
           }),
       });
     } else {
@@ -621,6 +635,7 @@ export function createDefaultProviderRegistry(
           onModels: init.onModels,
           resolveAccount: init.resolveAccount,
           extraEnv: init.extraEnv,
+          sandbox: init.sandbox,
         }),
     });
   }
@@ -688,6 +703,7 @@ export function createDefaultProviderRegistry(
             onModels: init.onModels,
             agent: config?.providers?.opencode?.agent,
             modelPrices: () => config?.pricing?.models,
+            sandbox: init.sandbox,
           }),
       });
     } else {

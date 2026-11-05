@@ -211,13 +211,13 @@ describe("elicitation hard gate", () => {
 });
 
 describe("unresolved-path hard gate", () => {
-  test("a call whose path couldn't be resolved for certain requires approval even in autonomous mode", async () => {
+  test("a call whose path couldn't be resolved for certain asks in guarded mode", async () => {
     const provider = new MockSessionProvider("mock", [
       toolTurn("opencode_unresolved_path", { tool: "read", path: "/w/l/x", paths: ["/w/x"], reason: "codeoid can't tell for certain where /w/l/x leads" }),
     ]);
     const session = makeSession(provider);
     attachRecorder(session);
-    session.setMode("autonomous");
+    session.setMode("guarded");
 
     await session.send("read it", TEST_AUTH);
     await until(() => session.status === "waiting_approval");
@@ -226,6 +226,22 @@ describe("unresolved-path hard gate", () => {
 
     session.approve("approval-1", false, TEST_AUTH);
     await until(() => session.status === "idle" || session.status === "error");
+  });
+
+  test("in autonomous mode it is refused at once, never parked, the reason handed back (#448)", async () => {
+    const provider = new MockSessionProvider("mock", [
+      toolTurn("opencode_unresolved_path", { tool: "read", path: "/w/l/x", paths: ["/w/x"], reason: "codeoid can't tell for certain where /w/l/x leads" }),
+    ]);
+    const session = makeSession(provider);
+    const received = attachRecorder(session);
+    session.setMode("autonomous");
+
+    await session.send("read it", TEST_AUTH);
+    await until(() => session.status === "idle" || session.status === "error");
+    expect(received.some((m) => m.type === "session.status_change" && m.status === "waiting_approval")).toBe(false);
+    const result = provider.canUseToolResults[0] as { behavior: string; message?: string };
+    expect(result.behavior).toBe("deny");
+    expect(result.message).toStartWith("Refused: autonomous mode doesn't allow a call whose path couldn't be resolved for certain.");
   });
 });
 

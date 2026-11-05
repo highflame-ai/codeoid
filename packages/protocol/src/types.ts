@@ -369,6 +369,56 @@ export function isActiveStatus(s: SessionStatus): boolean {
  */
 export type SessionMode = "interactive" | "guarded" | "autonomous";
 
+/**
+ * A session's OS sandbox setting (#448, docs/sandbox.md). Every field
+ * optional: what is absent follows the daemon's `sandbox.*` config.
+ */
+export interface SessionSandboxSetting {
+  /** `auto` (bubblewrap on Linux, Seatbelt on macOS), `off`, or a provider id (`bwrap`, `seatbelt`, `docker`). */
+  provider?: string;
+  /** What a sandboxed command may reach on the network. */
+  network?: SandboxNetworkMode;
+  /** Hosts allowed with `network: "allowlist"` (`example.com`, `*.example.com`). */
+  allowedHosts?: string[];
+}
+
+export type SandboxNetworkMode = "on" | "off" | "allowlist";
+
+/**
+ * Whether, and how, a session's commands run sandboxed (#448).
+ *
+ *   - `on`: they do, as `network` says (see `enforced`);
+ *   - `off`: the owner turned it off;
+ *   - `unavailable`: it was asked for and can't run here (`reason`): an
+ *     interactive session runs unsandboxed and says so on every approval
+ *     card, an autonomous one, a routine or a loop refuses to start;
+ *   - `no-shell`: the backend runs no commands (an HTTP model API).
+ */
+export interface SessionSandboxInfo {
+  /** What is set: `auto`, `off`, or a provider id. */
+  choice: string;
+  state: "on" | "off" | "unavailable" | "no-shell";
+  /** The provider in use (`bwrap`, …), when on. */
+  provider?: string;
+  providerName?: string;
+  /** Why it's off or unavailable. */
+  reason?: string;
+  /** The network commands get. */
+  network: SandboxNetworkMode;
+  /** What was asked, when it differs from `network` (an allowlist a provider can't enforce runs with the network off; a backend that needs the network to reach its model keeps it on). */
+  networkRequested?: SandboxNetworkMode;
+  allowedHosts?: string[];
+  isolation?: "os" | "kernel" | "hardware";
+  /** How this backend is put inside: its own sandbox with codeoid's policy, its whole process, or each command. */
+  confinement?: "native" | "process" | "command";
+  /** One line: how, in words ("Claude Code's sandbox (bubblewrap), codeoid's policy"). */
+  via?: string;
+  /** What isn't confined this way, in plain words. */
+  limits?: string[];
+  /** Everything asked is enforced: what an autonomous session, a routine or a loop needs to start. */
+  enforced: boolean;
+}
+
 export interface SessionInfo {
   id: string;
   name: string;
@@ -423,6 +473,8 @@ export interface SessionInfo {
   effectiveAccount?: string;
   /** Current execution mode (default "interactive"). */
   mode?: SessionMode;
+  /** Whether its commands run in an OS sandbox (#448). Absent on a daemon without sandboxing. */
+  sandbox?: SessionSandboxInfo;
   /** Active SDLC pipeline phase id when this session backs a phase. Absent = not a pipeline session. */
   phase?: string;
   /** Methodology pack/profile driving this session's phase. */
@@ -465,6 +517,12 @@ export interface SessionInfo {
    * mode or sends a message, or its controller sets a new budget. Absent = not.
    */
   budgetExhausted?: true;
+  /**
+   * The autonomous tool budget ran out and the session reverted to guarded
+   * mode (the default "park"): writes and commands ask again. Cleared when a
+   * mode is set. Absent = not (and on older daemons).
+   */
+  autonomousBudgetSpent?: true;
   /** Files pinned to the session — prepended to every turn's prompt. */
   pinnedFiles?: string[];
   /** SPIFFE/WIMSE URI of the primary session agent (falls back to anonymous:session:<id>). */
@@ -997,11 +1055,21 @@ export interface ToolWaitingConfirmationState {
    */
   collaborationCost?: CollaborationCost;
   /**
-   * A shell command's risk, judged from what it runs (#431); in autonomous
-   * mode also a write outside the working directory, its reason first
-   * ("writes outside the working directory: <path>"). Absent otherwise.
+   * A shell command's risk, judged from what it runs (#431); for a file-tool
+   * write into what the OS sandbox holds read-only, that reason first
+   * ("writes the repository's git structure …"). Absent otherwise.
    */
   risk?: ToolRisk;
+  /**
+   * Whether this call runs inside the session's OS sandbox (#448). False for
+   * a session that isn't sandboxed, a tool that runs in the backend's own
+   * process outside it, and a request to run a command unsandboxed (asked in
+   * guarded and interactive mode, refused in autonomous mode). Absent on a
+   * daemon without sandboxing.
+   */
+  sandboxed?: boolean;
+  /** Why not, or what's asked: "not sandboxed: bubblewrap is not installed", "asks to run outside the sandbox". */
+  sandboxNote?: string;
 }
 
 /** How risky a shell command is, and why (#431). */
@@ -1186,6 +1254,8 @@ export type ClientMessage =
   | SessionCommandsMsg
   | SessionDestroyMsg
   | SessionSetModeMsg
+  | SessionSetSandboxMsg
+  | SandboxProvidersMsg
   | SessionPinMsg
   | SessionUnpinMsg
   | SessionRotateMsg
@@ -1433,6 +1503,8 @@ export interface SessionCreateMsg extends BaseClientMsg {
   model?: string;
   /** Thinking effort (#417). Absent = `session.defaultEffort`, else the backend's default; null = the backend's default. */
   effort?: EffortLevel | null;
+  /** OS sandbox (#448). Absent = the daemon's `sandbox.*` config. `provider: "off"` needs session:approve. */
+  sandbox?: SessionSandboxSetting;
   /**
    * Activate an installed SDLC pack on this session (ambient mode): inject its
    * constitution, expose its skills/subagents, and — with `packRole` — run
@@ -1742,6 +1814,38 @@ export interface ProviderCommand {
 export interface SessionDestroyMsg extends BaseClientMsg {
   type: "session.destroy";
   sessionId: string;
+}
+
+/**
+ * Change a session's OS sandbox (#448). Owner only. Anything that narrows it
+ * (turning it on, the network off) applies at once; anything that widens it
+ * (turning it off, the network on or wider) is an approval the owner answers
+ * on the session, in every mode, and is audited: the reply is `response.ok`
+ * with `data: { pending: true, requestId }`, and the change lands when it is
+ * approved (`session.info_update`). It reaches the backend from its next
+ * start: a session mid-turn changes after the turn.
+ */
+export interface SessionSetSandboxMsg extends BaseClientMsg {
+  type: "session.set_sandbox";
+  sessionId: string;
+  sandbox: SessionSandboxSetting;
+}
+
+/** The sandbox providers this daemon has, and whether each runs here (#448). Needs session:create. */
+export interface SandboxProvidersMsg extends BaseClientMsg {
+  type: "sandbox.providers";
+}
+
+/** One entry of the `sandbox.providers` reply's `data.providers`. */
+export interface SandboxProviderWire {
+  id: string;
+  displayName: string;
+  available: boolean;
+  reason?: string;
+  isolation: "os" | "kernel" | "hardware";
+  placement: "local" | "remote";
+  workspace: "mount" | "sync";
+  network: SandboxNetworkMode[];
 }
 
 export interface SessionSetModeMsg extends BaseClientMsg {

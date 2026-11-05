@@ -32,7 +32,7 @@ import PartsView, { hasRichParts } from "./PartsView";
 import { openRewind } from "../RewindModal";
 import { openForkFromHere } from "../ForkFromHereModal";
 import { openCompare } from "../CompareModal";
-import { RiskLine } from "./ApprovalBar";
+import { RiskLine, SandboxLine } from "./ApprovalBar";
 
 const ROLE_LABEL: Record<MessageRole, string> = {
   user: "you",
@@ -345,6 +345,15 @@ const ToolBlock: Component<{ msg: SessionMessage }> = (props) => {
           {(t().state as { output?: string }).output ?? "no error message"}
         </div>
       </Show>
+      {/* A refused or interrupted edit: the diff stays as the body, and why it didn't run under it. */}
+      <Show when={(editInput() || writeInput()) && t().state.phase === "cancelled"}>
+        <div class="rounded border border-danger/40 bg-danger/10 px-2 py-1.5 text-xs text-danger">
+          cancelled — {(t().state as { reason: string }).reason}
+          <Show when={(t().state as { message?: string }).message}>
+            : {(t().state as { message?: string }).message}
+          </Show>
+        </div>
+      </Show>
     </div>
     }>
       {(card) => <FleetActionCard card={card()} state={t().state} toolId={t().toolId} />}
@@ -458,6 +467,7 @@ const WaitingConfirmationBody: Component<{
             {props.state.description}
           </div>
           <RiskLine risk={props.state.risk} />
+          <SandboxLine sandboxed={props.state.sandboxed} sandboxNote={props.state.sandboxNote} />
           <LazyJsonDetails value={props.state.input} />
         </div>
       </Match>

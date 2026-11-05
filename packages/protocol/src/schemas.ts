@@ -82,6 +82,19 @@ export const attachmentSchema = z
 
 export const pingSchema = z.object({ ...base, type: z.literal("ping") });
 
+/**
+ * A session's OS sandbox setting (#448). The provider is a bounded string,
+ * not an enum: the daemon answers an unknown one with what it has. Hosts are
+ * checked again by the daemon.
+ */
+export const sessionSandboxSettingSchema = z
+  .object({
+    provider: z.string().min(1).max(64).optional(),
+    network: z.enum(["on", "off", "allowlist"]).optional(),
+    allowedHosts: z.array(z.string().min(1).max(253)).max(256).optional(),
+  })
+  .strict();
+
 export const sessionCreateSchema = z.object({
   ...base,
   type: z.literal("session.create"),
@@ -145,6 +158,8 @@ export const sessionCreateSchema = z.object({
    * fail-closes on a role the pack doesn't declare.
    */
   packRole: z.string().max(64).optional(),
+  /** OS sandbox (#448); absent = the daemon's config. */
+  sandbox: sessionSandboxSettingSchema.optional(),
 });
 
 export const sessionListSchema = z.object({ ...base, type: z.literal("session.list") });
@@ -253,6 +268,15 @@ export const sessionSetModeSchema = z.object({
   mode: z.enum(["interactive", "guarded", "autonomous"]),
   maxTurns: z.number().int().positive().max(10_000).optional(),
 });
+
+export const sessionSetSandboxSchema = z.object({
+  ...base,
+  type: z.literal("session.set_sandbox"),
+  sessionId: sessionIdField,
+  sandbox: sessionSandboxSettingSchema,
+});
+
+export const sandboxProvidersSchema = z.object({ ...base, type: z.literal("sandbox.providers") });
 
 export const sessionPinSchema = z.object({
   ...base,
@@ -846,6 +870,7 @@ const routineSpecFields = {
   keepSessions: z.number().int(),
   api: z.boolean(),
   failurePauseAfter: z.number().int(),
+  sandbox: sessionSandboxSettingSchema,
 };
 const routineSpecSchema = z.object({
   name: routineSpecFields.name,
@@ -869,6 +894,7 @@ const routineSpecSchema = z.object({
   keepSessions: routineSpecFields.keepSessions.optional(),
   api: routineSpecFields.api.optional(),
   failurePauseAfter: routineSpecFields.failurePauseAfter.optional(),
+  sandbox: routineSpecFields.sandbox.optional(),
   loop: routineLoopSchema.optional(),
 });
 /** An update: every field optional, and `null` clears an optional one. */
@@ -901,6 +927,7 @@ export const loopStartSchema = z.object({
   checks: z.array(loopCheckSchema).min(1).max(10),
   provider: z.string().min(1).max(64).optional(),
   model: z.string().min(1).max(200).optional(),
+  sandbox: sessionSandboxSettingSchema.optional(),
   toolBudget: z.number().int().min(1).max(1_000).optional(),
   limits: z
     .object({
@@ -1242,6 +1269,8 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   sessionCommandsSchema,
   sessionDestroySchema,
   sessionSetModeSchema,
+  sessionSetSandboxSchema,
+  sandboxProvidersSchema,
   sessionPinSchema,
   sessionUnpinSchema,
   sessionRotateSchema,
