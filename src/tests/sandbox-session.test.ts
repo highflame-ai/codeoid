@@ -13,6 +13,9 @@ import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
+import { claudeHostFiles } from "../daemon/providers/claude/host-files.js";
+import { claudeProjectDirName } from "../daemon/providers/claude/native-history.js";
+import type { BackendHostFiles } from "../daemon/sandbox/host-file-tools.js";
 import { confinementFor } from "../daemon/sandbox/confinement.js";
 import { LocalSandboxHandle } from "../daemon/sandbox/local-handle.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
@@ -155,8 +158,17 @@ async function until(cond: () => boolean, ms = 5_000): Promise<void> {
 
 type Card = { phase: string; sandboxed?: boolean; sandboxNote?: string; message?: string; risk?: { reasons: string[] } };
 
-async function gateCall(name: string, input: Record<string, unknown>, opts: Parameters<typeof makeSession>[1] & { backend?: string } = {}) {
-  const provider = new MockSessionProvider(opts.backend ?? "claude", [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name, input, approvalId: "ap-1" }, DONE]]);
+/** The mock backend, saying what its own file tools keep outside the sandbox (SessionProvider.hostFiles). */
+class WithHostFiles extends MockSessionProvider {
+  hostFilesOf: () => BackendHostFiles = () => ({});
+  hostFiles(): BackendHostFiles {
+    return this.hostFilesOf();
+  }
+}
+
+async function gateCall(name: string, input: Record<string, unknown>, opts: Parameters<typeof makeSession>[1] & { backend?: string; hostFiles?: () => BackendHostFiles } = {}) {
+  const provider = new WithHostFiles(opts.backend ?? "claude", [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name, input, approvalId: "ap-1" }, DONE]]);
+  if (opts.hostFiles) provider.hostFilesOf = opts.hostFiles;
   const { session, cards, infos } = makeSession(provider, opts);
   void session.send("go", AUTH).catch(() => {});
   await until(() => provider.canUseToolResults.length > 0 || session.pendingToolApprovals().length > 0);
@@ -181,6 +193,22 @@ function expectOutside(r: Awaited<ReturnType<typeof gateCall>>, access: "read" |
   expect(r.card).toMatchObject({ phase: "cancelled", message: r.message });
   expect(r.bounds?.metadata).toMatchObject({ access });
   expect(audits.some((a) => a.action === "session.sandbox_bounds_refuse" && a.sessionId === r.session.id && a.detail?.includes(`access=${access}`))).toBe(true);
+}
+
+/**
+ * Guarded or interactive mode asked about a host-side file tool beyond the
+ * sandbox (#448 round 9): as without a sandbox, the owner decides; the card
+ * and the pending approval say it is outside the sandbox's bounds. Nothing
+ * refused, no info line, no audit of a refusal.
+ */
+function expectAskedOutside(r: Awaited<ReturnType<typeof gateCall>>, path?: string): void {
+  expect(r.asked).toBe(true);
+  expect(r.card?.phase).toBe("waiting_confirmation");
+  expect(r.card?.sandboxNote).toStartWith("outside the sandbox's bounds: ");
+  if (path) expect(r.card?.sandboxNote).toContain(path);
+  expect(r.pending[0]?.sandboxNote).toBe(r.card?.sandboxNote);
+  expect(r.bounds).toBeUndefined();
+  expect(audits.some((a) => a.action === "session.sandbox_bounds_refuse" && a.sessionId === r.session.id)).toBe(false);
 }
 
 /** Autonomous mode refused the call outright (#448): never asked, its reason to the agent and on the card, an info line, audited. */
@@ -464,24 +492,26 @@ describe("review fixes (#448)", () => {
     expect(r.behavior).toBe("allow");
   });
 
-  test("Claude (native): a file-tool write to the project's Claude settings, which the sandbox holds read-only, is refused in every mode (#448 round 8)", async () => {
+  test("Claude (native): a file-tool write to the project's Claude settings, which the sandbox holds read-only, is refused in autonomous mode and asked in guarded and interactive mode, the card saying why (#448 rounds 8, 9)", async () => {
     const write = { file_path: join(workdir, ".claude", "settings.json"), content: "{}" };
-    for (const mode of ["autonomous", "guarded", "interactive"] as const) expectOutside(await gateCall("Write", write, { mode }), "write", join(workdir, ".claude", "settings.json"));
+    expectOutside(await gateCall("Write", write, { mode: "autonomous" }), "write", join(workdir, ".claude", "settings.json"));
+    for (const mode of ["guarded", "interactive"] as const) expectAskedOutside(await gateCall("Write", write, { mode }), join(workdir, ".claude", "settings.json"));
   });
 
-  test("Claude (native): a write to a Claude settings file outside the workspace is refused in every mode: the sandbox can't write there", async () => {
-    for (const mode of ["autonomous", "guarded"] as const) {
-      expectOutside(await gateCall("Write", { file_path: join(root, "elsewhere", ".claude", "settings.local.json"), content: "{}" }, { mode }), "write");
-    }
+  test("Claude (native): a write to a Claude settings file outside the workspace is refused in autonomous mode, asked in guarded mode", async () => {
+    const write = { file_path: join(root, "elsewhere", ".claude", "settings.local.json"), content: "{}" };
+    expectOutside(await gateCall("Write", write, { mode: "autonomous" }), "write");
+    expectAskedOutside(await gateCall("Write", write, { mode: "guarded" }), join(root, "elsewhere", ".claude", "settings.local.json"));
   });
 
-  test("a host-side file tool (opencode's) writing the project settings agent CLIs run code from is refused in every mode while the sandbox is on; a backend whose file tools run inside it is held by the sandbox itself (#448 rounds 2, 8)", async () => {
+  test("a host-side file tool (opencode's) writing the project settings agent CLIs run code from is refused in autonomous mode and asked in guarded mode while the sandbox is on; a backend whose file tools run inside it is held by the sandbox itself (#448 rounds 2, 8, 9)", async () => {
     for (const [backend, name, input] of [
       ["opencode", "Write", { file_path: join(workdir, ".claude", "settings.json"), content: "{}" }],
       ["opencode", "Edit", { file_path: join(workdir, "a.ts"), files: [join(workdir, ".gemini", "settings.json")] }],
       ["opencode", "Write", { file_path: join(workdir, ".mcp.json"), content: "{}" }],
     ] as const) {
-      for (const mode of ["autonomous", "guarded"] as const) expectOutside(await gateCall(name, input as Record<string, unknown>, { mode, backend }), "write");
+      expectOutside(await gateCall(name, input as Record<string, unknown>, { mode: "autonomous", backend }), "write");
+      expectAskedOutside(await gateCall(name, input as Record<string, unknown>, { mode: "guarded", backend }));
     }
     // pi's write runs inside the sandbox, which holds `.pi/` read-only: nothing for the gate to refuse.
     const pi = await gateCall("write", { path: ".pi/extensions/x.ts", content: "" }, { mode: "autonomous", backend: "pi" });
@@ -493,7 +523,7 @@ describe("review fixes (#448)", () => {
     expect([off.asked, off.behavior]).toEqual([false, "allow"]);
   });
 
-  test("host-side file tools writing the repository's git structure: what the sandbox holds read-only is refused in every mode; the rest of the git dir is refused in autonomous mode, guarded mode asks, the card saying why (#448 rounds 3, 8)", async () => {
+  test("host-side file tools writing the repository's git structure: refused in autonomous mode, guarded mode asks, the card saying why (#448 rounds 3, 8, 9)", async () => {
     const execFile = (args: string[], cwd: string) => Bun.spawnSync(["git", ...args], { cwd, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
     execFile(["init", "-q", "-b", "main"], workdir);
     try {
@@ -514,7 +544,8 @@ describe("review fixes (#448)", () => {
         ["claude", "NotebookEdit", { notebook_path: join(workdir, ".git", "info", "attributes.ipynb") }],
         ["opencode", "Edit", { file_path: join(workdir, "a.ts"), files: [join(workdir, ".git", "info", "attributes")] }],
       ] as const) {
-        for (const mode of ["autonomous", "guarded"] as const) expectOutside(await gateCall(name, input as Record<string, unknown>, { mode, backend }), "write");
+        expectOutside(await gateCall(name, input as Record<string, unknown>, { mode: "autonomous", backend }), "write");
+        expectAskedOutside(await gateCall(name, input as Record<string, unknown>, { mode: "guarded", backend }));
       }
       // pi's write runs inside the sandbox, which holds the git structure itself.
       expect((await gateCall("write", { path: ".git/HEAD", content: "x" }, { mode: "autonomous", backend: "pi" })).behavior).toBe("allow");
@@ -893,13 +924,16 @@ describe("round 8 of the #448 audit: host-side file tools are held to the sandbo
     }
   });
 
-  test("the same in guarded and interactive mode, while sandboxed: refused, not asked; a write within still asks in guarded mode as before", async () => {
+  test("guarded and interactive mode, while sandboxed, decide as without a sandbox (#448 round 9): a write beyond it asks, the card saying it is outside the sandbox's bounds; a read runs in guarded mode, asks in interactive mode", async () => {
     for (const mode of ["guarded", "interactive"] as const) {
-      expectOutside(await gateCall("Write", { file_path: bashrc(), content: "x" }, { mode }), "write");
-      expectOutside(await gateCall("Read", { file_path: sshKey() }, { mode, backend: "opencode" }), "read");
+      expectAskedOutside(await gateCall("Write", { file_path: bashrc(), content: "x" }, { mode }), bashrc());
     }
+    const read = await gateCall("Read", { file_path: sshKey() }, { mode: "guarded", backend: "opencode" });
+    expect([read.asked, read.behavior]).toEqual([false, "allow"]);
+    expectAskedOutside(await gateCall("Read", { file_path: sshKey() }, { mode: "interactive", backend: "opencode" }), sshKey());
     expect((await gateCall("Write", { file_path: join(workdir, "b.ts"), content: "" }, { mode: "guarded" })).asked).toBe(true);
     expect((await gateCall("Read", { file_path: join(workdir, "b.ts") }, { mode: "guarded" })).behavior).toBe("allow");
+    expect(audits.some((a) => a.action === "session.sandbox_bounds_refuse")).toBe(false);
   });
 
   test("the sandbox decides what a read reaches: the home's allowlist is readable; the host's /tmp is to Claude's own sandbox, not to opencode's under bubblewrap (its /tmp is the session's)", async () => {
@@ -982,5 +1016,180 @@ describe("round 8 of the #448 audit: host-side file tools are held to the sandbo
       const info = await session.ensureSandbox();
       expect(info?.limits?.join("\n")).toContain("held to the sandbox's own policy at codeoid's gate");
     }
+  });
+});
+
+describe("round 9 of the #448 audit: the gate's host-side bounds hold in autonomous mode only", () => {
+  // Data only: the mock backend runs nothing, writes nothing.
+  const h = () => homedir();
+
+  test("guarded and interactive mode decide each call the reports list as origin/main does (no sandbox there): project settings writes ask, reads in the home run in guarded mode, a /tmp write asks; autonomous mode refuses them, saying where it may write", async () => {
+    const writes: Array<[string, string, Record<string, unknown>]> = [
+      ["claude", "Write", { file_path: join(workdir, ".claude", "commands", "deploy.md"), content: "x" }],
+      ["claude", "Write", { file_path: join(workdir, ".claude", "skills", "s", "SKILL.md"), content: "x" }],
+      ["claude", "Edit", { file_path: join(workdir, ".mcp.json"), old_string: "{", new_string: "{" }],
+      ["claude", "Write", { file_path: join(workdir, ".codex", "config.toml"), content: "x" }],
+      ["opencode", "Write", { file_path: join(workdir, "opencode.json"), content: "{}" }],
+      ["opencode", "Write", { file_path: join(workdir, ".claude", "agents", "a.md"), content: "x" }],
+      ["claude", "Write", { file_path: "/tmp/r9-scratch.py", content: "x" }],
+      ["claude", "Write", { file_path: join(h(), "src", "other-repo", "x.ts"), content: "x" }],
+    ];
+    for (const [backend, name, input] of writes) {
+      for (const mode of ["guarded", "interactive"] as const) expectAskedOutside(await gateCall(name, input, { mode, backend }), String(input.file_path));
+      const r = await gateCall(name, input, { mode: "autonomous", backend });
+      expectOutside(r, "write", String(input.file_path));
+      expect(r.message).toContain(`Write in the working directory (${workdir}) or the session's temp dir (`);
+    }
+    const reads: Array<[string, Record<string, unknown>]> = [
+      ["claude", { file_path: join(h(), "Downloads", "error.log") }],
+      ["claude", { file_path: join(h(), "Documents", "spec.md") }],
+      ["opencode", { file_path: join(h(), "src", "other-repo", "README.md") }],
+    ];
+    for (const [backend, input] of reads) {
+      const g = await gateCall("Read", input, { mode: "guarded", backend });
+      expect([backend, g.asked, g.behavior]).toEqual([backend, false, "allow"]);
+      expectAskedOutside(await gateCall("Read", input, { mode: "interactive", backend }), String(input.file_path));
+      const a = await gateCall("Read", input, { mode: "autonomous", backend });
+      expectOutside(a, "read", String(input.file_path));
+      expect(a.message).toContain("sandbox.homeReadable");
+    }
+    // A search reaching the home: guarded runs it (safe), as origin/main does.
+    expect((await gateCall("Grep", { pattern: "x", path: join(h(), "src", "other-repo") }, { mode: "guarded" })).behavior).toBe("allow");
+    // A credential refusal origin/main has stays, in every mode.
+    for (const mode of ["guarded", "interactive", "autonomous"] as const) {
+      const r = await gateCall("Read", { file_path: join(h(), ".codeoid", "config.json") }, { mode });
+      expect([mode, r.asked, r.behavior]).toEqual([mode, false, "deny"]);
+      expect(r.message).toContain("holds credentials");
+    }
+  });
+
+  test("autonomous mode: the Claude CLI's own context files are its file tools' (memory and plans as markdown, task output, tasks, todos; the user tier's agents, commands, rules, CLAUDE.md, installed plugins' skills read); its settings, credentials, hooks and plugins' code are not", async () => {
+    const cfg = join(h(), ".claude");
+    // Where Claude native keeps CLAUDE_CODE_TMPDIR: in the daemon's own dir, hidden from every sandbox.
+    const cli = join(sandboxRoot(), "claude-test-cli");
+    const hostFiles = () => claudeHostFiles({ configDir: cfg, cliTempDir: cli, workdir, uid: 1000 });
+    const memory = join(cfg, "projects", claudeProjectDirName(workdir), "memory");
+    const output = join(cli, "claude-1000", claudeProjectDirName(workdir), "sess", "tasks", "b1.output");
+    const allowed: Array<[string, Record<string, unknown>]> = [
+      ["Write", { file_path: join(memory, "feedback_pnpm.md"), content: "x" }],
+      ["Edit", { file_path: join(memory, "MEMORY.md"), old_string: "a", new_string: "b" }],
+      ["Read", { file_path: join(memory, "MEMORY.md") }],
+      ["Write", { file_path: join(cfg, "plans", "happy-plan.md"), content: "x" }],
+      ["Read", { file_path: join(cfg, "plans", "happy-plan.md") }],
+      ["Write", { file_path: join(cfg, "agent-memory", "reviewer", "MEMORY.md"), content: "x" }],
+      ["Read", { file_path: output }],
+      ["Write", { file_path: join(cli, "claude-1000", claudeProjectDirName(workdir), "sess", "scratchpad", "notes.txt"), content: "x" }],
+      ["Write", { file_path: join(cfg, "todos", "t.json"), content: "[]" }],
+      ["Read", { file_path: join(cfg, "tasks", "list", "1.json") }],
+      ["Read", { file_path: join(cfg, "agents", "a.md") }],
+      ["Read", { file_path: join(cfg, "commands", "c.md") }],
+      ["Read", { file_path: join(cfg, "rules", "r.md") }],
+      ["Read", { file_path: join(cfg, "output-styles", "o.md") }],
+      ["Read", { file_path: join(cfg, "CLAUDE.md") }],
+      ["Read", { file_path: join(cli, "claude-1000", "bundled-skills", "s", "ref.md") }],
+    ];
+    for (const [name, input] of allowed) {
+      const r = await gateCall(name, input, { mode: "autonomous", hostFiles });
+      expect([name, input.file_path, r.asked, r.behavior]).toEqual([name, input.file_path, false, "allow"]);
+    }
+    const refused: Array<[string, Record<string, unknown>, "read" | "write"]> = [
+      ["Write", { file_path: join(memory, "run.sh"), content: "x" }, "write"],
+      ["Write", { file_path: join(cfg, "settings.json"), content: "{}" }, "write"],
+      ["Read", { file_path: join(cfg, "settings.json") }, "read"],
+      ["Write", { file_path: join(cfg, "agents", "a.md"), content: "x" }, "write"],
+      ["Write", { file_path: join(cfg, "CLAUDE.md"), content: "x" }, "write"],
+      ["Write", { file_path: join(cfg, "hooks", "h.sh"), content: "x" }, "write"],
+      ["Read", { file_path: join(cfg, "plugins", "cache", "m", "p", "1", "hooks", "hooks.json") }, "read"],
+      ["Write", { file_path: join(cli, "claude-1000", "plugin-tool-staging", "x.js"), content: "x" }, "write"],
+      ["Read", { file_path: join(cli, "cc-socks", "s") }, "read"],
+      ["Write", { file_path: join(cfg, "projects", "-some-other-project", "memory", "MEMORY.md"), content: "x" }, "write"],
+    ];
+    for (const [name, input, access] of refused) expectOutside(await gateCall(name, input, { mode: "autonomous", hostFiles }), access);
+    // Its credentials: refused in every mode by the credential rule, before the carve-outs.
+    const creds = await gateCall("Read", { file_path: join(cfg, ".credentials.json") }, { mode: "autonomous", hostFiles });
+    expect([creds.asked, creds.behavior]).toEqual([false, "deny"]);
+  });
+
+  test("autonomous mode: a link planted in the memory dir is judged where it leads", async () => {
+    const cfg = join(root, "cfg");
+    const memory = join(cfg, "projects", claudeProjectDirName(workdir), "memory");
+    mkdirSync(memory, { recursive: true });
+    mkdirSync(join(root, "elsewhere"), { recursive: true });
+    symlinkSync(join(root, "elsewhere"), join(memory, "out"));
+    const hostFiles = () => claudeHostFiles({ configDir: cfg, workdir });
+    expect((await gateCall("Write", { file_path: join(memory, "a.md"), content: "x" }, { mode: "autonomous", hostFiles })).behavior).toBe("allow");
+    expectOutside(await gateCall("Write", { file_path: join(memory, "out", "a.md"), content: "x" }, { mode: "autonomous", hostFiles }), "write", join(root, "elsewhere", "a.md"));
+  });
+
+  test("autonomous mode: opencode's scratch dir is its file tools'", async () => {
+    const scratch = join(root, "oc-data", "tmp", "opencode");
+    const hostFiles = () => ({ writable: [scratch] });
+    for (const [name, input] of [
+      ["Write", { file_path: join(scratch, "images", "s", "image_1.png"), content: "x" }],
+      ["Read", { file_path: join(scratch, "images", "s", "image_1.png") }],
+    ] as const) {
+      const r = await gateCall(name, input as Record<string, unknown>, { mode: "autonomous", backend: "opencode", hostFiles });
+      expect([name, r.asked, r.behavior]).toEqual([name, false, "allow"]);
+    }
+    expectOutside(await gateCall("Write", { file_path: join(root, "oc-data", "data", "x"), content: "x" }, { mode: "autonomous", backend: "opencode", hostFiles }), "write");
+  });
+
+  test("a session in a monorepo's package: the repository's top is the sandbox's workspace at the gate too: the root and a sibling package are read and written, nothing above the repository is; the package's own settings stay held; the cwd is the package", async () => {
+    const mono = join(root, "mono");
+    const web = join(mono, "packages", "web");
+    mkdirSync(join(mono, ".git", "objects"), { recursive: true });
+    mkdirSync(join(mono, ".git", "refs"), { recursive: true });
+    writeFileSync(join(mono, ".git", "HEAD"), "ref: refs/heads/main\n");
+    mkdirSync(web, { recursive: true });
+    mkdirSync(join(mono, "packages", "shared"), { recursive: true });
+    writeFileSync(join(mono, "package.json"), "{}");
+    writeFileSync(join(mono, "packages", "shared", "index.ts"), "");
+    workdir = web;
+    for (const [name, input] of [
+      ["Read", { file_path: join(mono, "package.json") }],
+      ["Read", { file_path: join(mono, "packages", "shared", "index.ts") }],
+      ["Edit", { file_path: join(mono, "packages", "shared", "index.ts"), old_string: "", new_string: "x" }],
+      ["Grep", { pattern: "x", path: mono }],
+    ] as const) {
+      const r = await gateCall(name, input as Record<string, unknown>, { mode: "autonomous" });
+      expect([name, r.asked, r.behavior]).toEqual([name, false, "allow"]);
+    }
+    expectOutside(await gateCall("Write", { file_path: join(root, "above.txt"), content: "x" }, { mode: "autonomous" }), "write");
+    for (const f of [join(web, ".claude", "settings.json"), join(mono, "packages", "opencode.json"), join(mono, ".claude", "settings.json")]) {
+      expectOutside(await gateCall("Write", { file_path: f, content: "{}" }, { mode: "autonomous" }), "write", f);
+      expectAskedOutside(await gateCall("Write", { file_path: f, content: "{}" }, { mode: "guarded" }), f);
+    }
+    const { session } = makeSession(new MockSessionProvider("claude", []));
+    const info = await session.ensureSandbox();
+    expect(info?.limits?.join("\n")).toContain(`the workspace is the repository's top (${mono})`);
+    expect(session.workdir).toBe(web);
+  });
+
+  test("autonomous mode: a search at the workspace's top runs when the user's own hidden path is inside it: Claude's leaves it out (its Read deny rules), opencode's can't and runs; a credential location above the workspace stays refused", async () => {
+    writeFileSync(join(workdir, ".env"), "SECRET=planted\n");
+    const config = { sandbox: { hiddenPaths: [join(workdir, ".env")] } };
+    const claudeNo = await gateCall("Grep", { pattern: "x" }, { mode: "autonomous", config });
+    expectOutside(claudeNo, "search");
+    expect(claudeNo.message).toContain("search with grep in the shell");
+    const claude = await gateCall("Grep", { pattern: "x" }, { mode: "autonomous", config, hostFiles: () => ({ searchExcluded: [join(workdir, ".env")] }) });
+    expect([claude.asked, claude.behavior]).toEqual([false, "allow"]);
+    for (const name of ["Grep", "Glob"]) {
+      const oc = await gateCall(name, { pattern: "**/*" }, { mode: "autonomous", backend: "opencode", config });
+      expect([name, oc.asked, oc.behavior]).toEqual([name, false, "allow"]);
+    }
+    expectOutside(await gateCall("Grep", { pattern: "x", path: homedir() }, { mode: "autonomous", backend: "opencode", config }), "search");
+    // The shell's search runs inside the sandbox, which shows the hidden path empty.
+    for (const backend of ["claude", "opencode"]) {
+      for (const command of ["grep -rn parseConfig .", "rg parseConfig", "find . -name '*.ts'"]) {
+        const r = await gateCall("Bash", { command }, { mode: "autonomous", backend, config });
+        expect([backend, command, r.asked, r.behavior]).toEqual([backend, command, false, "allow"]);
+      }
+    }
+  });
+
+  test("Claude's LSP is a host-side reader: a hidden filePath is refused in autonomous mode, the card notes it in guarded mode", async () => {
+    const input = { operation: "documentSymbol", filePath: join(h(), ".bashrc"), line: 1, character: 1 };
+    expectOutside(await gateCall("LSP", input, { mode: "autonomous" }), "read", join(h(), ".bashrc"));
+    expectAskedOutside(await gateCall("LSP", input, { mode: "interactive" }), join(h(), ".bashrc"));
   });
 });

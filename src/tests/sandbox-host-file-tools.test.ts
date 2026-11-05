@@ -173,6 +173,70 @@ describe("each host-side file tool, judged by the rules", () => {
   test("the reason the agent reads names the path and says what to do", () => {
     const b = judge("Write", { file_path: join(home, ".bashrc") });
     expect(hostFileBreachReason(b!)).toStartWith(`Refused: outside what this session's sandbox allows: ${join(home, ".bashrc")} (`);
-    expect(hostFileBreachReason(b!)).toContain("keep to the working directory");
+    expect(hostFileBreachReason(b!)).toContain(`Write in the working directory (${ws}) or the session's temp dir (${temp}) instead.`);
+    const r = judge("Read", { file_path: join(home, ".bashrc") });
+    expect(hostFileBreachReason(r!)).toContain("Keep to the working directory");
+    expect(hostFileBreachReason(r!)).toContain("sandbox.homeReadable");
+  });
+
+  test("a refused write names where the agent may write instead: the working directory and the session's temp dir, by its real path (#448 round 9)", () => {
+    const reason = hostFileBreachReason(judge("Write", { file_path: join(elsewhere, "x") })!);
+    expect(reason).toContain(`Write in the working directory (${ws}) or the session's temp dir (${temp})`);
+    // Claude's native sandbox: its commands' temp dir, as written and physical.
+    mkdirSync(join(root, "ct-real", "c"), { recursive: true });
+    symlinkSync(join(root, "ct-real"), join(root, "ct-link"));
+    const native = { spec, plan: { kind: "native" }, provider: { id: "bwrap" }, claudeTemp: () => ({ cli: join(root, "cli"), root: join(root, "ct-link"), commands: join(root, "ct-link", "c") }) } as never;
+    const b = hostFileToolBreach("Write", { file_path: "/tmp/scratch.py" }, { bounds: hostToolBoundsFor(native, "claude"), workdir: ws });
+    expect(b).toMatchObject({ why: "not_writable" });
+    expect(hostFileBreachReason(b!)).toContain(`the session's temp dir (${join(root, "ct-link", "c")}, also ${join(root, "ct-real", "c")})`);
+    // A search refused at the working directory's top isn't told to keep to it.
+    const s = hostFileToolBreach("Grep", { pattern: "x" }, { bounds: hostToolBounds({ ...spec, hidden: [...spec.hidden, join(ws, "src")] }), workdir: ws, cwd: ws });
+    expect(s).toMatchObject({ why: "reaches_hidden" });
+    expect(hostFileBreachReason(s!)).not.toContain("Keep to the working directory");
+    expect(hostFileBreachReason(s!)).toContain("search with grep in the shell");
+  });
+
+  test("Claude's LSP opens its filePath in a language server outside the sandbox: judged as a read (#448 round 9)", () => {
+    expect(judge("LSP", { operation: "documentSymbol", filePath: join(home, ".ssh", "id_ed25519"), line: 1, character: 1 })).toMatchObject({ access: "read", why: "hidden" });
+    expect(judge("LSP", { operation: "hover", filePath: join(ws, "a.ts"), line: 1, character: 1 })).toBeNull();
+    expect(judge("LSP", { operation: "hover" })).toMatchObject({ why: "unresolved" });
+  });
+});
+
+describe("round 9 of the #448 audit: the backend's own context files, and searches past a hidden path", () => {
+  test("its writable context dirs are written, a markdown-only one only for .md files and read whole; one holding a hidden path is dropped; a link out is judged where it leads", () => {
+    const memory = join(home, ".claude", "projects", "-p", "memory");
+    const tasks = join(home, ".claude", "tasks");
+    mkdirSync(memory, { recursive: true });
+    mkdirSync(tasks, { recursive: true });
+    symlinkSync(join(home, ".ssh"), join(memory, "keys"));
+    const b = hostToolBounds(spec, { writable: [tasks, home], markdown: [memory] });
+    expect(sandboxWrites(b, join(memory, "MEMORY.md"))).toBe(true);
+    expect(sandboxWrites(b, join(memory, "run.sh"))).toBe(false);
+    expect(sandboxReads(b, join(memory, "run.sh"))).toBe(true);
+    expect(sandboxWrites(b, join(tasks, "list", "1.json"))).toBe(true);
+    // The home holds hidden paths: never a carve-out.
+    expect(sandboxWrites(b, join(home, "notes.md"))).toBe(false);
+    expect(sandboxReads(b, join(home, ".claude", "settings.json"))).toBe(false);
+    const j = (input: Record<string, unknown>, name = "Write") => hostFileToolBreach(name, input, { bounds: b, workdir: ws });
+    expect(j({ file_path: join(memory, "user.md") })).toBeNull();
+    expect(j({ file_path: join(memory, "keys", "id.md") })).toMatchObject({ path: join(home, ".ssh", "id.md"), why: "hidden" });
+  });
+
+  test("a search reaching a hidden path: allowed where the backend leaves it out, or (opencode, which can't) where it is the user's own hidden path inside the workspace; a credential outside the workspace stays refused", () => {
+    const env = join(ws, ".env");
+    writeFileSync(env, "SECRET=planted\n");
+    const withEnv = { ...spec, hidden: [...spec.hidden, env] };
+    const rt = (provider: string, plan = "command") => ({ spec: withEnv, plan: { kind: plan }, provider: { id: provider }, claudeTemp: () => ({ cli: temp, root: temp, commands: temp }) }) as never;
+    const grep = (bounds: ReturnType<typeof hostToolBounds>, path?: string) => hostFileToolBreach("Grep", { pattern: "x", ...(path ? { path } : {}) }, { bounds, workdir: ws, cwd: ws });
+    // Claude, no exclusion: refused; its Read deny rule for it (claudeSearchExclusions): allowed.
+    expect(grep(hostToolBoundsFor(rt("bwrap", "native"), "claude"))).toMatchObject({ why: "reaches_hidden", reaches: env });
+    expect(grep(hostToolBoundsFor(rt("bwrap", "native"), "claude", [], { searchExcluded: [env] }))).toBeNull();
+    // opencode: the user's own hidden path in the workspace is reached (its ripgrep runs with --no-config).
+    expect(grep(hostToolBoundsFor(rt("seatbelt"), "opencode", [], {}, [env]))).toBeNull();
+    expect(grep(hostToolBoundsFor(rt("seatbelt"), "opencode", [], {}, []))).toMatchObject({ why: "reaches_hidden" });
+    // Never a credential location above the workspace.
+    expect(grep(hostToolBoundsFor(rt("seatbelt"), "opencode", [], {}, [env]), root)).toMatchObject({ why: "reaches_hidden" });
+    expect(grep(hostToolBoundsFor(rt("seatbelt"), "opencode", [], {}, [join(home, ".ssh")]), home)).toMatchObject({ why: "hidden" });
   });
 });

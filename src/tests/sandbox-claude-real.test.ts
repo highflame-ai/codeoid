@@ -350,3 +350,60 @@ describe.skipIf(cli === null || process.env.CODEOID_TEST_CLAUDE_SANDBOX === "0")
     expect(refused.toolResult ?? "").toContain("the CLI's own worktrees aren't sandboxed");
   }, 300_000);
 });
+
+/**
+ * What the Claude CLI's own file tools reach outside its sandbox (#448 round
+ * 9), for real: where it writes a background command's output and names
+ * its memory dir (both within the gate's carve-outs, host-files.ts), and
+ * the Read deny rules an autonomous query carries leaving hidden paths out
+ * of its Grep and Glob. Needs only the CLI; the files are the test's own.
+ */
+describe.skipIf(cli === null || process.env.CODEOID_TEST_CLAUDE_SANDBOX === "0")("the Claude CLI's own context files and searches, for real (#448 round 9)", () => {
+  const OWN_PROBE = join(import.meta.dir, "fixtures", "claude-own-files-probe.ts");
+  let root: string;
+  beforeAll(() => {
+    root = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-own-claude-")));
+    const ws = join(root, "home", "proj");
+    mkdirSync(join(ws, "secretdir"), { recursive: true });
+    writeFileSync(join(ws, ".env"), "needle-in-secret\n");
+    writeFileSync(join(ws, "secretdir", "x.txt"), "needle-in-dir\n");
+    writeFileSync(join(ws, "a.txt"), "needle-in-code\n");
+  });
+  afterAll(() => rmSync(root, { recursive: true, force: true }));
+
+  async function run(call: Record<string, unknown>, mode = "none"): Promise<{ result: string; asked: string[]; toolResult: string | null; memDir: string | null }> {
+    const file = join(root, `call-${Math.random().toString(36).slice(2)}.json`);
+    writeFileSync(file, JSON.stringify(call));
+    const p = Bun.spawn([process.execPath, OWN_PROBE, root, file, mode], { stdout: "pipe", stderr: "pipe", timeout: 150_000 });
+    const out = await new Response(p.stdout).text();
+    await p.exited;
+    return JSON.parse(out.trim().split("\n").at(-1) ?? "{}");
+  }
+
+  test("a Read deny rule leaves a hidden file and a hidden dir out of Grep's and Glob's results; without it they show", async () => {
+    const grep = { name: "Grep", input: { pattern: "needle", output_mode: "content" } };
+    const glob = { name: "Glob", input: { pattern: "**/*.txt" } };
+    const open = await run(grep);
+    expect(open.toolResult).toContain("needle-in-secret");
+    expect(open.toolResult).toContain("needle-in-dir");
+    const denied = await run(grep, "deny");
+    expect(denied.toolResult).toContain("needle-in-code");
+    expect(denied.toolResult).not.toContain("needle-in-secret");
+    expect(denied.toolResult).not.toContain("needle-in-dir");
+    expect((await run(glob)).toolResult).toContain("secretdir/x.txt");
+    const globDenied = await run(glob, "deny");
+    expect(globDenied.toolResult).toContain("a.txt");
+    expect(globDenied.toolResult).not.toContain("secretdir");
+  }, 300_000);
+
+  test("a background command's output and the memory dir the CLI names are inside the gate's carve-outs for it", async () => {
+    const { claudeHostFiles } = await import("../daemon/providers/claude/host-files.js");
+    const bg = await run({ name: "Bash", input: { command: "echo background-probe-output", description: "probe", run_in_background: true } });
+    const output = /Output is being written to: (\S+\.output)/.exec(bg.toolResult ?? "")?.[1];
+    expect(output).toBeDefined();
+    const own = claudeHostFiles({ configDir: join(root, "home", ".claude"), cliTempDir: join(root, "cli"), workdir: join(root, "home", "proj") });
+    expect(own.writable.some((w) => output!.startsWith(`${w}/`))).toBe(true);
+    expect(bg.memDir).not.toBeNull();
+    expect(own.markdown.some((m) => bg.memDir!.replace(/\/$/, "") === m)).toBe(true);
+  }, 300_000);
+});

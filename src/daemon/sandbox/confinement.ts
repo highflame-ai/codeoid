@@ -16,7 +16,8 @@
  *   - `command`: each shell command starts inside (opencode: one server
  *     serves every session, so its shell is a codeoid shim that runs each
  *     line in the session's sandbox). File tools run in the server, outside,
- *     held to the sandbox's own policy at codeoid's gate (host-file-tools.ts).
+ *     held to the sandbox's own policy at codeoid's gate in autonomous mode
+ *     (host-file-tools.ts).
  *   - `no-shell`: the backend runs no commands (HTTP model APIs).
  */
 
@@ -112,7 +113,7 @@ export function confinementFor(backendId: string, provider: SandboxProvider | nu
             fileTools: false,
             wrapsBackend: false,
             limits: [
-              "Claude's file tools (Read, Edit, Write, Glob, Grep) run in the CLI, outside the sandbox: they are held to the sandbox's own policy at codeoid's gate (a read of what it hides, or a write outside what it lets commands write, is refused)",
+              "Claude's file tools (Read, Edit, Write, Glob, Grep, LSP) run in the CLI, outside the sandbox: in autonomous mode they are held to the sandbox's own policy at codeoid's gate (a read of what it hides, or a write outside what it lets commands write, is refused; the CLI's own memory, plans and task output stay its own); guarded and interactive mode ask as without a sandbox, the card saying a call is outside its bounds",
             ],
           },
         };
@@ -152,7 +153,7 @@ export function confinementFor(backendId: string, provider: SandboxProvider | nu
             fileTools: false,
             wrapsBackend: false,
             limits: [
-              "opencode's file tools run in its shared server, outside the sandbox: they are held to the sandbox's own policy at codeoid's gate (a read of what it hides, or a write outside what it lets commands write, is refused)",
+              "opencode's file tools run in its shared server, outside the sandbox: in autonomous mode they are held to the sandbox's own policy at codeoid's gate (a read of what it hides, or a write outside what it lets commands write, is refused; its scratch dir stays its own); guarded and interactive mode ask as without a sandbox, the card saying a call is outside its bounds",
             ],
           },
         };

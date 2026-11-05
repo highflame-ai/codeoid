@@ -133,6 +133,14 @@ export interface ProviderSessionInit {
   /** One of the parent's agents had a tool call denied (for the scrollback; the provider audits it). */
   onForeignAgentDenied?: (agentId: string, toolName: string) => void;
   /**
+   * Whether the session is in autonomous mode now, read on every tool call
+   * (#448 round 9). Claude only: its PreToolUse hook routes a file tool
+   * beyond the sandbox's bounds to the gate (past the CLI's own allows) only
+   * then, since only autonomous mode holds a host-side file tool to them.
+   * Absent: treated as autonomous (routed).
+   */
+  isAutonomous?: () => boolean;
+  /**
    * The session's OS sandbox while it is on (#448, sandbox/session-sandbox.ts),
    * read each time the backend is started: null when it is off, unavailable,
    * or the backend runs no commands. How a backend uses it is its own
@@ -455,6 +463,7 @@ export function createDefaultProviderRegistry(
         isFork: init.isFork,
         isOwnTask: init.isOwnTask,
         onForeignAgentDenied: init.onForeignAgentDenied,
+        ...(init.isAutonomous ? { isAutonomous: init.isAutonomous } : {}),
         sandbox: init.sandbox,
       }),
   });

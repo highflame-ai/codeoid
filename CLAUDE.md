@@ -293,14 +293,27 @@ any other `.git` file is held read-only and said in the sandbox's limits
 Codex's extra writable roots. The project settings agent CLIs run code from
 (`PROJECT_CONFIG_DIRS`/`_FILES`: `.claude/`, `.mcp.json`, …; missing ones made
 first, files as an empty config listed in `info/exclude`) read-only. File
-tools that run outside the sandbox (Claude native's, opencode's: plan
-`fileTools: false`) are held to the sandbox's own spec at the gate
-(sandbox/host-file-tools.ts, `Session#outsideSandbox`, round 8): a write
+tools that run outside the sandbox (Claude native's, LSP included, opencode's: plan
+`fileTools: false`) are held to the sandbox's own spec at the gate in
+autonomous mode (sandbox/host-file-tools.ts, `Session#outsideSandbox`, rounds 8, 9): a write
 outside what it lets commands write, a read or search of what it hides, is
-refused in every mode while sandboxed, never asked (event `sandbox.refused`,
-audit `session.sandbox_bounds_refuse`; on Claude the PreToolUse hook routes
-it past allow rules, `hostFileDecision`; the backend's own outside reads via
-`SessionProvider.hostReadable`). Such a tool writing the rest of the
+refused there, never asked (event `sandbox.refused`, audit
+`session.sandbox_bounds_refuse`; the reason names the workdir and the temp
+dir's real path; on Claude the PreToolUse hook routes it past allow rules,
+`hostFileDecision`, only while `isAutonomous`); guarded and interactive
+decide as on a session without a sandbox, the card's `sandboxNote` saying
+"outside the sandbox's bounds" (`#hostBoundsNote`). The backend's own context
+files stay its tools' (`SessionProvider.hostReadable`, `hostFiles`:
+providers/claude/host-files.ts — memory, plans, agent memory as `.md`, its
+`CLAUDE_CODE_TMPDIR` project dir and tasks/todos writable, user-tier agents,
+commands, rules, CLAUDE.md, installed plugins' skills read; opencode's
+`<dataDir>/tmp/opencode`); a search past a hidden path inside them runs where
+the backend leaves it out (Claude: an autonomous query's Read deny rules,
+`claudeSearchExclusions`) or, on opencode, where it is the user's own
+`sandbox.hiddenPaths` in the workspace. A workdir below its repository's
+top (a monorepo's package) gets the top as the sandbox's workspace
+(`sandboxWorkspaceOf`; project settings held in each dir up to it,
+`projectDirsOf`), the cwd unchanged. Such a tool writing the rest of the
 repository's git dirs or `.git` files (`protectedWriteTargets`), or a
 hard-linked file, asks while sandboxed (refused in autonomous mode;
 `heldWriteOf` in held-writes.ts, `heldWriteDecision`); backends whose file
@@ -386,7 +399,7 @@ levels are guidance, not a sandbox: high and not-understood commands ask in guar
 mode and a recognised credential path is refused in every mode, as a best effort. Low is a strict
 allow-list (`notLow` in shell-risk.ts); keep it one, never widen it by rules.
 On Claude the PreToolUse hook routes high and not-understood ones to the gate past any allow rule.
-Autonomous mode never waits on a person: the OS sandbox (#448) is its boundary (it doesn't start without one that runs, or the owner's own off). So in autonomous mode a shell command of any level runs (`#riskAsks` is false there; the level goes to the audit, `session.auto_approve … risk=high`), and a write runs where the sandbox lets it land (a host-side file tool beyond its spec is refused in every mode, `#outsideSandbox`). What the sandbox can't be left to hold is refused at once, never asked (`Session#autonomousRefusal`, shared by the gate and the tool_start card; `#refuseAutonomous`: the reason to the agent and on the card, an info line `autonomous.refused`, audit `session.autonomous_refuse kind=…`, no budget spent): `unsandboxed` (`#unsandboxedRequest`), `held_write` (`#heldWrite`), `claude_settings` (`#writesClaudeSettingsOnNamedAccount`), `credential_dir` (a secret-path `ask`, or a shell risk carrying one on a session that isn't sandboxed: `ls ~` runs inside one), `unresolved_path` (`isUnresolvedPathTool`). Credential reads stay refused in every mode. Elicitation tools and fleet send-class dispatch still ask (so they are all an unattended run parks on). When the budget runs out (park) the session reverts to guarded and says so (`#noteAutonomousBudgetSpent`: info line `budget.spent`, `SessionInfo.autonomousBudgetSpent` until a mode is set, `modeSummary` in `codeoid ls`). Guarded and interactive are unchanged. `approvals.askOnUnknown` is inert. Relative paths are judged from the cwd the backend reports (`ToolApprovalFn`'s `shellCwd`: Claude's PreToolUse hook `cwd`, kept for every tool, since the CLI resolves Bash's targets and a Grep/Glob relative `path` from its persisted cwd; null = unknown, asks). Claude's `Monitor` command is a shell call, `PowerShell` never understood. Claude's CLI gets `CDPATH=` and opencode's shells have none, so a bare `cd` goes where the shell reader places it. Codex autonomous asks nothing (#442).
+Autonomous mode never waits on a person: the OS sandbox (#448) is its boundary (it doesn't start without one that runs, or the owner's own off). So in autonomous mode a shell command of any level runs (`#riskAsks` is false there; the level goes to the audit, `session.auto_approve … risk=high`), and a write runs where the sandbox lets it land (a host-side file tool beyond its spec is refused there, `#outsideSandbox`). What the sandbox can't be left to hold is refused at once, never asked (`Session#autonomousRefusal`, shared by the gate and the tool_start card; `#refuseAutonomous`: the reason to the agent and on the card, an info line `autonomous.refused`, audit `session.autonomous_refuse kind=…`, no budget spent): `unsandboxed` (`#unsandboxedRequest`), `held_write` (`#heldWrite`), `claude_settings` (`#writesClaudeSettingsOnNamedAccount`), `credential_dir` (a secret-path `ask`, or a shell risk carrying one on a session that isn't sandboxed: `ls ~` runs inside one), `unresolved_path` (`isUnresolvedPathTool`). Credential reads stay refused in every mode. Elicitation tools and fleet send-class dispatch still ask (so they are all an unattended run parks on). When the budget runs out (park) the session reverts to guarded and says so (`#noteAutonomousBudgetSpent`: info line `budget.spent`, `SessionInfo.autonomousBudgetSpent` until a mode is set, `modeSummary` in `codeoid ls`). Guarded and interactive are unchanged. `approvals.askOnUnknown` is inert. Relative paths are judged from the cwd the backend reports (`ToolApprovalFn`'s `shellCwd`: Claude's PreToolUse hook `cwd`, kept for every tool, since the CLI resolves Bash's targets and a Grep/Glob relative `path` from its persisted cwd; null = unknown, asks). Claude's `Monitor` command is a shell call, `PowerShell` never understood. Claude's CLI gets `CDPATH=` and opencode's shells have none, so a bare `cd` goes where the shell reader places it. Codex autonomous asks nothing (#442).
 A command that could read another process's environment (a `/proc/<pid>/environ` however written, what a search of /proc hands on, `ps` unless its options and the line's variables prove it shows none) is refused as a credential read on every backend, failing closed (`refuseEnvironRead`, shell-risk.ts); a word's possible values are its `shape` (parse.ts).
 
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule

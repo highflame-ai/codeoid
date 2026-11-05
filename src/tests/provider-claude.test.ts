@@ -127,6 +127,7 @@ import {
   CLI_WORKTREE_DENY,
   type ClaudeProviderInit,
 } from "../daemon/providers/claude/index.js";
+import { claudeProjectDirName } from "../daemon/providers/claude/native-history.js";
 import { credentialEnvNames, physicalOf } from "../daemon/sandbox/claude-native.js";
 import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "../daemon/fork-isolation.js";
 import { getConfigDir } from "../config.js";
@@ -3522,8 +3523,9 @@ describe("ClaudeProvider — the OS sandbox", () => {
   const temp = { cli: join(tempBase, "cli"), root: join(tempBase, "cmd"), commands: join(tempBase, "cmd", "claude-1") };
   mkdirSync(temp.cli);
   mkdirSync(temp.commands, { recursive: true });
-  function providerWith(get: () => unknown, audits: Array<{ action: string }> = []): ClaudeProvider {
+  function providerWith(get: () => unknown, audits: Array<{ action: string }> = [], isAutonomous?: () => boolean): ClaudeProvider {
     return new ClaudeProvider({
+      ...(isAutonomous ? { isAutonomous } : {}),
       sessionId: "test-session",
       initialBackingId: "test-backing",
       workspaceId: "ws_test",
@@ -3698,6 +3700,103 @@ describe("ClaudeProvider — the OS sandbox", () => {
     await drain;
     await p.teardown();
     rmSync(base, { recursive: true, force: true });
+  });
+
+  it("the bounds routing is autonomous mode's alone (#448 round 9): in guarded or interactive mode a call the CLI allows itself (its memory, a read it lets through) is left to it, as without a sandbox; the held-write routing stays", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-claude-mode-")));
+    const ws = join(base, "ws");
+    const fakeHome = join(base, "home");
+    mkdirSync(join(ws, ".git", "objects"), { recursive: true });
+    mkdirSync(join(ws, ".git", "refs"), { recursive: true });
+    writeFileSync(join(ws, ".git", "HEAD"), "ref: refs/heads/main\n");
+    mkdirSync(join(fakeHome, ".ssh"), { recursive: true });
+    const rt = runtime("native").rt;
+    rt.spec = { ...rt.spec, workspace: ws, hidden: [fakeHome] };
+    let autonomous = false;
+    const p = providerWith(() => rt, [], () => autonomous);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const run = p.runTurn({ history: [], userMessage: "go", workdir: ws, mode: "guarded", canUseTool: async () => ({ behavior: "allow" as const }) });
+    const drain = (async () => {
+      await gate;
+      for await (const _ of run.events) {
+        /* drain */
+      }
+    })();
+    const hook = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }> } } }).options.hooks.PreToolUse[0]!.hooks[0]!;
+    const decision = async (tool: string, input: Record<string, unknown>, id: string) =>
+      (await hook({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, tool_use_id: id, cwd: ws })) as { hookSpecificOutput?: { permissionDecision?: string } };
+    const outside = { file_path: join(fakeHome, "Downloads", "error.log") };
+    expect((await decision("Read", outside, "tu-1")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    expect((await decision("Write", { file_path: join(base, "x.sh"), content: "x" }, "tu-2")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    // A write to the git structure is held as before (asked at the gate, round 7).
+    expect((await decision("Write", { file_path: join(ws, ".git", "HEAD"), content: "x" }, "tu-3")).hookSpecificOutput?.permissionDecision).toBe("ask");
+    autonomous = true;
+    expect((await decision("Read", outside, "tu-4")).hookSpecificOutput?.permissionDecision).toBe("ask");
+    release();
+    await drain;
+    await p.teardown();
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it("the CLI's own context files are where its query's CLI keeps them (its config dir, CLAUDE_CODE_TMPDIR), and the hook leaves them to it in autonomous mode; an autonomous query's Grep and Glob leave out what the sandbox hides inside the workspace, by Read deny rules, rebuilt on a mode switch (#448 round 9)", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-claude-own-")));
+    const ws = join(base, "ws");
+    const fakeHome = join(base, "home");
+    mkdirSync(ws, { recursive: true });
+    writeFileSync(join(ws, ".env"), "SECRET=planted\n");
+    const rt = runtime("native").rt;
+    rt.spec = { ...rt.spec, workspace: ws, hidden: [fakeHome, join(ws, ".env")] };
+    const prevHome = process.env.HOME;
+    const prevCfg = process.env.CLAUDE_CONFIG_DIR;
+    process.env.HOME = fakeHome;
+    delete process.env.CLAUDE_CONFIG_DIR;
+    try {
+      const p = providerWith(() => rt, [], () => true);
+      let release: () => void = () => {};
+      const gate = new Promise<void>((r) => {
+        release = r;
+      });
+      const run = p.runTurn({ history: [], userMessage: "go", workdir: ws, mode: "autonomous", canUseTool: async () => ({ behavior: "allow" as const }) });
+      const drain = (async () => {
+        await gate;
+        for await (const _ of run.events) {
+          /* drain */
+        }
+      })();
+      const settings = (options().settings ?? {}) as { permissions?: { deny?: string[] } };
+      expect(settings.permissions?.deny).toEqual([`Read(/${join(ws, ".env")})`, `Read(/${join(ws, ".env")}/**)`]);
+      const own = p.hostFiles();
+      const cfg = join(fakeHome, ".claude");
+      const memory = join(cfg, "projects", claudeProjectDirName(ws), "memory");
+      expect(own.markdown).toContain(memory);
+      expect(own.writable).toContain(join(temp.cli, `claude-${process.getuid?.() ?? 0}`, claudeProjectDirName(ws)));
+      expect(own.searchExcluded).toEqual([join(ws, ".env")]);
+      const hook = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }> } } }).options.hooks.PreToolUse[0]!.hooks[0]!;
+      const decision = async (tool: string, input: Record<string, unknown>, id: string) =>
+        (await hook({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, tool_use_id: id, cwd: ws })) as { hookSpecificOutput?: { permissionDecision?: string } };
+      expect((await decision("Write", { file_path: join(memory, "MEMORY.md"), content: "x" }, "tu-1")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+      expect((await decision("Write", { file_path: join(cfg, "settings.json"), content: "{}" }, "tu-2")).hookSpecificOutput?.permissionDecision).toBe("ask");
+      expect((await decision("Grep", { pattern: "x" }, "tu-3")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+      release();
+      await drain;
+      // A guarded query has no such rules: the next turn's loop is rebuilt without them.
+      capturedQueryOpts = null;
+      const again = p.runTurn({ history: [], userMessage: "go", workdir: ws, mode: "guarded", canUseTool: async () => ({ behavior: "allow" as const }) });
+      for await (const _ of again.events) {
+        /* drain */
+      }
+      expect(capturedQueryOpts).not.toBeNull();
+      expect((options().settings as { permissions?: unknown } | undefined)?.permissions).toBeUndefined();
+      expect(p.hostFiles().searchExcluded).toEqual([]);
+      await p.teardown();
+    } finally {
+      process.env.HOME = prevHome;
+      if (prevCfg !== undefined) process.env.CLAUDE_CONFIG_DIR = prevCfg;
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 
   it("a backend whose file tools run inside the sandbox (the CLI under Docker) leaves its file tools to it: no held-write or bounds routing (#448 round 8)", async () => {

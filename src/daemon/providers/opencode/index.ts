@@ -33,6 +33,8 @@
  *     authoritative for files.
  */
 
+import { join } from "node:path";
+import type { BackendHostFiles } from "../../sandbox/host-file-tools.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../../sandbox/types.js";
 import { AsyncQueue } from "../../async-queue.js";
@@ -84,6 +86,7 @@ import {
   fetchOrigin,
   hostedModelInfo,
   mcpNamespace,
+  opencodeServerDirs,
   opencodeShellEnv,
   SANDBOX_LAUNCHER_VAR,
   ownMountPrefix,
@@ -543,6 +546,18 @@ export class OpencodeProvider implements SessionProvider {
       init.mcpProxy,
       init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
     );
+  }
+
+  /**
+   * opencode's own scratch dir, `$TMPDIR/opencode` of its server (its
+   * `Global.Path.tmp`, which `GET /api/info` reports as `paths.tmp` and its
+   * tools write into, an image tool's output among them): read and written by
+   * its file tools in a sandboxed autonomous session (#448 round 9). Its
+   * truncated tool and shell output are the registered open dirs.
+   */
+  hostFiles(): BackendHostFiles {
+    const dataDir = this.#server.dataDir;
+    return typeof dataDir === "string" && dataDir ? { writable: [join(opencodeServerDirs(dataDir).TMPDIR, "opencode")] } : {};
   }
 
   /** The memory endpoint is mounted on this session's opencode location (#ensureMounts). */

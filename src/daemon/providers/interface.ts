@@ -19,6 +19,7 @@ import type {
   UiRequestMethod,
 } from "../../protocol/types.js";
 import type { CanonicalTurn, HistorySeedResult } from "./canonical.js";
+import type { BackendHostFiles } from "../sandbox/host-file-tools.js";
 import type { LLMCallUsage } from "../context-math.js";
 import type { PackSubagent } from "../pipeline/subagents.js";
 
@@ -837,6 +838,15 @@ export interface SessionProvider extends AgentProvider {
    * skills' own files). Read only, never written. Absent: nothing.
    */
   hostReadable?(): readonly string[];
+  /**
+   * What the backend's own file tools keep outside the sandbox as context,
+   * never as code (#448 round 9): readable (its user-tier agents, commands,
+   * rules, CLAUDE.md, installed plugins' skills), writable (its background
+   * tasks' output, its scratch dir), `.md` files writable (Claude's
+   * auto-memory and plan dirs), and the hidden paths its searches leave out.
+   * Held to in autonomous mode with the sandbox's own bounds. Absent: none.
+   */
+  hostFiles?(): BackendHostFiles;
   /** Underlying backing session ID (for display and Store persistence). */
   readonly backingSessionId: string;
   /** True once runTurn() has been called at least once (guards agent registration). */

@@ -1,11 +1,13 @@
 /**
  * File tools that run outside the OS sandbox, held to its policy (#448 round
- * 8). Claude's Read, Write, Edit, Glob, Grep (its native sandbox holds only its
- * commands) and opencode's read, write, edit, patch, glob, grep (they run in
- * its shared server) are judged at codeoid's gate against the very spec the
- * session's sandbox is built from: a call is allowed only where a sandboxed
- * command could do the same thing. Anything else is refused, in every mode,
- * never asked.
+ * 8). Claude's Read, Write, Edit, Glob, Grep, LSP (its native sandbox holds
+ * only its commands) and opencode's read, write, edit, patch, glob, grep (they
+ * run in its shared server) are judged at codeoid's gate against the very spec
+ * the session's sandbox is built from: a call is allowed only where a
+ * sandboxed command could do the same thing. In autonomous mode, where no one
+ * is asked, anything else is refused (#448 round 9); guarded and interactive
+ * mode ask or run as they would without a sandbox, the card saying the call
+ * is outside the sandbox's bounds.
  *
  *   - a write must land in what the sandbox makes writable (the workspace,
  *     the session's temp dir, the sandbox's caches, a git worktree's git
@@ -17,7 +19,10 @@
  *     `sandbox.hiddenPaths`);
  *   - a search (Glob, Grep, LS) must not start where a hidden path is below
  *     it: the tool would recurse into it, where a sandboxed `grep -r` sees
- *     nothing.
+ *     nothing. Unless the backend's search leaves it out (Claude: a Read deny
+ *     rule for it, which its Grep and Glob honour) or the backend's can't
+ *     and it is the user's own `sandbox.hiddenPaths` entry inside the
+ *     workspace (opencode's ripgrep runs with `--no-config`): `searchable`.
  *
  * Each path is resolved as the kernel resolves it (`physicalPath`: through
  * every link, `..` the parent of what the path so far really is), and also
@@ -31,7 +36,10 @@
  *
  * What the backend itself needs to read outside (a Claude skill's own files,
  * the CLI's saved tool output for this session, opencode's truncated tool
- * output) is passed in as `readable`; nothing there is ever writable.
+ * output) is passed in as `readable`; nothing there is writable. What its own
+ * file tools keep there as context, never as code (Claude's auto-memory and
+ * plan files, its background tasks' output; opencode's scratch dir), is
+ * passed in as `writable`, or `markdown` where only `.md` files are.
  *
  * Backends whose file tools run inside the sandbox (Codex, pi, the Gemini
  * CLI, Qwen; Claude under Docker) need none of this: the OS holds them.
@@ -57,6 +65,26 @@ export interface HostToolBounds {
   readonly readable: readonly string[];
   /** Unreadable (the spec's `hidden` and container sockets). */
   readonly hidden: readonly string[];
+  /** The backend's own context files inside a hidden one: writable by its file tools (never by commands). */
+  readonly ownWritable: readonly string[];
+  /** The same, for `.md` files only (Claude's memory and plan dirs); readable whole. */
+  readonly ownMarkdown: readonly string[];
+  /** Hidden paths a search may reach: the backend's search leaves them out, or can't and they are the user's own in the workspace. */
+  readonly searchable: readonly string[];
+  /** Where the session may write, for the refusal's reason: the workspace, and the temp dir as written and physical. */
+  readonly writeTo: { readonly workspace: string; readonly tempDir: readonly string[] };
+}
+
+/** What a backend's own file tools reach outside the sandbox (SessionProvider.hostFiles). */
+export interface BackendHostFiles {
+  /** Read, never written: its skills, its saved tool output, its user-tier context. */
+  readable?: readonly string[];
+  /** Read and written: its context files, never code (Claude's background tasks' output, opencode's scratch dir). */
+  writable?: readonly string[];
+  /** Read whole, `.md` files written (Claude's auto-memory and plan dirs). */
+  markdown?: readonly string[];
+  /** Hidden paths its searches leave out (Claude: its Read deny rules). */
+  searchExcluded?: readonly string[];
 }
 
 const FOLD = process.platform === "darwin" || process.platform === "win32";
@@ -94,17 +122,26 @@ function lexists(p: string): boolean {
  * `readOnly`: more the backend's sandbox holds read-only (Claude's
  * `denyWrite` takes a pinned dir's subtree). `readable`: what the backend
  * itself must read outside, never written; a root holding a hidden path is
- * dropped (it would show it). `hidden`: more that commands can't see (the
- * host's /tmp, where the sandbox has its own).
+ * dropped (it would show it); so is a `writable` or `markdown` one.
+ * `hidden`: more that commands can't see (the host's /tmp, where the sandbox
+ * has its own). `searchable`: hidden paths a search may reach.
  */
-export function hostToolBounds(spec: SandboxSpec, opts: { tempDir?: string; readOnly?: readonly string[]; readable?: readonly string[]; hidden?: readonly string[] } = {}): HostToolBounds {
+export function hostToolBounds(
+  spec: SandboxSpec,
+  opts: { tempDir?: string; readOnly?: readonly string[]; readable?: readonly string[]; writable?: readonly string[]; markdown?: readonly string[]; hidden?: readonly string[]; searchable?: readonly string[] } = {},
+): HostToolBounds {
   const hidden = bothForms([...spec.hidden, ...spec.containerSockets, ...(opts.hidden ?? [])]);
-  const extra = bothForms(opts.readable ?? []).filter((r) => !hidden.some((h) => within(h, r)));
+  const holdsNothingHidden = (r: string) => !hidden.some((h) => within(h, r));
+  const tempDir = opts.tempDir ?? spec.tempDir;
   return {
-    writable: bothForms([spec.workspace, opts.tempDir ?? spec.tempDir, ...spec.writable]),
+    writable: bothForms([spec.workspace, tempDir, ...spec.writable]),
     readOnly: bothForms([...(spec.readOnly ?? []), ...(opts.readOnly ?? [])]),
-    readable: [...bothForms(spec.reexposed), ...extra],
+    readable: [...bothForms(spec.reexposed), ...bothForms(opts.readable ?? []).filter(holdsNothingHidden)],
     hidden,
+    ownWritable: bothForms(opts.writable ?? []).filter(holdsNothingHidden),
+    ownMarkdown: bothForms(opts.markdown ?? []).filter(holdsNothingHidden),
+    searchable: bothForms(opts.searchable ?? []),
+    writeTo: { workspace: spec.workspace, tempDir: bothForms([tempDir]) },
   };
 }
 
@@ -114,16 +151,30 @@ export function hostToolBounds(spec: SandboxSpec, opts: { tempDir?: string; read
  * CLI's (`claudeTemp`), and a pinned dir is read-only with its subtree (the
  * CLI's `denyWrite`). `readable`: what the backend says it reads outside
  * (SessionProvider.hostReadable), with the dirs a backend's registered
- * credential locations keep open (opencode's tool output).
+ * credential locations keep open (opencode's tool output). `own`: what
+ * the backend's own file tools keep outside (SessionProvider.hostFiles).
+ * `userHidden`: the user's own `sandbox.hiddenPaths`, which a backend whose
+ * search can't leave them out may reach inside the workspace (round 9).
  */
-export function hostToolBoundsFor(rt: Pick<SandboxRuntime, "spec" | "plan" | "claudeTemp" | "provider">, backendId: string, readable: readonly string[] = []): HostToolBounds {
+export function hostToolBoundsFor(
+  rt: Pick<SandboxRuntime, "spec" | "plan" | "claudeTemp" | "provider">,
+  backendId: string,
+  readable: readonly string[] = [],
+  own: BackendHostFiles = {},
+  userHidden: readonly string[] = [],
+): HostToolBounds {
   const spec = rt.spec;
   const claudeNative = backendId === "claude" && rt.plan.kind === "native";
+  // Claude leaves out of its searches what its Read deny rules name; opencode's ripgrep can't be told to.
+  const searchable = own.searchExcluded ?? (backendId === "opencode" ? userHidden.filter((h) => isAbsolute(h) && within(resolve(h), spec.workspace) && resolve(h) !== resolve(spec.workspace)) : []);
   return hostToolBounds(spec, {
     ...(claudeNative ? { tempDir: rt.claudeTemp().commands, readOnly: spec.pinned ?? [] } : {}),
     // Bubblewrap and Docker put the session's temp dir at /tmp: the host's isn't there.
     ...(!claudeNative && REPLACES_TMP.has(rt.provider.id) ? { hidden: ["/tmp"] } : {}),
-    readable: [...readable, ...registeredOpenDirs()],
+    readable: [...readable, ...(own.readable ?? []), ...registeredOpenDirs()],
+    writable: own.writable ?? [],
+    markdown: own.markdown ?? [],
+    searchable,
   });
 }
 
@@ -142,6 +193,9 @@ function ruleAt(b: HostToolBounds, p: string): Rule | null {
     ["readOnly", b.readOnly],
     ["readable", b.readable],
     ["writable", b.writable],
+    ["writable", b.ownWritable],
+    // Claude's memory and plan dirs: a `.md` file written, anything else there only read.
+    [p.toLowerCase().endsWith(".md") ? "writable" : "readable", b.ownMarkdown],
   ];
   for (const [rule, list] of lists) {
     for (const at of list) {
@@ -163,9 +217,9 @@ export function sandboxWrites(b: HostToolBounds, p: string): boolean {
   return ruleAt(b, p) === "writable";
 }
 
-/** A hidden path below `root` (physical) that exists: what a search from there would reach. */
+/** A hidden path below `root` (physical) that exists, and that a search may not reach: what a search from there would reach. */
 export function hiddenBelow(b: HostToolBounds, root: string): string | null {
-  return b.hidden.find((h) => within(h, root) && lexists(h)) ?? null;
+  return b.hidden.find((h) => within(h, root) && lexists(h) && !b.searchable.some((s) => within(h, s))) ?? null;
 }
 
 /** Why a call breaks the bounds: where, and how. */
@@ -177,10 +231,13 @@ export interface HostToolBreach {
   why: "hidden" | "not_writable" | "reaches_hidden" | "unresolved";
   /** The hidden path a search would reach. */
   reaches?: string;
+  /** Where the session may write instead (a write refused). */
+  writeTo?: { workspace: string; tempDir: readonly string[] };
 }
 
 /** Claude's (and opencode's, as its cards name them) host-side file tools, by what they do. */
-const READ_TOOLS = new Set(["Read", "NotebookRead"]);
+/** Claude's LSP (`ENABLE_LSP_TOOL`) opens `filePath` in a language server outside the sandbox and hands back what it finds. */
+const READ_TOOLS = new Set(["Read", "NotebookRead", "LSP"]);
 const SEARCH_TOOLS = new Set(["Glob", "Grep", "LS"]);
 const WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
 /** opencode's own tool names, on an external-directory or unresolved-path card (`tool`). */
@@ -254,7 +311,7 @@ function targetsOf(toolName: string, input: Record<string, unknown>, base: strin
     add("write", ...(writeTargets(toolName, input) ?? [null]));
     if (str(input.requested_path)) add("write", str(input.requested_path));
   } else if (READ_TOOLS.has(toolName)) {
-    add("read", str(input.file_path) ?? str(input.notebook_path) ?? str(input.path));
+    add("read", str(input.file_path) ?? str(input.notebook_path) ?? str(input.filePath) ?? str(input.path));
     if (str(input.requested_path)) add("read", str(input.requested_path));
   } else if (SEARCH_TOOLS.has(toolName)) {
     // No root: the directory it runs in.
@@ -303,8 +360,8 @@ export function hostFileToolBreach(toolName: string, input: Record<string, unkno
     const at = landings(t.raw, base);
     if (at === null) return { path: t.raw, access: t.access, why: "unresolved" };
     for (const p of at) {
-      if (!sandboxReads(ctx.bounds, p)) return { path: p, access: t.access, why: "hidden" };
-      if (t.access === "write" && !sandboxWrites(ctx.bounds, p)) return { path: p, access: "write", why: "not_writable" };
+      if (!sandboxReads(ctx.bounds, p)) return { path: p, access: t.access, why: "hidden", ...(t.access === "write" ? { writeTo: ctx.bounds.writeTo } : {}) };
+      if (t.access === "write" && !sandboxWrites(ctx.bounds, p)) return { path: p, access: "write", why: "not_writable", writeTo: ctx.bounds.writeTo };
       if (t.access === "search") {
         const reaches = hiddenBelow(ctx.bounds, p);
         if (reaches) return { path: p, access: "search", why: "reaches_hidden", reaches };
@@ -314,8 +371,11 @@ export function hostFileToolBreach(toolName: string, input: Record<string, unkno
   return null;
 }
 
-/** What the agent reads when a call is refused for going beyond the sandbox. */
+/** What the agent reads when a call is refused for going beyond the sandbox (autonomous mode). */
 export function hostFileBreachReason(b: HostToolBreach): string {
+  const where = b.writeTo
+    ? `the working directory (${b.writeTo.workspace}) or the session's temp dir (${b.writeTo.tempDir.join(", also ")})`
+    : "the working directory or the session's temp dir";
   const why =
     b.why === "hidden"
       ? "the sandbox hides it from this session's commands"
@@ -324,5 +384,19 @@ export function hostFileBreachReason(b: HostToolBreach): string {
         : b.why === "reaches_hidden"
           ? `a search there reaches ${b.reaches}, which the sandbox hides`
           : "codeoid can't tell for certain where it leads";
-  return `Refused: outside what this session's sandbox allows: ${b.path} (${why}). This tool runs outside the OS sandbox, so codeoid holds it to the sandbox's own policy; keep to the working directory.`;
+  const instead =
+    b.access === "write" && (b.why === "not_writable" || b.why === "hidden")
+      ? `Write in ${where} instead.`
+      : b.why === "hidden"
+        ? "Keep to the working directory; the owner can copy the file into it, add its directory to sandbox.homeReadable, or switch this session to guarded mode to be asked."
+        : b.why === "reaches_hidden"
+          ? "Search a directory below it that doesn't hold it, or search with grep in the shell, which runs inside the sandbox and sees nothing there."
+          : "Name the path in full, without links or `..`.";
+  return `Refused: outside what this session's sandbox allows: ${b.path} (${why}). This tool runs outside the OS sandbox, so in autonomous mode codeoid holds it to the sandbox's own policy. ${instead}`;
+}
+
+/** What an approval card says of a call outside the sandbox's bounds (guarded and interactive mode, where the owner decides). */
+export function hostFileBreachNote(b: HostToolBreach): string {
+  const what = b.why === "reaches_hidden" ? `a search reaching ${b.reaches}` : b.why === "unresolved" ? `a path codeoid can't resolve for certain (${b.path})` : `${b.access === "write" ? "a write to" : "a read of"} ${b.path}`;
+  return `outside the sandbox's bounds: ${what}; runs in the backend's own process, outside the sandbox`;
 }

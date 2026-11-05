@@ -1981,6 +1981,7 @@ describe("opencode (real binary)", () => {
       const id = `it-risk-${Math.random().toString(36).slice(2)}`;
       store.createSession({ id, name: id, workdir, status: "idle", createdBy: auth.sub, createdAt: new Date().toISOString(), attachedClients: 0, accountId: "a", projectId: "p" });
       const p = provider();
+      scratch = p.hostFiles().writable?.[0] ?? "";
       const runTurn = p.runTurn.bind(p);
       p.runTurn = (o) => runTurn({ ...o, canUseTool: guarded(o.canUseTool) });
       const session = new Session({
@@ -2057,7 +2058,7 @@ describe("opencode (real binary)", () => {
     }
   }, 240_000);
 
-  maybeScripted("I70 through a sandboxed Session, opencode's file tools are held to the sandbox's policy: beyond it refused in every mode, nothing leaks; within it they run unasked (#448 round 8)", async () => {
+  maybeScripted("I70 through a sandboxed Session, opencode's file tools are held to the sandbox's policy in autonomous mode: beyond it refused, nothing leaks; within it, and in opencode's own scratch dir, they run unasked; guarded mode decides as without a sandbox, the card saying it is outside the bounds (#448 rounds 8, 9)", async () => {
     if (!(await new BwrapSandboxProvider().probe()).available) return;
     const root = realpathSync(mkdtempSync(join(WORK, "bounds-")));
     const workdir = join(root, "work");
@@ -2076,8 +2077,11 @@ describe("opencode (real binary)", () => {
     registry.register(new BwrapSandboxProvider());
     const verdicts: Array<{ name: string; behavior: string; message?: string }> = [];
     // Defense in depth: only what this case means to run is let through, whatever the Session decides.
+    let scratch = "";
     const runnable = (name: string, input: Record<string, unknown>) =>
-      (name === "Read" && input.file_path === join(workdir, "notes.txt")) || (name === "Write" && input.file_path === join(workdir, "made.txt"));
+      (name === "Read" && input.file_path === join(workdir, "notes.txt")) ||
+      (name === "Write" && (input.file_path === join(workdir, "made.txt") || (scratch !== "" && input.file_path === join(scratch, "made.txt")))) ||
+      (scratch !== "" && name === "opencode_external_directory" && JSON.stringify(input).includes(scratch));
     const guarded =
       (inner: ToolApprovalFn): ToolApprovalFn =>
       async (toolId, approvalId, name, input, signal, agentId) => {
@@ -2090,6 +2094,7 @@ describe("opencode (real binary)", () => {
       const id = `it-bounds-${Math.random().toString(36).slice(2)}`;
       store.createSession({ id, name: id, workdir, status: "idle", createdBy: auth.sub, createdAt: new Date().toISOString(), attachedClients: 0, accountId: "a", projectId: "p" });
       const p = provider();
+      scratch = p.hostFiles().writable?.[0] ?? "";
       const runTurn = p.runTurn.bind(p);
       p.runTurn = (o) => runTurn({ ...o, canUseTool: guarded(o.canUseTool) });
       const session = new Session({
@@ -2120,20 +2125,34 @@ describe("opencode (real binary)", () => {
       return { pending, verdicts: verdicts.slice(before), said };
     };
     try {
-      for (const mode of ["autonomous", "guarded"] as const) {
-        for (const call of [
-          `[[tool:read ${JSON.stringify({ path: join(home, ".ssh", "id_ed25519") })}]]`,
-          `[[tool:glob ${JSON.stringify({ pattern: "*", path: join(home, ".ssh") })}]]`,
-          `[[tool:write ${JSON.stringify({ path: join(outside, "planted.sh"), content: "x" })}]]`,
-        ]) {
-          const r = await run(call, mode);
-          expect([mode, call, r.pending.length]).toEqual([mode, call, 0]);
-          expect(r.verdicts[0]?.behavior).toBe("deny");
-          expect(r.verdicts[0]?.message).toStartWith("Refused: outside what this session's sandbox allows");
-          expect(r.said).not.toContain("KEY-DECOY-R8");
-          expect(existsSync(join(outside, "planted.sh"))).toBe(false);
-        }
+      const calls = [
+        `[[tool:read ${JSON.stringify({ path: join(home, ".ssh", "id_ed25519") })}]]`,
+        `[[tool:glob ${JSON.stringify({ pattern: "*", path: join(home, ".ssh") })}]]`,
+        `[[tool:write ${JSON.stringify({ path: join(outside, "planted.sh"), content: "x" })}]]`,
+      ];
+      for (const call of calls) {
+        const r = await run(call, "autonomous");
+        expect([call, r.pending.length]).toEqual([call, 0]);
+        expect(r.verdicts[0]?.behavior).toBe("deny");
+        expect(r.verdicts[0]?.message).toStartWith("Refused: outside what this session's sandbox allows");
+        expect(r.said).not.toContain("KEY-DECOY-R8");
+        expect(existsSync(join(outside, "planted.sh"))).toBe(false);
       }
+      // Guarded: as without a sandbox. Nothing is refused for the bounds; a write is asked, its card saying why.
+      for (const call of calls) {
+        const r = await run(call, "guarded");
+        for (const v of r.verdicts) expect(v.message ?? "").not.toStartWith("Refused: outside what this session's sandbox allows");
+        for (const a of r.pending) expect(a.sandboxNote).toStartWith("outside the sandbox's bounds: ");
+        expect(r.said).not.toContain("KEY-DECOY-R8");
+        expect(existsSync(join(outside, "planted.sh"))).toBe(false);
+      }
+      expect((await run(calls[2]!, "guarded")).pending.length).toBeGreaterThan(0);
+      // opencode's own scratch dir is its file tools', in autonomous mode too.
+      const scratchWrite = await run(`[[tool:write ${JSON.stringify({ path: join(scratch, "made.txt"), content: "SCRATCH" })}]]`, "autonomous");
+      expect(scratch).toEndWith(join("tmp", "opencode"));
+      expect(scratchWrite.pending).toHaveLength(0);
+      expect(scratchWrite.verdicts.every((v) => v.behavior === "allow")).toBe(true);
+      expect(readFileSync(join(scratch, "made.txt"), "utf8")).toBe("SCRATCH");
       // Within the sandbox, autonomous mode runs them unasked.
       const read = await run(`[[tool:read ${JSON.stringify({ path: join(workdir, "notes.txt") })}]]`, "autonomous");
       expect(read.pending).toHaveLength(0);

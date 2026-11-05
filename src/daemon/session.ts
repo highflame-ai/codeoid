@@ -207,11 +207,11 @@ import { loadShellParser, shellParserReady } from "./shell/parse.js";
 import { isShellTool, runsNoCommand, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import { asksOutsideSandbox } from "./sandbox/confinement.js";
-import { type HostToolBreach, hostFileBreachReason, hostFileToolBreach, hostToolBoundsFor, isHostFileTool } from "./sandbox/host-file-tools.js";
+import { type HostToolBreach, hostFileBreachNote, hostFileBreachReason, hostFileToolBreach, hostToolBoundsFor, isHostFileTool } from "./sandbox/host-file-tools.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
 import { resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
-import { protectedWriteTargets } from "./sandbox/policy.js";
+import { protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -1872,6 +1872,7 @@ export class Session {
       isFork: () => this.#forkIsolation !== null,
       isOwnTask: (taskId) => this.#isOwnTask(taskId),
       onForeignAgentDenied: (agentId, toolName) => this.#noteForeignAgentRefused(agentId, toolName),
+      isAutonomous: () => this.#mode === "autonomous",
       // Read each time the backend starts, and only what was resolved for THIS backend.
       sandbox: () => this.#sandbox?.runtimeFor(factory.id) ?? null,
       ...(this.#extraEnv ? { extraEnv: this.#extraEnv } : {}),
@@ -2174,24 +2175,40 @@ export class Session {
   }
 
   /**
-   * Where a host-side file tool (Claude's Read, Write, Edit, Glob, Grep;
+   * Where a host-side file tool (Claude's Read, Write, Edit, Glob, Grep, LSP;
    * opencode's) goes beyond what the session's sandbox allows its commands
    * (sandbox/host-file-tools.ts), judged against the spec the sandbox is
-   * built from: refused in every mode while sandboxed, never asked. Null
-   * when a sandboxed command could do the same, when the backend's file
-   * tools run inside the sandbox, or when it is off. Fail closed: a
-   * judgement that throws refuses.
+   * built from, with what the backend's own file tools keep outside
+   * (SessionProvider.hostFiles: its memory, plans, task output, scratch).
+   * Refused in autonomous mode, never asked (#448 round 9: guarded and
+   * interactive mode ask or run as without a sandbox, the card saying so,
+   * #hostBoundsNote). Null when a sandboxed command could do the same, when
+   * the backend's file tools run inside the sandbox, or when it is off. Fail
+   * closed: a judgement that throws counts as one.
    */
   #outsideSandbox(toolName: string, input: Record<string, unknown>, shellCwd: string | null | undefined): HostToolBreach | null {
     if (!isHostFileTool(toolName) || !this.#hostSideFileTools()) return null;
     const rt = this.#sandbox?.runtime;
     try {
       if (!rt) throw new Error("no runtime");
-      const bounds = hostToolBoundsFor(rt, this.#provider.id, this.#provider.hostReadable?.() ?? []);
+      const own = this.#provider.hostFiles?.() ?? {};
+      const bounds = hostToolBoundsFor(rt, this.#provider.id, this.#provider.hostReadable?.() ?? [], own, userHiddenPaths(this.#config));
       return hostFileToolBreach(toolName, input, { bounds, workdir: this.workdir, ...(shellCwd !== undefined ? { cwd: shellCwd } : {}) });
     } catch {
       return { path: "(couldn't be judged)", access: "read", why: "unresolved" };
     }
+  }
+
+  /** A host-side file tool beyond the sandbox, in autonomous mode: refused (#outsideSandbox). Null in every other mode. */
+  #outsideSandboxRefusal(toolName: string, input: Record<string, unknown>, shellCwd: string | null | undefined): HostToolBreach | null {
+    return this.#mode === "autonomous" ? this.#outsideSandbox(toolName, input, shellCwd) : null;
+  }
+
+  /** What an approval card says of a host-side file tool beyond the sandbox in guarded or interactive mode, where the owner decides. */
+  #hostBoundsNote(toolName: string, input: unknown, shellCwd: string | null | undefined): string | null {
+    if (this.#mode === "autonomous" || !input || typeof input !== "object") return null;
+    const breach = this.#outsideSandbox(toolName, input as Record<string, unknown>, shellCwd);
+    return breach ? hostFileBreachNote(breach) : null;
   }
 
   /** Refuse a host-side file tool that goes beyond the sandbox (#outsideSandbox): its card, the audit, and an info line in the transcript. */
@@ -3306,7 +3323,7 @@ export class Session {
   }
 
   /** What an approval card says of the sandbox (#448): whether the call runs inside, and why not. */
-  #cardSandbox(toolName: string, input: unknown): { sandboxed?: boolean; sandboxNote?: string } {
+  #cardSandbox(toolName: string, input: unknown, shellCwd?: string | null): { sandboxed?: boolean; sandboxNote?: string } {
     const info = this.#sandbox?.info;
     if (!info) return {};
     if (this.#unsandboxedRequest(toolName, input)) {
@@ -3317,9 +3334,10 @@ export class Session {
         const runner = this.#sandbox?.runtime?.plan;
         const shell = isShellTool(toolName) || isUnresolvedPathTool(toolName);
         const inside = shell || runner?.fileTools === true;
-        return inside
-          ? { sandboxed: true, sandboxNote: `sandboxed: ${info.providerName ?? info.provider}, network ${info.network}` }
-          : { sandboxed: false, sandboxNote: "runs in the backend's own process, outside the sandbox" };
+        if (inside) return { sandboxed: true, sandboxNote: `sandboxed: ${info.providerName ?? info.provider}, network ${info.network}` };
+        // Beyond what the sandbox lets its commands do: the owner decides, told so (#448 round 9).
+        const beyond = this.#hostBoundsNote(toolName, input, shellCwd);
+        return { sandboxed: false, sandboxNote: beyond ?? "runs in the backend's own process, outside the sandbox" };
       }
       case "no-shell":
         return {};
@@ -5424,7 +5442,7 @@ export class Session {
       const gated = this.#approvalInputs.get(approvalId);
       if (!gated) continue;
       const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
-      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, this.#heldWrite(gated.toolName, gated.input)), ...this.#cardSandbox(gated.toolName, gated.input) });
+      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, this.#heldWrite(gated.toolName, gated.input)), ...this.#cardSandbox(gated.toolName, gated.input, gated.shellCwd) });
     }
     return out;
   }
@@ -8291,9 +8309,10 @@ export class Session {
       }
 
       // A file tool running outside the OS sandbox (Claude's, opencode's) is
-      // held to the sandbox's own policy (#448 round 8): beyond it, refused in
-      // every mode, never asked.
-      const outside = this.#outsideSandbox(toolName, effectiveInput, shellCwd);
+      // held to the sandbox's own policy in autonomous mode (#448 rounds 8, 9):
+      // beyond it, refused, never asked. Guarded and interactive mode decide
+      // as without a sandbox, the card saying it is outside its bounds.
+      const outside = this.#outsideSandboxRefusal(toolName, effectiveInput, shellCwd);
       if (outside) return this.#refuseOutsideSandbox(approvalId, toolName, outside, sender);
 
       // A write to a Claude settings file on a named account: the CLI reloads
@@ -8983,8 +9002,8 @@ export class Session {
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
         // Autonomous mode refuses it outright (#autonomousRefusal): no approval card either.
         const deniedFirst = networkAsk || budgetDenied || secret?.action === "deny" || risk?.secret?.action === "deny";
-        // Beyond the sandbox, a host-side file tool is refused in every mode (#outsideSandbox).
-        const outside = deniedFirst ? null : this.#outsideSandbox(event.name, event.input, event.shellCwd);
+        // Beyond the sandbox, a host-side file tool is refused in autonomous mode (#outsideSandbox).
+        const outside = deniedFirst ? null : this.#outsideSandboxRefusal(event.name, event.input, event.shellCwd);
         const refused = deniedFirst ? null : outside ? { reason: hostFileBreachReason(outside) } : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
         const toolMsg = this.#makeMessage(
           "tool_call",
@@ -9008,7 +9027,7 @@ export class Session {
                   approvalId: event.approvalId,
                   ...this.#collaborationCostFor(event.name),
                   ...this.#cardRisk(risk, held),
-                  ...this.#cardSandbox(event.name, event.input),
+                  ...this.#cardSandbox(event.name, event.input, event.shellCwd),
                 } as unknown as ToolState),
           },
         );
