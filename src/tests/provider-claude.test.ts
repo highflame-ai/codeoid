@@ -3625,7 +3625,9 @@ describe("ClaudeProvider — the OS sandbox", () => {
     mkdirSync(join(ws, ".git", "hooks"), { recursive: true });
     mkdirSync(join(ws, ".git", "objects"));
     writeFileSync(join(ws, ".git", "HEAD"), "ref: refs/heads/main\n");
-    const p = providerWith(() => runtime("native").rt);
+    const rt = runtime("native").rt;
+    rt.spec = { ...rt.spec, workspace: ws };
+    const p = providerWith(() => rt);
     let release: () => void = () => {};
     const gate = new Promise<void>((r) => {
       release = r;
@@ -3653,7 +3655,52 @@ describe("ClaudeProvider — the OS sandbox", () => {
     rmSync(ws, { recursive: true, force: true });
   });
 
-  it("a backend whose file tools run inside the sandbox (the CLI under Docker) leaves its file tools to it: no held-write routing (#448 round 8)", async () => {
+  it("a file tool beyond what the sandbox allows its commands goes to codeoid's gate past any allow rule (a read in the workdir or an added dir is the CLI's own to allow); the CLI's saved output for this session and its skills are readable (#448 round 8)", async () => {
+    const base = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-claude-bounds-")));
+    const ws = join(base, "ws");
+    const fakeHome = join(base, "home");
+    mkdirSync(ws, { recursive: true });
+    mkdirSync(join(fakeHome, ".ssh"), { recursive: true });
+    const rt = runtime("native").rt;
+    const projectDir = join(fakeHome, ".claude", "projects", "p");
+    rt.spec = { ...rt.spec, workspace: ws, hidden: [fakeHome] };
+    const p = providerWith(() => rt);
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const run = p.runTurn({ history: [], userMessage: "go", workdir: ws, canUseTool: async () => ({ behavior: "allow" as const }) });
+    const drain = (async () => {
+      await gate;
+      for await (const _ of run.events) {
+        /* drain */
+      }
+    })();
+    const hook = (capturedQueryOpts as { options: { hooks: { PreToolUse: Array<{ hooks: Array<(i: unknown) => Promise<unknown>> }> } } }).options.hooks.PreToolUse[0]!.hooks[0]!;
+    const decision = async (tool: string, input: Record<string, unknown>, id: string) =>
+      (await hook({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, tool_use_id: id, cwd: ws, session_id: "sid-1", transcript_path: join(projectDir, "sid-1.jsonl") })) as {
+        hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string };
+      };
+    const key = await decision("Read", { file_path: join(fakeHome, ".ssh", "id_ed25519") }, "tu-1");
+    expect(key.hookSpecificOutput?.permissionDecision).toBe("ask");
+    expect(key.hookSpecificOutput?.permissionDecisionReason).toStartWith("Refused: outside what this session's sandbox allows");
+    expect((await decision("Grep", { pattern: "x", path: fakeHome }, "tu-2")).hookSpecificOutput?.permissionDecision).toBe("ask");
+    expect((await decision("Write", { file_path: join(base, "x.sh"), content: "x" }, "tu-3")).hookSpecificOutput?.permissionDecision).toBe("ask");
+    expect((await decision("Read", { file_path: join(ws, "a.ts") }, "tu-4")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    expect((await decision("Grep", { pattern: "x" }, "tu-5")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    // Where the CLI saves this session's large output, beside the transcript the hook names.
+    const results = join(projectDir, "sid-1", "tool-results");
+    expect(p.hostReadable()).toContain(results);
+    expect((await decision("Read", { file_path: join(results, "r.txt") }, "tu-6")).hookSpecificOutput?.permissionDecision).not.toBe("ask");
+    expect((await decision("Write", { file_path: join(results, "r.txt"), content: "" }, "tu-7")).hookSpecificOutput?.permissionDecision).toBe("ask");
+    expect((await decision("Read", { file_path: join(projectDir, "other.jsonl") }, "tu-8")).hookSpecificOutput?.permissionDecision).toBe("ask");
+    release();
+    await drain;
+    await p.teardown();
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it("a backend whose file tools run inside the sandbox (the CLI under Docker) leaves its file tools to it: no held-write or bounds routing (#448 round 8)", async () => {
     const ws = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-claude-inside-")));
     mkdirSync(join(ws, ".git", "hooks"), { recursive: true });
     mkdirSync(join(ws, ".git", "objects"));

@@ -93,10 +93,10 @@ Rewinding uses the same reading of a command for its "not undone by going back" 
 
 Autonomous mode never waits on a person. The OS sandbox is its boundary: an autonomous session, routine, loop or dispatched worker doesn't start (or switch to autonomous) while its sandbox can't run, and an owner who turns a session's sandbox off has chosen that ([sandbox.md](sandbox.md)). So:
 
-- **It runs, unasked:** shell commands of every level, not understood and unreadable ones included, a command reaching the home (`ls ~`, `echo $HOME`, `df -h /`) too while the session is sandboxed, since the sandbox hides the credentials; and writes, edits, deletes and moves wherever they lead, outside the working directory too. Each spends one call of the autonomous tool budget.
+- **It runs, unasked:** shell commands of every level, not understood and unreadable ones included, a command reaching the home (`ls ~`, `echo $HOME`, `df -h /`) too while the session is sandboxed, since the sandbox hides the credentials; and writes, edits, deletes and moves where the sandbox lets them land. A file tool that runs outside the sandbox (Claude's, opencode's) is held to the sandbox's own policy in every mode: a write outside what the sandbox lets commands write, or a read or search of what it hides, is refused, never asked ([sandbox.md](sandbox.md#file-tools-that-run-outside-the-sandbox); event `sandbox.refused`, audit `session.sandbox_bounds_refuse`). Each call that runs spends one call of the autonomous tool budget.
 - **It refuses at once, never asks** — the agent reads what was refused and that the owner can do it, or switch the session to guarded mode to be asked; the transcript gets an info line (`⛔ Refused <tool> in autonomous mode: …`, event `autonomous.refused`) and the audit log a `session.autonomous_refuse` with its kind. No budget is spent:
   - a request to run a command outside the OS sandbox, or to widen it (`unsandboxed`);
-  - a file tool that runs outside the sandbox (Claude's, opencode's) writing the repository's git structure or the project settings an agent CLI runs code from, which the sandbox holds read-only for commands, or a file with more than one hard link, while the session is sandboxed ([sandbox.md](sandbox.md); `held_write`). A backend whose file tools run inside the sandbox (Codex, pi, the Gemini CLI, Qwen) is held by the sandbox itself, so a hard-linked file in `node_modules` is edited unasked there;
+  - a file tool that runs outside the sandbox writing the repository's git dir (its objects and refs, which a sandboxed commit writes), or a file with more than one hard link, while the session is sandboxed ([sandbox.md](sandbox.md); `held_write`). A backend whose file tools run inside the sandbox (Codex, pi, the Gemini CLI, Qwen) is held by the sandbox itself, so a hard-linked file in `node_modules` is edited unasked there;
   - a write to a Claude settings file (`.claude/settings.json`, `settings.local.json`, judged where it really lands: `./`, `//`, `..`, `~` and links followed) on a session on a named Claude account, or under Claude's own sandbox (`claude_settings`);
   - a search by a file tool reaching a directory that holds credentials, `~/.claude.json`, or a relative path whose directory the backend didn't report; and a command doing so on a session that isn't sandboxed (`credential_dir`);
   - a call whose path a backend couldn't resolve for certain: opencode's `opencode_unresolved_path` (`unresolved_path`).
@@ -106,7 +106,7 @@ Autonomous mode never waits on a person. The OS sandbox is its boundary: an auto
 - **Unattended runs** (routines, loops, dispatched workers) therefore park on nothing but those two asks: a question for you, or a fleet dispatch.
 - Codex in autonomous mode asks codeoid about nothing (#442), so none of this reaches its calls; its own sandbox, and codeoid's around it, hold.
 
-Guarded and interactive mode are unchanged: they ask about every write already, and the cases above are asked there, never run unasked.
+Guarded and interactive mode are unchanged but for the host-side file tools' bounds while sandboxed (refused in every mode, above): they ask about every write already, and the other cases above are asked there, never run unasked.
 
 ## Which backends
 

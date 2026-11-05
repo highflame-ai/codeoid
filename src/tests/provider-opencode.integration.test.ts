@@ -119,6 +119,10 @@
  *   I69 (scripted only, bubblewrap) a session's shell lines run inside its OS sandbox (#448) through codeoid's shell shim:
  *       a planted credential is unreadable, a planted dir outside the workspace survives `rm -rf`, the workspace is
  *       writable, the daemon's processes aren't in its /proc; a session whose sandbox is off runs bash as before
+ *   I70 (scripted only, bubblewrap; #448 round 8) through a sandboxed Session, opencode's file tools (they run in its server,
+ *       outside the sandbox) are held to the sandbox's policy: a read of a planted key in the hidden home, a glob into it
+ *       and a write outside the workspace are refused (nothing of the key reaches the model, nothing is written), in
+ *       autonomous and guarded mode; a read and a write in the workspace run unasked in autonomous mode
  *   I68 (round 26) a host spliced into a Bedrock `region` (`x@opencode.ai/zen/v1?`): the user's provider is dropped while
  *       hosted models are off, one whose region only `{file:}` shows is refused at start from real 2.2.5's substituted
  *       listing, and a Bedrock provider whose keys come from `{file:}` is carried; nothing connects to opencode.ai
@@ -2052,6 +2056,100 @@ describe("opencode (real binary)", () => {
       store.close();
     }
   }, 240_000);
+
+  maybeScripted("I70 through a sandboxed Session, opencode's file tools are held to the sandbox's policy: beyond it refused in every mode, nothing leaks; within it they run unasked (#448 round 8)", async () => {
+    if (!(await new BwrapSandboxProvider().probe()).available) return;
+    const root = realpathSync(mkdtempSync(join(WORK, "bounds-")));
+    const workdir = join(root, "work");
+    const outside = join(root, "outside");
+    const home = join(root, "home");
+    for (const d of [workdir, outside, join(home, ".ssh")]) mkdirSync(d, { recursive: true });
+    writeFileSync(join(home, ".ssh", "id_ed25519"), "KEY-DECOY-R8\n");
+    writeFileSync(join(workdir, "notes.txt"), "IN-WORKSPACE\n");
+    const store = new Store(join(root, "codeoid.db"));
+    const transcriptStore = new TranscriptStore(join(root, "transcripts"));
+    const auth = { sub: "it", scopes: [], delegationDepth: 0, accountId: "a", projectId: "p" } as unknown as AuthContext;
+    // The session's sandbox hides this throwaway home (its HOME), with the planted key in it.
+    const realHome = process.env.HOME;
+    process.env.HOME = home;
+    const registry = new SandboxRegistry("linux");
+    registry.register(new BwrapSandboxProvider());
+    const verdicts: Array<{ name: string; behavior: string; message?: string }> = [];
+    // Defense in depth: only what this case means to run is let through, whatever the Session decides.
+    const runnable = (name: string, input: Record<string, unknown>) =>
+      (name === "Read" && input.file_path === join(workdir, "notes.txt")) || (name === "Write" && input.file_path === join(workdir, "made.txt"));
+    const guarded =
+      (inner: ToolApprovalFn): ToolApprovalFn =>
+      async (toolId, approvalId, name, input, signal, agentId) => {
+        const v = await inner(toolId, approvalId, name, input, signal, agentId);
+        verdicts.push({ name, behavior: v.behavior, ...(v.behavior === "deny" ? { message: v.message } : {}) });
+        if (v.behavior === "allow" && !runnable(name, input)) return { behavior: "deny", message: "integration guard: not run" };
+        return v;
+      };
+    const run = async (call: string, mode: SessionMode) => {
+      const id = `it-bounds-${Math.random().toString(36).slice(2)}`;
+      store.createSession({ id, name: id, workdir, status: "idle", createdBy: auth.sub, createdAt: new Date().toISOString(), attachedClients: 0, accountId: "a", projectId: "p" });
+      const p = provider();
+      const runTurn = p.runTurn.bind(p);
+      p.runTurn = (o) => runTurn({ ...o, canUseTool: guarded(o.canUseTool) });
+      const session = new Session({
+        name: id, workdir, auth, store, transcriptStore, existingId: id, _testProvider: p, sandboxRegistry: registry,
+        initialMode: { mode, ...(mode === "autonomous" ? { maxTurns: 10 } : {}) },
+        config: {
+          workspaceIndex: { enabled: false, episodeThreshold: 5, timeThresholdMs: 60_000, debounceMs: 15_000 },
+          compress: { enabled: false, excludeCommands: [], excludePatterns: [], compressPipes: false, minBytes: 1024 },
+          labeling: {},
+          telemetry: { osc8: "auto" },
+          autoRotate: { enabled: false, warnPct: 0.6, rotatePct: 0.8, hardRotatePct: 0.9, minTurnsBeforeRotate: 3, strategy: "task-anchor" },
+          session: {},
+          sandbox: { provider: "bwrap", network: "off", allowedHosts: [], hiddenPaths: [], docker: { image: "x" } },
+        } as unknown as CodeoidConfig,
+      });
+      expect(await session.ensureSandbox()).toMatchObject({ state: "on", confinement: "command" });
+      const before = verdicts.length;
+      void session.send(call, auth);
+      const deadline = Date.now() + 60_000;
+      while (Date.now() < deadline && session.pendingToolApprovals().length === 0 && !(session.status === "idle" && session.canonicalHistory.at(-1)?.role === "assistant")) await Bun.sleep(20);
+      const pending = session.pendingToolApprovals();
+      for (const a of pending) session.approve(a.approvalId, false, auth);
+      while (Date.now() < deadline && !(session.status === "idle" && session.canonicalHistory.at(-1)?.role === "assistant")) await Bun.sleep(20);
+      const said = JSON.stringify(session.canonicalHistory);
+      await session.interrupt(auth).catch(() => {});
+      await p.teardown();
+      await session.destroy(auth).catch(() => {});
+      return { pending, verdicts: verdicts.slice(before), said };
+    };
+    try {
+      for (const mode of ["autonomous", "guarded"] as const) {
+        for (const call of [
+          `[[tool:read ${JSON.stringify({ path: join(home, ".ssh", "id_ed25519") })}]]`,
+          `[[tool:glob ${JSON.stringify({ pattern: "*", path: join(home, ".ssh") })}]]`,
+          `[[tool:write ${JSON.stringify({ path: join(outside, "planted.sh"), content: "x" })}]]`,
+        ]) {
+          const r = await run(call, mode);
+          expect([mode, call, r.pending.length]).toEqual([mode, call, 0]);
+          expect(r.verdicts[0]?.behavior).toBe("deny");
+          expect(r.verdicts[0]?.message).toStartWith("Refused: outside what this session's sandbox allows");
+          expect(r.said).not.toContain("KEY-DECOY-R8");
+          expect(existsSync(join(outside, "planted.sh"))).toBe(false);
+        }
+      }
+      // Within the sandbox, autonomous mode runs them unasked.
+      const read = await run(`[[tool:read ${JSON.stringify({ path: join(workdir, "notes.txt") })}]]`, "autonomous");
+      expect(read.pending).toHaveLength(0);
+      expect(read.verdicts.map((v) => v.behavior)).toEqual(["allow"]);
+      expect(read.said).toContain("IN-WORKSPACE");
+      const write = await run(`[[tool:write ${JSON.stringify({ path: join(workdir, "made.txt"), content: "MADE" })}]]`, "autonomous");
+      expect(write.pending).toHaveLength(0);
+      expect(write.verdicts.map((v) => v.behavior)).toEqual(["allow"]);
+      expect(readFileSync(join(workdir, "made.txt"), "utf8")).toBe("MADE");
+    } finally {
+      process.env.HOME = realHome;
+      await transcriptStore.flush().catch(() => {});
+      store.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  }, 300_000);
 
   maybeScripted("I50 the daemon user's $SHELL isn't the shell opencode runs a line with: it's bash, the shell codeoid judges lines as", async () => {
     // opencode 2.2.5 runs a line with `$SHELL -c` for any shell but fish and nu

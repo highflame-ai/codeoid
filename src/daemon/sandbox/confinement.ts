@@ -16,7 +16,7 @@
  *   - `command`: each shell command starts inside (opencode: one server
  *     serves every session, so its shell is a codeoid shim that runs each
  *     line in the session's sandbox). File tools run in the server, outside,
- *     under codeoid's gate.
+ *     held to the sandbox's own policy at codeoid's gate (host-file-tools.ts).
  *   - `no-shell`: the backend runs no commands (HTTP model APIs).
  */
 
@@ -30,7 +30,11 @@ export interface ConfinementPlan {
   via: string;
   /** Network modes commands can be held to this way. */
   network: readonly NetworkMode[];
-  /** Whether the backend's file tools (edit, write) run inside too. */
+  /**
+   * Whether the backend's file tools (read, edit, write) run inside too. When
+   * they don't, codeoid's gate holds them to the sandbox's own policy
+   * (host-file-tools.ts).
+   */
   fileTools: boolean;
   /** Whether codeoid opens a handle around the backend's process (process kind, Codex's outer wrap). */
   wrapsBackend: boolean;
@@ -107,7 +111,9 @@ export function confinementFor(backendId: string, provider: SandboxProvider | nu
             network: ["on", "off", "allowlist"],
             fileTools: false,
             wrapsBackend: false,
-            limits: ["Claude's file tools (Read, Edit, Write) run in the CLI, outside the sandbox: codeoid's gate judges them (credential paths, writes outside the workspace)"],
+            limits: [
+              "Claude's file tools (Read, Edit, Write, Glob, Grep) run in the CLI, outside the sandbox: they are held to the sandbox's own policy at codeoid's gate (a read of what it hides, or a write outside what it lets commands write, is refused)",
+            ],
           },
         };
       }
@@ -145,7 +151,9 @@ export function confinementFor(backendId: string, provider: SandboxProvider | nu
             network: caps.network,
             fileTools: false,
             wrapsBackend: false,
-            limits: ["opencode's file tools run in its shared server, outside the sandbox: codeoid's gate judges them (credential paths, writes outside the workspace)"],
+            limits: [
+              "opencode's file tools run in its shared server, outside the sandbox: they are held to the sandbox's own policy at codeoid's gate (a read of what it hides, or a write outside what it lets commands write, is refused)",
+            ],
           },
         };
       }

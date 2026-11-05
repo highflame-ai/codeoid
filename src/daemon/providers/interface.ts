@@ -830,6 +830,13 @@ export interface SessionProvider extends AgentProvider {
    * proposed. Absent on a backend with no such check.
    */
   foreignCallRefusal?(toolName: string, input: unknown, agentId: string | undefined): string | null;
+  /**
+   * Where the backend's own file tools must read outside the sandbox while
+   * it is on (#448 round 8, sandbox/host-file-tools.ts): what it put there
+   * itself for the model (Claude's saved tool output for this session, its
+   * skills' own files). Read only, never written. Absent: nothing.
+   */
+  hostReadable?(): readonly string[];
   /** Underlying backing session ID (for display and Store persistence). */
   readonly backingSessionId: string;
   /** True once runTurn() has been called at least once (guards agent registration). */

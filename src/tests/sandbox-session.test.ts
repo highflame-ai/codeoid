@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
@@ -165,7 +165,22 @@ async function gateCall(name: string, input: Record<string, unknown>, opts: Para
   if (pending.length > 0) await session.interrupt(AUTH);
   const result = provider.canUseToolResults[0] as { behavior?: string; message?: string } | undefined;
   const refusal = infos.find((m) => (m.metadata as { event?: string } | undefined)?.event === "autonomous.refused");
-  return { session, asked: pending.length > 0, pending, card, behavior: result?.behavior, message: result?.message, refusal };
+  const bounds = infos.find((m) => (m.metadata as { event?: string } | undefined)?.event === "sandbox.refused");
+  return { session, asked: pending.length > 0, pending, card, behavior: result?.behavior, message: result?.message, refusal, bounds };
+}
+
+/**
+ * A host-side file tool held to the sandbox's policy refused the call (#448
+ * round 8): in every mode, never asked, its reason to the agent and on the
+ * card, an info line, audited.
+ */
+function expectOutside(r: Awaited<ReturnType<typeof gateCall>>, access: "read" | "write" | "search", path?: string): void {
+  expect([r.asked, r.behavior]).toEqual([false, "deny"]);
+  expect(r.message).toStartWith("Refused: outside what this session's sandbox allows: ");
+  if (path) expect(r.message).toContain(path);
+  expect(r.card).toMatchObject({ phase: "cancelled", message: r.message });
+  expect(r.bounds?.metadata).toMatchObject({ access });
+  expect(audits.some((a) => a.action === "session.sandbox_bounds_refuse" && a.sessionId === r.session.id && a.detail?.includes(`access=${access}`))).toBe(true);
 }
 
 /** Autonomous mode refused the call outright (#448): never asked, its reason to the agent and on the card, an info line, audited. */
@@ -449,35 +464,28 @@ describe("review fixes (#448)", () => {
     expect(r.behavior).toBe("allow");
   });
 
-  test("Claude (native): a file-tool write to the project's Claude settings is refused in autonomous mode, asked in guarded", async () => {
+  test("Claude (native): a file-tool write to the project's Claude settings, which the sandbox holds read-only, is refused in every mode (#448 round 8)", async () => {
     const write = { file_path: join(workdir, ".claude", "settings.json"), content: "{}" };
-    expectRefused(await gateCall("Write", write, { mode: "autonomous" }), "held_write");
-    expect((await gateCall("Write", write, { mode: "guarded" })).asked).toBe(true);
+    for (const mode of ["autonomous", "guarded", "interactive"] as const) expectOutside(await gateCall("Write", write, { mode }), "write", join(workdir, ".claude", "settings.json"));
   });
 
-  test("Claude (native): a write to a Claude settings file outside the held ones is refused in autonomous mode as a settings write", async () => {
-    const r = await gateCall("Write", { file_path: join(root, "elsewhere", ".claude", "settings.local.json"), content: "{}" }, { mode: "autonomous" });
-    expectRefused(r, "claude_settings");
-    expect(r.message).toContain("a Claude settings file");
+  test("Claude (native): a write to a Claude settings file outside the workspace is refused in every mode: the sandbox can't write there", async () => {
+    for (const mode of ["autonomous", "guarded"] as const) {
+      expectOutside(await gateCall("Write", { file_path: join(root, "elsewhere", ".claude", "settings.local.json"), content: "{}" }, { mode }), "write");
+    }
   });
 
-  test("a host-side file tool (opencode's) writing the project settings agent CLIs run code from is refused in autonomous mode while the sandbox is on; a backend whose file tools run inside it is held by the sandbox itself (#448 rounds 2, 8)", async () => {
+  test("a host-side file tool (opencode's) writing the project settings agent CLIs run code from is refused in every mode while the sandbox is on; a backend whose file tools run inside it is held by the sandbox itself (#448 rounds 2, 8)", async () => {
     for (const [backend, name, input] of [
       ["opencode", "Write", { file_path: join(workdir, ".claude", "settings.json"), content: "{}" }],
       ["opencode", "Edit", { file_path: join(workdir, "a.ts"), files: [join(workdir, ".gemini", "settings.json")] }],
       ["opencode", "Write", { file_path: join(workdir, ".mcp.json"), content: "{}" }],
     ] as const) {
-      const r = await gateCall(name, input as Record<string, unknown>, { mode: "autonomous", backend });
-      expectRefused(r, "held_write");
-      expect(r.message).toContain("project settings an agent CLI runs code from");
+      for (const mode of ["autonomous", "guarded"] as const) expectOutside(await gateCall(name, input as Record<string, unknown>, { mode, backend }), "write");
     }
     // pi's write runs inside the sandbox, which holds `.pi/` read-only: nothing for the gate to refuse.
     const pi = await gateCall("write", { path: ".pi/extensions/x.ts", content: "" }, { mode: "autonomous", backend: "pi" });
     expect([pi.asked, pi.behavior]).toEqual([false, "allow"]);
-    // Guarded mode asks, the card saying why.
-    const guarded = await gateCall("Write", { file_path: join(workdir, ".mcp.json"), content: "{}" }, { mode: "guarded", backend: "opencode" });
-    expect(guarded.asked).toBe(true);
-    expect(guarded.pending[0]?.risk?.reasons[0]).toContain("project settings an agent CLI runs code from");
     const plain = await gateCall("Write", { file_path: join(workdir, "src.ts"), content: "" }, { mode: "autonomous", backend: "opencode" });
     expect([plain.asked, plain.behavior]).toEqual([false, "allow"]);
     // The sandbox off: the owner's choice, nothing is held.
@@ -485,14 +493,20 @@ describe("review fixes (#448)", () => {
     expect([off.asked, off.behavior]).toEqual([false, "allow"]);
   });
 
-  test("file tools writing the repository's git structure are refused in autonomous mode while the sandbox is on; guarded mode asks, the card saying why (#448 round 3)", async () => {
+  test("host-side file tools writing the repository's git structure: what the sandbox holds read-only is refused in every mode; the rest of the git dir is refused in autonomous mode, guarded mode asks, the card saying why (#448 rounds 3, 8)", async () => {
     const execFile = (args: string[], cwd: string) => Bun.spawnSync(["git", ...args], { cwd, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
     execFile(["init", "-q", "-b", "main"], workdir);
     try {
-      const hook = await gateCall("Write", { file_path: join(workdir, ".git", "hooks", "pre-commit"), content: "x" }, { mode: "guarded" });
-      expect(hook.asked).toBe(true);
-      expect(hook.pending[0]?.risk?.reasons[0]).toContain("the repository's git structure");
-      expect(hook.card?.risk?.reasons[0]).toContain("the repository's git structure");
+      // A ref: writable to a sandboxed commit, but a file tool runs outside the sandbox.
+      const ref = await gateCall("Write", { file_path: join(workdir, ".git", "refs", "heads", "x"), content: "x" }, { mode: "guarded" });
+      expect(ref.asked).toBe(true);
+      expect(ref.pending[0]?.risk?.reasons[0]).toContain("the repository's git structure");
+      expect(ref.card?.risk?.reasons[0]).toContain("the repository's git structure");
+      for (const backend of ["claude", "opencode"]) {
+        const r = await gateCall("Write", { file_path: join(workdir, ".git", "refs", "heads", "x"), content: "x" }, { mode: "autonomous", backend });
+        expectRefused(r, "held_write");
+        expect(r.message).toContain("the repository's git structure");
+      }
       for (const [backend, name, input] of [
         ["claude", "Write", { file_path: join(workdir, ".git", "hooks", "pre-commit"), content: "x" }],
         ["claude", "Edit", { file_path: join(workdir, ".git", "config"), old_string: "[core]", new_string: "[core]" }],
@@ -500,9 +514,7 @@ describe("review fixes (#448)", () => {
         ["claude", "NotebookEdit", { notebook_path: join(workdir, ".git", "info", "attributes.ipynb") }],
         ["opencode", "Edit", { file_path: join(workdir, "a.ts"), files: [join(workdir, ".git", "info", "attributes")] }],
       ] as const) {
-        const r = await gateCall(name, input as Record<string, unknown>, { mode: "autonomous", backend });
-        expectRefused(r, "held_write");
-        expect(r.message).toContain("the repository's git structure");
+        for (const mode of ["autonomous", "guarded"] as const) expectOutside(await gateCall(name, input as Record<string, unknown>, { mode, backend }), "write");
       }
       // pi's write runs inside the sandbox, which holds the git structure itself.
       expect((await gateCall("write", { path: ".git/HEAD", content: "x" }, { mode: "autonomous", backend: "pi" })).behavior).toBe("allow");
@@ -848,7 +860,90 @@ describe("round 1 of the #448 audit", () => {
   });
 });
 
-describe("round 8 of the #448 audit", () => {
+describe("round 8 of the #448 audit: host-side file tools are held to the sandbox's own policy", () => {
+  // Data only: the mock backend runs nothing, writes nothing.
+  const sshKey = () => join(homedir(), ".ssh", "id_ed25519");
+  const bashrc = () => join(homedir(), ".bashrc");
+
+  test("Claude (native) and opencode: a write, edit, read or search beyond the sandbox is refused in autonomous mode with the reason, never asked; within it runs unasked", async () => {
+    mkdirSync(join(workdir, "src"), { recursive: true });
+    writeFileSync(join(workdir, "src", "a.ts"), "");
+    for (const backend of ["claude", "opencode"]) {
+      for (const [name, input, access, path] of [
+        ["Write", { file_path: bashrc(), content: "x" }, "write", bashrc()],
+        ["Write", { file_path: join(root, "elsewhere", "x.sh"), content: "x" }, "write", join(root, "elsewhere", "x.sh")],
+        ["Edit", { file_path: join(homedir(), ".gitconfig"), old_string: "a", new_string: "b" }, "write", join(homedir(), ".gitconfig")],
+        ["Read", { file_path: sshKey() }, "read", sshKey()],
+        ["Grep", { pattern: "BEGIN", path: homedir() }, "search", homedir()],
+      ] as const) {
+        const r = await gateCall(name, input as Record<string, unknown>, { mode: "autonomous", backend });
+        expectOutside(r, access, path);
+        expect(r.refusal).toBeUndefined();
+      }
+      for (const [name, input] of [
+        ["Write", { file_path: join(workdir, "src", "b.ts"), content: "" }],
+        ["Edit", { file_path: join(workdir, "src", "a.ts"), old_string: "", new_string: "x" }],
+        ["Read", { file_path: join(workdir, "src", "a.ts") }],
+        ["Grep", { pattern: "x", path: workdir }],
+        ["Glob", { pattern: "src/**/*.ts", path: workdir }],
+      ] as const) {
+        const r = await gateCall(name, input as Record<string, unknown>, { mode: "autonomous", backend });
+        expect([backend, name, r.asked, r.behavior]).toEqual([backend, name, false, "allow"]);
+      }
+    }
+  });
+
+  test("the same in guarded and interactive mode, while sandboxed: refused, not asked; a write within still asks in guarded mode as before", async () => {
+    for (const mode of ["guarded", "interactive"] as const) {
+      expectOutside(await gateCall("Write", { file_path: bashrc(), content: "x" }, { mode }), "write");
+      expectOutside(await gateCall("Read", { file_path: sshKey() }, { mode, backend: "opencode" }), "read");
+    }
+    expect((await gateCall("Write", { file_path: join(workdir, "b.ts"), content: "" }, { mode: "guarded" })).asked).toBe(true);
+    expect((await gateCall("Read", { file_path: join(workdir, "b.ts") }, { mode: "guarded" })).behavior).toBe("allow");
+  });
+
+  test("the sandbox decides what a read reaches: the home's allowlist is readable; the host's /tmp is to Claude's own sandbox, not to opencode's under bubblewrap (its /tmp is the session's)", async () => {
+    expect((await gateCall("Read", { file_path: join(homedir(), ".gitconfig") }, { mode: "autonomous" })).behavior).toBe("allow");
+    const outside = join(root, "elsewhere", "notes.txt");
+    expect((await gateCall("Read", { file_path: outside }, { mode: "autonomous" })).behavior).toBe("allow");
+    expectOutside(await gateCall("Read", { file_path: outside }, { mode: "autonomous", backend: "opencode" }), "read", outside);
+  });
+
+  test("a write through a link out of the workspace is judged where it lands", async () => {
+    mkdirSync(join(root, "elsewhere"), { recursive: true });
+    symlinkSync(join(root, "elsewhere"), join(workdir, "out"));
+    expectOutside(await gateCall("Write", { file_path: join(workdir, "out", "x"), content: "" }, { mode: "autonomous" }), "write", join(root, "elsewhere", "x"));
+  });
+
+  test("what the backend says it reads outside (its saved tool output, its skills) is readable, never writable", async () => {
+    const results = join(homedir(), ".claude", "projects", "p", "sid", "tool-results");
+    class WithOutput extends MockSessionProvider {
+      hostReadable(): readonly string[] {
+        return [results];
+      }
+    }
+    const read = { file_path: join(results, "out.txt") };
+    const run = async (input: Record<string, unknown>, name = "Read") => {
+      const provider = new WithOutput("claude", [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name, input, approvalId: "ap-1" }, DONE]]);
+      const { session } = makeSession(provider, { mode: "autonomous" });
+      void session.send("go", AUTH).catch(() => {});
+      await until(() => provider.canUseToolResults.length > 0 || session.pendingToolApprovals().length > 0);
+      return provider.canUseToolResults[0] as { behavior: string; message?: string };
+    };
+    expect((await run(read)).behavior).toBe("allow");
+    expect((await run({ ...read, content: "x" }, "Write")).message).toStartWith("Refused: outside what this session's sandbox allows");
+    expect((await run({ file_path: join(homedir(), ".claude", "projects", "p", "other.jsonl") })).behavior).toBe("deny");
+  });
+
+  test("not sandboxed (the owner's off): the gate is as before: guarded asks for a write outside, a read anywhere runs, autonomous runs a write outside", async () => {
+    const off = { provider: "off" } as const;
+    expect((await gateCall("Write", { file_path: bashrc(), content: "x" }, { mode: "guarded", sandbox: off })).asked).toBe(true);
+    expect((await gateCall("Read", { file_path: sshKey() }, { mode: "guarded", sandbox: off })).behavior).toBe("allow");
+    expect((await gateCall("Read", { file_path: sshKey() }, { mode: "autonomous", sandbox: off, backend: "opencode" })).behavior).toBe("allow");
+    expect((await gateCall("Write", { file_path: join(root, "elsewhere", "x"), content: "x" }, { mode: "autonomous", sandbox: off })).behavior).toBe("allow");
+    expect(audits.some((a) => a.action === "session.sandbox_bounds_refuse")).toBe(false);
+  });
+
   test("a command reaching the home runs in a sandboxed autonomous session (the sandbox hides the credentials), and is refused where it isn't sandboxed; a named credential stays refused everywhere", async () => {
     for (const command of ["ls ~", "echo $HOME", "df -h /", "stat ~", "test -d ~ && echo yes"]) {
       for (const backend of ["claude", "opencode", "pi"]) {
@@ -878,4 +973,14 @@ describe("round 8 of the #448 audit", () => {
     }
     const claude = await gateCall("Edit", { file_path: file, old_string: "1", new_string: "2" }, { mode: "autonomous" });
     expectRefused(claude, "held_write");
-  });});
+    expect(claude.message).not.toContain("outside what this session's sandbox allows");
+  });
+
+  test("the session's sandbox limits say the gate holds the host-side file tools to the sandbox's policy", async () => {
+    for (const backend of ["claude", "opencode"]) {
+      const { session } = makeSession(new MockSessionProvider(backend, []));
+      const info = await session.ensureSandbox();
+      expect(info?.limits?.join("\n")).toContain("held to the sandbox's own policy at codeoid's gate");
+    }
+  });
+});

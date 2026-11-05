@@ -19,6 +19,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { runCheck } from "../daemon/evidence/runner.js";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
+import { hostToolBoundsFor, sandboxReads, sandboxWrites } from "../daemon/sandbox/host-file-tools.js";
 import { buildSandboxSpec, programLocations } from "../daemon/sandbox/policy.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
 import { sandboxRoot } from "../daemon/sandbox/root.js";
@@ -1042,6 +1043,57 @@ describe.skipIf(!probe.available)("bubblewrap, for real: round 2 of the #448 aud
       expect(r.stdout).not.toContain("PLANTED");
       expect(r.stdout).not.toContain("PROJECT-TOOL-RAN");
       expect(r.stdout).toContain("DONE");
+    } finally {
+      await h.close();
+    }
+  });
+
+  test("the gate's rules for host-side file tools and the real sandbox agree, path by path: what a command can read and write is what a Claude or opencode file tool may (#448 round 8)", async () => {
+    const home = join(root, "home-agree");
+    const ws = join(home, "proj");
+    const out = join(root, "outside-agree");
+    for (const d of [join(ws, "src"), join(home, ".ssh"), join(home, ".config", "git"), out]) mkdirSync(d, { recursive: true });
+    Bun.spawnSync(["git", "init", "-q", "-b", "main"], { cwd: ws, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
+    const plant = (p: string, content = "x\n") => {
+      mkdirSync(dirname(p), { recursive: true });
+      writeFileSync(p, content);
+      return p;
+    };
+    const tmp = join(root, "tmp-agree");
+    mkdirSync(tmp);
+    const spec = buildSandboxSpec({ sessionId: "agree", workspace: ws, tempDir: tmp, network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" }, cache: false });
+    symlinkSync(out, join(ws, "out-link"));
+    const files = [
+      plant(join(ws, "src", "a.ts")),
+      join(ws, "src", "new.ts"),
+      join(tmp, "scratch.txt"),
+      plant(join(ws, ".git", "config"), "[core]\n"),
+      join(ws, ".git", "hooks", "pre-commit"),
+      plant(join(ws, ".git", "refs", "heads", "x"), "0\n"),
+      join(ws, ".claude", "settings.json"),
+      join(ws, ".mcp.json"),
+      plant(join(home, ".ssh", "id_ed25519"), "PLANTED-KEY\n"),
+      plant(join(home, ".gitconfig"), "[user]\n"),
+      plant(join(home, ".config", "git", "credentials"), "PLANTED-GIT\n"),
+      plant(join(home, ".bashrc"), "# rc\n"),
+      plant(join(home, "notes.txt")),
+      plant(join(out, "keep.txt")),
+      join(ws, "out-link", "made.txt"),
+    ];
+    const bounds = hostToolBoundsFor({ spec, plan: { kind: "command" }, provider: { id: "bwrap" }, claudeTemp: () => { throw new Error("not Claude"); } } as never, "opencode");
+    const h = await provider.open(spec);
+    try {
+      for (const f of files) {
+        // `f` is an argument, never part of the script; each write only appends to a file this test planted (or makes one).
+        const run = (script: string) => h.exec(["/bin/sh", "-c", script, "sh", f], { cwd: ws, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home }, timeoutMs: 20_000 });
+        const real = realpathSync(dirname(f));
+        const at = join(real, f.slice(f.lastIndexOf("/") + 1));
+        const existed = existsSync(at);
+        const canRead = existed ? (await run('cat "$1" >/dev/null 2>&1 && echo READ')).stdout.includes("READ") : null;
+        const canWrite = (await run('printf "" >> "$1" 2>/dev/null && echo WROTE')).stdout.includes("WROTE");
+        if (canRead !== null) expect([f, "read", sandboxReads(bounds, at)]).toEqual([f, "read", canRead]);
+        expect([f, "write", sandboxWrites(bounds, at)]).toEqual([f, "write", canWrite]);
+      }
     } finally {
       await h.close();
     }

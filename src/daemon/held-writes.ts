@@ -8,7 +8,8 @@
  * (Session's `#heldWrite`); one that runs inside the sandbox (Codex, pi, the
  * Gemini CLI, Qwen) is held by the sandbox itself and isn't judged here.
  * Claude's PreToolUse hook routes it to codeoid's gate past an allow rule
- * (`heldWriteDecision`).
+ * (`heldWriteDecision`). What the sandbox holds read-only of them is refused
+ * in every mode before this (sandbox/host-file-tools.ts).
  *
  * Each backend names its file tools its own way ({@link writeTargets}):
  * Claude's Write/Edit/MultiEdit/NotebookEdit, opencode's Write/Edit (a

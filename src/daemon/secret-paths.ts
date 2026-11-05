@@ -156,6 +156,11 @@ export function registeredSecretLocations(): { dirs: string[]; files: string[] }
   };
 }
 
+/** The dirs inside registered credential dirs that stay readable ({@link registerSecretPaths}'s `open`: opencode's tool output). */
+export function registeredOpenDirs(): string[] {
+  return [...REGISTERED_OPEN.keys()];
+}
+
 /**
  * `/proc/<pid>/environ`, `/proc/self/mem`, `/proc/<pid>/task/<tid>/fd/3`, …:
  * any such component below /proc, so a path through a process's `root` or

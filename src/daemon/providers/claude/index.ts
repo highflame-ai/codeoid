@@ -78,7 +78,8 @@ import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.
 import { listProcesses } from "../../process-tree.js";
 import { CLAUDE_HOME_LAYOUT, preparePrivateHome, withLoginsSynced } from "../../sandbox/backend-home.js";
 import { asksUnsandboxed, claudeNativeEnv, claudeSandboxSettings } from "../../sandbox/claude-native.js";
-import { programLocations, protectedWriteTargets } from "../../sandbox/policy.js";
+import { HOME_CREDENTIAL_PATHS, programLocations, protectedWriteTargets } from "../../sandbox/policy.js";
+import { hostFileBreachReason, hostFileToolBreach, hostToolBoundsFor } from "../../sandbox/host-file-tools.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../../sandbox/types.js";
 import type { LLMCallUsage } from "../../context-math.js";
@@ -349,6 +350,14 @@ export class ClaudeProvider implements SessionProvider {
    * Bounded: a call the CLI allows itself never reaches canUseTool.
    */
   #shellCwds = new Map<string, string>();
+  /**
+   * What the CLI's file tools must read outside the sandbox (hostReadable,
+   * #448 round 8): the dirs its skills' own files are in (the user tier's
+   * and the session's plugins', as `additionalDirectories` grants them), and
+   * where it saves this session's large tool output for the model to read.
+   */
+  #skillReadable: string[] = [];
+  #toolResultsDir: string | null = null;
   /** Id-keyed lifecycle events that arrived with no live queue, replayed into
    *  the next turn. See #handleUndeliverable. */
   #carryover: ProviderEvent[] = [];
@@ -531,6 +540,23 @@ export class ClaudeProvider implements SessionProvider {
   }
 
   /** SessionProvider.foreignCallRefusal: #refuseForeignCall on a call Session rewrote (audited and noted the same way). */
+  /**
+   * Where the CLI saves this session's large tool output for the model to
+   * Read (`<project dir>/<session id>/tool-results`, beside the transcript
+   * the hook names), noted from each call's hook input.
+   */
+  #noteToolResultsDir(input: PreToolUseHookInput): void {
+    const transcript = (input as { transcript_path?: unknown }).transcript_path;
+    const id = (input as { session_id?: unknown }).session_id;
+    if (typeof transcript !== "string" || !isAbsolute(transcript) || typeof id !== "string" || !/^[A-Za-z0-9-]+$/.test(id)) return;
+    if (transcript.slice(transcript.lastIndexOf("/") + 1) !== `${id}.jsonl`) return;
+    this.#toolResultsDir = join(dirname(transcript), id, "tool-results");
+  }
+
+  hostReadable(): readonly string[] {
+    return [...this.#skillReadable, ...(this.#toolResultsDir ? [this.#toolResultsDir] : [])];
+  }
+
   foreignCallRefusal(toolName: string, input: unknown, agentId: string | undefined): string | null {
     return this.#refuseForeignCall({ tool_name: toolName, tool_input: input, ...(agentId ? { agent_id: agentId } : {}) })?.hookSpecificOutput.permissionDecisionReason ?? null;
   }
@@ -1059,6 +1085,7 @@ export class ClaudeProvider implements SessionProvider {
     // The session's OS sandbox (#448), read per build: a change reaches the next query.
     const sandbox = this.#init.sandbox?.() ?? null;
     const desiredSandbox = sandboxFingerprint(sandbox);
+    this.#skillReadable = sandbox ? skillReadableDirs(opts.pluginDirs) : [];
 
     // Exact tool names we hand the SDK as pre-approved. Kept as its own list
     // (rather than inlined into `allowedTools`) because the PreToolUse hook has
@@ -1290,6 +1317,7 @@ export class ClaudeProvider implements SessionProvider {
           join(opts.workdir, ".claude", "skills"),
           ...pluginSkillDirs(opts.pluginDirs),
         ]),
+        // (The same grant, less the workspace's own tier, is what the gate lets its file tools read outside a sandbox: hostReadable.)
 
         hooks: {
           PreToolUse: [{
@@ -1339,6 +1367,11 @@ export class ClaudeProvider implements SessionProvider {
               if (sandbox?.plan.fileTools === false) {
                 const held = heldWriteDecision(input, opts.workdir);
                 if (held) return held;
+                // And any file tool beyond what the sandbox allows its commands (#448 round 8):
+                // to the gate, which refuses it, never on an allow rule. Fail-closed.
+                this.#noteToolResultsDir(input);
+                const outside = hostFileDecision(input, opts.workdir, sandbox, this.hostReadable());
+                if (outside) return outside;
               }
               // Past this point a throw fails OPEN: the CLI takes a hook that
               // errors as having no opinion (its createHookCallback returns {}),
@@ -2838,6 +2871,49 @@ export function heldWriteDecision(
     reason = heldWriteReason(held);
   } catch {
     reason = "codeoid couldn't tell whether this write reaches what the sandbox holds read-only, so it needs the owner's approval.";
+  }
+  return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: reason } };
+}
+
+/**
+ * The dirs a sandboxed session's file tools may read for its skills (#448
+ * round 8, hostReadable): the user tier's and the session plugins' skills
+ * (`skillSandboxDirs`: where each links to), never one in a credential
+ * store. The workspace's own tier is readable already, and a link there is
+ * the repository's to plant.
+ */
+export function skillReadableDirs(pluginDirs?: readonly string[]): string[] {
+  const home = homedir();
+  const stores = HOME_CREDENTIAL_PATHS.map((rel) => join(home, rel));
+  return skillSandboxDirs([join(home, ".claude", "skills"), ...pluginSkillDirs(pluginDirs)]).filter(
+    (d) => !stores.some((c) => d === c || d.startsWith(`${c}/`)),
+  );
+}
+
+/**
+ * The PreToolUse hook's decision for a file tool beyond what the session's
+ * sandbox allows its commands (#448 round 8, sandbox/host-file-tools.ts):
+ * `ask`, so it reaches codeoid's gate past any allow rule (the CLI allows a
+ * read in the workdir or an added dir itself), which refuses it; null for
+ * one within. A judgement that throws asks.
+ */
+export function hostFileDecision(
+  input: PreToolUseHookInput,
+  workdir: string,
+  sandbox: Pick<SandboxRuntime, "spec" | "plan" | "claudeTemp" | "provider">,
+  readable: readonly string[],
+): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "ask"; permissionDecisionReason: string } } | null {
+  let reason: string;
+  try {
+    const breach = hostFileToolBreach(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, {
+      bounds: hostToolBoundsFor(sandbox, "claude", readable),
+      workdir,
+      cwd: hookShellCwd(input),
+    });
+    if (!breach) return null;
+    reason = hostFileBreachReason(breach);
+  } catch {
+    reason = "codeoid couldn't tell whether this call stays within what the session's sandbox allows.";
   }
   return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: reason } };
 }

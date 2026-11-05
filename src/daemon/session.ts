@@ -207,6 +207,7 @@ import { loadShellParser, shellParserReady } from "./shell/parse.js";
 import { isShellTool, runsNoCommand, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import { asksOutsideSandbox } from "./sandbox/confinement.js";
+import { type HostToolBreach, hostFileBreachReason, hostFileToolBreach, hostToolBoundsFor, isHostFileTool } from "./sandbox/host-file-tools.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
 import { resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
@@ -2170,6 +2171,43 @@ export class Session {
    */
   #hostSideFileTools(): boolean {
     return this.#sandbox?.info?.state === "on" && this.#sandbox.runtime?.plan.fileTools !== true;
+  }
+
+  /**
+   * Where a host-side file tool (Claude's Read, Write, Edit, Glob, Grep;
+   * opencode's) goes beyond what the session's sandbox allows its commands
+   * (sandbox/host-file-tools.ts), judged against the spec the sandbox is
+   * built from: refused in every mode while sandboxed, never asked. Null
+   * when a sandboxed command could do the same, when the backend's file
+   * tools run inside the sandbox, or when it is off. Fail closed: a
+   * judgement that throws refuses.
+   */
+  #outsideSandbox(toolName: string, input: Record<string, unknown>, shellCwd: string | null | undefined): HostToolBreach | null {
+    if (!isHostFileTool(toolName) || !this.#hostSideFileTools()) return null;
+    const rt = this.#sandbox?.runtime;
+    try {
+      if (!rt) throw new Error("no runtime");
+      const bounds = hostToolBoundsFor(rt, this.#provider.id, this.#provider.hostReadable?.() ?? []);
+      return hostFileToolBreach(toolName, input, { bounds, workdir: this.workdir, ...(shellCwd !== undefined ? { cwd: shellCwd } : {}) });
+    } catch {
+      return { path: "(couldn't be judged)", access: "read", why: "unresolved" };
+    }
+  }
+
+  /** Refuse a host-side file tool that goes beyond the sandbox (#outsideSandbox): its card, the audit, and an info line in the transcript. */
+  #refuseOutsideSandbox(approvalId: string, toolName: string, breach: HostToolBreach, sender: AuthContext): { behavior: "deny"; message: string } {
+    const reason = hostFileBreachReason(breach);
+    this.#approvalPatchKeys.delete(approvalId);
+    this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: reason });
+    this.#store.audit(sender.sub, "session.sandbox_bounds_refuse", this.id, `tool=${toolName} access=${breach.access} why=${breach.why}`);
+    const infoMsg = this.#makeMessage("info", `⛔ Refused ${toolName}: outside what this session's sandbox allows (${breach.path})`, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "sandbox.refused",
+      tool: toolName,
+      access: breach.access,
+    });
+    this.#persistAndBuffer(infoMsg);
+    this.#broadcastRaw(infoMsg);
+    return { behavior: "deny", message: reason };
   }
 
   /**
@@ -7988,7 +8026,8 @@ export class Session {
    * project settings; a write to a Claude settings file on a named account;
    * a search reaching a directory that holds credentials, or a command doing
    * so on a session that isn't sandboxed; a path the backend couldn't resolve
-   * for certain. Null in every other mode, and for any
+   * for certain. (A host-side file tool beyond the sandbox is refused in every
+   * mode before this: #outsideSandbox.) Null in every other mode, and for any
    * other call. Side-effect free: the gate and the tool_start card read the
    * same verdict.
    */
@@ -8250,6 +8289,12 @@ export class Session {
         this.#broadcastRaw(infoMsg);
         return { behavior: "deny" as const, message: reason };
       }
+
+      // A file tool running outside the OS sandbox (Claude's, opencode's) is
+      // held to the sandbox's own policy (#448 round 8): beyond it, refused in
+      // every mode, never asked.
+      const outside = this.#outsideSandbox(toolName, effectiveInput, shellCwd);
+      if (outside) return this.#refuseOutsideSandbox(approvalId, toolName, outside, sender);
 
       // A write to a Claude settings file on a named account: the CLI reloads
       // it mid-turn and applies its env, after the turn-start check
@@ -8937,7 +8982,10 @@ export class Session {
         // end_attempt: the gate will refuse this call outright — no approval card.
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
         // Autonomous mode refuses it outright (#autonomousRefusal): no approval card either.
-        const refused = networkAsk || budgetDenied || secret?.action === "deny" || risk?.secret?.action === "deny" ? null : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
+        const deniedFirst = networkAsk || budgetDenied || secret?.action === "deny" || risk?.secret?.action === "deny";
+        // Beyond the sandbox, a host-side file tool is refused in every mode (#outsideSandbox).
+        const outside = deniedFirst ? null : this.#outsideSandbox(event.name, event.input, event.shellCwd);
+        const refused = deniedFirst ? null : outside ? { reason: hostFileBreachReason(outside) } : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
         const toolMsg = this.#makeMessage(
           "tool_call",
           `${event.name}(${Object.keys(event.input).join(", ")})`,

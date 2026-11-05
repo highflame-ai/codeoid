@@ -16,10 +16,11 @@ It is **on by default**, everywhere it can run.
 
 **Autonomous mode relies on it and never waits on a person**
 ([approvals.md](approvals.md#autonomous-mode)): there a command of any risk
-level runs and a write lands wherever it leads, while what the sandbox can't
-be left to hold — a command asking to run outside it, a file tool writing what
-it holds read-only, a credential directory — is refused at once with its
-reason. That is why an autonomous session, routine, loop or dispatched worker
+level runs, while what the sandbox can't be left to hold — a command asking
+to run outside it, a file tool writing the repository's git dir — is refused
+at once with its reason. File tools that run outside the sandbox, in the
+backend's own process (Claude's, opencode's), are held to the sandbox's own
+policy at codeoid's gate, in every mode ([below](#file-tools-that-run-outside-the-sandbox)). That is why an autonomous session, routine, loop or dispatched worker
 doesn't start without a sandbox that runs (below).
 
 ## What it guarantees, and what it doesn't
@@ -69,7 +70,7 @@ With the default policy (workspace-write):
 | **Home allowlist** (`sandbox.homeReadable`, read-only) | by default toolchains and tool settings that hold no secret: `~/.bun`, `~/.cargo/bin`, `~/.cargo/registry`, `~/.cargo/git`, `~/.rustup`, `~/.nvm`, `~/.npm`, `~/.local/bin`, `~/.local/lib` (pip `--user` packages), `~/.local/share/pnpm`, `~/.local/share/uv`, `~/.local/share/pipx`, `~/.local/share/mise`, `~/.local/share/claude/versions` (the Claude installer's binaries), `~/.pyenv`, `~/go/pkg`, `~/go/bin`, `~/.gitconfig`, `~/.config/git/config`, `~/.config/git/ignore`, `~/.config/git/attributes`. Not listed, so hidden: `~/.npmrc`, `~/.bunfig.toml`, `~/.yarnrc.yml`, `~/.pypirc`, `~/.cargo/credentials.toml`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.gradle`, `~/.m2` and everything else. A global npmrc inside an nvm install (`~/.nvm/versions/node/*/etc/npmrc`) and uv's credential store (`~/.local/share/uv/credentials`) are hidden again. A link inside a listed dir (`~/.local/bin/x`) works only where it leads into the list itself (a pipx or `uv tool` venv, the Claude installer's versions) or outside the home: what it leads to elsewhere in the home (a project of yours, with its `.env`) stays hidden, and the link dangles. List the target's dir in `sandbox.homeReadable` to show it. A link in the list (`~/.gitconfig` into a dotfiles repository) is shown at its own path and where it leads. A token written into `~/.gitconfig` itself (a URL carrying one, an `http.extraHeader`) would show: keep it in a credential helper. |
 | **Writable** | the session's working directory (its worktree), a private temp dir made for the session (`$TMPDIR`, and the sandbox's `/tmp` under bubblewrap and Docker), and what a commit in the workspace's **git repository** writes: its git dir, a linked worktree's own git dir and its repository's (objects, refs, logs, the index, `HEAD`, `packed-refs` and the lock files beside them), wherever they are, a repository under the host's `/tmp` included. Nothing else. |
 | **Read-only** | everything else on the machine. `rm -rf ~` fails with "Read-only file system". Inside the writable, **a repository's structure**: everything that decides which config, hooks or git dir git uses, since a hook, `core.hooksPath` or `core.fsmonitor` planted there (or a config git is pointed at) would run outside the sandbox at your next `git status`. That is, in the repository's git dir: `config`, `config.worktree`, `commondir`, `hooks/`, `info/`, `modules/` (a submodule's git dir carries hooks and config of its own), `remotes/`, `branches/` and `worktrees/` whole (every worktree's git dir, one added after the session started included; the workspace's own worktree git dir is writable over it); in a linked worktree's own git dir: `commondir`, `gitdir`, `config.worktree`; the worktree's `.git` file, and the `.git` file of every other worktree or submodule checked out inside the workspace. A **submodule checkout** as the workspace (its `.git` a file naming `<super>/.git/modules/<name>`, whose `core.worktree` names it back) is held the same way, its git dir being the repository's. Any other `.git` file (a `--separate-git-dir` checkout, which git's records don't name back) is held read-only, with what it names when that is inside the workspace: nothing commits from inside, and the session's sandbox limits say so. The git dirs themselves are bound at their own paths, so none can be renamed away and rebuilt (`mv .git .git-old` fails), the workspace's `.git` dir included. A plain repository at the top of the workspace gets an empty `HEAD/` dir beside its `.git`, held read-only (git doesn't see an empty dir): a `.git` made invalid (its `HEAD` garbled, `refs/` removed) would otherwise have git take the workspace's top for a bare repository planted there, with its own config. What of these isn't there yet is made first, so there is something to hold: empty `hooks/`, `info/`, `modules/`, `remotes/`, `branches/`, `worktrees/`, an empty `config.worktree` in every git dir of the repository, and a `commondir` in the repository's git dir holding `.` (git, libgit2 and gitoxide read it as that git dir itself; see Limits). An entry that would have to be held but is a link (a bind can't hold one) makes the git dir read-only whole: commits from inside then fail. And **the project settings agent CLIs run code from** (below). |
-| **Project settings** (read-only) | `.claude/`, `.gemini/`, `.qwen/`, `.codex/`, `.pi/`, `.opencode/` in the workspace, whole (made empty first where missing: git doesn't see an empty dir; not in a workspace that is your home or holds it, a temp root or `/`, where they would be the CLIs' own config dirs: there only those that exist are held), and `.mcp.json`, `opencode.json`, `opencode.jsonc` at its top, made first where missing (in the same places) holding an empty config (`{"mcpServers":{}}`, `{}`: what the CLIs read as none; your own `opencode` loads a project `opencode.json`'s MCP servers and plugins at its start) and, in a git repository, listed in its `.git/info/exclude` so `git status` and `git add -A` don't see them (an existing file is held as it is). A Claude hook, an MCP server, a pi or opencode plugin written there by one backend's command would run on the host in a later session of another, or in your own CLI. Changing them needs the sandbox lifted for that command: Claude's `dangerouslyDisableSandbox` and Codex's permission request are asked about in guarded and interactive mode and refused in autonomous mode (below); on other backends edit them yourself, or turn the session's sandbox off. A file tool that runs in the backend's own process, outside the sandbox (Claude's Write, Edit, MultiEdit and NotebookEdit, opencode's write, edit and patch), writing there **or into the repository's git structure** (anything in its git dir or a linked worktree's, the `.git` file, another checkout's `.git` file in the workspace) is asked about in guarded and interactive mode while the sandbox is on, the card saying why (audited `session.project_settings_write_ask` / `session.git_structure_write_ask`), and refused at once in autonomous mode (audited `session.autonomous_refuse`, kind `held_write`); on Claude the PreToolUse hook routes it to the gate past any allow rule. A backend whose file tools run inside the sandbox (Codex, pi, the Gemini CLI, Qwen; Claude under Docker) is held by the sandbox itself: nothing of this applies to it, a hard-linked file in `node_modules` included. |
+| **Project settings** (read-only) | `.claude/`, `.gemini/`, `.qwen/`, `.codex/`, `.pi/`, `.opencode/` in the workspace, whole (made empty first where missing: git doesn't see an empty dir; not in a workspace that is your home or holds it, a temp root or `/`, where they would be the CLIs' own config dirs: there only those that exist are held), and `.mcp.json`, `opencode.json`, `opencode.jsonc` at its top, made first where missing (in the same places) holding an empty config (`{"mcpServers":{}}`, `{}`: what the CLIs read as none; your own `opencode` loads a project `opencode.json`'s MCP servers and plugins at its start) and, in a git repository, listed in its `.git/info/exclude` so `git status` and `git add -A` don't see them (an existing file is held as it is). A Claude hook, an MCP server, a pi or opencode plugin written there by one backend's command would run on the host in a later session of another, or in your own CLI. Changing them needs the sandbox lifted for that command: Claude's `dangerouslyDisableSandbox` and Codex's permission request are asked about in guarded and interactive mode and refused in autonomous mode (below); on other backends edit them yourself, or turn the session's sandbox off. A file tool that runs in the backend's own process, outside the sandbox (Claude's Write, Edit, MultiEdit and NotebookEdit, opencode's write, edit and patch) is held to the same rules at codeoid's gate ([below](#file-tools-that-run-outside-the-sandbox)): writing what the sandbox holds read-only is refused in every mode. Writing the rest of **the repository's git dir** (its objects and refs, which a sandboxed commit writes, a linked worktree's, the `.git` file, another checkout's `.git` file in the workspace), or a file with more than one hard link, is asked about in guarded and interactive mode while the sandbox is on, the card saying why (audited `session.git_structure_write_ask` / `session.project_settings_write_ask`), and refused at once in autonomous mode (audited `session.autonomous_refuse`, kind `held_write`); on Claude the PreToolUse hook routes it to the gate past any allow rule. A backend whose file tools run inside the sandbox (Codex, pi, the Gemini CLI, Qwen; Claude under Docker) is held by the sandbox itself: nothing of this applies to it, a hard-linked file in `node_modules` included. |
 | **Hidden besides** (not readable at all) | outside the home, or in a workspace that holds it: codeoid's config dir (`~/.codeoid`: keys, accounts, endpoints, the local token) and every data dir it owns wherever it is configured (the database, transcripts and checkpoints, opencode's database and data dirs, memory's; their lock files); the agent CLIs' logins (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.qwen/oauth_creds.json`, `~/.gemini/oauth_creds.json` …, pi's `auth.json`) and what backends registered as credentials (opencode's key files); `~/.ssh`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.config/gh`, `~/.config/hub`, `~/.config/glab-cli`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.local/share/keyrings`, `~/.password-store`, `~/.config/op`, `~/.vault-token`, `~/.pypirc`, `~/.cargo/credentials(.toml)`, `~/.terraform.d/credentials.tfrc.json`, `~/.claude.json` (MCP tokens), `~/.local/share/opencode/auth.json` and `mcp-auth.json`, `~/.config/github-copilot`, `~/.pgpass`, `~/.config/rclone`, `~/.s3cfg`, `~/.boto`, `~/.pulumi/credentials.json`, `~/.config/doctl`, `~/.fly`, `~/.npmrc`, `~/.bunfig.toml`, `~/.yarnrc.yml`, `~/.gradle/gradle.properties`, `~/.m2/settings.xml`, `~/Library/Keychains`; the desktop session's runtime dir (`$XDG_RUNTIME_DIR`: keyring, D-Bus, agent sockets) and `$SSH_AUTH_SOCK`'s dir; the daemon's own temp dir when it isn't `/tmp`, and always the daemon's private dir in it (`codeoid-sandbox-*`, made at its start, 0700), where it makes every temp entry of its own: sign-in homes, a check's artifacts, a loop's index, pi's bridge, the sessions' temp dirs and launchers — so one made while a session runs is hidden from it too, on Claude's own sandbox (which keeps the host's `/tmp`) as well; plus `sandbox.hiddenPaths` (which also beats the allowlist). |
 | **The daemon's own git** | every git codeoid runs in a repository an agent can write (a fork's worktree made and removed, a destroyed session's work snapshotted, a worktree's setup, the branch and status the UI shows, loops) runs nothing that repository's config names, sandbox or not: no hook (the hooks dir's or one defined in config, `hook.<name>.command`), fsmonitor, alternates' ref command (`core.alternateRefsCommand`), external diff, signing or signature check (gpg's and ssh's programs, `gpg.ssh.defaultKeyCommand`), editor or pager, git-protocol proxy or auto gc, `core.sshCommand` is `ssh`, and every filter, diff or merge driver and credential helper defined in the repository's own config (local or worktree, includes too) is reset, your own global or system definition put back (git lfs installed globally keeps working; a repository redefining it doesn't). Reaching a remote (a base branch fetched for a fork, a partial clone's objects) is https or ssh only. Loops' repositories are stricter still: every driver off, no system config. Checkpoints run in codeoid's own shadow repository, whose config is codeoid's. |
 | **Never reachable** | container runtime sockets: `/run/docker.sock`, `/var/run/docker.sock`, containerd, podman, CRI-O, buildkit, k3s, the user's rootless sockets, Docker Desktop / Colima / Lima / Rancher / OrbStack, `$DOCKER_HOST`. A container socket is root on the machine. |
@@ -203,10 +204,12 @@ How a backend is put inside is the backend's (`src/daemon/sandbox/confinement.ts
 What each leaves open:
 
 - **Claude (native)**: its file tools (Read, Edit, Write, Grep, Glob) run in the
-  CLI, outside the sandbox — codeoid's gate judges them (credential paths are
-  refused, a write to `.claude/settings*.json` or any other project setting
-  above asks in guarded mode and is refused in autonomous mode: a hook or an
-  excluded command there would run outside the sandbox).
+  CLI, outside the sandbox — codeoid's gate holds them to the sandbox's own
+  policy ([below](#file-tools-that-run-outside-the-sandbox)): a read of what it
+  hides, or a write outside what it lets commands write (the project's
+  `.claude/` and other project settings, the user's `~/.claude`, the rest of
+  the home), is refused in every mode: a hook or an excluded command written
+  there would run outside the sandbox.
   Its commands can't write the project's `.claude/` or the user's Claude
   config dir at all. The home is denied whole
   (`denyRead`) and the allowlist allowed back (`allowRead`); verified with the
@@ -282,7 +285,10 @@ What each leaves open:
   earlier build kept its conversation in the real dir; it resumes from
   codeoid's history the same way.
 - **opencode**: its file tools run in its shared server, outside the sandbox,
-  under codeoid's gate. A subagent created in a feed gap, before codeoid set its
+  held to the sandbox's own policy at codeoid's gate
+  ([below](#file-tools-that-run-outside-the-sandbox)); under bubblewrap the
+  host's `/tmp` is out of bounds to them too, since its commands see the
+  session's temp dir there. A subagent created in a feed gap, before codeoid set its
   shell environment, runs nothing.
 - **MCP servers** a backend mounts (stdio servers from config, a project's
   `.mcp.json`) and the workdir's own hooks run as the backend starts them:
@@ -385,6 +391,65 @@ it, as its shell shim's `bin/`).
 - **Process-confined backends** (pi, the Gemini CLI, Qwen, Claude and Codex
   under Docker) and **Codex under bubblewrap** run their git inside the
   sandbox already, with everything else they do.
+
+## File tools that run outside the sandbox
+
+Claude's file tools under its native sandbox (Read, Write, Edit, MultiEdit,
+NotebookEdit, Glob, Grep, LS) and opencode's (read, write, edit, patch, glob,
+grep, list, and its external-directory requests) run in the backend's own
+process, outside the OS sandbox. While a session is sandboxed, codeoid's gate
+holds them to the sandbox's own policy (`src/daemon/sandbox/host-file-tools.ts`),
+judged against the very spec the session's sandbox was built from, so the two
+can't disagree: a call is allowed only where a sandboxed command could do the
+same thing.
+
+- **A write** must land in what the sandbox makes writable: the workspace, the
+  session's temp dir (on Claude's own sandbox, its commands' `TMPDIR`), the
+  sandbox's caches, a git worktree's git dirs; never what it holds read-only
+  there (the repository's git structure, the project settings) or hides. A
+  write to `~/.bashrc`, `~/.gitconfig`, `~/.ssh/authorized_keys`,
+  `~/.claude/settings.json`, `~/.config/systemd/…`, `~/.local/bin/…` or
+  another repository is refused.
+- **A read** must not reach what the sandbox hides: the home outside
+  `sandbox.homeReadable` and the workspace, codeoid's config and data dirs,
+  the CLIs' logins and the credential stores above, container sockets,
+  `sandbox.hiddenPaths`. `Read ~/.ssh/id_ed25519` is refused; `~/.gitconfig`
+  (on the allowlist) is read.
+- **A search** (Glob, Grep, LS) must not start in or above a hidden path: the
+  tool would recurse into it, where a sandboxed `grep -r` sees nothing. A
+  Glob pattern that is absolute or climbs out with `..` is judged from where
+  it starts.
+
+Each path is resolved as the kernel resolves it (through every link, `..` the
+parent of what the path so far really is) and also with `..` collapsed, as a
+tool normalizing it reads it; either out of bounds counts, and a path that
+can't be resolved for certain (`/proc`'s per-process links, `..` past a
+missing directory, a relative path whose directory isn't known) is refused.
+What the backend itself hands the model to read outside stays readable, never
+writable: the CLI's saved output for this session
+(`~/.claude/projects/<project>/<session>/tool-results`), its skills' own files
+(the user tier's and the session's plugins'), opencode's truncated tool and
+shell output.
+
+Such a call is **refused in every mode, never asked**: the agent reads
+"Refused: outside what this session's sandbox allows: <path> (why)", the card
+is cancelled with that reason, an info line says so (event `sandbox.refused`)
+and the audit log records `session.sandbox_bounds_refuse tool=… access=…`. On
+Claude the PreToolUse hook routes such a call to the gate past any allow rule
+(the CLI allows a read in the workdir or an added dir by itself). Within the
+bounds nothing changes: autonomous mode runs the call unasked, guarded mode
+asks about a write as before. A session whose sandbox is off (the owner's
+choice) keeps the gate as it was: no such refusal. Backends whose file tools
+run inside the sandbox (Codex, pi, the Gemini CLI, Qwen; Claude under Docker)
+are held by the OS and need no gate rule.
+
+Known consequences: on Claude the CLI's own auto-memory dir and plan files
+(under `~/.claude`) can't be written by its file tools while sandboxed, and an
+opencode tool can't use opencode's own scratch dir (in its data dir); both
+are outside what the sandbox lets commands write. A search doesn't follow
+links below its root (ripgrep's default), so a link in the workspace to a
+hidden dir shows only its name to a search; a Read through it is judged where
+it leads.
 
 ## Running one command outside the sandbox
 
