@@ -5,6 +5,7 @@
  * providers are fakes with a chosen probe (sandbox-bwrap-real.test.ts runs
  * the real one); the backend is the mock provider under Claude's id.
  */
+import { getConfigDir } from "../config.js";
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
@@ -986,7 +987,8 @@ describe("round 8 of the #448 audit: host-side file tools are held to the sandbo
       }
       expectRefused(await gateCall("Bash", { command }, { mode: "autonomous", sandbox: { provider: "off" } }), "credential_dir");
     }
-    const named = await gateCall("Bash", { command: `cat ${join(homedir(), ".codeoid", "config.json")}` }, { mode: "autonomous" });
+    // codeoid's own config dir (XDG_CONFIG_HOME on CI, not ~/.codeoid).
+    const named = await gateCall("Bash", { command: `cat ${join(getConfigDir(), "config.json")}` }, { mode: "autonomous" });
     expect([named.asked, named.behavior]).toEqual([false, "deny"]);
     expect(named.message).toContain("holds credentials");
   });
@@ -1057,7 +1059,7 @@ describe("round 9 of the #448 audit: the gate's host-side bounds hold in autonom
     expect((await gateCall("Grep", { pattern: "x", path: join(h(), "src", "other-repo") }, { mode: "guarded" })).behavior).toBe("allow");
     // A credential refusal origin/main has stays, in every mode.
     for (const mode of ["guarded", "interactive", "autonomous"] as const) {
-      const r = await gateCall("Read", { file_path: join(h(), ".codeoid", "config.json") }, { mode });
+      const r = await gateCall("Read", { file_path: join(getConfigDir(), "config.json") }, { mode });
       expect([mode, r.asked, r.behavior]).toEqual([mode, false, "deny"]);
       expect(r.message).toContain("holds credentials");
     }

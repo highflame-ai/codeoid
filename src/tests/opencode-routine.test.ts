@@ -181,8 +181,8 @@ describe("opencode turn costs as Session records them (#430)", () => {
     }
     await Bun.sleep(100);
     await s.interrupt(OWNER);
-    for (let i = 0; i < 500 && s.status !== "idle"; i++) await Bun.sleep(10);
-    await Bun.sleep(50);
+    // The stopped turn's record lands after the session goes idle, later on a busy machine: wait for it (bounded).
+    for (let i = 0; i < 1000 && (s.status !== "idle" || s.toInfo().usage?.costUnknownTurns === undefined); i++) await Bun.sleep(10);
     expect(s.toInfo().usage!.costUnknownTurns).toBe(1);
   });
 

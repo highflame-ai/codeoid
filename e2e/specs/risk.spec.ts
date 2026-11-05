@@ -28,13 +28,14 @@ test("guarded mode asks before a destructive command and says why", async ({ pag
 
 // #448: autonomous mode waits on no one; the OS sandbox is its boundary. (The
 // scripted backend runs no command it is given: these are gated, never executed.)
-test("autonomous mode runs a high-risk command unasked, and refuses a search of codeoid's credentials at once, saying why", async ({ page, codeoid }) => {
+test("autonomous mode runs a high-risk command unasked, and refuses a read of codeoid's credentials at once, saying why", async ({ page, codeoid }) => {
   codeoid.setScript([
     {
       match: "^tidy up",
       steps: [
         { tool: "Bash", input: { command: "git push --force origin main" }, output: "pushed" },
-        { tool: "Bash", input: { command: `grep -r apiKey ${codeoid.configDir}/codeoid` } },
+        // A search of the dir runs in a sandboxed session (the sandbox hides it); a read of the file is refused in every mode.
+        { tool: "Bash", input: { command: `cat ${codeoid.configDir}/codeoid/config.json` } },
         { text: "Done." },
       ],
     },
@@ -45,7 +46,7 @@ test("autonomous mode runs a high-risk command unasked, and refuses a search of 
 
   await send(page, "tidy up");
   await expect(messages(page).filter({ hasText: "Done." })).toHaveCount(1);
-  await expect(messages(page).filter({ hasText: "Refused Bash in autonomous mode" }).first()).toBeVisible();
+  await expect(messages(page).filter({ hasText: "holds credentials" }).first()).toBeVisible();
   await expect(messages(page).filter({ hasText: "completed" })).toHaveCount(1);
   await expect(page.getByText("Approval needed")).toHaveCount(0);
   await waitIdle(page);
