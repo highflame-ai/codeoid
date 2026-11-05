@@ -38,4 +38,9 @@ export const DEFAULT_HOME_READABLE: readonly string[] = [
   "~/.config/git/config",
   "~/.config/git/ignore",
   "~/.config/git/attributes",
+  // Installed Claude plugins and user skills (read-only): a skill's script runs
+  // as a sandboxed command and reads its own files. Code the user installed, no
+  // credentials; the CLI's settings, credentials and hooks stay hidden.
+  "~/.claude/plugins",
+  "~/.claude/skills",
 ];
