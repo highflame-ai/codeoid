@@ -1063,7 +1063,7 @@ describe("round 9 of the #448 audit: the gate's host-side bounds hold in autonom
     }
   });
 
-  test("autonomous mode: the Claude CLI's own context files are its file tools' (memory and plans as markdown, task output, tasks, todos; the user tier's agents, commands, rules, CLAUDE.md, installed plugins' skills read); its settings, credentials, hooks and plugins' code are not", async () => {
+  test("autonomous mode: the Claude CLI's own context files are its file tools' (memory and plans as markdown, task output, tasks, todos; the user tier's agents, commands, rules, CLAUDE.md, installed plugins read); its settings, credentials and hooks are not, nor writes to plugins", async () => {
     const cfg = join(h(), ".claude");
     // Where Claude native keeps CLAUDE_CODE_TMPDIR: in the daemon's own dir, hidden from every sandbox.
     const cli = join(sandboxRoot(), "claude-test-cli");
@@ -1087,6 +1087,8 @@ describe("round 9 of the #448 audit: the gate's host-side bounds hold in autonom
       ["Read", { file_path: join(cfg, "output-styles", "o.md") }],
       ["Read", { file_path: join(cfg, "CLAUDE.md") }],
       ["Read", { file_path: join(cli, "claude-1000", "bundled-skills", "s", "ref.md") }],
+      // Installed plugins are readable, as inside the sandbox (sandbox.homeReadable): code, no credentials.
+      ["Read", { file_path: join(cfg, "plugins", "cache", "m", "p", "1", "hooks", "hooks.json") }],
     ];
     for (const [name, input] of allowed) {
       const r = await gateCall(name, input, { mode: "autonomous", hostFiles });
@@ -1099,7 +1101,8 @@ describe("round 9 of the #448 audit: the gate's host-side bounds hold in autonom
       ["Write", { file_path: join(cfg, "agents", "a.md"), content: "x" }, "write"],
       ["Write", { file_path: join(cfg, "CLAUDE.md"), content: "x" }, "write"],
       ["Write", { file_path: join(cfg, "hooks", "h.sh"), content: "x" }, "write"],
-      ["Read", { file_path: join(cfg, "plugins", "cache", "m", "p", "1", "hooks", "hooks.json") }, "read"],
+      // ...but never written: a plugin's hooks and scripts run as code outside any sandbox.
+      ["Write", { file_path: join(cfg, "plugins", "cache", "m", "p", "1", "hooks", "hooks.json"), content: "{}" }, "write"],
       ["Write", { file_path: join(cli, "claude-1000", "plugin-tool-staging", "x.js"), content: "x" }, "write"],
       ["Read", { file_path: join(cli, "cc-socks", "s") }, "read"],
       ["Write", { file_path: join(cfg, "projects", "-some-other-project", "memory", "MEMORY.md"), content: "x" }, "write"],
