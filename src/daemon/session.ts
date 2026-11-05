@@ -73,6 +73,7 @@ import type {
   McpReconnectResult,
 } from "../protocol/types.js";
 import { basename, dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
+import { homedir } from "node:os";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { lstat, readdir } from "node:fs/promises";
@@ -199,7 +200,7 @@ import { type SecretPathVerdict, secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir } from "./compress/spill.js";
 import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
-import { type HeldPath, heldWriteOf, heldWriteReason, writeTargets } from "./held-writes.js";
+import { type HeldPath, heldWriteOf, heldWriteReason, writeLandings, writeTargets } from "./held-writes.js";
 import { outsideEffects } from "./risk/effects.js";
 import { assessShellCommandSync, type ShellRisk, UNREADABLE_SHELL_CALL } from "./risk/shell-risk.js";
 import { loadShellParser, shellParserReady } from "./shell/parse.js";
@@ -826,6 +827,20 @@ export class SendStoppedError extends Error {
 
 /** Claude's file tools that write. */
 const CLAUDE_FILE_WRITE_TOOLS = new Set(["Write", "Edit", "MultiEdit", "NotebookEdit"]);
+
+/** `.claude/settings.json` or `settings.local.json` at the end of `p`, case-insensitively (a case-insensitive filesystem opens either spelling). */
+const CLAUDE_SETTINGS_FILE = /(^|[\\/])\.claude[\\/]settings(\.local)?\.json$/i;
+
+/**
+ * A write to `target` lands in a Claude settings file: as written, with `.`,
+ * `//` and `..` collapsed, and where the kernel resolves it
+ * (`writeLandings`: `~`, every link on the way, against the workdir).
+ */
+export function writesClaudeSettingsFile(target: string, workdir: string): boolean {
+  const abs = target === "~" || target.startsWith("~/") ? `${homedir()}${target.slice(1)}` : isAbsolute(target) ? target : join(workdir, target);
+  const forms = [target, resolvePath(abs), ...(writeLandings(target, workdir, { hardLinks: false }) ?? [])];
+  return forms.some((p) => CLAUDE_SETTINGS_FILE.test(p));
+}
 
 /**
  * Background task kinds that make no model calls while they run (#430): a
@@ -2104,7 +2119,8 @@ export class Session {
 
   /**
    * Is this a file-tool write to a Claude settings file (`.claude/settings.json`
-   * or `settings.local.json`, anywhere) while the session runs on a named
+   * or `settings.local.json`, anywhere, however spelled: judged where it
+   * lands, `writesClaudeSettingsFile`) while the session runs on a named
    * Claude account? Shell commands can't be judged this way (see
    * secret-paths.ts).
    */
@@ -2112,7 +2128,7 @@ export class Session {
     if (this.#provider.id !== "claude" || !CLAUDE_FILE_WRITE_TOOLS.has(toolName) || !input || typeof input !== "object") return false;
     const o = input as Record<string, unknown>;
     const target = typeof o.file_path === "string" ? o.file_path : typeof o.notebook_path === "string" ? o.notebook_path : null;
-    if (!target || !/(^|[\\/])\.claude[\\/]settings(\.local)?\.json$/i.test(target)) return false;
+    if (!target || !writesClaudeSettingsFile(target, this.workdir)) return false;
     // Under Claude's own OS sandbox (#448) a hook or an excluded command
     // written there would run outside it from the CLI's next start.
     if (this.#sandbox?.runtime?.plan.kind === "native") return true;

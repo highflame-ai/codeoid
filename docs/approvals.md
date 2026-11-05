@@ -97,7 +97,7 @@ Autonomous mode never waits on a person. The OS sandbox is its boundary: an auto
 - **It refuses at once, never asks** — the agent reads what was refused and that the owner can do it, or switch the session to guarded mode to be asked; the transcript gets an info line (`⛔ Refused <tool> in autonomous mode: …`, event `autonomous.refused`) and the audit log a `session.autonomous_refuse` with its kind. No budget is spent:
   - a request to run a command outside the OS sandbox, or to widen it (`unsandboxed`);
   - a file tool writing the repository's git structure or the project settings an agent CLI runs code from, which the sandbox holds read-only for commands while the tool runs outside it ([sandbox.md](sandbox.md); `held_write`);
-  - a write to a Claude settings file on a session on a named Claude account, or under Claude's own sandbox (`claude_settings`);
+  - a write to a Claude settings file (`.claude/settings.json`, `settings.local.json`, judged where it really lands: `./`, `//`, `..`, `~` and links followed) on a session on a named Claude account, or under Claude's own sandbox (`claude_settings`);
   - a search or command reaching a directory that holds credentials, `~/.claude.json`, or a relative path whose directory the backend didn't report (`credential_dir`);
   - a call whose path a backend couldn't resolve for certain: opencode's `opencode_unresolved_path` (`unresolved_path`).
 - **Still refused, as in every mode:** a read of a credential file or of another process's environment.

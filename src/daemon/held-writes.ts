@@ -129,13 +129,13 @@ function within(child: string, parent: string): boolean {
 
 const underProc = (p: string) => p === "/proc" || p.startsWith("/proc/");
 
-/** `p` (absolute) where the kernel resolves it; null when that can't be told for certain. */
-function landing(p: string): string | null {
+/** `p` (absolute) where the kernel resolves it; null when that can't be told for certain (`hardLinks`: a file with several counts). */
+function landing(p: string, hardLinks = true): string | null {
   try {
     const at = physicalPath(p);
     if (underProc(at)) return null;
     // A file with another name may be anywhere: writing it here writes it there.
-    const st = lstatSync(at, { throwIfNoEntry: false });
+    const st = hardLinks ? lstatSync(at, { throwIfNoEntry: false }) : undefined;
     if (st && !st.isDirectory() && st.nlink > 1) return null;
     return at;
   } catch {
@@ -149,16 +149,17 @@ function landing(p: string): string | null {
  * through every link, and, when it has a `..`, also with that collapsed
  * first, as a tool normalizing its path reads it. Null when either can't be
  * told for certain: another user's `~name`, `/proc`, `..` past a missing
- * directory, a loop, a file with several hard links.
+ * directory, a loop, a file with several hard links (unless `hardLinks` is
+ * false: where its name leads is all that is asked).
  */
-export function writeLandings(raw: string, workdir: string): string[] | null {
+export function writeLandings(raw: string, workdir: string, opts: { hardLinks?: boolean } = {}): string[] | null {
   const home = raw === "~" || raw.startsWith("~/") ? `${homedir()}${raw.slice(1)}` : raw;
   if (home.startsWith("~")) return null;
   const abs = isAbsolute(home) ? home : `${resolve(workdir)}/${home}`;
   if (underProc(resolve(abs)) || underProc(abs)) return null;
   const out: string[] = [];
   for (const p of abs.split("/").includes("..") ? [abs, resolve(abs)] : [abs]) {
-    const at = landing(p);
+    const at = landing(p, opts.hardLinks !== false);
     if (at === null) return null;
     if (!out.includes(at)) out.push(at);
   }
