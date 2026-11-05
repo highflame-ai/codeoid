@@ -243,6 +243,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A refused tool call no longer shows as completed.**
+  When codeoid refused a call (a credential, a denial) and the backend then reported it finished, the card turned "completed" with the refusal as its output. It stays cancelled now, with the reason; a refused Edit or Write says so under its diff.
+- **A session shows "waiting approval" only once there is an approval to answer.**
+  It was set as the tool call started, a moment before the gate had the approval, so a client reacting to it (MCP control's `wait`) could find nothing pending.
+
 - **Stopping the daemon with memory on no longer crashes Bun.**
   Shutdown terminated the embedding model's worker thread, and doing that while onnxruntime held it (loading the model, running a batch, or with its native finalizers still pending) made Bun panic (`NAPI FATAL ERROR`, the daemon dying with SIGILL) before memory's store was closed and the data-dir lock released.
   The worker now stops itself: it finishes what it is running, lets the native finalizers run, and exits; it is never terminated from outside.

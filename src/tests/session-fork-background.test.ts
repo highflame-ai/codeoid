@@ -663,8 +663,11 @@ describe("a foreign agent can't act in the fork (audit 7, I4)", () => {
     expect(s.toInfo().status).toBe("idle"); // no approval waiting
     expect(s.canonicalHistory.flatMap((t) => (t.role === "assistant" ? (t.toolCalls ?? []) : [])).some((tc) => tc.id === "tu-foreign")).toBe(false);
 
-    // The fork's own background agent still shows (and asks) as usual.
-    provider.onSessionEvent!({ type: "background_event", event: toolStart("tu-own", "fork-own") });
+    // The fork's own background agent still shows (and asks) as usual: its
+    // backend asks the gate, which parks the call (waiting_approval is the gate's).
+    const own = toolStart("tu-own", "fork-own");
+    provider.onSessionEvent!({ type: "background_event", event: own });
+    void gate(own.toolId, own.approvalId, "Bash", own.input, undefined, "fork-own");
     await waitFor(() => s.toInfo().status === "waiting_approval");
   });
 });

@@ -8430,6 +8430,9 @@ export class Session {
     });
     const toolMsg = this.#toolCallMessages.get(msgId);
     if (toolMsg?.tool) {
+      // The live copy too: a backend reporting the call finished afterwards
+      // (tool_complete) must not turn a refused call into a completed one.
+      toolMsg.tool.state = resolvedState;
       const resolvedMsg: SessionMessage = { ...toolMsg, tool: { ...toolMsg.tool, state: resolvedState }, timestamp: new Date().toISOString() };
       this.#transcriptStore.append(this.id, resolvedMsg, this.#seq++).catch(() => {});
       this.#broadcastRaw({
@@ -9044,7 +9047,9 @@ export class Session {
         this.#persistAndBuffer(toolMsg);
         this.#broadcastRaw(toolMsg);
         this.#maybeInjectRepeatReminder(event.name, event.input, event.sdkAgentId);
-        if (!autoApprove && !budgetDenied && !refused) this.#setStatus("waiting_approval");
+        // waiting_approval is the gate's to set, when it parks the call
+        // (#makeCanUseToolFn): set here it showed before the approval
+        // existed, and a client reading the pending approvals saw none.
         break;
       }
 
@@ -9097,11 +9102,19 @@ export class Session {
         if (msgId) {
           const toolMsg = this.#toolCallMessages.get(msgId);
           if (toolMsg?.tool) {
-            const completedState = {
+            // A call codeoid refused (or one interrupted) stays as it was
+            // settled: the backend reporting it finished, with the refusal as
+            // its output, doesn't make it a completed call.
+            // Its reason from the backend's report when the settling gave none ("Denied by user").
+            const cancelled = toolMsg.tool.state.phase === "cancelled" ? (toolMsg.tool.state as { message?: string }) : null;
+            const settled = cancelled
+              ? { ...cancelled, ...(cancelled.message === undefined && typeof output === "string" && output !== "" ? { message: output } : {}) }
+              : null;
+            const completedState = (settled ?? {
               phase: "completed",
               success: event.success,
               output,
-            } as unknown as ToolState;
+            }) as unknown as ToolState;
             this.#scrollback.updateMessage(msgId, (m) => {
               const sm = m as SessionMessage;
               if (sm.tool) sm.tool.state = completedState;
