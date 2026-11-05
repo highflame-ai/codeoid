@@ -1981,7 +1981,6 @@ describe("opencode (real binary)", () => {
       const id = `it-risk-${Math.random().toString(36).slice(2)}`;
       store.createSession({ id, name: id, workdir, status: "idle", createdBy: auth.sub, createdAt: new Date().toISOString(), attachedClients: 0, accountId: "a", projectId: "p" });
       const p = provider();
-      scratch = p.hostFiles().writable?.[0] ?? "";
       const runTurn = p.runTurn.bind(p);
       p.runTurn = (o) => runTurn({ ...o, canUseTool: guarded(o.canUseTool) });
       const session = new Session({
