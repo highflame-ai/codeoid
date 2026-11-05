@@ -43,4 +43,8 @@ export const DEFAULT_HOME_READABLE: readonly string[] = [
   // credentials; the CLI's settings, credentials and hooks stay hidden.
   "~/.claude/plugins",
   "~/.claude/skills",
+  // Every Claude session's transcript and memory (read-only): an agent looking
+  // up what another session did. A secret once pasted into a session is in its
+  // transcript: remove this from sandbox.homeReadable to hide them.
+  "~/.claude/projects",
 ];

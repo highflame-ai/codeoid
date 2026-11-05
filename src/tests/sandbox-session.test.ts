@@ -967,7 +967,9 @@ describe("round 8 of the #448 audit: host-side file tools are held to the sandbo
     };
     expect((await run(read)).behavior).toBe("allow");
     expect((await run({ ...read, content: "x" }, "Write")).message).toStartWith("Refused: outside what this session's sandbox allows");
-    expect((await run({ file_path: join(homedir(), ".claude", "projects", "p", "other.jsonl") })).behavior).toBe("deny");
+    // Other sessions' transcripts are readable (sandbox.homeReadable); the rest of the home isn't.
+    expect((await run({ file_path: join(homedir(), ".claude", "projects", "p", "other.jsonl") })).behavior).toBe("allow");
+    expect((await run({ file_path: join(homedir(), "Documents", "notes.txt") })).behavior).toBe("deny");
   });
 
   test("not sandboxed (the owner's off): the gate is as before: guarded asks for a write outside, a read anywhere runs, autonomous runs a write outside", async () => {
