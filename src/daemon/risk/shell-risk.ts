@@ -85,13 +85,15 @@ export async function assessShellCommand(command: string, ctx: RiskContext): Pro
  */
 export function assessShellCommandSync(command: string, ctx: RiskContext): ShellRisk {
   try {
-    return judge(parseShellSync(command), { ...ctx, home: ctx.home ?? homedir() });
+    // `$HOME` is the home only on a line that can't change it: one naming HOME as a bare word (`HOME=`, `export HOME`, `unset HOME`, `read HOME`) may.
+    const homeFixed = !/(^|[^$\w{])HOME\b/.test(command);
+    return judge(parseShellSync(command), { ...ctx, home: ctx.home ?? homedir(), homeFixed });
   } catch (err) {
     return { level: "high", reasons: [`the command couldn't be analysed: ${err instanceof Error ? err.message : String(err)}`] };
   }
 }
 
-type Ctx = Required<RiskContext>;
+type Ctx = Required<RiskContext> & { /** `$HOME` can't have been changed by the line (see assessShellCommandSync). */ homeFixed?: boolean };
 
 class Verdict {
   level: RiskLevel = "low";
@@ -1242,6 +1244,8 @@ function safeProcLeaf(leaf: string): boolean {
  */
 function shapeComponents(w: ShellWord, cwd: string | null, ctx: Ctx): string[] | null {
   let shape = wordShape(w);
+  // `$HOME/…` on a line that can't change HOME is the home, as `~/…` is.
+  if (ctx.homeFixed && shape.startsWith(`${SHAPE_ANY}/`) && /^"?\$(?:HOME|\{HOME\})(?![\w}])"?\//.test(w.raw)) shape = ctx.home + shape.slice(SHAPE_ANY.length);
   if (shape === "~" || shape.startsWith("~/")) shape = ctx.home + shape.slice(1);
   else if (shape.startsWith("~")) return null;
   else if (!shape.startsWith("/") && !shape.startsWith(SHAPE_ANY)) shape = `${cwd ?? SHAPE_ANY}/${shape}`;
@@ -1276,7 +1280,12 @@ function procSecretWord(w: ShellWord, cwd: string | null, ctx: Ctx): string | nu
     if (name) return `${w.raw}, which could be /proc/<pid>/${name}`;
   }
   // Under a `proc` component (`/proc`, `/pr?c`, a cwd in /proc): only a fixed last component that is none of them is safe.
-  const at = comps.findIndex((c, i) => i < comps.length - 1 && !c.includes(SHAPE_ANY) && shapeRegex(c).test("proc"));
+  // /proc is a top-level directory: a component that only matches "proc" as a pattern (`*`, `pr?c`) is one at the
+  // root, or after what can lead anywhere (`$d`, `..`); a component that IS "proc" counts at any depth (a link to /).
+  const reachesRoot = (i: number) => i === 0 || comps.slice(0, i).some((c) => c.includes(SHAPE_ANY) || c === "..");
+  const at = comps.findIndex(
+    (c, i) => i < comps.length - 1 && !c.includes(SHAPE_ANY) && shapeRegex(c).test("proc") && (c === "proc" || reachesRoot(i)),
+  );
   if (at < 0) return null;
   // `/proc/<x>/root/…` is the process's `/`: what follows is judged from there.
   const root = comps.findIndex((c, i) => i > at && c === "root");

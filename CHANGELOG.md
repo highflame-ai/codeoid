@@ -243,6 +243,9 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A nested glob is no longer refused as a read of a process's environment.**
+  `cat src/*/*.ts`, or `grep x ~/.claude/projects/*/*.jsonl`, was refused in every mode with "/proc/<pid>/environ holds credentials": a bare `*` component could spell "proc", and was taken for /proc at any depth. A pattern counts as /proc only at the root or after what can lead anywhere (`$d`, `..`); `$HOME/…` is the home on a line that doesn't set HOME. Real reads of a process's environment are still refused.
+
 - **A refused tool call no longer shows as completed.**
   When codeoid refused a call (a credential, a denial) and the backend then reported it finished, the card turned "completed" with the refusal as its output. It stays cancelled now, with the reason; a refused Edit or Write says so under its diff.
 - **A session shows "waiting approval" only once there is an approval to answer.**
