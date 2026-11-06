@@ -75,7 +75,7 @@ function newManager(probe: SandboxProbe = { available: true }, sandbox?: Record<
   const sandboxRegistry = new SandboxRegistry("linux", HOST_HAS);
   sandboxRegistry.register(fake("bwrap", probe));
   sandboxRegistry.register(fake("docker", { available: false, reason: "the Docker daemon isn't reachable" }));
-  const config = { ...mkConfig(tmp), ...(sandbox ? { sandbox: { provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [], docker: { image: "x" }, ...sandbox } } : {}) } as CodeoidConfig;
+  const config = { ...mkConfig(tmp), ...(sandbox ? { sandbox: { provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [], worktreeRoots: [], docker: { image: "x" }, ...sandbox } } : {}) } as CodeoidConfig;
   const m = new SessionManager(store, transcript, undefined, undefined, undefined, { config, providers: registry, sandboxRegistry });
   managers.push(m);
   return m;
@@ -267,7 +267,7 @@ describe("round 1 of the #448 audit: wider than the daemon's sandbox is the owne
 
   it("a delegated token can't change the daemon's sandbox settings, and is audited", async () => {
     const m = newManager();
-    for (const key of ["sandbox.provider", "sandbox.bwrapPath", "sandbox.docker.image", "sandbox.homeReadable"]) {
+    for (const key of ["sandbox.provider", "sandbox.bwrapPath", "sandbox.docker.image", "sandbox.homeReadable", "sandbox.worktreeRoots"]) {
       const r = await m.handle({ type: "settings.set", id: "s", patches: [{ key, value: "off" }] } as never, DELEGATED, { ...CLIENT, auth: DELEGATED });
       expect(r).toMatchObject({ type: "response.error", code: "forbidden" });
       expect((r as { error: string }).error).toContain("sandbox");
@@ -293,7 +293,7 @@ describe("routines (#448 round 2)", () => {
     sandboxRegistry.register(fake("seatbelt-like", { available: true }));
     const config = {
       ...mkConfig(tmp),
-      sandbox: { provider: "auto", network: "allowlist", allowedHosts: ["a.example"], hiddenPaths: [], homeReadable: [], docker: { image: "x" } },
+      sandbox: { provider: "auto", network: "allowlist", allowedHosts: ["a.example"], hiddenPaths: [], homeReadable: [], worktreeRoots: [], docker: { image: "x" } },
       routines: { enabled: true, tickMs: 600_000, maxConcurrentRuns: 2, minIntervalSeconds: 60, apiFiresPerHour: 30, missedGraceSeconds: 120 },
     } as CodeoidConfig;
     const m = new SessionManager(store, transcript, undefined, undefined, undefined, { config, providers: registry, sandboxRegistry });

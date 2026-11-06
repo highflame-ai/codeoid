@@ -183,8 +183,8 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(listing).not.toContain("codeoid-login-");
   }, 120_000);
 
-  test("a worktree added while a command runs is read-only to it, under Claude's sandbox too (a plain repository's worktrees/ is held whole) (#448 round 3)", async () => {
-    const r2 = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-claude-late-")));
+  test("under Claude's sandbox too, a command adds a worktree in the sibling -worktrees location, commits there and removes it, while the user's worktrees stay held (#448 follow-up)", async () => {
+    const r2 = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-claude-wt-")));
     try {
       const home = join(r2, "home");
       const repo = join(home, "proj");
@@ -195,31 +195,28 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
       writeFileSync(join(repo, "a.txt"), "a\n");
       git(["add", "."], repo);
       git(["commit", "-qm", "init"], repo);
-      const lateDir = join(repo, ".git", "worktrees", "late");
+      // The user's own worktrees: one beside the repository, one in its -worktrees location.
+      expect(git(["worktree", "add", "-q", "-b", "user", join(r2, "userwt")], repo).exitCode).toBe(0);
+      expect(git(["worktree", "add", "-q", "-b", "userloc", join(home, "proj-worktrees", "userloc")], repo).exitCode).toBe(0);
+      const wts = join(repo, ".git", "worktrees");
       const command = [
-        `touch ${join(repo, "started")}`,
-        `i=0; while [ ! -e ${join(repo, "go")} ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done`,
-        `echo /elsewhere > ${join(lateDir, "commondir")} 2>/dev/null && echo REWROTE || echo LATE-READ-ONLY`,
-        `echo t > ${join(repo, "t.txt")} && git add t.txt && git -c user.name=t -c user.email=t@example.com commit -qm inside && echo COMMITTED`,
+        "git worktree add -q ../proj-worktrees/x -b feature/x && echo ADDED",
+        "cd ../proj-worktrees/x && echo x > x.txt && git add x.txt && git -c user.name=t -c user.email=t@example.com commit -qm in-worktree && echo COMMITTED",
+        `cd '${repo}' && git worktree remove ../proj-worktrees/x && echo REMOVED`,
+        `echo /elsewhere > ${join(wts, "userwt", "commondir")} 2>/dev/null && echo REWROTE || echo USER-HELD`,
+        `echo x > ${join(home, "proj-worktrees", "userloc", "x.txt")} 2>/dev/null && echo WROTE-USERLOC || echo USERLOC-HELD`,
+        `echo bad >> ${join(repo, ".git", "config")} 2>/dev/null && echo WROTE-CONFIG || echo CONFIG-HELD`,
       ].join("; ");
-      const file = join(r2, "cmd-late.txt");
+      const file = join(r2, "cmd-wt.txt");
       writeFileSync(file, command);
       const p = Bun.spawn([process.execPath, PROBE, r2, "off", file, "policy"], { stdout: "pipe", stderr: "pipe", timeout: 90_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
-      let exited = false;
-      void p.exited.then(() => {
-        exited = true;
-      });
-      for (let i = 0; i < 600 && !exited && !existsSync(join(repo, "started")); i++) await Bun.sleep(100);
-      expect(existsSync(join(repo, "started"))).toBe(true);
-      expect(git(["worktree", "add", "-q", "-b", "late", join(r2, "late")], repo).exitCode).toBe(0);
-      writeFileSync(join(repo, "go"), "");
       const out = await new Response(p.stdout).text();
       await p.exited;
       const r = JSON.parse(out.trim().split("\n").at(-1) ?? "{}") as { result: string; toolResult: string | null };
       expect(r.result).toBe("success");
-      expect(r.toolResult).toContain("LATE-READ-ONLY");
-      expect(r.toolResult).toContain("COMMITTED");
-      expect(readFileSync(join(lateDir, "commondir"), "utf8")).not.toContain("elsewhere");
+      for (const w of ["ADDED", "COMMITTED", "REMOVED", "USER-HELD", "USERLOC-HELD", "CONFIG-HELD"]) expect(r.toolResult).toContain(w);
+      expect(git(["log", "--oneline", "feature/x"], repo).stdout.toString()).toContain("in-worktree");
+      expect(readFileSync(join(wts, "userwt", "commondir"), "utf8")).not.toContain("elsewhere");
     } finally {
       rmSync(r2, { recursive: true, force: true });
     }

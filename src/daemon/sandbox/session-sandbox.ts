@@ -22,7 +22,8 @@ import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
-import { buildSandboxSpec, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, validAllowedHost } from "./policy.js";
+import { buildSandboxSpec, gitLayoutOf, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, validAllowedHost } from "./policy.js";
+import { worktreeAdminsOf } from "./worktrees.js";
 import type { SandboxRegistry } from "./registry.js";
 import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "./git-shim.js";
 import { launcherRoot, sandboxRoot } from "./root.js";
@@ -270,6 +271,7 @@ export class SessionSandbox {
   #homesDir: string | null = null;
   #claudeTemp: ClaudeTempDirs | null = null;
   #gitTempDir: string | null = null;
+  #worktreeBaseline: Set<string> | null = null;
 
   readonly #onWarning: ((text: string) => void) | undefined;
 
@@ -529,17 +531,34 @@ export class SessionSandbox {
   }
 
   #spec(network: NetworkPolicy, backendState: readonly string[], readable: readonly string[] = []): SandboxSpec {
+    // A monorepo's package: the repository's top (#448 round 9); the session's cwd stays the workdir.
+    const workspace = sandboxWorkspaceOf(this.#workdir);
     return buildSandboxSpec({
       backendReadable: readable,
       sessionId: this.#sessionId,
-      // A monorepo's package: the repository's top (#448 round 9); the session's cwd stays the workdir.
-      workspace: sandboxWorkspaceOf(this.#workdir),
+      workspace,
       workdir: this.#workdir,
       tempDir: this.#ensureTempDir(),
       network,
       ...(this.#config ? { config: this.#config } : {}),
       backendState,
+      worktreeBaseline: this.#worktreesAtStart(workspace),
     });
+  }
+
+  /**
+   * The repository's worktrees when this session's sandbox first looked: a
+   * worktree made since, checked out where its commands can write, is the
+   * session's own (worktrees.ts `isOwnWorktree`); every other is held.
+   * Kept for the session's life in this daemon (after a restart, what a
+   * session made before is held like anyone's).
+   */
+  #worktreesAtStart(workspace: string): ReadonlySet<string> {
+    if (!this.#worktreeBaseline) {
+      const common = gitLayoutOf(workspace)?.common;
+      this.#worktreeBaseline = new Set(common ? worktreeAdminsOf(common).map((a) => a.dir) : []);
+    }
+    return this.#worktreeBaseline;
   }
 
   /** The session's private temp dir (made on first use, 0700). */

@@ -390,6 +390,15 @@ past allow rules by the PreToolUse hook;
 `SandboxNetworkAccess` follows the session's network. `session.set_sandbox` is
 owner-only; widening is a confirm on the session (`widens`), never on an
 unattended turn. Forks and collaboration children inherit the setting.
+Worktrees (sandbox/worktrees.ts, docs/sandbox.md "Git worktrees inside the
+sandbox"): `<common>/worktrees/` is writable, bound at its own path, and the
+repository's worktree locations (`<repo>-worktrees/`, `.worktrees/`,
+`sandbox.worktreeRoots`; `GitPaths.locations`, `SandboxSpec.worktreeLocations`)
+are writable, so a command can `git worktree add/remove/prune`; every worktree
+that isn't the session's own is held whole (its admin dir, its `.git` file,
+its checkout when in a location). Own = appeared since `SessionSandbox`'s
+first look (`worktreeBaseline`), checked out in the workspace or a location,
+not codeoid's (`noteCodeoidWorktree` in git-worktree.ts).
 
 Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell/`
 parses a command line with tree-sitter-bash (WASM, vendored `tree-sitter-bash.wasm`;
@@ -439,6 +448,7 @@ CODEOID_ROUTINES_ENABLED=true       # scheduler + routine commands (docs/routine
 CODEOID_DEFAULT_EFFORT=             # thinking effort for new sessions: off|minimal|low|medium|high|xhigh|max (docs/thinking-effort.md)
 CODEOID_SANDBOX=auto                # OS sandbox for agents' commands: auto|bwrap|seatbelt|docker|off (docs/sandbox.md)
 CODEOID_SANDBOX_NETWORK=on          # on|off|allowlist (CODEOID_SANDBOX_ALLOWED_HOSTS); hiddenPaths: CODEOID_SANDBOX_HIDDEN_PATHS
+CODEOID_SANDBOX_WORKTREE_ROOTS=     # more places a sandboxed command may check a worktree out (csv)
 
 # Claude auth: uses your existing `claude login` session (Pro/Max subscription).
 # No ANTHROPIC_API_KEY needed if you're logged in via Claude Code CLI.

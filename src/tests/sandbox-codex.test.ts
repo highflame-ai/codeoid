@@ -79,6 +79,10 @@ describe("codex's own sandbox, per session", () => {
     // Under the host's /tmp the temp dir is codeoid's bubblewrap's /tmp (writable: excludeSlashTmp false), not at its own path:
     // as a root of its own it would fail every command in codex's sandbox (#448 round 2).
     expect(codexSandboxPolicy(fakeRuntime("native", "off", "/tmp/codeoid-sandbox-s/tmp-x").rt, "danger-full-access", "/w")).toMatchObject({ writableRoots: ["/w"], excludeSlashTmp: false });
+    // The repository's worktree locations too (#448 follow-up): where a command checks a new worktree out.
+    const wt = fakeRuntime("native", "off", "/var/tmp/s").rt;
+    (wt.spec as { worktreeLocations?: string[] }).worktreeLocations = ["/repo-worktrees"];
+    expect(codexSandboxPolicy(wt, "danger-full-access", "/w")).toMatchObject({ writableRoots: ["/w", "/var/tmp/s", "/repo-worktrees"] });
   });
 
   test("native: the repository's git dirs and the sandbox's cache dir are writable roots too (#448 round 2: codex's own sandbox makes every .git read-only)", () => {

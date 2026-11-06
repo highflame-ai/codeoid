@@ -129,6 +129,18 @@ describe("settings store", () => {
     expect(onDisk.session.turnStallTimeoutMs).toBe(200_000);
   });
 
+  it("the Sandbox tab's worktree locations (#448 follow-up): default, written, read back, and loaded", () => {
+    expect(getSnapshot().values["sandbox.worktreeRoots"]?.value ?? []).toEqual([]);
+    const r = applyPatches([{ key: "sandbox.worktreeRoots", value: ["~/wt", "../shared-worktrees"] }]);
+    expect(r).toMatchObject({ ok: true, errors: [] });
+    expect(getSnapshot().values["sandbox.worktreeRoots"]).toEqual({ value: ["~/wt", "../shared-worktrees"], source: "config" });
+    const onDisk = JSON.parse(readFileSync(configFilePaths().configPath, "utf8"));
+    expect(onDisk.sandbox.worktreeRoots).toEqual(["~/wt", "../shared-worktrees"]);
+    expect(loadConfig({ raw: onDisk, env: {}, quiet: true }).sandbox?.worktreeRoots).toEqual(["~/wt", "../shared-worktrees"]);
+    // The env var overrides.
+    expect(loadConfig({ raw: {}, env: { CODEOID_SANDBOX_WORKTREE_ROOTS: "/a,/b" }, quiet: true }).sandbox?.worktreeRoots).toEqual(["/a", "/b"]);
+  });
+
   it("rejects an out-of-range value and writes NOTHING", () => {
     applyPatches([{ key: "memory.enabled", value: false }]); // establish a file
     const before = readFileSync(configFilePaths().configPath, "utf8");

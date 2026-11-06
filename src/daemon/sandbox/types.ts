@@ -116,6 +116,13 @@ export interface SandboxSpec {
    * `~/.config/gh` out from under the rule that hides it.
    */
   pinned?: readonly string[];
+  /**
+   * The repository's worktree locations (in {@link writable} too): where a
+   * command checks a new worktree out (`<repo>-worktrees/`, `.worktrees/`,
+   * `sandbox.worktreeRoots`; policy/worktrees.ts). What a backend's own
+   * sandbox must also let it write (Codex's writable roots).
+   */
+  worktreeLocations?: readonly string[];
   /** Container runtime sockets (and their dirs): never reachable, they are root-equivalent. */
   containerSockets: readonly string[];
   network: NetworkPolicy;

@@ -20,11 +20,13 @@ import { dirname, join } from "node:path";
 import { runCheck } from "../daemon/evidence/runner.js";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
 import { hostToolBoundsFor, sandboxReads, sandboxWrites } from "../daemon/sandbox/host-file-tools.js";
+import { gitControlSnapshot } from "../daemon/sandbox/git-watch.js";
 import { buildSandboxSpec, programLocations, sandboxWorkspaceOf } from "../daemon/sandbox/policy.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
 import { sandboxRoot } from "../daemon/sandbox/root.js";
 import { openCheckSandbox } from "../daemon/sandbox/session-sandbox.js";
 import type { SandboxHandle, SandboxSpec } from "../daemon/sandbox/types.js";
+import { worktreeAdminsOf } from "../daemon/sandbox/worktrees.js";
 
 const provider = new BwrapSandboxProvider();
 const probe = await provider.probe();
@@ -743,31 +745,46 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: ro
     }
   });
 
-  test("G (#448 round 3): a worktree added after the sandbox opened is read-only from it (its commondir, its gitdir), and so is anything made in worktrees/", async () => {
+  test("G (#448 round 3, follow-up): a worktree added after the sandbox opened is held from the session's next sandbox, and a commondir rewritten meanwhile is named at the turn's end; worktrees/ itself can't be swapped", async () => {
     for (const worktree of [false, true]) {
       const f = fixture(worktree ? "g-wt" : "g", { worktree });
-      const h = await provider.open(f.spec);
       const late = join(f.dir, "late");
+      const lateDir = join(f.common, "worktrees", "late");
+      const h = await provider.open(f.spec);
+      const before = gitControlSnapshot(f.ws, f.home);
       try {
         // The user (or a fork) adds a worktree while the session's sandbox is open.
         git(["worktree", "add", "-q", "-b", "late", late], f.repo, f.home);
-        const lateDir = join(f.common, "worktrees", "late");
         const r = await sh(
           h,
           f.ws,
-          `cp -r '${f.common}' "$PWD/.evilcommon" && git --git-dir="$PWD/.evilcommon" config core.fsmonitor '${f.mark}' && echo BUILT; echo "$PWD/.evilcommon" > '${join(lateDir, "commondir")}' 2>/dev/null && echo REWROTE || echo LATE-READ-ONLY; echo x > '${join(lateDir, "gitdir")}' 2>/dev/null && echo REWROTE-GITDIR || echo GITDIR-READ-ONLY; mkdir '${join(f.common, "worktrees", "planted")}' 2>/dev/null && echo MADE || echo WORKTREES-READ-ONLY`,
+          `cp -r '${f.common}' "$PWD/.evilcommon" && git --git-dir="$PWD/.evilcommon" config core.fsmonitor '${f.mark}' && echo BUILT; echo "$PWD/.evilcommon" > '${join(lateDir, "commondir")}' 2>/dev/null && echo REWROTE || echo LATE-READ-ONLY; mv '${join(f.common, "worktrees")}' '${join(f.common, "wt-old")}' 2>/dev/null && echo SWAPPED || echo WORKTREES-PINNED`,
           f.env,
         );
         expect(r.stdout).toContain("BUILT");
-        expect(r.stdout).toContain("LATE-READ-ONLY");
-        expect(r.stdout).toContain("GITDIR-READ-ONLY");
-        expect(r.stdout).toContain("WORKTREES-READ-ONLY");
-        // Still commits (the worktree's own git dir stays writable over the read-only worktrees/).
+        expect(r.stdout).toContain("WORKTREES-PINNED");
+        // A sandbox already running doesn't hold a worktree it didn't see (docs/sandbox.md, Limits): when it
+        // rewrote one, the session's end-of-turn look names it before the user runs git there.
+        if (r.stdout.includes("REWROTE")) {
+          expect([...gitControlSnapshot(f.ws, f.home).keys()].filter((k) => !before.has(k)).some((k) => k.endsWith("worktrees/late/commondir"))).toBe(true);
+          writeFileSync(join(lateDir, "commondir"), "../..\n");
+        }
+        // Still commits (the worktree's own git dir stays writable).
         writeFileSync(join(f.ws, "g.txt"), "g\n");
         const c = await sh(h, f.ws, "git add g.txt && git commit -qm g-inside && echo COMMITTED", f.env);
         expect(c.stdout).toContain("COMMITTED");
       } finally {
         await h.close();
+      }
+      // The session's next sandbox (the same baseline: taken before the late one was added) holds it.
+      const baseline = new Set([...worktreeAdminsOf(f.common).map((a) => a.dir)].filter((d) => d !== lateDir));
+      const next = await provider.open(buildSandboxSpec({ sessionId: "g2", workspace: f.ws, tempDir: join(f.dir, "tmp"), network: { mode: "off" }, hidden: { home: f.home, configDir: join(f.home, ".codeoid"), env: { HOME: f.home }, daemonTmp: "/tmp" }, worktreeBaseline: baseline }));
+      try {
+        const r = await sh(next, f.ws, `echo x > '${join(lateDir, "commondir")}' 2>/dev/null && echo REWROTE || echo LATE-READ-ONLY; echo x > '${join(lateDir, "gitdir")}' 2>/dev/null && echo REWROTE-GITDIR || echo GITDIR-READ-ONLY`, f.env);
+        expect(r.stdout).toContain("LATE-READ-ONLY");
+        expect(r.stdout).toContain("GITDIR-READ-ONLY");
+      } finally {
+        await next.close();
       }
       userGit(f, late);
       expect(existsSync(f.marker)).toBe(false);

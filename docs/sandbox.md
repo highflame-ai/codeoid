@@ -2,9 +2,11 @@
 
 Every shell command an agent runs, on every backend that can be sandboxed,
 runs inside an operating-system sandbox. The workspace and a private temp
-directory are writable; everything else is read-only; credential stores are
-not there at all; container runtime sockets can't be reached; the network is a
-per-session setting.
+directory are writable (and, so an agent can branch in a worktree of its own,
+the repository's [worktree locations](#git-worktrees-inside-the-sandbox));
+everything else is read-only; credential stores are not there at all;
+container runtime sockets can't be reached; the network is a per-session
+setting.
 
 The approval gate's risk levels (#431, [approvals.md](approvals.md)) read a
 command's text. They are guidance: three audit rounds showed that reading bash
@@ -69,8 +71,8 @@ With the default policy (workspace-write):
 |---|---|
 | **Your home: hidden whole** | the sandbox starts from an empty, read-only home. A credential that isn't on any list, one created after the session started (`aws configure`, `gh auth login`), or one a program replaces by writing a new file and renaming it over the old one, is simply not there. What is shown again, read-only: the **allowlist** `sandbox.homeReadable` (below), and what the backend itself needs (its program; its private home, below). The workspace, when it is in your home, is shown writable. |
 | **Home allowlist** (`sandbox.homeReadable`, read-only) | by default toolchains and tool settings that hold no secret: `~/.bun`, `~/.cargo/bin`, `~/.cargo/registry`, `~/.cargo/git`, `~/.rustup`, `~/.nvm`, `~/.npm`, `~/.local/bin`, `~/.local/lib` (pip `--user` packages), `~/.local/share/pnpm`, `~/.local/share/uv`, `~/.local/share/pipx`, `~/.local/share/mise`, `~/.local/share/claude/versions` (the Claude installer's binaries), `~/.pyenv`, `~/go/pkg`, `~/go/bin`, `~/.gitconfig`, `~/.config/git/config`, `~/.config/git/ignore`, `~/.config/git/attributes`, `~/.claude/plugins` and `~/.claude/skills` (installed plugins and user skills, so a skill's script run as a command can read its own files; the CLI's settings, credentials and hooks stay hidden), and `~/.claude/projects` (every Claude session's transcript and memory, read-only, so an agent can look up what another session did; a secret once pasted into a session is in its transcript, so remove it from the list to hide them). Not listed, so hidden: `~/.npmrc`, `~/.bunfig.toml`, `~/.yarnrc.yml`, `~/.pypirc`, `~/.cargo/credentials.toml`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.gradle`, `~/.m2` and everything else. A global npmrc inside an nvm install (`~/.nvm/versions/node/*/etc/npmrc`) and uv's credential store (`~/.local/share/uv/credentials`) are hidden again. A link inside a listed dir (`~/.local/bin/x`) works only where it leads into the list itself (a pipx or `uv tool` venv, the Claude installer's versions) or outside the home: what it leads to elsewhere in the home (a project of yours, with its `.env`) stays hidden, and the link dangles. List the target's dir in `sandbox.homeReadable` to show it. A link in the list (`~/.gitconfig` into a dotfiles repository) is shown at its own path and where it leads. A token written into `~/.gitconfig` itself (a URL carrying one, an `http.extraHeader`) would show: keep it in a credential helper. |
-| **Writable** | the session's working directory (its worktree), a private temp dir made for the session (`$TMPDIR`, and the sandbox's `/tmp` under bubblewrap and Docker), and what a commit in the workspace's **git repository** writes: its git dir, a linked worktree's own git dir and its repository's (objects, refs, logs, the index, `HEAD`, `packed-refs` and the lock files beside them), wherever they are, a repository under the host's `/tmp` included. Nothing else. |
-| **Read-only** | everything else on the machine. `rm -rf ~` fails with "Read-only file system". Inside the writable, **a repository's structure**: everything that decides which config, hooks or git dir git uses, since a hook, `core.hooksPath` or `core.fsmonitor` planted there (or a config git is pointed at) would run outside the sandbox at your next `git status`. That is, in the repository's git dir: `config`, `config.worktree`, `commondir`, `hooks/`, `info/`, `modules/` (a submodule's git dir carries hooks and config of its own), `remotes/`, `branches/` and `worktrees/` whole (every worktree's git dir, one added after the session started included; the workspace's own worktree git dir is writable over it); in a linked worktree's own git dir: `commondir`, `gitdir`, `config.worktree`; the worktree's `.git` file, and the `.git` file of every other worktree or submodule checked out inside the workspace. A **submodule checkout** as the workspace (its `.git` a file naming `<super>/.git/modules/<name>`, whose `core.worktree` names it back) is held the same way, its git dir being the repository's. Any other `.git` file (a `--separate-git-dir` checkout, which git's records don't name back) is held read-only, with what it names when that is inside the workspace: nothing commits from inside, and the session's sandbox limits say so. The git dirs themselves are bound at their own paths, so none can be renamed away and rebuilt (`mv .git .git-old` fails), the workspace's `.git` dir included. A plain repository at the top of the workspace gets an empty `HEAD/` dir beside its `.git`, held read-only (git doesn't see an empty dir): a `.git` made invalid (its `HEAD` garbled, `refs/` removed) would otherwise have git take the workspace's top for a bare repository planted there, with its own config. What of these isn't there yet is made first, so there is something to hold: empty `hooks/`, `info/`, `modules/`, `remotes/`, `branches/`, `worktrees/`, an empty `config.worktree` in every git dir of the repository, and a `commondir` in the repository's git dir holding `.` (git, libgit2 and gitoxide read it as that git dir itself; see Limits). An entry that would have to be held but is a link (a bind can't hold one) makes the git dir read-only whole: commits from inside then fail. And **the project settings agent CLIs run code from** (below). |
+| **Writable** | the session's working directory (its worktree), a private temp dir made for the session (`$TMPDIR`, and the sandbox's `/tmp` under bubblewrap and Docker), what a commit in the workspace's **git repository** writes: its git dir, a linked worktree's own git dir and its repository's (objects, refs, logs, the index, `HEAD`, `packed-refs` and the lock files beside them), wherever they are, a repository under the host's `/tmp` included; and, so a command can add a worktree, the repository's `worktrees/` (where git makes a new worktree's git dir) and its **worktree locations**: `<repo>-worktrees/`, `<repo>/.worktrees/` and `sandbox.worktreeRoots` ([below](#git-worktrees-inside-the-sandbox)). Nothing else. |
+| **Read-only** | everything else on the machine. `rm -rf ~` fails with "Read-only file system". Inside the writable, **a repository's structure**: everything that decides which config, hooks or git dir git uses, since a hook, `core.hooksPath` or `core.fsmonitor` planted there (or a config git is pointed at) would run outside the sandbox at your next `git status`. That is, in the repository's git dir: `config`, `config.worktree`, `commondir`, `hooks/`, `info/`, `modules/` (a submodule's git dir carries hooks and config of its own), `remotes/`, `branches/`; in `worktrees/` (itself writable, so a command can add a worktree, but bound at its own path: it can't be renamed away and rebuilt), **every worktree's git dir that isn't the session's own, whole** (its `commondir`, `gitdir`, `config.worktree`, HEAD and index: it can't be rewritten, renamed, removed or pruned), with its checkout's `.git` file wherever the session can write, and its whole checkout when that is in a worktree location ([below](#git-worktrees-inside-the-sandbox)); in a linked worktree's own git dir: `commondir`, `gitdir`, `config.worktree`; the worktree's `.git` file, and the `.git` file of every submodule checked out inside the workspace. A **submodule checkout** as the workspace (its `.git` a file naming `<super>/.git/modules/<name>`, whose `core.worktree` names it back) is held the same way, its git dir being the repository's. Any other `.git` file (a `--separate-git-dir` checkout, which git's records don't name back) is held read-only, with what it names when that is inside the workspace: nothing commits from inside, and the session's sandbox limits say so. The git dirs themselves are bound at their own paths, so none can be renamed away and rebuilt (`mv .git .git-old` fails), the workspace's `.git` dir included. A plain repository at the top of the workspace gets an empty `HEAD/` dir beside its `.git`, held read-only (git doesn't see an empty dir): a `.git` made invalid (its `HEAD` garbled, `refs/` removed) would otherwise have git take the workspace's top for a bare repository planted there, with its own config. What of these isn't there yet is made first, so there is something to hold: empty `hooks/`, `info/`, `modules/`, `remotes/`, `branches/`, `worktrees/`, an empty `config.worktree` in every git dir of the repository, and a `commondir` in the repository's git dir holding `.` (git, libgit2 and gitoxide read it as that git dir itself; see Limits). An entry that would have to be held but is a link (a bind can't hold one) makes the git dir read-only whole: commits from inside then fail. And **the project settings agent CLIs run code from** (below). |
 | **Project settings** (read-only) | `.claude/`, `.gemini/`, `.qwen/`, `.codex/`, `.pi/`, `.opencode/` in the workspace (and, for a session in a monorepo's package, in every dir from the package up to the repository's top: where the CLIs look), whole (made empty first where missing: git doesn't see an empty dir; not in a workspace that is your home or holds it, a temp root or `/`, where they would be the CLIs' own config dirs: there only those that exist are held), and `.mcp.json`, `opencode.json`, `opencode.jsonc` at its top, made first where missing (in the same places) holding an empty config (`{"mcpServers":{}}`, `{}`: what the CLIs read as none; your own `opencode` loads a project `opencode.json`'s MCP servers and plugins at its start) and, in a git repository, listed in its `.git/info/exclude` so `git status` and `git add -A` don't see them (an existing file is held as it is). A Claude hook, an MCP server, a pi or opencode plugin written there by one backend's command would run on the host in a later session of another, or in your own CLI. Changing them needs the sandbox lifted for that command: Claude's `dangerouslyDisableSandbox` and Codex's permission request are asked about in guarded and interactive mode and refused in autonomous mode (below); on other backends edit them yourself, or turn the session's sandbox off. A file tool that runs in the backend's own process, outside the sandbox (Claude's Write, Edit, MultiEdit and NotebookEdit, opencode's write, edit and patch) is held to the same rules at codeoid's gate in autonomous mode ([below](#file-tools-that-run-outside-the-sandbox)): writing what the sandbox holds read-only is refused there, and asked about in guarded and interactive mode. Writing the rest of **the repository's git dir** (its objects and refs, which a sandboxed commit writes, a linked worktree's, the `.git` file, another checkout's `.git` file in the workspace), or a file with more than one hard link, is asked about in guarded and interactive mode while the sandbox is on, the card saying why (audited `session.git_structure_write_ask` / `session.project_settings_write_ask`), and refused at once in autonomous mode (audited `session.autonomous_refuse`, kind `held_write`); on Claude the PreToolUse hook routes it to the gate past any allow rule. A backend whose file tools run inside the sandbox (Codex, pi, the Gemini CLI, Qwen; Claude under Docker) is held by the sandbox itself: nothing of this applies to it, a hard-linked file in `node_modules` included. |
 | **Hidden besides** (not readable at all) | outside the home, or in a workspace that holds it: codeoid's config dir (`~/.codeoid`: keys, accounts, endpoints, the local token) and every data dir it owns wherever it is configured (the database, transcripts and checkpoints, opencode's database and data dirs, memory's; their lock files); the agent CLIs' logins (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.qwen/oauth_creds.json`, `~/.gemini/oauth_creds.json` …, pi's `auth.json`) and what backends registered as credentials (opencode's key files); `~/.ssh`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.config/gh`, `~/.config/hub`, `~/.config/glab-cli`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.local/share/keyrings`, `~/.password-store`, `~/.config/op`, `~/.vault-token`, `~/.pypirc`, `~/.cargo/credentials(.toml)`, `~/.terraform.d/credentials.tfrc.json`, `~/.claude.json` (MCP tokens), `~/.local/share/opencode/auth.json` and `mcp-auth.json`, `~/.config/github-copilot`, `~/.pgpass`, `~/.config/rclone`, `~/.s3cfg`, `~/.boto`, `~/.pulumi/credentials.json`, `~/.config/doctl`, `~/.fly`, `~/.npmrc`, `~/.bunfig.toml`, `~/.yarnrc.yml`, `~/.gradle/gradle.properties`, `~/.m2/settings.xml`, `~/Library/Keychains`; the desktop session's runtime dir (`$XDG_RUNTIME_DIR`: keyring, D-Bus, agent sockets) and `$SSH_AUTH_SOCK`'s dir; the daemon's own temp dir when it isn't `/tmp`, and always the daemon's private dir in it (`codeoid-sandbox-*`, made at its start, 0700), where it makes every temp entry of its own: sign-in homes, a check's artifacts, a loop's index, pi's bridge, the sessions' temp dirs and launchers — so one made while a session runs is hidden from it too, on Claude's own sandbox (which keeps the host's `/tmp`) as well; plus `sandbox.hiddenPaths` (which also beats the allowlist). |
 | **The daemon's own git** | every git codeoid runs in a repository an agent can write (a fork's worktree made and removed, a destroyed session's work snapshotted, a worktree's setup, the branch and status the UI shows, loops) runs nothing that repository's config names, sandbox or not: no hook (the hooks dir's or one defined in config, `hook.<name>.command`), fsmonitor, alternates' ref command (`core.alternateRefsCommand`), external diff, signing or signature check (gpg's and ssh's programs, `gpg.ssh.defaultKeyCommand`), editor or pager, git-protocol proxy or auto gc, `core.sshCommand` is `ssh`, and every filter, diff or merge driver and credential helper defined in the repository's own config (local or worktree, includes too) is reset, your own global or system definition put back (git lfs installed globally keeps working; a repository redefining it doesn't). Reaching a remote (a base branch fetched for a fork, a partial clone's objects) is https or ssh only. Loops' repositories are stricter still: every driver off, no system config. Checkpoints run in codeoid's own shadow repository, whose config is codeoid's. |
@@ -124,7 +126,9 @@ UI's settings and `/settings`) is the default for new sessions:
 with `sandbox.allowedHosts` (`CODEOID_SANDBOX_ALLOWED_HOSTS`, `example.com`,
 `*.example.com`, `localhost`; anything else fails the config's load).
 `sandbox.hiddenPaths` (`CODEOID_SANDBOX_HIDDEN_PATHS`) adds paths to hide (`~`
-expands). `sandbox.homeReadable` (`CODEOID_SANDBOX_HOME_READABLE`, comma
+expands). `sandbox.worktreeRoots` (`CODEOID_SANDBOX_WORKTREE_ROOTS`, Settings >
+Sandbox > More worktree locations) adds places a command may check a worktree
+out ([below](#git-worktrees-inside-the-sandbox)). `sandbox.homeReadable` (`CODEOID_SANDBOX_HOME_READABLE`, comma
 separated) replaces the home allowlist: add what your tools need that holds no
 secret (`~/.volta`, `~/.sdkman/candidates`, `~/.config/starship.toml`), never a
 file with a token. `sandbox.bwrapPath` picks the bwrap binary.
@@ -584,6 +588,94 @@ either way rather than depend on that. Not refused: a sub-agent's worktree
 isolation (the `Agent` tool's `isolation: "worktree"`), whose sub-agent runs
 in the CLI's process with the session's settings.
 
+## Git worktrees inside the sandbox
+
+Agents branch in a worktree of their own, never in a checkout others share:
+`git worktree add <path> -b <branch>`, work and commit there, then
+`git worktree remove`. Inside the sandbox that works, in every mode
+(`src/daemon/sandbox/worktrees.ts`):
+
+- **Where**: a command may check a worktree out in the repository's **worktree
+  locations**, which are writable: the sibling `<repo>-worktrees/` (codeoid's
+  own convention for forks and loops: `<main checkout>-worktrees/<name>`), the
+  repository's `.worktrees/`, and each `sandbox.worktreeRoots` entry (`~`
+  expands; a relative one is the main checkout's: `../worktrees`). The
+  defaults are made empty where missing (a mount needs something to mount; git
+  doesn't see an empty dir), `.worktrees/` only when the workspace doesn't
+  already hold it; a submodule gets only the configured ones (its sibling
+  would be made inside its superproject). Never a location of `/`, the home or
+  a dir holding it, one holding the main checkout or the git dir, one inside
+  the git dir, one inside a hidden path, one another user owns, and never a
+  link or a path through one below the main checkout's parent (a command in
+  the main checkout could otherwise make `.worktrees` a link that hands a
+  later session's sandbox a writable dir anywhere); such an entry is left out.
+- **git's own records**: the repository's `worktrees/` is writable, so git can
+  make the new worktree's admin dir, and the new branch's refs are written as
+  any commit's. `worktrees/` is bound at its own path: it can't be renamed
+  away and rebuilt.
+- `git worktree add`, `list`, `remove` and `prune`, committing, rebasing and
+  removing in such a worktree, and in it in the session's next sandbox (a
+  backend restarted, the next query), all work.
+- **What stays the user's** (the reason the structure is read-only: the user's
+  own checkouts must not be redirectable): the repository's `config`,
+  `config.worktree`, `hooks/`, `info/`, `modules/`, and **every worktree that
+  isn't the session's own**: its admin dir in `worktrees/`, whole (its
+  `commondir`, `gitdir`, `config.worktree`: what decides where git looks; it
+  can't be renamed, removed or replaced by a planted one under its name,
+  `git worktree prune` leaves it — it says it failed to delete it — and
+  `git worktree remove` can't remove it), its checkout's `.git` file, and,
+  when the checkout is in a worktree location, the whole checkout (so
+  `git worktree remove --force` deletes nothing of it). A checkout's `.git`
+  file outside the worktree locations and the workspace isn't writable at all.
+- **The session's own worktrees** are those whose admin dir appeared after the
+  session's sandbox first looked at the repository, checked out where its
+  commands can write (the workspace, a worktree location), and not made by
+  codeoid itself (a fork's, a loop's: those are held like yours in every
+  other session's sandbox, whenever they were made). They are writable whole:
+  a worktree the agent creates is its own output, like the workspace (its
+  files, its `.git` file, its admin dir). Review it as you would the
+  workspace.
+- **The end-of-turn warning** ([above](#what-it-guarantees-and-what-it-doesnt))
+  treats a worktree as `git worktree add` makes one (its `commondir` naming
+  its own repository, `../..`, no worktree config) as nothing changed, so
+  adding one isn't news; one whose `commondir` names anything else, or that
+  carries a `config.worktree`, is named (its `commondir` and `gitdir`).
+- **Codeoid's own sessions and loops in a worktree it made** (`--worktree`, a
+  fork, a loop run) are unaffected: their workspace's own git dir is held as
+  before, and their siblings in `<repo>-worktrees/` are other sessions' (held).
+
+Limits (defence in depth, as the rest of git's structure):
+
+- A worktree **you add yourself while a session's sandbox runs** isn't held by
+  that sandbox (it didn't see it): its admin dir is in the writable
+  `worktrees/`, so a command running then could rewrite its `commondir`. The
+  session's next sandbox holds it (it is checked out outside the locations, or
+  codeoid made it), and the end-of-turn warning names a `commondir` changed
+  meanwhile. Add worktrees while no session in that repository is running a
+  turn, or look at the warning before running git in the new one. A worktree
+  someone else checks out **in a worktree location** while the session runs
+  counts as the session's own in its next sandbox (unless codeoid made it):
+  the locations are the agents'.
+- A checkout of yours **whose admin dir is already gone** (pruned while its
+  disk was unmounted) isn't known to the sandbox: a command could make an
+  admin dir under its name. git already treats such a checkout as broken
+  ("not a git repository"); repair it (`git worktree repair`) before a session
+  runs, or remove it.
+- After the daemon restarts, a session's earlier worktrees are held like
+  yours (the session's look at the repository starts again): remove them
+  yourself, or from a session that runs outside the sandbox.
+- `git worktree add -b <branch> <path> origin/main` makes the worktree but
+  can't record the upstream (`branch.<name>.merge` is in the repository's
+  config, held read-only): git says "could not write config file". Pass
+  `--no-track`, or set the upstream yourself.
+- Everything in a worktree location is writable to every sandboxed session of
+  that repository but the checkouts held above (worktrees the session didn't
+  make): don't keep anything else there.
+- On Claude's own sandbox the rules are fixed when its query starts, as for
+  the rest (a worktree added during the query by someone else isn't held there
+  either). On Seatbelt `worktrees/` and each location are kept from being
+  renamed by a `literal` write denial (not verified on a Mac: see below).
+
 ## Committed project settings
 
 **Starting a Claude session in a repository trusts its committed project
@@ -675,8 +767,10 @@ to the workspace. In autonomous mode it is information only (the audit log's
   home's own files can't do that (the home isn't shown).
 - **Git**: with a repository's structure read-only, `git config …` (writing
   the repository's config), installing a hook, `git submodule update --init`,
-  `git worktree add`/`remove`, `git sparse-checkout` and editing
-  `.git/info/exclude` fail inside a command; run them yourself. The Claude
+  `git sparse-checkout`, editing `.git/info/exclude`, and removing or changing
+  a worktree the session didn't make fail inside a command; run them
+  yourself. Adding, using and removing worktrees of its own in the worktree
+  locations works ([above](#git-worktrees-inside-the-sandbox)). The Claude
   CLI's sub-agent worktree isolation works: its git may write `worktrees/`
   and `.claude/worktrees` ([above](#a-backend-clis-own-git)); its
   `EnterWorktree` is refused ([above](#the-claude-clis-own-worktrees)).
@@ -690,15 +784,15 @@ to the workspace. In autonomous mode it is information only (the audit log's
   dir, the empty `HEAD/` at the top of the workspace) are what let bubblewrap
   and Docker hold these read-only (a mount needs something to mount on, and a
   git dir must stay writable for git's lock files); they stay after the
-  session (`git worktree prune` removes an empty `worktrees/`; it is made
+  session (`git worktree prune` can't remove `worktrees/`, which is bound
+  while a sandbox runs; outside, it removes an empty one and it is made
   again). A `.git` that is a symlink can't be held. A top-level `HEAD` that
   is already a file or a non-empty dir of the project isn't held (on a
-  case-insensitive disk, a `head` too). On Claude's own sandbox, whose
-  `denyWrite` wins over `allowWrite` wherever they overlap, a linked
-  worktree's `worktrees/` is held entry by entry around its own git dir, so a
-  worktree added while its query runs isn't held there (the end-of-session
-  warning, above, names its `commondir` if it changes); a plain repository's
-  `worktrees/` is held whole there too. Not held,
+  case-insensitive disk, a `head` too). `worktrees/` is writable (a command
+  may add a worktree), each worktree's git dir in it held but the session's
+  own, so a worktree someone else adds while a sandbox runs isn't held by
+  that sandbox ([above](#git-worktrees-inside-the-sandbox); the
+  end-of-session warning names its `commondir` if it changes). Not held,
   because they are the workspace's own content: a repository planted in a
   subdirectory of the workspace (a `.git` made in a directory that had none,
   an uninitialised submodule's path included) is used by your git there, and
@@ -722,8 +816,10 @@ to the workspace. In autonomous mode it is information only (the audit log's
   repository is one codeoid doesn't widen to: above the home, a `.git` file
   git's records don't name back); a symlinked `.git`
   can't be held; a top-level `HEAD` that is already the project's isn't
-  held; a worktree added while a Claude query runs isn't held by Claude's
-  own sandbox; a `.git` file git's records don't name back is held but
+  held; a worktree someone else adds while a sandbox runs (a Claude query
+  included) isn't held by it, nor a checkout of yours whose admin dir is
+  already gone, nor what a worktree location holds besides others'
+  worktrees; a `.git` file git's records don't name back is held but
   unverified. Your global `safe.bareRepository=explicit` closes the bare
   repository fallback entirely. None of these reach the git a backend CLI
   runs for itself, which is contained ([above](#a-backend-clis-own-git)):
@@ -840,6 +936,30 @@ works, and skip where it doesn't):
   and makes a worktree; with codeoid's PreToolUse refusal it makes none and
   the model is told why. Whether the CLI loads a worktree's committed hooks
   after entering it: see [The Claude CLI's own worktrees](#the-claude-clis-own-worktrees).
+- Worktrees (#448 follow-up), real bubblewrap (`sandbox-worktrees-real.test.ts`):
+  from inside, `git worktree add ../repo-worktrees/x -b feature/x`, a commit
+  and a rebase there, `git worktree list`, a second one in `.worktrees/`,
+  `git worktree remove` of both and `git worktree prune` work, and the branch
+  is there outside; a worktree made in one sandbox is committed in and removed
+  (`--force`) in the session's next. Each of these is refused, from a plain
+  repository and from a linked worktree in the sibling location, and the
+  user's next git (outside the sandbox) runs nothing planted: an existing
+  worktree's `commondir`, `gitdir` or `config.worktree` rewritten; its admin
+  dir renamed, removed, or something made in or beside it under its name;
+  `worktrees/` renamed away; `git worktree remove --force` of the user's
+  worktree in the sibling location (its files stay), its `.git` file
+  redirected or a file written in it; the `.git` file of the user's worktree
+  outside the locations redirected; `git worktree prune` of the user's
+  worktree whose checkout is gone; the repository's config, hooks and `info/`
+  written. A worktree someone else added after the session started is held in
+  its next sandbox (outside the locations, or one codeoid made in the sibling
+  location); a configured `sandbox.worktreeRoots` location is writable, `..`
+  and `~` aren't taken. `sandbox-bwrap-real.test.ts` G: a worktree added while
+  a sandbox runs is held by the next, and a `commondir` rewritten meanwhile is
+  named by the end-of-turn look. The real Claude CLI
+  (`sandbox-claude-real.test.ts`): under its own sandbox a command adds a
+  worktree in `<repo>-worktrees/`, commits there and removes it, while the
+  user's worktrees and the config stay held.
 
 **To verify on a real Mac** (Seatbelt; profile generation is unit-tested only):
 
@@ -862,6 +982,10 @@ works, and skip where it doesn't):
 7. Codex's app-server, pi, the Gemini CLI and Qwen launched under `sandbox-exec`
    (node writes caches under `~/Library`: add writable state if they fail).
 8. opencode's shell shim through a Seatbelt launcher.
+9. Worktrees: that a `literal` write denial on `worktrees/` and a worktree
+   location (pinned as writable git dirs are) refuses `mv` of the dir while
+   `git worktree add` can make a new admin dir and checkout in it; that an
+   existing worktree's admin dir (`subpath` deny) can't be renamed.
 
 **Docker** (no Docker daemon was reachable here): `CODEOID_TEST_DOCKER=1 bun test
 src/tests/sandbox-docker.test.ts` runs the container checks. Also to check: the
@@ -875,7 +999,9 @@ reaching the client from a launcher (opencode, Qwen).
   [sandbox-providers.md](sandbox-providers.md) describes it and how to add one.
 - `registry.ts` — `auto | off | <id>`, cached probes.
 - `policy.ts` — the hidden home and its allowlist (`home-readable.ts`), the
-  hidden-path list, the workspace's git repository, and the spec.
+  hidden-path list, the workspace's git repository, and the spec;
+  `worktrees.ts` — the worktree locations and which worktrees are the
+  session's own.
 - `backend-home.ts` — a process backend's private home.
 - `bwrap.ts`, `seatbelt.ts`, `docker.ts` — the providers.
 - `confinement.ts` — per (backend, provider), how it is put inside.

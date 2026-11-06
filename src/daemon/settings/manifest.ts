@@ -233,6 +233,11 @@ const sandbox: SettingsTab = {
           envVar: "CODEOID_SANDBOX_HIDDEN_PATHS",
           applies: "next-session",
         }),
+        cfg("sandbox.worktreeRoots", "More worktree locations", "Where a sandboxed command may check out a git worktree of its repository, on top of <repo>-worktrees/ and <repo>/.worktrees/: writable. ~ expands; a relative path is the repository's. Never the home, / or a dir holding the repository.", {
+          kind: "string[]",
+          envVar: "CODEOID_SANDBOX_WORKTREE_ROOTS",
+          applies: "next-session",
+        }),
       ],
     },
     {

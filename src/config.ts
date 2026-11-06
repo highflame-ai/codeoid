@@ -271,6 +271,12 @@ const SandboxSchema = z
     hiddenPaths: z.array(z.string().min(1).max(4096)).max(256).default([]),
     /** What of the hidden home stays readable, read-only (`~` expands): toolchains and tool settings with no secrets. */
     homeReadable: z.array(z.string().min(1).max(4096)).max(256).default([...DEFAULT_HOME_READABLE]),
+    /**
+     * More places a sandboxed command may check a worktree of its repository
+     * out, on top of `<repo>-worktrees/` and `<repo>/.worktrees/` (`~`
+     * expands; a relative one is the repository's main checkout's).
+     */
+    worktreeRoots: z.array(z.string().min(1).max(4096)).max(64).default([]),
     /** The bwrap binary (default: on PATH). */
     bwrapPath: z.string().refine(isAbsolute, "must be an absolute path").optional(),
     docker: z
@@ -280,7 +286,7 @@ const SandboxSchema = z
       })
       .default({ image: "node:22-bookworm-slim" }),
   })
-  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], docker: { image: "node:22-bookworm-slim" } });
+  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], docker: { image: "node:22-bookworm-slim" } });
 
 const CompressSchema = z
   .object({
@@ -1792,6 +1798,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_SANDBOX_HIDDEN_PATHS", path: "sandbox.hiddenPaths", kind: "csv" },
   { env: "CODEOID_SANDBOX_HOME_READABLE", path: "sandbox.homeReadable", kind: "csv" },
   { env: "CODEOID_SANDBOX_DOCKER_IMAGE", path: "sandbox.docker.image", kind: "string" },
+  { env: "CODEOID_SANDBOX_WORKTREE_ROOTS", path: "sandbox.worktreeRoots", kind: "csv" },
   { env: "CODEOID_ROUTINES_MAX_CONCURRENT", path: "routines.maxConcurrentRuns", kind: "int" },
   { env: "CODEOID_MCP_CONTROL_ACTIONS", path: "mcpControl.allowActions", kind: "boolean" },
   { env: "CODEOID_MAX_SESSIONS_PER_USER", path: "rateLimit.maxSessionsPerUser", kind: "int" },

@@ -3,7 +3,9 @@
  * command, outside any sandbox, that `git status` and a diff don't show
  * (#448): its config, hooks (the hooks dir's, and `core.hooksPath`'s when it
  * points into the repository: husky's `.husky/_`), attributes, and what
- * names its git dirs (`commondir`, a worktree's `gitdir`, the `.git` file).
+ * names its git dirs (`commondir`, a worktree's `gitdir`, the `.git` file;
+ * a worktree as `git worktree add` makes one, naming its own repository,
+ * isn't news: an agent may add one).
  *
  * The sandbox holds most of these read-only, as defence in depth; it doesn't
  * guarantee the workspace is safe to run (it is the agent's output, and is
@@ -68,6 +70,20 @@ function placeholder(p: string, name: string): boolean {
   }
 }
 
+/** A worktree's git dir as git makes it: `commondir` naming its repository (`../..`), no `config.worktree` but codeoid's empty one. */
+function plainWorktree(dir: string): boolean {
+  try {
+    if (readFileSync(join(dir, "commondir"), "utf8").trim() !== "../..") return false;
+  } catch {
+    return false;
+  }
+  try {
+    return readFileSync(join(dir, "config.worktree"), "utf8") === "";
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT";
+  }
+}
+
 function entries(dir: string): string[] {
   try {
     return readdirSync(dir).sort().slice(0, DIR_LIMIT);
@@ -124,7 +140,14 @@ export function gitControlSnapshot(workspace: string, home: string = process.env
     for (const n of ["config", "config.worktree", "commondir"]) watch(join(common, n));
     watch(join(common, "info", "attributes"));
     watchDir(join(common, "hooks"));
-    for (const w of entries(join(common, "worktrees"))) for (const n of ["commondir", "gitdir", "config.worktree"]) watch(join(common, "worktrees", w, n));
+    // A worktree as `git worktree add` makes one (its repository's `commondir`, no config of its own) names no other
+    // git dir: one a sandboxed command adds reads as nothing changed. One that names another repository, or carries
+    // a config of its own, is watched, with what names its checkout.
+    for (const w of entries(join(common, "worktrees"))) {
+      const dir = join(common, "worktrees", w);
+      if (plainWorktree(dir)) continue;
+      for (const n of ["commondir", "gitdir", "config.worktree"]) watch(join(dir, n));
+    }
     const hooksPath = hooksPathOf([join(common, "config"), join(common, "config.worktree"), ...(layout.own ? [join(layout.own, "config.worktree")] : [])]);
     if (hooksPath) {
       const dir = hooksPath.startsWith("~/") ? join(home, hooksPath.slice(2)) : resolve(top, hooksPath);

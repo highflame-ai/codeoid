@@ -76,7 +76,8 @@ describe("what of a repository git runs at your next command, and what changed (
     git(["worktree", "add", "-q", "-b", "g", join(root, "late")], r);
     const before = gitControlSnapshot(wt, root);
     writeFileSync(join(r, ".git", "worktrees", "late", "commondir"), "/elsewhere\n");
-    expect(gitControlChanges(before, gitControlSnapshot(wt, root))).toEqual([join(r, ".git", "worktrees", "late", "commondir")]);
+    // No longer as git made it: what names its repository and its checkout are both named.
+    expect(gitControlChanges(before, gitControlSnapshot(wt, root))).toEqual([join(r, ".git", "worktrees", "late", "commondir"), join(r, ".git", "worktrees", "late", "gitdir")]);
   });
 
   test("no repository: nothing to watch", () => {

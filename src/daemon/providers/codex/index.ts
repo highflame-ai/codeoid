@@ -240,8 +240,9 @@ export function codexSandboxPolicy(rt: SandboxRuntime | null, fallback: SandboxM
       type: "workspaceWrite",
       // The repository's git dirs too: codex's own sandbox makes every `.git` read-only, so nothing would commit.
       // What of them must stay read-only is held so by codeoid's bubblewrap around the app-server (gitWorkspacePaths).
-      // And the sandbox's cache dir, where the toolchains' caches are pointed (SandboxSpec.env).
-      writableRoots: [...new Set([workdir, ...tempRoots(rt.spec), ...(rt.spec.gitDirs ?? []), ...cacheRoots(rt.spec)])],
+      // And the sandbox's cache dir, where the toolchains' caches are pointed (SandboxSpec.env), and the repository's
+      // worktree locations, where a command checks a new worktree out (sandbox/worktrees.ts).
+      writableRoots: [...new Set([workdir, ...tempRoots(rt.spec), ...(rt.spec.gitDirs ?? []), ...cacheRoots(rt.spec), ...(rt.spec.worktreeLocations ?? [])])],
       networkAccess: rt.spec.network.mode === "on",
       excludeTmpdirEnvVar: false,
       excludeSlashTmp: false,
