@@ -917,9 +917,22 @@ function transcriptLine(msg: DaemonMessage, seq: number): string {
   const entry: TranscriptEntry = {
     seq,
     timestamp: "timestamp" in msg ? (msg as { timestamp: string }).timestamp : new Date().toISOString(),
-    message: capPersistedToolOutput(msg),
+    message: withoutBufferSeq(capPersistedToolOutput(msg)),
   };
   return `${JSON.stringify(entry)}\n`;
+}
+
+/**
+ * A message without the replay buffer's `seq` stamp: a cursor into one daemon
+ * run's scrollback, meaningless once it is read back after a restart (the
+ * replay frame's `maxSeq` is the client's cursor), and present or not
+ * depending on whether the session's scrollback was in memory when it was
+ * appended (lazy session loading).
+ */
+function withoutBufferSeq(msg: DaemonMessage): DaemonMessage {
+  if (msg.type !== "session.message" || (msg as { seq?: number }).seq === undefined) return msg;
+  const { seq: _seq, ...rest } = msg as SessionMessage;
+  return rest as DaemonMessage;
 }
 
 /** A transcript line's entry, or null for a blank, torn or malformed line. */
