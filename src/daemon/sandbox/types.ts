@@ -125,6 +125,14 @@ export interface SandboxSpec {
   worktreeLocations?: readonly string[];
   /** Container runtime sockets (and their dirs): never reachable, they are root-equivalent. */
   containerSockets: readonly string[];
+  /**
+   * Container runtime sockets the owner let commands reach
+   * (`sandbox.docker.socket` / a session's `dockerSocket`, off by default):
+   * each reachable at its own path, `DOCKER_HOST` naming the first
+   * ({@link env}). Root-equivalent, so never without the owner's choice;
+   * never the client's credentials (`~/.docker/config.json` stays hidden).
+   */
+  dockerSockets?: readonly string[];
   network: NetworkPolicy;
   /** Environment variables removed from what runs inside (an agent socket, a desktop bus). */
   unsetEnv: readonly string[];

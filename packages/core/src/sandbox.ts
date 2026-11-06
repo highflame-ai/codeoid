@@ -17,6 +17,9 @@ export interface SandboxBadge {
   title: string;
 }
 
+/** Why Docker access is a warning, wherever it is shown (a tooltip, a card). */
+export const DOCKER_ACCESS_WHY = "Docker access can reach the whole machine (a container can mount /)";
+
 /** The session header's badge. Null on a daemon without sandboxing. */
 export function sandboxBadge(info: SessionSandboxInfo | undefined): SandboxBadge | null {
   if (!info) return null;
@@ -24,6 +27,13 @@ export function sandboxBadge(info: SessionSandboxInfo | undefined): SandboxBadge
     case "on": {
       const net = info.networkRequested ? `network ${info.network} (asked: ${info.networkRequested})` : `network ${info.network}`;
       const limits = info.limits?.length ? `\n${info.limits.map((l) => `• ${l}`).join("\n")}` : "";
+      if (info.dockerSocket) {
+        return {
+          text: info.enforced ? "sandboxed, Docker access" : "sandboxed partly, Docker access",
+          tone: "warn",
+          title: `Sandboxed, with Docker access: ${DOCKER_ACCESS_WHY}. ${info.via ?? info.providerName ?? info.provider ?? "on"}, ${net}.${limits}`,
+        };
+      }
       return {
         text: info.enforced ? "sandboxed" : "sandboxed, partly",
         tone: info.enforced ? "on" : "warn",
@@ -50,7 +60,7 @@ export function sandboxSummary(info: SessionSandboxInfo | undefined): string | n
     case "on": {
       const net = info.networkRequested ? `network ${info.network} (asked ${info.networkRequested})` : `network ${info.network}`;
       const hosts = info.network === "allowlist" && info.allowedHosts?.length ? ` [${info.allowedHosts.join(", ")}]` : "";
-      return `sandbox: ${info.providerName ?? info.provider}, ${net}${hosts}${info.enforced ? "" : " — not everything asked is enforced"}`;
+      return `sandbox: ${info.providerName ?? info.provider}, ${net}${hosts}${info.dockerSocket ? ", Docker access (can reach the whole machine)" : ""}${info.enforced ? "" : " — not everything asked is enforced"}`;
     }
     case "off":
       return "sandbox: off";
@@ -73,9 +83,18 @@ export function modeSummary(s: Pick<SessionInfo, "mode" | "turnsRemaining" | "au
   return s.turnsRemaining === undefined ? "mode: autonomous" : `mode: autonomous, ${s.turnsRemaining} tool call${s.turnsRemaining === 1 ? "" : "s"} left`;
 }
 
-/** The approval card's sandbox line, or null when the daemon said nothing of it. */
-export function approvalSandboxLine(state: Pick<ToolWaitingConfirmationState, "sandboxed" | "sandboxNote">): string | null {
+/** The approval card's sandbox line, or null when the daemon said nothing of it. A sandbox with Docker access is a warning. */
+export function approvalSandboxLine(state: Pick<ToolWaitingConfirmationState, "sandboxed" | "sandboxNote" | "sandboxDocker">): string | null {
   if (state.sandboxed === undefined && !state.sandboxNote) return null;
+  if (state.sandboxDocker) {
+    const note = state.sandboxNote ?? "sandboxed, Docker access";
+    return `⚠️ ${note}${note.includes("Docker access") ? "" : " (the sandbox has Docker access)"}`;
+  }
   if (state.sandboxed) return `🛡 ${state.sandboxNote ?? "sandboxed"}`;
   return `⚠️ ${state.sandboxNote ?? "not sandboxed"}`;
+}
+
+/** Whether the approval card's sandbox line is a warning (not sandboxed, or a sandbox with Docker access). */
+export function approvalSandboxWarns(state: Pick<ToolWaitingConfirmationState, "sandboxed" | "sandboxDocker">): boolean {
+  return !state.sandboxed || state.sandboxDocker === true;
 }

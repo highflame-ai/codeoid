@@ -48,6 +48,8 @@ interface SandboxSpec {
   env?: Record<string, string>; // set inside: the toolchains' caches in the sandbox's cache dir
   pinned?: string[];          // can't be renamed or removed, contents still writable (a dir between the workspace and a hidden path)
   containerSockets: string[]; // never reachable
+  dockerSockets?: string[];   // the owner's opt-in (Docker access): reachable at their own paths, DOCKER_HOST (in env) the first;
+                              // a provider that can't show one must leave it out, never widen past it
   network: { mode: "on" | "off" | "allowlist"; allow?: string[] };
   unsetEnv: string[];         // removed inside (agent and desktop sockets)
 }

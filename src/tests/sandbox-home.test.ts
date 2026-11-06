@@ -406,6 +406,21 @@ describe("Claude's own sandbox, with the home model", () => {
     // The CLI's TMPDIR is the parent of its commands' (it adds claude-<uid>), its own files elsewhere.
     expect(claudeTempEnv(temp)).toEqual({ TMPDIR: temp.root, CLAUDE_CODE_TMPDIR: temp.cli });
   });
+
+  test("Docker access (#448 follow-up): the socket readable through the denied home, and unix sockets let through the CLI's seccomp on Linux (by path on macOS)", () => {
+    const sock = join(root, "rt", "docker.sock");
+    const spec = { sessionId: "d", workspace: join(root, "dw"), tempDir: join(root, "dt"), writable: [], hidden: [join(root, "rt")], reexposed: [], containerSockets: [], dockerSockets: [sock], network: { mode: "off" as const }, unsetEnv: [] };
+    const s = claudeSandboxSettings({ spec, config: sandboxConfigOf(undefined) }, { HOME: join(root, "h") });
+    expect(s.filesystem?.allowRead).toContain(sock);
+    // Connecting needs no write to it (checked on the real CLI): it can't be removed or replaced.
+    expect(s.filesystem?.allowWrite).not.toContain(sock);
+    expect(s.filesystem?.denyRead).toContain(join(root, "rt"));
+    if (process.platform === "linux") expect(s.network).toMatchObject({ allowAllUnixSockets: true, deniedDomains: ["*"] });
+    else expect(s.network).toMatchObject({ allowUnixSockets: [sock] });
+    const none = claudeSandboxSettings({ spec: { ...spec, dockerSockets: undefined }, config: sandboxConfigOf(undefined) }, { HOME: join(root, "h") });
+    expect(none.network?.allowAllUnixSockets).toBeUndefined();
+    expect(none.network?.allowUnixSockets).toBeUndefined();
+  });
 });
 
 describe("a backend's private home", () => {

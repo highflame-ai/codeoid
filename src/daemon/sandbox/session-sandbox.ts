@@ -22,7 +22,7 @@ import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
-import { buildSandboxSpec, gitLayoutOf, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, validAllowedHost } from "./policy.js";
+import { buildSandboxSpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, validAllowedHost } from "./policy.js";
 import { worktreeAdminsOf } from "./worktrees.js";
 import type { SandboxRegistry } from "./registry.js";
 import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "./git-shim.js";
@@ -127,14 +127,28 @@ export interface SandboxRuntime {
   gitShim(caller: string): string;
 }
 
+/** A sandbox setting with the config filled in: the provider choice, the network, and whether commands reach the container runtime. */
+export interface EffectiveSandbox {
+  choice: string;
+  network: NetworkPolicy;
+  /** The host's container runtime socket is reachable (`sandbox.docker.socket` / the session's `dockerSocket`): root-equivalent. */
+  dockerSocket: boolean;
+}
+
 /** The setting a session ends up with: its own fields over the config's. */
-export function effectiveSetting(config: SandboxConfig, setting: SessionSandboxSetting | undefined): { choice: string; network: NetworkPolicy } {
+export function effectiveSetting(config: SandboxConfig, setting: SessionSandboxSetting | undefined): EffectiveSandbox {
   const choice = setting?.provider ?? config.provider;
   const network = networkPolicyOf(config, {
     ...(setting?.network ? { mode: setting.network } : {}),
     ...(setting?.allowedHosts ? { allow: setting.allowedHosts } : {}),
   });
-  return { choice, network };
+  return { choice, network, dockerSocket: setting?.dockerSocket ?? config.docker.socket ?? false };
+}
+
+/** A setting in words, for a change's line and audit: "bwrap, network on, Docker access". */
+export function describeSandbox(e: EffectiveSandbox): string {
+  if (e.choice === SANDBOX_OFF) return "off";
+  return `${e.choice}, network ${e.network.mode}${e.network.mode === "allowlist" ? ` (${(e.network.allow ?? []).join(", ")})` : ""}${e.dockerSocket ? ", Docker access" : ""}`;
 }
 
 /** Why a setting is malformed (an unknown provider, a host that isn't one), or null. */
@@ -154,13 +168,18 @@ function networkWidth(mode: NetworkMode): number {
 
 /**
  * Whether moving from `before` to `after` lets commands do more: the sandbox
- * turned off, the network wider, an allowlist with a host it didn't have.
- * Switching provider counts as widening (a different boundary).
+ * turned off, the network wider, an allowlist with a host it didn't have,
+ * the container runtime's socket let in (root on the machine). Switching
+ * provider counts as widening (a different boundary).
  */
-export function widens(before: { choice: string; network: NetworkPolicy }, after: { choice: string; network: NetworkPolicy }): boolean {
+export function widens(
+  before: { choice: string; network: NetworkPolicy; dockerSocket?: boolean },
+  after: { choice: string; network: NetworkPolicy; dockerSocket?: boolean },
+): boolean {
   if (after.choice === SANDBOX_OFF && before.choice !== SANDBOX_OFF) return true;
   if (before.choice === SANDBOX_OFF) return false;
   if (after.choice !== before.choice) return true;
+  if (after.dockerSocket === true && before.dockerSocket !== true) return true;
   const b = networkWidth(before.network.mode);
   const a = networkWidth(after.network.mode);
   if (a !== b) return a > b;
@@ -195,7 +214,7 @@ export async function resolveSandbox(opts: {
   /** The session's working directory: `/` can't be a sandbox's workspace. */
   workspace?: string;
 }): Promise<{ info: SessionSandboxInfo; provider: SandboxProvider | null; plan: ConfinementPlan | null; network: NetworkPolicy }> {
-  const { choice, network } = effectiveSetting(opts.config, opts.setting);
+  const { choice, network, dockerSocket } = effectiveSetting(opts.config, opts.setting);
   const base = {
     choice,
     network: network.mode,
@@ -226,7 +245,14 @@ export async function resolveSandbox(opts: {
   // A monorepo's package: what its commands may write is the whole repository (#448 round 9).
   const top = opts.workspace !== undefined && c.plan.kind !== "no-shell" ? sandboxWorkspaceOf(opts.workspace) : null;
   const topNote = top && opts.workspace !== undefined && top !== resolve(opts.workspace) ? `the workspace is the repository's top (${top}), which the working directory is inside: all of it is readable and writable, its git structure and every project settings dir on the way held read-only` : null;
-  const limits = [...c.plan.limits, ...(net.note ? [net.note] : []), ...(gitNote ? [gitNote] : []), ...(topNote ? [topNote] : [])];
+  // The container runtime's socket, when the owner let it in: said, and said when there is none to reach.
+  const sockets = dockerSocket ? dockerSocketPaths(process.env.HOME ?? homedir()) : [];
+  const dockerNote = dockerSocket
+    ? sockets.length > 0
+      ? `Docker access: commands can reach the container runtime (${sockets.join(", ")}), which can reach the whole machine (a container can mount /)`
+      : "Docker access was asked for, but no container runtime socket was found here"
+    : null;
+  const limits = [...c.plan.limits, ...(net.note ? [net.note] : []), ...(gitNote ? [gitNote] : []), ...(topNote ? [topNote] : []), ...(dockerNote ? [dockerNote] : [])];
   const applied: NetworkPolicy = net.mode === "allowlist" ? network : { mode: net.mode };
   return {
     info: {
@@ -239,6 +265,7 @@ export async function resolveSandbox(opts: {
       confinement: c.plan.kind === "no-shell" ? undefined : c.plan.kind,
       via: c.plan.via,
       ...(limits.length > 0 ? { limits } : {}),
+      ...(dockerSocket ? { dockerSocket: true } : {}),
       enforced: !net.widened,
     },
     provider,
@@ -307,7 +334,7 @@ export class SessionSandbox {
   }
 
   /** What `setting` means with the config filled in. */
-  effective(setting: SessionSandboxSetting | undefined = this.#setting): { choice: string; network: NetworkPolicy } {
+  effective(setting: SessionSandboxSetting | undefined = this.#setting): EffectiveSandbox {
     return effectiveSetting(this.config, setting);
   }
 
@@ -380,9 +407,10 @@ export class SessionSandbox {
     const provider = r.provider;
     const plan = r.plan;
     const config = this.config;
+    const dockerSocket = r.info.dockerSocket === true;
     const open = (backendState: readonly string[] = [], o: OpenOptions = {}) => {
       if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
-      return this.#spec(o.backendNetwork ? { mode: "on" } : r.network, backendState, o.readable ?? []);
+      return this.#spec(o.backendNetwork ? { mode: "on" } : r.network, backendState, o.readable ?? [], dockerSocket);
     };
     // Built (and the temp dir made) when a backend first needs it.
     let spec: SandboxSpec | null = null;
@@ -530,7 +558,7 @@ export class SessionSandbox {
     return this.#handles.size;
   }
 
-  #spec(network: NetworkPolicy, backendState: readonly string[], readable: readonly string[] = []): SandboxSpec {
+  #spec(network: NetworkPolicy, backendState: readonly string[], readable: readonly string[] = [], dockerSocket = false): SandboxSpec {
     // A monorepo's package: the repository's top (#448 round 9); the session's cwd stays the workdir.
     const workspace = sandboxWorkspaceOf(this.#workdir);
     return buildSandboxSpec({
@@ -543,6 +571,7 @@ export class SessionSandbox {
       ...(this.#config ? { config: this.#config } : {}),
       backendState,
       worktreeBaseline: this.#worktreesAtStart(workspace),
+      dockerSocket,
     });
   }
 
@@ -664,7 +693,7 @@ export async function openCheckSandbox(opts: {
   label: string;
 }): Promise<CheckSandbox> {
   const cfg = sandboxConfigOf(opts.config);
-  const { choice, network } = effectiveSetting(cfg, opts.setting);
+  const { choice, network, dockerSocket } = effectiveSetting(cfg, opts.setting);
   if (choice === SANDBOX_OFF) return { kind: "off" };
   const resolved = await opts.registry.resolve(choice);
   if (resolved.kind === "off") return { kind: "off" };
@@ -688,6 +717,8 @@ export async function openCheckSandbox(opts: {
       tempDir,
       network: mode === "allowlist" ? network : { mode },
       ...(opts.config ? { config: opts.config } : {}),
+      // A check that starts containers (testcontainers) gets the socket when the owner let the run's sandbox have it.
+      dockerSocket,
     });
     handle = await provider.open(spec);
   } catch (err) {

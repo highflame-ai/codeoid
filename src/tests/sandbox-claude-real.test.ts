@@ -7,6 +7,7 @@
  * scratch dir, outside the host's /tmp; nothing runs outside a sandbox but
  * the one call the gate refuses, which therefore never runs.
  */
+import { createServer } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -182,6 +183,26 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     const listing = (r.toolResult ?? "").split("SIGNIN-UNREADABLE")[1]?.split("LS-DONE")[0] ?? "";
     expect(listing).not.toContain("codeoid-login-");
   }, 120_000);
+
+  test("Docker access: a planted socket in the hidden runtime dir is unreachable by default, and reachable with the owner's option (#448 follow-up)", async () => {
+    if (!Bun.which("python3")) return;
+    const runtime = join(root, "run-user");
+    mkdirSync(runtime, { recursive: true, mode: 0o700 });
+    const sock = join(runtime, "docker.sock");
+    const server = createServer((c) => c.end("PLANTED-RUNTIME\n"));
+    await new Promise<void>((r) => server.listen(sock, r));
+    try {
+      const cmd = `python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(100).decode().strip())' '${sock}' 2>&1 || true`;
+      const hidden = await probe("off", cmd, ["policy"], { CODEOID_PROBE_RUNTIME_DIR: runtime });
+      expect(hidden.result).toBe("success");
+      expect(hidden.toolResult).not.toContain("PLANTED-RUNTIME");
+      const shown = await probe("off", cmd, ["policy"], { CODEOID_PROBE_RUNTIME_DIR: runtime, CODEOID_PROBE_DOCKER_SOCKET: "1" });
+      expect(shown.result).toBe("success");
+      expect(shown.toolResult).toContain("PLANTED-RUNTIME");
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 300_000);
 
   test("under Claude's sandbox too, a command adds a worktree in the sibling -worktrees location, commits there and removes it, while the user's worktrees stay held (#448 follow-up)", async () => {
     const r2 = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-claude-wt-")));

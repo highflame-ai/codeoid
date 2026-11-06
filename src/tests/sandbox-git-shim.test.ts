@@ -183,6 +183,10 @@ describe("git shim: the script", () => {
     expect(s.privateTemp).toBe(true);
     // No worktree dirs: exactly the command spec's paths.
     expect(gitShimSpec(spec, { tempParent: "/g-tmp" }).readOnly).toEqual(spec.readOnly as string[]);
+    // git reaches no container runtime, whatever the session's commands may (#448 follow-up).
+    const docker = gitShimSpec({ ...spec, dockerSockets: ["/run/docker.sock"], env: { DOCKER_HOST: "unix:///run/docker.sock", GOCACHE: "/c" } }, { tempParent: "/g-tmp" });
+    expect(docker.dockerSockets).toBeUndefined();
+    expect(docker.env).toEqual({ GOCACHE: "/c" });
   });
 
   test("the CLI's worktree dirs: the repository's worktrees/ and the workspace's .claude/worktrees, real dirs only, never in a git dir held whole", () => {

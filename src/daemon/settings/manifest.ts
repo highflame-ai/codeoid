@@ -238,6 +238,12 @@ const sandbox: SettingsTab = {
           envVar: "CODEOID_SANDBOX_WORKTREE_ROOTS",
           applies: "next-session",
         }),
+        cfg("sandbox.docker.socket", "Docker access", "Let sandboxed commands reach the container runtime's socket (Docker, rootless Docker, Podman; Docker Desktop on macOS) — for tests that start containers (testcontainers). Docker access can reach the whole machine: a container can mount /. Sessions say \"sandboxed, Docker access\"; a session can turn it on for itself (asked of its owner).", {
+          kind: "boolean",
+          envVar: "CODEOID_SANDBOX_DOCKER_SOCKET",
+          default: false,
+          applies: "next-session",
+        }),
       ],
     },
     {

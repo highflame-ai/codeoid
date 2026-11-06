@@ -6,7 +6,7 @@
  *   /interrupt               — interrupt current turn
  *   /rotate                  — rotate context (refresh skills/settings)
  *   /mode <i|g|x>            — interactive | guarded | autonomous
- *   /sandbox <auto|off|id> [on|off|allow:host,host] — the session's OS sandbox (#448); off is asked of the owner
+ *   /sandbox <auto|off|id> [on|off|allow:host,host] [docker|nodocker] — the session's OS sandbox (#448); off and Docker access are asked of the owner
  *   /model <id|alias>        — switch model (opus / sonnet / haiku / full id)
  *   /account <name|default|--follow-default> — switch the session's Claude account
  *   /help                    — surface help modal (TODO P6)
@@ -94,7 +94,7 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
     case "rotate":
       return { kind: "rotate" };
     case "sandbox": {
-      const usage = "/sandbox <auto|off|bwrap|seatbelt|docker> [on|off|allow:host,host]";
+      const usage = "/sandbox <auto|off|bwrap|seatbelt|docker> [on|off|allow:host,host] [docker|nodocker]";
       if (rest.length === 0) throw new Error(usage);
       const sandbox: SessionSandboxSetting = {};
       for (const word of rest) {
@@ -106,6 +106,11 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
         } else if (w.startsWith("allow:")) {
           sandbox.network = "allowlist";
           sandbox.allowedHosts = word.slice("allow:".length).split(",").filter(Boolean);
+        } else if (w === "docker" && sandbox.provider !== undefined) {
+          // After a provider, `docker` is Docker access (the container runtime's socket), asked of the owner.
+          sandbox.dockerSocket = true;
+        } else if (w === "nodocker" || w === "no-docker") {
+          sandbox.dockerSocket = false;
         } else if (sandbox.provider === undefined) {
           sandbox.provider = w;
         } else {

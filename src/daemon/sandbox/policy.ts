@@ -23,7 +23,7 @@
  *   - network per policy.
  */
 
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CodeoidConfig } from "../../config.js";
@@ -66,6 +66,12 @@ export interface SandboxConfig {
     image: string;
     /** `--runtime` (e.g. `runsc` for gVisor). */
     runtime?: string;
+    /**
+     * Let sandboxed commands reach the host's container runtime socket
+     * (testcontainers, `docker run`): off by default. Root-equivalent: a
+     * container can mount `/`. A session's own `dockerSocket` overrides it.
+     */
+    socket: boolean;
   };
 }
 
@@ -77,7 +83,7 @@ export const DEFAULT_SANDBOX_CONFIG: SandboxConfig = {
   hiddenPaths: [],
   homeReadable: [...DEFAULT_HOME_READABLE],
   worktreeRoots: [],
-  docker: { image: "node:22-bookworm-slim" },
+  docker: { image: "node:22-bookworm-slim", socket: false },
 };
 
 export function sandboxConfigOf(config: Pick<CodeoidConfig, "sandbox"> | undefined): SandboxConfig {
@@ -171,6 +177,46 @@ export function containerSocketPaths(home: string, env: Record<string, string | 
   const dockerHost = env.DOCKER_HOST;
   if (dockerHost?.startsWith("unix://")) out.push(dockerHost.slice("unix://".length));
   return out;
+}
+
+/**
+ * The host's container runtime sockets that exist now, for a sandbox whose
+ * owner opted in (`sandbox.docker.socket`): `$DOCKER_HOST`'s when it is a
+ * unix socket, then Docker's, rootless Docker's, Podman's (rootless, then
+ * the system's); on macOS Docker Desktop's (`~/.docker/run/docker.sock`,
+ * `/var/run/docker.sock`), Colima's, OrbStack's, Rancher Desktop's. First
+ * the one a client should use (`DOCKER_HOST`). Each is root on the machine.
+ */
+export function dockerSocketPaths(
+  home: string,
+  env: Record<string, string | undefined> = process.env,
+  platform: NodeJS.Platform = process.platform,
+  isSocket: (p: string) => boolean = socketAt,
+): string[] {
+  const runtime = env.XDG_RUNTIME_DIR || (typeof process.getuid === "function" ? `/run/user/${process.getuid()}` : "");
+  const host = env.DOCKER_HOST?.startsWith("unix://") ? env.DOCKER_HOST.slice("unix://".length) : null;
+  const candidates =
+    platform === "darwin"
+      ? [join(home, ".docker/run/docker.sock"), "/var/run/docker.sock", join(home, ".colima/default/docker.sock"), join(home, ".orbstack/run/docker.sock"), join(home, ".rd/docker.sock")]
+      : ["/var/run/docker.sock", "/run/docker.sock", ...(runtime ? [join(runtime, "docker.sock"), join(runtime, "podman/podman.sock")] : []), "/run/podman/podman.sock"];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const p of [...(host && isAbsolute(host) ? [host] : []), ...candidates]) {
+    if (!isSocket(p)) continue;
+    const real = realOr(p);
+    if (seen.has(real)) continue;
+    seen.add(real);
+    out.push(p);
+  }
+  return out;
+}
+
+function socketAt(p: string): boolean {
+  try {
+    return statSync(p).isSocket();
+  } catch {
+    return false;
+  }
 }
 
 /** Environment variables that point into the desktop session or an agent: never handed inside. */
@@ -273,6 +319,11 @@ export interface SpecInputs {
   cache?: boolean;
   /** The repository's worktrees when the session's sandbox first looked (GitWorkspaceOptions.worktreeBaseline). */
   worktreeBaseline?: ReadonlySet<string>;
+  /**
+   * Let commands reach the host's container runtime sockets
+   * (`sandbox.docker.socket`, opt-in: root-equivalent; dockerSocketPaths).
+   */
+  dockerSocket?: boolean;
 }
 
 /** The home a spec hides: absolute, and not `/` (nothing is left to show then). */
@@ -911,6 +962,9 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
       // Inside the hidden home, only what is inside something shown needs hiding again.
       (!homeHidden || h === homeHidden || !within(h, homeHidden) || shown.some((x) => within(h, x))),
   );
+  // The container runtime's sockets, when the owner opted in: reachable at their own paths, `DOCKER_HOST` the first.
+  const sockets = inputs.dockerSocket ? dockerSocketPaths(home, env) : [];
+  const exposed = new Set(sockets.flatMap((s) => [s, realOr(s)]));
   const spec: SandboxSpec = {
     sessionId: inputs.sessionId,
     workspace,
@@ -920,12 +974,13 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     readOnly: [...git.readOnly, ...projectConfig],
     gitDirs: git.gitDirs,
     ...(locations.length > 0 ? { worktreeLocations: locations } : {}),
-    ...(cache ? { env: toolchainCacheEnv(cache, home, env) } : {}),
+    ...(cache || sockets.length > 0 ? { env: { ...(cache ? toolchainCacheEnv(cache, home, env) : {}), ...(sockets[0] ? { DOCKER_HOST: `unix://${sockets[0]}` } : {}) } } : {}),
     pinned: protectedAncestors(hidden, [workspace, tempDir, ...own, ...locations]),
     reexposed,
-    containerSockets: containerSocketPaths(home, env),
+    containerSockets: containerSocketPaths(home, env).filter((p) => !exposed.has(p) && !exposed.has(realOr(p))),
+    ...(sockets.length > 0 ? { dockerSockets: sockets } : {}),
     network: inputs.network,
-    unsetEnv: SANDBOX_UNSET_ENV,
+    unsetEnv: sockets.length > 0 ? SANDBOX_UNSET_ENV.filter((n) => n !== "DOCKER_HOST") : SANDBOX_UNSET_ENV,
   };
   return spec;
 }

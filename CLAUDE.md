@@ -214,8 +214,8 @@ codeoid interrupt <n>
 codeoid approve <n> [--deny] [--pick N | --id <approvalId>] [--yes]
 codeoid account ls|login <name>|add-key <name>|add-gateway|add-token|add-bedrock|default <name>|use <session> <name>|--follow-default|rm <name> [--backend <id>]  # accounts for every backend (docs/backend-accounts-design.md)
 codeoid destroy <n>
-codeoid new <n> <d> --sandbox auto|bwrap|seatbelt|docker|off [--network on|off|allowlist] [--allow-host h]  # the session's OS sandbox (#448, docs/sandbox.md)
-codeoid sandbox providers | set <session> <provider> [--network …]  # what runs here; change a session's (widening asks its owner)
+codeoid new <n> <d> --sandbox auto|bwrap|seatbelt|docker|off [--network on|off|allowlist] [--allow-host h] [--docker-socket]  # the session's OS sandbox (#448, docs/sandbox.md)
+codeoid sandbox providers | set <session> [provider] [--network …] [--[no-]docker-socket]  # what runs here; change a session's (widening asks its owner)
 codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
 codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
 codeoid mcp reconnect <session> <server>            # redial a backend MCP server that's down (#389)
@@ -398,7 +398,13 @@ are writable, so a command can `git worktree add/remove/prune`; every worktree
 that isn't the session's own is held whole (its admin dir, its `.git` file,
 its checkout when in a location). Own = appeared since `SessionSandbox`'s
 first look (`worktreeBaseline`), checked out in the workspace or a location,
-not codeoid's (`noteCodeoidWorktree` in git-worktree.ts).
+not codeoid's (`noteCodeoidWorktree` in git-worktree.ts). Docker access
+(`sandbox.docker.socket`, a session's `dockerSocket`, off by default):
+`dockerSocketPaths` → `SandboxSpec.dockerSockets` + `DOCKER_HOST`, a widening
+in `widens` (so create/fork/routine/loop/set_sandbox authority follows),
+autonomous owner-only; every card `sandboxDocker` ("sandboxed, Docker access"),
+the chip amber (`DOCKER_ACCESS_WHY`); Claude native needs `allowAllUnixSockets`
+on Linux (its seccomp blocks unix sockets otherwise).
 
 Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell/`
 parses a command line with tree-sitter-bash (WASM, vendored `tree-sitter-bash.wasm`;
@@ -448,6 +454,7 @@ CODEOID_ROUTINES_ENABLED=true       # scheduler + routine commands (docs/routine
 CODEOID_DEFAULT_EFFORT=             # thinking effort for new sessions: off|minimal|low|medium|high|xhigh|max (docs/thinking-effort.md)
 CODEOID_SANDBOX=auto                # OS sandbox for agents' commands: auto|bwrap|seatbelt|docker|off (docs/sandbox.md)
 CODEOID_SANDBOX_NETWORK=on          # on|off|allowlist (CODEOID_SANDBOX_ALLOWED_HOSTS); hiddenPaths: CODEOID_SANDBOX_HIDDEN_PATHS
+CODEOID_SANDBOX_DOCKER_SOCKET=false # let sandboxed commands reach the container runtime (root-equivalent; docs/sandbox.md)
 CODEOID_SANDBOX_WORKTREE_ROOTS=     # more places a sandboxed command may check a worktree out (csv)
 
 # Claude auth: uses your existing `claude login` session (Pro/Max subscription).

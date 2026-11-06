@@ -117,7 +117,10 @@ const spec = policy
       tempDir: join(root, "tmp"),
       network: network === "allowlist" ? { mode: network, allow: [allowHost] } : { mode: network },
       config: { sandbox: config } as never,
-      hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" },
+      // CODEOID_PROBE_RUNTIME_DIR: the desktop runtime dir (hidden), where a planted socket stands in for rootless
+      // Docker's; CODEOID_PROBE_DOCKER_SOCKET=1: the owner let commands reach it (spec.dockerSockets).
+      hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home, ...(process.env.CODEOID_PROBE_RUNTIME_DIR ? { XDG_RUNTIME_DIR: process.env.CODEOID_PROBE_RUNTIME_DIR } : {}) }, daemonTmp: "/tmp" },
+      dockerSocket: process.env.CODEOID_PROBE_DOCKER_SOCKET === "1",
     })
   : {
       sessionId: "probe",

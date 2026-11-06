@@ -8959,6 +8959,11 @@ mcpHub: this.#mcpHub,
         this.#store.audit(auth.sub, "session.sandbox_refused", session.id, "set_mode autonomous: sandbox off, not the owner's own token");
         return { type: "response.error", requestId: msg.id, error: "This session's sandbox is off: only its owner, with their own token, can make it autonomous", code: "forbidden" };
       }
+      // Docker access (root on the machine) is the owner's choice too.
+      if (session.sandboxInfo?.dockerSocket === true && (auth.delegationDepth > 0 || auth.sub !== session.createdBy)) {
+        this.#store.audit(auth.sub, "session.sandbox_refused", session.id, "set_mode autonomous: Docker access, not the owner's own token");
+        return { type: "response.error", requestId: msg.id, error: "This session's sandbox has Docker access: only its owner, with their own token, can make it autonomous", code: "forbidden" };
+      }
     }
     session.setMode(msg.mode, msg.maxTurns, auth);
     return { type: "response.ok", requestId: msg.id };
@@ -8977,11 +8982,11 @@ mcpHub: this.#mcpHub,
     const cfg = sandboxConfigOf(this.#config);
     if (!widens(effectiveSetting(cfg, undefined), effectiveSetting(cfg, setting))) return null;
     const refusal = !hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)
-      ? `Missing scope: session:approve (needed to ${what} with a sandbox off or wider than the daemon's)`
+      ? `Missing scope: session:approve (needed to ${what} with a sandbox off, wider than the daemon's, or with Docker access)`
       : auth.delegationDepth > 0
-        ? `A delegated token can't ${what} with a sandbox off or wider than the daemon's`
+        ? `A delegated token can't ${what} with a sandbox off, wider than the daemon's, or with Docker access`
         : owner !== undefined && owner !== auth.sub
-          ? `Only the session's owner can ${what} with its sandbox (off or wider than the daemon's)`
+          ? `Only the session's owner can ${what} with its sandbox (off, wider than the daemon's, or with Docker access)`
           : null;
     if (refusal) this.#store.audit(auth.sub, "session.sandbox_wider_refused", "", `${what}: ${refusal}`);
     return refusal;
@@ -9061,7 +9066,7 @@ mcpHub: this.#mcpHub,
       requestId: msg.id,
       data: {
         enabled: registry !== undefined,
-        default: { provider: config.provider, network: config.network, allowedHosts: config.allowedHosts },
+        default: { provider: config.provider, network: config.network, allowedHosts: config.allowedHosts, dockerSocket: config.docker.socket },
         auto: registry?.autoId() ?? null,
         providers,
       },

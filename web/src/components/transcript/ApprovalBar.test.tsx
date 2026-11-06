@@ -11,7 +11,7 @@ vi.mock("../../state/connection", () => ({
   newRequestId: () => "r",
 }));
 
-import ApprovalBar from "./ApprovalBar";
+import ApprovalBar, { SandboxLine } from "./ApprovalBar";
 import {
   ingestSessionList,
   focusSession,
@@ -148,3 +148,17 @@ describe("ApprovalBar buttons", () => {
     );
   });
 });
+
+describe("SandboxLine (#448)", () => {
+  it("a sandbox with Docker access is a warning on the card, saying why in its tooltip", () => {
+    const { getByText } = render(() => <SandboxLine sandboxed sandboxDocker sandboxNote="sandboxed, Docker access: bubblewrap, network on" />);
+    const line = getByText("⚠️ sandboxed, Docker access: bubblewrap, network on");
+    expect(line.className).toContain("text-warn");
+    expect(line.getAttribute("title")).toContain("Docker access can reach the whole machine");
+    cleanup();
+    const plain = render(() => <SandboxLine sandboxed sandboxNote="sandboxed: bubblewrap, network on" />).getByText("🛡 sandboxed: bubblewrap, network on");
+    expect(plain.className).toContain("text-success");
+    expect(plain.getAttribute("title")).toBeNull();
+  });
+});
+

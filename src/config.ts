@@ -283,10 +283,12 @@ const SandboxSchema = z
       .object({
         image: z.string().min(1).max(512).default("node:22-bookworm-slim"),
         runtime: z.string().min(1).max(64).optional(),
+        /** Let sandboxed commands reach the host's container runtime socket (root-equivalent): off by default. */
+        socket: z.boolean().default(false),
       })
-      .default({ image: "node:22-bookworm-slim" }),
+      .default({ image: "node:22-bookworm-slim", socket: false }),
   })
-  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], docker: { image: "node:22-bookworm-slim" } });
+  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], docker: { image: "node:22-bookworm-slim", socket: false } });
 
 const CompressSchema = z
   .object({
@@ -1798,6 +1800,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_SANDBOX_HIDDEN_PATHS", path: "sandbox.hiddenPaths", kind: "csv" },
   { env: "CODEOID_SANDBOX_HOME_READABLE", path: "sandbox.homeReadable", kind: "csv" },
   { env: "CODEOID_SANDBOX_DOCKER_IMAGE", path: "sandbox.docker.image", kind: "string" },
+  { env: "CODEOID_SANDBOX_DOCKER_SOCKET", path: "sandbox.docker.socket", kind: "boolean" },
   { env: "CODEOID_SANDBOX_WORKTREE_ROOTS", path: "sandbox.worktreeRoots", kind: "csv" },
   { env: "CODEOID_ROUTINES_MAX_CONCURRENT", path: "routines.maxConcurrentRuns", kind: "int" },
   { env: "CODEOID_MCP_CONTROL_ACTIONS", path: "mcpControl.allowActions", kind: "boolean" },

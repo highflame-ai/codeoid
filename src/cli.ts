@@ -1080,6 +1080,7 @@ program
   )
   .option("--network <mode>", "What a sandboxed command may reach: on | off | allowlist (with --allow-host). Default: sandbox.network.")
   .option("--allow-host <host>", "A host the allowlist lets through, repeatable (example.com, *.example.com).", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .option("--docker-socket", "Let the session's sandboxed commands reach the container runtime (testcontainers, docker run). Docker access can reach the whole machine; needs session:approve. Default: sandbox.docker.socket.")
   .option(
     "--pack <id>",
     "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents). With --collaborate, the collaboration ADOPTS the pack: role names bind strictly to the pack's declared roles.",
@@ -1117,6 +1118,7 @@ program
         sandbox?: string;
         network?: string;
         allowHost: string[];
+        dockerSocket?: boolean;
       },
     ) => {
       const config = loadConfig();
@@ -1194,8 +1196,8 @@ program
     },
   );
 
-/** A session's sandbox setting from `--sandbox` / `--network` / `--allow-host` (#448); undefined when none is given. */
-function sandboxSettingFromFlags(o: { sandbox?: string; network?: string; allowHost?: string[] }): SessionSandboxSetting | undefined {
+/** A session's sandbox setting from `--sandbox` / `--network` / `--allow-host` / `--[no-]docker-socket` (#448); undefined when none is given. */
+function sandboxSettingFromFlags(o: { sandbox?: string; network?: string; allowHost?: string[]; dockerSocket?: boolean }): SessionSandboxSetting | undefined {
   const out: SessionSandboxSetting = {};
   if (o.sandbox) out.provider = o.sandbox;
   if (o.network) {
@@ -1207,6 +1209,7 @@ function sandboxSettingFromFlags(o: { sandbox?: string; network?: string; allowH
     out.network = "allowlist";
     out.allowedHosts = o.allowHost;
   }
+  if (o.dockerSocket !== undefined) out.dockerSocket = o.dockerSocket;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -1226,10 +1229,12 @@ sandboxCmd
 
 sandboxCmd
   .command("set <session> [provider]")
-  .description("Change a session's sandbox: auto | bwrap | seatbelt | docker | off, and/or --network. Turning it off or widening it is asked of the owner on the session")
+  .description("Change a session's sandbox: auto | bwrap | seatbelt | docker | off, and/or --network, --docker-socket. Turning it off or widening it (Docker access included) is asked of the owner on the session")
   .option("--network <mode>", "on | off | allowlist")
   .option("--allow-host <host>", "a host the allowlist lets through, repeatable", (v: string, p: string[] = []) => [...p, v], [] as string[])
-  .action(async (session: string, provider: string | undefined, o: { network?: string; allowHost: string[] }) => {
+  .option("--docker-socket", "let its commands reach the container runtime (Docker access can reach the whole machine)")
+  .option("--no-docker-socket", "take Docker access away")
+  .action(async (session: string, provider: string | undefined, o: { network?: string; allowHost: string[]; dockerSocket?: boolean }) => {
     let setting: SessionSandboxSetting | undefined;
     try {
       setting = sandboxSettingFromFlags({ ...(provider ? { sandbox: provider } : {}), ...o });
@@ -1238,7 +1243,7 @@ sandboxCmd
       process.exit(1);
     }
     if (!setting) {
-      console.error("Give a provider (auto | bwrap | seatbelt | docker | off) or --network.");
+      console.error("Give a provider (auto | bwrap | seatbelt | docker | off), --network or --[no-]docker-socket.");
       process.exit(1);
     }
     const client = new TerminalClient(loadConfig());
@@ -1677,6 +1682,7 @@ function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
     .option("--sandbox <provider>", "OS sandbox for its runs: auto | bwrap | seatbelt | docker | off (default: sandbox.provider); a run whose sandbox can't run here doesn't start")
     .option("--network <mode>", "what a sandboxed command may reach: on | off | allowlist")
     .option("--allow-host <host>", "a host the allowlist lets through (repeatable)", collect, [])
+    .option("--docker-socket", "let its runs' commands reach the container runtime (Docker access can reach the whole machine; needs session:approve)")
     .option("--guarded", "every non-read tool waits for your approval")
     .option("--autonomous", "tools auto-approve within --tool-budget (default)")
     .option("--tool-budget <n>", "autonomous tool calls per run (default 50)")
@@ -1741,6 +1747,7 @@ loop
   .option("--sandbox <provider>", "The worker's OS sandbox: auto | bwrap | seatbelt | docker | off (default: sandbox.provider); the run is refused where it can't run")
   .option("--network <mode>", "What the worker's commands may reach: on | off | allowlist")
   .option("--allow-host <host>", "A host the allowlist lets through (repeatable)", collect, [])
+  .option("--docker-socket", "Let the worker's commands and the checks reach the container runtime (tests that start containers). Docker access can reach the whole machine")
   .option("--wait", "Follow the run until it ends")
   .action(
     (
@@ -1758,6 +1765,7 @@ loop
         sandbox?: string;
         network?: string;
         allowHost: string[];
+        dockerSocket?: boolean;
         wait?: boolean;
       },
     ) =>

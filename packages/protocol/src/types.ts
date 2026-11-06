@@ -380,6 +380,12 @@ export interface SessionSandboxSetting {
   network?: SandboxNetworkMode;
   /** Hosts allowed with `network: "allowlist"` (`example.com`, `*.example.com`). */
   allowedHosts?: string[];
+  /**
+   * Let commands reach the host's container runtime socket (testcontainers,
+   * `docker run`): off by default (`sandbox.docker.socket`). Root on the
+   * machine: turning it on is a widening, asked of the owner.
+   */
+  dockerSocket?: boolean;
 }
 
 export type SandboxNetworkMode = "on" | "off" | "allowlist";
@@ -415,6 +421,8 @@ export interface SessionSandboxInfo {
   via?: string;
   /** What isn't confined this way, in plain words. */
   limits?: string[];
+  /** Commands can reach the container runtime's socket (the owner's opt-in): it can reach the whole machine. */
+  dockerSocket?: boolean;
   /** Everything asked is enforced: what an autonomous session, a routine or a loop needs to start. */
   enforced: boolean;
 }
@@ -1070,6 +1078,8 @@ export interface ToolWaitingConfirmationState {
   sandboxed?: boolean;
   /** Why not, or what's asked: "not sandboxed: bubblewrap is not installed", "asks to run outside the sandbox". */
   sandboxNote?: string;
+  /** It runs inside a sandbox whose commands can reach the container runtime (Docker access): said as a warning. */
+  sandboxDocker?: boolean;
 }
 
 /** How risky a shell command is, and why (#431). */

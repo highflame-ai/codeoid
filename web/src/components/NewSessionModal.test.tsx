@@ -865,6 +865,23 @@ describe("NewSessionModal sandbox choice (#448)", () => {
     );
   });
 
+  it("Docker access (#448 follow-up): a box, warned about, sent as dockerSocket; not offered with the sandbox off", async () => {
+    authMock.mockReturnValue(authOk(["claude"]));
+    requestMock.mockImplementation(async (m: { type: string }) => (m.type === "sandbox.providers" ? providersReply : { id: "s-new", name: "n", workdir: "/w" }));
+    const { getByText, getByLabelText, queryByLabelText, getByPlaceholderText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.click(getByText("change"));
+    await waitFor(() => expect(getByLabelText("Docker access")).toBeTruthy());
+    fireEvent.click(getByLabelText("Docker access"));
+    expect(getByText(/Docker access can reach the whole machine/)).toBeTruthy();
+    fireEvent.change(getByLabelText("Sandbox"), { target: { value: "off" } });
+    expect(queryByLabelText("Docker access")).toBeNull();
+    fireEvent.change(getByLabelText("Sandbox"), { target: { value: "" } });
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "demo" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalledWith(expect.objectContaining({ type: "session.create", sandbox: { dockerSocket: true } })));
+  });
+
   it("off says what it means", async () => {
     authMock.mockReturnValue(authOk(["claude"]));
     requestMock.mockResolvedValue(providersReply);

@@ -5,8 +5,8 @@ runs inside an operating-system sandbox. The workspace and a private temp
 directory are writable (and, so an agent can branch in a worktree of its own,
 the repository's [worktree locations](#git-worktrees-inside-the-sandbox));
 everything else is read-only; credential stores are not there at all;
-container runtime sockets can't be reached; the network is a per-session
-setting.
+container runtime sockets can't be reached unless the owner turns on
+[Docker access](#docker-access); the network is a per-session setting.
 
 The approval gate's risk levels (#431, [approvals.md](approvals.md)) read a
 command's text. They are guidance: three audit rounds showed that reading bash
@@ -76,7 +76,7 @@ With the default policy (workspace-write):
 | **Project settings** (read-only) | `.claude/`, `.gemini/`, `.qwen/`, `.codex/`, `.pi/`, `.opencode/` in the workspace (and, for a session in a monorepo's package, in every dir from the package up to the repository's top: where the CLIs look), whole (made empty first where missing: git doesn't see an empty dir; not in a workspace that is your home or holds it, a temp root or `/`, where they would be the CLIs' own config dirs: there only those that exist are held), and `.mcp.json`, `opencode.json`, `opencode.jsonc` at its top, made first where missing (in the same places) holding an empty config (`{"mcpServers":{}}`, `{}`: what the CLIs read as none; your own `opencode` loads a project `opencode.json`'s MCP servers and plugins at its start) and, in a git repository, listed in its `.git/info/exclude` so `git status` and `git add -A` don't see them (an existing file is held as it is). A Claude hook, an MCP server, a pi or opencode plugin written there by one backend's command would run on the host in a later session of another, or in your own CLI. Changing them needs the sandbox lifted for that command: Claude's `dangerouslyDisableSandbox` and Codex's permission request are asked about in guarded and interactive mode and refused in autonomous mode (below); on other backends edit them yourself, or turn the session's sandbox off. A file tool that runs in the backend's own process, outside the sandbox (Claude's Write, Edit, MultiEdit and NotebookEdit, opencode's write, edit and patch) is held to the same rules at codeoid's gate in autonomous mode ([below](#file-tools-that-run-outside-the-sandbox)): writing what the sandbox holds read-only is refused there, and asked about in guarded and interactive mode. Writing the rest of **the repository's git dir** (its objects and refs, which a sandboxed commit writes, a linked worktree's, the `.git` file, another checkout's `.git` file in the workspace), or a file with more than one hard link, is asked about in guarded and interactive mode while the sandbox is on, the card saying why (audited `session.git_structure_write_ask` / `session.project_settings_write_ask`), and refused at once in autonomous mode (audited `session.autonomous_refuse`, kind `held_write`); on Claude the PreToolUse hook routes it to the gate past any allow rule. A backend whose file tools run inside the sandbox (Codex, pi, the Gemini CLI, Qwen; Claude under Docker) is held by the sandbox itself: nothing of this applies to it, a hard-linked file in `node_modules` included. |
 | **Hidden besides** (not readable at all) | outside the home, or in a workspace that holds it: codeoid's config dir (`~/.codeoid`: keys, accounts, endpoints, the local token) and every data dir it owns wherever it is configured (the database, transcripts and checkpoints, opencode's database and data dirs, memory's; their lock files); the agent CLIs' logins (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.qwen/oauth_creds.json`, `~/.gemini/oauth_creds.json` …, pi's `auth.json`) and what backends registered as credentials (opencode's key files); `~/.ssh`, `~/.aws`, `~/.azure`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.config/gh`, `~/.config/hub`, `~/.config/glab-cli`, `~/.netrc`, `~/.git-credentials`, `~/.config/git/credentials`, `~/.local/share/keyrings`, `~/.password-store`, `~/.config/op`, `~/.vault-token`, `~/.pypirc`, `~/.cargo/credentials(.toml)`, `~/.terraform.d/credentials.tfrc.json`, `~/.claude.json` (MCP tokens), `~/.local/share/opencode/auth.json` and `mcp-auth.json`, `~/.config/github-copilot`, `~/.pgpass`, `~/.config/rclone`, `~/.s3cfg`, `~/.boto`, `~/.pulumi/credentials.json`, `~/.config/doctl`, `~/.fly`, `~/.npmrc`, `~/.bunfig.toml`, `~/.yarnrc.yml`, `~/.gradle/gradle.properties`, `~/.m2/settings.xml`, `~/Library/Keychains`; the desktop session's runtime dir (`$XDG_RUNTIME_DIR`: keyring, D-Bus, agent sockets) and `$SSH_AUTH_SOCK`'s dir; the daemon's own temp dir when it isn't `/tmp`, and always the daemon's private dir in it (`codeoid-sandbox-*`, made at its start, 0700), where it makes every temp entry of its own: sign-in homes, a check's artifacts, a loop's index, pi's bridge, the sessions' temp dirs and launchers — so one made while a session runs is hidden from it too, on Claude's own sandbox (which keeps the host's `/tmp`) as well; plus `sandbox.hiddenPaths` (which also beats the allowlist). |
 | **The daemon's own git** | every git codeoid runs in a repository an agent can write (a fork's worktree made and removed, a destroyed session's work snapshotted, a worktree's setup, the branch and status the UI shows, loops) runs nothing that repository's config names, sandbox or not: no hook (the hooks dir's or one defined in config, `hook.<name>.command`), fsmonitor, alternates' ref command (`core.alternateRefsCommand`), external diff, signing or signature check (gpg's and ssh's programs, `gpg.ssh.defaultKeyCommand`), editor or pager, git-protocol proxy or auto gc, `core.sshCommand` is `ssh`, and every filter, diff or merge driver and credential helper defined in the repository's own config (local or worktree, includes too) is reset, your own global or system definition put back (git lfs installed globally keeps working; a repository redefining it doesn't). Reaching a remote (a base branch fetched for a fork, a partial clone's objects) is https or ssh only. Loops' repositories are stricter still: every driver off, no system config. Checkpoints run in codeoid's own shadow repository, whose config is codeoid's. |
-| **Never reachable** | container runtime sockets: `/run/docker.sock`, `/var/run/docker.sock`, containerd, podman, CRI-O, buildkit, k3s, the user's rootless sockets, Docker Desktop / Colima / Lima / Rancher / OrbStack, `$DOCKER_HOST`. A container socket is root on the machine. |
+| **Never reachable** | container runtime sockets: `/run/docker.sock`, `/var/run/docker.sock`, containerd, podman, CRI-O, buildkit, k3s, the user's rootless sockets, Docker Desktop / Colima / Lima / Rancher / OrbStack, `$DOCKER_HOST`. A container socket is root on the machine. The one exception is the owner's: [Docker access](#docker-access), off by default. |
 | **Toolchain caches** | the home is read-only, so the caches are pointed at the sandbox's own cache dir, `${XDG_CACHE_HOME:-~/.cache}/codeoid-sandbox` (one per user, writable inside, read by none of your own tools): `XDG_CACHE_HOME` (pip, uv, Go's build cache and what else follows XDG), `GOCACHE`, `GOMODCACHE`, `BUN_INSTALL_CACHE_DIR`, `npm_config_cache`, `UV_CACHE_DIR`, `PIP_CACHE_DIR`, `CARGO_HOME` (cargo's registry cache; your `~/.cargo/config.toml` is still read from above a workspace in your home, not from `CARGO_HOME`). Go modules you already downloaded are read from your own module cache first, as a file proxy (`GOPROXY=file://~/go/pkg/mod/cache/download,<yours>`), so `go build` works with the network off. `go build`/`go test`, `bun install`, `npm install`, `uv` and `pip` work inside. The sandboxed sessions share this dir: what one downloads or builds, another reuses (and could have tampered with: a build cache is trust among your sandboxed sessions). A cache is code to the toolchain that reads it (`CARGO_HOME`'s `config.toml` and `bin/`, a module in `GOMODCACHE`, an install in npx's cache), so **these variables are set only for what runs inside a sandbox**, never for anything outside one: on Claude's own sandbox they aren't in the CLI's environment (nor, so, its MCP servers', its hooks', or a command you let run outside the sandbox); the CLI sources a file of codeoid's (`CLAUDE_ENV_FILE`, in the CLI's own temp dir) into each command, which sets them only where the CLI marks the command as sandboxed (`SANDBOX_RUNTIME=1`). |
 | **Environment** | `SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GPG_AGENT_INFO`, `DBUS_SESSION_BUS_ADDRESS`, `DOCKER_HOST`, `CONTAINER_HOST`, `KUBECONFIG` are unset inside. On Claude, every credential-named variable the CLI runs with is denied to its commands. |
 | **Network** | `on` (default), `off`, or `allowlist` (hosts in `sandbox.allowedHosts`), per session and in config. |
@@ -128,7 +128,9 @@ with `sandbox.allowedHosts` (`CODEOID_SANDBOX_ALLOWED_HOSTS`, `example.com`,
 `sandbox.hiddenPaths` (`CODEOID_SANDBOX_HIDDEN_PATHS`) adds paths to hide (`~`
 expands). `sandbox.worktreeRoots` (`CODEOID_SANDBOX_WORKTREE_ROOTS`, Settings >
 Sandbox > More worktree locations) adds places a command may check a worktree
-out ([below](#git-worktrees-inside-the-sandbox)). `sandbox.homeReadable` (`CODEOID_SANDBOX_HOME_READABLE`, comma
+out ([below](#git-worktrees-inside-the-sandbox)). `sandbox.docker.socket`
+(`CODEOID_SANDBOX_DOCKER_SOCKET`, Settings > Sandbox > Docker access, default
+`false`) gives every new session [Docker access](#docker-access). `sandbox.homeReadable` (`CODEOID_SANDBOX_HOME_READABLE`, comma
 separated) replaces the home allowlist: add what your tools need that holds no
 secret (`~/.volta`, `~/.sdkman/candidates`, `~/.config/starship.toml`), never a
 file with a token. `sandbox.bwrapPath` picks the bwrap binary.
@@ -139,19 +141,22 @@ needs `settings:write` from an undelegated token, and is audited old → new
 
 Per session:
 
-- at creation: `codeoid new <name> <dir> --sandbox bwrap|seatbelt|docker|auto|off [--network on|off|allowlist] [--allow-host h …]`,
-  the web UI's new-session dialog ("Sandbox: the daemon's default. change"), or
-  `session.create`'s `sandbox: { provider?, network?, allowedHosts? }`;
-- later, by the session's owner: `codeoid sandbox set <session> <provider> [--network …]`,
-  `/sandbox <auto|off|id> [on|off|allow:host,…]`, or `session.set_sandbox`.
+- at creation: `codeoid new <name> <dir> --sandbox bwrap|seatbelt|docker|auto|off [--network on|off|allowlist] [--allow-host h …] [--docker-socket]`,
+  the web UI's new-session dialog ("Sandbox: the daemon's default. change",
+  with a "Docker access" box), or `session.create`'s
+  `sandbox: { provider?, network?, allowedHosts?, dockerSocket? }`;
+- later, by the session's owner: `codeoid sandbox set <session> [provider] [--network …] [--docker-socket | --no-docker-socket]`,
+  `/sandbox <auto|off|id> [on|off|allow:host,…] [docker|nodocker]` (`docker`
+  after a provider is Docker access; alone it is the provider), or
+  `session.set_sandbox`.
   A change is made only while the session is idle: no turn running, no
   approval or dialog waiting, no background work (a dev server, a subagent).
   Otherwise it is refused, saying why ("the session is busy", "has background
   work running") — what runs must match what the session reports, and a
   backend running in the old sandbox is restarted to take the new one, never
   in the middle of work. Narrowing (on, the network off) is applied without
-  asking. **Widening — turning it off, a wider network, another provider — is
-  a confirm shown on the session, answered only by its owner with their own
+  asking. **Widening — turning it off, a wider network, another provider,
+  Docker access — is a confirm shown on the session, answered only by its owner with their own
   token (another member's or a delegated token's answer is refused, audited
   `session.ui_response_refused`), in every mode, and audited**
   (`session.sandbox_widen_ask`, `…_denied`, `session.set_sandbox` naming who
@@ -165,16 +170,19 @@ Per session:
   starting a loop) whose sandbox is off or wider than the daemon's default —
   `off`, a wider network, another provider, hosts the default doesn't allow —
   needs `session:approve` and an undelegated token (audited
-  `session.sandbox_wider_refused` when refused). A fork or a compare of a
+  `session.sandbox_wider_refused` when refused). Docker access counts as
+  wider whenever the daemon's default doesn't give it. A fork or a compare of a
   session with such a sandbox is made only by its owner, undelegated (anyone
   in the tenant may fork one whose sandbox is the daemon's or narrower). A
-  session whose sandbox is off is switched to autonomous only by its owner's
-  own token. A routine whose runs' sandbox is off or wider than the daemon's
+  session whose sandbox is off, or has Docker access, is switched to
+  autonomous only by its owner's own token. A routine whose runs' sandbox is off or wider than the daemon's
   (the same rule) needs `session:approve` (routine changes are refused to
   delegated tokens). A provider named explicitly that
   can't run here is refused (choose another, or `off`);
-- routines (`codeoid routine add … --sandbox …`, the spec's `sandbox`) and loops
-  (`codeoid loop start … --sandbox …`, `loop.start`'s `sandbox`) take one too.
+- routines (`codeoid routine add … --sandbox … [--docker-socket]`, the spec's
+  `sandbox`) and loops (`codeoid loop start … --sandbox … [--docker-socket]`,
+  `loop.start`'s `sandbox`) take one too; a loop's acceptance checks get
+  Docker access when its sandbox has it.
 - A fork, and a collaboration's children, keep their parent's setting (a
   collaboration's lead is created by the same request, under the rule above).
 
@@ -676,6 +684,85 @@ Limits (defence in depth, as the rest of git's structure):
   either). On Seatbelt `worktrees/` and each location are kept from being
   renamed by a `literal` write denial (not verified on a Mac: see below).
 
+## Docker access
+
+Tests that start containers (testcontainers' MySQL or Postgres, `docker run`
+in a script) need the container runtime's socket, which the sandbox hides on
+purpose: **a container socket is root on the machine** (a command can start a
+container that mounts `/` and read or change anything, your credentials
+included). So it is an **opt-in, off by default**:
+
+- daemon-wide: `sandbox.docker.socket` (`CODEOID_SANDBOX_DOCKER_SOCKET=true`,
+  Settings > Sandbox > Docker access), which needs `settings:write` from an
+  undelegated token, as every `sandbox.*` setting;
+- per session: the setting's `dockerSocket: true` — `codeoid new … --docker-socket`,
+  the new-session dialog's "Docker access" box, `/sandbox <provider> … docker`,
+  `codeoid sandbox set <session> … --docker-socket` (`--no-docker-socket`,
+  `/sandbox … nodocker` take it away); routines and loops `--docker-socket`.
+
+Turning it on is a **widening**, under the same rules as turning the sandbox
+off or widening the network: on a session, a confirm only its owner answers
+with their own token, in every mode, audited (`session.sandbox_widen_ask` …
+`session.set_sandbox`, "→ auto, network on, Docker access"); at create, fork,
+compare, routine or loop start it needs `session:approve` and an undelegated
+token when the daemon's default doesn't give it; a delegated token can't ask
+for it. Turning it off is applied at once. A session with Docker access is
+switched to autonomous only by its owner's own token; autonomous mode,
+routines and loops then run on it (the owner chose it, as with `off`).
+
+The session says so plainly: its chip reads **"sandboxed, Docker access"**
+(amber; the tooltip: "Docker access can reach the whole machine (a container
+can mount /)"), `codeoid ls` "sandbox: bubblewrap, network on, Docker access
+(can reach the whole machine)", the sandbox's limits name the socket, and
+**every approval card** reads "⚠️ sandboxed, Docker access: …" (a file tool's
+card adds "(the sandbox has Docker access)").
+
+What a command gets:
+
+- **The host's runtime sockets that exist**, each at its own path: `$DOCKER_HOST`'s
+  when it is a unix socket, Docker's `/var/run/docker.sock`, rootless Docker's
+  `$XDG_RUNTIME_DIR/docker.sock`, Podman's (`$XDG_RUNTIME_DIR/podman/podman.sock`,
+  `/run/podman/podman.sock`); on macOS Docker Desktop's
+  `~/.docker/run/docker.sock` and `/var/run/docker.sock`, Colima's, OrbStack's,
+  Rancher Desktop's. Nothing else of the dirs holding them: the rest of
+  `$XDG_RUNTIME_DIR` (keyring, D-Bus, agent sockets) stays hidden, as do
+  containerd's and the other runtimes' sockets.
+- **`DOCKER_HOST`** naming the first of them (the docker CLI and testcontainers
+  read it). Never the client's credentials: `~/.docker` (`config.json`, its
+  registry logins and credential helpers) stays hidden, so pulling a private
+  image fails inside — pull it yourself first. A docker context of yours isn't
+  there either; `DOCKER_HOST` is.
+- The network is still the session's: reaching a container's published port
+  (`localhost:<port>`, how testcontainers connects) needs the network `on`
+  (the default); with it `off` a command can start containers but not reach
+  them over TCP.
+
+Per provider:
+
+- **bubblewrap**: each socket bound read-only at its own path (connecting
+  needs no write to the mount; it can't be removed or replaced), over the
+  hidden dir holding it; a pathname socket works across the sandbox's network
+  namespace, so with the network off too.
+- **Claude's own sandbox**: the socket allowed for reading (only) through the
+  denied home and runtime dir; on Linux its sandbox otherwise refuses to
+  create any unix socket (checked on the real CLI: `socket(AF_UNIX)` fails with
+  "Operation not permitted"), so Docker access turns on its
+  `allowAllUnixSockets` — the filesystem still decides which are reachable
+  (every other runtime socket, the desktop's runtime dir and agent sockets are
+  hidden, and its network namespace has none of the host's abstract sockets);
+  on macOS the socket is allowed by path (`allowUnixSockets`).
+- **Seatbelt**: the socket's file (read, and written as data: never removed or
+  renamed) and a connection to it allowed last, by its own path and where it
+  leads, the network off too (not verified on a Mac).
+- **Docker** (the provider): the runtime's socket mounted at
+  `/var/run/docker.sock` in the container (Docker Desktop's own name for it on
+  macOS), with its group added so the container's user can connect, and
+  `DOCKER_HOST` naming it. A container started from there is a sibling on the
+  host's runtime, not nested.
+- **Codex** under bubblewrap: the socket is shown in codeoid's bubblewrap
+  around the app-server; whether codex's own sandbox (nested in it) lets a
+  command connect to it isn't verified here.
+
 ## Committed project settings
 
 **Starting a Claude session in a repository trusts its committed project
@@ -960,6 +1047,13 @@ works, and skip where it doesn't):
   (`sandbox-claude-real.test.ts`): under its own sandbox a command adds a
   worktree in `<repo>-worktrees/`, commits there and removes it, while the
   user's worktrees and the config stay held.
+- Docker access (#448 follow-up), with a planted listening socket standing in
+  for rootless Docker's in a hidden `$XDG_RUNTIME_DIR` (no Docker daemon is
+  reachable here): under real bubblewrap it can't be connected to by default;
+  with the option it can (network off and on), `DOCKER_HOST` names it and the
+  rest of the runtime dir stays hidden. Under the real Claude CLI's sandbox
+  the same, and without `allowAllUnixSockets` its Linux sandbox refuses to
+  create a unix socket at all.
 
 **To verify on a real Mac** (Seatbelt; profile generation is unit-tested only):
 
@@ -986,12 +1080,18 @@ works, and skip where it doesn't):
    location (pinned as writable git dirs are) refuses `mv` of the dir while
    `git worktree add` can make a new admin dir and checkout in it; that an
    existing worktree's admin dir (`subpath` deny) can't be renamed.
+10. Docker access: with Docker Desktop, a sandboxed `docker ps` reaches
+   `~/.docker/run/docker.sock` (and through `/var/run/docker.sock`'s link),
+   the network off too; Claude's own Seatbelt sandbox with `allowUnixSockets`.
 
 **Docker** (no Docker daemon was reachable here): `CODEOID_TEST_DOCKER=1 bun test
 src/tests/sandbox-docker.test.ts` runs the container checks. Also to check: the
 Claude CLI in the default image (it needs glibc), codex's app-server in a
-container, opencode's per-line latency, and a rootless Docker's `DOCKER_HOST`
-reaching the client from a launcher (opencode, Qwen).
+container, opencode's per-line latency, a rootless Docker's `DOCKER_HOST`
+reaching the client from a launcher (opencode, Qwen), and Docker access from
+the Docker provider (the socket at `/var/run/docker.sock` with its group
+added, testcontainers starting a sibling container) and from a real Docker
+socket under bubblewrap (`docker ps`, testcontainers' Ryuk).
 
 ## How it is built
 
@@ -999,9 +1099,9 @@ reaching the client from a launcher (opencode, Qwen).
   [sandbox-providers.md](sandbox-providers.md) describes it and how to add one.
 - `registry.ts` — `auto | off | <id>`, cached probes.
 - `policy.ts` — the hidden home and its allowlist (`home-readable.ts`), the
-  hidden-path list, the workspace's git repository, and the spec;
-  `worktrees.ts` — the worktree locations and which worktrees are the
-  session's own.
+  hidden-path list, the workspace's git repository, Docker access's sockets
+  (`dockerSocketPaths`), and the spec; `worktrees.ts` — the worktree
+  locations and which worktrees are the session's own.
 - `backend-home.ts` — a process backend's private home.
 - `bwrap.ts`, `seatbelt.ts`, `docker.ts` — the providers.
 - `confinement.ts` — per (backend, provider), how it is put inside.

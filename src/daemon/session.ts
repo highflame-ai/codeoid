@@ -209,7 +209,7 @@ import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import { asksOutsideSandbox } from "./sandbox/confinement.js";
 import { type HostToolBreach, hostFileBreachNote, hostFileBreachReason, hostFileToolBreach, hostToolBoundsFor, isHostFileTool } from "./sandbox/host-file-tools.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
-import { resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { describeSandbox, resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
 import { protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
 import {
@@ -3177,8 +3177,7 @@ export class Session {
     if (setting.network && setting.network !== "allowlist" && setting.allowedHosts === undefined) delete next.allowedHosts;
     const before = sbx.effective();
     const after = sbx.effective(next);
-    const describe = (e: { choice: string; network: { mode: string; allow?: readonly string[] } }) =>
-      `${e.choice === "off" ? "off" : e.choice}, network ${e.network.mode}${e.network.mode === "allowlist" ? ` (${(e.network.allow ?? []).join(", ")})` : ""}`;
+    const describe = describeSandbox;
     const change = `${describe(before)} → ${describe(after)}`;
     const apply = async (answeredBy?: string): Promise<boolean> => {
       // A confirm answered later: the session may have got busy meanwhile.
@@ -3214,10 +3213,11 @@ export class Session {
     // What it would really be here: a provider that can't run is no sandbox at all.
     const resolvedAfter = await resolveSandbox({ registry: sbx.registry, config: sbx.config, setting: next, backendId: this.#provider.id }).catch(() => null);
     const unsandboxed = after.choice === "off" || (resolvedAfter !== null && resolvedAfter.info.state !== "on" && resolvedAfter.info.state !== "no-shell");
-    const title = unsandboxed ? `Turn the sandbox off for "${this.name}"?` : `Widen the sandbox for "${this.name}"?`;
+    const dockerAdded = !unsandboxed && after.dockerSocket && !before.dockerSocket;
+    const title = unsandboxed ? `Turn the sandbox off for "${this.name}"?` : dockerAdded ? `Give "${this.name}" Docker access?` : `Widen the sandbox for "${this.name}"?`;
     const message = unsandboxed
       ? `The agent's commands would run with your full rights${after.choice === "off" ? "" : ` (${resolvedAfter?.info.reason ?? "the sandbox can't run here"})`}: they could read your credentials and change any file you can.`
-      : `Commands would run with: ${describe(after)} (now: ${describe(before)}).`;
+      : `Commands would run with: ${describe(after)} (now: ${describe(before)}).${dockerAdded ? " Docker access can reach the whole machine: a command could start a container that mounts / and read or change anything, your credentials included." : ""}`;
     // Answered by the owner alone, undelegated: what bounds the owner's agent is the owner's call.
     let answeredBy: string | undefined;
     void this.requestUserInput({ method: "confirm", title, message }, {
@@ -3323,7 +3323,7 @@ export class Session {
   }
 
   /** What an approval card says of the sandbox (#448): whether the call runs inside, and why not. */
-  #cardSandbox(toolName: string, input: unknown, shellCwd?: string | null): { sandboxed?: boolean; sandboxNote?: string } {
+  #cardSandbox(toolName: string, input: unknown, shellCwd?: string | null): { sandboxed?: boolean; sandboxNote?: string; sandboxDocker?: boolean } {
     const info = this.#sandbox?.info;
     if (!info) return {};
     if (this.#unsandboxedRequest(toolName, input)) {
@@ -3334,10 +3334,12 @@ export class Session {
         const runner = this.#sandbox?.runtime?.plan;
         const shell = isShellTool(toolName) || isUnresolvedPathTool(toolName);
         const inside = shell || runner?.fileTools === true;
-        if (inside) return { sandboxed: true, sandboxNote: `sandboxed: ${info.providerName ?? info.provider}, network ${info.network}` };
+        // Commands can reach the container runtime (the owner's opt-in): every card says so, as a warning.
+        const docker = info.dockerSocket === true ? { sandboxDocker: true } : {};
+        if (inside) return { sandboxed: true, sandboxNote: `sandboxed${info.dockerSocket ? ", Docker access" : ""}: ${info.providerName ?? info.provider}, network ${info.network}`, ...docker };
         // Beyond what the sandbox lets its commands do: the owner decides, told so (#448 round 9).
         const beyond = this.#hostBoundsNote(toolName, input, shellCwd);
-        return { sandboxed: false, sandboxNote: beyond ?? "runs in the backend's own process, outside the sandbox" };
+        return { sandboxed: false, sandboxNote: beyond ?? "runs in the backend's own process, outside the sandbox", ...docker };
       }
       case "no-shell":
         return {};

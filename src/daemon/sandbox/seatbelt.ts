@@ -12,7 +12,8 @@
  *     workspace hidden again (as bwrap.ts lays its mounts); a repository's
  *     hooks and config not writable; a pinned directory not writable itself
  *     (`literal`: no rename, no removal), what is in it still writable;
- *   - container sockets: not readable, and no connection to them;
+ *   - container sockets: not readable, and no connection to them (but
+ *     those the owner let in, `spec.dockerSockets`: allowed last);
  *   - network off (and an allowlist, which Seatbelt can't enforce by host):
  *     no network at all.
  *
@@ -137,6 +138,15 @@ export function seatbeltProfile(
     if (isDir(s) !== true) lines.push(`(deny network-outbound (remote unix-socket (path-literal ${param(s)})))`);
   }
   if (seatbeltNetwork(spec.network.mode) === "off") lines.push("(deny network*)");
+  // Container runtime sockets the owner let in (spec.dockerSockets), last, so they win over the rules above: the file
+  // (by its own path and where it leads: Docker Desktop's `/var/run/docker.sock` links into the home), read and
+  // written as a socket is, never removed or replaced, and a connection to it, the network off or not.
+  for (const s of spec.dockerSockets ?? []) {
+    for (const p of new Set([s, real(s)])) {
+      lines.push(`(allow file-read* file-write-data (literal ${param(p)}))`);
+      lines.push(`(allow network-outbound (remote unix-socket (path-literal ${param(p)})))`);
+    }
+  }
   return { profile: `${lines.join("\n")}\n`, params };
 }
 

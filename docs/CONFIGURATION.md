@@ -113,6 +113,7 @@ CODEOID_SANDBOX_ALLOWED_HOSTS=          # with allowlist: github.com,*.npmjs.org
 CODEOID_SANDBOX_HIDDEN_PATHS=           # more paths to hide: ~/work/.env
 CODEOID_SANDBOX_HOME_READABLE=          # replaces the home allowlist: ~/.bun,~/.cargo/bin,~/.gitconfig
 CODEOID_SANDBOX_DOCKER_IMAGE=node:22-bookworm-slim
+CODEOID_SANDBOX_DOCKER_SOCKET=false     # Docker access: commands reach the container runtime (root-equivalent)
 CODEOID_SANDBOX_WORKTREE_ROOTS=         # more places a command may check a worktree out: ~/wt,../shared-worktrees
 
 # Forks, backend switches and rewinds (docs/FEATURES.md#how-a-fork-switch-or-rewind-carries-the-conversation)
@@ -250,6 +251,7 @@ Agents' commands run in an OS sandbox, on by default ([sandbox.md](sandbox.md)):
 - Every `sandbox.*` change through `settings.set` needs an undelegated token, and is audited old → new.
 - `bwrapPath` — the bubblewrap binary (default: on `PATH`). Claude Code's own sandbox on Linux also needs `socat`.
 - `docker.image` (`CODEOID_SANDBOX_DOCKER_IMAGE`) and `docker.runtime` — what a Docker sandbox runs, and `runsc` for gVisor.
+- `docker.socket` (`CODEOID_SANDBOX_DOCKER_SOCKET`, default `false`) — Docker access: sandboxed commands can reach the host's container runtime socket (Docker, rootless Docker, Podman; Docker Desktop on macOS), with `DOCKER_HOST` set, for tests that start containers. Root-equivalent (a container can mount `/`), so every session with it says "sandboxed, Docker access"; a session turns it on for itself with `--docker-socket` / `/sandbox … docker`, asked of its owner ([sandbox.md](sandbox.md#docker-access)).
 - `worktreeRoots` (`CODEOID_SANDBOX_WORKTREE_ROOTS`, comma separated) — more places a sandboxed command may check a git worktree of its repository out, on top of `<repo>-worktrees/` and `<repo>/.worktrees/` (`~` expands; a relative path is the repository's main checkout's). Writable to sandboxed commands ([sandbox.md](sandbox.md#git-worktrees-inside-the-sandbox)).
 - Where the sandbox can't run, interactive sessions run unsandboxed and say so on every approval; autonomous sessions, routines and loops refuse to start. `codeoid sandbox providers` shows what runs here.
 

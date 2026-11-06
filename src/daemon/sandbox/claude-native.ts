@@ -123,6 +123,11 @@ export function claudeSandboxSettings(rt: Pick<SandboxRuntime, "spec" | "config"
       : spec.network.mode === "allowlist"
         ? { allowedDomains: [...(spec.network.allow ?? [])], strictAllowlist: true }
         : {};
+  // Container runtime sockets the owner let in (spec.dockerSockets): the CLI's macOS sandbox allows them by path; its
+  // Linux one can't, and blocks every unix socket a command makes unless all are allowed: there the filesystem holds
+  // which are reachable (every other runtime socket, the desktop's runtime dir, the agent's are denied or hidden).
+  const sockets = physical(spec.dockerSockets ?? []);
+  if (sockets.length > 0) Object.assign(network, process.platform === "linux" ? { allowAllUnixSockets: true } : { allowUnixSockets: sockets });
   const envVars = credentialEnvNames(env, spec.unsetEnv).map((name) => ({ name, mode: "deny" as const }));
   return {
     enabled: true,
@@ -141,7 +146,7 @@ export function claudeSandboxSettings(rt: Pick<SandboxRuntime, "spec" | "config"
       denyWrite: physical([...claudeSettingsPaths(spec.workspace, env), ...denyAround(spec.readOnly ?? [], spec.writable), ...(spec.pinned ?? [])]),
       denyRead: physical([...spec.hidden, ...spec.containerSockets]),
       // Inside the denied home: the allowlist, and what is written (a workspace in it).
-      allowRead: physical([spec.workspace, tempDir, ...spec.writable, ...spec.reexposed]),
+      allowRead: physical([spec.workspace, tempDir, ...spec.writable, ...spec.reexposed, ...sockets]),
     },
     network,
     ...(envVars.length > 0 ? { credentials: { envVars } } : {}),

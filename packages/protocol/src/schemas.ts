@@ -92,6 +92,7 @@ export const sessionSandboxSettingSchema = z
     provider: z.string().min(1).max(64).optional(),
     network: z.enum(["on", "off", "allowlist"]).optional(),
     allowedHosts: z.array(z.string().min(1).max(253)).max(256).optional(),
+    dockerSocket: z.boolean().optional(),
   })
   .strict();
 

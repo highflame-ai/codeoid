@@ -1,19 +1,22 @@
 /**
  * Real bubblewrap (#448 follow-up), skipped where it can't run: an agent
- * makes git worktrees inside the sandbox.
+ * makes git worktrees inside the sandbox, and tests that start containers
+ * get the container runtime's socket only when the owner opted in.
  *
  * Everything destructive runs INSIDE the sandbox under test, against a
  * repository this test planted in its own temp dir; "the user's next git"
  * runs outside the session's sandbox, in a bubblewrap that may write only the
- * test's dir, and must run nothing a command planted.
+ * test's dir, and must run nothing a command planted. No real Docker socket
+ * is touched: a listening unix socket this test makes stands in for one.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createServer, type Server } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
 import { gitControlSnapshot } from "../daemon/sandbox/git-watch.js";
-import { buildSandboxSpec } from "../daemon/sandbox/policy.js";
+import { buildSandboxSpec, dockerSocketPaths } from "../daemon/sandbox/policy.js";
 import type { SandboxHandle } from "../daemon/sandbox/types.js";
 import { noteCodeoidWorktree, worktreeAdminsOf } from "../daemon/sandbox/worktrees.js";
 
@@ -329,6 +332,74 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
       expect(r.stdout).toContain("PARENT-READ-ONLY");
     } finally {
       await h.close();
+    }
+  });
+});
+
+describe.skipIf(!probe.available)("bubblewrap, for real: Docker access (a planted socket stands in for the runtime's)", () => {
+  let root: string;
+  let runtime: string;
+  let sock: string;
+  let server: Server;
+  beforeAll(async () => {
+    root = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-docker-")));
+    // Rootless Docker's place: $XDG_RUNTIME_DIR/docker.sock, in a dir every sandbox hides.
+    runtime = join(root, "run-user");
+    mkdirSync(runtime, { mode: 0o700 });
+    mkdirSync(join(root, "ws"));
+    mkdirSync(join(root, "tmp"));
+    sock = join(runtime, "docker.sock");
+    server = createServer((c) => c.end("PLANTED-RUNTIME\n"));
+    await new Promise<void>((r) => server.listen(sock, r));
+  });
+  afterAll(async () => {
+    await new Promise<void>((r) => server.close(() => r()));
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const env = () => ({ HOME: join(root, "home"), XDG_RUNTIME_DIR: runtime, PATH: process.env.PATH ?? "/usr/bin:/bin" });
+  const spec = (dockerSocket: boolean, network: "on" | "off" = "off") =>
+    buildSandboxSpec({
+      sessionId: "docker",
+      workspace: join(root, "ws"),
+      tempDir: join(root, "tmp"),
+      network: { mode: network },
+      git: false,
+      dockerSocket,
+      hidden: { home: join(root, "home"), configDir: join(root, "home", ".codeoid"), env: env(), daemonTmp: "/tmp" },
+    });
+  const connect = (h: SandboxHandle, target: string) =>
+    h.exec(["/bin/sh", "-c", `python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(100).decode().strip())' '${target}' 2>&1; echo "DOCKER_HOST=$DOCKER_HOST"`], { cwd: join(root, "ws"), env: { PATH: "/usr/bin:/bin", DOCKER_HOST: "unix:///host-value" }, timeoutMs: 20_000 });
+
+  test.skipIf(!Bun.which("python3"))("hidden by default; reachable, with DOCKER_HOST naming it, only with the option (network off too)", async () => {
+    expect(dockerSocketPaths(join(root, "home"), env())).toEqual([sock]);
+    const off = spec(false);
+    expect(off.dockerSockets).toBeUndefined();
+    const h0 = await provider.open(off);
+    try {
+      const r = await connect(h0, sock);
+      expect(r.stdout).not.toContain("PLANTED-RUNTIME");
+      expect(r.stdout).toContain("DOCKER_HOST=\n");
+    } finally {
+      await h0.close();
+    }
+    for (const network of ["off", "on"] as const) {
+      const on = spec(true, network);
+      expect(on.dockerSockets).toEqual([sock]);
+      const h1 = await provider.open(on);
+      try {
+        const r = await connect(h1, sock);
+        expect(r.stdout).toContain("PLANTED-RUNTIME");
+        expect(r.stdout).toContain(`DOCKER_HOST=unix://${sock}`);
+        // Reachable, never removable or replaceable.
+        const rm = await h1.exec(["/bin/sh", "-c", `rm -f '${sock}' 2>/dev/null; [ -S '${sock}' ] && echo SOCKET-KEPT`], { cwd: join(root, "ws"), env: { PATH: "/usr/bin:/bin" }, timeoutMs: 10_000 });
+        expect(rm.stdout).toContain("SOCKET-KEPT");
+        // The rest of the runtime dir stays hidden.
+        const ls = await h1.exec(["/bin/sh", "-c", `ls -A '${runtime}'`], { cwd: join(root, "ws"), env: { PATH: "/usr/bin:/bin" }, timeoutMs: 10_000 });
+        expect(ls.stdout.trim()).toBe("docker.sock");
+      } finally {
+        await h1.close();
+      }
     }
   });
 });
