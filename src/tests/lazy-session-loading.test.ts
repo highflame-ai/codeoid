@@ -9,7 +9,7 @@
  * a client sees: ids, timestamps and the data dirs normalized, nothing else.
  */
 
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, it, setDefaultTimeout } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -25,6 +25,9 @@ import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
 import { type AuthContext, CAPABILITIES, type DaemonMessage, type SessionInfo, type SessionMessage } from "../protocol/types.js";
+
+// Two daemons per test, each resuming and shutting down: slower than the default under a loaded suite.
+setDefaultTimeout(60_000);
 
 const AUTH: AuthContext = {
   sub: "user:lazy",
@@ -221,7 +224,7 @@ beforeAll(async () => {
   // From before the canonical log and the turn index (#354).
   rmSync(join(base, "transcripts", `${ids.legacy}.canonical.jsonl`));
   rmSync(join(base, "transcripts", `${ids.legacy}.turns.jsonl`));
-});
+}, 60_000);
 
 afterAll(() => {
   rmSync(base, { recursive: true, force: true });
@@ -387,14 +390,23 @@ describe("lazy session loading: a resumed session before it is used", () => {
     expect(loaded(pair.lazy, "rich")).toBe(false);
   });
 
-  it("a notice while unloaded (mode, rename) is in the scrollback and on disk in order, its seq never reused", async () => {
+  it("notices while unloaded (model, effort) are in the scrollback and on disk in order, their seqs never reused", async () => {
     const pair = await both();
+    const before = seqsOnDisk(pair.lazy, ids.short!).length;
     await same(pair, async (env) => {
-      await call(env, { type: "session.set_mode", sessionId: ids.short, mode: "guarded" });
-      await call(env, { type: "session.rename", sessionId: ids.short, name: "short-again" });
-      return sessionOf(env, "short").toInfo();
+      const results = [
+        await call(env, { type: "session.set_mode", sessionId: ids.short, mode: "guarded" }),
+        await call(env, { type: "session.rename", sessionId: ids.short, name: "short-again" }),
+        await call(env, { type: "session.set_model", sessionId: ids.short, model: "sonnet" }),
+        await call(env, { type: "session.set_effort", sessionId: ids.short, effort: "high" }),
+      ];
+      expect(results.map((r) => r.type)).toEqual(["response.ok", "response.ok", "response.ok", "response.ok"]);
+      await env.transcript.flush();
+      return { results, info: sessionOf(env, "short").toInfo() };
     });
+    // Appended while the history stayed on disk.
     expect(loaded(pair.lazy, "short")).toBe(false);
+    expect(seqsOnDisk(pair.lazy, ids.short!).length).toBeGreaterThan(before);
     await same(pair, async (env) => attach(env, ids.short!));
     await same(pair, async (env) => {
       await sendAndSettle(env, ids.short!, "after the notices");
@@ -592,7 +604,7 @@ describe("lazy session loading: using a resumed session", () => {
 });
 
 describe("lazy session loading: restarts", () => {
-  it("restarting twice, with notices and a turn in between, keeps everything the same", async () => {
+  it("restarting twice, with notices (some while unloaded) and a turn in between, keeps everything the same", async () => {
     const pair = await both();
     const restart = async (env: Env): Promise<Env> => {
       await closeEnv(env);
@@ -603,8 +615,15 @@ describe("lazy session loading: restarts", () => {
       return next;
     };
     let { eager, lazy } = pair;
+    const models: Record<string, number> = {};
     const step = async (env: Env) => {
       await call(env, { type: "session.set_mode", sessionId: ids.short, mode: "autonomous", maxTurns: 2 });
+      // A notice appended while "short" is unloaded (lazy), persisted across the restarts.
+      const n = (models[env.label] ?? 0) + 1;
+      models[env.label] = n;
+      const r = await call(env, { type: "session.set_model", sessionId: ids.short, model: n === 1 ? "sonnet" : "haiku" });
+      expect([r.type, (r as { error?: string }).error]).toEqual(["response.ok", undefined]);
+      if (env.label === "lazy") expect(sessionOf(env, "short").hydrated).toBe(false);
       await sendAndSettle(env, ids.rich!, "between restarts");
       return list(env);
     };
@@ -624,6 +643,8 @@ describe("lazy session loading: restarts", () => {
     for (const env of [eager, lazy]) {
       const seqs = seqsOnDisk(env, ids.short!);
       expect(new Set(seqs).size).toBe(seqs.length);
+      const replay = (await attach(env, ids.short!)).find((f) => f.type === "scrollback.replay") as { messages: SessionMessage[] };
+      expect(replay.messages.filter((m) => m.metadata?.event === "session.model_changed").length).toBe(2);
     }
   });
 });
