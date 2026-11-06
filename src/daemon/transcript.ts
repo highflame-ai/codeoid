@@ -288,6 +288,13 @@ export class TranscriptStore {
     ]);
   }
 
+  /** Sessions with a write still in flight (each chain clears itself once its last write settles). */
+  get pendingWrites(): number {
+    return (
+      this.#metaWriteChain.size + this.#appendChain.size + this.#canonicalChain.size + this.#turnIndexChain.size
+    );
+  }
+
   // ── Canonical history log (#354) ─────────────────────────────────────────
   //
   // The backend-neutral conversation (CanonicalTurn[]) every fork, backend

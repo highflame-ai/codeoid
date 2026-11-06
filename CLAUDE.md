@@ -161,8 +161,11 @@ retries the turn on that model instead of failing it. There is no daemon-side
 retry manager.
 
 **Graceful shutdown**: cleanup registry runs in LIFO order on SIGTERM/SIGINT/SIGHUP.
-Sessions drained (in-flight work interrupted), store flushed, WebSockets closed,
-frontends stopped. 30-second grace period before forced exit.
+Sessions drained (in-flight work interrupted, each interrupted turn waited
+for until its end, spend included, is recorded — a backend acknowledges an
+interrupt before the turn's result arrives — then the transcript writes
+flushed; bounded by drain's 10 s, never a fixed wait), store flushed,
+WebSockets closed, frontends stopped. 30-second grace period before forced exit.
 
 **One daemon per data dir**: `codeoid start` locks each dir the daemon owns
 (`daemonOwnedDirs`: the database's, transcripts, opencode's database and data

@@ -552,7 +552,7 @@ Thinking content and sub-agent tool calls surface as separate italic messages. S
 | Pattern | What it does |
 |---|---|
 | **Retry with fallback model** | Exponential backoff with jitter, 429/529/5xx categorization, falls back to cheaper model after 3 capacity failures. |
-| **Graceful shutdown** | LIFO cleanup registry with 30s grace. SIGTERM / SIGINT / SIGHUP handlers drain sessions before closing the store. |
+| **Graceful shutdown** | LIFO cleanup registry with 30s grace. SIGTERM / SIGINT / SIGHUP handlers drain sessions before closing the store: an interrupted turn's late result (its last reply, its cost) and its transcript writes are recorded first. |
 | **Session resume** | JSONL transcripts per session; user prompts written BEFORE API calls. On daemon restart, sessions rebuild from transcript; `#hasQueried` flag ensures Claude Code's own session store is reused via `resume` instead of re-creating. |
 | **Session limits** | **None by default** — running many sessions in parallel is the point. `rateLimit.maxSessionsPerUser` / `rateLimit.maxCreationsPerHour` default to `0` (unlimited); set either for a shared multi-user daemon. Automated spawning is bounded at its source by `dispatch.maxConcurrentWorkers`. |
 | **Tool approval correlation** | Each approval request has a unique `approvalId`; first response wins; multiple concurrent approvals supported. |

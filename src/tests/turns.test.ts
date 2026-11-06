@@ -9,7 +9,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
@@ -432,6 +432,54 @@ class LateResultProvider extends MockSessionProvider {
     };
   }
 }
+
+describe("drain() at shutdown", () => {
+  for (const late of [0, 20, 100, 300, 600]) {
+    it(`records an interrupted turn whose result comes ${late} ms after the interrupt, before it returns`, async () => {
+      const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+        config: mkConfig(tmp),
+        _testProviderFactory: () => new LateResultProvider(late),
+      });
+      const id = await create(m);
+      const s = m._sessionForTest(id)!;
+      const sending = s.send("go", AUTH).catch((e) => e);
+      for (let i = 0; i < 200 && s.status !== "thinking"; i++) await Bun.sleep(5);
+      expect(s.status).toBe("thinking");
+
+      const errors: string[] = [];
+      const consoleError = console.error;
+      console.error = (...args: unknown[]) => {
+        errors.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(" "));
+      };
+      try {
+        const started = performance.now();
+        await m.drain(10_000);
+        const took = performance.now() - started;
+        // What is on disk now is what the daemon leaves: the store closes next, then the process exits.
+        const persisted = store.getSession(id)?.status;
+        store.close();
+        const canonical = readFileSync(transcript.canonicalPath(id), "utf8");
+        const lines = readFileSync(join(tmp, "transcripts", `${id}.jsonl`), "utf8");
+        const usage = s.toInfo().usage!;
+
+        expect(s.turnInFlight).toBe(false);
+        expect(canonical.split("\n").filter((l) => l.includes('"assistant"'))).toHaveLength(1);
+        expect(lines).toContain("working on it, cut short");
+        expect(usage.numTurns).toBe(1);
+        expect(usage.totalCostUsd).toBeCloseTo(0.42);
+        expect(persisted).toBe(s.status);
+        // As soon as the turn has ended, not after a fixed wait.
+        expect(took).toBeLessThan(late + 400);
+
+        await Bun.sleep(50);
+        expect(errors.filter((e) => /closed database|persist failed/i.test(e))).toEqual([]);
+      } finally {
+        console.error = consoleError;
+      }
+      await sending;
+    });
+  }
+});
 
 describe("a stopped turn's last reply", () => {
   it("is shown whole, not typed out frame by frame, so the turn ends as its result arrives", async () => {

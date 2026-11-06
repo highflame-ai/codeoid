@@ -3977,7 +3977,7 @@ mcpHub: this.#mcpHub,
           // too, or it starts after shutdown began.
           s.preparingTurn,
       );
-      if (working.length === 0) return;
+      if (working.length === 0) break;
       for (const session of working) {
         if (interrupted.has(session.id)) continue;
         void session.interrupt(systemAuth);
@@ -3985,6 +3985,37 @@ mcpHub: this.#mcpHub,
       }
       await Bun.sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
       pollMs = Math.min(pollMs * 2, 500);
+    }
+    // Idle is not ended: a session goes idle once its backend acknowledges
+    // the interrupt, and the turn's result follows (Claude's after the
+    // interrupt receipt, Codex's turn/completed, opencode's feed or
+    // read-back). Wait for each interrupted turn to record its end, spend
+    // included, then for the writes it started, so the store closing next
+    // loses none of it.
+    const remaining = () => Math.max(0, deadline - Date.now());
+    await Promise.all([...interrupted].map((id) => this.#sessions.get(id)?.turnDrained(remaining())));
+    await this.#flushTranscripts(deadline);
+  }
+
+  /**
+   * Await the transcript store's writes until none is in flight, within the
+   * deadline. A settled write's handler may start another (the turn index
+   * written as a turn ends), so look again after each round.
+   */
+  async #flushTranscripts(deadline: number): Promise<void> {
+    for (let round = 0; round < 10 && Date.now() < deadline; round++) {
+      // One macrotask first: a handler a settled write woke may start the next write there.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (this.#transcriptStore.pendingWrites === 0) return;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        this.#transcriptStore.flush(),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+          timer.unref?.();
+        }),
+      ]);
+      clearTimeout(timer);
     }
   }
 
