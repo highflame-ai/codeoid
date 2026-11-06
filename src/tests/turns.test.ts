@@ -366,6 +366,19 @@ describe("a Stop while a send prepares its turn", () => {
     expect(providers.at(-1)!.capturedOpts).toHaveLength(0);
     expect(s.status).toBe("idle");
   });
+
+  it("drain() returns as soon as the work it stopped has settled, not after a fixed half second", async () => {
+    const m = newManager();
+    const id = await create(m);
+    const s = m._sessionForTest(id)!;
+    const sending = s.send("go", AUTH).catch((e) => e);
+    const started = performance.now();
+    await m.drain(2_000);
+    // The stop settles within milliseconds; drain used to wait 500 ms before
+    // looking again, which every shutdown with busy sessions paid.
+    expect(performance.now() - started).toBeLessThan(400);
+    expect(await sending).toBeInstanceOf(SendStoppedError);
+  });
 });
 
 describe("turn attribution across mid-turn messages, rotation and forks", () => {

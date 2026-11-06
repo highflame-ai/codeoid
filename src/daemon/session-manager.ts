@@ -3964,6 +3964,9 @@ mcpHub: this.#mcpHub,
       projectId: "",
     };
     const interrupted = new Set<string>();
+    // Interrupted sessions usually settle within milliseconds: check again
+    // soon, backing off to 500 ms, rather than always waiting half a second.
+    let pollMs = 10;
     while (Date.now() < deadline) {
       const working = [...this.#sessions.values()].filter(
         (s) =>
@@ -3980,7 +3983,8 @@ mcpHub: this.#mcpHub,
         void session.interrupt(systemAuth);
         interrupted.add(session.id);
       }
-      await Bun.sleep(500);
+      await Bun.sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
+      pollMs = Math.min(pollMs * 2, 500);
     }
   }
 
