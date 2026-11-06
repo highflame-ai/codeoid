@@ -150,6 +150,7 @@ Sessions live in the daemon. Clients are stateless.
 - **Scrollback buffer**: circular ring (5000 entries / 20MB) replayed on attach
 - **Transcript persistence**: JSONL per session, user prompts written before API call
 - **Session resume**: on daemon restart, meta files scanned, sessions rebuilt, scrollback restored
+- **Lazy loading** (`session.lazyLoad`, default on): a resumed session holds its metadata only (`Session.prepareResume`: the log's next seq, its newest canonical turn, the turn index) and loads its scrollback and canonical history the first time it is used, exactly as a resume loaded them. Entry points await `Session.ensureHydrated()` (one shared load): `SessionManager.handle` for any message naming a session (less `NO_HISTORY_MESSAGES`), `send`, and the async history readers; `#scrollback` / `#accumulator` are getters that load synchronously, logged, if anything reaches them first (`Session.syncHydrations`). A notice while unloaded is appended at the next seq and kept for the load (`#buffer`); a re-seed owed by a teardown waits for it (`#reseedAfterTeardown`). Sessions from before the canonical log or turn index, or with a fresh backing, load at resume.
 
 Detach from terminal -> attach from Telegram -> same session, same context, scrollback replayed.
 

@@ -31,7 +31,6 @@ import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEn
 import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption, shellArg } from "./mcp/adopt.js";
 import { readWorkdirServers } from "./mcp/workdir-servers.js";
 import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcpUrl, serverProgram, shownLabel, visibleCompact, visibleVerbatim } from "./mcp/redact.js";
-import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, type LoginOutcome, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore } from "./claude-accounts.js";
 import { AccountError, type AccountStore, LOGIN_KINDS, validateAccountName } from "./accounts.js";
@@ -410,6 +409,45 @@ export function cutRowsAfterTurn<T extends { message: DaemonMessage }>(
  * whole log is read on demand by the features that need old turns.
  */
 const RESUME_CANONICAL_MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Messages that name a session but never read its scrollback or canonical
+ * history: they don't load a resumed session's (lazy session loading). A
+ * notice one of them adds is kept for the load (`Session#buffer`); anything
+ * that does read the history loads it there (`Session#hydrateNow`).
+ */
+const NO_HISTORY_MESSAGES: ReadonlySet<string> = new Set([
+  "session.detach",
+  "session.destroy",
+  "session.interrupt",
+  "session.ui_response",
+  "session.commands",
+  "session.set_mode",
+  "session.set_sandbox",
+  "session.pin",
+  "session.unpin",
+  "session.rename",
+  "session.turns",
+  "session.approvals",
+  "session.set_model",
+  "session.set_effort",
+  "session.set_account",
+  "session.set_claude_account",
+  "session.mcp_reconnect",
+  "session.mcp_refresh",
+  "session.export",
+  "claude.config",
+  "mcp.approve",
+  "mcp.approve.preview",
+  "fs.list",
+  "fs.read",
+  "fs.browse_dir",
+  "blackboard.index",
+  "blackboard.read",
+  "collaboration.panels",
+  "compare.get",
+  "compare.list",
+]);
 
 /** Sort key for resume ordering: most-recently-active first. Falls back to
  * createdAt, then 0, so a malformed timestamp never throws. */
@@ -959,6 +997,7 @@ export class SessionManager {
       if (m.collaboration) goalConfigs.set(m.sessionId, m.collaboration);
     }
     const deadline = Date.now() + RESUME_DEADLINE_MS;
+    const lazyLoad = this.#config?.session?.lazyLoad ?? true;
     let resumed = 0;
     let skippedDeadline = 0;
     let resumedChildren = 0;
@@ -1083,54 +1122,22 @@ mcpHub: this.#mcpHub,
         session.adoptReportedBackgroundTasks(meta.reportedBackgroundTasks);
         session.adoptKnownBackgroundTasks(meta.knownBackgroundTasks);
 
-        // Restore scrollback from transcript, seeding the seq counter past
-        // the persisted tail so new appends continue the monotonic sequence.
-        // Byte-budgeted + deadline-aware: one huge transcript can neither
-        // OOM the daemon nor eat the whole resume window by itself.
-        const loadStats: { truncated?: boolean } = {};
-        const entries = await this.#transcriptStore.loadTranscript(meta.sessionId, {
-          maxBytes: RESUME_TRANSCRIPT_MAX_BYTES,
-          deadlineAt: deadline,
-          stats: loadStats,
-        });
-        const messages = entries.map((e) => e.message);
-        const maxSeq = entries.reduce((max, e) => Math.max(max, e.seq), -1);
-        session.restoreScrollback(messages, maxSeq + 1, entries.map((e) => e.bytes), {
-          partialHistory: loadStats.truncated === true,
-        });
-        // The backend-neutral conversation (#354). Without it a restored
-        // session forked / switched backend with no history, and stateless
-        // backends answered the next prompt with no memory of the session.
-        // Sessions from before the log existed are rebuilt from the
-        // transcript once, then read from the log.
-        try {
-          const canonical = await this.#transcriptStore.loadCanonical(meta.sessionId, {
-            maxBytes: RESUME_CANONICAL_MAX_BYTES,
-          });
-          const index = await this.#transcriptStore.loadTurnIndex(meta.sessionId);
-          // No log: a session from before it existed. Rebuild once from the
-          // WHOLE transcript (the scrollback window above may be a tail) and
-          // persist it — a long session's history must not shrink to the
-          // window, or to just the next turn on the following restart.
-          let rebuildFrom = messages;
-          if (!canonical && loadStats.truncated === true) {
-            const all = await this.#transcriptStore.loadTranscript(meta.sessionId, { deadlineAt: deadline });
-            rebuildFrom = all.map((e) => e.message);
-          }
-          const history =
-            canonical?.turns ?? (rebuildFrom.length > 0 ? canonicalFromTranscript(rebuildFrom, providerId) : []);
-          session.restoreTurns(history, index ?? turnIndexFromHistory(history), {
-            persistHistory: !canonical && history.length > 0,
-            persistIndex: !index && history.some((t) => t.turnId),
-            partial: canonical?.partial ?? false,
-          });
-          if (meta.redactedBackings) session.adoptRedactedBackings(meta.redactedBackings);
-          if (meta.backingFresh) await session.reseedFreshBacking();
-        } catch (err) {
-          console.error(
-            `[codeoid/resume] canonical history restore failed for ${meta.sessionId} (session resumes without it): ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
+        // The history (scrollback + canonical conversation) loads the first
+        // time something uses the session (`session.lazyLoad`, default on):
+        // only what it reports and appends with before then is read here.
+        // Sessions from before the canonical log or the turn index load now,
+        // since the load rebuilds and persists them.
+        if (meta.redactedBackings) session.adoptRedactedBackings(meta.redactedBackings);
+        const loadNow = !(await session.prepareResume({
+          transcriptMaxBytes: RESUME_TRANSCRIPT_MAX_BYTES,
+          canonicalMaxBytes: RESUME_CANONICAL_MAX_BYTES,
+          deadlineMs: RESUME_DEADLINE_MS,
+          providerId,
+          backingFresh: meta.backingFresh === true,
+        }));
+        // A fresh backing is re-seeded at resume, as before: it is rare (a
+        // rewind not yet followed by a turn) and its backend is owed it now.
+        if (loadNow || !lazyLoad || meta.backingFresh) await session.ensureHydrated({ deadlineAt: deadline, atResume: true });
 
         this.#sessions.set(session.id, session);
         // Track a resumed child's mount so teardown revokes it. Without this a
@@ -1333,6 +1340,14 @@ mcpHub: this.#mcpHub,
       rawToken?: string;
     },
   ): Promise<DaemonMessage> {
+    // A resumed session loads its history the first time it is used. Only
+    // then is there an await here: handlers that claim state synchronously
+    // (a rewind's stop point) keep doing so before the caller's next call.
+    const loading = this.#loadHistoryFor(msg, auth);
+    if (loading) {
+      const unloadable = await loading;
+      if (unloadable) return unloadable;
+    }
     switch (msg.type) {
       case "ping":
         // Liveness heartbeat — lets a client detect a half-open/zombie
@@ -1580,6 +1595,38 @@ mcpHub: this.#mcpHub,
         };
       }
     }
+  }
+
+  /**
+   * Load the history of the session `msg` names (lazy session loading), so
+   * every handler finds it in memory: the one place a client's use of a
+   * session loads it. Only for a session the caller's tenant owns, and not
+   * for messages that never read it (`NO_HISTORY_MESSAGES`). Null when
+   * there is nothing to load; resolves to an error response when the
+   * transcript can't be read.
+   */
+  #loadHistoryFor(msg: ClientMessage, auth: AuthContext): Promise<DaemonMessage | null> | null {
+    if (NO_HISTORY_MESSAGES.has(msg.type)) return null;
+    const id = (msg as { sessionId?: unknown }).sessionId;
+    if (typeof id !== "string") return null;
+    const session = this.#sessions.get(id);
+    if (!session?.historyPending || session.accountId !== auth.accountId || session.projectId !== auth.projectId) {
+      return null;
+    }
+    return session.ensureHydrated().then(
+      () => null,
+      (err): DaemonMessage => {
+        console.error(
+          `[codeoid/resume] could not load the history of ${id}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        return {
+          type: "response.error",
+          requestId: (msg as { id?: string }).id ?? "",
+          error: "The session's history could not be loaded from disk — try again, or see the daemon's log.",
+          code: "internal",
+        };
+      },
+    );
   }
 
   async #sessionExport(
@@ -5678,7 +5725,9 @@ mcpHub: this.#mcpHub,
     // COMPLETE (or ask for input) on GENUINELY NEW final text — never on the
     // PRIOR phase's ⟦PHASE-COMPLETE⟧ that still sits in lastAssistantText (e.g.
     // behind a tools-only turn whose own text is empty). Without this, phase N
-    // "completes" instantly by reading phase N-1's marker.
+    // "completes" instantly by reading phase N-1's marker. A pipeline resumed
+    // after a restart drives a session whose history may not be loaded yet.
+    if (session.historyPending) await session.ensureHydrated();
     let textAtSend = session.lastAssistantText ?? "";
     // Every NEW assistant text this phase produced, in order. The phase's
     // summary is the whole of what the model said across its turns, not only
@@ -7269,6 +7318,11 @@ mcpHub: this.#mcpHub,
 
       workerStatus: (sessionId: string) => this.#sessions.get(sessionId)?.status ?? null,
 
+      prepareWorkerDigest: async (task: DispatchTaskRow): Promise<void> => {
+        const worker = this.#sessionForTask(task.workerSessionId, task);
+        if (worker?.historyPending) await worker.ensureHydrated().catch(() => {});
+      },
+
       buildWorkerDigest: (task: DispatchTaskRow): string => {
         const worker = this.#sessionForTask(task.workerSessionId, task);
         const header = `task ${task.id.slice(0, 8)} (${task.kind}/${task.shape}) in ${task.workdir ?? task.targetSession ?? "?"}`;
@@ -8203,6 +8257,8 @@ mcpHub: this.#mcpHub,
 
   async #freezeBranch(t: CompareRunRow["targets"][number], s: Session): Promise<void> {
     const turnId = t.baseTurnId!;
+    // A branch settled after a restart may not have loaded its history yet.
+    if (s.historyPending) await s.ensureHydrated().catch(() => {});
     const status: "idle" | "error" = s.status === "error" ? "error" : "idle";
     // Nothing after the compared turn yet: the branch's totals are that turn's
     // (a fork starts with none). Read before awaiting — the user may go on.
