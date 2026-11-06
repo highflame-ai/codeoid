@@ -8906,6 +8906,13 @@ export class Session {
           this.#commitStreamed(this.#activeAssistantMsg);
           this.#broadcastRaw(this.#activeAssistantMsg);
           this.#activeAssistantMsg = null;
+        } else if (event.content && this.#turnInterrupted) {
+          // A stopped turn's last reply, shown whole: animating it held the
+          // turn's end, and so a shutdown's drain, for up to half a second.
+          const msg = this.#makeMessage("assistant", event.content, this.#agentIdentity, []);
+          msg.parts = [{ kind: "text", text: event.content, markdown: true }];
+          this.#commitStreamed(msg);
+          this.#broadcastRaw(msg);
         } else if (event.content) {
           // No preceding text_delta — the SDK returned the response as a batch
           // (happens for mid-turn now-priority continuations). Simulate streaming

@@ -13,10 +13,11 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
+import { AsyncQueue } from "../daemon/async-queue.js";
 import { canonicalFromTranscript } from "../daemon/canonical-restore.js";
 import { listCheckpoints, shadowRepoPath } from "../daemon/checkpoints.js";
 import { SendStoppedError } from "../daemon/session.js";
-import type { ProviderEvent } from "../daemon/providers/interface.js";
+import type { ProviderEvent, TurnOpts, TurnRun } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
@@ -378,6 +379,82 @@ describe("a Stop while a send prepares its turn", () => {
     // looking again, which every shutdown with busy sessions paid.
     expect(performance.now() - started).toBeLessThan(400);
     expect(await sending).toBeInstanceOf(SendStoppedError);
+  });
+});
+
+/**
+ * A backend whose interrupt is acknowledged at once while the turn's result
+ * follows `late` ms after it, as real ones do: Claude's result after the
+ * interrupt receipt, Codex's turn/completed after turn/interrupt, opencode's
+ * feed or read-back after its interrupt call.
+ */
+class LateResultProvider extends MockSessionProvider {
+  constructor(private readonly late: number) {
+    super("claude");
+  }
+
+  override runTurn(opts: TurnOpts): TurnRun {
+    this.capturedOpts.push(opts);
+    const queue = new AsyncQueue<ProviderEvent>();
+    void Promise.resolve().then(() => queue.push({ type: "text_delta", content: "working on it" } as ProviderEvent));
+    let interrupted = false;
+    return {
+      events: queue,
+      interrupt: async () => {
+        if (interrupted) return;
+        interrupted = true;
+        setTimeout(() => {
+          try {
+            queue.push({ type: "text_done", content: "working on it, cut short" } as ProviderEvent);
+            queue.push({
+              type: "turn_done",
+              result: {
+                providerId: "mock",
+                model: "mock",
+                inputTokens: 1000,
+                outputTokens: 200,
+                cacheReadTokens: 0,
+                cacheCreationTokens: 0,
+                totalCostUsd: 0.42,
+                costSource: "backend",
+                durationMs: 1,
+                isError: true,
+                errorMessage: "interrupted",
+              },
+            } as ProviderEvent);
+          } catch {
+            // closed
+          }
+          queue.close();
+        }, this.late);
+      },
+      endTurn: () => queue.close(),
+    };
+  }
+}
+
+describe("a stopped turn's last reply", () => {
+  it("is shown whole, not typed out frame by frame, so the turn ends as its result arrives", async () => {
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(tmp),
+      _testProviderFactory: () => new LateResultProvider(0),
+    });
+    managers.push(m);
+    const id = await create(m);
+    const s = m._sessionForTest(id)!;
+    const seen: DaemonMessage[] = [];
+    s.attach({ id: "w", auth: AUTH, send: (msg: DaemonMessage) => { seen.push(msg); } });
+    const sending = s.send("go", AUTH).catch((e) => e);
+    for (let i = 0; i < 200 && s.status !== "thinking"; i++) await Bun.sleep(5);
+    await s.interrupt(AUTH);
+    await s.turnDrained(5_000);
+    await sending;
+
+    const last = seen.filter(
+      (x): x is SessionMessage & DaemonMessage => x.type === "session.message" && x.role === "assistant" && x.content === "working on it, cut short",
+    );
+    expect(last).toHaveLength(1);
+    expect(seen.some((x) => x.type === "session.message.delta" && x.messageId === last[0]!.messageId)).toBe(false);
   });
 });
 
