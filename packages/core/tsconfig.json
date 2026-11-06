@@ -1,7 +1,7 @@
 {
   "extends": "../../tsconfig.json",
   "compilerOptions": {
-    "tsBuildInfoFile": "../../node_modules/.cache/tsc/core.tsbuildinfo",
+    "tsBuildInfoFile": "../../.cache/tsc/core.tsbuildinfo",
     "rootDir": "src",
     "noEmit": true
   },
