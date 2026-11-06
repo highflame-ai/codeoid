@@ -522,8 +522,13 @@ afterEach(async () => {
   // Let in-flight fire-and-forget meta writes land before the tmp dir goes
   // away. Without this, tearing down a collaboration's children races their
   // own meta writes and floods the output with ENOENT rename warnings that
-  // would mask a real failure.
-  await Bun.sleep(150);
+  // would mask a real failure. Awaited, not slept for: flush settles every
+  // write chain the store has in flight, and a few rounds catch the writes
+  // that settling handlers start (a turn index written as a turn ends).
+  for (let i = 0; i < 5; i++) {
+    await transcript.flush();
+    await Bun.sleep(2);
+  }
   rmSync(tmp, { recursive: true, force: true });
 });
 
