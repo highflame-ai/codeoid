@@ -13,17 +13,17 @@
  * starts on it.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, renameSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
-import type { CodeoidConfig } from "../../config.js";
+import { type CodeoidConfig, getConfigDir } from "../../config.js";
 import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
 import { buildSandboxSpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, validAllowedHost } from "./policy.js";
-import { worktreeAdminsOf } from "./worktrees.js";
+import { existingFolderName, sessionFolderName, worktreeLocationDirs, worktreeRootNotes, worktreeSignature } from "./worktrees.js";
 import type { SandboxRegistry } from "./registry.js";
 import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "./git-shim.js";
 import { launcherRoot, sandboxRoot } from "./root.js";
@@ -252,7 +252,10 @@ export async function resolveSandbox(opts: {
       ? `Docker access: commands can reach the container runtime (${sockets.join(", ")}), which can reach the whole machine (a container can mount /)`
       : "Docker access was asked for, but no container runtime socket was found here"
     : null;
-  const limits = [...c.plan.limits, ...(net.note ? [net.note] : []), ...(gitNote ? [gitNote] : []), ...(topNote ? [topNote] : []), ...(dockerNote ? [dockerNote] : [])];
+  // `sandbox.worktreeRoots` refused here, or missing and not beside the repository (never made): said (worktrees.ts).
+  const layout = top !== null && opts.config.worktreeRoots.length > 0 ? gitLayoutOf(top) : null;
+  const rootNotes = layout ? worktreeRootNotes(layout, { roots: opts.config.worktreeRoots, configDir: getConfigDir() }) : [];
+  const limits = [...c.plan.limits, ...(net.note ? [net.note] : []), ...(gitNote ? [gitNote] : []), ...(topNote ? [topNote] : []), ...(dockerNote ? [dockerNote] : []), ...rootNotes];
   const applied: NetworkPolicy = net.mode === "allowlist" ? network : { mode: net.mode };
   return {
     info: {
@@ -298,12 +301,18 @@ export class SessionSandbox {
   #homesDir: string | null = null;
   #claudeTemp: ClaudeTempDirs | null = null;
   #gitTempDir: string | null = null;
-  #worktreeBaseline: Set<string> | null = null;
+  /** The session's worktree folder name (worktrees.ts), once found or chosen: the same for its life. */
+  #folderName: string | null = null;
+  /** The worktree folders a spec gave the session: the empty ones are removed at close. */
+  #folders = new Set<string>();
 
   readonly #onWarning: ((text: string) => void) | undefined;
+  readonly #name: () => string;
 
   constructor(opts: {
     sessionId: string;
+    /** The session's name (its worktree folder is named after it, with a short id: worktrees.ts `sessionFolderName`). */
+    name?: string | (() => string);
     workdir: string;
     registry: SandboxRegistry;
     config?: CodeoidConfig;
@@ -313,6 +322,8 @@ export class SessionSandbox {
   }) {
     this.#onWarning = opts.onWarning;
     this.#sessionId = opts.sessionId;
+    const name = opts.name;
+    this.#name = typeof name === "function" ? name : () => name ?? opts.sessionId;
     this.#workdir = opts.workdir;
     this.#registry = opts.registry;
     this.#config = opts.config;
@@ -412,16 +423,24 @@ export class SessionSandbox {
       if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
       return this.#spec(o.backendNetwork ? { mode: "on" } : r.network, backendState, o.readable ?? [], dockerSocket);
     };
-    // Built (and the temp dir made) when a backend first needs it.
+    // Built (and the temp dir made) when a backend first needs it, and again whenever a worktree's admin dir
+    // appeared or went in the repository (#448 round 10): one made meanwhile is held from then on (a Claude query
+    // whose spec changed is rebuilt at its next turn), and one removed is no longer bound.
     let spec: SandboxSpec | null = null;
+    let specFor = "";
     let gitShim: string | null = null;
+    const signature = () => worktreeSignature(gitLayoutOf(sandboxWorkspaceOf(this.#workdir))?.common ?? null);
     this.#runtime = {
       info: r.info,
       plan,
       provider,
       config,
       get spec() {
-        spec ??= open([]);
+        const now = signature();
+        if (!spec || now !== specFor) {
+          spec = open([]);
+          specFor = now;
+        }
         return spec;
       },
       open: async (backendState, o) => this.#track(await provider.open(open(backendState, o))),
@@ -561,7 +580,8 @@ export class SessionSandbox {
   #spec(network: NetworkPolicy, backendState: readonly string[], readable: readonly string[] = [], dockerSocket = false): SandboxSpec {
     // A monorepo's package: the repository's top (#448 round 9); the session's cwd stays the workdir.
     const workspace = sandboxWorkspaceOf(this.#workdir);
-    return buildSandboxSpec({
+    const folder = this.#worktreeFolderName(workspace);
+    const spec = buildSandboxSpec({
       backendReadable: readable,
       sessionId: this.#sessionId,
       workspace,
@@ -570,24 +590,39 @@ export class SessionSandbox {
       network,
       ...(this.#config ? { config: this.#config } : {}),
       backendState,
-      worktreeBaseline: this.#worktreesAtStart(workspace),
+      ...(folder ? { worktreeFolder: folder } : {}),
       dockerSocket,
     });
+    for (const f of spec.worktreeFolders ?? []) this.#folders.add(f);
+    return spec;
   }
 
   /**
-   * The repository's worktrees when this session's sandbox first looked: a
-   * worktree made since, checked out where its commands can write, is the
-   * session's own (worktrees.ts `isOwnWorktree`); every other is held.
-   * Kept for the session's life in this daemon (after a restart, what a
-   * session made before is held like anyone's).
+   * The session's worktree folder name (#448 round 10, worktrees.ts): the
+   * one it already has in a location (found by its short id, so a rename
+   * or a daemon restart keeps it), else its name and short id. Null outside
+   * a repository codeoid can verify.
    */
-  #worktreesAtStart(workspace: string): ReadonlySet<string> {
-    if (!this.#worktreeBaseline) {
-      const common = gitLayoutOf(workspace)?.common;
-      this.#worktreeBaseline = new Set(common ? worktreeAdminsOf(common).map((a) => a.dir) : []);
+  #worktreeFolderName(workspace: string): string | null {
+    if (this.#folderName) return this.#folderName;
+    const layout = gitLayoutOf(workspace);
+    if (!layout?.common) return null;
+    const { locations } = worktreeLocationDirs(layout, { roots: this.config.worktreeRoots, configDir: getConfigDir() });
+    this.#folderName = existingFolderName(locations, this.#sessionId) ?? sessionFolderName(this.#name(), this.#sessionId);
+    return this.#folderName;
+  }
+
+  /**
+   * Where the session's commands may check a git worktree out: its own
+   * folder in each worktree location (SandboxSpec.worktreeFolders), as the
+   * running sandbox has them; empty without one.
+   */
+  worktreeFolders(): string[] {
+    try {
+      return [...(this.#runtime?.spec.worktreeFolders ?? [])];
+    } catch {
+      return [];
     }
-    return this.#worktreeBaseline;
   }
 
   /** The session's private temp dir (made on first use, 0700). */
@@ -615,6 +650,15 @@ export class SessionSandbox {
     for (const dir of [this.#launcherDir, this.#homesDir, this.#gitTempDir, this.#claudeTemp ? join(this.#claudeTemp.cli, "..") : null]) {
       if (dir) rmSync(dir, { recursive: true, force: true });
     }
+    // The session's worktree folders it left empty: never one with anything in it (a worktree is the user's to keep).
+    for (const f of this.#folders) {
+      try {
+        rmdirSync(f);
+      } catch {
+        /* not empty, or gone */
+      }
+    }
+    this.#folders.clear();
     this.#launcherDir = null;
     this.#gitTempDir = null;
     this.#homesDir = null;

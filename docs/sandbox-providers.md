@@ -37,14 +37,15 @@ interface SandboxSpec {
   privateTemp?: boolean;      // a fresh temp dir per program, gone when it exits, never tempDir itself (the git shim's):
                               //   bwrap/Docker a tmpfs /tmp; Seatbelt a dir the wrapper makes in tempDir and removes
   writable: string[];         // the backend's private home (when its whole process is inside); a git repository's dirs (its
-                              // worktrees/ too); the cache dir; the repository's worktree locations
+                              // worktrees/ too); the cache dir; the session's own folder in each worktree location
                               // (each bound at its own path: none may be renamed, as a mount point can't)
   hidden: string[];           // not readable at all (the user's home first, whole)
   reexposed: string[];        // read-only inside something hidden (the home allowlist, the backend's program and login)
   readOnly?: string[];        // read-only inside something writable, with what is in it (what picks a repository's config,
                               // hooks and git dir; the project settings agent CLIs run code from); each exists
   gitDirs?: string[];         // the git dirs a commit writes (a backend's own sandbox's extra writable roots)
-  worktreeLocations?: string[]; // where a command checks a new worktree out (in writable too; a backend's own sandbox's roots)
+  worktreeFolders?: string[]; // the session's folder in each worktree location: where a command checks a new worktree out
+                              // (in writable too; a backend's own sandbox's roots); nothing else of a location is writable
   env?: Record<string, string>; // set inside: the toolchains' caches in the sandbox's cache dir
   pinned?: string[];          // can't be renamed or removed, contents still writable (a dir between the workspace and a hidden path)
   containerSockets: string[]; // never reachable

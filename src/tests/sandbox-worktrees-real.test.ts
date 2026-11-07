@@ -1,7 +1,8 @@
 /**
- * Real bubblewrap (#448 follow-up), skipped where it can't run: an agent
- * makes git worktrees inside the sandbox, and tests that start containers
- * get the container runtime's socket only when the owner opted in.
+ * Real bubblewrap (#448 follow-up, round 10), skipped where it can't run: an
+ * agent makes git worktrees inside the sandbox, in its own folder of each
+ * worktree location only, and tests that start containers get the container
+ * runtime's socket only when the owner opted in.
  *
  * Everything destructive runs INSIDE the sandbox under test, against a
  * repository this test planted in its own temp dir; "the user's next git"
@@ -10,15 +11,17 @@
  * is touched: a listening unix socket this test makes stands in for one.
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
-import { gitControlSnapshot } from "../daemon/sandbox/git-watch.js";
+import { gitControlChanges, gitControlSnapshot } from "../daemon/sandbox/git-watch.js";
 import { buildSandboxSpec, dockerSocketPaths } from "../daemon/sandbox/policy.js";
+import { SandboxRegistry } from "../daemon/sandbox/registry.js";
+import { SessionSandbox } from "../daemon/sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../daemon/sandbox/types.js";
-import { noteCodeoidWorktree, worktreeAdminsOf } from "../daemon/sandbox/worktrees.js";
+import { noteCodeoidWorktree } from "../daemon/sandbox/worktrees.js";
 
 const provider = new BwrapSandboxProvider();
 const probe = await provider.probe();
@@ -57,7 +60,9 @@ function git(args: string[], cwd: string, home: string): string {
   return r.stdout.toString();
 }
 
-describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an agent's own git worktrees", () => {
+const FOLDER = "agent-1111aaaa";
+
+describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an agent's own git worktrees, in its own folder (#448 round 10)", () => {
   let root: string;
   beforeAll(() => {
     root = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-wt-")));
@@ -67,12 +72,12 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
   const sh = (h: SandboxHandle, cwd: string, script: string, env: Record<string, string>) => h.exec(["/bin/sh", "-c", script], { cwd, env, timeoutMs: 30_000 });
 
   /**
-   * A repository with a commit, two worktrees of the user's (one beside it,
-   * one in its `-worktrees` location), and one whose checkout is gone (as
-   * after an unmounted disk: `git worktree prune` would remove it). The
-   * session's baseline is what is there now, as SessionSandbox takes it.
+   * A repository with a commit; the user's worktrees (one beside it, one in
+   * its `-worktrees` location); one whose checkout is gone (as after an
+   * unmounted disk); another session's worktree in its own folder there; and
+   * a codeoid fork's checkout. The session under test is `FOLDER`'s.
    */
-  function fixture(name: string, opts: { workspace?: "main" | "worktree" } = {}) {
+  function fixture(name: string, opts: { workspace?: "main" | "worktree"; config?: unknown } = {}) {
     const dir = join(root, name);
     const home = join(dir, "home");
     const repo = join(dir, "repo");
@@ -82,16 +87,25 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
     writeFileSync(join(repo, "a.txt"), "a\n");
     git(["add", "."], repo, home);
     git(["commit", "-qm", "init"], repo, home);
+    const loc = join(dir, "repo-worktrees");
     const userWt = join(dir, "userwt");
     git(["worktree", "add", "-q", "-b", "user", userWt], repo, home);
-    const userLoc = join(dir, "repo-worktrees", "userloc");
+    const userLoc = join(loc, "userloc");
     git(["worktree", "add", "-q", "-b", "userloc", userLoc], repo, home);
     const gone = join(dir, "gone");
     git(["worktree", "add", "-q", "-b", "gone", gone], repo, home);
     rmSync(gone, { recursive: true, force: true });
+    // Another session's worktree, in its folder.
+    const otherWt = join(loc, "other-2222bbbb", "ow");
+    git(["worktree", "add", "-q", "-b", "ow", otherWt], repo, home);
+    // A codeoid fork's checkout.
+    const fork = join(loc, "fork-3333cccc");
+    noteCodeoidWorktree(fork);
+    git(["worktree", "add", "-q", "-b", "fork", fork], repo, home);
     let ws = repo;
     if (opts.workspace === "worktree") {
-      ws = join(dir, "repo-worktrees", "session");
+      ws = join(loc, "session-4444dddd");
+      noteCodeoidWorktree(ws);
       git(["worktree", "add", "-q", "-b", "session", ws], repo, home);
     }
     const common = join(repo, ".git");
@@ -100,17 +114,17 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
     writeFileSync(mark, `#!/bin/sh\necho ran >> '${marker}'\n`, { mode: 0o755 });
     const tmp = join(dir, "tmp");
     mkdirSync(tmp);
-    const baseline = new Set(worktreeAdminsOf(common).map((a) => a.dir));
-    const spec = () =>
+    const spec = (folder: string = FOLDER) =>
       buildSandboxSpec({
         sessionId: name,
         workspace: ws,
         tempDir: tmp,
         network: { mode: "off" },
+        ...(opts.config ? { config: opts.config as never } : {}),
         hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" },
-        worktreeBaseline: baseline,
+        worktreeFolder: folder,
       });
-    return { dir, home, repo, ws, common, userWt, userLoc, gone, marker, mark, spec, env: gitEnv(home) };
+    return { dir, home, repo, ws, loc, own: join(loc, FOLDER), common, userWt, userLoc, gone, otherWt, fork, marker, mark, spec, env: gitEnv(home) };
   }
 
   /** The user's next git in `cwd`, outside the session's sandbox (it may write only the test's dir). */
@@ -119,57 +133,118 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
     Bun.spawnSync([bwrap, "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--bind", f.dir, f.dir, "--chdir", cwd, "--", "git", "status", "--short"], { env: gitEnv(f.home) });
   }
 
-  test("git worktree add in the sibling -worktrees location, commit there, list, remove, add in .worktrees, prune: all from inside", async () => {
-    const f = fixture("add");
+  test("in its own folder: git worktree add, commit, rebase, list, remove, prune; from a linked worktree in .worktrees/<folder> too; still its own in the next sandbox", async () => {
+    for (const workspace of ["main", "worktree"] as const) {
+      const f = fixture(`add-${workspace}`, { workspace });
+      const spec = f.spec();
+      expect(spec.worktreeFolders).toEqual(workspace === "main" ? [f.own] : [f.own, join(f.repo, ".worktrees", FOLDER)]);
+      const h = await provider.open(spec);
+      try {
+        const add = await sh(h, f.ws, `git worktree add '${join(f.own, "x")}' -b feature/x 2>&1 && echo ADDED`, f.env);
+        expect(add.stdout).toContain("ADDED");
+        const commit = await sh(h, join(f.own, "x"), "echo x > x.txt && git add x.txt && git commit -qm in-worktree && echo COMMITTED && git rebase -q main && echo REBASED", f.env);
+        expect(commit.stdout).toContain("COMMITTED");
+        expect(commit.stdout).toContain("REBASED");
+        expect((await sh(h, f.ws, "git worktree list --porcelain", f.env)).stdout).toContain(join(f.own, "x"));
+        expect((await sh(h, f.ws, `git worktree remove '${join(f.own, "x")}' && echo REMOVED && git worktree prune && echo PRUNED`, f.env)).stdout).toContain("PRUNED");
+        if (workspace === "worktree") {
+          const dot = join(f.repo, ".worktrees", FOLDER, "z");
+          const r = await sh(h, f.ws, `git worktree add -q '${dot}' -b z && echo ADDED-Z && git worktree remove '${dot}' && echo REMOVED-Z`, f.env);
+          expect(r.stdout).toContain("REMOVED-Z");
+        }
+        expect((await sh(h, f.ws, `git worktree add -q '${join(f.own, "mine")}' -b mine-${workspace} && echo ADDED`, f.env)).stdout).toContain("ADDED");
+      } finally {
+        await h.close();
+      }
+      // The next sandbox (a backend restarted, the next query, a daemon restart): it is checked out in the session's folder.
+      const h2 = await provider.open(f.spec());
+      try {
+        const r = await sh(h2, join(f.own, "mine"), `echo m > m.txt && git add m.txt && git commit -qm mine && echo COMMITTED && cd '${f.ws}' && git worktree remove --force '${join(f.own, "mine")}' && echo REMOVED`, f.env);
+        expect(r.stdout).toContain("COMMITTED");
+        expect(r.stdout).toContain("REMOVED");
+      } finally {
+        await h2.close();
+      }
+      expect(git(["log", "--oneline", "feature/x"], f.repo, f.home)).toContain("in-worktree");
+      expect(git(["log", "--oneline", `mine-${workspace}`], f.repo, f.home)).toContain("mine");
+      expect(existsSync(join(f.common, "worktrees", "x"))).toBe(false);
+      expect(existsSync(join(f.common, "worktrees", "gone"))).toBe(true);
+      expect(git(["status", "--short"], f.userLoc, f.home)).toBe("");
+    }
+  });
+
+  test("anywhere else in a location it fails (Read-only file system): the location itself, another session's folder, the main checkout's .worktrees from a session there", async () => {
+    const f = fixture("elsewhere");
     const h = await provider.open(f.spec());
     try {
-      const add = await sh(h, f.repo, "git worktree add ../repo-worktrees/x -b feature/x && echo ADDED", f.env);
-      expect(add.stderr).not.toContain("Operation not permitted");
-      expect(add.stdout).toContain("ADDED");
-      const commit = await sh(h, join(f.dir, "repo-worktrees", "x"), "echo x > x.txt && git add x.txt && git commit -qm in-worktree && echo COMMITTED && git rebase -q main && echo REBASED", f.env);
-      expect(commit.stdout).toContain("COMMITTED");
-      expect(commit.stdout).toContain("REBASED");
-      const list = await sh(h, f.repo, "git worktree list --porcelain", f.env);
-      expect(list.stdout).toContain(join(f.dir, "repo-worktrees", "x"));
-      // A second one, in the repository's .worktrees, then both gone again.
-      const more = await sh(h, f.repo, "git worktree add -q .worktrees/y -b y && echo ADDED-Y && git worktree remove ../repo-worktrees/x && echo REMOVED-X && git worktree remove .worktrees/y && echo REMOVED-Y", f.env);
-      expect(more.stdout).toContain("ADDED-Y");
-      expect(more.stdout).toContain("REMOVED-X");
-      expect(more.stdout).toContain("REMOVED-Y");
-      // prune runs; the user's admin dir whose checkout is gone (an unmounted disk) is not the session's to remove.
-      const prune = await sh(h, f.repo, "git worktree prune; echo PRUNED", f.env);
-      expect(prune.stdout).toContain("PRUNED");
+      const r = await sh(
+        h,
+        f.repo,
+        [
+          `git worktree add '${join(f.loc, "x")}' -b x 2>&1 && echo ADDED-IN-LOCATION || echo LOCATION-REFUSED`,
+          `git worktree add '${join(f.loc, "other-2222bbbb", "y")}' -b y 2>&1 && echo ADDED-IN-OTHER || echo OTHER-REFUSED`,
+          `mkdir '${join(f.loc, "mine-too")}' 2>&1 && echo MADE-FOLDER || echo FOLDER-REFUSED`,
+          "git worktree add .worktrees/z -b z 2>&1 && echo ADDED-DOT || echo DOT-REFUSED",
+        ].join("; "),
+        f.env,
+      );
+      for (const w of ["LOCATION-REFUSED", "OTHER-REFUSED", "FOLDER-REFUSED", "DOT-REFUSED"]) expect(r.stdout).toContain(w);
+      expect(r.stdout).toContain("Read-only file system");
     } finally {
       await h.close();
     }
-    expect(git(["log", "--oneline", "feature/x"], f.repo, f.home)).toContain("in-worktree");
-    expect(existsSync(join(f.dir, "repo-worktrees", "x"))).toBe(false);
-    expect(existsSync(join(f.common, "worktrees", "x"))).toBe(false);
-    expect(existsSync(join(f.common, "worktrees", "gone"))).toBe(true);
-    expect(git(["status", "--short"], f.userLoc, f.home)).toBe("");
+    for (const p of [join(f.loc, "x"), join(f.loc, "other-2222bbbb", "y"), join(f.loc, "mine-too"), join(f.repo, ".worktrees", "z")]) expect(existsSync(p)).toBe(false);
   });
 
-  test("a worktree the session made stays its own in its next sandbox: committed in and removed there", async () => {
-    const f = fixture("own");
-    const h1 = await provider.open(f.spec());
-    try {
-      expect((await sh(h1, f.repo, "git worktree add -q ../repo-worktrees/mine -b mine && echo ADDED", f.env)).stdout).toContain("ADDED");
-    } finally {
-      await h1.close();
+  test("another session's folder, the user's worktrees and a codeoid fork stay read-only, and so do a folder and a fork made after the sandbox opened", async () => {
+    for (const workspace of ["main", "worktree"] as const) {
+      const f = fixture(`others-${workspace}`, { workspace });
+      const h = await provider.open(f.spec());
+      // Made while the sandbox runs: another session's folder with a worktree in it, and a codeoid fork.
+      const lateOther = join(f.loc, "late-5555eeee", "lw");
+      git(["worktree", "add", "-q", "-b", "lw", lateOther], f.repo, f.home);
+      const lateFork = join(f.loc, "fork2-6666ffff");
+      noteCodeoidWorktree(lateFork);
+      git(["worktree", "add", "-q", "-b", "fork2", lateFork], f.repo, f.home);
+      try {
+        const lines: string[] = [];
+        for (const [tag, at] of [["OTHER", f.otherWt], ["USERLOC", f.userLoc], ["USERWT", f.userWt], ["FORK", f.fork], ["LATE", lateOther], ["LATEFORK", lateFork]] as const) {
+          lines.push(`echo hi > '${join(at, "new.txt")}' 2>/dev/null && echo WROTE-${tag} || echo ${tag}-READ-ONLY`);
+          lines.push(`echo "gitdir: /planted" > '${join(at, ".git")}' 2>/dev/null && echo REDIRECTED-${tag} || echo ${tag}-DOTGIT-HELD`);
+          lines.push(`mkdir -p '${join(at, ".claude")}' 2>/dev/null; echo '{}' > '${join(at, ".claude", "settings.json")}' 2>/dev/null && echo SETTINGS-${tag} || echo ${tag}-SETTINGS-HELD`);
+        }
+        lines.push(`git worktree remove --force '${f.otherWt}' 2>/dev/null && echo REMOVED-OTHER || echo OTHER-NOT-REMOVED`);
+        lines.push(`mkdir '${join(f.loc, "late-5555eeee", "planted")}' 2>/dev/null && echo WROTE-LATE-FOLDER || echo LATE-FOLDER-READ-ONLY`);
+        const r = await sh(h, f.ws, lines.join("; "), f.env);
+        for (const tag of ["OTHER", "USERLOC", "USERWT", "FORK", "LATE", "LATEFORK"]) {
+          expect(r.stdout).toContain(`${tag}-READ-ONLY`);
+          expect(r.stdout).toContain(`${tag}-DOTGIT-HELD`);
+          expect(r.stdout).toContain(`${tag}-SETTINGS-HELD`);
+        }
+        expect(r.stdout).toContain("OTHER-NOT-REMOVED");
+        expect(r.stdout).toContain("LATE-FOLDER-READ-ONLY");
+      } finally {
+        await h.close();
+      }
+      // The next sandbox holds the late ones' admin dirs too.
+      const h2 = await provider.open(f.spec());
+      try {
+        const r = await sh(h2, f.ws, `echo x > '${join(f.common, "worktrees", "lw", "commondir")}' 2>/dev/null && echo REWROTE-LATE || echo LATE-ADMIN-HELD; echo x > '${join(f.common, "worktrees", "fork2-6666ffff", "commondir")}' 2>/dev/null && echo REWROTE-FORK || echo FORK-ADMIN-HELD`, f.env);
+        expect(r.stdout).toContain("LATE-ADMIN-HELD");
+        expect(r.stdout).toContain("FORK-ADMIN-HELD");
+      } finally {
+        await h2.close();
+      }
+      for (const at of [f.otherWt, f.userLoc, f.userWt, f.fork, lateOther, lateFork]) {
+        expect(existsSync(join(at, "new.txt"))).toBe(false);
+        expect(readFileSync(join(at, ".git"), "utf8")).not.toContain("planted");
+        userGit(f, at);
+      }
+      expect(existsSync(f.marker)).toBe(false);
     }
-    // The next sandbox (a backend restarted, the next query) is built with the same baseline.
-    const h2 = await provider.open(f.spec());
-    try {
-      const r = await sh(h2, join(f.dir, "repo-worktrees", "mine"), "echo m > m.txt && git add m.txt && git commit -qm mine && echo COMMITTED && cd ../../repo && git worktree remove --force ../repo-worktrees/mine && echo REMOVED", f.env);
-      expect(r.stdout).toContain("COMMITTED");
-      expect(r.stdout).toContain("REMOVED");
-    } finally {
-      await h2.close();
-    }
-    expect(git(["log", "--oneline", "mine"], f.repo, f.home)).toContain("mine");
   });
 
-  test("the user's worktrees can't be redirected, renamed, removed or pruned; worktrees/ can't be swapped; config and hooks stay read-only", async () => {
+  test("the repository's existing worktrees can't be redirected, renamed, removed or pruned; worktrees/ can't be swapped; config and hooks stay read-only", async () => {
     for (const workspace of ["main", "worktree"] as const) {
       const f = fixture(`held-${workspace}`, { workspace });
       const wts = join(f.common, "worktrees");
@@ -179,24 +254,21 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
           h,
           f.ws,
           [
-            `cp -r '${f.common}' "$PWD/.evil" && git --git-dir="$PWD/.evil" config core.fsmonitor '${f.mark}' && echo BUILT`,
+            `cp -r '${f.common}' '${join(f.own, "evil")}' && git --git-dir='${join(f.own, "evil")}' config core.fsmonitor '${f.mark}' && echo BUILT`,
             // An existing worktree's admin files: what decides where git looks.
-            `echo "$PWD/.evil" > '${join(wts, "userwt", "commondir")}' 2>/dev/null && echo REWROTE-COMMONDIR || echo COMMONDIR-HELD`,
+            `echo '${join(f.own, "evil")}' > '${join(wts, "userwt", "commondir")}' 2>/dev/null && echo REWROTE-COMMONDIR || echo COMMONDIR-HELD`,
             `echo x > '${join(wts, "userwt", "gitdir")}' 2>/dev/null && echo REWROTE-GITDIR || echo GITDIR-HELD`,
             `echo '[core]' > '${join(wts, "userloc", "config.worktree")}' 2>/dev/null && echo WROTE-CONFIG-WORKTREE || echo CONFIG-WORKTREE-HELD`,
+            `echo x > '${join(wts, "ow", "commondir")}' 2>/dev/null && echo REWROTE-OTHER-ADMIN || echo OTHER-ADMIN-HELD`,
             // Renamed away, then planted again under its name.
             `mv '${join(wts, "userwt")}' '${join(wts, "moved")}' 2>/dev/null && echo MOVED-ADMIN || echo ADMIN-PINNED`,
             `rm -rf '${join(wts, "userwt")}' 2>/dev/null; [ -f '${join(wts, "userwt", "commondir")}' ] && echo ADMIN-KEPT || echo ADMIN-REMOVED`,
             `mv '${wts}' '${join(f.common, "wt-old")}' 2>/dev/null && echo MOVED-WORKTREES || echo WORKTREES-PINNED`,
-            // The checkout in a worktree location the session didn't make: not removed, not redirected.
-            `git worktree remove --force '${f.userLoc}' 2>/dev/null && echo REMOVED-USERLOC || echo USERLOC-NOT-REMOVED`,
-            `echo "gitdir: $PWD/.evil" > '${join(f.userLoc, ".git")}' 2>/dev/null && echo REDIRECTED-USERLOC || echo USERLOC-DOTGIT-HELD`,
-            `echo hi > '${join(f.userLoc, "new.txt")}' 2>/dev/null && echo WROTE-USERLOC || echo USERLOC-READ-ONLY`,
-            // The checkout outside every location: its .git file isn't the session's either.
-            `echo "gitdir: $PWD/.evil" > '${join(f.userWt, ".git")}' 2>/dev/null && echo REDIRECTED-USERWT || echo USERWT-HELD`,
             // A prunable worktree of the user's (its disk unmounted) stays.
             "git worktree prune 2>/dev/null; echo PRUNE-RAN",
             `[ -d '${join(wts, "gone")}' ] && echo GONE-KEPT || echo GONE-PRUNED`,
+            // The session's own folder can't be renamed away either.
+            `mv '${f.own}' '${join(f.own, "..", "renamed")}' 2>/dev/null && echo MOVED-OWN || echo OWN-PINNED`,
             // The repository's own structure, as before.
             `echo bad >> '${join(f.common, "config")}' 2>/dev/null && echo WROTE-CONFIG || echo CONFIG-HELD`,
             `echo bad > '${join(f.common, "hooks", "post-checkout")}' 2>/dev/null && echo WROTE-HOOK || echo HOOKS-HELD`,
@@ -205,33 +277,29 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
           f.env,
         );
         expect(r.stdout).toContain("BUILT");
-        for (const held of ["COMMONDIR-HELD", "GITDIR-HELD", "CONFIG-WORKTREE-HELD", "ADMIN-PINNED", "ADMIN-KEPT", "WORKTREES-PINNED", "USERLOC-NOT-REMOVED", "USERLOC-DOTGIT-HELD", "USERLOC-READ-ONLY", "USERWT-HELD", "PRUNE-RAN", "GONE-KEPT", "CONFIG-HELD", "HOOKS-HELD", "INFO-HELD"]) {
+        for (const held of ["COMMONDIR-HELD", "GITDIR-HELD", "CONFIG-WORKTREE-HELD", "OTHER-ADMIN-HELD", "ADMIN-PINNED", "ADMIN-KEPT", "WORKTREES-PINNED", "PRUNE-RAN", "GONE-KEPT", "OWN-PINNED", "CONFIG-HELD", "HOOKS-HELD", "INFO-HELD"]) {
           expect(r.stdout).toContain(held);
         }
-        // Still: a worktree of its own, and a commit where it works.
-        const own = await sh(h, f.ws, "git worktree add -q ../repo-worktrees/agent -b agent 2>&1 && echo ADDED", f.env);
-        expect(own.stdout).toContain("ADDED");
+        // Still: a commit where it works.
         writeFileSync(join(f.ws, "w.txt"), "w\n");
         expect((await sh(h, f.ws, "git add w.txt && git commit -qm inside && echo COMMITTED", f.env)).stdout).toContain("COMMITTED");
       } finally {
         await h.close();
       }
-      expect(readFileSync(join(f.userLoc, "a.txt"), "utf8")).toBe("a\n");
-      for (const at of [f.ws, f.userWt, f.userLoc, f.repo]) userGit(f, at);
+      for (const at of [f.ws, f.userWt, f.userLoc, f.repo, f.otherWt]) userGit(f, at);
       expect(existsSync(f.marker)).toBe(false);
     }
   });
 
-  test("planting an admin dir: a new one is the session's own, never one a checkout of the user's names", async () => {
+  test("planting an admin dir under a held one's name fails; a new one is the session's own only when checked out in its folder", async () => {
     const f = fixture("plant");
     const wts = join(f.common, "worktrees");
     const h = await provider.open(f.spec());
     try {
-      // The user's checkout names worktrees/userwt: held, so nothing can be laid in its place.
       const r = await sh(
         h,
         f.repo,
-        `cp -r '${f.common}' "$PWD/.evil" && git --git-dir="$PWD/.evil" config core.fsmonitor '${f.mark}'; mkdir -p '${join(wts, "userwt", "x")}' 2>/dev/null && echo MADE-IN-USERS || echo USERS-HELD; echo "$PWD/.evil" > '${join(wts, "userwt", "commondir.new")}' 2>/dev/null && echo WROTE-BESIDE || echo USERS-DIR-HELD`,
+        `mkdir -p '${join(wts, "userwt", "x")}' 2>/dev/null && echo MADE-IN-USERS || echo USERS-HELD; echo x > '${join(wts, "userwt", "commondir.new")}' 2>/dev/null && echo WROTE-BESIDE || echo USERS-DIR-HELD`,
         f.env,
       );
       expect(r.stdout).toContain("USERS-HELD");
@@ -243,42 +311,78 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
     expect(existsSync(f.marker)).toBe(false);
   });
 
-  test("a worktree added by someone else after the session started is held in the session's next sandbox (outside the locations, or made by codeoid)", async () => {
-    const f = fixture("late");
-    const late = join(f.dir, "late");
-    git(["worktree", "add", "-q", "-b", "late", late], f.repo, f.home);
-    const fork = join(f.dir, "repo-worktrees", "fork");
-    noteCodeoidWorktree(fork);
-    git(["worktree", "add", "-q", "-b", "fork", fork], f.repo, f.home);
-    const h = await provider.open(f.spec());
+  test("a session's sandbox spec is built again when a worktree appears: a fork made after its first query is held from then on (SessionSandbox)", async () => {
+    const f = fixture("refresh");
+    const registry = new SandboxRegistry("linux");
+    registry.register(provider);
+    const sbx = new SessionSandbox({ sessionId: "1111aaaa-0000-4000-8000-000000000000", name: "agent", workdir: f.repo, registry, setting: { provider: "bwrap", network: "off" } });
     try {
-      const r = await sh(
-        h,
-        f.repo,
-        `echo x > '${join(f.common, "worktrees", "late", "commondir")}' 2>/dev/null && echo REWROTE-LATE || echo LATE-HELD; echo x > '${join(f.common, "worktrees", "fork", "commondir")}' 2>/dev/null && echo REWROTE-FORK || echo FORK-HELD; echo x > '${join(fork, "f.txt")}' 2>/dev/null && echo WROTE-FORK || echo FORK-CHECKOUT-HELD`,
-        f.env,
-      );
-      expect(r.stdout).toContain("LATE-HELD");
-      expect(r.stdout).toContain("FORK-HELD");
-      expect(r.stdout).toContain("FORK-CHECKOUT-HELD");
+      const info = await sbx.refresh("pi");
+      expect(info.state).toBe("on");
+      const rt = sbx.runtimeFor("pi");
+      if (!rt) throw new Error("no runtime");
+      const first = rt.spec;
+      expect(rt.spec).toBe(first);
+      expect(sbx.worktreeFolders()).toEqual([join(f.loc, FOLDER)]);
+      const fork = join(f.loc, "fork9-7777aaaa");
+      noteCodeoidWorktree(fork);
+      git(["worktree", "add", "-q", "-b", "fork9", fork], f.repo, f.home);
+      const next = rt.spec;
+      expect(next).not.toBe(first);
+      expect(next.readOnly).toContain(join(f.common, "worktrees", "fork9-7777aaaa"));
+      const h = await provider.open(next);
+      try {
+        const r = await sh(h, f.repo, `echo x > '${join(f.common, "worktrees", "fork9-7777aaaa", "commondir")}' 2>/dev/null && echo REWROTE || echo FORK-ADMIN-HELD; echo x > '${join(fork, "f.txt")}' 2>/dev/null && echo WROTE || echo FORK-CHECKOUT-HELD`, f.env);
+        expect(r.stdout).toContain("FORK-ADMIN-HELD");
+        expect(r.stdout).toContain("FORK-CHECKOUT-HELD");
+      } finally {
+        await h.close();
+      }
     } finally {
-      await h.close();
+      await sbx.close();
     }
+    // Its folder, left empty, is removed with the session.
+    expect(existsSync(join(f.loc, FOLDER))).toBe(false);
   });
 
-  test("the end-of-turn warning: a worktree git made reads as nothing changed; one naming another repository is named", async () => {
+  test("the end-of-turn warning: a worktree git made in the session's folder reads as nothing changed; its .git pointed at a planted git dir is named", async () => {
     const f = fixture("watch");
-    const before = gitControlSnapshot(f.repo, f.home);
-    const h = await provider.open(f.spec());
+    const opts = { ownFolders: [f.own] };
+    const spec = f.spec();
+    const before = gitControlSnapshot(f.repo, f.home, opts);
+    const h = await provider.open(spec);
     try {
-      await sh(h, f.repo, "git worktree add -q ../repo-worktrees/w -b w", f.env);
+      await sh(h, f.repo, `git worktree add -q '${join(f.own, "w")}' -b w`, f.env);
     } finally {
       await h.close();
     }
-    const after = gitControlSnapshot(f.repo, f.home);
-    expect([...after.keys()].filter((k) => !before.has(k))).toEqual([]);
-    writeFileSync(join(f.common, "worktrees", "w", "commondir"), "/elsewhere\n");
-    expect([...gitControlSnapshot(f.repo, f.home).keys()].some((k) => k.includes("worktrees/w/commondir"))).toBe(true);
+    const after = gitControlSnapshot(f.repo, f.home, opts);
+    expect(gitControlChanges(before, after)).toEqual([]);
+    // The agent redirects its own worktree's .git to a copy of the git dir carrying core.fsmonitor.
+    const h2 = await provider.open(spec);
+    try {
+      const r = await sh(
+        h2,
+        f.repo,
+        `cp -r '${f.common}' '${join(f.own, ".evil")}' && git --git-dir='${join(f.own, ".evil")}' config core.fsmonitor '${f.mark}' && echo "gitdir: ${join(f.own, ".evil")}" > '${join(f.own, "w", ".git")}' && echo REDIRECTED`,
+        f.env,
+      );
+      expect(r.stdout).toContain("REDIRECTED");
+    } finally {
+      await h2.close();
+    }
+    const changed = gitControlChanges(after, gitControlSnapshot(f.repo, f.home, opts));
+    expect(changed).toContain(join(f.own, "w", ".git"));
+    // A .git dir planted in the folder (a repository of its own, its config obeyed there) is named too.
+    const before3 = gitControlSnapshot(f.repo, f.home, opts);
+    mkdirSync(join(f.own, "clone", ".git"), { recursive: true });
+    writeFileSync(join(f.own, "clone", ".git", "config"), "[core]\n");
+    expect(gitControlChanges(before3, gitControlSnapshot(f.repo, f.home, opts))).toContain(join(f.own, "clone", ".git"));
+    // Another's admin dir changed is named; one removed is not news.
+    const before4 = gitControlSnapshot(f.repo, f.home, opts);
+    writeFileSync(join(f.common, "worktrees", "ow", "gitdir"), "/elsewhere/.git\n");
+    rmSync(join(f.common, "worktrees", "userloc"), { recursive: true, force: true });
+    expect(gitControlChanges(before4, gitControlSnapshot(f.repo, f.home, opts))).toEqual([".git/worktrees/ow/gitdir"]);
   });
 
   test("a location planted as a link (.worktrees in the main checkout, made by a command) leads no later session anywhere", async () => {
@@ -286,19 +390,15 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
     const elsewhere = join(f.dir, "elsewhere");
     mkdirSync(elsewhere);
     writeFileSync(join(elsewhere, "keep.txt"), "keep\n");
-    // A session in the main checkout: its workspace, so it may make `.worktrees` a link.
-    const h = await provider.open(f.spec());
-    try {
-      expect((await sh(h, f.repo, `ln -s '${elsewhere}' .worktrees && echo LINKED`, f.env)).stdout).toContain("LINKED");
-    } finally {
-      await h.close();
-    }
+    // Made by a command before any sandbox held .worktrees (or by hand).
+    rmSync(join(f.repo, ".worktrees"), { recursive: true, force: true });
+    symlinkSync(elsewhere, join(f.repo, ".worktrees"));
     // A later session in a linked worktree of the repository: `.worktrees` would be a location of its own.
-    const ws = join(f.dir, "repo-worktrees", "later");
+    const ws = join(f.loc, "later");
     git(["worktree", "add", "-q", "-b", "later", ws], f.repo, f.home);
-    const spec = buildSandboxSpec({ sessionId: "later", workspace: ws, tempDir: join(f.dir, "tmp"), network: { mode: "off" }, hidden: { home: f.home, configDir: join(f.home, ".codeoid"), env: { HOME: f.home }, daemonTmp: "/tmp" } });
-    expect(spec.worktreeLocations ?? []).not.toContain(elsewhere);
-    expect(spec.writable).not.toContain(elsewhere);
+    const spec = buildSandboxSpec({ sessionId: "later", workspace: ws, tempDir: join(f.dir, "tmp"), network: { mode: "off" }, hidden: { home: f.home, configDir: join(f.home, ".codeoid"), env: { HOME: f.home }, daemonTmp: "/tmp" }, worktreeFolder: "later-8888aaaa" });
+    expect(spec.worktreeFolders ?? []).toEqual([join(f.loc, "later-8888aaaa")]);
+    expect(spec.writable.some((w) => w.startsWith(elsewhere))).toBe(false);
     const h2 = await provider.open(spec);
     try {
       const r = await sh(h2, ws, `echo x > '${join(elsewhere, "keep.txt")}' 2>/dev/null && echo WROTE || echo ELSEWHERE-READ-ONLY`, f.env);
@@ -307,32 +407,46 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
       await h2.close();
     }
     expect(readFileSync(join(elsewhere, "keep.txt"), "utf8")).toBe("keep\n");
+    expect(readdirSync(elsewhere)).toEqual(["keep.txt"]);
   });
 
-  test("sandbox.worktreeRoots: a configured location is writable; one holding the repository, or the home, is not", async () => {
-    const f = fixture("roots");
-    const extra = join(f.dir, "elsewhere", "wts");
-    const config = { sandbox: { worktreeRoots: [extra, "..", "~"] } } as never;
-    const spec = buildSandboxSpec({
-      sessionId: "roots",
-      workspace: f.repo,
-      tempDir: join(f.dir, "tmp"),
-      network: { mode: "off" },
-      config,
-      hidden: { home: f.home, configDir: join(f.home, ".codeoid"), env: { HOME: f.home }, daemonTmp: "/tmp" },
-      worktreeBaseline: new Set(worktreeAdminsOf(f.common).map((a) => a.dir)),
-    });
-    expect(spec.worktreeLocations).toContain(realpathSync(extra));
-    expect(spec.worktreeLocations).not.toContain(f.dir);
-    expect(spec.worktreeLocations).not.toContain(f.home);
+  test("sandbox.worktreeRoots: a root shared by repositories gets <root>/<repo>/<folder>; another repository's worktree there stays read-only; a missing root elsewhere isn't made; a refused one isn't used", async () => {
+    const base = join(root, "roots-elsewhere");
+    const shared = join(base, "shared");
+    mkdirSync(shared, { recursive: true });
+    const f = fixture("roots", { config: { sandbox: { worktreeRoots: [shared, join(base, "missing"), "../beside", "~/.config", "~"] } } });
+    // Repository B's worktree in the shared root (the docs' old `~/wt` shape).
+    const b = join(base, "b");
+    mkdirSync(b);
+    git(["init", "-q", "-b", "main"], b, f.home);
+    writeFileSync(join(b, "b.txt"), "b\n");
+    git(["add", "."], b, f.home);
+    git(["commit", "-qm", "b"], b, f.home);
+    const bFeat = join(shared, "b-feat");
+    git(["worktree", "add", "-q", "-b", "feat", bFeat], b, f.home);
+    const spec = f.spec();
+    const mine = join(shared, "repo", FOLDER);
+    const beside = join(f.dir, "beside", "repo", FOLDER);
+    expect(spec.worktreeFolders).toEqual([f.own, mine, beside]);
+    expect(existsSync(join(base, "missing"))).toBe(false);
     const h = await provider.open(spec);
     try {
-      const r = await sh(h, f.repo, `git worktree add -q '${join(extra, "e")}' -b e && echo ADDED; echo x > '${join(f.dir, "beside.txt")}' 2>/dev/null && echo WROTE-PARENT || echo PARENT-READ-ONLY`, f.env);
-      expect(r.stdout).toContain("ADDED");
-      expect(r.stdout).toContain("PARENT-READ-ONLY");
+      const r = await sh(
+        h,
+        f.repo,
+        [
+          `git worktree add -q '${join(mine, "e")}' -b e && echo ADDED`,
+          `echo "gitdir: /planted" > '${join(bFeat, ".git")}' 2>/dev/null && echo REDIRECTED-B || echo B-DOTGIT-HELD`,
+          `echo x > '${join(bFeat, "b.txt")}' 2>/dev/null && echo WROTE-B || echo B-READ-ONLY`,
+          `mkdir '${join(shared, "x")}' 2>/dev/null && echo WROTE-ROOT || echo ROOT-READ-ONLY`,
+        ].join("; "),
+        f.env,
+      );
+      for (const w of ["ADDED", "B-DOTGIT-HELD", "B-READ-ONLY", "ROOT-READ-ONLY"]) expect(r.stdout).toContain(w);
     } finally {
       await h.close();
     }
+    expect(readFileSync(join(bFeat, ".git"), "utf8")).not.toContain("planted");
   });
 });
 

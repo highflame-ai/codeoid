@@ -391,14 +391,22 @@ past allow rules by the PreToolUse hook;
 owner-only; widening is a confirm on the session (`widens`), never on an
 unattended turn. Forks and collaboration children inherit the setting.
 Worktrees (sandbox/worktrees.ts, docs/sandbox.md "Git worktrees inside the
-sandbox"): `<common>/worktrees/` is writable, bound at its own path, and the
-repository's worktree locations (`<repo>-worktrees/`, `.worktrees/`,
-`sandbox.worktreeRoots`; `GitPaths.locations`, `SandboxSpec.worktreeLocations`)
-are writable, so a command can `git worktree add/remove/prune`; every worktree
-that isn't the session's own is held whole (its admin dir, its `.git` file,
-its checkout when in a location). Own = appeared since `SessionSandbox`'s
-first look (`worktreeBaseline`), checked out in the workspace or a location,
-not codeoid's (`noteCodeoidWorktree` in git-worktree.ts). Docker access
+sandbox", #448 round 10): `<common>/worktrees/` is writable, bound at its own
+path; a session writes only its own folder of each worktree location
+(`<repo>-worktrees/<folder>`, `.worktrees/<folder>`, `<root>/<repo>/<folder>`
+for `sandbox.worktreeRoots`; `sessionFolderName`: its name and short id, found
+again by the id after a rename or restart; `SandboxSpec.worktreeFolders`,
+Codex's roots), the rest of a location read-only (shown read-only, but not on
+Claude native, whose CLI would lay it over the folder), a location inside the
+workspace held whole; told to the agent in the system prompt
+(`worktreeFolderNote`). Every admin dir not checked out in the folder is held
+whole (`isOwnWorktree`); `SessionSandbox`'s spec is rebuilt when an admin dir
+appears or goes (`worktreeSignature`). `worktreeRootProblem` refuses a root at
+config load (`/`, home, a dot dir of the home, `~/Library`, the config dir, a
+system dir); a missing root is made only beside the repository
+(`worktreeRootNotes` says the rest). The end-of-turn look covers the
+folder's `.git`s (`GitControlOptions.ownFolders`) and treats admin dirs as
+groups (a new plain one or a removed one isn't news). Docker access
 (`sandbox.docker.socket`, a session's `dockerSocket`, off by default):
 `dockerSocketPaths` → `SandboxSpec.dockerSockets` + `DOCKER_HOST`, a widening
 in `widens` (so create/fork/routine/loop/set_sandbox authority follows),
@@ -455,7 +463,7 @@ CODEOID_DEFAULT_EFFORT=             # thinking effort for new sessions: off|mini
 CODEOID_SANDBOX=auto                # OS sandbox for agents' commands: auto|bwrap|seatbelt|docker|off (docs/sandbox.md)
 CODEOID_SANDBOX_NETWORK=on          # on|off|allowlist (CODEOID_SANDBOX_ALLOWED_HOSTS); hiddenPaths: CODEOID_SANDBOX_HIDDEN_PATHS
 CODEOID_SANDBOX_DOCKER_SOCKET=false # let sandboxed commands reach the container runtime (root-equivalent; docs/sandbox.md)
-CODEOID_SANDBOX_WORKTREE_ROOTS=     # more places a sandboxed command may check a worktree out (csv)
+CODEOID_SANDBOX_WORKTREE_ROOTS=     # more worktree locations (csv): <root>/<repo>/<session folder>; never ~/.config, ~, /
 
 # Claude auth: uses your existing `claude login` session (Pro/Max subscription).
 # No ANTHROPIC_API_KEY needed if you're logged in via Claude Code CLI.

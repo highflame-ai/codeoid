@@ -18,6 +18,7 @@ import type { ModelPrice } from "./daemon/pricing/index.js";
 import type { SandboxConfig } from "./daemon/sandbox/policy.js";
 import { DEFAULT_HOME_READABLE } from "./daemon/sandbox/home-readable.js";
 import { validAllowedHost } from "./daemon/sandbox/hosts.js";
+import { worktreeRootProblem } from "./daemon/sandbox/worktrees.js";
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, rmSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join, isAbsolute, resolve, dirname } from "node:path";
@@ -274,9 +275,25 @@ const SandboxSchema = z
     /**
      * More places a sandboxed command may check a worktree of its repository
      * out, on top of `<repo>-worktrees/` and `<repo>/.worktrees/` (`~`
-     * expands; a relative one is the repository's main checkout's).
+     * expands; a relative one is the repository's main checkout's): each
+     * repository gets `<root>/<repo>/`, each session its own folder there.
+     * Refused: `/`, the home or a dir holding it, a hidden dir of the home,
+     * `~/Library`, codeoid's config dir, a system dir (worktreeRootProblem).
      */
-    worktreeRoots: z.array(z.string().min(1).max(4096)).max(64).default([]),
+    worktreeRoots: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(4096)
+          .superRefine((root, ctx) => {
+            // Never a place whose contents run outside the sandbox, the home or `/` (#448 round 10, sandbox/worktrees.ts).
+            const problem = worktreeRootProblem(root, { configDir: getConfigDir() });
+            if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `not a worktree root: ${problem}` });
+          }),
+      )
+      .max(64)
+      .default([]),
     /** The bwrap binary (default: on PATH). */
     bwrapPath: z.string().refine(isAbsolute, "must be an absolute path").optional(),
     docker: z

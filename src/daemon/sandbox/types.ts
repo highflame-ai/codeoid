@@ -117,12 +117,14 @@ export interface SandboxSpec {
    */
   pinned?: readonly string[];
   /**
-   * The repository's worktree locations (in {@link writable} too): where a
-   * command checks a new worktree out (`<repo>-worktrees/`, `.worktrees/`,
-   * `sandbox.worktreeRoots`; policy/worktrees.ts). What a backend's own
-   * sandbox must also let it write (Codex's writable roots).
+   * The session's own folder in each of the repository's worktree locations
+   * (in {@link writable} too): where a command checks a new worktree out
+   * (`<repo>-worktrees/<folder>`, `.worktrees/<folder>`,
+   * `<root>/<repo>/<folder>`; worktrees.ts). Nothing else of a location is
+   * writable. What a backend's own sandbox must also let it write (Codex's
+   * writable roots).
    */
-  worktreeLocations?: readonly string[];
+  worktreeFolders?: readonly string[];
   /** Container runtime sockets (and their dirs): never reachable, they are root-equivalent. */
   containerSockets: readonly string[];
   /**

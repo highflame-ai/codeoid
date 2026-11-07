@@ -233,7 +233,7 @@ const sandbox: SettingsTab = {
           envVar: "CODEOID_SANDBOX_HIDDEN_PATHS",
           applies: "next-session",
         }),
-        cfg("sandbox.worktreeRoots", "More worktree locations", "Where a sandboxed command may check out a git worktree of its repository, on top of <repo>-worktrees/ and <repo>/.worktrees/: writable. ~ expands; a relative path is the repository's. Never the home, / or a dir holding the repository.", {
+        cfg("sandbox.worktreeRoots", "More worktree locations", "More places a sandboxed session may check out git worktrees, on top of <repo>-worktrees/ and <repo>/.worktrees/: each repository gets <root>/<repo>/, and each session writes only its own folder there. ~ expands; a relative path is the repository's (at most one level up: ../wt). A root that isn't there is used only once you create it. Refused: /, your home or a dir holding it, a hidden dir of your home (~/.config, ~/.local, …), ~/Library, codeoid's config dir, a system dir, a dir holding the repository.", {
           kind: "string[]",
           envVar: "CODEOID_SANDBOX_WORKTREE_ROOTS",
           applies: "next-session",

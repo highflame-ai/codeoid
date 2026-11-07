@@ -20,13 +20,12 @@ import { dirname, join } from "node:path";
 import { runCheck } from "../daemon/evidence/runner.js";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
 import { hostToolBoundsFor, sandboxReads, sandboxWrites } from "../daemon/sandbox/host-file-tools.js";
-import { gitControlSnapshot } from "../daemon/sandbox/git-watch.js";
+import { gitControlChanges, gitControlSnapshot } from "../daemon/sandbox/git-watch.js";
 import { buildSandboxSpec, programLocations, sandboxWorkspaceOf } from "../daemon/sandbox/policy.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
 import { sandboxRoot } from "../daemon/sandbox/root.js";
 import { openCheckSandbox } from "../daemon/sandbox/session-sandbox.js";
 import type { SandboxHandle, SandboxSpec } from "../daemon/sandbox/types.js";
-import { worktreeAdminsOf } from "../daemon/sandbox/worktrees.js";
 
 const provider = new BwrapSandboxProvider();
 const probe = await provider.probe();
@@ -766,7 +765,7 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: ro
         // A sandbox already running doesn't hold a worktree it didn't see (docs/sandbox.md, Limits): when it
         // rewrote one, the session's end-of-turn look names it before the user runs git there.
         if (r.stdout.includes("REWROTE")) {
-          expect([...gitControlSnapshot(f.ws, f.home).keys()].filter((k) => !before.has(k)).some((k) => k.endsWith("worktrees/late/commondir"))).toBe(true);
+          expect(gitControlChanges(before, gitControlSnapshot(f.ws, f.home)).some((k) => k.endsWith("worktrees/late/commondir"))).toBe(true);
           writeFileSync(join(lateDir, "commondir"), "../..\n");
         }
         // Still commits (the worktree's own git dir stays writable).
@@ -776,9 +775,8 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: ro
       } finally {
         await h.close();
       }
-      // The session's next sandbox (the same baseline: taken before the late one was added) holds it.
-      const baseline = new Set([...worktreeAdminsOf(f.common).map((a) => a.dir)].filter((d) => d !== lateDir));
-      const next = await provider.open(buildSandboxSpec({ sessionId: "g2", workspace: f.ws, tempDir: join(f.dir, "tmp"), network: { mode: "off" }, hidden: { home: f.home, configDir: join(f.home, ".codeoid"), env: { HOME: f.home }, daemonTmp: "/tmp" }, worktreeBaseline: baseline }));
+      // The session's next sandbox holds it: it isn't checked out in the session's own worktree folder.
+      const next = await provider.open(buildSandboxSpec({ sessionId: "g2", workspace: f.ws, tempDir: join(f.dir, "tmp"), network: { mode: "off" }, hidden: { home: f.home, configDir: join(f.home, ".codeoid"), env: { HOME: f.home }, daemonTmp: "/tmp" }, worktreeFolder: "g2-1234abcd" }));
       try {
         const r = await sh(next, f.ws, `echo x > '${join(lateDir, "commondir")}' 2>/dev/null && echo REWROTE || echo LATE-READ-ONLY; echo x > '${join(lateDir, "gitdir")}' 2>/dev/null && echo REWROTE-GITDIR || echo GITDIR-READ-ONLY`, f.env);
         expect(r.stdout).toContain("LATE-READ-ONLY");

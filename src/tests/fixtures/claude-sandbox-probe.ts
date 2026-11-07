@@ -23,7 +23,8 @@
  * offline, with an environment of its own) or not, and a second query after the first (a new
  * CLI start in the same workspace, the one that runs its `git status`);
  * the second one's system prompt is told as `system`. A workspace of the
- * test's own: `CODEOID_PROBE_WORKSPACE`. Run in its own
+ * test's own: `CODEOID_PROBE_WORKSPACE`; the session's worktree folder
+ * name: `CODEOID_PROBE_WORKTREE_FOLDER`. Run in its own
  * process: a test file that mocks the SDK module must not see this one.
  * canUseTool here allows a sandboxed call and DENIES one asking to run
  * outside the sandbox, as codeoid's gate would until its owner says yes.
@@ -109,7 +110,7 @@ const env: Record<string, string> = {
   DISABLE_AUTOUPDATER: "1",
   ...(policy ? { ...claudeTempEnv(temp), GIT_CONFIG_NOSYSTEM: "1" } : {}),
 };
-const config = { provider: "auto", network, allowedHosts: [], hiddenPaths: [], homeReadable: ["~/.gitconfig", "~/.bun"], docker: { image: "x" } };
+const config = { provider: "auto", network, allowedHosts: [], hiddenPaths: [], homeReadable: ["~/.gitconfig", "~/.bun"], docker: { image: "x" }, ...(process.env.CODEOID_PROBE_BWRAP_PATH ? { bwrapPath: process.env.CODEOID_PROBE_BWRAP_PATH } : {}) };
 const spec = policy
   ? buildSandboxSpec({
       sessionId: "probe",
@@ -121,6 +122,8 @@ const spec = policy
       // Docker's; CODEOID_PROBE_DOCKER_SOCKET=1: the owner let commands reach it (spec.dockerSockets).
       hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home, ...(process.env.CODEOID_PROBE_RUNTIME_DIR ? { XDG_RUNTIME_DIR: process.env.CODEOID_PROBE_RUNTIME_DIR } : {}) }, daemonTmp: "/tmp" },
       dockerSocket: process.env.CODEOID_PROBE_DOCKER_SOCKET === "1",
+      // CODEOID_PROBE_WORKTREE_FOLDER: the session's worktree folder name (sandbox/worktrees.ts).
+      ...(process.env.CODEOID_PROBE_WORKTREE_FOLDER ? { worktreeFolder: process.env.CODEOID_PROBE_WORKTREE_FOLDER } : {}),
     })
   : {
       sessionId: "probe",

@@ -204,7 +204,7 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     }
   }, 300_000);
 
-  test("under Claude's sandbox too, a command adds a worktree in the sibling -worktrees location, commits there and removes it, while the user's worktrees stay held (#448 follow-up)", async () => {
+  test("under Claude's sandbox too, a command adds a worktree in its own folder, commits there and removes it; nothing lands elsewhere in the location, and the user's and other sessions' worktrees stay held (#448 round 10)", async () => {
     const r2 = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-claude-wt-")));
     try {
       const home = join(r2, "home");
@@ -216,28 +216,37 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
       writeFileSync(join(repo, "a.txt"), "a\n");
       git(["add", "."], repo);
       git(["commit", "-qm", "init"], repo);
-      // The user's own worktrees: one beside the repository, one in its -worktrees location.
+      // The user's own worktrees: one beside the repository, one in its -worktrees location; another session's folder.
       expect(git(["worktree", "add", "-q", "-b", "user", join(r2, "userwt")], repo).exitCode).toBe(0);
       expect(git(["worktree", "add", "-q", "-b", "userloc", join(home, "proj-worktrees", "userloc")], repo).exitCode).toBe(0);
+      expect(git(["worktree", "add", "-q", "-b", "other", join(home, "proj-worktrees", "other-2222bbbb", "o")], repo).exitCode).toBe(0);
       const wts = join(repo, ".git", "worktrees");
+      const own = join(home, "proj-worktrees", "agent-1111aaaa");
       const command = [
-        "git worktree add -q ../proj-worktrees/x -b feature/x && echo ADDED",
-        "cd ../proj-worktrees/x && echo x > x.txt && git add x.txt && git -c user.name=t -c user.email=t@example.com commit -qm in-worktree && echo COMMITTED",
-        `cd '${repo}' && git worktree remove ../proj-worktrees/x && echo REMOVED`,
+        `git worktree add -q ${own}/x -b feature/x && echo ADDED`,
+        `cd ${own}/x && echo x > x.txt && git add x.txt && git -c user.name=t -c user.email=t@example.com commit -qm in-worktree && echo COMMITTED`,
+        `cd '${repo}' && git worktree remove ${own}/x && echo REMOVED`,
+        "git worktree add -q ../proj-worktrees/y -b y 2>/dev/null && echo ADDED-ELSEWHERE || echo ELSEWHERE-REFUSED",
+        `echo x > ${join(home, "proj-worktrees", "other-2222bbbb", "o", "x.txt")} 2>/dev/null && echo WROTE-OTHER || echo OTHER-HELD`,
         `echo /elsewhere > ${join(wts, "userwt", "commondir")} 2>/dev/null && echo REWROTE || echo USER-HELD`,
         `echo x > ${join(home, "proj-worktrees", "userloc", "x.txt")} 2>/dev/null && echo WROTE-USERLOC || echo USERLOC-HELD`,
         `echo bad >> ${join(repo, ".git", "config")} 2>/dev/null && echo WROTE-CONFIG || echo CONFIG-HELD`,
       ].join("; ");
       const file = join(r2, "cmd-wt.txt");
       writeFileSync(file, command);
-      const p = Bun.spawn([process.execPath, PROBE, r2, "off", file, "policy"], { stdout: "pipe", stderr: "pipe", timeout: 90_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
+      const p = Bun.spawn([process.execPath, PROBE, r2, "off", file, "policy"], { stdout: "pipe", stderr: "pipe", timeout: 90_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", CODEOID_PROBE_WORKTREE_FOLDER: "agent-1111aaaa" } });
       const out = await new Response(p.stdout).text();
       await p.exited;
       const r = JSON.parse(out.trim().split("\n").at(-1) ?? "{}") as { result: string; toolResult: string | null };
       expect(r.result).toBe("success");
-      for (const w of ["ADDED", "COMMITTED", "REMOVED", "USER-HELD", "USERLOC-HELD", "CONFIG-HELD"]) expect(r.toolResult).toContain(w);
+      for (const w of ["ADDED", "COMMITTED", "REMOVED", "OTHER-HELD", "USER-HELD", "USERLOC-HELD", "CONFIG-HELD"]) expect(r.toolResult).toContain(w);
       expect(git(["log", "--oneline", "feature/x"], repo).stdout.toString()).toContain("in-worktree");
       expect(readFileSync(join(wts, "userwt", "commondir"), "utf8")).not.toContain("elsewhere");
+      // Elsewhere in a location inside the (denied) home it lands in the CLI's scratch home, never on the host
+      // (docs/sandbox.md: on Claude's own sandbox the location isn't shown, it would cover the session's folder).
+      expect(existsSync(join(home, "proj-worktrees", "y"))).toBe(false);
+      expect(readFileSync(join(home, "proj-worktrees", "other-2222bbbb", "o", "a.txt"), "utf8")).toBe("a\n");
+      expect(existsSync(join(home, "proj-worktrees", "other-2222bbbb", "o", "x.txt"))).toBe(false);
     } finally {
       rmSync(r2, { recursive: true, force: true });
     }

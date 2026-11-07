@@ -211,6 +211,7 @@ import { type HostToolBreach, hostFileBreachNote, hostFileBreachReason, hostFile
 import type { SandboxRegistry } from "./sandbox/registry.js";
 import { describeSandbox, resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
+import { worktreeFolderNote } from "./sandbox/worktrees.js";
 import { protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -1569,6 +1570,7 @@ export class Session {
     if (opts.sandboxRegistry) {
       this.#sandbox = new SessionSandbox({
         sessionId: this.id,
+        name: () => this.name,
         workdir: opts.workdir,
         registry: opts.sandboxRegistry,
         ...(opts.config ? { config: opts.config } : {}),
@@ -3271,7 +3273,7 @@ export class Session {
     const before = this.#gitBaseline;
     if (!before) return commits;
     try {
-      const now = gitControlSnapshot(this.workdir);
+      const now = gitControlSnapshot(this.workdir, undefined, { ownFolders: this.#sandbox?.worktreeFolders() ?? [] });
       const changed = gitControlChanges(before, now);
       this.#gitBaseline = now;
       if (changed.length > 0) {
@@ -4040,7 +4042,7 @@ export class Session {
     }
     this.#store.audit(sender.sub, "session.send", this.id);
     // What of the repository git runs at the user's next command, as it is before the agent works (#448).
-    if (this.#sandbox && !this.#gitBaseline) this.#gitBaseline = gitControlSnapshot(this.workdir);
+    if (this.#sandbox && !this.#gitBaseline) this.#gitBaseline = gitControlSnapshot(this.workdir, undefined, { ownFolders: this.#sandbox.worktreeFolders() });
     // And the commits its refs name, so a commit made from here on can be told (#448 round 6).
     if (this.#sandbox && !this.#refBaseline) this.#refBaseline = refTips(this.workdir);
     await this.#refBaseline;
@@ -7622,7 +7624,22 @@ export class Session {
     // the active capability role into every turn's system prompt.
     if (this.#pack) parts.push(this.#buildPackPromptAppend(this.#pack));
     if (this.#memory) parts.push(this.#buildMemoryPromptAppend());
+    const worktrees = this.#worktreePromptAppend();
+    if (worktrees) parts.push(worktrees);
     return parts.length > 0 ? parts.join("\n\n") : undefined;
+  }
+
+  /**
+   * Where the session's sandboxed commands may make git worktrees (#448
+   * round 10, sandbox/worktrees.ts): its own folder in each worktree
+   * location. A `git worktree add` anywhere else fails with the OS's
+   * "Read-only file system", which says nothing of why: this says where.
+   * Stable for the session's life (a cache-friendly prefix).
+   */
+  #worktreePromptAppend(): string | null {
+    const folders = this.#sandbox?.worktreeFolders() ?? [];
+    if (folders.length === 0) return null;
+    return worktreeFolderNote(folders);
   }
 
   /**

@@ -145,13 +145,21 @@ export function claudeSandboxSettings(rt: Pick<SandboxRuntime, "spec" | "config"
       // between the workspace and a hidden path in it (nothing renames it away).
       denyWrite: physical([...claudeSettingsPaths(spec.workspace, env), ...denyAround(spec.readOnly ?? [], spec.writable), ...(spec.pinned ?? [])]),
       denyRead: physical([...spec.hidden, ...spec.containerSockets]),
-      // Inside the denied home: the allowlist, and what is written (a workspace in it).
-      allowRead: physical([spec.workspace, tempDir, ...spec.writable, ...spec.reexposed, ...sockets]),
+      // Inside the denied home: the allowlist, and what is written (a workspace in it). Not a worktree location
+      // holding the session's folder: the CLI lays what is readable over what is writable, which would make the
+      // folder read-only (#448 round 10); the location stays the denied home's scratch dir there.
+      allowRead: physical([spec.workspace, tempDir, ...spec.writable, ...spec.reexposed.filter((r) => !holdsFolder(r, spec.worktreeFolders ?? [])), ...sockets]),
     },
     network,
     ...(envVars.length > 0 ? { credentials: { envVars } } : {}),
     ...(rt.config.bwrapPath ? { bwrapPath: rt.config.bwrapPath } : {}),
   };
+}
+
+/** Whether `dir` holds one of the session's worktree folders (is a location of it). */
+function holdsFolder(dir: string, folders: readonly string[]): boolean {
+  const d = resolve(dir);
+  return folders.some((f) => resolve(f) !== d && resolve(f).startsWith(`${d}/`));
 }
 
 /**
