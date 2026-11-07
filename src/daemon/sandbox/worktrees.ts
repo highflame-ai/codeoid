@@ -132,8 +132,10 @@ const SYSTEM_DIRS = ["/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64"
  * one (the main checkout's) never climbs more than one level (`../wt`), and
  * is never the checkout itself or its parent (which hold the repository).
  */
-export function worktreeRootProblem(root: string, ctx: { home?: string; configDir?: string } = {}): string | null {
+export function worktreeRootProblem(root: string, ctx: { home?: string; configDir?: string; platform?: NodeJS.Platform } = {}): string | null {
   const home = resolve(ctx.home ?? process.env.HOME ?? homedir());
+  // macOS's filesystem ignores case (`/Users/ME/.config` is `~/.config`), and its realpath doesn't always fix it.
+  const fold = (p: string) => ((ctx.platform ?? process.platform) === "darwin" ? p.toLowerCase() : p);
   const p = root === "~" ? home : root.startsWith("~/") ? join(home, root.slice(2)) : root;
   if (!p.trim()) return "an empty path";
   if (!isAbsolute(p)) {
@@ -144,21 +146,21 @@ export function worktreeRootProblem(root: string, ctx: { home?: string; configDi
   }
   const abs = resolve(p);
   const real = realOr(abs);
-  const homeReal = realOr(home);
-  for (const at of new Set([abs, real])) {
+  const homes = [...new Set([home, realOr(home)].map(fold))];
+  for (const at of new Set([abs, real].map(fold))) {
     if (at === "/") return `${root} is /`;
-    if (within(home, at) || within(homeReal, at)) return `${root} is your home or holds it`;
-    for (const h of new Set([home, homeReal])) {
+    if (homes.some((h) => within(h, at))) return `${root} is your home or holds it`;
+    for (const h of homes) {
       if (!within(at, h) || at === h) continue;
       const first = at.slice(h.length + 1).split("/")[0] ?? "";
       if (first.startsWith(".")) return `${root} is in a hidden dir of your home (~/${first}), where tools load programs and settings from outside the sandbox`;
-      if (first === "Library") return `${root} is in ~/Library (LaunchAgents and app settings run outside the sandbox)`;
+      if (first === fold("Library")) return `${root} is in ~/Library (LaunchAgents and app settings run outside the sandbox)`;
     }
     if (ctx.configDir) {
-      const cfg = resolve(ctx.configDir);
+      const cfg = fold(resolve(ctx.configDir));
       if (within(at, cfg) || within(cfg, at)) return `${root} is codeoid's config dir, in it or holds it`;
     }
-    const sys = SYSTEM_DIRS.find((d) => within(at, d));
+    const sys = SYSTEM_DIRS.find((d) => within(at, fold(d)));
     if (sys) return `${root} is a system dir (${sys})`;
   }
   return null;
@@ -178,23 +180,35 @@ export interface WorktreeLocation {
  * ones, its sibling being inside its superproject) and `<root>/<repo>` for
  * each of `roots` (`~` expands, a relative one is the main checkout's),
  * scoped by repository so a root shared by several holds each one's apart.
- * A root {@link worktreeRootProblem} refuses is in `problems`, not here.
+ * A root {@link worktreeRootProblem} refuses is in `problems`, not here, as
+ * written and again once resolved, links and all (#448 round 11: `../.config`
+ * of a repository in the home is `~/.config`); so is one inside the main
+ * checkout (nothing is made in the user's checkout, and its project settings
+ * dirs are there).
  */
-export function worktreeLocationDirs(layout: GitLayout, opts: { roots?: readonly string[]; home?: string; configDir?: string } = {}): { locations: WorktreeLocation[]; problems: string[] } {
+export function worktreeLocationDirs(layout: GitLayout, opts: { roots?: readonly string[]; home?: string; configDir?: string; platform?: NodeJS.Platform } = {}): { locations: WorktreeLocation[]; problems: string[] } {
   const main = mainCheckoutOf(layout);
   const locations: WorktreeLocation[] = [];
   const problems: string[] = [];
   if (!main || !layout.common) return { locations, problems };
   const home = resolve(opts.home ?? process.env.HOME ?? homedir());
   if (layout.kind !== "submodule") for (const d of defaultWorktreeLocations(main)) locations.push({ dir: d });
+  const ctx = { home, ...(opts.configDir ? { configDir: opts.configDir } : {}), ...(opts.platform ? { platform: opts.platform } : {}) };
   for (const r of opts.roots ?? []) {
-    const problem = worktreeRootProblem(r, { home, ...(opts.configDir ? { configDir: opts.configDir } : {}) });
+    const p = r === "~" ? home : r.startsWith("~/") ? join(home, r.slice(2)) : r;
+    const at = resolve(isAbsolute(p) ? p : join(main, p));
+    // As written (a relative one may climb one level only), then where it really is.
+    const written = worktreeRootProblem(r, ctx);
+    const resolved = written ? null : worktreeRootProblem(at, ctx);
+    const problem = written ?? (resolved ? `${r} → ${resolved}` : null);
     if (problem) {
       problems.push(`sandbox.worktreeRoots: ${problem}: not used`);
       continue;
     }
-    const p = r === "~" ? home : r.startsWith("~/") ? join(home, r.slice(2)) : r;
-    const at = resolve(isAbsolute(p) ? p : join(main, p));
+    if (within(at, resolve(main)) || within(realOr(at), realOr(main))) {
+      problems.push(`sandbox.worktreeRoots: ${r} is inside the repository's checkout (${resolve(main)}), where nothing is made: not used`);
+      continue;
+    }
     locations.push({ dir: join(at, basename(main)), root: { written: r, at } });
   }
   return { locations, problems };

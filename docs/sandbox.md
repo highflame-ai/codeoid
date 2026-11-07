@@ -677,14 +677,19 @@ dir holding it, anything in a hidden dir of the home (`~/.config`, `~/.local`,
 `~/.ssh`, shell and systemd user dirs, the backends' and codeoid's own: tools
 load programs and settings from there outside the sandbox), `~/Library`
 (LaunchAgents), codeoid's config dir or a dir holding it, a system dir (`/usr`,
-`/etc`, `/opt`, …), `.`, `..`. At a session's start, also left out (and said
-on the sandbox's limits line): a root that is a link or reached through one,
-one another user owns, one holding the repository or its git dir, one inside a
-hidden path; and a root that doesn't exist, unless it is beside the
-repository (in the main checkout's parent), where it is made: anywhere else
-codeoid never makes it — create it to use it. The defaults are made where
-their parent is there; a submodule gets only the configured ones (its sibling
-would be made inside its superproject).
+`/etc`, `/opt`, …), `.`, `..`; on macOS compared without regard to case, as
+its filesystem does. A relative root is judged again, by the same list, where
+it leads once resolved for the repository, links and all (`../.config` of a
+repository at `~/proj` is `~/.config`: refused), and one inside the main
+checkout is refused (nothing is made in your checkout). At a session's start,
+also left out (and said on the sandbox's limits line): a root that is a link
+or reached through one, one another user owns, one holding the repository or
+its git dir, one inside a hidden path, a relative one refused where it leads;
+and a root that doesn't exist, unless it is beside the repository (in the
+main checkout's parent), where it is made: anywhere else codeoid never makes
+it — create it to use it. The sibling location is made where its parent is
+there; a submodule gets only the configured ones (its sibling would be made
+inside its superproject).
 
 Limits (defence in depth, as the rest of git's structure):
 

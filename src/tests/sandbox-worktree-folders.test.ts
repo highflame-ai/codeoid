@@ -95,6 +95,31 @@ describe("sandbox.worktreeRoots validation (#448 round 10)", () => {
       rmSync(away, { recursive: true, force: true });
     }
   });
+  test("a relative root is judged again where it leads (#448 round 11): ../.config of a repository in the home is ~/.config; one inside the checkout is refused", () => {
+    const home = join(root, "home");
+    const proj = repo(join(home, "proj"));
+    const layout = gitLayoutOf(proj, join(root, "elsewhere"));
+    if (!layout) throw new Error("no layout");
+    const { locations, problems } = worktreeLocationDirs(layout, { roots: ["../.config", "../.local", "./../.ssh", "../wt", ".claude/commands", "wts"], home });
+    expect(locations.map((l) => l.dir)).toEqual([join(home, "proj-worktrees"), join(home, "wt", "proj")]);
+    expect(problems).toEqual([
+      expect.stringContaining(`../.config → ${join(home, ".config")} is in a hidden dir of your home (~/.config)`),
+      expect.stringContaining("hidden dir of your home (~/.local)"),
+      expect.stringContaining("hidden dir of your home (~/.ssh)"),
+      expect.stringContaining(".claude/commands is inside the repository's checkout"),
+      expect.stringContaining("wts is inside the repository's checkout"),
+    ]);
+    // Through a link too: a root beside the repository that leads into the home's hidden dirs.
+    mkdirSync(join(home, ".config"));
+    symlinkSync(join(home, ".config"), join(home, "cfg"));
+    expect(worktreeLocationDirs(layout, { roots: ["../cfg"], home }).problems).toEqual([expect.stringContaining("hidden dir of your home (~/.config)")]);
+  });
+  test("on macOS a root differing only in case is the same dir (the filesystem ignores case)", () => {
+    expect(worktreeRootProblem("/Users/Me/.Config/wt", { home: "/Users/me", platform: "darwin" })).toContain("hidden dir of your home");
+    expect(worktreeRootProblem("/USERS/me/LIBRARY/wt", { home: "/Users/me", platform: "darwin" })).toContain("~/Library");
+    expect(worktreeRootProblem("/Users/Me", { home: "/Users/me", platform: "darwin" })).toContain("your home");
+    expect(worktreeRootProblem("/Users/Me/.Config/wt", { home: "/Users/me", platform: "linux" })).toBeNull();
+  });
   test("the config refuses one at load, in a settings write, and from the environment, saying why", () => {
     const bad = validateConfigObject({ sandbox: { worktreeRoots: ["~/.local/bin"] } });
     expect(bad.ok).toBe(false);
