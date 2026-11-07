@@ -917,6 +917,16 @@ interface Dehydrated {
   loading?: Promise<void>;
 }
 
+/** A send counted as preparing before it reaches `Session.send` (`Session.holdSend`). */
+export interface SendHold {
+  /** The Stop generation when it arrived: a Stop since stops it. */
+  readonly stopGen: number;
+  /** Take the count over (true once; false after `take` or `release`). */
+  take(): boolean;
+  /** Give the count back, unless taken. */
+  release(): void;
+}
+
 /** What a history load read, for `Session#installHistory`. */
 interface LoadedHistory {
   entries: TranscriptEntry[];
@@ -3961,6 +3971,8 @@ export class Session {
     sender: AuthContext,
     attachments?: readonly Attachment[],
     priority?: "now" | "next" | "later",
+    /** Counted as preparing since it arrived (`holdSend`): this send takes it over. */
+    hold?: SendHold,
   ): Promise<void> {
     // Shutting down: nothing is recorded, nothing starts.
     if (this.#draining) throw new DaemonStoppingError();
@@ -3974,8 +3986,9 @@ export class Session {
     // A send is "preparing" from the moment it is queued until its turn has
     // started (or it failed): drain() must treat that as work, and a Stop in
     // that window must cancel it — see #stoppedBeforeStart.
-    const stopGen = this.#stopGen;
-    this.#preparingSends++;
+    const held = hold?.take() === true;
+    const stopGen = held ? hold!.stopGen : this.#stopGen;
+    if (!held) this.#preparingSends++;
     const next = this.#sendChain
       .catch(() => undefined)
       // A resumed session loads its history before its first turn.
@@ -3992,6 +4005,30 @@ export class Session {
       () => undefined,
     );
     return next;
+  }
+
+  /**
+   * Count a send as preparing before it reaches send(): one the daemon holds
+   * while the session's history loads (`SessionManager.handle`). The drain
+   * sees it, and a Stop meanwhile stops it as it stops a queued send. Hand
+   * it to send(), which takes it over, or release() it.
+   */
+  holdSend(): SendHold {
+    this.#preparingSends++;
+    let held = true;
+    return {
+      stopGen: this.#stopGen,
+      take: () => {
+        const was = held;
+        held = false;
+        return was;
+      },
+      release: () => {
+        if (!held) return;
+        held = false;
+        this.#preparingSends--;
+      },
+    };
   }
 
   /** Sends queued or preparing their turn (see send()). */

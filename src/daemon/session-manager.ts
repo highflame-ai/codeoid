@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { type ForkPoint, RewindError, SendStoppedError, SHUTDOWN_AUTH, Session, type AttachedClient, type WindowScope } from "./session.js";
+import { type ForkPoint, RewindError, type SendHold, SendStoppedError, SHUTDOWN_AUTH, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
 import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, DEFAULT_ACCOUNT, type AccountKind, type ClaudeAccountKind } from "../protocol/types.js";
@@ -465,6 +465,12 @@ const LOOP_WORKER_PROVIDERS: ReadonlySet<string> = new Set(["claude"]);
 
 export class SessionManager {
   #sessions = new Map<string, Session>();
+  /** Per session, the newest message waiting on its history's load (`#historyGate`): the next one waits behind it. */
+  #historyGates = new Map<string, Promise<DaemonMessage | null>>();
+  /** Clients with messages waiting on a load, and how many. */
+  #clientsWaiting = new Map<string, number>();
+  /** Of those, the ones that disconnected meanwhile (`disconnectClient`). */
+  #clientsGone = new Set<string>();
   #store: Store;
   #transcriptStore: TranscriptStore;
   #identityManager?: AgentIdentityManager;
@@ -1347,11 +1353,46 @@ mcpHub: this.#mcpHub,
     // A resumed session loads its history the first time it is used. Only
     // then is there an await here: handlers that claim state synchronously
     // (a rewind's stop point) keep doing so before the caller's next call.
-    const loading = this.#loadHistoryFor(msg, auth);
-    if (loading) {
-      const unloadable = await loading;
+    const gate = this.#historyGate(msg, auth);
+    if (!gate) return this.#route(msg, auth, client, opts);
+    return this.#routeAfterLoad(gate, msg, auth, client, opts);
+  }
+
+  /** `handle`, once the session `msg` names has loaded its history (`#historyGate`). */
+  async #routeAfterLoad(
+    gate: { session: Session; wait: Promise<DaemonMessage | null> },
+    msg: ClientMessage,
+    auth: AuthContext,
+    client: AttachedClient,
+    opts?: { rawToken?: string },
+  ): Promise<DaemonMessage> {
+    // A prompt waiting on the load is a send preparing its turn: the drain
+    // sees it, and a Stop meanwhile stops it, as a queued send.
+    const hold = msg.type === "session.send" ? gate.session.holdSend() : undefined;
+    this.#clientsWaiting.set(client.id, (this.#clientsWaiting.get(client.id) ?? 0) + 1);
+    try {
+      const unloadable = await gate.wait;
       if (unloadable) return unloadable;
+      return await this.#route(msg, auth, client, opts, hold);
+    } finally {
+      hold?.release();
+      const waiting = (this.#clientsWaiting.get(client.id) ?? 1) - 1;
+      if (waiting > 0) this.#clientsWaiting.set(client.id, waiting);
+      else {
+        this.#clientsWaiting.delete(client.id);
+        // Gone while its messages waited: what they attached it to lets go of it.
+        if (this.#clientsGone.delete(client.id)) this.disconnectClient(client.id);
+      }
     }
+  }
+
+  async #route(
+    msg: ClientMessage,
+    auth: AuthContext,
+    client: AttachedClient,
+    opts?: { rawToken?: string },
+    sendHold?: SendHold,
+  ): Promise<DaemonMessage> {
     switch (msg.type) {
       case "ping":
         // Liveness heartbeat — lets a client detect a half-open/zombie
@@ -1384,7 +1425,7 @@ mcpHub: this.#mcpHub,
       case "session.detach":
         return this.#detach(msg, client);
       case "session.send":
-        return this.#send(msg, auth);
+        return this.#send(msg, auth, sendHold);
       case "session.interrupt":
         return this.#interrupt(msg, auth);
       case "session.approve":
@@ -1605,32 +1646,43 @@ mcpHub: this.#mcpHub,
    * Load the history of the session `msg` names (lazy session loading), so
    * every handler finds it in memory: the one place a client's use of a
    * session loads it. Only for a session the caller's tenant owns, and not
-   * for messages that never read it (`NO_HISTORY_MESSAGES`). Null when
-   * there is nothing to load; resolves to an error response when the
-   * transcript can't be read.
+   * for messages that never read it (`NO_HISTORY_MESSAGES`). While a load is awaited here,
+   * every later message naming that session waits behind it, whether it
+   * reads the history or not, so they are handled in the order they came
+   * (an interrupt never overtakes the prompt it stops); other sessions'
+   * don't. Null when nothing waits; `wait` resolves to an error response
+   * when the transcript can't be read.
    */
-  #loadHistoryFor(msg: ClientMessage, auth: AuthContext): Promise<DaemonMessage | null> | null {
-    if (NO_HISTORY_MESSAGES.has(msg.type)) return null;
+  #historyGate(msg: ClientMessage, auth: AuthContext): { session: Session; wait: Promise<DaemonMessage | null> } | null {
     const id = (msg as { sessionId?: unknown }).sessionId;
     if (typeof id !== "string") return null;
     const session = this.#sessions.get(id);
-    if (!session?.historyPending || session.accountId !== auth.accountId || session.projectId !== auth.projectId) {
-      return null;
-    }
-    return session.ensureHydrated().then(
-      () => null,
-      (err): DaemonMessage => {
-        console.error(
-          `[codeoid/resume] could not load the history of ${id}: ${err instanceof Error ? err.message : String(err)}`,
-        );
-        return {
-          type: "response.error",
-          requestId: (msg as { id?: string }).id ?? "",
-          error: "The session's history could not be loaded from disk — try again, or see the daemon's log.",
-          code: "internal",
-        };
-      },
-    );
+    if (!session || session.accountId !== auth.accountId || session.projectId !== auth.projectId) return null;
+    const load = (): Promise<DaemonMessage | null> | null => {
+      if (NO_HISTORY_MESSAGES.has(msg.type) || !session.historyPending) return null;
+      return session.ensureHydrated().then(
+        () => null,
+        (err): DaemonMessage => {
+          console.error(
+            `[codeoid/resume] could not load the history of ${id}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return {
+            type: "response.error",
+            requestId: (msg as { id?: string }).id ?? "",
+            error: "The session's history could not be loaded from disk — try again, or see the daemon's log.",
+            code: "internal",
+          };
+        },
+      );
+    };
+    const behind = this.#historyGates.get(id);
+    const wait = behind ? behind.then(load) : load();
+    if (!wait) return null;
+    this.#historyGates.set(id, wait);
+    void wait.finally(() => {
+      if (this.#historyGates.get(id) === wait) this.#historyGates.delete(id);
+    });
+    return { session, wait };
   }
 
   async #sessionExport(
@@ -3961,6 +4013,9 @@ mcpHub: this.#mcpHub,
 
   /** Remove a client from all sessions (e.g. on disconnect). */
   disconnectClient(clientId: string): void {
+    // A message of its own still waiting on a session's load runs after
+    // this: whatever it attaches the client to is let go of then.
+    if (this.#clientsWaiting.has(clientId)) this.#clientsGone.add(clientId);
     for (const session of this.#sessions.values()) {
       session.detach(clientId);
     }
@@ -4074,7 +4129,9 @@ mcpHub: this.#mcpHub,
         }
         waiting++;
       }
-      if (waiting === 0) break;
+      // A message waiting on a session's load is handled after it: wait for
+      // it too (a prompt among them is preparing, and is stopped above).
+      if (waiting === 0 && this.#historyGates.size === 0) break;
       await Bun.sleep(Math.min(pollMs, remaining()));
       pollMs = Math.min(pollMs * 2, 50);
     }
@@ -8559,6 +8616,7 @@ mcpHub: this.#mcpHub,
   #send(
     msg: Extract<ClientMessage, { type: "session.send" }>,
     auth: AuthContext,
+    hold?: SendHold,
   ): DaemonMessage | Promise<DaemonMessage> {
     if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
       return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
@@ -8607,7 +8665,7 @@ mcpHub: this.#mcpHub,
     // returned a false "ok" and dropped the error — silent data loss).
     // priority controls mid-turn insertion semantics (default "later" = FIFO).
     session
-      .send(msg.text, auth, msg.attachments, msg.priority)
+      .send(msg.text, auth, msg.attachments, msg.priority, hold)
       .catch((err) => {
         // Stopped before its turn started: the user already got a notice.
         if (err instanceof SendStoppedError) return;

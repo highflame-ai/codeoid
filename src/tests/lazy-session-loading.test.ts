@@ -965,3 +965,92 @@ describe("lazy session loading: logs whose seqs don't grow along the file", () =
     }
   });
 });
+
+describe("lazy session loading: messages while a load is in flight", () => {
+  /** The fixture resumed eagerly and lazily, every transcript read held `ms` (a large log). */
+  async function slowPair(ms: number): Promise<{ eager: Env; lazy: Env }> {
+    const pair = await both();
+    for (const env of [pair.eager, pair.lazy]) {
+      const load = env.transcript.loadTranscript.bind(env.transcript);
+      env.transcript.loadTranscript = async (sessionId, opts) => {
+        await Bun.sleep(ms);
+        return load(sessionId, opts);
+      };
+    }
+    return pair;
+  }
+
+  /** A turn's worth of provider sends the session's backends were handed. */
+  const prompts = (env: Env) => env.made.reduce((n, p) => n + p.capturedOpts.length, 0);
+
+  it("are handled in the order they came: an interrupt stops the prompt sent before it, a detach follows its attach", async () => {
+    const pair = await slowPair(50);
+    await same(pair, async (env) => {
+      const sent = env.m.handle({ type: "session.send", id: "s", sessionId: ids.rich, text: "go" } as never, AUTH, client("c", []));
+      const stop = env.m.handle({ type: "session.interrupt", id: "i", sessionId: ids.rich } as never, AUTH, client("c", []));
+      const responses = await Promise.all([sent, stop]);
+      await settle(env, ids.rich!);
+      return { responses, prompts: prompts(env), turns: sessionOf(env, "rich").toInfo().usage?.numTurns };
+    });
+    expect(prompts(pair.lazy)).toBe(0);
+    await same(pair, async (env) => {
+      const frames: DaemonMessage[] = [];
+      const c = client("ws", frames);
+      const attached = env.m.handle({ type: "session.attach", id: "a", sessionId: ids.short } as never, AUTH, c);
+      const detached = env.m.handle({ type: "session.detach", id: "d", sessionId: ids.short } as never, AUTH, c);
+      const responses = await Promise.all([attached, detached]);
+      return { responses: responses.map((r) => r.type), clients: sessionOf(env, "short").attachedClientCount };
+    });
+    expect(sessionOf(pair.lazy, "short").attachedClientCount).toBe(0);
+  });
+
+  it("an attach whose socket closed while it waited leaves no client attached", async () => {
+    const pair = await slowPair(50);
+    await same(pair, async (env) => {
+      const attached = env.m.handle({ type: "session.attach", id: "a", sessionId: ids.rich } as never, AUTH, client("ws1", []));
+      env.m.disconnectClient("ws1"); // the socket's close handler
+      await attached;
+      return sessionOf(env, "rich").attachedClientCount;
+    });
+    expect(sessionOf(pair.lazy, "rich").attachedClientCount).toBe(0);
+    // Another client of the same session is unaffected.
+    const frames: DaemonMessage[] = [];
+    await pair.lazy.m.handle({ type: "session.attach", id: "b", sessionId: ids.rich } as never, AUTH, client("ws2", frames));
+    expect(sessionOf(pair.lazy, "rich").attachedClientCount).toBe(1);
+  });
+
+  it("a prompt waiting on the load is work the shutdown drain sees: no turn starts after it", async () => {
+    const pair = await slowPair(300);
+    for (const env of [pair.eager, pair.lazy]) {
+      const sent = env.m.handle({ type: "session.send", id: "s", sessionId: ids.rich, text: "go" } as never, AUTH, client("c", []));
+      expect(sessionOf(env, "rich").preparingTurn).toBe(true);
+      await env.m.drain(5_000);
+      const drained = prompts(env);
+      expect((await sent).type).toBe("response.ok");
+      await Bun.sleep(100);
+      expect(prompts(env)).toBe(drained);
+      expect(sessionOf(env, "rich").preparingTurn).toBe(false);
+      expect(sessionOf(env, "rich").status).toBe("idle");
+    }
+    expect(prompts(pair.lazy)).toBe(0);
+  });
+
+  it("the drain waits for a message waiting on a load", async () => {
+    const lazy = openEnv("lazy", cloneBase("lazy"), true);
+    envs.push(lazy);
+    await lazy.m.resumeSessions();
+    const load = lazy.transcript.loadTranscript.bind(lazy.transcript);
+    lazy.transcript.loadTranscript = async (sessionId, opts) => {
+      await Bun.sleep(300);
+      return load(sessionId, opts);
+    };
+    let answered = false;
+    const attached = lazy.m.handle({ type: "session.attach", id: "a", sessionId: ids.rich } as never, AUTH, client("c", [])).then((r) => {
+      answered = true;
+      return r;
+    });
+    await lazy.m.drain(5_000);
+    expect(answered).toBe(true);
+    expect((await attached).type).toBe("response.ok");
+  });
+});
