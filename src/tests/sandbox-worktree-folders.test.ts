@@ -188,11 +188,13 @@ describe("runtime sockets (#448 round 10)", () => {
     await new Promise<void>((r) => server.listen(sock, r));
     try {
       const env = { XDG_RUNTIME_DIR: run };
-      expect(dockerSocketPaths(root, env, "linux")).toEqual([sock]);
+      // Only what this test planted: the machine's own runtime socket, if it has one, isn't the test's.
+      const planted = (paths: string[]) => paths.filter((p) => p.startsWith(root));
+      expect(planted(dockerSocketPaths(root, env, "linux"))).toEqual([sock]);
       chmodSync(sock, 0o400);
       if (process.getuid?.() === 0) return;
-      expect(dockerSocketPaths(root, env, "linux")).toEqual([]);
-      expect(unconnectableDockerSockets(root, env, "linux")).toEqual([sock]);
+      expect(planted(dockerSocketPaths(root, env, "linux"))).toEqual([]);
+      expect(planted(unconnectableDockerSockets(root, env, "linux"))).toEqual([sock]);
     } finally {
       await new Promise<void>((r) => server.close(() => r()));
     }

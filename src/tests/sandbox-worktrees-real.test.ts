@@ -503,7 +503,8 @@ describe.skipIf(!probe.available)("bubblewrap, for real: Docker access (a plante
     h.exec(["/bin/sh", "-c", `python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(100).decode().strip())' '${target}' 2>&1; echo "DOCKER_HOST=$DOCKER_HOST"`], { cwd: join(root, "ws"), env: { PATH: "/usr/bin:/bin", DOCKER_HOST: "unix:///host-value" }, timeoutMs: 20_000 });
 
   test.skipIf(!Bun.which("python3"))("hidden by default; reachable, with DOCKER_HOST naming it, only with the option (network off too)", async () => {
-    expect(dockerSocketPaths(join(root, "home"), env())).toEqual([sock]);
+    // The planted socket is the user's runtime one, so it comes first; the machine's own (if any) may follow.
+    expect(dockerSocketPaths(join(root, "home"), env())[0]).toBe(sock);
     const off = spec(false);
     expect(off.dockerSockets).toBeUndefined();
     const h0 = await provider.open(off);
@@ -516,7 +517,7 @@ describe.skipIf(!probe.available)("bubblewrap, for real: Docker access (a plante
     }
     for (const network of ["off", "on"] as const) {
       const on = spec(true, network);
-      expect(on.dockerSockets).toEqual([sock]);
+      expect(on.dockerSockets?.[0]).toBe(sock);
       const h1 = await provider.open(on);
       try {
         const r = await connect(h1, sock);

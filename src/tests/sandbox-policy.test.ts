@@ -73,10 +73,11 @@ describe("bwrapArgs", () => {
     expect(with_).toContainEqual(["--setenv", "DOCKER_HOST", `unix://${sock}`]);
   });
 
-  test("dockerSocketPaths (#448 follow-up): $DOCKER_HOST's first, then Docker's, rootless Docker's, Podman's; only sockets that exist; on macOS Docker Desktop's", () => {
+  test("dockerSocketPaths (#448 follow-up): $DOCKER_HOST's first, then the user's own (rootless Docker, Podman), then the system's; only sockets that exist; on macOS Docker Desktop's", () => {
     const there = new Set(["/run/user/7/podman/podman.sock", "/var/run/docker.sock", "/srv/d.sock", "/h/.docker/run/docker.sock"]);
     const isSocket = (p: string) => there.has(p);
-    expect(dockerSocketPaths("/h", { XDG_RUNTIME_DIR: "/run/user/7" }, "linux", isSocket)).toEqual(["/var/run/docker.sock", "/run/user/7/podman/podman.sock"]);
+    // The user's own runtime before the root daemon's: DOCKER_HOST names the one that isn't root on the host.
+    expect(dockerSocketPaths("/h", { XDG_RUNTIME_DIR: "/run/user/7" }, "linux", isSocket)).toEqual(["/run/user/7/podman/podman.sock", "/var/run/docker.sock"]);
     expect(dockerSocketPaths("/h", { XDG_RUNTIME_DIR: "/run/user/7", DOCKER_HOST: "unix:///srv/d.sock" }, "linux", isSocket)[0]).toBe("/srv/d.sock");
     expect(dockerSocketPaths("/h", { DOCKER_HOST: "tcp://1.2.3.4:2375" }, "linux", () => false)).toEqual([]);
     expect(dockerSocketPaths("/h", {}, "darwin", isSocket)).toEqual(["/h/.docker/run/docker.sock", "/var/run/docker.sock"]);

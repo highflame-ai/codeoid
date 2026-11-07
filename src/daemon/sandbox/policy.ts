@@ -279,7 +279,8 @@ export function dockerSocketPaths(
   const candidates =
     platform === "darwin"
       ? [join(home, ".docker/run/docker.sock"), "/var/run/docker.sock", join(home, ".colima/default/docker.sock"), join(home, ".orbstack/run/docker.sock"), join(home, ".rd/docker.sock")]
-      : ["/var/run/docker.sock", "/run/docker.sock", ...(runtime ? [join(runtime, "docker.sock"), join(runtime, "podman/podman.sock")] : []), "/run/podman/podman.sock"];
+      : // The user's own (rootless) runtime first: when both exist, DOCKER_HOST names the one that isn't root on the host.
+        [...(runtime ? [join(runtime, "docker.sock"), join(runtime, "podman/podman.sock")] : []), "/var/run/docker.sock", "/run/docker.sock", "/run/podman/podman.sock"];
   const out: string[] = [];
   const seen = new Set<string>();
   for (const p of [...(host && isAbsolute(host) ? [host] : []), ...candidates]) {
