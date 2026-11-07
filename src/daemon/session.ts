@@ -1099,6 +1099,8 @@ export class Session {
   #currentTurnId: string | null = null;
   /** In-flight workspace snapshot per turn, so destroy can wait for them. */
   #pendingCheckpoints = new Set<Promise<unknown>>();
+  /** Work a turn's end started and doesn't await (the #448 git check, `after_turn` hooks): see turnEndWork. */
+  readonly #turnEndJobs = new Set<Promise<unknown>>();
   /** The session's turns, oldest first (#354) — see #indexTurn. */
   #turnIndex: TurnIndexEntry[] = [];
   /**
@@ -3963,6 +3965,31 @@ export class Session {
   /** The running turn was already asked to stop (by its owner, a routine, or as it started during a drain). */
   get interruptRequested(): boolean {
     return this.#activeRun !== null && this.#turnInterrupted;
+  }
+
+  /** Hold `job`, started by a turn's end and not awaited, until it settles: turnEndWork waits for it. */
+  #keepTurnEnd(job: Promise<unknown>): void {
+    this.#turnEndJobs.add(job);
+    const done = () => this.#turnEndJobs.delete(job);
+    void job.then(done, done);
+  }
+
+  /**
+   * Settles once the work this session's turn ends started and don't await
+   * has: the #448 git and settings-commit check (its audit row and warning
+   * line), the end (and any start) snapshot, `after_turn` hooks. Drain
+   * awaits it, bounded, before the transcripts flush and the store closes,
+   * so a shutdown cuts none of it off. A job that starts another (a
+   * snapshot chained behind one) is waited for too. Never rejects.
+   */
+  async turnEndWork(): Promise<void> {
+    const waited = new Set<Promise<unknown>>();
+    for (;;) {
+      const jobs = [...this.#turnEndJobs, ...this.#pendingCheckpoints].filter((j) => !waited.has(j));
+      if (jobs.length === 0) return;
+      for (const j of jobs) waited.add(j);
+      await Promise.allSettled(jobs);
+    }
   }
 
   /** How long drain waits for this session's interrupted turn to end before it gives up on it. */
@@ -9364,10 +9391,11 @@ export class Session {
         // finally reconciles sub-agents alongside tools. Sweeping here too would
         // just be a redundant pass a few statements earlier.
         // Hook seam: observe-only (git-checkpoint per turn, usage export).
-        this.#hookBus?.emit("after_turn", this.#hookContext(), {
+        const hooks = this.#hookBus?.emit("after_turn", this.#hookContext(), {
           result: event.result,
         });
-        void this.#checkGitControl(SYSTEM_IDENTITY.sub);
+        if (hooks) this.#keepTurnEnd(hooks);
+        this.#keepTurnEnd(this.#checkGitControl(SYSTEM_IDENTITY.sub));
         if (event.result.isError) {
           const errText = event.result.errorMessage ?? "Turn ended with an error";
           // The CLI reports an overflow as the turn's assistant text and ends

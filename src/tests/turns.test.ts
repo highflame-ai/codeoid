@@ -8,6 +8,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { Database } from "bun:sqlite";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,11 +16,15 @@ import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import { AsyncQueue } from "../daemon/async-queue.js";
 import { canonicalFromTranscript } from "../daemon/canonical-restore.js";
+import { HookBus } from "../daemon/hooks/bus.js";
 import { listCheckpoints, shadowRepoPath } from "../daemon/checkpoints.js";
 import { DaemonStoppingError, SendStoppedError } from "../daemon/session.js";
 import type { ProviderEvent, TurnOpts, TurnRun } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
-import { SessionManager } from "../daemon/session-manager.js";
+import { LocalSandboxHandle } from "../daemon/sandbox/local-handle.js";
+import { SandboxRegistry } from "../daemon/sandbox/registry.js";
+import type { SandboxProvider, SandboxSpec } from "../daemon/sandbox/types.js";
+import { SessionManager, TURN_END_SETTLE_MS } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
@@ -666,6 +671,138 @@ describe("drain() at shutdown", () => {
     expect(took).toBeLessThan(300 + 1_500);
     for (const id of ids) expect(warned.some((w) => w.includes(id.slice(0, 8)) && /didn't end its turn/.test(w))).toBe(true);
   });
+});
+
+describe("drain() and the work a turn's end starts", () => {
+  /** A sandbox provider that wraps nothing: enough for the session's #448 git check to run. */
+  function fakeSandboxes(): SandboxRegistry {
+    const open = (spec: SandboxSpec) => new LocalSandboxHandle("bwrap", spec, (argv, o) => ({ argv: [...argv], env: o.env }));
+    const reg = new SandboxRegistry("linux", (n) => `/usr/bin/${n}`);
+    reg.register({
+      id: "bwrap",
+      displayName: "bwrap",
+      capabilities: { isolation: "os", placement: "local", workspace: "mount", stdioProcess: true, commands: true, wrapsArgv: true, network: ["on", "off"], platforms: ["linux"] },
+      probe: async () => ({ available: true }),
+      open: async (spec) => open(spec),
+      openSync: open,
+    } as SandboxProvider);
+    return reg;
+  }
+
+  /** The agent commits a project settings file during its turn (what #checkSettingsCommits exists to catch). */
+  class SettingsCommitter extends LateResultProvider {
+    override runTurn(opts: TurnOpts): TurnRun {
+      mkdirSync(join(repo, ".claude"), { recursive: true });
+      writeFileSync(join(repo, ".claude", "settings.json"), "{}\n");
+      git("add", ".claude");
+      git("commit", "-qm", "settings");
+      return super.runTurn(opts);
+    }
+  }
+
+  /** A manager on `provider`, its session mid-turn; drained, then the store closed: what is on disk is what the daemon leaves. */
+  async function drainMidTurn(provider: () => MockSessionProvider, extra: { sandboxRegistry?: SandboxRegistry; hooks?: HookBus } = {}) {
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(tmp),
+      _testProviderFactory: provider,
+      ...extra,
+    });
+    const id = await create(m);
+    const s = m._sessionForTest(id)!;
+    const sending = s.send("go", AUTH).catch((e) => e);
+    // A large workspace's start snapshot holds the turn back up to its 2 s wait.
+    for (let i = 0; i < 1_000 && s.status !== "thinking"; i++) await Bun.sleep(5);
+    expect(s.status).toBe("thinking");
+    const errors: string[] = [];
+    const warned: string[] = [];
+    const consoleError = console.error;
+    const consoleWarn = console.warn;
+    console.error = (...args: unknown[]) => void errors.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(" "));
+    console.warn = (...args: unknown[]) => void warned.push(args.map(String).join(" "));
+    let took = 0;
+    // Read synchronously right after the store closes: nothing still running gets a turn first.
+    let snapshots: string[] = [];
+    let lines = "";
+    try {
+      const started = performance.now();
+      await m.drain(10_000);
+      took = performance.now() - started;
+      store.close();
+      lines = readFileSync(join(tmp, "transcripts", `${id}.jsonl`), "utf8");
+      snapshots = existsSync(shadowRepoPath(ckptRoot(), id))
+        ? execFileSync("git", ["--git-dir", shadowRepoPath(ckptRoot(), id), "for-each-ref", "--format=%(refname)", "refs/turns/"], { encoding: "utf8" })
+            .split("\n")
+            .filter(Boolean)
+        : [];
+      await Bun.sleep(50);
+    } finally {
+      console.error = consoleError;
+      console.warn = consoleWarn;
+    }
+    await sending;
+    const db = new Database(join(tmp, "codeoid.db"), { readonly: true });
+    const audit = (db.query("SELECT action FROM audit_log WHERE session_id = ?").all(id) as Array<{ action: string }>).map((r) => r.action);
+    db.close();
+    return { id, took, errors, warned, lines, snapshots, audit };
+  }
+
+  const closedStore = (errors: string[]) => errors.filter((e) => /closed database|persist failed|audit write failed/i.test(e));
+
+  /** A repository with a 3000-commit history, a tag on each: git takes longer than drain's poll slack. */
+  function deepHistory(): void {
+    const head = git("rev-parse", "HEAD").trim();
+    let script = "";
+    for (let i = 0; i < 3000; i++) {
+      script += `commit refs/heads/main\nmark :${i + 1}\ncommitter t <t@e> ${1_700_000_000 + i} +0000\ndata 2\nc\n${i === 0 ? `from ${head}\n` : ""}M 644 inline f${i % 50}.txt\ndata 2\n${i % 10}\n\nreset refs/tags/t${i}\nfrom :${i + 1}\n\n`;
+    }
+    execFileSync("git", ["fast-import", "--quiet"], { cwd: repo, input: script });
+    git("checkout", "-q", "-f", "main");
+  }
+
+  it("records the turn end's settings-commit check (audit row, warning line) before the store closes", async () => {
+    const r = await drainMidTurn(() => new SettingsCommitter(20), { sandboxRegistry: fakeSandboxes() });
+    expect(r.audit).toContain("session.settings_committed");
+    expect(r.lines).toContain("sandbox.settings_committed");
+    expect(closedStore(r.errors)).toEqual([]);
+  });
+
+  for (const late of [20, 100, 300]) {
+    it(`records it in a repository with a 3000-commit history, the result ${late} ms after the interrupt`, async () => {
+      deepHistory();
+      const r = await drainMidTurn(() => new SettingsCommitter(late), { sandboxRegistry: fakeSandboxes() });
+      expect(r.audit).toContain("session.settings_committed");
+      expect(r.lines).toContain("sandbox.settings_committed");
+      expect(closedStore(r.errors)).toEqual([]);
+    }, 30_000);
+  }
+
+  it("takes the interrupted turn's end snapshot of a large workspace before it returns", async () => {
+    mkdirSync(join(repo, "src"));
+    for (let i = 0; i < 20_000; i++) writeFileSync(join(repo, "src", `f${i}.txt`), `file ${i}\n`.repeat(20));
+    const r = await drainMidTurn(() => new LateResultProvider(20));
+    // The start snapshot and the end one: a rewind past this turn has the files it ended with.
+    expect(r.snapshots).toHaveLength(2);
+    expect(r.snapshots.filter((ref) => ref.endsWith("-end"))).toHaveLength(1);
+    expect(closedStore(r.errors)).toEqual([]);
+  }, 30_000);
+
+  it("lets an after_turn hook finish", async () => {
+    const out = join(tmp, "after-turn.json");
+    const hooks = new HookBus([{ event: "after_turn", type: "command", command: `sleep 0.3; cat > "${out}"` }]);
+    const r = await drainMidTurn(() => new LateResultProvider(20), { hooks });
+    expect(existsSync(out)).toBe(true);
+    expect(r.took).toBeGreaterThanOrEqual(250);
+  });
+
+  it("waits for a turn end's work at most its bound, and names the session", async () => {
+    const out = join(tmp, "never.json");
+    // A hook that outlives the bound: shutdown goes on without it.
+    const hooks = new HookBus([{ event: "after_turn", type: "command", command: `sleep 7; cat > "${out}"`, timeoutMs: 10_000 }]);
+    const r = await drainMidTurn(() => new LateResultProvider(20), { hooks });
+    expect(r.took).toBeGreaterThanOrEqual(TURN_END_SETTLE_MS - 100);
+    expect(r.took).toBeLessThan(TURN_END_SETTLE_MS + 1_500);
+    expect(r.warned.some((w) => w.includes(r.id.slice(0, 8)) && /didn't finish its turn's end/.test(w))).toBe(true);
+  }, 15_000);
 });
 
 describe("a stopped turn's last reply", () => {

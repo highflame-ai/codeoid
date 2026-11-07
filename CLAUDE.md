@@ -169,9 +169,15 @@ stopped just before included) is waited for until its end, spend included, is
 recorded — a backend acknowledges an interrupt before the turn's result
 arrives — but at most its backend's settle bound (`interruptSettleMs`,
 `DRAIN_SETTLE_MS` 2 s; opencode 3 s), all sessions at once, then named in the
-log and left; routine runs then record their rows (`RoutineService.settled`,
-≤ 1 s) and the transcript writes are flushed; polled at 10 ms backing off to
-50 ms, bounded by drain's 10 s, never a fixed wait. Store flushed,
+log and left; then, at once and at most `TURN_END_SETTLE_MS` (5 s), what
+each turn's end started and doesn't await (`Session.turnEndWork`: the #448
+git/settings-commit check's audit row and warning line, the end snapshot,
+`after_turn` hooks) and the routine runs' final rows, spend included
+(`RoutineService.settled`: a run waits as long as drain waits for its turn,
+then records it, cost unknown if drain gave up on it); then the transcript
+writes are flushed; polled at 10 ms backing off to 50 ms, bounded by drain's
+10 s, never a fixed wait. Drain is one-way: the manager refuses sends after it.
+Store flushed,
 WebSockets closed, frontends stopped. 30-second grace period before forced exit.
 
 **One daemon per data dir**: `codeoid start` locks each dir the daemon owns

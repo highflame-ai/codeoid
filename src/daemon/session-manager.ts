@@ -360,8 +360,15 @@ function toFleetEventWire(row: DispatchEventRow): FleetEventWire {
  *  configured value is `session.resumeMaxSessions`. */
 const RESUME_MAX_SESSIONS_DEFAULT = 200;
 const RESUME_DEADLINE_MS = 20_000;
-/** At shutdown, how long drain waits, after the turns ended, for routine runs to record theirs. */
-const ROUTINE_SETTLE_MS = 1_000;
+/**
+ * At shutdown, how long drain waits, after the turns ended, for what their
+ * ends started (Session.turnEndWork: the #448 git check, the end snapshot,
+ * hooks) and for routine runs to record theirs. Measured: the settings-commit
+ * look over a 3000-commit repository, and the end snapshot of a 20 000-file
+ * workspace, each well under a second; the margin is for a large repository
+ * on a loaded machine.
+ */
+export const TURN_END_SETTLE_MS = 5_000;
 /** Per-session transcript read budget on resume. Scrollback keeps at most
  * 20 MiB / 5000 messages — parsing history past that would be evicted on
  * arrival, so cap the read slightly above the scrollback byte cap. */
@@ -3939,8 +3946,14 @@ mcpHub: this.#mcpHub,
    * interrupt and the turn's result follows. Each is waited for at most its
    * backend's settle bound (`Session.interruptSettleMs`), all at once, so a
    * backend that never ends the turn holds shutdown that long, not to the
-   * deadline; it is named in the log and left. Then the routine runs record
-   * their rows, and the transcript writes are flushed.
+   * deadline; it is named in the log and left. Then, all at once, what the
+   * turns' ends started and don't await is waited for (`Session.turnEndWork`:
+   * the #448 git check's audit row and warning line, the end snapshot, hooks)
+   * and the routine runs record their rows, spend included, at most
+   * `TURN_END_SETTLE_MS` together; then the transcript writes are flushed.
+   * The store closes after drain, so nothing a turn's end started is cut off.
+   *
+   * One-way: the manager refuses every send from then on. It is shutdown's.
    */
   async drain(timeoutMs = 10_000): Promise<void> {
     try {
@@ -4010,12 +4023,38 @@ mcpHub: this.#mcpHub,
       await Bun.sleep(Math.min(pollMs, remaining()));
       pollMs = Math.min(pollMs * 2, 50);
     }
-    // A routine run records its final row, spend included, once its turn has
-    // ended; the store closes next.
-    if (this.#routines && !(await this.#routines.settled(Math.min(remaining(), ROUTINE_SETTLE_MS)))) {
-      console.warn("[codeoid/session-manager] drain: a routine run didn't record its end in time");
-    }
+    await this.#settleTurnEnds(Math.min(remaining(), TURN_END_SETTLE_MS));
     await this.#flushTranscripts(deadline);
+  }
+
+  /**
+   * Wait, at most `boundMs`, for what every session's turn end started
+   * (`Session.turnEndWork`) and for the routine runs to record their final
+   * rows, spend included (they do once their turn has ended, or once drain
+   * gave up on it): all at once. The store closes next.
+   */
+  async #settleTurnEnds(boundMs: number): Promise<void> {
+    const pending = new Set<Session>();
+    const work = [...this.#sessions.values()].map((s) => {
+      pending.add(s);
+      return s.turnEndWork().then(() => void pending.delete(s));
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const [routinesEnded] = await Promise.all([
+      this.#routines ? this.#routines.settled(boundMs) : Promise.resolve(true),
+      Promise.race([
+        Promise.all(work),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, boundMs);
+          timer.unref?.();
+        }),
+      ]),
+    ]);
+    clearTimeout(timer);
+    for (const s of pending) {
+      console.warn(`[codeoid/session-manager] drain: session ${s.id.slice(0, 8)} (${s.name}) didn't finish its turn's end within ${boundMs} ms (its git check, snapshot or hooks); going on without it`);
+    }
+    if (!routinesEnded) console.warn("[codeoid/session-manager] drain: a routine run didn't record its end in time");
   }
 
   /**
