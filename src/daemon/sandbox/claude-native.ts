@@ -161,7 +161,9 @@ export function claudeSandboxSettings(
       // repository's hooks and config, for the same reason. And every dir
       // between the workspace and a hidden path in it (nothing renames it away).
       denyWrite: physical([...claudeSettingsPaths(spec.workspace, env), ...denyAround(spec.readOnly ?? [], spec.writable), ...(spec.pinned ?? [])]),
-      denyRead: physical([...spec.hidden, ...spec.containerSockets, ...(allSockets ? HOST_SHARED_TEMP : [])]),
+      // Local services' sockets too while the network is off (spec.serviceSockets): those in the host's /tmp are
+      // behind its seccomp's unix socket block, or the denied /tmp with every socket allowed.
+      denyRead: physical([...spec.hidden, ...spec.containerSockets, ...(spec.serviceSockets ?? []).filter((p) => !HOST_SHARED_TEMP.some((t) => p === t || p.startsWith(`${t}/`)) && !p.startsWith("/private/tmp/")), ...(allSockets ? HOST_SHARED_TEMP : [])]),
       // Inside the denied home: the allowlist, and what is written (a workspace in it). Not a worktree location
       // holding the session's folder: the CLI lays what is readable over what is writable, which would make the
       // folder read-only (#448 round 10); the location stays the denied home's scratch dir there.

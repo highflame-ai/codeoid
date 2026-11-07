@@ -417,7 +417,9 @@ on Linux (its seccomp blocks unix sockets otherwise), so there the host's
 reachable is said (`CLAUDE_ALL_SOCKETS_NOTE`); a socket the user can't
 connect to isn't counted. Every other runtime's socket (libvirt, LXD, Incus,
 containerd, …: `containerSocketPaths`) and the system bus and screen's dir
-(`HOST_SOCKET_DIRS`) are hidden in every sandbox.
+(`HOST_SOCKET_DIRS`) are hidden in every sandbox; local services' sockets
+(Postgres, MySQL, Redis: `localServiceSocketPaths` → `SandboxSpec.serviceSockets`)
+when the network the session asked for is off or an allowlist.
 
 Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell/`
 parses a command line with tree-sitter-bash (WASM, vendored `tree-sitter-bash.wasm`;

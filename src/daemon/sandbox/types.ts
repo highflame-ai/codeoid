@@ -128,6 +128,13 @@ export interface SandboxSpec {
   /** Container runtime sockets (and their dirs): never reachable, they are root-equivalent. */
   containerSockets: readonly string[];
   /**
+   * Local services' sockets (and their dirs) that let a connection in by who
+   * the user is (Postgres, MySQL, Redis: policy.ts `localServiceSocketPaths`):
+   * hidden like {@link containerSockets} while the session's network is off
+   * or an allowlist (#448 round 11); absent with the network on.
+   */
+  serviceSockets?: readonly string[];
+  /**
    * Container runtime sockets the owner let commands reach
    * (`sandbox.docker.socket` / a session's `dockerSocket`, off by default):
    * each reachable at its own path, `DOCKER_HOST` naming the first

@@ -8,7 +8,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,9 +16,9 @@ import { loadConfig, validateConfigObject } from "../config.js";
 import type { CodeoidConfig } from "../config.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
-import { claudeSandboxSettings, HOST_SHARED_TEMP } from "../daemon/sandbox/claude-native.js";
+import { claudeSandboxSettings, HOST_SHARED_TEMP, physicalOf } from "../daemon/sandbox/claude-native.js";
 import { LocalSandboxHandle } from "../daemon/sandbox/local-handle.js";
-import { containerSocketPaths, dockerSocketPaths, gitLayoutOf, HOST_SOCKET_DIRS, hiddenPathsFor, unconnectableDockerSockets } from "../daemon/sandbox/policy.js";
+import { buildSandboxSpec, containerSocketPaths, dockerSocketPaths, gitLayoutOf, HOST_SOCKET_DIRS, hiddenPathsFor, LOCAL_SERVICE_SOCKET_DIRS, localServiceSocketPaths, unconnectableDockerSockets } from "../daemon/sandbox/policy.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
 import { CLAUDE_ALL_SOCKETS_NOTE, resolveSandbox, SessionSandbox } from "../daemon/sandbox/session-sandbox.js";
 import type { SandboxProvider, SandboxSpec } from "../daemon/sandbox/types.js";
@@ -102,6 +102,48 @@ describe("sandbox.worktreeRoots validation (#448 round 10)", () => {
     expect(validateConfigObject({ sandbox: { worktreeRoots: ["~/wt"] } })).toEqual({ ok: true });
     expect(() => loadConfig({ raw: { sandbox: { worktreeRoots: ["/"] } }, env: {}, quiet: true })).toThrow(/not a worktree root: \/ is \//);
     expect(() => loadConfig({ raw: {}, env: { CODEOID_SANDBOX_WORKTREE_ROOTS: `${homedir()}/.config` }, quiet: true })).toThrow(/not a worktree root/);
+  });
+});
+
+describe("local services' sockets (#448 round 11)", () => {
+  test("hidden while the network is off or an allowlist, as the session's (not a backend handle's) network says; not with it on", async () => {
+    const ws = join(root, "ws");
+    mkdirSync(ws);
+    const base = { sessionId: "s", workspace: ws, tempDir: join(root, "tmp"), hidden: { home: join(root, "home"), configDir: join(root, "home", ".codeoid"), env: { HOME: join(root, "home") }, daemonTmp: "/tmp" } };
+    for (const network of [{ mode: "off" as const }, { mode: "allowlist" as const, allow: ["example.com"] }]) {
+      const spec = buildSandboxSpec({ ...base, network });
+      for (const d of ["/run/postgresql", "/var/run/postgresql", "/run/mysqld", "/var/run/mysqld", "/run/redis"]) expect(spec.serviceSockets).toContain(d);
+    }
+    expect(buildSandboxSpec({ ...base, network: { mode: "on" } }).serviceSockets).toBeUndefined();
+    // A process backend's handle has the network on (for its model); a session with it off still hides them.
+    expect(buildSandboxSpec({ ...base, network: { mode: "on" }, hideLocalServices: true }).serviceSockets).toEqual(expect.arrayContaining([...LOCAL_SERVICE_SOCKET_DIRS]));
+    const reg = new SandboxRegistry("linux", (n) => `/usr/bin/${n}`);
+    reg.register(fakeBwrap());
+    const sbx = new SessionSandbox({ sessionId: "x", workdir: ws, registry: reg, setting: { provider: "bwrap", network: "off" } });
+    try {
+      await sbx.refresh("pi");
+      const rt = sbx.runtimeFor("pi");
+      if (!rt) throw new Error("no runtime");
+      const h = await rt.open([], { backendNetwork: true });
+      expect(h.spec.network.mode).toBe("on");
+      expect(h.spec.serviceSockets).toEqual(expect.arrayContaining([...LOCAL_SERVICE_SOCKET_DIRS]));
+      expect(rt.spec.serviceSockets).toEqual(expect.arrayContaining([...LOCAL_SERVICE_SOCKET_DIRS]));
+    } finally {
+      await sbx.close();
+    }
+  });
+  test("those in the host's shared temp dirs are found by name (Homebrew's Postgres and MySQL put theirs in /tmp)", () => {
+    const t = join(root, "t");
+    mkdirSync(t);
+    for (const n of [".s.PGSQL.5432", ".s.PGSQL.5432.lock", "mysql.sock", "mysqlx.sock", "redis.sock", "mongodb-27017.sock", "tmux-1000", "notes.txt"]) writeFileSync(join(t, n), "");
+    const found = localServiceSocketPaths([t]).filter((p) => p.startsWith(t));
+    expect(found.sort()).toEqual([".s.PGSQL.5432", ".s.PGSQL.5432.lock", "mongodb-27017.sock", "mysql.sock", "mysqlx.sock", "redis.sock"].map((n) => join(t, n)).sort());
+  });
+  test("Claude's own sandbox denies their dirs; those in /tmp are behind its unix socket block or the denied /tmp", () => {
+    const spec = { sessionId: "s", workspace: "/w", tempDir: "/t", writable: [], hidden: [], reexposed: [], containerSockets: [], serviceSockets: ["/run/postgresql", "/tmp/.s.PGSQL.5432"], network: { mode: "off" as const }, unsetEnv: [] };
+    const sb = claudeSandboxSettings({ spec, config: { bwrapPath: undefined } as never }, {}, undefined, "linux");
+    expect(sb.filesystem?.denyRead).toContain(physicalOf("/run/postgresql"));
+    expect(sb.filesystem?.denyRead).not.toContain("/tmp/.s.PGSQL.5432");
   });
 });
 

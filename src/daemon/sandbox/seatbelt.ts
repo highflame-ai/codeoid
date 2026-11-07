@@ -94,7 +94,7 @@ export function seatbeltProfile(
   type Rule = { path: string; kind: "hide" | "write" | "read" | "read-only" | "pinned" };
   const rules: Rule[] = [];
   const seen = new Set<string>();
-  for (const p of [...spec.hidden, ...spec.containerSockets].map(real)) {
+  for (const p of [...spec.hidden, ...spec.containerSockets, ...(spec.serviceSockets ?? [])].map(real)) {
     if (p === "/" || seen.has(`h:${p}`)) continue;
     seen.add(`h:${p}`);
     rules.push({ path: p, kind: "hide" });
@@ -132,9 +132,9 @@ export function seatbeltProfile(
     else if (r.kind === "pinned") lines.push(`(deny file-write* (literal ${param(r.path)}))`);
     else lines.push(`(allow file-read* ${filter(r.path)})`);
   }
-  // Container runtimes: nothing connects to their sockets.
+  // Container runtimes and (the network off) local services: nothing connects to their sockets.
   // (A socket in a container runtime's dir is behind its dir's file rule; connecting needs write access.)
-  for (const s of spec.containerSockets.map(real)) {
+  for (const s of [...spec.containerSockets, ...(spec.serviceSockets ?? [])].map(real)) {
     if (isDir(s) !== true) lines.push(`(deny network-outbound (remote unix-socket (path-literal ${param(s)})))`);
   }
   if (seatbeltNetwork(spec.network.mode) === "off") lines.push("(deny network*)");

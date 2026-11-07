@@ -211,6 +211,56 @@ export function containerSocketPaths(home: string, env: Record<string, string | 
 export const HOST_SOCKET_DIRS: readonly string[] = ["/run/dbus", "/var/run/dbus", "/run/screen", "/var/run/screen"];
 
 /**
+ * Local services' socket dirs that let a connection in by who the user is,
+ * no password asked (#448 round 11): Postgres's peer auth, MySQL and
+ * MariaDB's `unix_socket`, a Redis or memcached socket with no auth. With the
+ * network off (or an allowlist) a sandboxed command must not reach them: a
+ * filesystem socket isn't the network, so unsharing it doesn't stop one.
+ */
+export const LOCAL_SERVICE_SOCKET_DIRS: readonly string[] = [
+  "/run/postgresql",
+  "/var/run/postgresql",
+  "/run/mysqld",
+  "/var/run/mysqld",
+  "/run/mariadb",
+  "/var/run/mariadb",
+  "/var/lib/mysql/mysql.sock",
+  "/run/redis",
+  "/var/run/redis",
+  "/run/redis-server",
+  "/run/valkey",
+  "/var/run/valkey",
+  "/run/memcached",
+  "/var/run/memcached",
+  "/run/mongodb",
+  "/var/run/mongodb",
+  "/run/pgbouncer",
+  "/var/run/pgbouncer",
+];
+
+/** Such sockets in the host's shared temp dirs (Homebrew's and source builds' defaults): Postgres, MySQL, MariaDB, Redis, MongoDB. */
+const TEMP_SERVICE_SOCKET = /^(?:\.s\.PGSQL\.\d+(?:\.lock)?|mysqlx?\.sock(?:\.lock)?|mysqld?\.sock|redis(?:-server)?(?:-\d+)?\.sock|valkey(?:-\d+)?\.sock|mongodb-\d+\.sock|memcached\.sock)$/;
+
+/**
+ * The host's local service sockets a sandbox hides while its network is off
+ * or an allowlist ({@link LOCAL_SERVICE_SOCKET_DIRS}, and those found now in
+ * `/tmp`, `/private/tmp` and `/var/tmp`). `sandbox.hiddenPaths` hides more.
+ */
+export function localServiceSocketPaths(tempDirs: readonly string[] = ["/tmp", "/private/tmp", "/var/tmp"]): string[] {
+  const out = [...LOCAL_SERVICE_SOCKET_DIRS];
+  for (const t of tempDirs) {
+    let names: string[] = [];
+    try {
+      names = readdirSync(t);
+    } catch {
+      continue;
+    }
+    for (const n of names) if (TEMP_SERVICE_SOCKET.test(n)) out.push(join(t, n));
+  }
+  return out;
+}
+
+/**
  * The host's container runtime sockets that exist now, for a sandbox whose
  * owner opted in (`sandbox.docker.socket`): `$DOCKER_HOST`'s when it is a
  * unix socket, then Docker's, rootless Docker's, Podman's (rootless, then
@@ -377,6 +427,13 @@ export interface SpecInputs {
    * (`sandbox.docker.socket`, opt-in: root-equivalent; dockerSocketPaths).
    */
   dockerSocket?: boolean;
+  /**
+   * Hide the host's local service sockets (databases that let a connection in
+   * by who the user is: {@link localServiceSocketPaths}). Default: when the
+   * network isn't on. A session passes its own network's, not a handle's (a
+   * process backend's handle has the network on to reach its model).
+   */
+  hideLocalServices?: boolean;
 }
 
 /** The home a spec hides: absolute, and not `/` (nothing is left to show then). */
@@ -1048,6 +1105,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     pinned: protectedAncestors(hidden, [workspace, tempDir, ...own, ...locations]),
     reexposed,
     containerSockets: containerSocketPaths(home, env).filter((p) => !exposed.has(p) && !exposed.has(realOr(p))),
+    ...((inputs.hideLocalServices ?? inputs.network.mode !== "on") ? { serviceSockets: localServiceSocketPaths() } : {}),
     ...(sockets.length > 0 ? { dockerSockets: sockets } : {}),
     network: inputs.network,
     unsetEnv: sockets.length > 0 ? SANDBOX_UNSET_ENV.filter((n) => n !== "DOCKER_HOST") : SANDBOX_UNSET_ENV,

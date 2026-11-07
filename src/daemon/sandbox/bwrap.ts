@@ -103,7 +103,7 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
     mounts.push(k === "dir" ? { kind: "hide-dir", path: at } : { kind: "hide-file", path: at });
   };
   for (const p of spec.hidden) hide(p);
-  for (const p of spec.containerSockets) hide(p);
+  for (const p of [...spec.containerSockets, ...(spec.serviceSockets ?? [])]) hide(p);
   const hiddenDirs = mounts.filter((m) => m.kind === "hide-dir").map((m) => m.path);
   for (const at of writable) {
     if (!kind(at) || seen.has(`w:${at}`)) continue;

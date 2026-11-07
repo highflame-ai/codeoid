@@ -46,7 +46,7 @@ import {
  * limits line says it (docs/sandbox.md, Docker access).
  */
 export const CLAUDE_ALL_SOCKETS_NOTE =
-  "on Claude's Linux sandbox that lets a command connect to any unix socket it can see: the host's /tmp, the desktop's runtime dir, the system bus and every other runtime's socket are hidden, but a socket in the workspace, in what your home shows (sandbox.homeReadable) or in a system dir open to every user (systemd's journal, printing) is reachable";
+  "on Claude's Linux sandbox that lets a command connect to any unix socket it can see: the host's /tmp, the desktop's runtime dir, the system bus and every other runtime's socket are hidden, and local databases' (Postgres, MySQL, Redis) while the network is off, but a socket in the workspace, in what your home shows (sandbox.homeReadable) or in a system dir open to every user (systemd's journal, printing; a database's with the network on) is reachable";
 
 /** A session's sandbox can't satisfy what an unattended or autonomous run needs. */
 export class SandboxRequiredError extends Error {
@@ -433,9 +433,12 @@ export class SessionSandbox {
     const plan = r.plan;
     const config = this.config;
     const dockerSocket = r.info.dockerSocket === true;
+    // Local services' sockets follow the network the session asked for, not a handle's (a process backend's has it on
+    // for its model) nor one widened because the backend can't turn it off: hiding them needs no network rule.
+    const hideLocalServices = (r.info.networkRequested ?? r.info.network) !== "on";
     const open = (backendState: readonly string[] = [], o: OpenOptions = {}) => {
       if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
-      return this.#spec(o.backendNetwork ? { mode: "on" } : r.network, backendState, o.readable ?? [], dockerSocket);
+      return this.#spec(o.backendNetwork ? { mode: "on" } : r.network, backendState, o.readable ?? [], dockerSocket, hideLocalServices);
     };
     // Built (and the temp dir made) when a backend first needs it, and again whenever a worktree's admin dir
     // appeared or went in the repository (#448 round 10): one made meanwhile is held from then on (a Claude query
@@ -591,7 +594,7 @@ export class SessionSandbox {
     return this.#handles.size;
   }
 
-  #spec(network: NetworkPolicy, backendState: readonly string[], readable: readonly string[] = [], dockerSocket = false): SandboxSpec {
+  #spec(network: NetworkPolicy, backendState: readonly string[], readable: readonly string[] = [], dockerSocket = false, hideLocalServices = network.mode !== "on"): SandboxSpec {
     // A monorepo's package: the repository's top (#448 round 9); the session's cwd stays the workdir.
     const workspace = sandboxWorkspaceOf(this.#workdir);
     const folder = this.#worktreeFolderName(workspace);
@@ -606,6 +609,7 @@ export class SessionSandbox {
       backendState,
       ...(folder ? { worktreeFolder: folder } : {}),
       dockerSocket,
+      hideLocalServices,
     });
     for (const f of spec.worktreeFolders ?? []) this.#folders.add(f);
     return spec;

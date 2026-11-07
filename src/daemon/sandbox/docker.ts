@@ -165,7 +165,7 @@ export function dockerRunArgs(spec: SandboxSpec, argv: readonly string[], o: Doc
     if (kind(at) === "dir" && inMounted(at) && !hiddenAt.some((h) => within(at, h))) bind(at, at, false);
   }
   // A hidden path inside something mounted is covered again.
-  for (const h of [...spec.hidden, ...spec.containerSockets]) {
+  for (const h of [...spec.hidden, ...spec.containerSockets, ...(spec.serviceSockets ?? [])]) {
     const at = realOr(h);
     if (!inMounted(at)) continue;
     const k = kind(at);
