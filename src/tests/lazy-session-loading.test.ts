@@ -1033,7 +1033,15 @@ describe("lazy session loading: messages while a load is in flight", () => {
       expect(sessionOf(env, "rich").preparingTurn).toBe(true);
       await env.m.drain(5_000);
       const drained = prompts(env);
-      expect((await sent).type).toBe("response.ok");
+      const reply = (await sent) as { type: string; error?: string };
+      if (env === pair.eager) {
+        // It was already preparing when the drain began: accepted, then stopped before it went out.
+        expect(reply.type).toBe("response.ok");
+      } else {
+        // Still waiting on the load when the drain began: refused, saying so (no turn starts once a shutdown has).
+        expect(reply.type).toBe("response.error");
+        expect(reply.error).toContain("shutting down");
+      }
       await Bun.sleep(100);
       expect(prompts(env)).toBe(drained);
       expect(sessionOf(env, "rich").preparingTurn).toBe(false);
