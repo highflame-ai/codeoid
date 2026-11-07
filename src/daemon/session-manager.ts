@@ -448,6 +448,8 @@ const NO_HISTORY_MESSAGES: ReadonlySet<string> = new Set([
   "collaboration.panels",
   "compare.get",
   "compare.list",
+  "compare.keep",
+  "mcp.adopt",
 ]);
 
 /**
@@ -462,12 +464,10 @@ const HISTORY_SCOPES: Readonly<Record<string, ReadonlyArray<readonly Scope[]>>> 
   "session.part_action": [[SCOPES.SESSION_SEND]],
   "session.rotate": [[SCOPES.SESSION_SEND]],
   "session.rewind": [[SCOPES.SESSION_SEND]],
-  "compare.keep": [[SCOPES.SESSION_SEND]],
   "session.approve": [[SCOPES.SESSION_APPROVE]],
   "session.set_provider": [[SCOPES.SESSION_APPROVE]],
   "session.fork": [[SCOPES.SESSION_CREATE]],
   "session.compare": [[SCOPES.SESSION_CREATE], [SCOPES.SESSION_SEND]],
-  "mcp.adopt": [[SCOPES.SETTINGS_WRITE]],
 };
 
 /** Whether `auth` holds the scopes `type`'s handler requires before it reads a session's history. */
@@ -1688,6 +1688,7 @@ mcpHub: this.#mcpHub,
     if (!session || session.accountId !== auth.accountId || session.projectId !== auth.projectId) return null;
     const load = (): Promise<DaemonMessage | null> | null => {
       if (NO_HISTORY_MESSAGES.has(msg.type) || !session.historyPending || !mayReadHistory(msg.type, auth)) return null;
+      if (this.#refusedBeforeHistory(msg, auth)) return null;
       return session.ensureHydrated().then(
         () => null,
         (err): DaemonMessage => {
@@ -6852,6 +6853,27 @@ mcpHub: this.#mcpHub,
       error: `This session is a running loop's worker; you can't ${what} it until the run ends (cancel it with codeoid loop cancel)`,
       code: "invalid_request",
     };
+  }
+
+  /**
+   * A history-reading message its handler refuses before it reads the
+   * history, for a reason other than scope (`#loopWorkerGuard`, a delegated
+   * approval of a loop worker's): it loads nothing. A handler that goes on
+   * after all loads the history itself.
+   */
+  #refusedBeforeHistory(msg: ClientMessage, auth: AuthContext): boolean {
+    const id = (msg as { sessionId?: unknown }).sessionId;
+    if (typeof id !== "string") return false;
+    switch (msg.type) {
+      case "session.rotate":
+      case "session.rewind":
+      case "session.set_provider":
+        return this.#isLiveLoopWorker(id);
+      case "session.approve":
+        return auth.delegationDepth > 0 && this.#isLiveLoopWorker(id);
+      default:
+        return false;
+    }
   }
 
   /** The session works in an active loop run's worktree: its current worker,

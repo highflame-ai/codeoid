@@ -1093,6 +1093,38 @@ describe("lazy session loading: messages while a load is in flight", () => {
     expect(r.type).toBe("response.ok");
     expect(sessionOf(lazy, "rich").hydrated).toBe(true);
   });
+
+  it("a request its handler refuses for another reason, or that never reads the history, loads nothing", async () => {
+    const lazy = openEnv("lazy", cloneBase("lazy"), true);
+    envs.push(lazy);
+    await lazy.m.resumeSessions();
+    const delegated: AuthContext = { ...AUTH, delegationDepth: 1 };
+    const ask = async (msg: Record<string, unknown>, auth: AuthContext = AUTH) => {
+      const r = await lazy.m.handle({ id: "r", sessionId: ids.rich, ...msg } as never, auth, client("c", []));
+      expect(sessionOf(lazy, "rich").hydrated).toBe(false);
+      return r;
+    };
+    // mcp.adopt only reads the session's workdir; compare.keep its status.
+    expect(((await ask({ type: "mcp.adopt", server: "srv" }, delegated)) as { error?: string }).error).toContain("delegated token");
+    expect(((await ask({ type: "compare.keep", compareId: "nope" })) as { error?: string }).error).toBe("Comparison not found");
+    // A running loop's worker: what its guard refuses never reaches the history.
+    const loops = lazy.m.loops!;
+    const runOfWorker = loops.runOfWorker.bind(loops);
+    loops.runOfWorker = (id) => (id === ids.rich ? "loop_test" : runOfWorker(id));
+    try {
+      for (const msg of [
+        { type: "session.rotate" },
+        { type: "session.rewind", turnId: "t" },
+        { type: "session.set_provider", providerId: "codex" },
+      ]) {
+        expect(((await ask(msg)) as { error?: string }).error).toContain("running loop's worker");
+      }
+      const approve = await ask({ type: "session.approve", approvalId: "x", decision: "allow" }, delegated);
+      expect((approve as { error?: string }).error).toContain("loop worker");
+    } finally {
+      loops.runOfWorker = runOfWorker;
+    }
+  });
 });
 
 describe("lazy session loading: a canonical log that can't be read", () => {
