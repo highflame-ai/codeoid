@@ -393,17 +393,34 @@ unattended turn. Forks and collaboration children inherit the setting.
 Worktrees (sandbox/worktrees.ts, docs/sandbox.md "Git worktrees inside the
 sandbox", #448 round 10): `<common>/worktrees/` is writable, bound at its own
 path; a session writes only its own folder of each worktree location
-(`<repo>-worktrees/<folder>`, `.worktrees/<folder>`, `<root>/<repo>/<folder>`
-for `sandbox.worktreeRoots`; `sessionFolderName`: its name and short id, found
-again by the id after a rename or restart; `SandboxSpec.worktreeFolders`,
-Codex's roots), the rest of a location read-only (shown read-only, but not on
-Claude native, whose CLI would lay it over the folder), a location inside the
-workspace held whole; told to the agent in the system prompt
-(`worktreeFolderNote`). Every admin dir not checked out in the folder is held
-whole (`isOwnWorktree`); `SessionSandbox`'s spec is rebuilt when an admin dir
-appears or goes (`worktreeSignature`). `worktreeRootProblem` refuses a root at
+(`<repo>-worktrees/<folder>`, `<root>/<repo>/<folder>` for
+`sandbox.worktreeRoots`; nothing made inside the checkout, an existing
+`.worktrees/` held whole for a session there; `sessionFolderName`: its name
+and short id, found again by the id after a rename or restart;
+`SandboxSpec.worktreeFolders`, Codex's roots), the rest of a location
+read-only (shown read-only, but not on Claude native, whose CLI would lay it
+over the folder); told to the agent in the system prompt
+(`worktreeFolderNote`). The folder is made only in a repository and removed
+while empty, with an emptied `<repo>-worktrees/` (`SessionSandbox.tidyFolders`
+at a turn's end with no background work and no wrapped backend, and at
+close; `prepareFolders` at the next turn's start). Every admin dir the
+session didn't make is held whole at spec build; a worktree added or removed
+never rebuilds the spec (#448 round 11: it would rebuild a Claude query).
+Instead `WorktreeEntryGuard` (worktree-entries.ts) checks every admin dir
+against git's layout at spec build, turn end and destroy
+(`SessionSandbox.checkWorktreeEntries`): not a link, `commondir` the common
+dir, no `config`/`hooks`/`info` (but sparse-checkout), `config.worktree`
+empty or the user's, `gitdir` naming a checkout that names it back (the
+back-link found by scanning the locations, beside the main checkout and the
+last record, never the tampered file); restores what is certain (moved aside
+into `<common>/codeoid-held-worktrees/`, never deleted), removes a link and
+says the rest; Session says it (`sandbox.worktree_entry`) and audits
+(`session.worktree_entry_restored`/`_unrestored`). Own = first seen checked
+out in the folder and claimed by no other checkout, recorded per entry inode
+(`ownWorktreeEntries` to the spec). `worktreeRootProblem` refuses a root at
 config load (`/`, home, a dot dir of the home, `~/Library`, the config dir, a
-system dir); a missing root is made only beside the repository
+system dir; case-folded on macOS), again where a relative one leads, and one
+inside the checkout; a missing root is made only beside the repository
 (`worktreeRootNotes` says the rest). The end-of-turn look covers the
 folder's `.git`s (`GitControlOptions.ownFolders`) and treats admin dirs as
 groups (a new plain one or a removed one isn't news). Docker access

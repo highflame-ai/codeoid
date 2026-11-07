@@ -423,6 +423,13 @@ export interface SpecInputs {
    */
   worktreeFolder?: string;
   /**
+   * The repository's worktree entries the session made itself (its record:
+   * worktree-entries.ts `WorktreeEntryGuard.ownEntries`): left writable; every
+   * other entry there is held. Absent: an entry checked out in the session's
+   * folder is its own (worktrees.ts `isOwnWorktree`).
+   */
+  ownWorktreeEntries?: readonly string[];
+  /**
    * Let commands reach the host's container runtime sockets
    * (`sandbox.docker.socket`, opt-in: root-equivalent; dockerSocketPaths).
    */
@@ -510,6 +517,8 @@ export interface GitWorkspaceOptions {
    * worktree held.
    */
   worktreeFolder?: string;
+  /** The entries the session made itself (SpecInputs.ownWorktreeEntries): the others are held. */
+  ownEntries?: readonly string[];
   /** codeoid's config dir: no worktree root is in it or holds it. */
   configDir?: string;
 }
@@ -739,11 +748,12 @@ export function gitWorkspacePaths(workspace: string, home: string = process.env.
     out.readOnly.push(...f.held);
     out.problems.push(...f.problems);
   }
-  // Every other worktree there now, unless it is checked out in the session's folder: its admin dir read-only whole
-  // (not rewritten, renamed, removed or pruned), and its `.git` file when that is in the workspace. One made later
-  // is in the writable `worktrees/` until the spec is built again (SessionSandbox does when one appears).
+  // Every other worktree there now, unless the session made it: its admin dir read-only whole (not rewritten,
+  // renamed, removed or pruned), and its `.git` file when that is in the workspace. One made later is in the
+  // writable `worktrees/` until the spec is next built: its integrity is checked instead (worktree-entries.ts).
+  const ownEntries = opts.ownEntries ? new Set(opts.ownEntries.map((e) => resolve(e))) : null;
   for (const a of admins) {
-    if (isOwnWorktree(a, out.folders)) continue;
+    if (ownEntries ? ownEntries.has(resolve(a.dir)) : isOwnWorktree(a, out.folders)) continue;
     if (!isLink(a.dir)) out.readOnly.push(a.dir);
     if (a.dotgit && a.dotgit !== dotgit && within(realOr(a.dotgit), realOr(ws)) && lexists(a.dotgit) && !isLink(a.dotgit)) out.readOnly.push(a.dotgit);
   }
@@ -1048,6 +1058,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
           worktreeRoots: sandboxCfg.worktreeRoots,
           configDir: inputs.hidden?.configDir ?? getConfigDir(),
           ...(inputs.worktreeFolder ? { worktreeFolder: inputs.worktreeFolder } : {}),
+          ...(inputs.ownWorktreeEntries ? { ownEntries: inputs.ownWorktreeEntries } : {}),
         });
   const projectConfig = inputs.projectConfig === false ? [] : projectDirsOf(inputs.workdir ?? workspace, workspace).flatMap((dir) => projectConfigPaths(dir, home));
   const cache = inputs.cache === false ? null : sandboxCacheDir(home, env);

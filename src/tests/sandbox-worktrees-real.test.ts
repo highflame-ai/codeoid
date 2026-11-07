@@ -310,33 +310,43 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
     expect(existsSync(f.marker)).toBe(false);
   });
 
-  test("a session's sandbox spec is built again when a worktree appears: a fork made after its first query is held from then on (SessionSandbox)", async () => {
+  test("a worktree added while the session runs doesn't rebuild its sandbox; what a command changes in its entry is restored at the turn's end, and the next spec holds it (SessionSandbox, #448 round 11)", async () => {
     const f = fixture("refresh");
     const registry = new SandboxRegistry("linux");
     registry.register(provider);
-    const sbx = new SessionSandbox({ sessionId: "1111aaaa-0000-4000-8000-000000000000", name: "agent", workdir: f.repo, registry, setting: { provider: "bwrap", network: "off" } });
+    const found: string[] = [];
+    const sbx = new SessionSandbox({ sessionId: "1111aaaa-0000-4000-8000-000000000000", name: "agent", workdir: f.repo, registry, setting: { provider: "bwrap", network: "off" }, onWorktreeEntries: (_c, fs) => found.push(...fs.map((x) => x.name)) });
     try {
       const info = await sbx.refresh("pi");
       expect(info.state).toBe("on");
       const rt = sbx.runtimeFor("pi");
       if (!rt) throw new Error("no runtime");
       const first = rt.spec;
-      expect(rt.spec).toBe(first);
       expect(sbx.worktreeFolders()).toEqual([join(f.loc, FOLDER)]);
       const fork = join(f.loc, "fork9-7777aaaa");
       noteCodeoidWorktree(fork);
       git(["worktree", "add", "-q", "-b", "fork9", fork], f.repo, f.home);
-      const next = rt.spec;
-      expect(next).not.toBe(first);
-      expect(next.readOnly).toContain(join(f.common, "worktrees", "fork9-7777aaaa"));
-      const h = await provider.open(next);
+      // Not rebuilt: a Claude query, a process backend keep running as they are.
+      expect(rt.spec).toBe(first);
+      const h = await provider.open(first);
       try {
         const r = await sh(h, f.repo, `echo x > '${join(f.common, "worktrees", "fork9-7777aaaa", "commondir")}' 2>/dev/null && echo REWROTE || echo FORK-ADMIN-HELD; echo x > '${join(fork, "f.txt")}' 2>/dev/null && echo WROTE || echo FORK-CHECKOUT-HELD`, f.env);
-        expect(r.stdout).toContain("FORK-ADMIN-HELD");
+        expect(r.stdout).toContain("REWROTE");
         expect(r.stdout).toContain("FORK-CHECKOUT-HELD");
       } finally {
         await h.close();
       }
+      sbx.checkWorktreeEntries();
+      expect(found).toEqual(["fork9-7777aaaa"]);
+      expect(readFileSync(join(f.common, "worktrees", "fork9-7777aaaa", "commondir"), "utf8").trim()).toBe("../..");
+      userGit(f, fork);
+      expect(existsSync(f.marker)).toBe(false);
+      // The next natural rebuild (its setting changed) holds it.
+      await sbx.set({ provider: "bwrap", network: "off", allowedHosts: [] });
+      await sbx.refresh("pi");
+      const next = sbx.runtimeFor("pi")?.spec;
+      expect(next).not.toBe(first);
+      expect(next?.readOnly).toContain(join(f.common, "worktrees", "fork9-7777aaaa"));
     } finally {
       await sbx.close();
     }

@@ -70,10 +70,16 @@ function placeholder(p: string, name: string): boolean {
   }
 }
 
-/** A worktree's git dir as git makes it: `commondir` naming its repository (`../..`), no `config.worktree` but codeoid's empty one. */
-function plainWorktree(dir: string): boolean {
+/**
+ * A worktree's git dir as git makes it: a dir (a link git would follow
+ * anywhere isn't, #448 round 11), `commondir` naming its repository
+ * (`common`, as `../..` from there), no `config.worktree` but codeoid's empty one.
+ */
+function plainWorktree(dir: string, common: string): boolean {
   try {
-    if (readFileSync(join(dir, "commondir"), "utf8").trim() !== "../..") return false;
+    if (!lstatSync(dir).isDirectory() || lstatSync(join(dir, "commondir")).isSymbolicLink()) return false;
+    const named = resolve(dir, readFileSync(join(dir, "commondir"), "utf8").trim());
+    if (named !== resolve(common) && named !== realOr(common)) return false;
   } catch {
     return false;
   }
@@ -251,7 +257,7 @@ export function gitControlSnapshot(workspace: string, home: string = process.env
         /* no gitdir */
       }
       const mine = checkout !== null && own.some((f) => within(checkout as string, f) && checkout !== f);
-      out.set(`${label(dir)}/`, `${WORKTREE_GROUP}${plainWorktree(dir) ? "plain" : "custom"}`);
+      out.set(`${label(dir)}/`, `${WORKTREE_GROUP}${plainWorktree(dir, common) ? "plain" : "custom"}`);
       // The session's own may move (`git worktree move` rewrites its `gitdir`): only what names its git dirs.
       for (const n of mine ? ["commondir", "config.worktree"] : ["commondir", "gitdir", "config.worktree"]) watch(join(dir, n));
     }

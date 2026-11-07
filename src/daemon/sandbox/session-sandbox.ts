@@ -13,9 +13,9 @@
  * starts on it.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
 import { type CodeoidConfig, getConfigDir } from "../../config.js";
 import type { ClaudeTempDirs } from "./claude-native.js";
@@ -23,7 +23,8 @@ import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinem
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
 import { buildSandboxSpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
-import { existingFolderName, sessionFolderName, worktreeLocationDirs, worktreeRootNotes, worktreeSignature } from "./worktrees.js";
+import { ENTRY_GRACE_MS, WorktreeEntryGuard, type WorktreeEntryFinding } from "./worktree-entries.js";
+import { existingFolderName, mainCheckoutOf, sessionFolderName, worktreeFoldersOf, worktreeLocationDirs, worktreeRootNotes } from "./worktrees.js";
 import type { SandboxRegistry } from "./registry.js";
 import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "./git-shim.js";
 import { launcherRoot, sandboxRoot } from "./root.js";
@@ -317,10 +318,16 @@ export class SessionSandbox {
   #gitTempDir: string | null = null;
   /** The session's worktree folder name (worktrees.ts), once found or chosen: the same for its life. */
   #folderName: string | null = null;
-  /** The worktree folders a spec gave the session: the empty ones are removed at close. */
+  /** The worktree folders a spec gave the session: the empty ones are removed (tidyFolders, close). */
   #folders = new Set<string>();
+  /** The repository's worktree entries as git makes them (#448 round 11, worktree-entries.ts). */
+  readonly #entries = new WorktreeEntryGuard();
+  /** The spec last built for the session: what its commands can write, for the entries' look. */
+  #lastSpec: SandboxSpec | null = null;
+  #entriesRecheck: ReturnType<typeof setTimeout> | null = null;
 
   readonly #onWarning: ((text: string) => void) | undefined;
+  readonly #onWorktreeEntries: ((common: string, findings: WorktreeEntryFinding[]) => void) | undefined;
   readonly #name: () => string;
 
   constructor(opts: {
@@ -333,8 +340,11 @@ export class SessionSandbox {
     setting?: SessionSandboxSetting;
     /** A warning line on the session (SandboxRuntime.warn). */
     onWarning?: (text: string) => void;
+    /** What a look at the repository's worktree entries found (checkWorktreeEntries): said on the session and audited. */
+    onWorktreeEntries?: (common: string, findings: WorktreeEntryFinding[]) => void;
   }) {
     this.#onWarning = opts.onWarning;
+    this.#onWorktreeEntries = opts.onWorktreeEntries;
     this.#sessionId = opts.sessionId;
     const name = opts.name;
     this.#name = typeof name === "function" ? name : () => name ?? opts.sessionId;
@@ -440,24 +450,18 @@ export class SessionSandbox {
       if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
       return this.#spec(o.backendNetwork ? { mode: "on" } : r.network, backendState, o.readable ?? [], dockerSocket, hideLocalServices);
     };
-    // Built (and the temp dir made) when a backend first needs it, and again whenever a worktree's admin dir
-    // appeared or went in the repository (#448 round 10): one made meanwhile is held from then on (a Claude query
-    // whose spec changed is rebuilt at its next turn), and one removed is no longer bound.
+    // Built (and the temp dir made) when a backend first needs it, then kept: a worktree added or removed in the
+    // repository never rebuilds it (#448 round 11: that would rebuild a Claude query, its background tasks with it).
+    // An entry made meanwhile is checked instead (checkWorktreeEntries), and held from the next spec on.
     let spec: SandboxSpec | null = null;
-    let specFor = "";
     let gitShim: string | null = null;
-    const signature = () => worktreeSignature(gitLayoutOf(sandboxWorkspaceOf(this.#workdir))?.common ?? null);
     this.#runtime = {
       info: r.info,
       plan,
       provider,
       config,
       get spec() {
-        const now = signature();
-        if (!spec || now !== specFor) {
-          spec = open([]);
-          specFor = now;
-        }
+        spec ??= open([]);
         return spec;
       },
       open: async (backendState, o) => this.#track(await provider.open(open(backendState, o))),
@@ -598,6 +602,8 @@ export class SessionSandbox {
     // A monorepo's package: the repository's top (#448 round 9); the session's cwd stays the workdir.
     const workspace = sandboxWorkspaceOf(this.#workdir);
     const folder = this.#worktreeFolderName(workspace);
+    // The repository's worktree entries looked at first: the spec holds every one the session didn't make.
+    if (folder) this.#checkEntries();
     const spec = buildSandboxSpec({
       backendReadable: readable,
       sessionId: this.#sessionId,
@@ -607,12 +613,97 @@ export class SessionSandbox {
       network,
       ...(this.#config ? { config: this.#config } : {}),
       backendState,
-      ...(folder ? { worktreeFolder: folder } : {}),
+      ...(folder ? { worktreeFolder: folder, ownWorktreeEntries: this.#entries.ownEntries() } : {}),
       dockerSocket,
       hideLocalServices,
     });
     for (const f of spec.worktreeFolders ?? []) this.#folders.add(f);
+    this.#lastSpec = spec;
     return spec;
+  }
+
+  /**
+   * Look at the repository's worktree entries now (#448 round 11,
+   * worktree-entries.ts): what isn't as git makes it is restored where that
+   * is certain, and said (onWorktreeEntries) either way. At the end of every
+   * turn, at destroy, and when a spec is built. Only while the sandbox is on
+   * (its commands are what could have changed them unseen). Never throws.
+   */
+  checkWorktreeEntries(): void {
+    if (this.#closed || !this.#runtime) return;
+    if (!this.#worktreeFolderName(sandboxWorkspaceOf(this.#workdir))) return;
+    this.#checkEntries();
+  }
+
+  #checkEntries(): void {
+    try {
+      const workspace = sandboxWorkspaceOf(this.#workdir);
+      const layout = gitLayoutOf(workspace);
+      const folder = this.#folderName;
+      if (!layout?.common || !folder) return;
+      const opts = { roots: this.config.worktreeRoots, configDir: getConfigDir() };
+      const main = mainCheckoutOf(layout);
+      const last = this.#lastSpec;
+      // Before the first spec, the folders as they are (nothing is made for a look).
+      const folders = last ? [...(last.worktreeFolders ?? [])] : worktreeFoldersOf(layout, folder, { ...opts, workspace, make: false }).folders;
+      const dot = main ? join(main, ".worktrees") : null;
+      const { findings, pending } = this.#entries.check({
+        common: layout.common,
+        main,
+        ownFolders: folders,
+        writable: [workspace, ...(this.#tempDir ? [this.#tempDir] : []), ...folders, ...(last?.writable ?? [])],
+        readOnly: last?.readOnly ?? [],
+        locations: [...worktreeLocationDirs(layout, opts).locations.map((l) => l.dir), ...(dot ? [dot] : [])],
+      });
+      if (pending && !this.#entriesRecheck) {
+        // An entry git may still be making: looked at once it is done.
+        this.#entriesRecheck = setTimeout(() => {
+          this.#entriesRecheck = null;
+          this.checkWorktreeEntries();
+        }, ENTRY_GRACE_MS + 100);
+        this.#entriesRecheck.unref?.();
+      }
+      if (findings.length > 0) this.#onWorktreeEntries?.(layout.common, findings);
+    } catch (err) {
+      console.error(`[codeoid/sandbox ${this.#sessionId.slice(0, 8)}] looking at the repository's worktree entries failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Make the session's worktree folders again where {@link tidyFolders}
+   * removed them (a turn's start: its commands, and a Claude query's sandbox,
+   * need them there). Never through a link (worktrees.ts `worktreeFoldersOf`).
+   */
+  prepareFolders(): void {
+    if (this.#closed || this.#folders.size === 0 || [...this.#folders].every((f) => existsSync(f))) return;
+    try {
+      const workspace = sandboxWorkspaceOf(this.#workdir);
+      const layout = gitLayoutOf(workspace);
+      if (!layout || !this.#folderName) return;
+      worktreeFoldersOf(layout, this.#folderName, { roots: this.config.worktreeRoots, configDir: getConfigDir(), workspace });
+    } catch {
+      /* a folder that can't be made: a worktree add there fails, as outside one */
+    }
+  }
+
+  /**
+   * Remove the session's worktree folders that are empty, and the location
+   * holding one when that is left empty too (#448 round 11: nothing of the
+   * sandbox's stays beside your repository for a session that made no
+   * worktree): never anything with something in it, never through a link.
+   * At the end of a turn with nothing running, and with the session.
+   */
+  tidyFolders(): void {
+    for (const f of this.#folders) {
+      for (const dir of [f, dirname(f)]) {
+        try {
+          if (!lstatSync(dir).isDirectory()) break;
+          rmdirSync(dir);
+        } catch {
+          break;
+        }
+      }
+    }
   }
 
   /**
@@ -668,14 +759,12 @@ export class SessionSandbox {
     for (const dir of [this.#launcherDir, this.#homesDir, this.#gitTempDir, this.#claudeTemp ? join(this.#claudeTemp.cli, "..") : null]) {
       if (dir) rmSync(dir, { recursive: true, force: true });
     }
-    // The session's worktree folders it left empty: never one with anything in it (a worktree is the user's to keep).
-    for (const f of this.#folders) {
-      try {
-        rmdirSync(f);
-      } catch {
-        /* not empty, or gone */
-      }
+    if (this.#entriesRecheck) {
+      clearTimeout(this.#entriesRecheck);
+      this.#entriesRecheck = null;
     }
+    // The session's worktree folders it left empty: never one with anything in it (a worktree is the user's to keep).
+    this.tidyFolders();
     this.#folders.clear();
     this.#launcherDir = null;
     this.#gitTempDir = null;

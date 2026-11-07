@@ -623,6 +623,53 @@ describe("review fixes (#448)", () => {
     }
   });
 
+  test("a worktree entry taken over while the session ran is restored at the turn's end, said on the session and audited; its empty worktree folder goes at a turn's end and is back for the next (#448 round 11)", async () => {
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@e", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@e" };
+    const run = (args: string[]) => {
+      const r = Bun.spawnSync(["git", ...args], { cwd: workdir, env });
+      if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+    };
+    run(["init", "-q", "-b", "main"]);
+    run(["commit", "-q", "--allow-empty", "-m", "i"]);
+    const provider = new MockSessionProvider("claude", [[DONE], [DONE], [DONE]]);
+    const { session } = makeSession(provider);
+    const infos: Array<{ text: string; event?: string }> = [];
+    session.attach({
+      id: "w",
+      auth: AUTH,
+      capabilities: [],
+      send: (m: { type: string; role?: string; content?: string; metadata?: { event?: string } }) => {
+        if (m.type === "session.message" && m.role === "info") infos.push({ text: m.content ?? "", event: m.metadata?.event });
+      },
+    } as never);
+    const said = () => infos.filter((i) => i.event === "sandbox.worktree_entry");
+    const loc = join(root, "work-worktrees");
+    await session.send("one", AUTH);
+    await until(() => session.status === "idle");
+    // Claude's own sandbox (nothing of it runs between turns): the folder, left empty, is gone with its location.
+    expect(existsSync(loc)).toBe(false);
+    expect(said()).toEqual([]);
+    // Yours, added while the session runs, and what a command could then do to its entry (here between turns).
+    const yours = join(root, "yours");
+    run(["worktree", "add", "-q", "-b", "yours", yours]);
+    writeFileSync(join(workdir, ".git", "worktrees", "yours", "commondir"), `${join(root, "planted")}\n`);
+    let madeAgain = false;
+    const runTurn = provider.runTurn.bind(provider);
+    provider.runTurn = (o) => {
+      madeAgain = existsSync(loc);
+      return runTurn(o);
+    };
+    await session.send("two", AUTH);
+    await until(() => said().length === 1);
+    expect(madeAgain).toBe(true);
+    expect(said()[0]!.text).toContain(".git/worktrees/yours commondir named");
+    expect(said()[0]!.text).toContain("is restored");
+    expect(readFileSync(join(workdir, ".git", "worktrees", "yours", "commondir"), "utf8").trim()).toBe("../..");
+    expect(audits.filter((a) => a.action === "session.worktree_entry_restored")).toEqual([expect.objectContaining({ sessionId: session.id, detail: expect.stringContaining("worktrees/yours commondir") })]);
+    await until(() => session.status === "idle");
+    expect(existsSync(loc)).toBe(false);
+  });
+
   test("a commit made during the session that changed project settings (through git plumbing, never in the working tree) is named with its files: at the turn's end, once, and at destroy (#448 round 6)", async () => {
     const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@e", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@e" };
     const run = (args: string[], extra: Record<string, string> = {}, input?: string) => {

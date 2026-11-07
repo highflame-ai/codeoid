@@ -25,9 +25,9 @@
  *     read-only whole for a session working in that checkout (other
  *     sessions' worktrees may be in it).
  *
- * A worktree is the session's own when it is checked out in its folder
- * ({@link isOwnWorktree}): what the agent made there is its own output,
- * like the workspace, across a restart too.
+ * Which admin dirs are the session's own, and whether the others are as git
+ * made them, is worktree-entries.ts's: what the agent made in its folder is
+ * its own output, like the workspace.
  */
 
 import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
@@ -397,19 +397,12 @@ export function worktreeAdminsOf(common: string, limit = 500): WorktreeAdmin[] {
   });
 }
 
-/** The repository's admin dirs by name, for telling when one appeared or went (SessionSandbox rebuilds its spec then). */
-export function worktreeSignature(common: string | null): string {
-  if (!common) return "";
-  try {
-    return readdirSync(join(common, "worktrees")).sort().join("\n");
-  } catch {
-    return "";
-  }
-}
-
 /**
- * Whether `admin` is a worktree the session made itself: checked out in
- * one of its folders (`folders`), and not codeoid's own.
+ * Whether `admin` is checked out in one of the session's folders
+ * (`folders`), and not codeoid's own, as its `gitdir` says: the verdict of a
+ * spec built without a session's record of its own entries (a check's, the
+ * git shim's: no folder there). A session's sandbox decides by its record
+ * (worktree-entries.ts), never by this file alone, which a command can write.
  */
 export function isOwnWorktree(admin: WorktreeAdmin, folders: readonly string[]): boolean {
   if (!admin.dotgit || folders.length === 0) return false;

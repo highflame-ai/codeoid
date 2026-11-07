@@ -210,6 +210,7 @@ import { asksOutsideSandbox } from "./sandbox/confinement.js";
 import { type HostToolBreach, hostFileBreachNote, hostFileBreachReason, hostFileToolBreach, hostToolBoundsFor, isHostFileTool } from "./sandbox/host-file-tools.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
 import { CLAUDE_ALL_SOCKETS_NOTE, describeSandbox, resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { type WorktreeEntryFinding, worktreeEntryLine, worktreeEntryWarning } from "./sandbox/worktree-entries.js";
 import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
 import { worktreeFolderNote } from "./sandbox/worktrees.js";
 import { protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
@@ -1576,6 +1577,7 @@ export class Session {
         ...(opts.config ? { config: opts.config } : {}),
         ...(opts.sandbox ? { setting: opts.sandbox } : {}),
         onWarning: (text) => this.#sandboxWarning(text, "sandbox.login_not_saved"),
+        onWorktreeEntries: (common, findings) => this.#worktreeEntriesFound(common, findings),
       });
     }
     this.#requireSandbox = opts.requireSandbox === true;
@@ -3270,6 +3272,8 @@ export class Session {
    */
   #checkGitControl(sub: string): Promise<void> {
     const commits = this.#checkSettingsCommits(sub);
+    // The repository's worktree entries first (#448 round 11): what is restored there isn't news below.
+    this.#sandbox?.checkWorktreeEntries();
     const before = this.#gitBaseline;
     if (!before) return commits;
     try {
@@ -3314,6 +3318,30 @@ export class Session {
       console.error(`[codeoid/session ${this.id}] checking the session's commits failed: ${err instanceof Error ? err.message : String(err)}`);
     });
     return this.#settingsCheck;
+  }
+
+  /**
+   * What a look at the repository's worktree entries found (#448 round 11,
+   * sandbox/worktree-entries.ts): an entry not as git makes it, restored or
+   * left for the owner. Audited one by one, said in one warning line.
+   */
+  #worktreeEntriesFound(common: string, findings: readonly WorktreeEntryFinding[]): void {
+    for (const f of findings) {
+      this.#store.audit(SYSTEM_IDENTITY.sub, f.restored ? "session.worktree_entry_restored" : "session.worktree_entry_unrestored", this.id, worktreeEntryLine(common, f).slice(0, 2000));
+    }
+    this.#sandboxWarning(worktreeEntryWarning(common, findings), "sandbox.worktree_entry");
+  }
+
+  /**
+   * The session's empty worktree folders removed at a turn's end (#448 round
+   * 11), unless something still runs in its sandbox: background work, or a
+   * backend whose process is inside it (its mounts were fixed at its start).
+   * The next turn makes them again (SessionSandbox.prepareFolders).
+   */
+  #tidyWorktreeFolders(): void {
+    const sbx = this.#sandbox;
+    if (!sbx?.runtime || sbx.runtime.plan.wrapsBackend || this.#hasAgentBackgroundWork()) return;
+    sbx.tidyFolders();
   }
 
   /** A warning line on the session about its sandbox (#448), persisted and shown to every client. */
@@ -4032,6 +4060,8 @@ export class Session {
     // The OS sandbox (#448), resolved for this backend before it starts. An
     // autonomous or unattended turn doesn't start without one that holds.
     await this.ensureSandbox();
+    // Its worktree folders, removed while empty at the last turn's end, are there again for this one's commands.
+    this.#sandbox?.prepareFolders();
     const sandboxRefused =
       this.sandboxRefusal() ??
       // Its backend still runs in the sandbox it had before a change: not what the session reports.
@@ -9311,6 +9341,7 @@ export class Session {
           result: event.result,
         });
         void this.#checkGitControl(SYSTEM_IDENTITY.sub);
+        this.#tidyWorktreeFolders();
         if (event.result.isError) {
           const errText = event.result.errorMessage ?? "Turn ended with an error";
           // The CLI reports an overflow as the turn's assistant text and ends
