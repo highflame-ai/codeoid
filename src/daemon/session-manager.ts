@@ -360,6 +360,8 @@ function toFleetEventWire(row: DispatchEventRow): FleetEventWire {
  *  configured value is `session.resumeMaxSessions`. */
 const RESUME_MAX_SESSIONS_DEFAULT = 200;
 const RESUME_DEADLINE_MS = 20_000;
+/** At shutdown, how long drain waits, after the turns ended, for routine runs to record theirs. */
+const ROUTINE_SETTLE_MS = 1_000;
 /** Per-session transcript read budget on resume. Scrollback keeps at most
  * 20 MiB / 5000 messages — parsing history past that would be evicted on
  * arrival, so cap the read slightly above the scrollback byte cap. */
@@ -3937,8 +3939,8 @@ mcpHub: this.#mcpHub,
    * interrupt and the turn's result follows. Each is waited for at most its
    * backend's settle bound (`Session.interruptSettleMs`), all at once, so a
    * backend that never ends the turn holds shutdown that long, not to the
-   * deadline; it is named in the log and left. Then the transcript writes are
-   * flushed.
+   * deadline; it is named in the log and left. Then the routine runs record
+   * their rows, and the transcript writes are flushed.
    */
   async drain(timeoutMs = 10_000): Promise<void> {
     try {
@@ -4007,6 +4009,11 @@ mcpHub: this.#mcpHub,
       if (waiting === 0) break;
       await Bun.sleep(Math.min(pollMs, remaining()));
       pollMs = Math.min(pollMs * 2, 50);
+    }
+    // A routine run records its final row, spend included, once its turn has
+    // ended; the store closes next.
+    if (this.#routines && !(await this.#routines.settled(Math.min(remaining(), ROUTINE_SETTLE_MS)))) {
+      console.warn("[codeoid/session-manager] drain: a routine run didn't record its end in time");
     }
     await this.#flushTranscripts(deadline);
   }

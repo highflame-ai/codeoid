@@ -12,7 +12,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import { HookBus } from "../daemon/hooks/bus.js";
-import type { ProviderEvent } from "../daemon/providers/interface.js";
+import { AsyncQueue } from "../daemon/async-queue.js";
+import type { ProviderEvent, TurnOpts, TurnRun } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { handleRoutineFire } from "../daemon/routines/http.js";
@@ -83,6 +84,38 @@ let nextScript: ProviderEvent[][];
 let nextStall = false;
 let hookFile: string;
 let registry: ProviderRegistry;
+/** Set: the next backend works until interrupted, its result (spend included) following that many ms after. */
+let nextLateResult: number | null = null;
+
+/** Works until interrupted; acknowledges at once and ends the turn, $0.42 spent, `late` ms after. */
+class LateResultProvider extends MockSessionProvider {
+  constructor(private readonly late: number) {
+    super("claude");
+  }
+
+  override runTurn(opts: TurnOpts): TurnRun {
+    this.capturedOpts.push(opts);
+    const queue = new AsyncQueue<ProviderEvent>();
+    void Promise.resolve().then(() => queue.push({ type: "text_delta", content: "working" } as ProviderEvent));
+    return {
+      events: queue,
+      interrupt: async () => {
+        setTimeout(() => {
+          try {
+            queue.push({
+              type: "turn_done",
+              result: { providerId: "claude", model: "mock", inputTokens: 1000, outputTokens: 200, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0.42, costSource: "backend", durationMs: 1, isError: true, errorMessage: "interrupted" },
+            } as ProviderEvent);
+          } catch {
+            // closed
+          }
+          queue.close();
+        }, this.late);
+      },
+      endTurn: () => queue.close(),
+    };
+  }
+}
 
 const CLIENT = (auth: AuthContext) => ({ id: `c-${auth.sub}`, auth, send: () => {} });
 const call = (msg: Record<string, unknown>, auth: AuthContext = OWNER): Promise<DaemonMessage> =>
@@ -113,13 +146,14 @@ beforeEach(() => {
   providers = [];
   nextScript = [reply("Found 2 stale PRs: #12, #15.")];
   nextStall = false;
+  nextLateResult = null;
   hookFile = join(tmp, "hook.json");
   registry = new ProviderRegistry("claude");
   registry.register({
     id: "claude",
     displayName: "claude",
     create: () => {
-      const p = new MockSessionProvider("claude", nextScript.map((t) => [...t]), { stall: nextStall });
+      const p = nextLateResult !== null ? new LateResultProvider(nextLateResult) : new MockSessionProvider("claude", nextScript.map((t) => [...t]), { stall: nextStall });
       providers.push(p);
       return p;
     },
@@ -291,6 +325,36 @@ describe("routine lifecycle through the protocol", () => {
     expect(got.runs![0]).toMatchObject({ status: "silent", costUsd: 0 });
     expect(providers).toHaveLength(0);
   });
+});
+
+describe("a routine run at shutdown", () => {
+  for (const late of [0, 100, 300]) {
+    it(`records its end and its spend before the store closes (the turn's result ${late} ms after the interrupt)`, async () => {
+      nextLateResult = late;
+      await create({ name: "long" });
+      const fired = (await call({ type: "routine.run", routine: "long" })) as RoutineRunResultMsg;
+      const svc = manager.routines!;
+      let sessionId: string | null = null;
+      for (let i = 0; i < 200; i++) {
+        sessionId = svc.store.getRun(fired.run.id)?.sessionId ?? null;
+        if (sessionId && manager._sessionForTest(sessionId)?.status === "thinking") break;
+        await Bun.sleep(10);
+      }
+      expect(manager._sessionForTest(sessionId!)?.status).toBe("thinking");
+
+      // The daemon's order: routines stop, the dispatcher stops, sessions drain, then the store closes.
+      const started = performance.now();
+      manager.stopRoutines();
+      manager.stopDispatcher();
+      await manager.drain(10_000);
+      const took = performance.now() - started;
+      // What the store holds now is what it keeps.
+      const row = svc.store.getRun(fired.run.id)!;
+      expect(row.status).toBe("interrupted");
+      expect(row.costUsd).toBeCloseTo(0.42);
+      expect(took).toBeLessThan(late + 1_000);
+    });
+  }
 });
 
 describe("authority", () => {

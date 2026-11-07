@@ -656,6 +656,8 @@ export class RoutineService {
   #timer: ReturnType<typeof setInterval> | null = null;
   #ticking = false;
   readonly #live = new Map<string, LiveRun>();
+  /** Each live run's execution, until it has recorded its end. */
+  readonly #running = new Set<Promise<void>>();
   /** sessionId → the live run waiting on it. */
   readonly #bySession = new Map<string, LiveRun>();
   /**
@@ -728,6 +730,25 @@ export class RoutineService {
       live.abort.abort();
       live.wake();
     }
+  }
+
+  /**
+   * After `stop()`, at shutdown: resolves true once every live run has
+   * recorded its end (its row, spend included), false after `timeoutMs`.
+   * The daemon's drain awaits it before the store closes.
+   */
+  async settled(timeoutMs: number): Promise<boolean> {
+    if (this.#running.size === 0) return true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ended = await Promise.race([
+      Promise.allSettled([...this.#running]).then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    clearTimeout(timer);
+    return ended;
   }
 
   /**
@@ -970,11 +991,13 @@ export class RoutineService {
         abort: new AbortController(),
       };
       this.#live.set(run.id, live);
-      void this.#execute(routine, run, live).finally(() => {
+      const running = this.#execute(routine, run, live).finally(() => {
         this.#live.delete(run.id);
+        this.#running.delete(running);
         if (live.sessionId) this.#bySession.delete(live.sessionId);
         this.#drainQueue();
       });
+      this.#running.add(running);
     }
   }
 
@@ -1266,12 +1289,14 @@ export class RoutineService {
               stoppedTasks = true;
               quiet = 0;
               await this.#host.stopBackgroundTasks(id, left).catch(() => {});
-            } else if (!(force || stoppedTasks) || ++quiet >= 3) {
+            } else if (!(force || stoppedTasks) || ++quiet >= 3 || this.#stopped) {
               // After a stop, a few quiet polls: a wake that slipped in shows up as a turn.
+              // Not when the daemon is stopping: no wake is delivered then, and the store closes next.
               return;
             }
           }
-          await this.#sleep(100);
+          // Stopping: the row is written as soon as the turn has ended, before the store closes.
+          await this.#sleep(this.#stopped ? 10 : 100);
         }
         unsettled = true;
       };

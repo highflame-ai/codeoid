@@ -161,10 +161,17 @@ retries the turn on that model instead of failing it. There is no daemon-side
 retry manager.
 
 **Graceful shutdown**: cleanup registry runs in LIFO order on SIGTERM/SIGINT/SIGHUP.
-Sessions drained (in-flight work interrupted, each interrupted turn waited
-for until its end, spend included, is recorded — a backend acknowledges an
-interrupt before the turn's result arrives — then the transcript writes
-flushed; bounded by drain's 10 s, never a fixed wait), store flushed,
+Sessions drained: from its start no turn starts (a send is refused, a turn
+the backend starts on its own is interrupted as it starts, no wake, recovery
+or seed retry runs: `Session.beginDrain`); in-flight work is interrupted once
+per turn, and every turn not yet recorded (one its owner, a routine or a loop
+stopped just before included) is waited for until its end, spend included, is
+recorded — a backend acknowledges an interrupt before the turn's result
+arrives — but at most its backend's settle bound (`interruptSettleMs`,
+`DRAIN_SETTLE_MS` 2 s; opencode 3 s), all sessions at once, then named in the
+log and left; routine runs then record their rows (`RoutineService.settled`,
+≤ 1 s) and the transcript writes are flushed; polled at 10 ms backing off to
+50 ms, bounded by drain's 10 s, never a fixed wait. Store flushed,
 WebSockets closed, frontends stopped. 30-second grace period before forced exit.
 
 **One daemon per data dir**: `codeoid start` locks each dir the daemon owns
