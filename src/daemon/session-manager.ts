@@ -449,6 +449,32 @@ const NO_HISTORY_MESSAGES: ReadonlySet<string> = new Set([
   "compare.list",
 ]);
 
+/**
+ * The scopes each history-reading message's handler requires (every group,
+ * any scope within one): a caller without them is refused there, so its
+ * message loads nothing. Types not listed load for any caller of the tenant.
+ */
+const HISTORY_SCOPES: Readonly<Record<string, ReadonlyArray<readonly Scope[]>>> = {
+  "session.attach": [[SCOPES.SESSION_ATTACH, SCOPES.SESSION_WATCH]],
+  "scrollback.page": [[SCOPES.SESSION_ATTACH, SCOPES.SESSION_WATCH]],
+  "session.send": [[SCOPES.SESSION_SEND]],
+  "session.part_action": [[SCOPES.SESSION_SEND]],
+  "session.rotate": [[SCOPES.SESSION_SEND]],
+  "session.rewind": [[SCOPES.SESSION_SEND]],
+  "compare.keep": [[SCOPES.SESSION_SEND]],
+  "session.approve": [[SCOPES.SESSION_APPROVE]],
+  "session.set_provider": [[SCOPES.SESSION_APPROVE]],
+  "session.fork": [[SCOPES.SESSION_CREATE]],
+  "session.compare": [[SCOPES.SESSION_CREATE], [SCOPES.SESSION_SEND]],
+  "mcp.adopt": [[SCOPES.SETTINGS_WRITE]],
+};
+
+/** Whether `auth` holds the scopes `type`'s handler requires before it reads a session's history. */
+function mayReadHistory(type: string, auth: AuthContext): boolean {
+  const groups = HISTORY_SCOPES[type];
+  return !groups || groups.every((any) => any.some((scope) => hasScope(auth.scopes as string[], scope)));
+}
+
 /** Sort key for resume ordering: most-recently-active first. Falls back to
  * createdAt, then 0, so a malformed timestamp never throws. */
 function resumeSortKey(m: { lastActivityAt?: string; createdAt?: string }): number {
@@ -1645,8 +1671,9 @@ mcpHub: this.#mcpHub,
   /**
    * Load the history of the session `msg` names (lazy session loading), so
    * every handler finds it in memory: the one place a client's use of a
-   * session loads it. Only for a session the caller's tenant owns, and not
-   * for messages that never read it (`NO_HISTORY_MESSAGES`). While a load is awaited here,
+   * session loads it. Only for a session the caller's tenant owns, with the
+   * scope its handler needs (`HISTORY_SCOPES`), and not for messages that
+   * never read it (`NO_HISTORY_MESSAGES`). While a load is awaited here,
    * every later message naming that session waits behind it, whether it
    * reads the history or not, so they are handled in the order they came
    * (an interrupt never overtakes the prompt it stops); other sessions'
@@ -1659,7 +1686,7 @@ mcpHub: this.#mcpHub,
     const session = this.#sessions.get(id);
     if (!session || session.accountId !== auth.accountId || session.projectId !== auth.projectId) return null;
     const load = (): Promise<DaemonMessage | null> | null => {
-      if (NO_HISTORY_MESSAGES.has(msg.type) || !session.historyPending) return null;
+      if (NO_HISTORY_MESSAGES.has(msg.type) || !session.historyPending || !mayReadHistory(msg.type, auth)) return null;
       return session.ensureHydrated().then(
         () => null,
         (err): DaemonMessage => {

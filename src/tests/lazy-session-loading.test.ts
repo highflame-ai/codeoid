@@ -1053,4 +1053,37 @@ describe("lazy session loading: messages while a load is in flight", () => {
     expect(answered).toBe(true);
     expect((await attached).type).toBe("response.ok");
   });
+
+  it("a request its handler refuses on scope loads nothing", async () => {
+    const lazy = openEnv("lazy", cloneBase("lazy"), true);
+    envs.push(lazy);
+    await lazy.m.resumeSessions();
+    const asked: Array<[string, Record<string, unknown>]> = [
+      ["session.attach", {}],
+      ["scrollback.page", { maxBytes: 4096 }],
+      ["session.send", { text: "hi" }],
+      ["session.part_action", { messageId: "m", action: "a" }],
+      ["session.rotate", {}],
+      ["session.rewind", { turnId: "t" }],
+      ["session.approve", { approvalId: "x", decision: "allow" }],
+      ["session.fork", { name: "f" }],
+      ["session.set_provider", { providerId: "codex" }],
+    ];
+    for (const scopes of [[], ["session:watch"]] as const) {
+      const auth: AuthContext = { ...AUTH, scopes: [...scopes] as AuthContext["scopes"] };
+      for (const [type, rest] of asked) {
+        if (type === "session.attach" || type === "scrollback.page") {
+          if (scopes.length > 0) continue; // a watcher may read the history
+        }
+        const r = await lazy.m.handle({ type, id: "r", sessionId: ids.rich, ...rest } as never, auth, client("c", []));
+        expect([type, r.type, (r as { error?: string }).error?.startsWith("Missing scope")]).toEqual([type, "response.error", true]);
+        expect(sessionOf(lazy, "rich").hydrated).toBe(false);
+      }
+    }
+    // A watcher's attach does load it.
+    const watcher: AuthContext = { ...AUTH, scopes: ["session:watch"] as AuthContext["scopes"] };
+    const r = await lazy.m.handle({ type: "session.attach", id: "w", sessionId: ids.rich } as never, watcher, client("w", []));
+    expect(r.type).toBe("response.ok");
+    expect(sessionOf(lazy, "rich").hydrated).toBe(true);
+  });
 });
