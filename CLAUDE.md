@@ -412,7 +412,12 @@ groups (a new plain one or a removed one isn't news). Docker access
 in `widens` (so create/fork/routine/loop/set_sandbox authority follows),
 autonomous owner-only; every card `sandboxDocker` ("sandboxed, Docker access"),
 the chip amber (`DOCKER_ACCESS_WHY`); Claude native needs `allowAllUnixSockets`
-on Linux (its seccomp blocks unix sockets otherwise).
+on Linux (its seccomp blocks unix sockets otherwise), so there the host's
+`/tmp` and `/var/tmp` are denied too (`HOST_SHARED_TEMP`) and what stays
+reachable is said (`CLAUDE_ALL_SOCKETS_NOTE`); a socket the user can't
+connect to isn't counted. Every other runtime's socket (libvirt, LXD, Incus,
+containerd, …: `containerSocketPaths`) and the system bus and screen's dir
+(`HOST_SOCKET_DIRS`) are hidden in every sandbox.
 
 Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell/`
 parses a command line with tree-sitter-bash (WASM, vendored `tree-sitter-bash.wasm`;

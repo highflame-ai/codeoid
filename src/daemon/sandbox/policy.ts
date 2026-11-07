@@ -23,7 +23,7 @@
  *   - network per policy.
  */
 
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CodeoidConfig } from "../../config.js";
@@ -152,14 +152,21 @@ export const HOME_CREDENTIAL_PATHS: readonly string[] = [
 ];
 
 /**
- * Container runtime sockets (and the dirs that hold them). Reaching one is
- * root on the machine, so none is ever visible inside, whatever else is.
+ * Container and VM runtime sockets (and the dirs that hold them). Reaching
+ * one is root on the machine (a privileged container, a VM with the host's
+ * disk), so none is ever visible inside, whatever else is; Docker access
+ * shows only the runtime's own ({@link dockerSocketPaths}).
  */
 export function containerSocketPaths(home: string, env: Record<string, string | undefined> = process.env): string[] {
   const runtime = env.XDG_RUNTIME_DIR || (typeof process.getuid === "function" ? `/run/user/${process.getuid()}` : "");
   const out = [
     "/run/docker.sock",
     "/var/run/docker.sock",
+    // dockerd's own dir: its plugins' and its containerd's sockets.
+    "/run/docker",
+    "/var/run/docker",
+    "/run/cri-dockerd.sock",
+    "/var/run/cri-dockerd.sock",
     "/run/containerd",
     "/var/run/containerd",
     "/run/podman",
@@ -168,17 +175,40 @@ export function containerSocketPaths(home: string, env: Record<string, string | 
     "/var/run/crio",
     "/run/buildkit",
     "/run/k3s",
+    "/var/run/k3s",
+    "/run/k0s",
+    "/run/firecracker-containerd",
+    "/var/snap/microk8s/common/run",
+    "/var/run/balena-engine.sock",
+    "/var/run/balena.sock",
+    // libvirt (group libvirt: a VM with the host's disk), LXD and Incus (group lxd / incus-admin: a privileged container).
+    "/run/libvirt",
+    "/var/run/libvirt",
+    "/var/snap/lxd/common/lxd",
+    "/var/snap/lxd/common/lxd-user",
+    "/var/lib/lxd",
+    "/run/lxd",
+    "/var/lib/incus",
+    "/run/incus",
     join(home, ".docker/run"),
     join(home, ".colima"),
     join(home, ".lima"),
     join(home, ".rd"),
     join(home, ".orbstack"),
   ];
-  if (runtime) out.push(join(runtime, "docker.sock"), join(runtime, "podman"), join(runtime, "containerd"));
+  if (runtime) out.push(join(runtime, "docker.sock"), join(runtime, "docker"), join(runtime, "podman"), join(runtime, "containerd"), join(runtime, "libvirt"));
   const dockerHost = env.DOCKER_HOST;
   if (dockerHost?.startsWith("unix://")) out.push(dockerHost.slice("unix://".length));
   return out;
 }
+
+/**
+ * The host's other shared socket dirs a command must not reach: the system
+ * D-Bus (polkit lets a desktop user mount drives, change the network, power
+ * off) and screen's sessions. Hidden in every sandbox (the desktop session's
+ * runtime dir, with its bus and agents, already is).
+ */
+export const HOST_SOCKET_DIRS: readonly string[] = ["/run/dbus", "/var/run/dbus", "/run/screen", "/var/run/screen"];
 
 /**
  * The host's container runtime sockets that exist now, for a sandbox whose
@@ -212,12 +242,28 @@ export function dockerSocketPaths(
   return out;
 }
 
+/** A socket the daemon's user can connect to (writable: `/var/run/docker.sock` of a user not in the docker group isn't). */
 function socketAt(p: string): boolean {
   try {
-    return statSync(p).isSocket();
+    if (!statSync(p).isSocket()) return false;
+    accessSync(p, constants.W_OK);
+    return true;
   } catch {
     return false;
   }
+}
+
+/** The runtime sockets {@link dockerSocketPaths} looks for that exist but the daemon's user can't connect to (said, not shown). */
+export function unconnectableDockerSockets(home: string, env: Record<string, string | undefined> = process.env, platform: NodeJS.Platform = process.platform): string[] {
+  const exists = (p: string) => {
+    try {
+      return statSync(p).isSocket();
+    } catch {
+      return false;
+    }
+  };
+  const connectable = new Set(dockerSocketPaths(home, env, platform));
+  return dockerSocketPaths(home, env, platform, exists).filter((p) => !connectable.has(p));
 }
 
 /** Environment variables that point into the desktop session or an agent: never handed inside. */
@@ -265,6 +311,8 @@ export function hiddenPathsFor(config: CodeoidConfig | undefined, inputs: Hidden
   if (runtime) out.push(runtime);
   // An agent socket wherever it is.
   if (env.SSH_AUTH_SOCK) out.push(dirname(env.SSH_AUTH_SOCK));
+  // The system bus and screen's sessions (#448 round 10).
+  out.push(...HOST_SOCKET_DIRS);
   // The daemon's own temp dir, when it isn't /tmp (which the sandbox replaces).
   const daemonTmp = inputs.daemonTmp ?? tmpdir();
   if (daemonTmp && resolve(daemonTmp) !== "/tmp") out.push(daemonTmp);

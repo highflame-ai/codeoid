@@ -22,7 +22,7 @@ import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
-import { buildSandboxSpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, validAllowedHost } from "./policy.js";
+import { buildSandboxSpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
 import { existingFolderName, sessionFolderName, worktreeLocationDirs, worktreeRootNotes, worktreeSignature } from "./worktrees.js";
 import type { SandboxRegistry } from "./registry.js";
 import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "./git-shim.js";
@@ -39,6 +39,14 @@ import {
   type SandboxSpawnOptions,
   type SandboxSpec,
 } from "./types.js";
+
+/**
+ * What Docker access also lets a command reach under Claude's own Linux
+ * sandbox, which can't allow a single socket (`allowAllUnixSockets`): the
+ * limits line says it (docs/sandbox.md, Docker access).
+ */
+export const CLAUDE_ALL_SOCKETS_NOTE =
+  "on Claude's Linux sandbox that lets a command connect to any unix socket it can see: the host's /tmp, the desktop's runtime dir, the system bus and every other runtime's socket are hidden, but a socket in the workspace, in what your home shows (sandbox.homeReadable) or in a system dir open to every user (systemd's journal, printing) is reachable";
 
 /** A session's sandbox can't satisfy what an unattended or autonomous run needs. */
 export class SandboxRequiredError extends Error {
@@ -246,11 +254,17 @@ export async function resolveSandbox(opts: {
   const top = opts.workspace !== undefined && c.plan.kind !== "no-shell" ? sandboxWorkspaceOf(opts.workspace) : null;
   const topNote = top && opts.workspace !== undefined && top !== resolve(opts.workspace) ? `the workspace is the repository's top (${top}), which the working directory is inside: all of it is readable and writable, its git structure and every project settings dir on the way held read-only` : null;
   // The container runtime's socket, when the owner let it in: said, and said when there is none to reach.
-  const sockets = dockerSocket ? dockerSocketPaths(process.env.HOME ?? homedir()) : [];
+  const home = process.env.HOME ?? homedir();
+  const sockets = dockerSocket ? dockerSocketPaths(home) : [];
+  const unconnectable = dockerSocket && sockets.length === 0 ? unconnectableDockerSockets(home) : [];
+  // Claude's Linux sandbox can't allow one socket: every one a command can see is connectable then (#448 round 10).
+  const allSockets = sockets.length > 0 && c.plan.kind === "native" && process.platform === "linux";
   const dockerNote = dockerSocket
     ? sockets.length > 0
-      ? `Docker access: commands can reach the container runtime (${sockets.join(", ")}), which can reach the whole machine (a container can mount /)`
-      : "Docker access was asked for, but no container runtime socket was found here"
+      ? `Docker access: commands can reach the container runtime (${sockets.join(", ")}), which can reach the whole machine (a container can mount /)${allSockets ? `; ${CLAUDE_ALL_SOCKETS_NOTE}` : ""}`
+      : unconnectable.length > 0
+        ? `Docker access was asked for, but the container runtime socket found here (${unconnectable.join(", ")}) isn't one you can connect to (is your user in its group?): not shown`
+        : "Docker access was asked for, but no container runtime socket was found here"
     : null;
   // `sandbox.worktreeRoots` refused here, or missing and not beside the repository (never made): said (worktrees.ts).
   const layout = top !== null && opts.config.worktreeRoots.length > 0 ? gitLayoutOf(top) : null;

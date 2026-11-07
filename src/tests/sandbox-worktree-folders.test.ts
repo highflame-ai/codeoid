@@ -1,24 +1,26 @@
 /**
  * #448 round 10: a sandboxed session's git worktrees go in its own folder of
  * each worktree location (sandbox/worktrees.ts), `sandbox.worktreeRoots` is
- * validated and scoped per repository.
+ * validated and scoped per repository, every other runtime's socket stays
+ * hidden, and Docker access on Claude's Linux sandbox hides the host's /tmp.
  * No sandbox runs here (sandbox-worktrees-real.test.ts and
  * sandbox-claude-real.test.ts run the real ones).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
+import { createServer, type Server } from "node:net";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig, validateConfigObject } from "../config.js";
 import type { CodeoidConfig } from "../config.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
-import { claudeSandboxSettings } from "../daemon/sandbox/claude-native.js";
+import { claudeSandboxSettings, HOST_SHARED_TEMP } from "../daemon/sandbox/claude-native.js";
 import { LocalSandboxHandle } from "../daemon/sandbox/local-handle.js";
-import { gitLayoutOf } from "../daemon/sandbox/policy.js";
+import { containerSocketPaths, dockerSocketPaths, gitLayoutOf, HOST_SOCKET_DIRS, hiddenPathsFor, unconnectableDockerSockets } from "../daemon/sandbox/policy.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
-import { resolveSandbox, SessionSandbox } from "../daemon/sandbox/session-sandbox.js";
+import { CLAUDE_ALL_SOCKETS_NOTE, resolveSandbox, SessionSandbox } from "../daemon/sandbox/session-sandbox.js";
 import type { SandboxProvider, SandboxSpec } from "../daemon/sandbox/types.js";
 import { existingFolderName, sessionFolderName, worktreeFolderNote, worktreeLocationDirs, worktreeRootNotes, worktreeRootProblem } from "../daemon/sandbox/worktrees.js";
 import { Session } from "../daemon/session.js";
@@ -103,7 +105,34 @@ describe("sandbox.worktreeRoots validation (#448 round 10)", () => {
   });
 });
 
-describe("Claude's own sandbox (#448 round 10)", () => {
+describe("runtime sockets (#448 round 10)", () => {
+  test("libvirt, LXD, Incus and more runtimes are hidden; the system bus and screen's dir in every sandbox", () => {
+    const paths = containerSocketPaths("/h", { XDG_RUNTIME_DIR: "/run/user/7" });
+    for (const p of ["/run/libvirt", "/var/run/libvirt", "/run/user/7/libvirt", "/var/snap/lxd/common/lxd", "/var/lib/lxd", "/var/lib/incus", "/run/incus", "/run/docker", "/run/k0s", "/var/snap/microk8s/common/run", "/run/containerd", "/run/k3s"]) expect(paths).toContain(p);
+    const hidden = hiddenPathsFor(undefined, { home: "/h", configDir: "/h/.codeoid", env: {}, daemonTmp: "/tmp" });
+    for (const p of HOST_SOCKET_DIRS) expect(hidden).toContain(p);
+  });
+
+  test("a runtime socket the daemon's user can't connect to isn't shown, and is said", async () => {
+    const run = join(root, "run");
+    mkdirSync(run, { mode: 0o700 });
+    const sock = join(run, "docker.sock");
+    const server: Server = createServer(() => {});
+    await new Promise<void>((r) => server.listen(sock, r));
+    try {
+      const env = { XDG_RUNTIME_DIR: run };
+      expect(dockerSocketPaths(root, env, "linux")).toEqual([sock]);
+      chmodSync(sock, 0o400);
+      if (process.getuid?.() === 0) return;
+      expect(dockerSocketPaths(root, env, "linux")).toEqual([]);
+      expect(unconnectableDockerSockets(root, env, "linux")).toEqual([sock]);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+});
+
+describe("Docker access on Claude's own sandbox (#448 round 10)", () => {
   const spec = (dockerSockets?: string[]): SandboxSpec => ({
     sessionId: "s",
     workspace: "/w",
@@ -118,8 +147,18 @@ describe("Claude's own sandbox (#448 round 10)", () => {
     ...(dockerSockets ? { dockerSockets } : {}),
   });
   const config = { provider: "auto", network: "off", allowedHosts: [], hiddenPaths: [], homeReadable: [], worktreeRoots: [], docker: { image: "x", socket: true } } as never;
+  test("Linux: every unix socket allowed, so the host's /tmp and /var/tmp are denied; without Docker access, or on macOS, they aren't", () => {
+    const on = claudeSandboxSettings({ spec: spec(["/run/user/1/docker.sock"]), config }, {}, undefined, "linux");
+    expect(on.network?.allowAllUnixSockets).toBe(true);
+    for (const t of HOST_SHARED_TEMP) expect(on.filesystem?.denyRead).toContain(t);
+    const off = claudeSandboxSettings({ spec: spec(), config }, {}, undefined, "linux");
+    for (const t of HOST_SHARED_TEMP) expect(off.filesystem?.denyRead).not.toContain(t);
+    const mac = claudeSandboxSettings({ spec: spec(["/nonexistent/docker.sock"]), config }, {}, undefined, "darwin");
+    expect(mac.network?.allowUnixSockets).toEqual(["/nonexistent/docker.sock"]);
+    for (const t of HOST_SHARED_TEMP) expect(mac.filesystem?.denyRead).not.toContain(t);
+  });
   test("a worktree location isn't readable there (the CLI would lay it over the session's writable folder); the folder is writable", () => {
-    const s = claudeSandboxSettings({ spec: spec(), config }, {});
+    const s = claudeSandboxSettings({ spec: spec(), config }, {}, undefined, "linux");
     expect(s.filesystem?.allowRead).not.toContain("/w-worktrees");
     expect(s.filesystem?.allowRead).toContain("/h/.bun");
     expect(s.filesystem?.allowWrite).toContain("/w-worktrees/agent-1");
@@ -139,18 +178,30 @@ function fakeBwrap(): SandboxProvider {
 }
 
 describe("the sandbox's limits and the session's note", () => {
-  test("a worktree root that isn't there and isn't beside the repository is said on the limits line", async () => {
+  test("Claude on Linux with Docker access says every socket it can see is reachable; a missing root elsewhere is said", async () => {
+    const run = join(root, "run");
+    mkdirSync(run, { mode: 0o700 });
+    const sock = join(run, "docker.sock");
+    const server: Server = createServer(() => {});
+    await new Promise<void>((r) => server.listen(sock, r));
+    const saved = process.env.XDG_RUNTIME_DIR;
+    process.env.XDG_RUNTIME_DIR = run;
     const away = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-wt-away-")));
     try {
       const reg = new SandboxRegistry("linux", (n) => `/usr/bin/${n}`);
       reg.register(fakeBwrap());
       const ws = repo(join(root, "proj"));
       const config = { provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [], worktreeRoots: [join(away, "missing")], docker: { image: "x", socket: false } } as never;
-      const r = await resolveSandbox({ registry: reg, config, setting: undefined, backendId: "pi", workspace: ws });
+      const r = await resolveSandbox({ registry: reg, config, setting: { dockerSocket: true }, backendId: "claude", workspace: ws });
       expect(r.info.state).toBe("on");
+      if (process.platform === "linux") expect(r.info.limits?.some((l) => l.includes(CLAUDE_ALL_SOCKETS_NOTE))).toBe(true);
       expect(r.info.limits?.some((l) => l.includes("create it to use it"))).toBe(true);
-      expect(existsSync(join(away, "missing"))).toBe(false);
+      const pi = await resolveSandbox({ registry: reg, config, setting: { dockerSocket: true }, backendId: "pi", workspace: ws });
+      expect(pi.info.limits?.some((l) => l.includes(CLAUDE_ALL_SOCKETS_NOTE))).toBe(false);
     } finally {
+      if (saved === undefined) delete process.env.XDG_RUNTIME_DIR;
+      else process.env.XDG_RUNTIME_DIR = saved;
+      await new Promise<void>((r) => server.close(() => r()));
       rmSync(away, { recursive: true, force: true });
     }
   });

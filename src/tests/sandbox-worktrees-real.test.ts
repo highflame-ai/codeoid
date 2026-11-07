@@ -2,7 +2,7 @@
  * Real bubblewrap (#448 follow-up, round 10), skipped where it can't run: an
  * agent makes git worktrees inside the sandbox, in its own folder of each
  * worktree location only, and tests that start containers get the container
- * runtime's socket only when the owner opted in.
+ * runtime's socket only when the owner opted in (no other runtime's).
  *
  * Everything destructive runs INSIDE the sandbox under test, against a
  * repository this test planted in its own temp dir; "the user's next git"
@@ -465,9 +465,17 @@ describe.skipIf(!probe.available)("bubblewrap, for real: Docker access (a plante
     sock = join(runtime, "docker.sock");
     server = createServer((c) => c.end("PLANTED-RUNTIME\n"));
     await new Promise<void>((r) => server.listen(sock, r));
+    // A session libvirt's socket beside it ($XDG_RUNTIME_DIR/libvirt/libvirt-sock): a VM with the host's disk.
+    mkdirSync(join(runtime, "libvirt"), { mode: 0o700 });
+    libvirtSock = join(runtime, "libvirt", "libvirt-sock");
+    libvirt = createServer((c) => c.end("PLANTED-LIBVIRT\n"));
+    await new Promise<void>((r) => libvirt.listen(libvirtSock, r));
   });
+  let libvirt: Server;
+  let libvirtSock: string;
   afterAll(async () => {
     await new Promise<void>((r) => server.close(() => r()));
+    await new Promise<void>((r) => libvirt.close(() => r()));
     rmSync(root, { recursive: true, force: true });
   });
 
@@ -508,11 +516,40 @@ describe.skipIf(!probe.available)("bubblewrap, for real: Docker access (a plante
         // Reachable, never removable or replaceable.
         const rm = await h1.exec(["/bin/sh", "-c", `rm -f '${sock}' 2>/dev/null; [ -S '${sock}' ] && echo SOCKET-KEPT`], { cwd: join(root, "ws"), env: { PATH: "/usr/bin:/bin" }, timeoutMs: 10_000 });
         expect(rm.stdout).toContain("SOCKET-KEPT");
-        // The rest of the runtime dir stays hidden.
-        const ls = await h1.exec(["/bin/sh", "-c", `ls -A '${runtime}'`], { cwd: join(root, "ws"), env: { PATH: "/usr/bin:/bin" }, timeoutMs: 10_000 });
-        expect(ls.stdout.trim()).toBe("docker.sock");
+        // The rest of the runtime dir stays hidden (another runtime's dir in it is there empty: its mount point).
+        const ls = await h1.exec(["/bin/sh", "-c", `ls -A '${runtime}'; echo ---; ls -A '${join(runtime, "libvirt")}'`], { cwd: join(root, "ws"), env: { PATH: "/usr/bin:/bin" }, timeoutMs: 10_000 });
+        expect(ls.stdout.trim().split(/\s+/)).toEqual(["docker.sock", "libvirt", "---"]);
       } finally {
         await h1.close();
+      }
+    }
+  });
+
+  test.skipIf(!Bun.which("python3"))("another runtime's socket (libvirt's, #448 round 10) stays hidden with Docker access on; the host's own libvirt, LXD and Incus sockets are unreachable in every sandbox", async () => {
+    const on = spec(true);
+    expect(on.containerSockets).toContain(join(runtime, "libvirt"));
+    const h = await provider.open(on);
+    try {
+      const r = await connect(h, libvirtSock);
+      expect(r.stdout).not.toContain("PLANTED-LIBVIRT");
+      expect((await connect(h, sock)).stdout).toContain("PLANTED-RUNTIME");
+    } finally {
+      await h.close();
+    }
+    for (const p of ["/run/libvirt", "/var/run/libvirt", "/var/snap/lxd/common/lxd", "/var/lib/lxd", "/var/lib/incus", "/run/incus", "/run/dbus", "/run/screen"]) {
+      expect([...spec(false).containerSockets, ...spec(false).hidden]).toContain(p);
+    }
+    // Where the host has them (this one may: a libvirt daemon), nothing of them is there inside.
+    const real = ["/run/libvirt/libvirt-sock", "/run/libvirt/libvirt-sock-ro", "/var/snap/lxd/common/lxd/unix.socket", "/var/lib/incus/unix.socket", "/run/dbus/system_bus_socket"].filter((p) => existsSync(p));
+    for (const docker of [false, true]) {
+      const h2 = await provider.open(spec(docker));
+      try {
+        for (const p of real) {
+          const r = await connect(h2, p);
+          expect(r.stdout).toMatch(/FileNotFoundError|ConnectionRefusedError|No such file|refused/);
+        }
+      } finally {
+        await h2.close();
       }
     }
   });

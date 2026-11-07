@@ -209,7 +209,7 @@ import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import { asksOutsideSandbox } from "./sandbox/confinement.js";
 import { type HostToolBreach, hostFileBreachNote, hostFileBreachReason, hostFileToolBreach, hostToolBoundsFor, isHostFileTool } from "./sandbox/host-file-tools.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
-import { describeSandbox, resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { CLAUDE_ALL_SOCKETS_NOTE, describeSandbox, resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
 import { worktreeFolderNote } from "./sandbox/worktrees.js";
 import { protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
@@ -3219,7 +3219,7 @@ export class Session {
     const title = unsandboxed ? `Turn the sandbox off for "${this.name}"?` : dockerAdded ? `Give "${this.name}" Docker access?` : `Widen the sandbox for "${this.name}"?`;
     const message = unsandboxed
       ? `The agent's commands would run with your full rights${after.choice === "off" ? "" : ` (${resolvedAfter?.info.reason ?? "the sandbox can't run here"})`}: they could read your credentials and change any file you can.`
-      : `Commands would run with: ${describe(after)} (now: ${describe(before)}).${dockerAdded ? " Docker access can reach the whole machine: a command could start a container that mounts / and read or change anything, your credentials included." : ""}`;
+      : `Commands would run with: ${describe(after)} (now: ${describe(before)}).${dockerAdded ? ` Docker access can reach the whole machine: a command could start a container that mounts / and read or change anything, your credentials included.${resolvedAfter?.plan?.kind === "native" && process.platform === "linux" ? ` Also, ${CLAUDE_ALL_SOCKETS_NOTE}.` : ""}` : ""}`;
     // Answered by the owner alone, undelegated: what bounds the owner's agent is the owner's call.
     let answeredBy: string | undefined;
     void this.requestUserInput({ method: "confirm", title, message }, {

@@ -252,6 +252,33 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     }
   }, 120_000);
 
+  test("Docker access on Claude's Linux sandbox (every unix socket allowed): a tmux-style socket in the host's /tmp is out of reach, the runtime's isn't (#448 round 10)", async () => {
+    if (!Bun.which("python3")) return;
+    const runtime = join(root, "run-user-tmux");
+    mkdirSync(runtime, { recursive: true, mode: 0o700 });
+    const tmuxDir = realpathSync(mkdtempSync("/tmp/codeoid-test-tmux-"));
+    const sockets = { docker: join(runtime, "docker.sock"), tmux: join(tmuxDir, "default") };
+    const servers = await Promise.all(
+      Object.entries(sockets).map(
+        ([name, at]) =>
+          new Promise<ReturnType<typeof createServer>>((r) => {
+            const s = createServer((c) => c.end(`REACHED-${name.toUpperCase()}\n`));
+            s.listen(at, () => r(s));
+          }),
+      ),
+    );
+    try {
+      const py = (at: string) => `python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(100).decode().strip())' '${at}' 2>&1 | tail -1`;
+      const r = await probe("off", `${py(sockets.docker)}; ${py(sockets.tmux)}`, ["policy"], { CODEOID_PROBE_RUNTIME_DIR: runtime, CODEOID_PROBE_DOCKER_SOCKET: "1" });
+      expect(r.result).toBe("success");
+      expect(r.toolResult).toContain("REACHED-DOCKER");
+      expect(r.toolResult).not.toContain("REACHED-TMUX");
+    } finally {
+      for (const s of servers) s.close();
+      rmSync(tmuxDir, { recursive: true, force: true });
+    }
+  }, 300_000);
+
   test("the toolchains' cache variables reach only sandboxed commands: never the CLI, its MCP servers, or a command run outside the sandbox (#448 round 3)", async () => {
     mkdirSync(join(root, "home", "proj"), { recursive: true });
     const show = `echo "cargo=[$CARGO_HOME] gomod=[$GOMODCACHE] npm=[$npm_config_cache] xdg=[$XDG_CACHE_HOME] marker=[$SANDBOX_RUNTIME]"`;
