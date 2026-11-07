@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
+import { type ForkPoint, RewindError, SendStoppedError, SHUTDOWN_AUTH, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
 import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, DEFAULT_ACCOUNT, type AccountKind, type ClaudeAccountKind } from "../protocol/types.js";
@@ -3924,16 +3924,21 @@ mcpHub: this.#mcpHub,
   }
 
   /**
-   * Graceful drain — wait for all in-flight sessions to reach idle.
+   * Graceful drain: stop every turn and wait for each to record its end.
    * Used during shutdown.
    *
-   * Each working session is interrupted **once**. The previous loop
-   * re-interrupted on every poll iteration; if the SDK subprocess
-   * was mid HTTP retry and didn't respond within 500 ms, drain
-   * piled up duplicate "interrupted by system:shutdown" info rows
-   * (up to 20 in a 10-s window) and 20× the audit log churn. Track
-   * a per-session "already interrupted" set, then poll status until
-   * idle or deadline.
+   * From its start no turn starts: every session refuses sends, interrupts a
+   * turn its backend starts on its own and delivers no wake (`beginDrain`).
+   * Each running turn is interrupted **once** (a re-interrupt per poll piled
+   * up duplicate "interrupted by system:shutdown" rows when the SDK was mid
+   * HTTP retry). Then drain waits, polling, for every turn that hasn't
+   * recorded its end, the ones stopped just before it began included: idle
+   * isn't ended, since a session goes idle once its backend acknowledges the
+   * interrupt and the turn's result follows. Each is waited for at most its
+   * backend's settle bound (`Session.interruptSettleMs`), all at once, so a
+   * backend that never ends the turn holds shutdown that long, not to the
+   * deadline; it is named in the log and left. Then the transcript writes are
+   * flushed.
    */
   async drain(timeoutMs = 10_000): Promise<void> {
     try {
@@ -3944,7 +3949,13 @@ mcpHub: this.#mcpHub,
     }
   }
 
+  /** Set when drain begins: no session.send is taken from then on. */
+  #draining = false;
+
   async #drain(timeoutMs: number): Promise<void> {
+    // Before anything else: nothing starts a turn from here on.
+    this.#draining = true;
+    for (const s of this.#sessions.values()) s.beginDrain();
     // An abandoned login is a live pty holding an open OAuth attempt. Kill
     // those first, and unconditionally — they are not work worth draining.
     this.#backendLogin.dispose();
@@ -3956,44 +3967,47 @@ mcpHub: this.#mcpHub,
     for (const t of this.#evidenceTimers) clearTimeout(t);
     this.#evidenceTimers = [];
     const deadline = Date.now() + timeoutMs;
-    const systemAuth: AuthContext = {
-      sub: "system:shutdown",
-      scopes: [],
-      delegationDepth: 0,
-      accountId: "",
-      projectId: "",
-    };
-    const interrupted = new Set<string>();
-    // Interrupted sessions usually settle within milliseconds: check again
-    // soon, backing off to 500 ms, rather than always waiting half a second.
+    const remaining = () => Math.max(0, deadline - Date.now());
+    // Per turn (its run; the session for a send still preparing): when drain
+    // first found it, so a turn started after an interrupt is a new one.
+    const since = new Map<object, number>();
+    const givenUp = new Set<object>();
+    // Turns usually settle within milliseconds of the interrupt: look again
+    // soon, backing off only to 50 ms.
     let pollMs = 10;
     while (Date.now() < deadline) {
-      const working = [...this.#sessions.values()].filter(
-        (s) =>
-          s.status === "thinking" ||
-          s.status === "tool_running" ||
-          s.status === "waiting_approval" ||
+      let waiting = 0;
+      for (const session of this.#sessions.values()) {
+        // A session made since drain began.
+        session.beginDrain();
+        const working =
+          session.status === "thinking" ||
+          session.status === "tool_running" ||
+          session.status === "waiting_approval" ||
           // Looks idle, but a queued send is about to start a turn: stop it
           // too, or it starts after shutdown began.
-          s.preparingTurn,
-      );
-      if (working.length === 0) break;
-      for (const session of working) {
-        if (interrupted.has(session.id)) continue;
-        void session.interrupt(systemAuth);
-        interrupted.add(session.id);
+          session.preparingTurn;
+        if (!working && !session.turnUnsettled) continue;
+        const key = session.drainKey;
+        if (givenUp.has(key)) continue;
+        const first = since.get(key);
+        if (first === undefined) {
+          since.set(key, Date.now());
+          // Stopped already (by its owner, a routine, or as it started): only waited for.
+          if (working && !session.interruptRequested) void session.interrupt(SHUTDOWN_AUTH).catch(() => {});
+        } else if (Date.now() - first >= session.interruptSettleMs) {
+          givenUp.add(key);
+          console.warn(
+            `[codeoid/session-manager] drain: session ${session.id.slice(0, 8)} (${session.name}) didn't end its turn within ${session.interruptSettleMs} ms of the interrupt; going on without it`,
+          );
+          continue;
+        }
+        waiting++;
       }
-      await Bun.sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
-      pollMs = Math.min(pollMs * 2, 500);
+      if (waiting === 0) break;
+      await Bun.sleep(Math.min(pollMs, remaining()));
+      pollMs = Math.min(pollMs * 2, 50);
     }
-    // Idle is not ended: a session goes idle once its backend acknowledges
-    // the interrupt, and the turn's result follows (Claude's after the
-    // interrupt receipt, Codex's turn/completed, opencode's feed or
-    // read-back). Wait for each interrupted turn to record its end, spend
-    // included, then for the writes it started, so the store closing next
-    // loses none of it.
-    const remaining = () => Math.max(0, deadline - Date.now());
-    await Promise.all([...interrupted].map((id) => this.#sessions.get(id)?.turnDrained(remaining())));
     await this.#flushTranscripts(deadline);
   }
 
@@ -8468,6 +8482,11 @@ mcpHub: this.#mcpHub,
       } catch (err) {
         return this.#claudeAccountsError(msg.id, err);
       }
+    }
+
+    // Shutting down: no turn starts. Said here, not as a line in a stream the client may not get.
+    if (this.#draining) {
+      return { type: "response.error", requestId: msg.id, error: "The daemon is shutting down: the message wasn't sent", code: "internal" };
     }
 
     // Fire and forget — output streams to attached clients. The user message

@@ -817,6 +817,12 @@ export interface SessionProvider extends AgentProvider {
    */
   readonly continuesAfterBackgroundWork?: boolean;
   /**
+   * How long, at most, the backend takes to end a turn (its result, spend
+   * included) after an interrupt. A daemon shutting down waits that long for
+   * an interrupted turn's end, then gives up on it (`DRAIN_SETTLE_MS` when unset).
+   */
+  readonly interruptSettleMs?: number;
+  /**
    * Stop background tasks by id (the ids of the `background_tasks` level).
    * What Stop does when no turn is in flight: without it, nobody holding only
    * `session:interrupt` could halt a misbehaving background agent. Optional —

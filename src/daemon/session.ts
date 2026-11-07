@@ -260,6 +260,21 @@ const SUBAGENT_REGISTRATION_FENCE_MS = 5_000;
 const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
 /** How long a send waits for an ended run's last events before its own turn replaces it. */
 const ENDED_RUN_DRAIN_MS = 5_000;
+/**
+ * How long a daemon shutting down waits for an interrupted turn to end, when
+ * its backend declares no bound of its own (`SessionProvider.interruptSettleMs`):
+ * Claude's result follows the interrupt receipt, Codex's turn/completed its
+ * reply, within well under a second.
+ */
+export const DRAIN_SETTLE_MS = 2_000;
+/** The principal a daemon shutting down interrupts turns as. */
+export const SHUTDOWN_AUTH: AuthContext = {
+  sub: "system:shutdown",
+  scopes: [],
+  delegationDepth: 0,
+  accountId: "",
+  projectId: "",
+};
 /** How long a destroy waits for its look at the session's commits (#checkSettingsCommits) before it goes on without it. */
 const DESTROY_COMMIT_CHECK_MS = 15_000;
 
@@ -820,9 +835,17 @@ const TURN_INDEX_KEEP = 1000;
 const TURN_INDEX_SLACK = 200;
 
 export class SendStoppedError extends Error {
-  constructor() {
-    super("Stopped before the agent started on this message");
+  constructor(message = "Stopped before the agent started on this message") {
+    super(message);
     this.name = "SendStoppedError";
+  }
+}
+
+/** A send refused because the daemon is shutting down: no turn starts once drain began. */
+export class DaemonStoppingError extends SendStoppedError {
+  constructor() {
+    super("The daemon is shutting down: no new turn starts");
+    this.name = "DaemonStoppingError";
   }
 }
 
@@ -3877,6 +3900,8 @@ export class Session {
     attachments?: readonly Attachment[],
     priority?: "now" | "next" | "later",
   ): Promise<void> {
+    // Shutting down: nothing is recorded, nothing starts.
+    if (this.#draining) throw new DaemonStoppingError();
     // Before anything is recorded: a session whose Claude account was removed
     // must not quietly run on some other credential.
     this.assertAccountUsable();
@@ -3912,6 +3937,37 @@ export class Session {
    */
   get preparingTurn(): boolean {
     return this.#preparingSends > 0;
+  }
+
+  /** Set by the daemon's drain: no turn starts from here on. */
+  #draining = false;
+
+  /**
+   * The daemon is shutting down: a send is refused from here on, a turn the
+   * backend starts on its own is interrupted as it starts, and no wake is
+   * delivered. Turns already running are drain's to interrupt and wait for.
+   */
+  beginDrain(): void {
+    this.#draining = true;
+    if (this.#backgroundWakeFallback) {
+      clearTimeout(this.#backgroundWakeFallback);
+      this.#backgroundWakeFallback = null;
+    }
+  }
+
+  /** What drain tells one turn from the next by: the running turn's run, else the session (a send still preparing). */
+  get drainKey(): object {
+    return this.#activeRun ?? this;
+  }
+
+  /** The running turn was already asked to stop (by its owner, a routine, or as it started during a drain). */
+  get interruptRequested(): boolean {
+    return this.#activeRun !== null && this.#turnInterrupted;
+  }
+
+  /** How long drain waits for this session's interrupted turn to end before it gives up on it. */
+  get interruptSettleMs(): number {
+    return this.#provider.interruptSettleMs ?? DRAIN_SETTLE_MS;
   }
 
   /** Per-turn loop controls, reset when a turn starts. */
@@ -4300,6 +4356,8 @@ export class Session {
     this.#provider.onRecoveryNeeded = (content: string) => {
       const recoverySender = this.#currentSender ?? sender;
       this.#sendChain = this.#sendChain.then(async () => {
+        // The daemon is draining: no turn starts (the prompt is already in the transcript).
+        if (this.#draining) return;
         // Reset to a fresh backing session for recovery.
         const newBackingId = randomUUID();
         this.#provider.resetToNewSession(newBackingId);
@@ -5019,6 +5077,8 @@ export class Session {
     this.#setStatus("thinking");
     this.#onTurnStarted();
     this.#broadcastInfoUpdate();
+    // Shutting down: consumed, so its end and spend are recorded, but stopped at once.
+    if (this.#draining) void this.interrupt(SHUTDOWN_AUTH).catch(() => {});
   }
 
   /**
@@ -5078,7 +5138,7 @@ export class Session {
    */
   #armBackgroundWakeFallback(): void {
     if (this.#backgroundWakeFallback) return;
-    if (this.#destroyed) return;
+    if (this.#destroyed || this.#draining) return;
     this.#backgroundWakeFallback = setTimeout(() => {
       this.#backgroundWakeFallback = null;
       this.#maybeDeliverBackgroundReports({ fallback: true });
@@ -5163,6 +5223,8 @@ export class Session {
     // interrupt) would inject a duplicate turn beside the backend's own.
     if (this.#provider.continuesAfterBackgroundWork && !opts.fallback) return;
     if (this.#destroyed) return;
+    // Shutting down: no turn starts (its refused send would requeue and retry at once).
+    if (this.#draining) return;
     // Mid-rewind: these reports belong to turns being taken back (#355).
     if (this.#rewinding) return;
     if (this.#deliveringBackgroundReports) return;
@@ -5831,7 +5893,8 @@ export class Session {
       .catch(() => undefined)
       .then(async () => {
         // A send, switch or fork re-seed got here first — it owns the session now.
-        if (this.#destroyed || this.#pendingSeed !== seed || this.#activeRun) return;
+        // Nor once the daemon is draining: no turn starts.
+        if (this.#destroyed || this.#draining || this.#pendingSeed !== seed || this.#activeRun) return;
         await this.#teardownProvider();
         const newBackingId = randomUUID();
         this.#provider.resetToNewSession(newBackingId);
@@ -6739,14 +6802,20 @@ export class Session {
   get turnInFlight(): boolean {
     // A continuation still to come (background results to deliver, a wake
     // armed) is a turn on its way: its spend belongs with this one's (#430).
+    // Not once the daemon is draining: none is delivered then.
+    if (this.#draining) return this.turnUnsettled;
     return (
-      this.#activeRun !== null ||
-      this.#drainingConsumers > 0 ||
+      this.turnUnsettled ||
       this.#backgroundWakeFallback !== null ||
       // Reports that can still be delivered (a wake runs at rest); after an
       // error they wait for the next turn, which is no turn on its way.
       (this.#pendingBackgroundReports.length > 0 && (this.#status === "idle" || this.#status === "waiting_approval"))
     );
+  }
+
+  /** A turn is running, or its consumer hasn't recorded its end (spend included) yet. */
+  get turnUnsettled(): boolean {
+    return this.#activeRun !== null || this.#drainingConsumers > 0;
   }
 
   /** Every live background task, a shell or a watcher included (#430). */
@@ -9714,7 +9783,8 @@ export class Session {
    * transcript.
    */
   #throwIfStoppedBeforeStart(stopGen: number): void {
-    if (stopGen === this.#stopGen && !this.#destroyed) return;
+    // A send queued before drain began doesn't start its turn after it.
+    if (stopGen === this.#stopGen && !this.#destroyed && !this.#draining) return;
     if (!this.#destroyed) {
       const note = this.#makeMessage(
         "info",
