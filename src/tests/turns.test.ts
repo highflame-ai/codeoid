@@ -611,12 +611,14 @@ describe("drain() at shutdown", () => {
     const s = m._sessionForTest(id)!;
     await m.drain(2_000);
     await expect(s.send("late", AUTH)).rejects.toBeInstanceOf(DaemonStoppingError);
-    const r = await m.handle({ type: "session.send", id: "s1", sessionId: id, text: "late" } as never, AUTH, {
+    const r = await m.handle({ type: "session.send", id: "s1", sessionId: id, text: "late", clientMsgId: "cm-late" } as never, AUTH, {
       id: "cli",
       auth: AUTH,
       send: () => {},
     });
     expect(r.type).toBe("response.error");
+    // Refused, so its id isn't marked as seen: this is its first mark.
+    expect(s.markClientMsgSeen("cm-late")).toBe(false);
     expect(providers.at(-1)!.capturedOpts).toHaveLength(0);
   });
 

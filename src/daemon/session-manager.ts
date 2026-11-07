@@ -8511,6 +8511,12 @@ mcpHub: this.#mcpHub,
     const loopRun = this.#liveLoopRunOf(session.id);
     if (loopRun) return this.#steerFromSend(msg, auth, loopRun);
 
+    // Shutting down: no turn starts. Said here, not as a line in a stream the client may not get.
+    // Before the duplicate check: a refused send doesn't mark its clientMsgId seen.
+    if (this.#draining) {
+      return { type: "response.error", requestId: msg.id, error: "The daemon is shutting down: the message wasn't sent", code: "internal" };
+    }
+
     // Duplicate-send suppression (`send.idempotency`): a client that
     // couldn't observe whether its send survived a dropped socket resends
     // with the SAME clientMsgId — acknowledging instead of dispatching
@@ -8528,11 +8534,6 @@ mcpHub: this.#mcpHub,
       } catch (err) {
         return this.#claudeAccountsError(msg.id, err);
       }
-    }
-
-    // Shutting down: no turn starts. Said here, not as a line in a stream the client may not get.
-    if (this.#draining) {
-      return { type: "response.error", requestId: msg.id, error: "The daemon is shutting down: the message wasn't sent", code: "internal" };
     }
 
     // Fire and forget — output streams to attached clients. The user message
