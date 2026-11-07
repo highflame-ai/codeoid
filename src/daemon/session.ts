@@ -756,7 +756,7 @@ export interface ForkPoint {
 /** A rewind that can't proceed (unknown turn, a turn that wouldn't stop). */
 export class RewindError extends Error {
   constructor(
-    readonly code: "not_found" | "busy" | "restore_failed" | "before_rotation",
+    readonly code: "not_found" | "busy" | "restore_failed" | "before_rotation" | "history_unavailable",
     message: string,
   ) {
     super(message);
@@ -916,6 +916,25 @@ interface Dehydrated {
   /** The load in flight. */
   loading?: Promise<void>;
 }
+
+/**
+ * The canonical log (or turn index) couldn't be read when a resume loaded
+ * the history (`Session#historyUnread`): what the session holds in memory is
+ * only what came since.
+ */
+interface HistoryUnread {
+  plan: ResumeHistoryPlan;
+  /** The turn index wasn't read either: it is read again with the log. */
+  indexUnread: boolean;
+  /** The last read's error, logged once per distinct one. */
+  error: string;
+  /** The read in flight. */
+  retry?: Promise<void>;
+}
+
+/** Why going back or forking is refused while the log couldn't be read. */
+const HISTORY_UNREAD_REFUSAL =
+  "This session's earlier conversation couldn't be read from disk, so going back or forking now would lose it. Nothing was changed — try again, or see the daemon's log.";
 
 /** A send counted as preparing before it reaches `Session.send` (`Session.holdSend`). */
 export interface SendHold {
@@ -1696,6 +1715,12 @@ export class Session {
     // still carry the conversation.
     this.#historyAccumulator.onChange = (change) => {
       if (this.#destroyed) return;
+      // Never write a history that couldn't be read over the log it lost;
+      // what is appended still is (`#historyUnread`).
+      if (change.op === "replace" && this.#historyUnread) {
+        console.error(`[codeoid/session ${this.id}] canonical history not rewritten: the log couldn't be read, and would lose its turns`);
+        return;
+      }
       void this.#transcriptStore.recordCanonical(this.id, change);
     };
     this.#identityManager = opts.identityManager;
@@ -3993,7 +4018,7 @@ export class Session {
       .catch(() => undefined)
       // A resumed session loads its history before its first turn.
       .then(() =>
-        this.#dehydrated
+        this.#dehydrated || this.#historyUnread
           ? this.ensureHydrated().then(() => this.#sendInner(text, sender, attachments, priority, stopGen))
           : this.#sendInner(text, sender, attachments, priority, stopGen),
       )
@@ -6574,6 +6599,15 @@ export class Session {
   #dehydrated: Dehydrated | null = null;
   /** Work the load leaves the backend (a re-seed), awaited by `ensureHydrated()`. */
   #afterHydrate: Promise<void> | null = null;
+  /**
+   * The canonical log couldn't be read when a resume loaded the history: the
+   * session runs without it, as a resume always did, but the history in
+   * memory is only what came since. It is never written over the log (going
+   * back or forking is refused, `#assertHistoryRead`), turns are still
+   * appended to it, and every use reads it again (`#rereadHistory`) until it
+   * can. Null otherwise.
+   */
+  #historyUnread: HistoryUnread | null = null;
   /** Loads `#hydrateNow` had to do synchronously, daemon-wide (tests read it). */
   static syncHydrations = 0;
 
@@ -6607,9 +6641,9 @@ export class Session {
     this.#promptTooLongFlag = v;
   }
 
-  /** The history isn't in place yet, or a load's re-seed is still running: await `ensureHydrated()`. */
+  /** The history isn't in place yet (or couldn't be read), or a load's re-seed is still running: await `ensureHydrated()`. */
   get #loadPending(): boolean {
-    return this.#dehydrated !== null || this.#afterHydrate !== null;
+    return this.#dehydrated !== null || this.#afterHydrate !== null || this.#historyUnread !== null;
   }
 
   /** `ensureHydrated()` has work to do (a load, or a load's re-seed still running). */
@@ -6679,13 +6713,15 @@ export class Session {
   /**
    * Load the history of a session resumed by `prepareResume`, if it isn't
    * loaded: idempotent, and concurrent callers share one load. Rejects when
-   * the transcript can't be read (the session stays unloaded; the next call
-   * tries again); a canonical history that can't be read is logged and the
-   * session goes on without it, as on a resume. Resolves once a fresh
-   * backing has been re-seeded too.
+   * the transcript, canonical log or turn index can't be read (the session
+   * stays unloaded; the next call tries again). At resume (`atResume`) a
+   * canonical log that can't be read is logged and the session goes on
+   * without it, as a resume always did (`#historyUnread`); each later call
+   * reads it again. Resolves once a fresh backing has been re-seeded too.
    */
   ensureHydrated(opts: { deadlineAt?: number; atResume?: boolean } = {}): Promise<void> {
     const d = this.#dehydrated;
+    if (!d && this.#historyUnread) return this.#rereadHistory().then(() => this.#afterHydrate ?? undefined);
     if (!d) return this.#afterHydrate ?? Promise.resolve();
     if (!d.loading) {
       const loading = this.#hydrate(d, opts.deadlineAt, opts.atResume === true).then(() => this.#afterHydrate ?? undefined);
@@ -6716,6 +6752,9 @@ export class Session {
         loaded.rebuildFrom = all.map((e) => e.message);
       }
     } catch (err) {
+      // After the resume, the session is used: it must not go on without its
+      // conversation. The request fails, and the next use loads it again.
+      if (!atResume) throw err;
       loaded.canonicalError = err;
     }
     // Loaded synchronously meanwhile (#hydrateNow): that load stands.
@@ -6738,18 +6777,15 @@ export class Session {
     const stats: { truncated?: boolean } = {};
     const deadlineAt = Date.now() + d.plan.deadlineMs;
     const window = { maxBytes: d.plan.transcriptMaxBytes, deadlineAt, stats, asOf: d.files };
+    // Any read error throws, the session left unloaded, as in `#hydrate`.
     const entries = this.#transcriptStore.loadTranscriptSync(this.id, window);
     const loaded: LoadedHistory = { entries, truncated: stats.truncated === true, canonical: null };
-    try {
-      loaded.canonical = this.#transcriptStore.loadCanonicalSync(this.id, { maxBytes: d.plan.canonicalMaxBytes });
-      if (d.indexUnread) loaded.index = this.#transcriptStore.loadTurnIndexSync(this.id);
-      if (!loaded.canonical && loaded.truncated) {
-        loaded.rebuildFrom = this.#transcriptStore
-          .loadTranscriptSync(this.id, { deadlineAt, asOf: d.files })
-          .map((e) => e.message);
-      }
-    } catch (err) {
-      loaded.canonicalError = err;
+    loaded.canonical = this.#transcriptStore.loadCanonicalSync(this.id, { maxBytes: d.plan.canonicalMaxBytes });
+    if (d.indexUnread) loaded.index = this.#transcriptStore.loadTurnIndexSync(this.id);
+    if (!loaded.canonical && loaded.truncated) {
+      loaded.rebuildFrom = this.#transcriptStore
+        .loadTranscriptSync(this.id, { deadlineAt, asOf: d.files })
+        .map((e) => e.message);
     }
     this.#installHistory(d, loaded, started);
   }
@@ -6791,8 +6827,10 @@ export class Session {
       }
     }
     if (canonicalError !== undefined) {
+      const error = canonicalError instanceof Error ? canonicalError.message : String(canonicalError);
+      this.#historyUnread = { plan: d.plan, indexUnread: d.indexUnread === true, error };
       console.error(
-        `[codeoid/resume] canonical history restore failed for ${this.id} (session resumes without it): ${canonicalError instanceof Error ? canonicalError.message : String(canonicalError)}`,
+        `[codeoid/resume] canonical history restore failed for ${this.id} (session resumes without it, and reads it again on its next use): ${error}`,
       );
     }
     // What this process appended before the load, in order, as it was pushed live.
@@ -6818,6 +6856,80 @@ export class Session {
     console.log(
       `[codeoid/session ${this.id.slice(0, 8)}] history loaded: ${this.#scrollbackBuffer.length} message(s), ${this.#historyAccumulator.history.length} turn(s) in ${ms}ms`,
     );
+  }
+
+  /**
+   * Read the canonical log again, for a session that couldn't at resume
+   * (`#historyUnread`): never rejects, the session goes on without it until
+   * a read succeeds. Not while a turn runs (its reply is being built in the
+   * history), and a read that something changed the history or the turn
+   * list under is dropped: the next use reads again.
+   */
+  #rereadHistory(): Promise<void> {
+    const u = this.#historyUnread;
+    if (!u || this.#turnActive() || this.#destroyed) return Promise.resolve();
+    u.retry ??= this.#reread(u).finally(() => {
+      u.retry = undefined;
+    });
+    return u.retry;
+  }
+
+  async #reread(u: HistoryUnread): Promise<void> {
+    const history = this.#historyAccumulator.history;
+    const indexed = this.#turnIndex;
+    let canonical: Awaited<ReturnType<TranscriptStore["loadCanonical"]>>;
+    let index: TurnIndexEntry[] | null = null;
+    try {
+      canonical = await this.#transcriptStore.loadCanonical(this.id, { maxBytes: u.plan.canonicalMaxBytes });
+      if (u.indexUnread) index = await this.#transcriptStore.loadTurnIndex(this.id);
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      if (error !== u.error) {
+        u.error = error;
+        console.error(`[codeoid/session ${this.id}] canonical history still can't be read (the session goes on without it): ${error}`);
+      }
+      return;
+    }
+    if (
+      this.#historyUnread !== u ||
+      this.#destroyed ||
+      this.#turnActive() ||
+      this.#historyAccumulator.history !== history ||
+      this.#historyAccumulator.history.length !== history.length ||
+      this.#turnIndex !== indexed ||
+      this.#turnIndex.length !== indexed.length
+    ) {
+      return;
+    }
+    // What this process appended since is in the log too. No log: nothing was
+    // written since, and nothing on disk to keep.
+    const turns = canonical?.turns ?? history;
+    try {
+      const turnIndex = u.indexUnread ? (index ?? turnIndexFromHistory(turns)) : indexed;
+      this.restoreTurns(turns, turnIndex, {
+        persistHistory: false,
+        persistIndex: u.indexUnread && !index && turns.some((t) => t.turnId),
+        partial: canonical?.partial ?? false,
+      });
+    } catch (err) {
+      console.error(`[codeoid/session ${this.id}] canonical history read again but not restored: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    this.#historyUnread = null;
+    console.log(`[codeoid/session ${this.id.slice(0, 8)}] canonical history read again: ${turns.length} turn(s)`);
+    // A fresh backing no turn has used yet is owed the history it missed.
+    if (u.plan.backingFresh && this.#backingFresh && turns.length > 0) {
+      await this.reseedFreshBacking().catch((err) => {
+        console.error(
+          `[codeoid/session ${this.id}] re-seeding the backend from the history read again failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  }
+
+  /** Refuse what would rewrite the canonical log from a history that couldn't be read (`#historyUnread`). */
+  #assertHistoryRead(): void {
+    if (this.#historyUnread) throw new RewindError("history_unavailable", HISTORY_UNREAD_REFUSAL);
   }
 
   /**
@@ -7945,6 +8057,9 @@ export class Session {
     // CRITICAL: reset the provider so it creates a fresh session rather
     // than trying to resume an id that has no persisted history.
     this.#provider.resetToNewSession(newBackingId);
+    // A rotation empties the log whatever it held: one that couldn't be read
+    // (`#historyUnread`) loses nothing by it, and is now what memory holds.
+    this.#historyUnread = null;
     this.#accumulator.reset();
     // Re-snapshot the frozen workspace index for the fresh context (the rotated
     // session gets an up-to-date orientation; within the context it stays stable
@@ -10331,6 +10446,7 @@ export class Session {
   /** The whole canonical history: from the log when memory holds only its tail. */
   async fullCanonicalHistory(): Promise<readonly CanonicalTurn[]> {
     if (this.#loadPending) await this.ensureHydrated();
+    this.#assertHistoryRead();
     if (!this.#canonicalPartial) return this.#accumulator.history;
     const full = await this.#transcriptStore.loadCanonical(this.id);
     return full && full.turns.length >= this.#accumulator.history.length ? full.turns : this.#accumulator.history;
@@ -10382,6 +10498,7 @@ export class Session {
    */
   async forkPoint(turnId: string): Promise<ForkPoint> {
     if (this.#loadPending) await this.ensureHydrated();
+    this.#assertHistoryRead();
     // One copy of the turn list: a rewind during the awaits below must not
     // make the turns and the conversation disagree.
     const index = this.#turnIndex.map((e) => ({ ...e }));
@@ -10590,6 +10707,7 @@ export class Session {
   /** What going back to before `turnId` would remove, restore and not undo. */
   async #planRewind(turnId: string, restoreFiles: boolean): Promise<RewindOutcome> {
     if (this.#loadPending) await this.ensureHydrated();
+    this.#assertHistoryRead();
     const pos = this.#turnIndex.findIndex((e) => e.turnId === turnId);
     if (pos === -1) throw new RewindError("not_found", "That turn isn't in this session (or is older than its turn list).");
     const removedIds = this.#turnIndex.slice(pos).map((e) => e.turnId);
@@ -10723,6 +10841,8 @@ export class Session {
       throw new RewindError("busy", "The session is busy; going back would stop it, which needs session:interrupt.");
     }
     if (this.#loadPending) await this.ensureHydrated();
+    // Before anything is stopped: the log couldn't be read, so nothing changes.
+    this.#assertHistoryRead();
     this.#rewinding = true;
     try {
       return await this.#rewindStopped(turnId, opts, sender);

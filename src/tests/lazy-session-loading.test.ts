@@ -822,14 +822,14 @@ describe("lazy session loading: a log that can't be read at start", () => {
     });
   });
 
-  it("a canonical log or turn index that can't be read: the session resumes without its history, as an eager resume did", async () => {
+  it("a canonical log or turn index that can't be read: the session resumes without its history, as an eager resume did, and reads it on its next use once it can", async () => {
     const { chmodSync } = await import("node:fs");
     const roots = { eager: cloneBase("eager"), lazy: cloneBase("lazy") };
     const paths = Object.values(roots).map((r) => join(r, "transcripts", `${ids.short}.canonical.jsonl`));
     for (const p of paths) chmodSync(p, 0o000);
+    const pair = { eager: openEnv("eager", roots.eager, false), lazy: openEnv("lazy", roots.lazy, true) };
+    envs.push(pair.eager, pair.lazy);
     try {
-      const pair = { eager: openEnv("eager", roots.eager, false), lazy: openEnv("lazy", roots.lazy, true) };
-      envs.push(pair.eager, pair.lazy);
       await pair.eager.m.resumeSessions();
       await pair.lazy.m.resumeSessions();
       await same(pair, async (env) => {
@@ -839,6 +839,13 @@ describe("lazy session loading: a log that can't be read at start", () => {
     } finally {
       for (const p of paths) chmodSync(p, 0o600);
     }
+    // Readable again: the next use reads it.
+    await same(pair, async (env) => {
+      await attach(env, ids.short!, PAGING);
+      const s = sessionOf(env, "short");
+      return { history: s.historyLength, last: s.lastTurnId };
+    });
+    expect(sessionOf(pair.lazy, "short").historyLength).toBe(2);
   });
 });
 
@@ -1085,5 +1092,131 @@ describe("lazy session loading: messages while a load is in flight", () => {
     const r = await lazy.m.handle({ type: "session.attach", id: "w", sessionId: ids.rich } as never, watcher, client("w", []));
     expect(r.type).toBe("response.ok");
     expect(sessionOf(lazy, "rich").hydrated).toBe(true);
+  });
+});
+
+describe("lazy session loading: a canonical log that can't be read", () => {
+  /** The canonical log's lines on disk. */
+  const canonicalLines = (env: Env, sessionId: string) =>
+    readFileSync(env.transcript.canonicalPath(sessionId), "utf8").split("\n").filter((l) => l.trim()).length;
+  const newestTurn = async (env: Env, sessionId: string) =>
+    ((await call(env, { type: "session.turns", sessionId })) as { turns: Array<{ turnId: string }> }).turns.at(-1)!.turnId;
+
+  it("at the first use: that request fails, nothing is lost, and the next use loads the whole conversation", async () => {
+    const pair = await both();
+    const { chmodSync } = await import("node:fs");
+    const path = pair.lazy.transcript.canonicalPath(ids.rich!);
+    chmodSync(path, 0o000);
+    try {
+      const r = await call(pair.lazy, { type: "session.attach", sessionId: ids.rich });
+      expect(r.type).toBe("response.error");
+      expect(sessionOf(pair.lazy, "rich").hydrated).toBe(false);
+      const send = await call(pair.lazy, { type: "session.send", sessionId: ids.rich, text: "hi" });
+      expect(send.type).toBe("response.error");
+    } finally {
+      chmodSync(path, 0o600);
+    }
+    expect(pair.lazy.made.reduce((n, p) => n + p.capturedOpts.length, 0)).toBe(0);
+    await same(pair, async (env) => {
+      const replay = await attach(env, ids.rich!, PAGING);
+      const s = sessionOf(env, "rich");
+      return { replay, history: s.historyLength, last: s.lastTurnId, text: s.lastAssistantText };
+    });
+    expect(sessionOf(pair.lazy, "rich").historyLength).toBe(12);
+    // Going back the newest turn keeps the rest on disk.
+    await same(pair, async (env) => {
+      const r = await call(env, { type: "session.rewind", sessionId: ids.rich, turnId: await newestTurn(env, ids.rich!) });
+      expect(r.type).toBe("session.rewind.result");
+      await settle(env, ids.rich!);
+      return canonicalLines(env, ids.rich!);
+    });
+    expect(canonicalLines(pair.lazy, ids.rich!)).toBe(10);
+  });
+
+  it("a synchronous load that can't read it throws, and leaves the session unloaded for the next use", async () => {
+    const lazy = openEnv("lazy", cloneBase("lazy"), true);
+    envs.push(lazy);
+    await lazy.m.resumeSessions();
+    const { chmodSync } = await import("node:fs");
+    const path = lazy.transcript.canonicalPath(ids.rich!);
+    const s = sessionOf(lazy, "rich");
+    chmodSync(path, 0o000);
+    try {
+      expect(() => s.canonicalHistory).toThrow();
+      expect(s.hydrated).toBe(false);
+    } finally {
+      chmodSync(path, 0o600);
+    }
+    expect(s.canonicalHistory.length).toBe(12);
+    expect(s.hydrated).toBe(true);
+  });
+
+  it("at resume: the session runs without it, as before, never writes over it, and reads it again on its next use", async () => {
+    const pair = { eager: openEnv("eager", cloneBase("eager"), false), lazy: openEnv("lazy", cloneBase("lazy"), true) };
+    envs.push(pair.eager, pair.lazy);
+    let failing = true;
+    for (const env of [pair.eager, pair.lazy]) {
+      const load = env.transcript.loadCanonical.bind(env.transcript);
+      env.transcript.loadCanonical = (sessionId, opts) => {
+        if (failing && sessionId === ids.rich) return Promise.reject(new Error("EIO: i/o error, read"));
+        return load(sessionId, opts);
+      };
+    }
+    await pair.eager.m.resumeSessions();
+    await pair.lazy.m.resumeSessions();
+    const env = pair.eager;
+    expect(sessionOf(env, "rich").historyLength).toBe(0);
+    const turnId = await newestTurn(env, ids.rich!);
+    // Going back or forking would rewrite the log from what's in memory: refused, the log untouched.
+    const rewind = await call(env, { type: "session.rewind", sessionId: ids.rich, turnId });
+    expect([rewind.type, (rewind as { error?: string }).error]).toEqual(["response.error", expect.stringContaining("couldn't be read")]);
+    const preview = await call(env, { type: "session.rewind", sessionId: ids.rich, turnId, dryRun: true });
+    expect(preview.type).toBe("response.error");
+    for (const fork of [{}, { afterTurnId: turnId }]) {
+      const r = await call(env, { type: "session.fork", sessionId: ids.rich, name: "f", isolate: false, ...fork });
+      expect([r.type, (r as { error?: string }).error]).toEqual(["response.error", expect.stringContaining("couldn't be read")]);
+    }
+    expect(canonicalLines(env, ids.rich!)).toBe(12);
+    // A turn still runs, and is appended to the log.
+    expect((await sendAndSettle(env, ids.rich!, "more")).type).toBe("response.ok");
+    expect(canonicalLines(env, ids.rich!)).toBe(14);
+    expect(sessionOf(env, "rich").historyLength).toBe(2);
+    // Readable again: the next use reads it, the turn since included.
+    failing = false;
+    await attach(env, ids.rich!, PAGING);
+    expect(sessionOf(env, "rich").historyLength).toBe(14);
+    const r = await call(env, { type: "session.rewind", sessionId: ids.rich, turnId: await newestTurn(env, ids.rich!) });
+    expect(r.type).toBe("session.rewind.result");
+    await settle(env, ids.rich!);
+    expect(canonicalLines(env, ids.rich!)).toBe(12);
+    // The lazy daemon read it at the first use, failing or not.
+    expect(sessionOf(pair.lazy, "rich").hydrated).toBe(false);
+    await attach(pair.lazy, ids.rich!, PAGING);
+    expect(sessionOf(pair.lazy, "rich").historyLength).toBe(12);
+  });
+
+  it("at resume: a rotation empties it, as it always does, and nothing is read back after it", async () => {
+    const env = openEnv("eager", cloneBase("eager"), false);
+    envs.push(env);
+    let failing = true;
+    const load = env.transcript.loadCanonical.bind(env.transcript);
+    env.transcript.loadCanonical = (sessionId, opts) =>
+      failing && sessionId === ids.rich ? Promise.reject(new Error("EIO: i/o error, read")) : load(sessionId, opts);
+    await env.m.resumeSessions();
+    // Past the turns a rotation needs, each appended to the log.
+    for (const text of ["one", "two", "three"]) await sendAndSettle(env, ids.rich!, text);
+    await env.transcript.flush();
+    expect(canonicalLines(env, ids.rich!)).toBe(18);
+    expect((await call(env, { type: "session.rotate", sessionId: ids.rich })).type).toBe("response.ok");
+    await settle(env, ids.rich!);
+    expect(sessionOf(env, "rich").toInfo().rotation?.count).toBe(1);
+    await env.transcript.flush();
+    expect(canonicalLines(env, ids.rich!)).toBe(0);
+    failing = false;
+    await attach(env, ids.rich!, PAGING);
+    expect(sessionOf(env, "rich").historyLength).toBe(0);
+    expect((await sendAndSettle(env, ids.rich!, "after")).type).toBe("response.ok");
+    expect(sessionOf(env, "rich").historyLength).toBe(2);
+    expect(canonicalLines(env, ids.rich!)).toBe(2);
   });
 });

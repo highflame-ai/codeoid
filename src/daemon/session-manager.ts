@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
 import { type ForkPoint, RewindError, type SendHold, SendStoppedError, SHUTDOWN_AUTH, Session, type AttachedClient, type WindowScope } from "./session.js";
+import type { CanonicalTurn } from "./providers/canonical.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
 import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, DEFAULT_ACCOUNT, type AccountKind, type ClaudeAccountKind } from "../protocol/types.js";
@@ -5193,26 +5194,26 @@ mcpHub: this.#mcpHub,
         code: "invalid_request",
       };
     }
-    if (msg.afterTurnId) {
-      try {
-        point = await parent.forkPoint(msg.afterTurnId);
-      } catch (err) {
-        return {
-          type: "response.error",
-          requestId: msg.id,
-          error: err instanceof Error ? err.message : String(err),
-          code:
-            err instanceof RewindError
-              ? err.code === "not_found"
-                ? "not_found"
-                : err.code === "restore_failed"
-                  ? "internal"
-                  : "invalid_request" // before_rotation, busy: pick another point / wait
-              : "internal",
-        };
-      }
+    let parentHistory: readonly CanonicalTurn[];
+    try {
+      if (msg.afterTurnId) point = await parent.forkPoint(msg.afterTurnId);
+      parentHistory = point ? point.history : await parent.fullCanonicalHistory();
+    } catch (err) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: err instanceof Error ? err.message : String(err),
+        code:
+          err instanceof RewindError
+            ? err.code === "not_found"
+              ? "not_found"
+              : err.code === "restore_failed" || err.code === "history_unavailable"
+                ? "internal"
+                : "invalid_request" // before_rotation, busy: pick another point / wait
+            : "internal",
+      };
     }
-    const history = (point ? point.history : await parent.fullCanonicalHistory()).map((t) => ({ ...t }));
+    const history = parentHistory.map((t) => ({ ...t }));
     // From an earlier turn: the parent's background launches after that turn
     // are its own business, not news for the fork's model (they stay foreign).
     // Only the parent's unfinished work matters, and it is looked for in the
@@ -8597,7 +8598,7 @@ mcpHub: this.#mcpHub,
           type: "response.error",
           requestId: msg.id,
           error: err.message,
-          code: err.code === "not_found" ? "not_found" : "invalid_request",
+          code: err.code === "not_found" ? "not_found" : err.code === "history_unavailable" ? "internal" : "invalid_request",
         };
       }
       throw err;
