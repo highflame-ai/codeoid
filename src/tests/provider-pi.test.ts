@@ -375,6 +375,22 @@ describe("PiProvider", () => {
     }
   });
 
+  it("T12: an interrupt before pi is up stops the turn: the prompt never goes out, the history seed waits for the next", async () => {
+    const p = makeProvider();
+    p.seedFromHistory([{ role: "user", content: "earlier question" }]);
+    // pi's process is still starting: there is nothing to send an abort to.
+    const run = p.runTurn(turnOpts("hello"));
+    await run.interrupt();
+    const events = await collect(run.events);
+    expect(events.some((e) => e.type === "text_delta")).toBe(false);
+    expect(events.find((e) => e.type === "turn_done")).toMatchObject({ result: { stopReason: "interrupted", inputTokens: 0, totalCostUsd: 0 } });
+
+    const next = await collect(p.runTurn(turnOpts("echo-prompt")).events);
+    const done = next.find((e) => e.type === "text_done");
+    expect(done?.type === "text_done" && done.content).toContain("earlier question");
+    expect(next.find((e) => e.type === "turn_done")).toMatchObject({ result: { inputTokens: 100 } });
+  });
+
   it("T10: second turn reports usage as a DELTA, not the cumulative total", async () => {
     const p = makeProvider();
     await collect(p.runTurn(turnOpts("hello")).events);
