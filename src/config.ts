@@ -502,6 +502,15 @@ const SessionSchema = z
      */
     resumeMaxSessions: z.number().int().min(1).default(200),
     /**
+     * Resume sessions without loading their history: a resumed session holds
+     * its metadata only, and loads its scrollback and canonical history the
+     * first time something uses them (attach, a prompt, a fork, …). Most
+     * resumed sessions are never opened before the next restart, and their
+     * history was most of the daemon's memory. Off = load every session's at
+     * start, as before.
+     */
+    lazyLoad: z.boolean().default(true),
+    /**
      * Per-turn workspace snapshots (#354): at the start of every turn the
      * session's working directory (minus .gitignore'd files, secrets and
      * dependency dirs) is recorded in a daemon-owned shadow git repository
@@ -556,6 +565,7 @@ const SessionSchema = z
     mcpToolTimeoutMs: 120_000,
     attachTailBytes: 512 * 1024,
     resumeMaxSessions: 200,
+    lazyLoad: true,
     seedBudgetChars: 0,
     seedCharsPerToken: 2,
     seedWindowFraction: 0.7,
@@ -1506,6 +1516,8 @@ export interface CodeoidConfig {
     idleReleaseMinutes?: number;
     /** Sessions restored from disk at daemon start, newest-first by last activity. Resume is also time-boxed, so this is the coarse guard; the remainder stays on disk. Defaults to 200 when omitted. */
     resumeMaxSessions?: number;
+    /** Load a resumed session's history the first time it is used, not at start. Defaults to true when omitted. */
+    lazyLoad?: boolean;
     /** Per-turn workspace snapshots (#354). Enabled unless `enabled: false`. */
     checkpoints?: {
       enabled?: boolean;
@@ -1817,6 +1829,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_TURN_STALL_TIMEOUT_MS", path: "session.turnStallTimeoutMs", kind: "int" },
   { env: "CODEOID_MCP_TOOL_TIMEOUT_MS", path: "session.mcpToolTimeoutMs", kind: "int" },
   { env: "CODEOID_RESUME_MAX_SESSIONS", path: "session.resumeMaxSessions", kind: "int" },
+  { env: "CODEOID_SESSION_LAZY_LOAD", path: "session.lazyLoad", kind: "boolean" },
   { env: "CODEOID_SEED_BUDGET_CHARS", path: "session.seedBudgetChars", kind: "int" },
   { env: "CODEOID_SEED_CHARS_PER_TOKEN", path: "session.seedCharsPerToken", kind: "float" },
   { env: "CODEOID_SEED_WINDOW_FRACTION", path: "session.seedWindowFraction", kind: "float" },
