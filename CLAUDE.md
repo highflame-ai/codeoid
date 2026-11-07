@@ -177,7 +177,8 @@ git/settings-commit check's audit row and warning line, the end snapshot,
 then records it, cost unknown if drain gave up on it); then the transcript
 writes are flushed; polled at 10 ms backing off to 50 ms, bounded by drain's
 10 s, never a fixed wait. Drain is one-way: the manager refuses sends after it.
-Store flushed,
+A dispatch task whose start a stopping daemon refused goes back to the queue,
+no attempt spent, and a stopped dispatcher claims nothing more. Store flushed,
 WebSockets closed, frontends stopped. 30-second grace period before forced exit.
 
 **One daemon per data dir**: `codeoid start` locks each dir the daemon owns
