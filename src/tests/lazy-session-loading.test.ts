@@ -649,53 +649,53 @@ describe("lazy session loading: restarts", () => {
   });
 });
 
-describe("lazy session loading: a history past the resume budgets", () => {
-  /**
-   * A session from a long-lived daemon: a transcript past the 24 MiB the
-   * scrollback is read from, and a canonical log past the 4 MiB the history
-   * is, written into both copies.
-   */
-  function writeBig(root: string): string {
-    const id = "0b16b16b-0000-4000-8000-00000000b16b";
-    const dir = join(root, "transcripts");
-    const at = (i: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString();
-    const lines: string[] = [];
-    const canon: string[] = [];
-    const index: string[] = [];
-    let seq = 0;
-    for (let t = 0; t < 1100; t++) {
-      const turnId = `turn-${String(t).padStart(5, "0")}`;
-      const prompt = `prompt ${t} ${"x".repeat(200)}`;
-      const reply = `reply ${t} ${"y".repeat(24_000)}`;
-      const user = { type: "session.message", sessionId: id, messageId: `u-${t}`, role: "user", content: prompt, identity: { sub: AUTH.sub, type: "human" }, timestamp: at(2 * t), turnId };
-      const asst = { type: "session.message", sessionId: id, messageId: `a-${t}`, role: "assistant", content: reply, identity: { sub: `agent:${id}`, type: "agent", name: "big (Claude)" }, timestamp: at(2 * t + 1), turnId };
-      lines.push(JSON.stringify({ seq: seq++, timestamp: user.timestamp, message: user }));
-      lines.push(JSON.stringify({ seq: seq++, timestamp: asst.timestamp, message: asst }));
-      canon.push(JSON.stringify({ op: "append", turn: { role: "user", content: prompt, turnId, prompt, at: user.timestamp } }));
-      canon.push(JSON.stringify({ op: "append", turn: { role: "assistant", content: reply.slice(0, 4_000), turnId } }));
-      index.push(JSON.stringify({ turnId, kind: "prompt", preview: `prompt ${t}`, startedAt: user.timestamp }));
-    }
-    writeFileSync(join(dir, `${id}.jsonl`), `${lines.join("\n")}\n`);
-    writeFileSync(join(dir, `${id}.canonical.jsonl`), `${canon.join("\n")}\n`);
-    writeFileSync(join(dir, `${id}.turns.jsonl`), `${index.join("\n")}\n`);
-    writeFileSync(
-      join(dir, `${id}.meta.json`),
-      JSON.stringify({
-        sessionId: id,
-        sessionName: "big",
-        workdir: join(root, "repo"),
-        createdBy: AUTH.sub,
-        createdAt: at(0),
-        lastStatus: "idle",
-        lastActivityAt: at(2200),
-        accountId: AUTH.accountId,
-        projectId: AUTH.projectId,
-        providerId: "claude",
-      }),
-    );
-    return id;
+/**
+ * A session from a long-lived daemon: a transcript past the 24 MiB the
+ * scrollback is read from, and a canonical log past the 4 MiB the history
+ * is, written into both copies. `seqOf` gives line i of n its seq (none: undefined).
+ */
+function writeBig(root: string, seqOf: (i: number, n: number) => number | undefined = (i) => i): string {
+  const id = "0b16b16b-0000-4000-8000-00000000b16b";
+  const dir = join(root, "transcripts");
+  const at = (i: number) => new Date(Date.UTC(2026, 0, 1, 0, 0, i)).toISOString();
+  const lines: string[] = [];
+  const canon: string[] = [];
+  const index: string[] = [];
+  const entries: Array<{ timestamp: string; message: object }> = [];
+  for (let t = 0; t < 1100; t++) {
+    const turnId = `turn-${String(t).padStart(5, "0")}`;
+    const prompt = `prompt ${t} ${"x".repeat(200)}`;
+    const reply = `reply ${t} ${"y".repeat(24_000)}`;
+    const user = { type: "session.message", sessionId: id, messageId: `u-${t}`, role: "user", content: prompt, identity: { sub: AUTH.sub, type: "human" }, timestamp: at(2 * t), turnId };
+    const asst = { type: "session.message", sessionId: id, messageId: `a-${t}`, role: "assistant", content: reply, identity: { sub: `agent:${id}`, type: "agent", name: "big (Claude)" }, timestamp: at(2 * t + 1), turnId };
+    entries.push({ timestamp: user.timestamp, message: user }, { timestamp: asst.timestamp, message: asst });
+    canon.push(JSON.stringify({ op: "append", turn: { role: "user", content: prompt, turnId, prompt, at: user.timestamp } }));
+    canon.push(JSON.stringify({ op: "append", turn: { role: "assistant", content: reply.slice(0, 4_000), turnId } }));
+    index.push(JSON.stringify({ turnId, kind: "prompt", preview: `prompt ${t}`, startedAt: user.timestamp }));
   }
+  for (let i = 0; i < entries.length; i++) lines.push(JSON.stringify({ seq: seqOf(i, entries.length), ...entries[i]! }));
+  writeFileSync(join(dir, `${id}.jsonl`), `${lines.join("\n")}\n`);
+  writeFileSync(join(dir, `${id}.canonical.jsonl`), `${canon.join("\n")}\n`);
+  writeFileSync(join(dir, `${id}.turns.jsonl`), `${index.join("\n")}\n`);
+  writeFileSync(
+    join(dir, `${id}.meta.json`),
+    JSON.stringify({
+      sessionId: id,
+      sessionName: "big",
+      workdir: join(root, "repo"),
+      createdBy: AUTH.sub,
+      createdAt: at(0),
+      lastStatus: "idle",
+      lastActivityAt: at(2200),
+      accountId: AUTH.accountId,
+      projectId: AUTH.projectId,
+      providerId: "claude",
+    }),
+  );
+  return id;
+}
 
+describe("lazy session loading: a history past the resume budgets", () => {
   it("loads the same windows: a partial scrollback paged from disk, a partial history read whole on demand", async () => {
     const eager = openEnv("eager", cloneBase("eager"), false);
     const lazy = openEnv("lazy", cloneBase("lazy"), true);
@@ -783,5 +783,185 @@ describe("lazy session loading: the load itself", () => {
     expect(ok[0]!.type).toBe("response.ok");
     expect(sessionOf(lazy, "short").hydrated).toBe(true);
     expect((ok[1] as { messages: unknown[] }).messages.length).toBeGreaterThan(0);
+  });
+});
+
+describe("lazy session loading: a log that can't be read at start", () => {
+  it("a transcript that can't be read fails the session's resume, as an eager resume did, and leaves it as it was for the next start", async () => {
+    const { chmodSync } = await import("node:fs");
+    const roots = { eager: cloneBase("eager"), lazy: cloneBase("lazy") };
+    const paths = Object.values(roots).map((r) => join(r, "transcripts", `${ids.short}.jsonl`));
+    const before = readFileSync(paths[0]!, "utf8");
+    for (const p of paths) chmodSync(p, 0o000);
+    try {
+      const pair = { eager: openEnv("eager", roots.eager, false), lazy: openEnv("lazy", roots.lazy, true) };
+      envs.push(pair.eager, pair.lazy);
+      await pair.eager.m.resumeSessions();
+      await pair.lazy.m.resumeSessions();
+      // Not listed as a session with no history (its seq at 0, its backend starting over): not listed.
+      await same(pair, async (env) => (await list(env)).map((i) => i.name));
+      expect(pair.lazy.m._sessionForTest(ids.short!)).toBeUndefined();
+      await same(pair, (env) => call(env, { type: "session.set_model", sessionId: ids.short, model: "sonnet" }));
+      for (const env of [pair.eager, pair.lazy]) await closeEnv(env);
+      envs.splice(0);
+    } finally {
+      for (const p of paths) chmodSync(p, 0o600);
+    }
+    for (const p of paths) expect(readFileSync(p, "utf8")).toBe(before);
+    // Readable again: the next start resumes it whole.
+    const pair = { eager: openEnv("eager", roots.eager, false), lazy: openEnv("lazy", roots.lazy, true) };
+    envs.push(pair.eager, pair.lazy);
+    await pair.eager.m.resumeSessions();
+    await pair.lazy.m.resumeSessions();
+    const queried = await same(pair, async (env) => env.made.map((p) => p.hasQueried));
+    expect(queried.filter((q) => !q).length).toBe(1); // the empty session's
+    await same(pair, async (env) => attach(env, ids.short!, PAGING));
+    await same(pair, async (env) => {
+      await sendAndSettle(env, ids.short!, "again");
+      return attach(env, ids.short!, PAGING);
+    });
+  });
+
+  it("a canonical log or turn index that can't be read: the session resumes without its history, as an eager resume did", async () => {
+    const { chmodSync } = await import("node:fs");
+    const roots = { eager: cloneBase("eager"), lazy: cloneBase("lazy") };
+    const paths = Object.values(roots).map((r) => join(r, "transcripts", `${ids.short}.canonical.jsonl`));
+    for (const p of paths) chmodSync(p, 0o000);
+    try {
+      const pair = { eager: openEnv("eager", roots.eager, false), lazy: openEnv("lazy", roots.lazy, true) };
+      envs.push(pair.eager, pair.lazy);
+      await pair.eager.m.resumeSessions();
+      await pair.lazy.m.resumeSessions();
+      await same(pair, async (env) => {
+        const s = sessionOf(env, "short");
+        return { names: (await list(env)).map((i) => i.name), history: s.historyLength, last: s.lastTurnId, replay: await attach(env, ids.short!, PAGING) };
+      });
+    } finally {
+      for (const p of paths) chmodSync(p, 0o600);
+    }
+  });
+});
+
+describe("lazy session loading: logs whose seqs don't grow along the file", () => {
+  /** Line i of n's seq in each shape the audits found on disk (undefined: the line has none). */
+  const SHAPES: Record<string, (i: number, n: number) => number | undefined> = {
+    // A daemon from before 2026-07-03 started every run's seqs at 0.
+    "seqs restarted at 0 by an older daemon": (i, n) => (i < n - 2 ? i : i - (n - 2)),
+    "the newest lines' seqs back down": (i, n) => (i < n - 4 ? i : i - (n - 4)),
+    // An import writes 1..N; the imported session's own prompt then started at 0.
+    "an import, then a prompt": (i, n) => (i < n - 2 ? i + 1 : i - (n - 2)),
+    "no seqs at all": () => undefined,
+    "the newest lines without a seq": (i, n) => (i < n - 2 ? i : undefined),
+  };
+
+  /** Rewrite a session's transcript with `shape`'s seqs, its lines unchanged otherwise. */
+  function reshape(root: string, sessionId: string, shape: (i: number, n: number) => number | undefined): void {
+    const path = join(root, "transcripts", `${sessionId}.jsonl`);
+    const lines = readFileSync(path, "utf8").split("\n").filter((l) => l.trim());
+    const out = lines.map((l, i) => {
+      const { seq: _seq, ...rest } = JSON.parse(l) as { seq?: number };
+      const seq = shape(i, lines.length);
+      return JSON.stringify(seq === undefined ? rest : { seq, ...rest });
+    });
+    writeFileSync(path, `${out.join("\n")}\n`);
+  }
+
+  /** What a resume read before lazy loading (origin/main's loader): the log's newest 24 MiB, merged, as it is now. */
+  async function eagerRead(root: string, sessionId: string): Promise<{ messages: unknown[]; truncated: boolean }> {
+    const stats: { truncated?: boolean } = {};
+    const entries = await new TranscriptStore(join(root, "transcripts")).loadTranscript(sessionId, { maxBytes: 24 * 1024 * 1024, stats });
+    return { messages: entries.map((e) => e.message), truncated: stats.truncated === true };
+  }
+
+  /** A replayed message as the log holds it (the buffer stamps its own seq; a resumed tool call is reconciled). */
+  const shown = (m: unknown) => {
+    const { seq: _seq, ...rest } = m as SessionMessage;
+    return { messageId: rest.messageId, role: rest.role, content: rest.content };
+  };
+
+  for (const [label, shape] of Object.entries(SHAPES)) {
+    it(`${label}: every line loads, as an eager resume read it, with and without lazy loading`, async () => {
+      const roots = { eager: cloneBase("eager"), lazy: cloneBase("lazy") };
+      for (const root of Object.values(roots)) {
+        reshape(root, ids.rich!, shape);
+        reshape(root, ids.legacy!, shape);
+      }
+      const want = await eagerRead(roots.eager, ids.rich!);
+      const wantLegacy = await eagerRead(roots.eager, ids.legacy!);
+      expect(want.messages.length).toBeGreaterThan(10);
+      const pair = { eager: openEnv("eager", roots.eager, false), lazy: openEnv("lazy", roots.lazy, true) };
+      envs.push(pair.eager, pair.lazy);
+      await pair.eager.m.resumeSessions();
+      await pair.lazy.m.resumeSessions();
+      expect(loaded(pair.lazy, "rich")).toBe(false);
+      // Every backend with a conversation on disk is told to resume it, seqs or none.
+      expect(pair.eager.made.length).toBeGreaterThan(0);
+      const queried = await same(pair, async (env) => env.made.map((p) => p.hasQueried));
+      // All but the empty session's.
+      expect(queried.filter((q) => !q).length).toBe(1);
+      // A notice while unloaded is appended past the log, whatever its seqs.
+      await same(pair, (env) => call(env, { type: "session.set_model", sessionId: ids.rich, model: "sonnet" }));
+      const replays = await same(pair, async (env) => {
+        const replay = (await attach(env, ids.rich!))[1] as { messages: SessionMessage[] };
+        const s = sessionOf(env, "rich");
+        return { messages: replay.messages, partial: s.historyIsPartial };
+      });
+      // What the log held, in its order, then the notice.
+      expect(replays.messages.slice(0, -1).map(shown)).toEqual(want.messages.map(shown));
+      expect(replays.messages.at(-1)!.content).toContain("Model switched");
+      expect(replays.partial).toBe(want.truncated);
+      // A session from before the canonical log rebuilds its history from every line, and persists it.
+      await same(pair, async (env) => {
+        const s = sessionOf(env, "legacy");
+        const replay = (await attach(env, ids.legacy!))[1] as { messages: SessionMessage[] };
+        expect(replay.messages.map(shown)).toEqual(wantLegacy.messages.map(shown));
+        return { history: s.historyLength, turns: (await call(env, { type: "session.turns", sessionId: ids.legacy })) };
+      });
+      // A new prompt's lines continue past every seq the log holds.
+      await same(pair, (env) => sendAndSettle(env, ids.rich!, "after the restart"));
+      for (const env of [pair.eager, pair.lazy]) {
+        const seqs = seqsOnDisk(env, ids.rich!);
+        const before = seqs.slice(0, want.messages.length).filter((q) => q !== undefined);
+        const newest = seqs.slice(-2);
+        if (before.length > 0) for (const q of newest) expect(q).toBeGreaterThan(Math.max(...before));
+      }
+      // And the next restart reads the same log from both.
+      const after = await Promise.all([eagerRead(roots.eager, ids.rich!), eagerRead(roots.lazy, ids.rich!)]);
+      expect(norm(pair.lazy, after[1].messages.map(shown))).toEqual(norm(pair.eager, after[0].messages.map(shown)));
+    });
+  }
+
+  it("a log past the read budget whose seqs restarted: the same window, the same partial flag", async () => {
+    const pair = { eager: openEnv("eager", cloneBase("eager"), false), lazy: openEnv("lazy", cloneBase("lazy"), true) };
+    envs.push(pair.eager, pair.lazy);
+    // Seqs restarted at 0 for the newest 20 turns.
+    const restart = (i: number, n: number) => (i < n - 40 ? i : i - (n - 40));
+    const id = writeBig(pair.eager.root, restart);
+    writeBig(pair.lazy.root, restart);
+    const want = await eagerRead(pair.eager.root, id);
+    expect(want.truncated).toBe(true);
+    ids.big = id;
+    try {
+      await pair.eager.m.resumeSessions();
+      await pair.lazy.m.resumeSessions();
+      await same(pair, (env) => call(env, { type: "session.set_model", sessionId: id, model: "sonnet" }));
+      const got = await same(pair, async (env) => {
+        const s = env.m._sessionForTest(id)!;
+        const page = (await call(env, { type: "scrollback.page", sessionId: id, maxBytes: 2_000_000 })) as { messages: SessionMessage[] };
+        return { ids: page.messages.map((m) => m.messageId), partial: s.historyIsPartial };
+      });
+      // The newest page is what was read, in its order, up to its newest line, then the notice.
+      const read = want.messages.map((m) => (m as SessionMessage).messageId);
+      const kept = got.ids.slice(0, -1);
+      expect(kept.length).toBeGreaterThan(50);
+      const at = kept.map((k) => read.indexOf(k!));
+      expect(at.every((i, n) => i >= 0 && (n === 0 || i > at[n - 1]!))).toBe(true);
+      expect(kept.at(-1)).toBe(read.at(-1));
+      // It reaches back past where the seqs restarted (turn 1080).
+      expect(kept).toContain("a-1070");
+      expect(got.partial).toBe(true);
+    } finally {
+      delete ids.big;
+    }
   });
 });

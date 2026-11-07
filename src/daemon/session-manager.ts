@@ -1158,8 +1158,12 @@ mcpHub: this.#mcpHub,
         // "Concurrent session limit reached" until the user
         // /destroys some.
         resumed++;
-      } catch {
-        // Skip sessions that fail to resume
+      } catch (err) {
+        // Skip sessions that fail to resume (a transcript that can't be
+        // read): left on disk as they are, tried again at the next start.
+        console.error(
+          `[codeoid/resume] could not resume ${meta.sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     }
 
@@ -1854,6 +1858,10 @@ mcpHub: this.#mcpHub,
           },
         },
       );
+
+      // The imported log's lines are seqs 1..N: the session's own appends
+      // continue past them, so its seqs only grow along the log.
+      this.#sessions.get(result.newSessionId)?.restoreScrollback([], result.importedMessages + 1);
 
       return {
         type: "session.import.result",

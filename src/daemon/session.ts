@@ -130,7 +130,7 @@ import type { Store } from "./store.js";
 import type { AgentIdentityManager } from "./agent-identity.js";
 import { ScrollbackBuffer } from "./scrollback.js";
 import { reconcileResumedMessage } from "./resume-reconcile.js";
-import type { TranscriptEntry, TranscriptStore } from "./transcript.js";
+import type { TranscriptEntry, TranscriptFileMark, TranscriptStore } from "./transcript.js";
 import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import {
   backgroundLaunchIds,
@@ -897,14 +897,18 @@ export interface ResumeHistoryPlan {
  */
 interface Dehydrated {
   plan: ResumeHistoryPlan;
-  /** The first seq this process appends with: the log below it is the previous run's. */
-  startSeq: number;
+  /**
+   * The log's files as they were at resume: the load reads them up to there,
+   * exactly what an eager resume read, whatever this process appended since
+   * and whatever their seqs.
+   */
+  files: TranscriptFileMark[];
   /** Messages appended since (on disk too), pushed onto the scrollback after the load, as if live. */
   appended: SessionMessage[];
-  /** Their bytes on disk: the load's window is widened by them, so it starts where a resume's would have. */
-  appendedBytes: number;
   /** The session had a turn index on disk (else the load rebuilds it from the history). */
   hadIndex: boolean;
+  /** The turn index or canonical log couldn't be read at resume: the load reads the index again, and fails as a resume did. */
+  indexUnread?: boolean;
   /** The newest canonical turn, for `lastTurnId` / `lastTurnRole`. */
   lastTurn: Pick<CanonicalTurn, "role" | "turnId"> | null;
   /** A teardown owed the backend a re-seed from the history (`#reseedAfterTeardown`): paid on load. */
@@ -920,6 +924,8 @@ interface LoadedHistory {
   canonical: { turns: CanonicalTurn[]; partial: boolean } | null;
   /** The whole transcript, when there's no log to read and the scrollback read was a tail. */
   rebuildFrom?: DaemonMessage[];
+  /** The turn index, read by the load (`Dehydrated.indexUnread`). */
+  index?: TurnIndexEntry[] | null;
   canonicalError?: unknown;
 }
 
@@ -6587,24 +6593,35 @@ export class Session {
    * has a conversation to resume, and a fresh backing's flags are set, as a
    * full resume sets them. Returns false when the history must be loaded now:
    * a session from before the canonical log or the turn index (the load
-   * rebuilds and persists them).
+   * rebuilds and persists them), or one whose log or index couldn't be read
+   * (the load fails as a resume did: the history is resumed without).
+   * Rejects when the transcript is there but can't be read: the session
+   * can't resume, as when a resume couldn't load it — never as one with no
+   * history, whose seq starts over and whose backend starts a new conversation.
    */
   async prepareResume(plan: ResumeHistoryPlan): Promise<boolean> {
-    const [tail, canonical, index] = await Promise.all([
-      this.#transcriptStore.transcriptTail(this.id),
-      this.#transcriptStore.canonicalTail(this.id),
-      this.#transcriptStore.loadTurnIndex(this.id),
-    ]);
+    const tail = await this.#transcriptStore.transcriptTail(this.id);
+    let canonical: Awaited<ReturnType<TranscriptStore["canonicalTail"]>> = null;
+    let index: TurnIndexEntry[] | null = null;
+    let indexUnread = false;
+    try {
+      [canonical, index] = await Promise.all([
+        this.#transcriptStore.canonicalTail(this.id),
+        this.#transcriptStore.loadTurnIndex(this.id),
+      ]);
+    } catch {
+      indexUnread = true;
+    }
     if (tail.nextSeq > this.#seq) this.#seq = tail.nextSeq;
     // A session with prior scrollback already exists in its backend's own
     // store — the next send() must resume it, not re-create it.
     if (tail.hasEntries) this.#provider.setHasQueried(true);
     this.#dehydrated = {
       plan,
-      startSeq: this.#seq,
+      files: tail.files,
       appended: [],
-      appendedBytes: 0,
       hadIndex: index !== null,
+      ...(indexUnread ? { indexUnread } : {}),
       lastTurn: canonical?.last ?? null,
       reseed: false,
     };
@@ -6619,7 +6636,7 @@ export class Session {
       this.#provider.setHasQueried(false);
     }
     // An empty index over a non-empty history names its current turn from the history.
-    return canonical !== null && index !== null && (index.length > 0 || canonical.last === null);
+    return !indexUnread && canonical !== null && index !== null && (index.length > 0 || canonical.last === null);
   }
 
   /**
@@ -6645,19 +6662,20 @@ export class Session {
 
   async #hydrate(d: Dehydrated, deadlineAt = Date.now() + d.plan.deadlineMs, atResume = false): Promise<void> {
     const started = performance.now();
-    // The window an eager resume read: the newest bytes as of the restart,
-    // so what was appended since widens it, and is left out (it is in memory).
+    // The window an eager resume read: the log as it was at the restart.
+    // What was appended since is left out (it is in memory).
     const stats: { truncated?: boolean } = {};
-    const window = { maxBytes: d.plan.transcriptMaxBytes + d.appendedBytes, deadlineAt, stats, beforeSeq: d.startSeq };
+    const window = { maxBytes: d.plan.transcriptMaxBytes, deadlineAt, stats, asOf: d.files };
     const entries = await this.#transcriptStore.loadTranscript(this.id, window);
     const loaded: LoadedHistory = { entries, truncated: stats.truncated === true, canonical: null };
     try {
       loaded.canonical = await this.#transcriptStore.loadCanonical(this.id, { maxBytes: d.plan.canonicalMaxBytes });
+      if (d.indexUnread) loaded.index = await this.#transcriptStore.loadTurnIndex(this.id);
       // No log: a session from before it existed. Rebuild once from the
       // WHOLE transcript (the scrollback window may be a tail) and persist it
       // — a long session's history must not shrink to the window.
       if (!loaded.canonical && loaded.truncated) {
-        const all = await this.#transcriptStore.loadTranscript(this.id, { deadlineAt, beforeSeq: d.startSeq });
+        const all = await this.#transcriptStore.loadTranscript(this.id, { deadlineAt, asOf: d.files });
         loaded.rebuildFrom = all.map((e) => e.message);
       }
     } catch (err) {
@@ -6682,14 +6700,15 @@ export class Session {
     console.warn(`[codeoid/session ${this.id}] ${what} needed before it was loaded — loading it synchronously (${where})`);
     const stats: { truncated?: boolean } = {};
     const deadlineAt = Date.now() + d.plan.deadlineMs;
-    const window = { maxBytes: d.plan.transcriptMaxBytes + d.appendedBytes, deadlineAt, stats, beforeSeq: d.startSeq };
+    const window = { maxBytes: d.plan.transcriptMaxBytes, deadlineAt, stats, asOf: d.files };
     const entries = this.#transcriptStore.loadTranscriptSync(this.id, window);
     const loaded: LoadedHistory = { entries, truncated: stats.truncated === true, canonical: null };
     try {
       loaded.canonical = this.#transcriptStore.loadCanonicalSync(this.id, { maxBytes: d.plan.canonicalMaxBytes });
+      if (d.indexUnread) loaded.index = this.#transcriptStore.loadTurnIndexSync(this.id);
       if (!loaded.canonical && loaded.truncated) {
         loaded.rebuildFrom = this.#transcriptStore
-          .loadTranscriptSync(this.id, { deadlineAt, beforeSeq: d.startSeq })
+          .loadTranscriptSync(this.id, { deadlineAt, asOf: d.files })
           .map((e) => e.message);
       }
     } catch (err) {
@@ -6704,7 +6723,9 @@ export class Session {
     const { entries } = loaded;
     // Restore scrollback from transcript. Byte-budgeted + deadline-aware: one
     // huge transcript can neither OOM the daemon nor stall the load. The seq
-    // counter already continues past the log (prepareResume).
+    // counter continues past the log's newest line (prepareResume), and now
+    // past its highest seq too: a log whose seqs went back down (an older
+    // daemon restarted them, an import) holds it further up.
     const messages = entries.map((e) => e.message);
     const maxSeq = entries.reduce((max, e) => Math.max(max, e.seq), -1);
     this.restoreScrollback(messages, maxSeq + 1, entries.map((e) => e.bytes), {
@@ -6721,9 +6742,11 @@ export class Session {
         const history =
           loaded.canonical?.turns ??
           (rebuildFrom.length > 0 ? canonicalFromTranscript(rebuildFrom, d.plan.providerId) : []);
-        this.restoreTurns(history, d.hadIndex ? this.#turnIndex : turnIndexFromHistory(history), {
+        // The index read at resume, or by the load when it couldn't be then.
+        const index = loaded.index !== undefined ? loaded.index : d.hadIndex ? this.#turnIndex : null;
+        this.restoreTurns(history, index ?? turnIndexFromHistory(history), {
           persistHistory: !loaded.canonical && history.length > 0,
-          persistIndex: !d.hadIndex && history.some((t) => t.turnId),
+          persistIndex: !index && history.some((t) => t.turnId),
           partial: loaded.canonical?.partial ?? false,
         });
       } catch (err) {
@@ -6776,18 +6799,13 @@ export class Session {
   }
 
   /**
-   * Push a message about to be appended at `seq` onto the scrollback — or,
-   * history not loaded yet, keep it for the load, which pushes it after
-   * what it restores, as if it had been pushed live.
+   * Push a message onto the scrollback — or, history not loaded yet, keep it
+   * for the load, which pushes it after what it restores, as if it had been
+   * pushed live (the load reads the log as it was before it was appended).
    */
-  #buffer(msg: SessionMessage, seq: number): void {
-    const d = this.#dehydrated;
-    if (!d) {
-      this.#scrollbackBuffer.push(msg);
-      return;
-    }
-    d.appended.push(msg);
-    d.appendedBytes += this.#transcriptStore.lineBytes(msg, seq);
+  #buffer(msg: SessionMessage): void {
+    if (this.#dehydrated) this.#dehydrated.appended.push(msg);
+    else this.#scrollbackBuffer.push(msg);
   }
 
   restoreScrollback(
@@ -10939,15 +10957,14 @@ export class Session {
 
   /** Persist to transcript + scrollback buffer + memory chunker */
   #persistAndBuffer(msg: SessionMessage): void {
-    const seq = this.#seq++;
     // A notice for a session whose history isn't loaded (a mode change, a
     // rename) doesn't load it: it is kept for the load.
-    this.#buffer(msg, seq);
+    this.#buffer(msg);
     // Log instead of swallowing — a silently-dropped transcript write means a
     // turn that's missing on resume with no trace. (Scrollback above is the
     // in-memory handoff source and is synchronous, so device-handoff replay
     // is unaffected; this is the durable-persistence path.)
-    this.#transcriptStore.append(this.id, msg, seq).catch((e) => {
+    this.#transcriptStore.append(this.id, msg, this.#seq++).catch((e) => {
       console.error(
         `[codeoid/session ${this.id}] transcript append failed: ${e instanceof Error ? e.message : String(e)}`,
       );
