@@ -11,7 +11,7 @@
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
+import { type ForkPoint, RewindError, SendStoppedError, SHUTDOWN_AUTH, Session, type AttachedClient, type WindowScope } from "./session.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
 import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, DEFAULT_ACCOUNT, type AccountKind, type ClaudeAccountKind } from "../protocol/types.js";
@@ -360,6 +360,15 @@ function toFleetEventWire(row: DispatchEventRow): FleetEventWire {
  *  configured value is `session.resumeMaxSessions`. */
 const RESUME_MAX_SESSIONS_DEFAULT = 200;
 const RESUME_DEADLINE_MS = 20_000;
+/**
+ * At shutdown, how long drain waits, after the turns ended, for what their
+ * ends started (Session.turnEndWork: the #448 git check, the end snapshot,
+ * hooks) and for routine runs to record theirs. Measured: the settings-commit
+ * look over a 3000-commit repository, and the end snapshot of a 20 000-file
+ * workspace, each well under a second; the margin is for a large repository
+ * on a loaded machine.
+ */
+export const TURN_END_SETTLE_MS = 5_000;
 /** Per-session transcript read budget on resume. Scrollback keeps at most
  * 20 MiB / 5000 messages — parsing history past that would be evicted on
  * arrival, so cap the read slightly above the scrollback byte cap. */
@@ -3924,16 +3933,27 @@ mcpHub: this.#mcpHub,
   }
 
   /**
-   * Graceful drain — wait for all in-flight sessions to reach idle.
+   * Graceful drain: stop every turn and wait for each to record its end.
    * Used during shutdown.
    *
-   * Each working session is interrupted **once**. The previous loop
-   * re-interrupted on every poll iteration; if the SDK subprocess
-   * was mid HTTP retry and didn't respond within 500 ms, drain
-   * piled up duplicate "interrupted by system:shutdown" info rows
-   * (up to 20 in a 10-s window) and 20× the audit log churn. Track
-   * a per-session "already interrupted" set, then poll status until
-   * idle or deadline.
+   * From its start no turn starts: every session refuses sends, interrupts a
+   * turn its backend starts on its own and delivers no wake (`beginDrain`).
+   * Each running turn is interrupted **once** (a re-interrupt per poll piled
+   * up duplicate "interrupted by system:shutdown" rows when the SDK was mid
+   * HTTP retry). Then drain waits, polling, for every turn that hasn't
+   * recorded its end, the ones stopped just before it began included: idle
+   * isn't ended, since a session goes idle once its backend acknowledges the
+   * interrupt and the turn's result follows. Each is waited for at most its
+   * backend's settle bound (`Session.interruptSettleMs`), all at once, so a
+   * backend that never ends the turn holds shutdown that long, not to the
+   * deadline; it is named in the log and left. Then, all at once, what the
+   * turns' ends started and don't await is waited for (`Session.turnEndWork`:
+   * the #448 git check's audit row and warning line, the end snapshot, hooks)
+   * and the routine runs record their rows, spend included, at most
+   * `TURN_END_SETTLE_MS` together; then the transcript writes are flushed.
+   * The store closes after drain, so nothing a turn's end started is cut off.
+   *
+   * One-way: the manager refuses every send from then on. It is shutdown's.
    */
   async drain(timeoutMs = 10_000): Promise<void> {
     try {
@@ -3944,7 +3964,13 @@ mcpHub: this.#mcpHub,
     }
   }
 
+  /** Set when drain begins: no session.send is taken from then on. */
+  #draining = false;
+
   async #drain(timeoutMs: number): Promise<void> {
+    // Before anything else: nothing starts a turn from here on.
+    this.#draining = true;
+    for (const s of this.#sessions.values()) s.beginDrain();
     // An abandoned login is a live pty holding an open OAuth attempt. Kill
     // those first, and unconditionally — they are not work worth draining.
     this.#backendLogin.dispose();
@@ -3956,31 +3982,100 @@ mcpHub: this.#mcpHub,
     for (const t of this.#evidenceTimers) clearTimeout(t);
     this.#evidenceTimers = [];
     const deadline = Date.now() + timeoutMs;
-    const systemAuth: AuthContext = {
-      sub: "system:shutdown",
-      scopes: [],
-      delegationDepth: 0,
-      accountId: "",
-      projectId: "",
-    };
-    const interrupted = new Set<string>();
+    const remaining = () => Math.max(0, deadline - Date.now());
+    // Per turn (its run; the session for a send still preparing): when drain
+    // first found it, so a turn started after an interrupt is a new one.
+    const since = new Map<object, number>();
+    const givenUp = new Set<object>();
+    // Turns usually settle within milliseconds of the interrupt: look again
+    // soon, backing off only to 50 ms.
+    let pollMs = 10;
     while (Date.now() < deadline) {
-      const working = [...this.#sessions.values()].filter(
-        (s) =>
-          s.status === "thinking" ||
-          s.status === "tool_running" ||
-          s.status === "waiting_approval" ||
+      let waiting = 0;
+      for (const session of this.#sessions.values()) {
+        // A session made since drain began.
+        session.beginDrain();
+        const working =
+          session.status === "thinking" ||
+          session.status === "tool_running" ||
+          session.status === "waiting_approval" ||
           // Looks idle, but a queued send is about to start a turn: stop it
           // too, or it starts after shutdown began.
-          s.preparingTurn,
-      );
-      if (working.length === 0) return;
-      for (const session of working) {
-        if (interrupted.has(session.id)) continue;
-        void session.interrupt(systemAuth);
-        interrupted.add(session.id);
+          session.preparingTurn;
+        if (!working && !session.turnUnsettled) continue;
+        const key = session.drainKey;
+        if (givenUp.has(key)) continue;
+        const first = since.get(key);
+        if (first === undefined) {
+          since.set(key, Date.now());
+          // Stopped already (by its owner, a routine, or as it started): only waited for.
+          if (working && !session.interruptRequested) void session.interrupt(SHUTDOWN_AUTH).catch(() => {});
+        } else if (Date.now() - first >= session.interruptSettleMs) {
+          givenUp.add(key);
+          console.warn(
+            `[codeoid/session-manager] drain: session ${session.id.slice(0, 8)} (${session.name}) didn't end its turn within ${session.interruptSettleMs} ms of the interrupt; going on without it`,
+          );
+          continue;
+        }
+        waiting++;
       }
-      await Bun.sleep(500);
+      if (waiting === 0) break;
+      await Bun.sleep(Math.min(pollMs, remaining()));
+      pollMs = Math.min(pollMs * 2, 50);
+    }
+    await this.#settleTurnEnds(Math.min(remaining(), TURN_END_SETTLE_MS));
+    await this.#flushTranscripts(deadline);
+  }
+
+  /**
+   * Wait, at most `boundMs`, for what every session's turn end started
+   * (`Session.turnEndWork`) and for the routine runs to record their final
+   * rows, spend included (they do once their turn has ended, or once drain
+   * gave up on it): all at once. The store closes next.
+   */
+  async #settleTurnEnds(boundMs: number): Promise<void> {
+    const pending = new Set<Session>();
+    const work = [...this.#sessions.values()].map((s) => {
+      pending.add(s);
+      return s.turnEndWork().then(() => void pending.delete(s));
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const [routinesEnded] = await Promise.all([
+      this.#routines ? this.#routines.settled(boundMs) : Promise.resolve(true),
+      Promise.race([
+        Promise.all(work),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, boundMs);
+          timer.unref?.();
+        }),
+      ]),
+    ]);
+    clearTimeout(timer);
+    for (const s of pending) {
+      console.warn(`[codeoid/session-manager] drain: session ${s.id.slice(0, 8)} (${s.name}) didn't finish its turn's end within ${boundMs} ms (its git check, snapshot or hooks); going on without it`);
+    }
+    if (!routinesEnded) console.warn("[codeoid/session-manager] drain: a routine run didn't record its end in time");
+  }
+
+  /**
+   * Await the transcript store's writes until none is in flight, within the
+   * deadline. A settled write's handler may start another (the turn index
+   * written as a turn ends), so look again after each round.
+   */
+  async #flushTranscripts(deadline: number): Promise<void> {
+    for (let round = 0; round < 10 && Date.now() < deadline; round++) {
+      // One macrotask first: a handler a settled write woke may start the next write there.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (this.#transcriptStore.pendingWrites === 0) return;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        this.#transcriptStore.flush(),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+          timer.unref?.();
+        }),
+      ]);
+      clearTimeout(timer);
     }
   }
 
@@ -8415,6 +8510,12 @@ mcpHub: this.#mcpHub,
     // question) instead of a second conversation the controller can't see.
     const loopRun = this.#liveLoopRunOf(session.id);
     if (loopRun) return this.#steerFromSend(msg, auth, loopRun);
+
+    // Shutting down: no turn starts. Said here, not as a line in a stream the client may not get.
+    // Before the duplicate check: a refused send doesn't mark its clientMsgId seen.
+    if (this.#draining) {
+      return { type: "response.error", requestId: msg.id, error: "The daemon is shutting down: the message wasn't sent", code: "internal" };
+    }
 
     // Duplicate-send suppression (`send.idempotency`): a client that
     // couldn't observe whether its send survived a dropped socket resends

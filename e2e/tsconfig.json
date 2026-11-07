@@ -1,6 +1,7 @@
 {
   "extends": "../tsconfig.json",
   "compilerOptions": {
+    "tsBuildInfoFile": "../.cache/tsc/e2e.tsbuildinfo",
     "rootDir": "..",
     "declaration": false,
     "sourceMap": false

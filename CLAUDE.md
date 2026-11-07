@@ -161,8 +161,25 @@ retries the turn on that model instead of failing it. There is no daemon-side
 retry manager.
 
 **Graceful shutdown**: cleanup registry runs in LIFO order on SIGTERM/SIGINT/SIGHUP.
-Sessions drained (in-flight work interrupted), store flushed, WebSockets closed,
-frontends stopped. 30-second grace period before forced exit.
+Sessions drained: from its start no turn starts (a send is refused, a turn
+the backend starts on its own is interrupted as it starts, no wake, recovery
+or seed retry runs: `Session.beginDrain`); in-flight work is interrupted once
+per turn, and every turn not yet recorded (one its owner, a routine or a loop
+stopped just before included) is waited for until its end, spend included, is
+recorded — a backend acknowledges an interrupt before the turn's result
+arrives — but at most its backend's settle bound (`interruptSettleMs`,
+`DRAIN_SETTLE_MS` 2 s; opencode 3 s), all sessions at once, then named in the
+log and left; then, at once and at most `TURN_END_SETTLE_MS` (5 s), what
+each turn's end started and doesn't await (`Session.turnEndWork`: the #448
+git/settings-commit check's audit row and warning line, the end snapshot,
+`after_turn` hooks) and the routine runs' final rows, spend included
+(`RoutineService.settled`: a run waits as long as drain waits for its turn,
+then records it, cost unknown if drain gave up on it); then the transcript
+writes are flushed; polled at 10 ms backing off to 50 ms, bounded by drain's
+10 s, never a fixed wait. Drain is one-way: the manager refuses sends after it.
+A dispatch task whose start a stopping daemon refused goes back to the queue,
+no attempt spent, and a stopped dispatcher claims nothing more. Store flushed,
+WebSockets closed, frontends stopped. 30-second grace period before forced exit.
 
 **One daemon per data dir**: `codeoid start` locks each dir the daemon owns
 (`daemonOwnedDirs`: the database's, transcripts, opencode's database and data

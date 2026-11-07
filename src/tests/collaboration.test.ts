@@ -489,7 +489,15 @@ let tmp: string;
 let workdir: string;
 let store: Store;
 let transcript: TranscriptStore;
+/** Every transcript store the test made (a restart makes another), for the teardown to flush. */
+let transcripts: TranscriptStore[] = [];
 let manager: SessionManager;
+
+function newTranscriptStore(): TranscriptStore {
+  const t = new TranscriptStore(join(tmp, "transcripts"));
+  transcripts.push(t);
+  return t;
+}
 
 function run(msg: ClientMessage): Promise<DaemonMessage> {
   return manager.handle(msg, AUTH, CLIENT);
@@ -508,7 +516,8 @@ beforeEach(() => {
   workdir = join(tmp, "repo");
   mkdirSync(workdir, { recursive: true });
   store = new Store(join(tmp, "codeoid.db"));
-  transcript = new TranscriptStore(join(tmp, "transcripts"));
+  transcripts = [];
+  transcript = newTranscriptStore();
   manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
     config: mkConfig(),
     providers: makeRegistry(),
@@ -522,8 +531,9 @@ afterEach(async () => {
   // Let in-flight fire-and-forget meta writes land before the tmp dir goes
   // away. Without this, tearing down a collaboration's children races their
   // own meta writes and floods the output with ENOENT rename warnings that
-  // would mask a real failure.
-  await Bun.sleep(150);
+  // would mask a real failure. drain flushes the live manager's store; the
+  // others (a restarted test's first manager's) are flushed here.
+  await Promise.all(transcripts.map((t) => t.flush()));
   rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -2142,7 +2152,7 @@ describe("collaboration survives a daemon restart", () => {
     await Bun.sleep(150); // let in-flight meta writes land
     const next = new SessionManager(
       new Store(join(tmp, "codeoid.db")),
-      new TranscriptStore(join(tmp, "transcripts")),
+      newTranscriptStore(),
       undefined,
       undefined,
       undefined,
@@ -2214,7 +2224,7 @@ describe("collaboration survives a daemon restart", () => {
     claudeOnly.register({ id: "claude", displayName: "claude", create: () => new MockSessionProvider("claude", []) });
     const next = new SessionManager(
       new Store(join(tmp, "codeoid.db")),
-      new TranscriptStore(join(tmp, "transcripts")),
+      newTranscriptStore(),
       undefined, undefined, undefined,
       { config: mkConfig(), providers: claudeOnly },
     );
@@ -3105,7 +3115,7 @@ describe("the collaboration cost roll-up", () => {
     await Bun.sleep(150);
     const next = new SessionManager(
       new Store(join(tmp, "codeoid.db")),
-      new TranscriptStore(join(tmp, "transcripts")),
+      newTranscriptStore(),
       undefined, undefined, undefined,
       { config: mkConfig(), providers: makeRegistry() },
     );

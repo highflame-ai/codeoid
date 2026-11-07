@@ -25,3 +25,6 @@ package-lock.json
 # end-to-end suite output (#429)
 test-results/
 playwright-report/
+
+# tsc incremental build info (bun run typecheck)
+.cache/

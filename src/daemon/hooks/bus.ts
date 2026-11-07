@@ -187,16 +187,18 @@ export class HookBus {
    * Fire-and-forget dispatch for observe-only events (`after_turn` +
    * lifecycle). Outcomes are ignored; failures are logged by #run. Never
    * blocks the caller — lifecycle seams (constructor, destroy) are not
-   * places to await user scripts.
+   * places to await user scripts. The returned promise settles once every
+   * hook ran (never rejects), for a caller that must not cut them off: a
+   * turn's end, waited for at shutdown (`Session.turnEndWork`).
    */
   emit(
     event: HookEvent,
     ctx: HookSessionContext,
     payload: Record<string, unknown>,
-  ): void {
+  ): Promise<void> {
     const entries = this.#matching(event);
-    if (entries.length === 0) return;
-    void (async () => {
+    if (entries.length === 0) return Promise.resolve();
+    return (async () => {
       for (const entry of entries) {
         await this.#run(entry, ctx, { event, ...payload });
       }
