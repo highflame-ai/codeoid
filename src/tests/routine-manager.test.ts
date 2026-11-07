@@ -18,6 +18,7 @@ import { MockSessionProvider } from "../daemon/providers/mock/session-provider.j
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { handleRoutineFire } from "../daemon/routines/http.js";
 import { SessionManager } from "../daemon/session-manager.js";
+import { DRAIN_SETTLE_MS } from "../daemon/session.js";
 import { readSetupRecipe } from "../daemon/workspace-setup.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
@@ -328,33 +329,47 @@ describe("routine lifecycle through the protocol", () => {
 });
 
 describe("a routine run at shutdown", () => {
-  for (const late of [0, 100, 300]) {
-    it(`records its end and its spend before the store closes (the turn's result ${late} ms after the interrupt)`, async () => {
-      nextLateResult = late;
-      await create({ name: "long" });
-      const fired = (await call({ type: "routine.run", routine: "long" })) as RoutineRunResultMsg;
-      const svc = manager.routines!;
-      let sessionId: string | null = null;
-      for (let i = 0; i < 200; i++) {
-        sessionId = svc.store.getRun(fired.run.id)?.sessionId ?? null;
-        if (sessionId && manager._sessionForTest(sessionId)?.status === "thinking") break;
-        await Bun.sleep(10);
-      }
-      expect(manager._sessionForTest(sessionId!)?.status).toBe("thinking");
+  /** A routine run mid-turn; then the daemon's order: routines stop, the dispatcher stops, sessions drain, the store closes. */
+  async function shutDownMidRun(late: number) {
+    nextLateResult = late;
+    await create({ name: "long" });
+    const fired = (await call({ type: "routine.run", routine: "long" })) as RoutineRunResultMsg;
+    const svc = manager.routines!;
+    let sessionId: string | null = null;
+    for (let i = 0; i < 200; i++) {
+      sessionId = svc.store.getRun(fired.run.id)?.sessionId ?? null;
+      if (sessionId && manager._sessionForTest(sessionId)?.status === "thinking") break;
+      await Bun.sleep(10);
+    }
+    expect(manager._sessionForTest(sessionId!)?.status).toBe("thinking");
+    const started = performance.now();
+    manager.stopRoutines();
+    manager.stopDispatcher();
+    await manager.drain(10_000);
+    const took = performance.now() - started;
+    // What the store holds now is what it keeps.
+    const row = svc.store.getRun(fired.run.id)!;
+    return { row, took };
+  }
 
-      // The daemon's order: routines stop, the dispatcher stops, sessions drain, then the store closes.
-      const started = performance.now();
-      manager.stopRoutines();
-      manager.stopDispatcher();
-      await manager.drain(10_000);
-      const took = performance.now() - started;
-      // What the store holds now is what it keeps.
-      const row = svc.store.getRun(fired.run.id)!;
+  // 1300 and 1800: past the ~1.1 s a run used to wait, within the 2 s drain waits for the turn.
+  for (const late of [0, 100, 300, 1300, 1800]) {
+    it(`records its end and its spend before the store closes (the turn's result ${late} ms after the interrupt)`, async () => {
+      const { row, took } = await shutDownMidRun(late);
       expect(row.status).toBe("interrupted");
       expect(row.costUsd).toBeCloseTo(0.42);
+      expect(row.costUnknown).toBeFalsy();
       expect(took).toBeLessThan(late + 1_000);
     });
   }
+
+  it("records its end at once, the cost unknown, when drain gives up on its turn", async () => {
+    // Past the backend's settle bound (DRAIN_SETTLE_MS): the turn is left, the run isn't.
+    const { row, took } = await shutDownMidRun(DRAIN_SETTLE_MS + 2_000);
+    expect(row.status).toBe("interrupted");
+    expect(row.costUnknown).toBe(true);
+    expect(took).toBeLessThan(DRAIN_SETTLE_MS + 1_000);
+  });
 });
 
 describe("authority", () => {
