@@ -145,8 +145,9 @@ describe("the workspace's git repository", () => {
     expect(g.readOnly).toContain(join(nested, ".git"));
     expect(g.readOnly).not.toContain(own);
     // The session's own folder in each worktree location, made where missing (#448 round 10): in its sibling
-    // `-worktrees` dir and the main checkout's `.worktrees`; nothing else of either is writable.
-    expect(g.folders).toEqual([join(home, "repo-worktrees", "s-1234abcd"), join(repo, ".worktrees", "s-1234abcd")]);
+    // `-worktrees` dir; nothing else of it is writable, and nothing is made in the main checkout (#448 round 11).
+    expect(g.folders).toEqual([join(home, "repo-worktrees", "s-1234abcd")]);
+    expect(existsSync(join(repo, ".worktrees"))).toBe(false);
     expect(g.problems).toEqual([]);
     expect(g.writable).not.toContain(join(home, "repo-worktrees"));
     // Without a folder name (a check, the git shim): none.
@@ -168,10 +169,13 @@ describe("the workspace's git repository", () => {
     for (const n of ["gh-wt", "nested"]) expect(plain.readOnly).toContain(join(common, "worktrees", n));
     // Its .git file is outside the workspace and every worktree location: nothing of it is writable to hold.
     expect(plain.readOnly).not.toContain(join(wt, ".git"));
-    // In the main checkout, `.worktrees` is in the workspace: other sessions' folders are there, so it is held
-    // read-only whole, and the session's folder is only in the sibling location (#448 round 10).
+    // In the main checkout nothing is made (#448 round 11): no `.worktrees`; one you have there is held read-only
+    // whole (worktrees may be in it); the session's folder is only in the sibling location.
     expect(plain.folders).toEqual([join(home, "repo-worktrees", "m-5678abcd")]);
-    expect(plain.readOnly).toContain(join(repo, ".worktrees"));
+    expect(existsSync(join(repo, ".worktrees"))).toBe(false);
+    expect(plain.readOnly).not.toContain(join(repo, ".worktrees"));
+    mkdirSync(join(repo, ".worktrees"));
+    expect(gitWorkspacePaths(repo, home, { worktreeFolder: "m-5678abcd" }).readOnly).toContain(join(repo, ".worktrees"));
     // Its top can't become a git dir of its own when .git is made invalid: an empty HEAD dir, held (#448 round 3).
     expect(plain.readOnly).toContain(join(repo, "HEAD"));
     expect(readdirSync(join(repo, "HEAD"))).toEqual([]);

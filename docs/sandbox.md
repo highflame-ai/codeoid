@@ -627,10 +627,9 @@ session's own worktree folder** (`src/daemon/sandbox/worktrees.ts`):
   worktrees there, other sessions' folders, codeoid's own fork, loop and
   `--worktree` checkouts, and anything anyone makes there later (the session's
   writable set is its folder, fixed by name, so a later arrival is never in
-  it). A location inside the session's workspace — the main checkout's
-  `.worktrees/` for a session working in the main checkout — is held
-  read-only whole and gives that session no folder (its folder is then only in
-  `<repo>-worktrees/`), since other sessions' folders are there.
+  it). A `.worktrees/` you have in the main checkout is held read-only whole
+  for a session working there (worktrees of yours, or other sessions' from
+  before, may be in it), and gives no session a folder.
 - **git's own records**: the repository's `worktrees/` is writable, so git can
   make the new worktree's admin dir, and the new branch's refs are written as
   any commit's. `worktrees/` is bound at its own path: it can't be renamed
@@ -1080,8 +1079,8 @@ works, and skip where it doesn't):
   after entering it: see [The Claude CLI's own worktrees](#the-claude-clis-own-worktrees).
 - Worktrees (#448 follow-up), real bubblewrap (`sandbox-worktrees-real.test.ts`):
   from inside, `git worktree add ../repo-worktrees/x -b feature/x`, a commit
-  and a rebase there, `git worktree list`, a second one in `.worktrees/`,
-  `git worktree remove` of both and `git worktree prune` work, and the branch
+  and a rebase there, `git worktree list`,
+  `git worktree remove` and `git worktree prune` work, and the branch
   is there outside; a worktree made in one sandbox is committed in and removed
   (`--force`) in the session's next. Each of these is refused, from a plain
   repository and from a linked worktree in the sibling location, and the

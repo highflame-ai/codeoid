@@ -12,17 +12,18 @@
  *     renamed away and rebuilt), and every admin dir in it when the spec is
  *     built that isn't the session's own is held read-only whole;
  *   - each of the repository's **worktree locations** (the sibling
- *     `<repo>-worktrees/`, codeoid's own convention, git-worktree.ts; the
- *     repository's `.worktrees/`; `<root>/<repo>/` for each
- *     `sandbox.worktreeRoots` entry: {@link worktreeLocationDirs}) holds one
- *     **folder per session** ({@link sessionFolderName}), and only the
- *     session's own folder is writable to it ({@link worktreeFoldersOf}).
- *     Everything else in a location stays read-only: the user's worktrees,
- *     other sessions' folders, codeoid's own fork, loop and `--worktree`
- *     checkouts, and anything anyone makes there later (the writable set is
- *     the folder, fixed by name). A location inside the session's workspace
- *     (the main checkout's `.worktrees/` for a session working there) is held
- *     read-only whole and gets no folder: it is other sessions'.
+ *     `<repo>-worktrees/`, codeoid's own convention, git-worktree.ts;
+ *     `<root>/<repo>/` for each `sandbox.worktreeRoots` entry:
+ *     {@link worktreeLocationDirs}) holds one **folder per session**
+ *     ({@link sessionFolderName}), and only the session's own folder is
+ *     writable to it ({@link worktreeFoldersOf}). Everything else in a
+ *     location stays read-only: the user's worktrees, other sessions'
+ *     folders, codeoid's own fork, loop and `--worktree` checkouts, and
+ *     anything anyone makes there later (the writable set is the folder,
+ *     fixed by name). Nothing is made inside the user's checkout (#448 round
+ *     11): a `.worktrees/` already there is no location, and is held
+ *     read-only whole for a session working in that checkout (other
+ *     sessions' worktrees may be in it).
  *
  * A worktree is the session's own when it is checked out in its folder
  * ({@link isOwnWorktree}): what the agent made there is its own output,
@@ -111,9 +112,9 @@ export function mainCheckoutOf(layout: GitLayout): string | null {
   return dirname(layout.dotgit);
 }
 
-/** The repository's worktree locations by default, relative to its main checkout: codeoid's sibling dir and `.worktrees/`. */
+/** The repository's worktree location by default, beside its main checkout: codeoid's sibling dir (never anything inside the checkout). */
 export function defaultWorktreeLocations(main: string): string[] {
-  return [join(dirname(main), `${basename(main)}-worktrees`), join(main, ".worktrees")];
+  return [join(dirname(main), `${basename(main)}-worktrees`)];
 }
 
 /** Dirs no worktree root may be in, or be: the system's. */
@@ -243,8 +244,9 @@ export interface WorktreeFolders {
  * repository's git dir or inside it, one another user owns, and never one
  * that is (or is reached through) a link below the main checkout's parent
  * (a command could have planted it). A location inside the workspace isn't
- * given a folder: it is held read-only whole (made first where missing, so
- * there is something to hold).
+ * given a folder: it is held read-only whole. Nothing is made inside the
+ * main checkout: a `.worktrees/` already there is held read-only whole for a
+ * session working in it (#448 round 11), never made.
  */
 export function worktreeFoldersOf(
   layout: GitLayout,
@@ -311,6 +313,9 @@ export function worktreeFoldersOf(
     if (!out.folders.includes(folder)) out.folders.push(folder);
     if (!out.locations.includes(real)) out.locations.push(real);
   }
+  // Worktrees a user (or an earlier codeoid) put in the checkout's `.worktrees/`: not a location, but not the agent's to change.
+  const dot = join(mainLit, ".worktrees");
+  if (ws && within(dot, ws) && ownDir(dot) && !linked(dot, dirname(mainLit)) && !out.held.includes(realOr(dot))) out.held.push(realOr(dot));
   return out;
 }
 

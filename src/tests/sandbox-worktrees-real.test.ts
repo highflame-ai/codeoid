@@ -133,11 +133,13 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
     Bun.spawnSync([bwrap, "--die-with-parent", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--bind", f.dir, f.dir, "--chdir", cwd, "--", "git", "status", "--short"], { env: gitEnv(f.home) });
   }
 
-  test("in its own folder: git worktree add, commit, rebase, list, remove, prune; from a linked worktree in .worktrees/<folder> too; still its own in the next sandbox", async () => {
+  test("in its own folder: git worktree add, commit, rebase, list, remove, prune; from a linked worktree too; still its own in the next sandbox", async () => {
     for (const workspace of ["main", "worktree"] as const) {
       const f = fixture(`add-${workspace}`, { workspace });
       const spec = f.spec();
-      expect(spec.worktreeFolders).toEqual(workspace === "main" ? [f.own] : [f.own, join(f.repo, ".worktrees", FOLDER)]);
+      // Only beside the repository: nothing is made in the main checkout (#448 round 11).
+      expect(spec.worktreeFolders).toEqual([f.own]);
+      expect(existsSync(join(f.repo, ".worktrees"))).toBe(false);
       const h = await provider.open(spec);
       try {
         const add = await sh(h, f.ws, `git worktree add '${join(f.own, "x")}' -b feature/x 2>&1 && echo ADDED`, f.env);
@@ -147,11 +149,6 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
         expect(commit.stdout).toContain("REBASED");
         expect((await sh(h, f.ws, "git worktree list --porcelain", f.env)).stdout).toContain(join(f.own, "x"));
         expect((await sh(h, f.ws, `git worktree remove '${join(f.own, "x")}' && echo REMOVED && git worktree prune && echo PRUNED`, f.env)).stdout).toContain("PRUNED");
-        if (workspace === "worktree") {
-          const dot = join(f.repo, ".worktrees", FOLDER, "z");
-          const r = await sh(h, f.ws, `git worktree add -q '${dot}' -b z && echo ADDED-Z && git worktree remove '${dot}' && echo REMOVED-Z`, f.env);
-          expect(r.stdout).toContain("REMOVED-Z");
-        }
         expect((await sh(h, f.ws, `git worktree add -q '${join(f.own, "mine")}' -b mine-${workspace} && echo ADDED`, f.env)).stdout).toContain("ADDED");
       } finally {
         await h.close();
@@ -173,8 +170,10 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: an
     }
   });
 
-  test("anywhere else in a location it fails (Read-only file system): the location itself, another session's folder, the main checkout's .worktrees from a session there", async () => {
+  test("anywhere else in a location it fails (Read-only file system): the location itself, another session's folder, a .worktrees you have in the main checkout from a session there", async () => {
     const f = fixture("elsewhere");
+    // Yours, from before: no location (nothing is made there), but held for a session working in the checkout.
+    mkdirSync(join(f.repo, ".worktrees"));
     const h = await provider.open(f.spec());
     try {
       const r = await sh(

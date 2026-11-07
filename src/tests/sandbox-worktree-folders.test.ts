@@ -81,7 +81,7 @@ describe("sandbox.worktreeRoots validation (#448 round 10)", () => {
     const layout = gitLayoutOf(a, join(root, "home"));
     if (!layout) throw new Error("no layout");
     const { locations, problems } = worktreeLocationDirs(layout, { roots: [join(root, "wt"), "~/.config"], home: join(root, "home") });
-    expect(locations.map((l) => l.dir)).toEqual([join(root, "a-worktrees"), join(a, ".worktrees"), join(root, "wt", "a")]);
+    expect(locations.map((l) => l.dir)).toEqual([join(root, "a-worktrees"), join(root, "wt", "a")]);
     expect(problems).toEqual([expect.stringContaining("~/.config is in a hidden dir of your home")]);
     // A root that isn't there and isn't beside the repository: said, never made.
     const notes = worktreeRootNotes(layout, { roots: [join(root, "elsewhere", "missing")], home: join(root, "home") });
