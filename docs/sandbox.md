@@ -4,7 +4,10 @@ Every shell command an agent runs, on every backend that can be sandboxed,
 runs inside an operating-system sandbox. The workspace and a private temp
 directory are writable (and, so an agent can branch in a worktree of its own,
 the session's own [worktree folder](#git-worktrees-inside-the-sandbox));
-everything else is read-only; credential stores are not there at all;
+the session's [project roots](#working-across-repositories) (by default the
+parent of its repository: the repositories beside it) are readable, and the
+directories it was [given](#added-directories-other-repositories-writable)
+writable; everything else is read-only; credential stores are not there at all;
 container runtime sockets can't be reached unless the owner turns on
 [Docker access](#docker-access); the network is a per-session setting.
 
@@ -778,6 +781,167 @@ Limits (defence in depth, as the rest of git's structure):
 - On Seatbelt `worktrees/` and each session folder are kept from being renamed
   by a `literal` write denial (not verified on a Mac: see below).
 
+## Working across repositories
+
+A session works in one directory, but work often spans several: a library
+and the app that uses it, a fix in a client and its server, a look at what
+another session did in its checkout. Two things open the sandbox up for
+that, each as narrow as it can be.
+
+### Project roots: other repositories, read-only
+
+Everything under a **project root** is readable to the session's commands,
+read-only, and to the backend's own file tools as the gate holds them
+([below](#file-tools-that-run-outside-the-sandbox)). By default the root is
+the **parent of the session's repository**: a session in `~/Workspace/codeoid`
+reads `~/Workspace/*`, so `cat`, `grep`, `git log` and `git status` work in
+the repositories beside it, and in the other sessions' checkouts there
+(`~/Workspace/codeoid-worktrees/…`). For a linked worktree (a fork's) it is
+the parent of the repository's main checkout; for a workspace that isn't in
+a repository, the workspace's parent.
+
+- **Set it** daemon-wide with `sandbox.projectRoots`
+  (`CODEOID_SANDBOX_PROJECT_ROOTS`, comma-separated; Settings > Sandbox >
+  "Project roots"): a list of absolute dirs (`~` expands) and `@parent` (the
+  default, the repository's parent). `[]` is none. Per session at create:
+  `codeoid new … --project-root <dir>` (repeatable; replaces the daemon's
+  list, `@parent` included only if you name it), `--no-project-roots`, the
+  new-session dialog's "Readable project roots", or `session.create`'s
+  `sandbox.projectRoots`. A root the daemon's default doesn't have is a
+  widening (needs `session:approve` and an undelegated token, as below);
+  fewer is narrower.
+- **What stays hidden inside a root**: everything the sandbox hides anywhere
+  — codeoid's config and data dirs, every agent CLI's login and the other
+  [credential stores](#what-is-protected), `sandbox.hiddenPaths`, the
+  desktop's runtime dir, container and (with the network off) local service
+  sockets — and the **secret files at the top of each project** under the
+  root (the root itself and each dir directly in it): `.env` and `.env.*`
+  (not `.env.example`, `.sample`, `.template`, `.dist`, `.defaults`,
+  `.schema`), `.envrc`, `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`.
+  Not the session's own: its workspace's and its added directories' are its
+  to use. They are found when the sandbox is built: one made later, or deeper
+  (`~/Workspace/b/config/.env`), isn't hidden; add such paths to
+  `sandbox.hiddenPaths`.
+- **Refused as a root**: `/`, your home or a dir holding it, anything in a
+  hidden dir of your home (`~/.config`, `~/.local`, …: where tools load
+  programs and settings from), `~/Library`, codeoid's config dir, a system
+  dir (`/etc`, `/usr`, …), a relative path. The config fails to load on one;
+  a session's own is refused at create. **A default that would be your home**
+  (a repository directly in it, `~/proj`) falls back to no root, said on the
+  session ("no project root: the default, the repository's parent (…), is
+  your home…"): set `sandbox.projectRoots` to read your other repositories.
+- Writing there stays refused: "Read-only file system", as anywhere else
+  outside the workspace.
+
+### Added directories: other repositories, writable
+
+A session can be given **more directories to write**, each treated as its
+workspace is: writable, its repository's git structure (config, hooks,
+`info/`, the other worktrees' admin dirs, …) and project settings
+(`.claude/`, `.mcp.json`, …) held read-only and made first where missing,
+the session's own [worktree folder](#git-worktrees-inside-the-sandbox) in
+its repository's locations (`~/Workspace/b-worktrees/<session folder>/`), a
+host-side file tool writing its git structure or settings asked about
+([held writes](#file-tools-that-run-outside-the-sandbox)), and the
+end-of-turn look at its git settings and commits (`sandbox.git_changed`,
+`sandbox.settings_committed`, naming the directory). What the sandbox hides
+stays hidden inside one; its own `.env` is readable.
+
+**Adding one is a widening**, so it is the owner's own decision:
+
+- **By the owner**: `/sandbox add <dir>` and `/sandbox remove <dir>` (every
+  frontend), `codeoid sandbox add|remove <session> <dir>`,
+  `codeoid new … --add-dir <dir>` (repeatable), the new-session dialog's
+  "Also writable", `session.create`'s `sandbox.addedDirs`, the
+  `session.sandbox_dir` message. Adding needs `session:approve`, the
+  session's owner and an undelegated token; on a running session it is a
+  confirm on the session ("Let "<name>" write <dir>?") that only the owner's
+  own token answers (`codeoid approve <session>`, or any frontend). Removing
+  is narrowing: applied, by a delegated token too. Audited:
+  `session.sandbox_dir_ask`, `_added` (`by=owner`), `_denied`, `_removed`.
+- **Asked for by the agent**: codeoid's `request_directory` tool
+  (`path`, `reason`). In **guarded and interactive mode** the owner gets a
+  confirm card naming the directory and the agent's reason ("The agent asks
+  to write <dir>"), answered by the owner's own token only; the agent reads
+  the answer. In **autonomous mode** a directory under one of the session's
+  project roots is added at once, unasked (audited: `by=agent under a
+  project root, autonomous`), and anything else is refused at once with a
+  reason the agent reads ("… isn't under this session's project roots …; the
+  owner can add it (`/sandbox add <dir>`)"). An unattended run (a routine, a
+  loop) is never parked on it: refused, said. An unanswered card is
+  withdrawn after 8 minutes (the agent is told). Audited:
+  `session.sandbox_dir_request`, `_added` (`by=agent …`), `_refused`.
+- **Refused as an added dir**: everything refused as a root (above), and a
+  dir that isn't there, isn't a directory, isn't yours, is inside what the
+  sandbox hides (codeoid's data dirs, a credential store, a
+  `sandbox.hiddenPaths` entry, the daemon's temp dir), or holds a dir on
+  the daemon's `PATH` (a program written there would run outside the sandbox
+  at your next command). One inside the workspace is writable already.
+- **Kept**: in the session's sandbox setting, so a daemon restart and a
+  resume keep them, and a fork, a compare and a collaboration's children
+  inherit them (a fork carries them for the parent's owner only, undelegated,
+  as any [wider sandbox](#choosing-a-sandbox)).
+
+`request_directory`, per backend:
+
+| Backend | How it's delivered |
+| --- | --- |
+| Claude | in-process MCP server (`mcp__codeoid_sandbox__request_directory`), pre-approved: the session decides it |
+| Qwen Code | in-process MCP server, the same |
+| pi | a tool in codeoid's bridge extension, as registry servers' are |
+| Codex, Gemini CLI, opencode | the daemon's `/mcp/sandbox` endpoint (loopback only), a token of the session's own (Codex reads it from `CODEOID_SANDBOX_TOKEN`, kept out of its commands' environment by `CODEOID_*_TOKEN`); its call timeout is raised past the card's 8 minutes on Codex and opencode |
+| OpenAI, Gemini, llama.cpp | none: these run no commands, so there is no sandbox to widen |
+
+The gate never asks about the call itself (it is the ask); its card is the
+session's own confirm.
+
+### When a change takes effect
+
+An added or removed directory takes effect **at the session's next turn that
+starts with no turn, approval or background work running** — never in the
+middle of work, which a rebuilt sandbox would end. The agent is told
+("writable … from your next turn"); until then the session's info lists it
+as pending (the chip: "from the next turn: +<dir>"), and an info line says
+when it applied.
+
+| Backend | What happens at that turn |
+| --- | --- |
+| Claude (its own sandbox) | its query is built again with the new directories (it resumes the same conversation) |
+| Claude under Docker, Codex, pi, the Gemini CLI, Qwen Code | the backend's process is restarted in the new sandbox before the turn (the conversation resumes; the Gemini CLI is handed its history) |
+| opencode | the session's shell lines run in the new sandbox (its launcher is written afresh each turn); its server keeps running |
+
+With background work running (a Claude background agent, a background shell),
+the change waits until it has ended; the confirm says so.
+
+### A workspace that is your home
+
+Starting a session in a parent directory makes that directory its workspace,
+writable: start it where the work is. A session whose workspace is **your
+home itself** is allowed, but then nothing of your home is hidden but what
+the [hidden list](#what-is-protected) names: every project, dotfile and
+setting in it is readable and writable to its commands. The chip says
+**"sandboxed: workspace is your home — only credentials are protected"**, as
+do `codeoid ls` and every approval card; project roots don't apply (all of the
+home is the workspace).
+
+### Limits
+
+- On **Claude's own sandbox**, a root that holds what the session writes (the
+  default does: it holds the workspace) is shown entry by entry around it:
+  its CLI lays every readable bind after every writable one, so showing the
+  root whole would make the workspace read-only (checked: every command then
+  fails). A dir made in the root after the query started isn't shown until
+  the next query.
+- The secret files hidden in a root are those at each project's top when the
+  sandbox is built (above).
+- The default root shows **every repository beside yours**, read-only: their
+  source, their git history, and any credential in a file not named above. Set
+  `sandbox.projectRoots: []` (or `--no-project-roots`) where that is too
+  much, and `sandbox.hiddenPaths` for what must stay out.
+- An added directory that is **another worktree of the session's own
+  repository** is writable, and its own admin dir with it; the rest of the
+  repository's structure stays held.
+
 ## Docker access
 
 Tests that start containers (testcontainers' MySQL or Postgres, `docker run`
@@ -950,9 +1114,12 @@ to the workspace. In autonomous mode it is information only (the audit log's
   script from the workdir, an earlier run's agent may have changed it — keep the
   gate to commands you trust, or run with `--worktree`.
 - Credentials in **project files** (`.env` in the workspace) are the workspace's:
-  add them to `sandbox.hiddenPaths` or keep them out of the workdir. A
+  add them to `sandbox.hiddenPaths` or keep them out of the workdir. Those at
+  the top of the other projects under a project root are hidden
+  ([above](#project-roots-other-repositories-read-only)). A
   workspace that is your home itself shows the home (the hidden list still
-  applies in it); one that holds it (`/home`) hides it.
+  applies in it; [the chip says so](#a-workspace-that-is-your-home)); one
+  that holds it (`/home`) hides it.
 - **The home is read-only and mostly empty inside.** The usual caches are
   pointed at the sandbox's cache dir (above); a tool that writes other state in
   the home fails there (`pip install --user`, `go install` into `~/go/bin`,
@@ -1073,6 +1240,22 @@ works, and skip where it doesn't):
   the gate and, denied, never runs. (Manually also: network on reaches a host;
   the command sees 5 processes and no environment carrying the key; a command
   can't create `.claude/settings.json` in the workspace.)
+- Working across repositories, real bubblewrap
+  (`src/tests/sandbox-project-roots-real.test.ts`): a session in
+  `<root>/a` reads `<root>/b` (`cat`, `grep -r`, `git log`, `git status`)
+  and can't write or commit there ("Read-only file system") while its own
+  workspace stays writable; `b/.env` and `.env.local` are hidden, its
+  `.env.example` readable, codeoid's config dir and a `sandbox.hiddenPaths`
+  dir inside the root and the home's `~/.ssh` hidden, `grep -r` over the root
+  finds none of them; added, `b` is written and committed in, its hooks,
+  config and `.claude/` refused, a worktree added in its own folder of
+  `b-worktrees/` and refused elsewhere there, the user's next git in `b`
+  running nothing planted, its `.env` readable. The real Claude CLI
+  (`sandbox-claude-real.test.ts`, "project roots and added dirs"): the root
+  around the workspace is readable, the workspace writable, `b` read-only
+  and its `.env` hidden; added, `b` writable; handing the CLI the root whole
+  instead makes the workspace read-only (every command fails), which is why
+  it is split.
 - `src/tests/sandbox-codex.test.ts`: the app-server started inside real
   bubblewrap can't read a planted credential and can read its own home; codex's
   own sandbox (0.166) works nested inside codeoid's bubblewrap; with the real

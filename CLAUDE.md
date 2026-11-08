@@ -216,6 +216,7 @@ codeoid account ls|login <name>|add-key <name>|add-gateway|add-token|add-bedrock
 codeoid destroy <n>
 codeoid new <n> <d> --sandbox auto|bwrap|seatbelt|docker|off [--network on|off|allowlist] [--allow-host h] [--docker-socket]  # the session's OS sandbox (#448, docs/sandbox.md)
 codeoid sandbox providers | set <session> [provider] [--network …] [--[no-]docker-socket]  # what runs here; change a session's (widening asks its owner)
+codeoid sandbox add|remove <session> <dir>   # another dir its commands write, as a workspace (adding asks its owner); codeoid new … --add-dir <dir> --project-root <dir> --no-project-roots
 codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
 codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
 codeoid mcp reconnect <session> <server>            # redial a backend MCP server that's down (#389)
@@ -438,6 +439,24 @@ containerd, …: `containerSocketPaths`) and the system bus and screen's dir
 (Postgres, MySQL, Redis: `localServiceSocketPaths` → `SandboxSpec.serviceSockets`)
 when the network the session asked for is off or an allowlist.
 
+Working across repositories (sandbox/project-roots.ts, dir-rules.ts, request-directory.ts; docs/sandbox.md
+"Working across repositories"): `sandbox.projectRoots` (default `@parent`: the parent of the repository's main
+checkout, `defaultProjectRoot`; the home falls back to none, said) are shown read-only (`SandboxSpec.projectRoots`,
+in `reexposed`), the hidden list hidden inside and `projectRootSecrets` (`.env*`, `.envrc`, `.npmrc`, … at each
+project's top, not the session's own). `SessionSandboxSetting.addedDirs` are writable, each a workspace to
+`buildSandboxSpec` (its `gitWorkspacePaths`, `projectConfigPaths`, worktree folder, a `WorktreeEntryGuard` per
+repository) and to `protectedWriteTargets` and the end-of-turn git look (`#checkAddedGitControl`); validated by
+`addedDirProblem` (`sandboxDirProblem`'s refusals, what the sandbox hides, a PATH entry). Adding a dir or a root
+`widens()`. `session.sandbox_dir` (owner, undelegated, owner-only confirm; remove narrows) and the agent's
+`request_directory` (`Session#requestDirectory`: guarded/interactive an owner-only confirm with the reason,
+autonomous added under a root else refused, unattended refused; in-process on Claude/Qwen, pi's bridge,
+`/mcp/sandbox` loopback with a per-session token for Codex/Gemini CLI/opencode; `isRequestDirectoryTool` skips the
+gate card). A dirs-only change (`onlyDirsChanged`) leaves the runtime until `Session.ensureSandbox` applies it at a
+turn start with no turn, approval or background work (`dirsPending`, `SessionSandboxInfo.pendingDirs`), then
+`#restartForSandboxDirs` restarts a process backend. Claude native shows a root around what is writable
+(`readAround`: its CLI binds allowRead after allowWrite). `homeWorkspace`: the chip says "sandboxed: workspace is
+your home — only credentials are protected".
+
 Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell/`
 parses a command line with tree-sitter-bash (WASM, vendored `tree-sitter-bash.wasm`;
 the daemon loads it at start, so the gate judges synchronously and the approval
@@ -488,6 +507,7 @@ CODEOID_SANDBOX=auto                # OS sandbox for agents' commands: auto|bwra
 CODEOID_SANDBOX_NETWORK=on          # on|off|allowlist (CODEOID_SANDBOX_ALLOWED_HOSTS); hiddenPaths: CODEOID_SANDBOX_HIDDEN_PATHS
 CODEOID_SANDBOX_DOCKER_SOCKET=false # let sandboxed commands reach the container runtime (root-equivalent; docs/sandbox.md)
 CODEOID_SANDBOX_WORKTREE_ROOTS=     # more worktree locations (csv): <root>/<repo>/<session folder>; never ~/.config, ~, /
+CODEOID_SANDBOX_PROJECT_ROOTS=@parent # readable roots (csv): @parent = the repository's parent; [] none; never ~, /
 
 # Claude auth: uses your existing `claude login` session (Pro/Max subscription).
 # No ANTHROPIC_API_KEY needed if you're logged in via Claude Code CLI.
