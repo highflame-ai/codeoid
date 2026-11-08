@@ -3481,7 +3481,8 @@ export class Session {
     };
     if (this.#mode === "autonomous") {
       const roots = sbx.appliedProjectRoots();
-      if (inAnyDir(dir, roots)) return grant(SYSTEM_IDENTITY.sub, "under a project root, autonomous");
+      // Strictly under one: a root itself (every repository in it) is the owner's to add.
+      if (roots.some((r) => inAnyDir(dir, [r]) && !inAnyDir(r, [dir]))) return grant(SYSTEM_IDENTITY.sub, "under a project root, autonomous");
       return refuse(
         `${dir} isn't under this session's project roots (${roots.length > 0 ? roots.join(", ") : "none"}); in autonomous mode nothing else is added. The owner can add it (\`/sandbox add ${dir}\`)`,
       );

@@ -259,6 +259,8 @@ describe("project roots and added directories through the SessionManager", () =>
     expect(asked).toHaveLength(0);
     expect(session?.toInfo().sandbox?.addedDirs).toEqual([sibling]);
     expect(await session?.requestDirectory({ path: homedir(), reason: "all of it" })).toContain("Refused:");
+    // The root itself (every repository in it) is the owner's to add, not the agent's unasked.
+    expect(await session?.requestDirectory({ path: root, reason: "everything" })).toContain(`Refused: ${root} isn't under this session's project roots`);
   });
 
   it("request_directory on an unattended run (a routine, a loop) in guarded mode: refused, not parked", async () => {

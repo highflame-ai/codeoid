@@ -864,7 +864,7 @@ stays hidden inside one; its own `.env` is readable.
   confirm card naming the directory and the agent's reason ("The agent asks
   to write <dir>"), answered by the owner's own token only; the agent reads
   the answer. In **autonomous mode** a directory under one of the session's
-  project roots is added at once, unasked (audited: `by=agent under a
+  project roots (inside it, never the root itself) is added at once, unasked (audited: `by=agent under a
   project root, autonomous`), and anything else is refused at once with a
   reason the agent reads ("… isn't under this session's project roots …; the
   owner can add it (`/sandbox add <dir>`)"). An unattended run (a routine, a
