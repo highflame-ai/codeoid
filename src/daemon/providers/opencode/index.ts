@@ -33,7 +33,7 @@
  *     authoritative for files.
  */
 
-import { REQUEST_DIRECTORY_WAIT_MS, SANDBOX_MCP_SERVER_NAME, type SandboxMcpMount } from "../../sandbox/request-directory.js";
+import { SANDBOX_MCP_SERVER_NAME, type SandboxMcpMount } from "../../sandbox/request-directory.js";
 import { join } from "node:path";
 import type { BackendHostFiles } from "../../sandbox/host-file-tools.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
@@ -1646,9 +1646,10 @@ export class OpencodeProvider implements SessionProvider {
     }
     const bb = this.#blackboardMcp?.();
     if (bb) configs.push({ name: BLACKBOARD_MCP_SERVER_NAME, config: remote(bb.url, bb.token) });
-    // The sandbox's ask for a directory to write (sandbox/request-directory.ts); its call waits on the owner.
+    // The sandbox's ask for a directory to write (sandbox/request-directory.ts): its call returns within opencode's
+    // MCP call timeout, the owner's question left open (REQUEST_DIRECTORY_SHORT_WAIT_MS).
     const sbx = this.#sandboxMcp?.();
-    if (sbx) configs.push({ name: SANDBOX_MCP_SERVER_NAME, config: { ...remote(sbx.url, sbx.token), timeout: REQUEST_DIRECTORY_WAIT_MS + 60_000 } });
+    if (sbx) configs.push({ name: SANDBOX_MCP_SERVER_NAME, config: remote(sbx.url, sbx.token) });
     for (const spec of this.#mcpRegistry?.forNativeMount(this.id) ?? []) {
       const t = spec.transport;
       if (t.kind === "stdio") {

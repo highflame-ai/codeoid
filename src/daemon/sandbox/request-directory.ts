@@ -30,11 +30,14 @@ export const SANDBOX_MCP_PATH = "/mcp/sandbox";
 /** The env var a URL-mounting backend reads the token from (Codex's `bearer_token_env_var`; out of its commands' environment: `CODEOID_*_TOKEN`). */
 export const SANDBOX_MCP_TOKEN_ENV = "CODEOID_SANDBOX_TOKEN";
 /**
- * How long a request waits for its owner's answer before it is withdrawn
- * (said to the agent): under the Gemini CLI's MCP call timeout (10 min);
- * Codex's is raised past it (`tool_timeout_sec`).
+ * How long a call waits for its owner's answer before it returns "no answer
+ * yet" (the question stays open; a later yes still adds the directory):
+ * under the Gemini CLI's and Qwen's MCP call timeout (10 min); Codex's is
+ * raised past it (`tool_timeout_sec`).
  */
 export const REQUEST_DIRECTORY_WAIT_MS = 8 * 60_000;
+/** The same on opencode, whose MCP client gives a call about a minute (the MCP SDK's default request timeout). */
+export const REQUEST_DIRECTORY_SHORT_WAIT_MS = 45_000;
 
 export interface RequestDirectoryInput {
   path: string;

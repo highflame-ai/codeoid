@@ -868,8 +868,11 @@ stays hidden inside one; its own `.env` is readable.
   project root, autonomous`), and anything else is refused at once with a
   reason the agent reads ("… isn't under this session's project roots …; the
   owner can add it (`/sandbox add <dir>`)"). An unattended run (a routine, a
-  loop) is never parked on it: refused, said. An unanswered card is
-  withdrawn after 8 minutes (the agent is told). Audited:
+  loop) is never parked on it: refused, said. The call returns "no answer
+  yet" if the owner hasn't answered within 8 minutes (45 seconds on opencode,
+  whose MCP client gives a call about a minute); the card stays open, a later
+  yes still adds the directory, and asking again for the same one waits on
+  that card rather than raising another. Audited:
   `session.sandbox_dir_request`, `_added` (`by=agent …`), `_refused`.
 - **Refused as an added dir**: everything refused as a root (above), and a
   dir that isn't there, isn't a directory, isn't yours, is inside what the
@@ -889,7 +892,7 @@ stays hidden inside one; its own `.env` is readable.
 | Claude | in-process MCP server (`mcp__codeoid_sandbox__request_directory`), pre-approved: the session decides it |
 | Qwen Code | in-process MCP server, the same |
 | pi | a tool in codeoid's bridge extension, as registry servers' are |
-| Codex, Gemini CLI, opencode | the daemon's `/mcp/sandbox` endpoint (loopback only), a token of the session's own (Codex reads it from `CODEOID_SANDBOX_TOKEN`, kept out of its commands' environment by `CODEOID_*_TOKEN`); its call timeout is raised past the card's 8 minutes on Codex and opencode |
+| Codex, Gemini CLI, opencode | the daemon's `/mcp/sandbox` endpoint (loopback only), a token of the session's own (Codex reads it from `CODEOID_SANDBOX_TOKEN`, kept out of its commands' environment by `CODEOID_*_TOKEN`); Codex's call timeout is raised past the 8-minute wait |
 | OpenAI, Gemini, llama.cpp | none: these run no commands, so there is no sandbox to widen |
 
 The gate never asks about the call itself (it is the ask); its card is the

@@ -290,6 +290,48 @@ describe("applied between turns, never mid-work", () => {
     await sbx.close();
   });
 
+  test("request_directory unanswered: the call returns before its backend's MCP client would give up, the question stays open, a repeat joins it, a later yes adds it", async () => {
+    const dir = join(base, "late");
+    const work = join(dir, "projects", "work");
+    const other = join(dir, "projects", "other");
+    mkdirSync(work, { recursive: true });
+    mkdirSync(other, { recursive: true });
+    mkdirSync(join(dir, "data"));
+    const st = new Store(join(dir, "data", "codeoid.db"));
+    const tr = new TranscriptStore(join(dir, "data", "transcripts"));
+    const id = randomUUID();
+    st.createSession({ id, name: "late", workdir: work, status: "idle", createdBy: AUTH.sub, createdAt: new Date().toISOString(), attachedClients: 0, accountId: AUTH.accountId, projectId: AUTH.projectId });
+    const session = new Session({
+      name: "late",
+      workdir: work,
+      auth: AUTH,
+      store: st,
+      transcriptStore: tr,
+      existingId: id,
+      _testProvider: new MockSessionProvider("opencode", [[DONE]]),
+      initialMode: { mode: "guarded" },
+      config: { workspaceIndex: { enabled: false }, compress: { enabled: false, excludeCommands: [], excludePatterns: [], compressPipes: false, minBytes: 1024 }, labeling: {}, telemetry: { osc8: "auto" }, autoRotate: { enabled: false }, session: {}, dbPath: join(dir, "data", "codeoid.db"), transcriptDir: join(dir, "data", "transcripts") } as unknown as CodeoidConfig,
+      sandboxRegistry: fakeRegistry([]),
+      requestDirectoryWaitMs: 30,
+    });
+    const dialogs: SessionUiRequestMsg[] = [];
+    session.attach({ id: "c", auth: AUTH, capabilities: [CAPABILITIES.UI_DIALOGS], send: (m: { type: string }) => void (m.type === "session.ui_request" && dialogs.push(m as SessionUiRequestMsg)) } as never);
+    try {
+      await session.ensureSandbox();
+      expect(await session.requestDirectory({ path: other, reason: "shared types" })).toContain("No answer yet");
+      expect(await session.requestDirectory({ path: other, reason: "again" })).toContain("No answer yet");
+      expect(dialogs).toHaveLength(1);
+      session.resolveUiRequestFromClient(dialogs[0]?.requestId as string, { confirmed: true }, AUTH);
+      for (let i = 0; i < 200 && !session.toInfo().sandbox?.addedDirs; i++) await Bun.sleep(5);
+      expect(session.toInfo().sandbox?.addedDirs).toEqual([other]);
+      expect(await session.requestDirectory({ path: other, reason: "check" })).toContain("is added already");
+    } finally {
+      await session.destroy(AUTH).catch(() => {});
+      await tr.flush().catch(() => {});
+      st.close();
+    }
+  });
+
   test("a session with background work running keeps its sandbox; the dir lands at the next turn after it ended, and the backend starts again in it", async () => {
     const dir = join(base, "s");
     const work = join(dir, "projects", "work");

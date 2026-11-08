@@ -232,7 +232,7 @@ import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitCont
 import { worktreeFolderNote } from "./sandbox/worktrees.js";
 import { hiddenPathsFor, protectedWriteTargets, sandboxWorkspaceOf, userHiddenPaths } from "./sandbox/policy.js";
 import { addedDirProblem, inAnyDir, normalizeSandboxDir } from "./sandbox/project-roots.js";
-import { REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
+import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -469,6 +469,8 @@ export interface SessionCreateOptions {
   backgroundWakeFallbackMs?: number;
   /** Override for FOREIGN_STOP_GRACE_MS (tests). */
   foreignStopGraceMs?: number;
+  /** Override for how long `request_directory` waits for its owner's answer before it returns (tests). */
+  requestDirectoryWaitMs?: number;
   /** Optional memory engine — when provided, episodes are chunked and stored for recall. */
   memory?: MemoryEngine;
   /** Shared in-daemon memory MCP endpoint + URL, for URL-mounting backends. */
@@ -1262,6 +1264,9 @@ export class Session {
   #settingsCheck: Promise<void> = Promise.resolve();
   /** The same two looks for each directory the session was given to write (its repository's), from when it applied. */
   readonly #addedGitBaselines = new Map<string, { git: GitControlSnapshot; refs: Promise<string[] | null> }>();
+  /** The agent's `request_directory` questions still open, by directory: a repeat request joins its answer. */
+  readonly #dirRequests = new Map<string, Promise<string>>();
+  #requestDirectoryWaitMs: number | undefined;
   /** Started for unattended work: turns need an enforced sandbox (SessionCreateOptions.requireSandbox). */
   #requireSandbox = false;
   /** The sandbox changed while the backend process ran: it runs in the old one until it is restarted. */
@@ -1583,6 +1588,7 @@ export class Session {
     this.collaborationRole = opts.collaborationRole;
     this.#blackboardMcp = opts.blackboardMcp;
     this.#sandboxMcp = opts.sandboxMcp;
+    this.#requestDirectoryWaitMs = opts.requestDirectoryWaitMs;
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
     this.#collaborationCost = opts.collaborationCost;
@@ -3480,33 +3486,53 @@ export class Session {
         `${dir} isn't under this session's project roots (${roots.length > 0 ? roots.join(", ") : "none"}); in autonomous mode nothing else is added. The owner can add it (\`/sandbox add ${dir}\`)`,
       );
     }
-    let answeredBy: string | undefined;
-    const answer = await this.requestUserInput(
-      {
-        method: "confirm",
-        title: `The agent asks to write ${dir}`,
-        message: `"${this.name}" asks for its sandboxed commands to write ${dir} (its git structure and project settings stay read-only).\n\nIts reason: ${input.reason}`,
-        timeoutMs: REQUEST_DIRECTORY_WAIT_MS,
-      },
-      { ownerOnly: true, onAnswer: (sub) => {
-          answeredBy = sub;
+    // One card per directory: a repeat request while it is open waits on the same answer.
+    let pending = this.#dirRequests.get(dir);
+    if (!pending) {
+      let answeredBy: string | undefined;
+      const asked = this.requestUserInput(
+        {
+          method: "confirm",
+          title: `The agent asks to write ${dir}`,
+          message: `"${this.name}" asks for its sandboxed commands to write ${dir} (its git structure and project settings stay read-only).\n\nIts reason: ${input.reason}`,
         },
-      },
-    );
-    if (answer.cancelled || answer.confirmed !== true) {
-      const why =
-        answer.reason === "unattended"
-          ? "nobody is there to approve it in this unattended run; the owner can add it (`/sandbox add`)"
-          : answer.reason === "timeout"
-            ? `the owner didn't answer within ${Math.round(REQUEST_DIRECTORY_WAIT_MS / 60_000)} minutes`
-            : "the owner declined";
-      this.#store.audit(answeredBy ?? SYSTEM_IDENTITY.sub, "session.sandbox_dir_denied", this.id, `${dir} ${answer.reason ?? "declined"}`);
-      return refuse(why);
+        {
+          ownerOnly: true,
+          onAnswer: (sub) => {
+            answeredBy = sub;
+          },
+        },
+      );
+      pending = asked.then(async (answer): Promise<string> => {
+        this.#dirRequests.delete(dir);
+        if (answer.cancelled || answer.confirmed !== true) {
+          const why =
+            answer.reason === "unattended"
+              ? "nobody is there to approve it in this unattended run; the owner can add it (`/sandbox add`)"
+              : answer.cancelled
+                ? `the question was withdrawn (${answer.reason ?? "cancelled"})`
+                : "the owner declined";
+          this.#store.audit(answeredBy ?? SYSTEM_IDENTITY.sub, "session.sandbox_dir_denied", this.id, `${dir} ${answer.reason ?? "declined"}`);
+          return refuse(why);
+        }
+        const again = this.#sandboxDirCheck(dir);
+        if ("error" in again) return refuse(again.error);
+        if (again.already) return `Nothing to add: ${again.already}.`;
+        return grant(answeredBy ?? this.createdBy, "the owner approved");
+      });
+      this.#dirRequests.set(dir, pending);
     }
-    const again = this.#sandboxDirCheck(dir);
-    if ("error" in again) return refuse(again.error);
-    if (again.already) return `Nothing to add: ${again.already}.`;
-    return grant(answeredBy ?? this.createdBy, "the owner approved");
+    // The call returns before its backend's MCP client gives up on it (opencode's: about a minute); the card stays
+    // open, and a later yes still adds the directory.
+    const waitMs = this.#requestDirectoryWaitMs ?? (this.#provider.id === "opencode" ? REQUEST_DIRECTORY_SHORT_WAIT_MS : REQUEST_DIRECTORY_WAIT_MS);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), waitMs);
+    });
+    const first = await Promise.race([pending, late]);
+    clearTimeout(timer);
+    if (first !== null) return first;
+    return `No answer yet: the owner has been asked to let you write ${dir}, and the question stays open. If they say yes, it is writable from a later turn (call request_directory again to see). Carry on without it, or end this turn.`;
   }
 
   /**
