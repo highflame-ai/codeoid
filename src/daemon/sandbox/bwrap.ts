@@ -14,6 +14,8 @@
  *   --ro-bind <p> <p>        read-only inside something writable (what of a repository decides its config,
  *                            hooks and git dir; the project settings agent CLIs run code from)
  *   --bind <d> <d>           a pinned directory: a mount point, so it can't be renamed, still writable inside
+ *   --ro-bind <s> <s>        a container runtime socket the owner let in (spec.dockerSockets; off by default):
+ *                            connecting needs no write to the mount, and it can't be removed or replaced
  *   --setenv                 the toolchains' caches in the sandbox's cache dir (spec.env)
  *   --unshare-net            network off
  *   --die-with-parent, --new-session; bwrap always sets no_new_privs
@@ -101,7 +103,7 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
     mounts.push(k === "dir" ? { kind: "hide-dir", path: at } : { kind: "hide-file", path: at });
   };
   for (const p of spec.hidden) hide(p);
-  for (const p of spec.containerSockets) hide(p);
+  for (const p of [...spec.containerSockets, ...(spec.serviceSockets ?? [])]) hide(p);
   const hiddenDirs = mounts.filter((m) => m.kind === "hide-dir").map((m) => m.path);
   for (const at of writable) {
     if (!kind(at) || seen.has(`w:${at}`)) continue;
@@ -131,6 +133,14 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
     if (kind(at) !== "dir" || seen.has(`o:${at}`) || hiddenDirs.some((d) => within(at, d))) continue;
     seen.add(`o:${at}`);
     mounts.push({ kind: "bind", src: at, path: at });
+  }
+  // Container runtime sockets the owner let in (spec.dockerSockets): each bound at its own path, over a hidden dir holding it.
+  for (const p of spec.dockerSockets ?? []) {
+    const at = realOr(p);
+    if (kind(at) !== "other" || seen.has(`d:${at}`)) continue;
+    seen.add(`d:${at}`);
+    // Read-only: connecting to a socket needs no write to its mount, and it can't be removed or replaced.
+    mounts.push({ kind: "ro-bind", src: at, path: at });
   }
   const coveredAt = (at: string) => hiddenDirs.some((d) => within(at, d) && d !== at) || (within(at, "/tmp") && at !== "/tmp" && !writable.some((w) => within(at, w)));
   for (const p of spec.reexposed) {

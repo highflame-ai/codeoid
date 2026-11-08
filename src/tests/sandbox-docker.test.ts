@@ -131,6 +131,21 @@ describe("dockerRunArgs", () => {
     expect(flags(other.wrap?.(["sh"], { cwd: "", env: {} }).argv ?? [], "--label")).not.toContain(handleLabel ?? "");
   });
 
+  test("Docker access (#448 follow-up): the runtime's socket mounted at /var/run/docker.sock with its group, DOCKER_HOST naming it; never without the option", () => {
+    expect(dockerRunArgs(spec(), ["sh"], base).join(" ")).not.toContain("docker.sock");
+    const on = spec({ containerSockets: [], dockerSockets: ["/run/user/1000/docker.sock"], env: { DOCKER_HOST: "unix:///run/user/1000/docker.sock", GOCACHE: "/c" } });
+    const args = dockerRunArgs(on, ["sh"], { ...base, platform: "linux", socketGroup: () => 998 });
+    expect(flags(args, "--mount")).toContain("type=bind,source=/run/user/1000/docker.sock,target=/var/run/docker.sock");
+    expect(flags(args, "--group-add")).toEqual(["998"]);
+    expect(flags(args, "-e")).toContain("DOCKER_HOST=unix:///var/run/docker.sock");
+    expect(flags(args, "-e")).not.toContain("DOCKER_HOST=unix:///run/user/1000/docker.sock");
+    expect(flags(args, "-e")).toContain("GOCACHE=/c");
+    // Docker Desktop: the daemon's own name for its socket, whatever the host's link.
+    const mac = dockerRunArgs(spec({ dockerSockets: ["/Users/u/.docker/run/docker.sock"] }), ["sh"], { ...base, platform: "darwin" });
+    expect(flags(mac, "--mount")).toContain("type=bind,source=/var/run/docker.sock,target=/var/run/docker.sock");
+    expect(flags(mac, "--group-add")).toEqual(["0"]);
+  });
+
   test("network: on is the bridge, off and an allowlist (Docker can't hold one) are none", () => {
     expect(flags(dockerRunArgs(spec(), ["x"], base), "--network")).toEqual(["bridge"]);
     expect(dockerNetwork("off")).toBe("none");

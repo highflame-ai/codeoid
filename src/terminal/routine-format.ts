@@ -30,6 +30,8 @@ export interface RoutineFlags {
   sandbox?: string;
   network?: string;
   allowHost?: string[];
+  /** --docker-socket: its runs' commands reach the container runtime. */
+  dockerSocket?: boolean;
   guarded?: boolean;
   autonomous?: boolean;
   toolBudget?: string;
@@ -121,12 +123,13 @@ export function specFromFlags(
   else if (f.checkTimeout !== undefined) throw new RoutineFlagError("--check-timeout needs --check");
   if (f.provider !== undefined) out.provider = f.provider;
   if (f.model !== undefined) out.model = f.model;
-  if (f.sandbox !== undefined || f.network !== undefined || (f.allowHost?.length ?? 0) > 0) {
+  if (f.sandbox !== undefined || f.network !== undefined || (f.allowHost?.length ?? 0) > 0 || f.dockerSocket !== undefined) {
     if (f.network !== undefined && !["on", "off", "allowlist"].includes(f.network)) throw new RoutineFlagError("--network is on, off or allowlist");
     if (f.allowHost?.length && f.network !== undefined && f.network !== "allowlist") throw new RoutineFlagError("--allow-host goes with --network allowlist");
     out.sandbox = {
       ...(f.sandbox !== undefined ? { provider: f.sandbox } : {}),
       ...(f.allowHost?.length ? { network: "allowlist" as const, allowedHosts: f.allowHost } : f.network !== undefined ? { network: f.network as "on" | "off" | "allowlist" } : {}),
+      ...(f.dockerSocket !== undefined ? { dockerSocket: f.dockerSocket } : {}),
     };
   }
   if (f.guarded && f.autonomous) throw new RoutineFlagError("use --guarded or --autonomous, not both");

@@ -7,6 +7,7 @@
  * scratch dir, outside the host's /tmp; nothing runs outside a sandbox but
  * the one call the gate refuses, which therefore never runs.
  */
+import { createServer } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
@@ -183,8 +184,28 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(listing).not.toContain("codeoid-login-");
   }, 120_000);
 
-  test("a worktree added while a command runs is read-only to it, under Claude's sandbox too (a plain repository's worktrees/ is held whole) (#448 round 3)", async () => {
-    const r2 = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-claude-late-")));
+  test("Docker access: a planted socket in the hidden runtime dir is unreachable by default, and reachable with the owner's option (#448 follow-up)", async () => {
+    if (!Bun.which("python3")) return;
+    const runtime = join(root, "run-user");
+    mkdirSync(runtime, { recursive: true, mode: 0o700 });
+    const sock = join(runtime, "docker.sock");
+    const server = createServer((c) => c.end("PLANTED-RUNTIME\n"));
+    await new Promise<void>((r) => server.listen(sock, r));
+    try {
+      const cmd = `python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(100).decode().strip())' '${sock}' 2>&1 || true`;
+      const hidden = await probe("off", cmd, ["policy"], { CODEOID_PROBE_RUNTIME_DIR: runtime });
+      expect(hidden.result).toBe("success");
+      expect(hidden.toolResult).not.toContain("PLANTED-RUNTIME");
+      const shown = await probe("off", cmd, ["policy"], { CODEOID_PROBE_RUNTIME_DIR: runtime, CODEOID_PROBE_DOCKER_SOCKET: "1" });
+      expect(shown.result).toBe("success");
+      expect(shown.toolResult).toContain("PLANTED-RUNTIME");
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 300_000);
+
+  test("under Claude's sandbox too, a command adds a worktree in its own folder, commits there and removes it; nothing lands elsewhere in the location, and the user's and other sessions' worktrees stay held (#448 round 10)", async () => {
+    const r2 = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-claude-wt-")));
     try {
       const home = join(r2, "home");
       const repo = join(home, "proj");
@@ -195,35 +216,68 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
       writeFileSync(join(repo, "a.txt"), "a\n");
       git(["add", "."], repo);
       git(["commit", "-qm", "init"], repo);
-      const lateDir = join(repo, ".git", "worktrees", "late");
+      // The user's own worktrees: one beside the repository, one in its -worktrees location; another session's folder.
+      expect(git(["worktree", "add", "-q", "-b", "user", join(r2, "userwt")], repo).exitCode).toBe(0);
+      expect(git(["worktree", "add", "-q", "-b", "userloc", join(home, "proj-worktrees", "userloc")], repo).exitCode).toBe(0);
+      expect(git(["worktree", "add", "-q", "-b", "other", join(home, "proj-worktrees", "other-2222bbbb", "o")], repo).exitCode).toBe(0);
+      const wts = join(repo, ".git", "worktrees");
+      const own = join(home, "proj-worktrees", "agent-1111aaaa");
       const command = [
-        `touch ${join(repo, "started")}`,
-        `i=0; while [ ! -e ${join(repo, "go")} ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done`,
-        `echo /elsewhere > ${join(lateDir, "commondir")} 2>/dev/null && echo REWROTE || echo LATE-READ-ONLY`,
-        `echo t > ${join(repo, "t.txt")} && git add t.txt && git -c user.name=t -c user.email=t@example.com commit -qm inside && echo COMMITTED`,
+        `git worktree add -q ${own}/x -b feature/x && echo ADDED`,
+        `cd ${own}/x && echo x > x.txt && git add x.txt && git -c user.name=t -c user.email=t@example.com commit -qm in-worktree && echo COMMITTED`,
+        `cd '${repo}' && git worktree remove ${own}/x && echo REMOVED`,
+        "git worktree add -q ../proj-worktrees/y -b y 2>/dev/null && echo ADDED-ELSEWHERE || echo ELSEWHERE-REFUSED",
+        `echo x > ${join(home, "proj-worktrees", "other-2222bbbb", "o", "x.txt")} 2>/dev/null && echo WROTE-OTHER || echo OTHER-HELD`,
+        `echo /elsewhere > ${join(wts, "userwt", "commondir")} 2>/dev/null && echo REWROTE || echo USER-HELD`,
+        `echo x > ${join(home, "proj-worktrees", "userloc", "x.txt")} 2>/dev/null && echo WROTE-USERLOC || echo USERLOC-HELD`,
+        `echo bad >> ${join(repo, ".git", "config")} 2>/dev/null && echo WROTE-CONFIG || echo CONFIG-HELD`,
       ].join("; ");
-      const file = join(r2, "cmd-late.txt");
+      const file = join(r2, "cmd-wt.txt");
       writeFileSync(file, command);
-      const p = Bun.spawn([process.execPath, PROBE, r2, "off", file, "policy"], { stdout: "pipe", stderr: "pipe", timeout: 90_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
-      let exited = false;
-      void p.exited.then(() => {
-        exited = true;
-      });
-      for (let i = 0; i < 600 && !exited && !existsSync(join(repo, "started")); i++) await Bun.sleep(100);
-      expect(existsSync(join(repo, "started"))).toBe(true);
-      expect(git(["worktree", "add", "-q", "-b", "late", join(r2, "late")], repo).exitCode).toBe(0);
-      writeFileSync(join(repo, "go"), "");
+      const p = Bun.spawn([process.execPath, PROBE, r2, "off", file, "policy"], { stdout: "pipe", stderr: "pipe", timeout: 90_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", CODEOID_PROBE_WORKTREE_FOLDER: "agent-1111aaaa" } });
       const out = await new Response(p.stdout).text();
       await p.exited;
       const r = JSON.parse(out.trim().split("\n").at(-1) ?? "{}") as { result: string; toolResult: string | null };
       expect(r.result).toBe("success");
-      expect(r.toolResult).toContain("LATE-READ-ONLY");
-      expect(r.toolResult).toContain("COMMITTED");
-      expect(readFileSync(join(lateDir, "commondir"), "utf8")).not.toContain("elsewhere");
+      for (const w of ["ADDED", "COMMITTED", "REMOVED", "OTHER-HELD", "USER-HELD", "USERLOC-HELD", "CONFIG-HELD"]) expect(r.toolResult).toContain(w);
+      expect(git(["log", "--oneline", "feature/x"], repo).stdout.toString()).toContain("in-worktree");
+      expect(readFileSync(join(wts, "userwt", "commondir"), "utf8")).not.toContain("elsewhere");
+      // Elsewhere in a location inside the (denied) home it lands in the CLI's scratch home, never on the host
+      // (docs/sandbox.md: on Claude's own sandbox the location isn't shown, it would cover the session's folder).
+      expect(existsSync(join(home, "proj-worktrees", "y"))).toBe(false);
+      expect(readFileSync(join(home, "proj-worktrees", "other-2222bbbb", "o", "a.txt"), "utf8")).toBe("a\n");
+      expect(existsSync(join(home, "proj-worktrees", "other-2222bbbb", "o", "x.txt"))).toBe(false);
     } finally {
       rmSync(r2, { recursive: true, force: true });
     }
   }, 120_000);
+
+  test("Docker access on Claude's Linux sandbox (every unix socket allowed): a tmux-style socket in the host's /tmp is out of reach, the runtime's isn't (#448 round 10)", async () => {
+    if (!Bun.which("python3")) return;
+    const runtime = join(root, "run-user-tmux");
+    mkdirSync(runtime, { recursive: true, mode: 0o700 });
+    const tmuxDir = realpathSync(mkdtempSync("/tmp/codeoid-test-tmux-"));
+    const sockets = { docker: join(runtime, "docker.sock"), tmux: join(tmuxDir, "default") };
+    const servers = await Promise.all(
+      Object.entries(sockets).map(
+        ([name, at]) =>
+          new Promise<ReturnType<typeof createServer>>((r) => {
+            const s = createServer((c) => c.end(`REACHED-${name.toUpperCase()}\n`));
+            s.listen(at, () => r(s));
+          }),
+      ),
+    );
+    try {
+      const py = (at: string) => `python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(100).decode().strip())' '${at}' 2>&1 | tail -1`;
+      const r = await probe("off", `${py(sockets.docker)}; ${py(sockets.tmux)}`, ["policy"], { CODEOID_PROBE_RUNTIME_DIR: runtime, CODEOID_PROBE_DOCKER_SOCKET: "1" });
+      expect(r.result).toBe("success");
+      expect(r.toolResult).toContain("REACHED-DOCKER");
+      expect(r.toolResult).not.toContain("REACHED-TMUX");
+    } finally {
+      for (const s of servers) s.close();
+      rmSync(tmuxDir, { recursive: true, force: true });
+    }
+  }, 300_000);
 
   test("the toolchains' cache variables reach only sandboxed commands: never the CLI, its MCP servers, or a command run outside the sandbox (#448 round 3)", async () => {
     mkdirSync(join(root, "home", "proj"), { recursive: true });

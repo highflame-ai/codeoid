@@ -209,8 +209,10 @@ import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import { asksOutsideSandbox } from "./sandbox/confinement.js";
 import { type HostToolBreach, hostFileBreachNote, hostFileBreachReason, hostFileToolBreach, hostToolBoundsFor, isHostFileTool } from "./sandbox/host-file-tools.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
-import { resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { CLAUDE_ALL_SOCKETS_NOTE, describeSandbox, resolveSandbox, SandboxRequiredError, SessionSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { type WorktreeEntryFinding, worktreeEntryLine, worktreeEntryWarning } from "./sandbox/worktree-entries.js";
 import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
+import { worktreeFolderNote } from "./sandbox/worktrees.js";
 import { protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -1569,11 +1571,13 @@ export class Session {
     if (opts.sandboxRegistry) {
       this.#sandbox = new SessionSandbox({
         sessionId: this.id,
+        name: () => this.name,
         workdir: opts.workdir,
         registry: opts.sandboxRegistry,
         ...(opts.config ? { config: opts.config } : {}),
         ...(opts.sandbox ? { setting: opts.sandbox } : {}),
         onWarning: (text) => this.#sandboxWarning(text, "sandbox.login_not_saved"),
+        onWorktreeEntries: (common, findings) => this.#worktreeEntriesFound(common, findings),
       });
     }
     this.#requireSandbox = opts.requireSandbox === true;
@@ -3177,8 +3181,7 @@ export class Session {
     if (setting.network && setting.network !== "allowlist" && setting.allowedHosts === undefined) delete next.allowedHosts;
     const before = sbx.effective();
     const after = sbx.effective(next);
-    const describe = (e: { choice: string; network: { mode: string; allow?: readonly string[] } }) =>
-      `${e.choice === "off" ? "off" : e.choice}, network ${e.network.mode}${e.network.mode === "allowlist" ? ` (${(e.network.allow ?? []).join(", ")})` : ""}`;
+    const describe = describeSandbox;
     const change = `${describe(before)} → ${describe(after)}`;
     const apply = async (answeredBy?: string): Promise<boolean> => {
       // A confirm answered later: the session may have got busy meanwhile.
@@ -3214,10 +3217,11 @@ export class Session {
     // What it would really be here: a provider that can't run is no sandbox at all.
     const resolvedAfter = await resolveSandbox({ registry: sbx.registry, config: sbx.config, setting: next, backendId: this.#provider.id }).catch(() => null);
     const unsandboxed = after.choice === "off" || (resolvedAfter !== null && resolvedAfter.info.state !== "on" && resolvedAfter.info.state !== "no-shell");
-    const title = unsandboxed ? `Turn the sandbox off for "${this.name}"?` : `Widen the sandbox for "${this.name}"?`;
+    const dockerAdded = !unsandboxed && after.dockerSocket && !before.dockerSocket;
+    const title = unsandboxed ? `Turn the sandbox off for "${this.name}"?` : dockerAdded ? `Give "${this.name}" Docker access?` : `Widen the sandbox for "${this.name}"?`;
     const message = unsandboxed
       ? `The agent's commands would run with your full rights${after.choice === "off" ? "" : ` (${resolvedAfter?.info.reason ?? "the sandbox can't run here"})`}: they could read your credentials and change any file you can.`
-      : `Commands would run with: ${describe(after)} (now: ${describe(before)}).`;
+      : `Commands would run with: ${describe(after)} (now: ${describe(before)}).${dockerAdded ? ` Docker access can reach the whole machine: a command could start a container that mounts / and read or change anything, your credentials included.${resolvedAfter?.plan?.kind === "native" && process.platform === "linux" ? ` Also, ${CLAUDE_ALL_SOCKETS_NOTE}.` : ""}` : ""}`;
     // Answered by the owner alone, undelegated: what bounds the owner's agent is the owner's call.
     let answeredBy: string | undefined;
     void this.requestUserInput({ method: "confirm", title, message }, {
@@ -3268,10 +3272,12 @@ export class Session {
    */
   #checkGitControl(sub: string): Promise<void> {
     const commits = this.#checkSettingsCommits(sub);
+    // The repository's worktree entries first (#448 round 11): what is restored there isn't news below.
+    this.#sandbox?.checkWorktreeEntries();
     const before = this.#gitBaseline;
     if (!before) return commits;
     try {
-      const now = gitControlSnapshot(this.workdir);
+      const now = gitControlSnapshot(this.workdir, undefined, { ownFolders: this.#sandbox?.worktreeFolders() ?? [] });
       const changed = gitControlChanges(before, now);
       this.#gitBaseline = now;
       if (changed.length > 0) {
@@ -3314,6 +3320,30 @@ export class Session {
     return this.#settingsCheck;
   }
 
+  /**
+   * What a look at the repository's worktree entries found (#448 round 11,
+   * sandbox/worktree-entries.ts): an entry not as git makes it, restored or
+   * left for the owner. Audited one by one, said in one warning line.
+   */
+  #worktreeEntriesFound(common: string, findings: readonly WorktreeEntryFinding[]): void {
+    for (const f of findings) {
+      this.#store.audit(SYSTEM_IDENTITY.sub, f.restored ? "session.worktree_entry_restored" : "session.worktree_entry_unrestored", this.id, worktreeEntryLine(common, f).slice(0, 2000));
+    }
+    this.#sandboxWarning(worktreeEntryWarning(common, findings), "sandbox.worktree_entry");
+  }
+
+  /**
+   * The session's empty worktree folders removed at a turn's end (#448 round
+   * 11), unless something still runs in its sandbox: background work, or a
+   * backend whose process is inside it (its mounts were fixed at its start).
+   * The next turn makes them again (SessionSandbox.prepareFolders).
+   */
+  #tidyWorktreeFolders(): void {
+    const sbx = this.#sandbox;
+    if (!sbx?.runtime || sbx.runtime.plan.wrapsBackend || this.#hasAgentBackgroundWork()) return;
+    sbx.tidyFolders();
+  }
+
   /** A warning line on the session about its sandbox (#448), persisted and shown to every client. */
   #sandboxWarning(text: string, event: string): void {
     if (this.#destroyed) return;
@@ -3323,7 +3353,7 @@ export class Session {
   }
 
   /** What an approval card says of the sandbox (#448): whether the call runs inside, and why not. */
-  #cardSandbox(toolName: string, input: unknown, shellCwd?: string | null): { sandboxed?: boolean; sandboxNote?: string } {
+  #cardSandbox(toolName: string, input: unknown, shellCwd?: string | null): { sandboxed?: boolean; sandboxNote?: string; sandboxDocker?: boolean } {
     const info = this.#sandbox?.info;
     if (!info) return {};
     if (this.#unsandboxedRequest(toolName, input)) {
@@ -3334,10 +3364,12 @@ export class Session {
         const runner = this.#sandbox?.runtime?.plan;
         const shell = isShellTool(toolName) || isUnresolvedPathTool(toolName);
         const inside = shell || runner?.fileTools === true;
-        if (inside) return { sandboxed: true, sandboxNote: `sandboxed: ${info.providerName ?? info.provider}, network ${info.network}` };
+        // Commands can reach the container runtime (the owner's opt-in): every card says so, as a warning.
+        const docker = info.dockerSocket === true ? { sandboxDocker: true } : {};
+        if (inside) return { sandboxed: true, sandboxNote: `sandboxed${info.dockerSocket ? ", Docker access" : ""}: ${info.providerName ?? info.provider}, network ${info.network}`, ...docker };
         // Beyond what the sandbox lets its commands do: the owner decides, told so (#448 round 9).
         const beyond = this.#hostBoundsNote(toolName, input, shellCwd);
-        return { sandboxed: false, sandboxNote: beyond ?? "runs in the backend's own process, outside the sandbox" };
+        return { sandboxed: false, sandboxNote: beyond ?? "runs in the backend's own process, outside the sandbox", ...docker };
       }
       case "no-shell":
         return {};
@@ -4028,6 +4060,8 @@ export class Session {
     // The OS sandbox (#448), resolved for this backend before it starts. An
     // autonomous or unattended turn doesn't start without one that holds.
     await this.ensureSandbox();
+    // Its worktree folders, removed while empty at the last turn's end, are there again for this one's commands.
+    this.#sandbox?.prepareFolders();
     const sandboxRefused =
       this.sandboxRefusal() ??
       // Its backend still runs in the sandbox it had before a change: not what the session reports.
@@ -4038,7 +4072,7 @@ export class Session {
     }
     this.#store.audit(sender.sub, "session.send", this.id);
     // What of the repository git runs at the user's next command, as it is before the agent works (#448).
-    if (this.#sandbox && !this.#gitBaseline) this.#gitBaseline = gitControlSnapshot(this.workdir);
+    if (this.#sandbox && !this.#gitBaseline) this.#gitBaseline = gitControlSnapshot(this.workdir, undefined, { ownFolders: this.#sandbox.worktreeFolders() });
     // And the commits its refs name, so a commit made from here on can be told (#448 round 6).
     if (this.#sandbox && !this.#refBaseline) this.#refBaseline = refTips(this.workdir);
     await this.#refBaseline;
@@ -7620,7 +7654,22 @@ export class Session {
     // the active capability role into every turn's system prompt.
     if (this.#pack) parts.push(this.#buildPackPromptAppend(this.#pack));
     if (this.#memory) parts.push(this.#buildMemoryPromptAppend());
+    const worktrees = this.#worktreePromptAppend();
+    if (worktrees) parts.push(worktrees);
     return parts.length > 0 ? parts.join("\n\n") : undefined;
+  }
+
+  /**
+   * Where the session's sandboxed commands may make git worktrees (#448
+   * round 10, sandbox/worktrees.ts): its own folder in each worktree
+   * location. A `git worktree add` anywhere else fails with the OS's
+   * "Read-only file system", which says nothing of why: this says where.
+   * Stable for the session's life (a cache-friendly prefix).
+   */
+  #worktreePromptAppend(): string | null {
+    const folders = this.#sandbox?.worktreeFolders() ?? [];
+    if (folders.length === 0) return null;
+    return worktreeFolderNote(folders);
   }
 
   /**
@@ -9292,6 +9341,7 @@ export class Session {
           result: event.result,
         });
         void this.#checkGitControl(SYSTEM_IDENTITY.sub);
+        this.#tidyWorktreeFolders();
         if (event.result.isError) {
           const errText = event.result.errorMessage ?? "Turn ended with an error";
           // The CLI reports an overflow as the turn's assistant text and ends

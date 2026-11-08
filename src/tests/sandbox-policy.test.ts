@@ -12,6 +12,7 @@ import type { CodeoidConfig } from "../config.js";
 import { loadConfig } from "../config.js";
 import { BwrapSandboxProvider, type PathKind, bwrapArgs } from "../daemon/sandbox/bwrap.js";
 import {
+  dockerSocketPaths,
   DEFAULT_HOME_READABLE,
   HOME_CREDENTIAL_PATHS,
   buildSandboxSpec,
@@ -58,6 +59,30 @@ function mounts(args: string[]): string[][] {
 }
 
 describe("bwrapArgs", () => {
+  test("Docker access (#448 follow-up): a socket the owner let in is bound read-only at its own path, over the hidden runtime dir holding it; none without it", () => {
+    const run = "/run/user/1000";
+    const sock = `${run}/docker.sock`;
+    const kinds = fs({ "/work/repo": "dir", [run]: "dir", [sock]: "other", "/var/tmp/codeoid-s1": "dir" });
+    const without = mounts(bwrapArgs(spec({ hidden: [run] }), "", kinds));
+    expect(without.some((m) => m[1] === sock)).toBe(false);
+    const with_ = mounts(bwrapArgs(spec({ hidden: [run], dockerSockets: [sock], env: { DOCKER_HOST: `unix://${sock}` } }), "", kinds));
+    const hide = with_.findIndex((m) => m[0] === "--tmpfs" && m[1] === run);
+    const bind = with_.findIndex((m) => m[0] === "--ro-bind" && m[1] === sock && m[2] === sock);
+    expect(hide).toBeGreaterThanOrEqual(0);
+    expect(bind).toBeGreaterThan(hide);
+    expect(with_).toContainEqual(["--setenv", "DOCKER_HOST", `unix://${sock}`]);
+  });
+
+  test("dockerSocketPaths (#448 follow-up): $DOCKER_HOST's first, then the user's own (rootless Docker, Podman), then the system's; only sockets that exist; on macOS Docker Desktop's", () => {
+    const there = new Set(["/run/user/7/podman/podman.sock", "/var/run/docker.sock", "/srv/d.sock", "/h/.docker/run/docker.sock"]);
+    const isSocket = (p: string) => there.has(p);
+    // The user's own runtime before the root daemon's: DOCKER_HOST names the one that isn't root on the host.
+    expect(dockerSocketPaths("/h", { XDG_RUNTIME_DIR: "/run/user/7" }, "linux", isSocket)).toEqual(["/run/user/7/podman/podman.sock", "/var/run/docker.sock"]);
+    expect(dockerSocketPaths("/h", { XDG_RUNTIME_DIR: "/run/user/7", DOCKER_HOST: "unix:///srv/d.sock" }, "linux", isSocket)[0]).toBe("/srv/d.sock");
+    expect(dockerSocketPaths("/h", { DOCKER_HOST: "tcp://1.2.3.4:2375" }, "linux", () => false)).toEqual([]);
+    expect(dockerSocketPaths("/h", {}, "darwin", isSocket)).toEqual(["/h/.docker/run/docker.sock", "/var/run/docker.sock"]);
+  });
+
   test("the host read-only, a new /dev and /proc, a private /tmp, the workspace writable, starting in cwd", () => {
     const args = bwrapArgs(spec(), "/work/repo/sub", fs({ "/work/repo": "dir", "/var/tmp/codeoid-s1": "dir" }));
     expect(args.slice(0, 6)).toEqual(["--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup-try"]);
@@ -255,7 +280,7 @@ describe("hidden paths", () => {
 describe("config", () => {
   test("on by default: auto, network on", () => {
     const c = loadConfig({ raw: {}, env: {}, quiet: true });
-    expect(c.sandbox).toEqual({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], docker: { image: "node:22-bookworm-slim" } });
+    expect(c.sandbox).toEqual({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], docker: { image: "node:22-bookworm-slim", socket: false } });
   });
 
   test("env vars override the file", () => {

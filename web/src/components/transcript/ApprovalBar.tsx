@@ -47,7 +47,7 @@ import {
 import { sessionList } from "../../state/sessions";
 import type { CollaborationCost, SessionMessage, ToolRisk } from "../../protocol/types";
 import { formatCollaborationCost, formatToolRisk } from "../../lib/format";
-import { approvalSandboxLine } from "@highflame/codeoid-core";
+import { approvalSandboxLine, approvalSandboxWarns, DOCKER_ACCESS_WHY } from "@highflame/codeoid-core";
 
 /**
  * Repo/branch/content preview for a send-class fleet dispatch, or null for any
@@ -142,6 +142,7 @@ const ApprovalBar: Component = () => {
       risk: s.risk,
       sandboxed: s.sandboxed,
       sandboxNote: s.sandboxNote,
+      sandboxDocker: s.sandboxDocker,
     };
   });
 
@@ -230,6 +231,7 @@ const ApprovalBar: Component = () => {
                 risk={snap().risk}
                 sandboxed={snap().sandboxed}
                 sandboxNote={snap().sandboxNote}
+                sandboxDocker={snap().sandboxDocker}
                 dispatch={dispatchFor(snap().toolName, snap().input)}
                 isPlanMode={isPlanMode()}
                 busy={busy()}
@@ -323,6 +325,8 @@ const BinaryBar: Component<{
   /** Whether it runs in the session's OS sandbox (#448). */
   sandboxed?: boolean;
   sandboxNote?: string;
+  /** The sandbox lets commands reach the container runtime (Docker access): a warning. */
+  sandboxDocker?: boolean;
   /** Present only for a send-class fleet dispatch — repo/branch/content (R3). */
   dispatch?: DispatchPreviewModel | null;
   isPlanMode: boolean;
@@ -356,7 +360,7 @@ const BinaryBar: Component<{
           {(d) => <DispatchDetails preview={d()} />}
         </Show>
         <RiskLine risk={props.risk} />
-        <SandboxLine sandboxed={props.sandboxed} sandboxNote={props.sandboxNote} />
+        <SandboxLine sandboxed={props.sandboxed} sandboxNote={props.sandboxNote} sandboxDocker={props.sandboxDocker} />
         <Show when={props.collaborationCost}>
           {(c) => (
             <div class="mt-1 truncate font-mono text-[11px] text-warn" title="Rolled up across this collaboration's orchestrator and its live role-children">
@@ -414,12 +418,18 @@ export const RiskLine: Component<{ risk?: ToolRisk }> = (props) => (
 /**
  * Whether the call runs inside the session's OS sandbox (#448), in the same
  * words as every other surface (approvalSandboxLine). Not sandboxed is a
- * warning: the risk line above is guidance, the sandbox is the boundary.
+ * warning: the risk line above is guidance, the sandbox is the boundary. So
+ * is a sandbox with Docker access (it can reach the whole machine).
  */
-export const SandboxLine: Component<{ sandboxed?: boolean; sandboxNote?: string }> = (props) => (
+export const SandboxLine: Component<{ sandboxed?: boolean; sandboxNote?: string; sandboxDocker?: boolean }> = (props) => (
   <Show when={approvalSandboxLine(props)}>
     {(text) => (
-      <div class={`mt-1 truncate text-[11px] ${props.sandboxed ? "text-success" : "font-semibold text-warn"}`} data-sandboxed={props.sandboxed ? "yes" : "no"}>
+      <div
+        class={`mt-1 truncate text-[11px] ${approvalSandboxWarns(props) ? "font-semibold text-warn" : "text-success"}`}
+        data-sandboxed={props.sandboxed ? "yes" : "no"}
+        data-docker={props.sandboxDocker ? "yes" : undefined}
+        title={props.sandboxDocker ? DOCKER_ACCESS_WHY : undefined}
+      >
         {text()}
       </div>
     )}

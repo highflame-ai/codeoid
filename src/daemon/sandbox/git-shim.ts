@@ -187,8 +187,12 @@ export function gitShimSpec(spec: SandboxSpec, opts: { tempParent: string; workt
   const open = opts.worktrees?.open ?? [];
   const keep = opts.worktrees?.keep ?? [];
   const held = (p: string) => !open.some((o) => within(p, o)) || keep.some((k) => within(p, k));
+  // git reaches no container runtime, whatever the session's commands may.
+  const { dockerSockets: _sockets, ...rest } = spec;
+  const { DOCKER_HOST: _host, ...env } = spec.env ?? {};
   return {
-    ...spec,
+    ...rest,
+    ...(spec.env ? { env } : {}),
     tempDir: opts.tempParent,
     privateTemp: true,
     writable: [...spec.writable, ...open],

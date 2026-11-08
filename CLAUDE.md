@@ -214,8 +214,8 @@ codeoid interrupt <n>
 codeoid approve <n> [--deny] [--pick N | --id <approvalId>] [--yes]
 codeoid account ls|login <name>|add-key <name>|add-gateway|add-token|add-bedrock|default <name>|use <session> <name>|--follow-default|rm <name> [--backend <id>]  # accounts for every backend (docs/backend-accounts-design.md)
 codeoid destroy <n>
-codeoid new <n> <d> --sandbox auto|bwrap|seatbelt|docker|off [--network on|off|allowlist] [--allow-host h]  # the session's OS sandbox (#448, docs/sandbox.md)
-codeoid sandbox providers | set <session> <provider> [--network …]  # what runs here; change a session's (widening asks its owner)
+codeoid new <n> <d> --sandbox auto|bwrap|seatbelt|docker|off [--network on|off|allowlist] [--allow-host h] [--docker-socket]  # the session's OS sandbox (#448, docs/sandbox.md)
+codeoid sandbox providers | set <session> [provider] [--network …] [--[no-]docker-socket]  # what runs here; change a session's (widening asks its owner)
 codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
 codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
 codeoid mcp reconnect <session> <server>            # redial a backend MCP server that's down (#389)
@@ -390,6 +390,53 @@ past allow rules by the PreToolUse hook;
 `SandboxNetworkAccess` follows the session's network. `session.set_sandbox` is
 owner-only; widening is a confirm on the session (`widens`), never on an
 unattended turn. Forks and collaboration children inherit the setting.
+Worktrees (sandbox/worktrees.ts, docs/sandbox.md "Git worktrees inside the
+sandbox", #448 round 10): `<common>/worktrees/` is writable, bound at its own
+path; a session writes only its own folder of each worktree location
+(`<repo>-worktrees/<folder>`, `<root>/<repo>/<folder>` for
+`sandbox.worktreeRoots`; nothing made inside the checkout, an existing
+`.worktrees/` held whole for a session there; `sessionFolderName`: its name
+and short id, found again by the id after a rename or restart;
+`SandboxSpec.worktreeFolders`, Codex's roots), the rest of a location
+read-only (shown read-only, but not on Claude native, whose CLI would lay it
+over the folder); told to the agent in the system prompt
+(`worktreeFolderNote`). The folder is made only in a repository and removed
+while empty, with an emptied `<repo>-worktrees/` (`SessionSandbox.tidyFolders`
+at a turn's end with no background work and no wrapped backend, and at
+close; `prepareFolders` at the next turn's start). Every admin dir the
+session didn't make is held whole at spec build; a worktree added or removed
+never rebuilds the spec (#448 round 11: it would rebuild a Claude query).
+Instead `WorktreeEntryGuard` (worktree-entries.ts) checks every admin dir
+against git's layout at spec build, turn end and destroy
+(`SessionSandbox.checkWorktreeEntries`): not a link, `commondir` the common
+dir, no `config`/`hooks`/`info` (but sparse-checkout), `config.worktree`
+empty or the user's, `gitdir` naming a checkout that names it back (the
+back-link found by scanning the locations, beside the main checkout and the
+last record, never the tampered file); restores what is certain (moved aside
+into `<common>/codeoid-held-worktrees/`, never deleted), removes a link and
+says the rest; Session says it (`sandbox.worktree_entry`) and audits
+(`session.worktree_entry_restored`/`_unrestored`). Own = first seen checked
+out in the folder and claimed by no other checkout, recorded per entry inode
+(`ownWorktreeEntries` to the spec). `worktreeRootProblem` refuses a root at
+config load (`/`, home, a dot dir of the home, `~/Library`, the config dir, a
+system dir; case-folded on macOS), again where a relative one leads, and one
+inside the checkout; a missing root is made only beside the repository
+(`worktreeRootNotes` says the rest). The end-of-turn look covers the
+folder's `.git`s (`GitControlOptions.ownFolders`) and treats admin dirs as
+groups (a new plain one or a removed one isn't news). Docker access
+(`sandbox.docker.socket`, a session's `dockerSocket`, off by default):
+`dockerSocketPaths` → `SandboxSpec.dockerSockets` + `DOCKER_HOST`, a widening
+in `widens` (so create/fork/routine/loop/set_sandbox authority follows),
+autonomous owner-only; every card `sandboxDocker` ("sandboxed, Docker access"),
+the chip amber (`DOCKER_ACCESS_WHY`); Claude native needs `allowAllUnixSockets`
+on Linux (its seccomp blocks unix sockets otherwise), so there the host's
+`/tmp` and `/var/tmp` are denied too (`HOST_SHARED_TEMP`) and what stays
+reachable is said (`CLAUDE_ALL_SOCKETS_NOTE`); a socket the user can't
+connect to isn't counted. Every other runtime's socket (libvirt, LXD, Incus,
+containerd, …: `containerSocketPaths`) and the system bus and screen's dir
+(`HOST_SOCKET_DIRS`) are hidden in every sandbox; local services' sockets
+(Postgres, MySQL, Redis: `localServiceSocketPaths` → `SandboxSpec.serviceSockets`)
+when the network the session asked for is off or an allowlist.
 
 Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell/`
 parses a command line with tree-sitter-bash (WASM, vendored `tree-sitter-bash.wasm`;
@@ -439,6 +486,8 @@ CODEOID_ROUTINES_ENABLED=true       # scheduler + routine commands (docs/routine
 CODEOID_DEFAULT_EFFORT=             # thinking effort for new sessions: off|minimal|low|medium|high|xhigh|max (docs/thinking-effort.md)
 CODEOID_SANDBOX=auto                # OS sandbox for agents' commands: auto|bwrap|seatbelt|docker|off (docs/sandbox.md)
 CODEOID_SANDBOX_NETWORK=on          # on|off|allowlist (CODEOID_SANDBOX_ALLOWED_HOSTS); hiddenPaths: CODEOID_SANDBOX_HIDDEN_PATHS
+CODEOID_SANDBOX_DOCKER_SOCKET=false # let sandboxed commands reach the container runtime (root-equivalent; docs/sandbox.md)
+CODEOID_SANDBOX_WORKTREE_ROOTS=     # more worktree locations (csv): <root>/<repo>/<session folder>; never ~/.config, ~, /
 
 # Claude auth: uses your existing `claude login` session (Pro/Max subscription).
 # No ANTHROPIC_API_KEY needed if you're logged in via Claude Code CLI.

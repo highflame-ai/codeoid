@@ -233,6 +233,17 @@ const sandbox: SettingsTab = {
           envVar: "CODEOID_SANDBOX_HIDDEN_PATHS",
           applies: "next-session",
         }),
+        cfg("sandbox.worktreeRoots", "More worktree locations", "More places a sandboxed session may check out git worktrees, on top of <repo>-worktrees/ and <repo>/.worktrees/: each repository gets <root>/<repo>/, and each session writes only its own folder there. ~ expands; a relative path is the repository's (at most one level up: ../wt). A root that isn't there is used only once you create it. Refused: /, your home or a dir holding it, a hidden dir of your home (~/.config, ~/.local, …), ~/Library, codeoid's config dir, a system dir, a dir holding the repository.", {
+          kind: "string[]",
+          envVar: "CODEOID_SANDBOX_WORKTREE_ROOTS",
+          applies: "next-session",
+        }),
+        cfg("sandbox.docker.socket", "Docker access", "Let sandboxed commands reach the container runtime's socket (Docker, rootless Docker, Podman; Docker Desktop on macOS) — for tests that start containers (testcontainers). Docker access can reach the whole machine: a container can mount /. Sessions say \"sandboxed, Docker access\"; a session can turn it on for itself (asked of its owner).", {
+          kind: "boolean",
+          envVar: "CODEOID_SANDBOX_DOCKER_SOCKET",
+          default: false,
+          applies: "next-session",
+        }),
       ],
     },
     {

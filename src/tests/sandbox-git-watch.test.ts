@@ -76,6 +76,7 @@ describe("what of a repository git runs at your next command, and what changed (
     git(["worktree", "add", "-q", "-b", "g", join(root, "late")], r);
     const before = gitControlSnapshot(wt, root);
     writeFileSync(join(r, ".git", "worktrees", "late", "commondir"), "/elsewhere\n");
+    // An existing worktree's admin file changed: named.
     expect(gitControlChanges(before, gitControlSnapshot(wt, root))).toEqual([join(r, ".git", "worktrees", "late", "commondir")]);
   });
 

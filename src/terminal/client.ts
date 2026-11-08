@@ -158,7 +158,7 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
     }
 
     case "session.message": {
-      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string; risk?: ToolRisk; sandboxed?: boolean; sandboxNote?: string } }; identity?: { name?: string; type?: string } };
+      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string; risk?: ToolRisk; sandboxed?: boolean; sandboxNote?: string; sandboxDocker?: boolean } }; identity?: { name?: string; type?: string } };
       const id = sm.identity?.name ? `${DIM}${S(sm.identity.name)}${RESET} ` : "";
       switch (sm.role) {
         case "user":
@@ -472,12 +472,12 @@ export class TerminalClient {
       this.#printError(resp);
       return;
     }
-    const data = resp.data as { enabled: boolean; auto: string | null; default: { provider: string; network: string }; providers: SandboxProviderWire[] };
+    const data = resp.data as { enabled: boolean; auto: string | null; default: { provider: string; network: string; dockerSocket?: boolean }; providers: SandboxProviderWire[] };
     if (!data.enabled) {
       console.log("This daemon has no OS sandbox.");
       return;
     }
-    console.log(`\n  Default: ${data.default.provider}${data.default.provider === "auto" && data.auto ? ` (${data.auto} here)` : ""}, network ${data.default.network}\n`);
+    console.log(`\n  Default: ${data.default.provider}${data.default.provider === "auto" && data.auto ? ` (${data.auto} here)` : ""}, network ${data.default.network}${data.default.dockerSocket ? ", Docker access (can reach the whole machine)" : ""}\n`);
     for (const p of data.providers) {
       const where = `${p.isolation} isolation, ${p.placement}, network ${p.network.join("/")}`;
       console.log(`  ${p.id.padEnd(10)} ${p.available ? "available" : "not available"}  ${p.displayName} — ${where}`);

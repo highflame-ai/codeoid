@@ -21,8 +21,10 @@
  * names no container; each handle labels its containers, so closing one
  * removes only its own.
  *
- * The container runtime's socket is never mounted, and `DOCKER_HOST` is the
- * docker client's only, never the container's. With `--runtime runsc`
+ * The container runtime's socket is never mounted unless the owner let it
+ * in (`spec.dockerSockets`, `sandbox.docker.socket`: mounted at
+ * `/var/run/docker.sock`, its group added, `DOCKER_HOST` naming it), and the
+ * docker client's own `DOCKER_HOST` is never the container's. With `--runtime runsc`
  * (gVisor) the isolation is a separate kernel.
  *
  * Not verified against a Docker daemon in this change (the integration tests
@@ -31,7 +33,7 @@
 
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { lstatSync, realpathSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve as resolvePath } from "node:path";
 import { LocalSandboxHandle } from "./local-handle.js";
@@ -87,6 +89,21 @@ export interface DockerRunOptions {
   uid: number;
   gid: number;
   kind?: (p: string) => DockerPathKind;
+  /** The platform the Docker daemon's sockets are named for (default: this one's). */
+  platform?: NodeJS.Platform;
+  /** The group owning a socket on the host, for `--group-add` (tests replace it). */
+  socketGroup?: (p: string) => number | null;
+}
+
+/** Where a container runtime socket the owner let in is mounted inside the container (`DOCKER_HOST` names it). */
+export const CONTAINER_DOCKER_SOCKET = "/var/run/docker.sock";
+
+function socketGroup(p: string): number | null {
+  try {
+    return statSync(p).gid;
+  } catch {
+    return null;
+  }
 }
 
 /** `docker run`'s arguments for `argv` under `spec`. Pure but for `kind` (tests replace it). */
@@ -148,16 +165,27 @@ export function dockerRunArgs(spec: SandboxSpec, argv: readonly string[], o: Doc
     if (kind(at) === "dir" && inMounted(at) && !hiddenAt.some((h) => within(at, h))) bind(at, at, false);
   }
   // A hidden path inside something mounted is covered again.
-  for (const h of [...spec.hidden, ...spec.containerSockets]) {
+  for (const h of [...spec.hidden, ...spec.containerSockets, ...(spec.serviceSockets ?? [])]) {
     const at = realOr(h);
     if (!inMounted(at)) continue;
     const k = kind(at);
     if (k === "dir") args.push("--mount", mountSpec([["type", "tmpfs"], ["destination", at]], true));
     else if (k === "other") args.push("--mount", mountSpec([["type", "bind"], ["source", "/dev/null"], ["target", at]], true));
   }
+  // The container runtime's socket, when the owner let it in (spec.dockerSockets): the one the Docker daemon serves,
+  // as it names it (Docker Desktop's is `/var/run/docker.sock` whatever the host's link), at the usual path, and its
+  // group added so the container's user can connect.
+  const socket = spec.dockerSockets?.[0];
+  if (socket) {
+    const source = (o.platform ?? process.platform) === "darwin" ? CONTAINER_DOCKER_SOCKET : realOr(socket);
+    args.push("--mount", mountSpec([["type", "bind"], ["source", source], ["target", CONTAINER_DOCKER_SOCKET]], false));
+    const group = (o.platform ?? process.platform) === "darwin" ? 0 : (o.socketGroup ?? socketGroup)(source);
+    if (group !== null) args.push("--group-add", String(group));
+  }
   args.push("-w", o.cwd ? o.cwd : CWD_FROM_CALLER);
   for (const n of o.envNames) if (!spec.unsetEnv.includes(n) && !CLIENT_ENV.includes(n)) args.push("-e", n);
-  for (const [k, v] of Object.entries(spec.env ?? {})) args.push("-e", `${k}=${v}`);
+  for (const [k, v] of Object.entries(spec.env ?? {})) if (k !== "DOCKER_HOST") args.push("-e", `${k}=${v}`);
+  if (socket) args.push("-e", `DOCKER_HOST=unix://${CONTAINER_DOCKER_SOCKET}`);
   args.push("-e", "TMPDIR=/tmp", "-e", `HOME=${homedir()}`);
   args.push(o.image, ...argv);
   return args;

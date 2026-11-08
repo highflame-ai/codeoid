@@ -11,6 +11,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { approvalSandboxLine } from "@highflame/codeoid-core";
 import type { CodeoidConfig } from "../config.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
@@ -20,7 +21,7 @@ import type { BackendHostFiles } from "../daemon/sandbox/host-file-tools.js";
 import { confinementFor } from "../daemon/sandbox/confinement.js";
 import { LocalSandboxHandle } from "../daemon/sandbox/local-handle.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
-import { openCheckSandbox, resolveSandbox, SandboxRequiredError, type SandboxRuntime, SessionSandbox, sandboxRefusalOf, widens } from "../daemon/sandbox/session-sandbox.js";
+import { effectiveSetting, openCheckSandbox, resolveSandbox, SandboxRequiredError, type SandboxRuntime, SessionSandbox, sandboxRefusalOf, widens } from "../daemon/sandbox/session-sandbox.js";
 import { sandboxConfigOf } from "../daemon/sandbox/policy.js";
 import { sandboxRoot } from "../daemon/sandbox/root.js";
 import type { NetworkMode, SandboxProbe, SandboxProvider, SandboxSpec } from "../daemon/sandbox/types.js";
@@ -157,7 +158,7 @@ async function until(cond: () => boolean, ms = 5_000): Promise<void> {
   }
 }
 
-type Card = { phase: string; sandboxed?: boolean; sandboxNote?: string; message?: string; risk?: { reasons: string[] } };
+type Card = { phase: string; sandboxed?: boolean; sandboxNote?: string; sandboxDocker?: boolean; message?: string; risk?: { reasons: string[] } };
 
 /** The mock backend, saying what its own file tools keep outside the sandbox (SessionProvider.hostFiles). */
 class WithHostFiles extends MockSessionProvider {
@@ -309,6 +310,16 @@ describe("what a session's sandbox resolves to", () => {
     expect(widens(list("a.com"), on)).toBe(true);
     expect(widens(on, { choice: "docker", network: { mode: "on" } })).toBe(true);
     expect(widens({ choice: "off", network: { mode: "on" } }, on)).toBe(false);
+    // Docker access (#448 follow-up): root on the machine, so turning it on widens, off narrows.
+    expect(widens({ ...off, dockerSocket: false }, { ...off, dockerSocket: true })).toBe(true);
+    expect(widens({ ...on, dockerSocket: true }, { ...on, dockerSocket: false })).toBe(false);
+    expect(widens({ ...on, dockerSocket: true }, { ...off, dockerSocket: true })).toBe(false);
+    expect(widens({ choice: "off", network: { mode: "on" }, dockerSocket: false }, { ...on, dockerSocket: true })).toBe(false);
+    // The daemon's default counts: a session that sets nothing gets it; one that sets false doesn't.
+    const cfg = sandboxConfigOf({ sandbox: { docker: { socket: true } } } as never);
+    expect(effectiveSetting(cfg, undefined).dockerSocket).toBe(true);
+    expect(effectiveSetting(cfg, { dockerSocket: false }).dockerSocket).toBe(false);
+    expect(effectiveSetting(sandboxConfigOf(undefined), undefined).dockerSocket).toBe(false);
   });
 });
 
@@ -358,6 +369,21 @@ describe("the approval card and the gate", () => {
   test("a shell call on a sandboxed session: sandboxed, with the provider and network", async () => {
     const r = await gateCall("Bash", { command: "ls" });
     expect(r.card).toMatchObject({ sandboxed: true, sandboxNote: "sandboxed: fake-bwrap, network on" });
+  });
+
+  test("a sandbox with Docker access: every card says so, as a warning (#448 follow-up)", async () => {
+    const r = await gateCall("Bash", { command: "ls" }, { sandbox: { dockerSocket: true } });
+    expect(r.card).toMatchObject({ sandboxed: true, sandboxDocker: true, sandboxNote: "sandboxed, Docker access: fake-bwrap, network on" });
+    expect(r.pending[0]).toMatchObject({ sandboxDocker: true, sandboxNote: "sandboxed, Docker access: fake-bwrap, network on" });
+    expect(approvalSandboxLine(r.card as Card)).toBe("⚠️ sandboxed, Docker access: fake-bwrap, network on");
+    const file = await gateCall("Write", { file_path: join(workdir, "a.ts"), content: "x" }, { sandbox: { dockerSocket: true } });
+    expect(file.card).toMatchObject({ sandboxed: false, sandboxDocker: true });
+    expect(approvalSandboxLine(file.card as Card)).toBe("⚠️ runs in the backend's own process, outside the sandbox (the sandbox has Docker access)");
+    const info = r.session.toInfo().sandbox;
+    expect(info).toMatchObject({ state: "on", dockerSocket: true, enforced: true });
+    expect(info?.limits?.some((l) => l.startsWith("Docker access"))).toBe(true);
+    // Autonomous runs on it: the owner chose it, as with off.
+    expect(r.session.sandboxRefusal({ forMode: "autonomous" })).toBeNull();
   });
 
   test("a Claude file tool runs in the CLI, outside its sandbox: the card says so", async () => {
@@ -595,6 +621,53 @@ describe("review fixes (#448)", () => {
       rmSync(join(workdir, ".git"), { recursive: true, force: true });
       rmSync(join(workdir, "HEAD"), { recursive: true, force: true });
     }
+  });
+
+  test("a worktree entry taken over while the session ran is restored at the turn's end, said on the session and audited; its empty worktree folder goes at a turn's end and is back for the next (#448 round 11)", async () => {
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@e", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@e" };
+    const run = (args: string[]) => {
+      const r = Bun.spawnSync(["git", ...args], { cwd: workdir, env });
+      if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+    };
+    run(["init", "-q", "-b", "main"]);
+    run(["commit", "-q", "--allow-empty", "-m", "i"]);
+    const provider = new MockSessionProvider("claude", [[DONE], [DONE], [DONE]]);
+    const { session } = makeSession(provider);
+    const infos: Array<{ text: string; event?: string }> = [];
+    session.attach({
+      id: "w",
+      auth: AUTH,
+      capabilities: [],
+      send: (m: { type: string; role?: string; content?: string; metadata?: { event?: string } }) => {
+        if (m.type === "session.message" && m.role === "info") infos.push({ text: m.content ?? "", event: m.metadata?.event });
+      },
+    } as never);
+    const said = () => infos.filter((i) => i.event === "sandbox.worktree_entry");
+    const loc = join(root, "work-worktrees");
+    await session.send("one", AUTH);
+    await until(() => session.status === "idle");
+    // Claude's own sandbox (nothing of it runs between turns): the folder, left empty, is gone with its location.
+    expect(existsSync(loc)).toBe(false);
+    expect(said()).toEqual([]);
+    // Yours, added while the session runs, and what a command could then do to its entry (here between turns).
+    const yours = join(root, "yours");
+    run(["worktree", "add", "-q", "-b", "yours", yours]);
+    writeFileSync(join(workdir, ".git", "worktrees", "yours", "commondir"), `${join(root, "planted")}\n`);
+    let madeAgain = false;
+    const runTurn = provider.runTurn.bind(provider);
+    provider.runTurn = (o) => {
+      madeAgain = existsSync(loc);
+      return runTurn(o);
+    };
+    await session.send("two", AUTH);
+    await until(() => said().length === 1);
+    expect(madeAgain).toBe(true);
+    expect(said()[0]!.text).toContain(".git/worktrees/yours commondir named");
+    expect(said()[0]!.text).toContain("is restored");
+    expect(readFileSync(join(workdir, ".git", "worktrees", "yours", "commondir"), "utf8").trim()).toBe("../..");
+    expect(audits.filter((a) => a.action === "session.worktree_entry_restored")).toEqual([expect.objectContaining({ sessionId: session.id, detail: expect.stringContaining("worktrees/yours commondir") })]);
+    await until(() => session.status === "idle");
+    expect(existsSync(loc)).toBe(false);
   });
 
   test("a commit made during the session that changed project settings (through git plumbing, never in the working tree) is named with its files: at the turn's end, once, and at destroy (#448 round 6)", async () => {

@@ -18,6 +18,7 @@ import type { ModelPrice } from "./daemon/pricing/index.js";
 import type { SandboxConfig } from "./daemon/sandbox/policy.js";
 import { DEFAULT_HOME_READABLE } from "./daemon/sandbox/home-readable.js";
 import { validAllowedHost } from "./daemon/sandbox/hosts.js";
+import { worktreeRootProblem } from "./daemon/sandbox/worktrees.js";
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, rmSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join, isAbsolute, resolve, dirname } from "node:path";
@@ -271,16 +272,40 @@ const SandboxSchema = z
     hiddenPaths: z.array(z.string().min(1).max(4096)).max(256).default([]),
     /** What of the hidden home stays readable, read-only (`~` expands): toolchains and tool settings with no secrets. */
     homeReadable: z.array(z.string().min(1).max(4096)).max(256).default([...DEFAULT_HOME_READABLE]),
+    /**
+     * More places a sandboxed command may check a worktree of its repository
+     * out, on top of `<repo>-worktrees/` and `<repo>/.worktrees/` (`~`
+     * expands; a relative one is the repository's main checkout's): each
+     * repository gets `<root>/<repo>/`, each session its own folder there.
+     * Refused: `/`, the home or a dir holding it, a hidden dir of the home,
+     * `~/Library`, codeoid's config dir, a system dir (worktreeRootProblem).
+     */
+    worktreeRoots: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(4096)
+          .superRefine((root, ctx) => {
+            // Never a place whose contents run outside the sandbox, the home or `/` (#448 round 10, sandbox/worktrees.ts).
+            const problem = worktreeRootProblem(root, { configDir: getConfigDir() });
+            if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `not a worktree root: ${problem}` });
+          }),
+      )
+      .max(64)
+      .default([]),
     /** The bwrap binary (default: on PATH). */
     bwrapPath: z.string().refine(isAbsolute, "must be an absolute path").optional(),
     docker: z
       .object({
         image: z.string().min(1).max(512).default("node:22-bookworm-slim"),
         runtime: z.string().min(1).max(64).optional(),
+        /** Let sandboxed commands reach the host's container runtime socket (root-equivalent): off by default. */
+        socket: z.boolean().default(false),
       })
-      .default({ image: "node:22-bookworm-slim" }),
+      .default({ image: "node:22-bookworm-slim", socket: false }),
   })
-  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], docker: { image: "node:22-bookworm-slim" } });
+  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], docker: { image: "node:22-bookworm-slim", socket: false } });
 
 const CompressSchema = z
   .object({
@@ -1792,6 +1817,8 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_SANDBOX_HIDDEN_PATHS", path: "sandbox.hiddenPaths", kind: "csv" },
   { env: "CODEOID_SANDBOX_HOME_READABLE", path: "sandbox.homeReadable", kind: "csv" },
   { env: "CODEOID_SANDBOX_DOCKER_IMAGE", path: "sandbox.docker.image", kind: "string" },
+  { env: "CODEOID_SANDBOX_DOCKER_SOCKET", path: "sandbox.docker.socket", kind: "boolean" },
+  { env: "CODEOID_SANDBOX_WORKTREE_ROOTS", path: "sandbox.worktreeRoots", kind: "csv" },
   { env: "CODEOID_ROUTINES_MAX_CONCURRENT", path: "routines.maxConcurrentRuns", kind: "int" },
   { env: "CODEOID_MCP_CONTROL_ACTIONS", path: "mcpControl.allowActions", kind: "boolean" },
   { env: "CODEOID_MAX_SESSIONS_PER_USER", path: "rateLimit.maxSessionsPerUser", kind: "int" },

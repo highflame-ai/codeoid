@@ -23,7 +23,7 @@
  *   - network per policy.
  */
 
-import { closeSync, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, writeFileSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CodeoidConfig } from "../../config.js";
@@ -34,6 +34,7 @@ import { cliCredentialFiles, registeredSecretLocations } from "../secret-paths.j
 import { DEFAULT_HOME_READABLE } from "./home-readable.js";
 import { validAllowedHost } from "./hosts.js";
 import { sandboxRoot } from "./root.js";
+import { isOwnWorktree, worktreeAdminsOf, worktreeFoldersOf } from "./worktrees.js";
 import type { NetworkMode, NetworkPolicy, SandboxSpec } from "./types.js";
 
 export { DEFAULT_HOME_READABLE, validAllowedHost };
@@ -54,11 +55,24 @@ export interface SandboxConfig {
   homeReadable: string[];
   /** The bwrap binary (default: on PATH). */
   bwrapPath?: string;
+  /**
+   * More places a command may check a worktree of its repository out, on top
+   * of `<repo>-worktrees/` and `<repo>/.worktrees/` (`~` expands; a relative
+   * one is the repository's main checkout's): each repository gets
+   * `<root>/<repo>/`, each session its own folder there (worktrees.ts).
+   */
+  worktreeRoots: string[];
   docker: {
     /** Image a Docker sandbox runs; must carry what the backend runs (a shell, node for pi / the Gemini CLI). */
     image: string;
     /** `--runtime` (e.g. `runsc` for gVisor). */
     runtime?: string;
+    /**
+     * Let sandboxed commands reach the host's container runtime socket
+     * (testcontainers, `docker run`): off by default. Root-equivalent: a
+     * container can mount `/`. A session's own `dockerSocket` overrides it.
+     */
+    socket: boolean;
   };
 }
 
@@ -69,7 +83,8 @@ export const DEFAULT_SANDBOX_CONFIG: SandboxConfig = {
   allowedHosts: [],
   hiddenPaths: [],
   homeReadable: [...DEFAULT_HOME_READABLE],
-  docker: { image: "node:22-bookworm-slim" },
+  worktreeRoots: [],
+  docker: { image: "node:22-bookworm-slim", socket: false },
 };
 
 export function sandboxConfigOf(config: Pick<CodeoidConfig, "sandbox"> | undefined): SandboxConfig {
@@ -137,14 +152,21 @@ export const HOME_CREDENTIAL_PATHS: readonly string[] = [
 ];
 
 /**
- * Container runtime sockets (and the dirs that hold them). Reaching one is
- * root on the machine, so none is ever visible inside, whatever else is.
+ * Container and VM runtime sockets (and the dirs that hold them). Reaching
+ * one is root on the machine (a privileged container, a VM with the host's
+ * disk), so none is ever visible inside, whatever else is; Docker access
+ * shows only the runtime's own ({@link dockerSocketPaths}).
  */
 export function containerSocketPaths(home: string, env: Record<string, string | undefined> = process.env): string[] {
   const runtime = env.XDG_RUNTIME_DIR || (typeof process.getuid === "function" ? `/run/user/${process.getuid()}` : "");
   const out = [
     "/run/docker.sock",
     "/var/run/docker.sock",
+    // dockerd's own dir: its plugins' and its containerd's sockets.
+    "/run/docker",
+    "/var/run/docker",
+    "/run/cri-dockerd.sock",
+    "/var/run/cri-dockerd.sock",
     "/run/containerd",
     "/var/run/containerd",
     "/run/podman",
@@ -153,16 +175,146 @@ export function containerSocketPaths(home: string, env: Record<string, string | 
     "/var/run/crio",
     "/run/buildkit",
     "/run/k3s",
+    "/var/run/k3s",
+    "/run/k0s",
+    "/run/firecracker-containerd",
+    "/var/snap/microk8s/common/run",
+    "/var/run/balena-engine.sock",
+    "/var/run/balena.sock",
+    // libvirt (group libvirt: a VM with the host's disk), LXD and Incus (group lxd / incus-admin: a privileged container).
+    "/run/libvirt",
+    "/var/run/libvirt",
+    "/var/snap/lxd/common/lxd",
+    "/var/snap/lxd/common/lxd-user",
+    "/var/lib/lxd",
+    "/run/lxd",
+    "/var/lib/incus",
+    "/run/incus",
     join(home, ".docker/run"),
     join(home, ".colima"),
     join(home, ".lima"),
     join(home, ".rd"),
     join(home, ".orbstack"),
   ];
-  if (runtime) out.push(join(runtime, "docker.sock"), join(runtime, "podman"), join(runtime, "containerd"));
+  if (runtime) out.push(join(runtime, "docker.sock"), join(runtime, "docker"), join(runtime, "podman"), join(runtime, "containerd"), join(runtime, "libvirt"));
   const dockerHost = env.DOCKER_HOST;
   if (dockerHost?.startsWith("unix://")) out.push(dockerHost.slice("unix://".length));
   return out;
+}
+
+/**
+ * The host's other shared socket dirs a command must not reach: the system
+ * D-Bus (polkit lets a desktop user mount drives, change the network, power
+ * off) and screen's sessions. Hidden in every sandbox (the desktop session's
+ * runtime dir, with its bus and agents, already is).
+ */
+export const HOST_SOCKET_DIRS: readonly string[] = ["/run/dbus", "/var/run/dbus", "/run/screen", "/var/run/screen"];
+
+/**
+ * Local services' socket dirs that let a connection in by who the user is,
+ * no password asked (#448 round 11): Postgres's peer auth, MySQL and
+ * MariaDB's `unix_socket`, a Redis or memcached socket with no auth. With the
+ * network off (or an allowlist) a sandboxed command must not reach them: a
+ * filesystem socket isn't the network, so unsharing it doesn't stop one.
+ */
+export const LOCAL_SERVICE_SOCKET_DIRS: readonly string[] = [
+  "/run/postgresql",
+  "/var/run/postgresql",
+  "/run/mysqld",
+  "/var/run/mysqld",
+  "/run/mariadb",
+  "/var/run/mariadb",
+  "/var/lib/mysql/mysql.sock",
+  "/run/redis",
+  "/var/run/redis",
+  "/run/redis-server",
+  "/run/valkey",
+  "/var/run/valkey",
+  "/run/memcached",
+  "/var/run/memcached",
+  "/run/mongodb",
+  "/var/run/mongodb",
+  "/run/pgbouncer",
+  "/var/run/pgbouncer",
+];
+
+/** Such sockets in the host's shared temp dirs (Homebrew's and source builds' defaults): Postgres, MySQL, MariaDB, Redis, MongoDB. */
+const TEMP_SERVICE_SOCKET = /^(?:\.s\.PGSQL\.\d+(?:\.lock)?|mysqlx?\.sock(?:\.lock)?|mysqld?\.sock|redis(?:-server)?(?:-\d+)?\.sock|valkey(?:-\d+)?\.sock|mongodb-\d+\.sock|memcached\.sock)$/;
+
+/**
+ * The host's local service sockets a sandbox hides while its network is off
+ * or an allowlist ({@link LOCAL_SERVICE_SOCKET_DIRS}, and those found now in
+ * `/tmp`, `/private/tmp` and `/var/tmp`). `sandbox.hiddenPaths` hides more.
+ */
+export function localServiceSocketPaths(tempDirs: readonly string[] = ["/tmp", "/private/tmp", "/var/tmp"]): string[] {
+  const out = [...LOCAL_SERVICE_SOCKET_DIRS];
+  for (const t of tempDirs) {
+    let names: string[] = [];
+    try {
+      names = readdirSync(t);
+    } catch {
+      continue;
+    }
+    for (const n of names) if (TEMP_SERVICE_SOCKET.test(n)) out.push(join(t, n));
+  }
+  return out;
+}
+
+/**
+ * The host's container runtime sockets that exist now, for a sandbox whose
+ * owner opted in (`sandbox.docker.socket`): `$DOCKER_HOST`'s when it is a
+ * unix socket, then Docker's, rootless Docker's, Podman's (rootless, then
+ * the system's); on macOS Docker Desktop's (`~/.docker/run/docker.sock`,
+ * `/var/run/docker.sock`), Colima's, OrbStack's, Rancher Desktop's. First
+ * the one a client should use (`DOCKER_HOST`). Each is root on the machine.
+ */
+export function dockerSocketPaths(
+  home: string,
+  env: Record<string, string | undefined> = process.env,
+  platform: NodeJS.Platform = process.platform,
+  isSocket: (p: string) => boolean = socketAt,
+): string[] {
+  const runtime = env.XDG_RUNTIME_DIR || (typeof process.getuid === "function" ? `/run/user/${process.getuid()}` : "");
+  const host = env.DOCKER_HOST?.startsWith("unix://") ? env.DOCKER_HOST.slice("unix://".length) : null;
+  const candidates =
+    platform === "darwin"
+      ? [join(home, ".docker/run/docker.sock"), "/var/run/docker.sock", join(home, ".colima/default/docker.sock"), join(home, ".orbstack/run/docker.sock"), join(home, ".rd/docker.sock")]
+      : // The user's own (rootless) runtime first: when both exist, DOCKER_HOST names the one that isn't root on the host.
+        [...(runtime ? [join(runtime, "docker.sock"), join(runtime, "podman/podman.sock")] : []), "/var/run/docker.sock", "/run/docker.sock", "/run/podman/podman.sock"];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const p of [...(host && isAbsolute(host) ? [host] : []), ...candidates]) {
+    if (!isSocket(p)) continue;
+    const real = realOr(p);
+    if (seen.has(real)) continue;
+    seen.add(real);
+    out.push(p);
+  }
+  return out;
+}
+
+/** A socket the daemon's user can connect to (writable: `/var/run/docker.sock` of a user not in the docker group isn't). */
+function socketAt(p: string): boolean {
+  try {
+    if (!statSync(p).isSocket()) return false;
+    accessSync(p, constants.W_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** The runtime sockets {@link dockerSocketPaths} looks for that exist but the daemon's user can't connect to (said, not shown). */
+export function unconnectableDockerSockets(home: string, env: Record<string, string | undefined> = process.env, platform: NodeJS.Platform = process.platform): string[] {
+  const exists = (p: string) => {
+    try {
+      return statSync(p).isSocket();
+    } catch {
+      return false;
+    }
+  };
+  const connectable = new Set(dockerSocketPaths(home, env, platform));
+  return dockerSocketPaths(home, env, platform, exists).filter((p) => !connectable.has(p));
 }
 
 /** Environment variables that point into the desktop session or an agent: never handed inside. */
@@ -210,6 +362,8 @@ export function hiddenPathsFor(config: CodeoidConfig | undefined, inputs: Hidden
   if (runtime) out.push(runtime);
   // An agent socket wherever it is.
   if (env.SSH_AUTH_SOCK) out.push(dirname(env.SSH_AUTH_SOCK));
+  // The system bus and screen's sessions (#448 round 10).
+  out.push(...HOST_SOCKET_DIRS);
   // The daemon's own temp dir, when it isn't /tmp (which the sandbox replaces).
   const daemonTmp = inputs.daemonTmp ?? tmpdir();
   if (daemonTmp && resolve(daemonTmp) !== "/tmp") out.push(daemonTmp);
@@ -263,6 +417,31 @@ export interface SpecInputs {
   projectConfig?: boolean;
   /** Give the toolchains a writable cache (default: yes; sandboxCacheDir). */
   cache?: boolean;
+  /**
+   * The session's worktree folder name (worktrees.ts `sessionFolderName`):
+   * its folder in each worktree location is writable (GitWorkspaceOptions).
+   * Absent: none is (a check, the git shim).
+   */
+  worktreeFolder?: string;
+  /**
+   * The repository's worktree entries the session made itself (its record:
+   * worktree-entries.ts `WorktreeEntryGuard.ownEntries`): left writable; every
+   * other entry there is held. Absent: an entry checked out in the session's
+   * folder is its own (worktrees.ts `isOwnWorktree`).
+   */
+  ownWorktreeEntries?: readonly string[];
+  /**
+   * Let commands reach the host's container runtime sockets
+   * (`sandbox.docker.socket`, opt-in: root-equivalent; dockerSocketPaths).
+   */
+  dockerSocket?: boolean;
+  /**
+   * Hide the host's local service sockets (databases that let a connection in
+   * by who the user is: {@link localServiceSocketPaths}). Default: when the
+   * network isn't on. A session passes its own network's, not a handle's (a
+   * process backend's handle has the network on to reach its model).
+   */
+  hideLocalServices?: boolean;
 }
 
 /** The home a spec hides: absolute, and not `/` (nothing is left to show then). */
@@ -320,6 +499,29 @@ export interface GitPaths {
   readOnly: string[];
   /** The git dirs a commit writes in: what a backend's own sandbox must also let it write (Codex's writable roots). */
   gitDirs: string[];
+  /** The session's own folder in each worktree location (worktrees.ts): writable, where a command checks a new worktree out. */
+  folders: string[];
+  /** The locations those folders are in: shown read-only (worktrees.ts `WorktreeFolders.locations`). */
+  locations: string[];
+  /** Why a worktree location gives the session no folder (a root refused or missing). */
+  problems: string[];
+}
+
+/** What {@link gitWorkspacePaths} is told of the session's own worktrees. */
+export interface GitWorkspaceOptions {
+  /** `sandbox.worktreeRoots`: more worktree locations (worktrees.ts `worktreeLocationDirs`). */
+  worktreeRoots?: readonly string[];
+  /**
+   * The session's worktree folder name: its folder in each location is
+   * writable, and a worktree checked out there is its own, left writable
+   * whole (worktrees.ts `isOwnWorktree`). Absent: no folder, every existing
+   * worktree held.
+   */
+  worktreeFolder?: string;
+  /** The entries the session made itself (SpecInputs.ownWorktreeEntries): the others are held. */
+  ownEntries?: readonly string[];
+  /** codeoid's config dir: no worktree root is in it or holds it. */
+  configDir?: string;
 }
 
 /**
@@ -329,7 +531,9 @@ export interface GitPaths {
  * where the config turns it on; `info/` holds attributes and sparse rules,
  * `modules/` the submodules' git dirs (each with its own config and hooks),
  * `remotes/` and `branches/` remotes defined as files, `worktrees/` the
- * linked worktrees' git dirs (each naming its repository in `commondir`).
+ * linked worktrees' git dirs (each naming its repository in `commondir`):
+ * `worktrees/` itself is writable (a command may add a worktree), each
+ * existing worktree's git dir in it held (gitWorkspacePaths).
  */
 export const GIT_CONTROL = ["config", "config.worktree", "commondir", "hooks", "info", "modules", "remotes", "branches", "worktrees"] as const;
 /** In a linked worktree's own git dir: what names its repository and its checkout, and its own config. */
@@ -452,13 +656,16 @@ export function projectDirsOf(workdir: string, workspace: string): string[] {
  * at). So, read-only:
  *
  *   - in the repository's git dir: `config`, `config.worktree`,
- *     `commondir`, `hooks/`, `info/`, `modules/`, `remotes/`, `branches/`
- *     and `worktrees/` whole ({@link GIT_CONTROL}): every worktree's git
- *     dir, those added after the sandbox opened too;
- *   - in a linked worktree's own git dir (bound writable on top of
- *     `worktrees/`): `commondir`, `gitdir`, `config.worktree`;
- *   - the workspace's `.git` file, and the `.git` file of every other
- *     worktree or submodule checked out inside the workspace;
+ *     `commondir`, `hooks/`, `info/`, `modules/`, `remotes/` and
+ *     `branches/` ({@link GIT_CONTROL});
+ *   - `worktrees/` is writable, bound at its own path (a command adds a
+ *     worktree there: worktrees.ts), but every worktree's admin dir in it
+ *     that isn't the session's own is read-only whole, with its checkout's
+ *     `.git` file, and its whole checkout when that is in a worktree
+ *     location; the workspace's own: `commondir`, `gitdir`,
+ *     `config.worktree`;
+ *   - the workspace's `.git` file, and the `.git` file of every submodule
+ *     checked out inside the workspace;
  *   - a plain repository at the top of the workspace: an empty `HEAD/`
  *     beside its `.git` (made when missing; git doesn't see an empty dir).
  *     A `.git` made invalid (its `HEAD` garbled, `refs/` removed) would
@@ -484,8 +691,8 @@ export function projectDirsOf(workdir: string, workspace: string): string[] {
  * and so is what it names when that is inside the workspace: nothing
  * commits from inside then ({@link gitLayoutProblem} says so).
  */
-export function gitWorkspacePaths(workspace: string, home: string = process.env.HOME ?? homedir()): GitPaths {
-  const out: GitPaths = { writable: [], readOnly: [], gitDirs: [] };
+export function gitWorkspacePaths(workspace: string, home: string = process.env.HOME ?? homedir(), opts: GitWorkspaceOptions = {}): GitPaths {
+  const out: GitPaths = { writable: [], readOnly: [], gitDirs: [], folders: [], locations: [], problems: [] };
   const ws = resolve(workspace);
   const layout = gitLayoutOf(ws, home);
   if (!layout) return out;
@@ -510,13 +717,10 @@ export function gitWorkspacePaths(workspace: string, home: string = process.env.
   // `.` is the git dir itself, as git, libgit2 and gitoxide read it: one an agent writes can't send git elsewhere.
   makeIfMissing(join(common, "commondir"), ".\n");
   const worktrees = join(common, "worktrees");
-  const others: string[] = [];
-  for (const name of listDirs(worktrees)) {
-    const dir = join(worktrees, name);
-    makeIfMissing(join(dir, "config.worktree"), "");
-    if (own && resolve(dir) === resolve(own)) continue;
-    others.push(dir);
-  }
+  const all = worktreeAdminsOf(common);
+  for (const a of all) makeIfMissing(join(a.dir, "config.worktree"), "");
+  if (own) makeIfMissing(join(own, "config.worktree"), "");
+  const admins = all.filter((a) => !own || resolve(a.dir) !== resolve(own));
   const control = [
     ...GIT_CONTROL.map((n) => join(common, n)),
     ...(own ? WORKTREE_CONTROL.map((n) => join(own, n)) : []),
@@ -529,12 +733,33 @@ export function gitWorkspacePaths(workspace: string, home: string = process.env.
     return out;
   }
   out.writable.push(common);
-  // Over the read-only `worktrees/`: this worktree's own git dir, writable, its control read-only again.
+  // `worktrees/` writable, so a command can add a worktree (git makes its admin dir there), and bound at its own
+  // path so it can't be renamed away and rebuilt with an admin dir a checkout of the user's would follow.
+  out.writable.push(worktrees);
+  // This worktree's own git dir, bound at its own path, its control read-only again.
   if (own) out.writable.push(own);
-  out.readOnly.push(...control);
+  out.readOnly.push(...control.filter((p) => p !== worktrees));
   if (dotgitFile) out.readOnly.push(dotgit);
-  // Other checkouts of this repository inside the workspace (a worktree, a submodule): their `.git` files too.
-  for (const f of [...others.map((d) => gitdirTarget(d)), ...submoduleCheckouts(join(common, "modules"))]) {
+  // Where a command checks a new worktree out: the session's own folder in each location (worktrees.ts). The rest
+  // of a location isn't writable at all, but for one inside the workspace, which is held read-only whole.
+  if (opts.worktreeFolder) {
+    const f = worktreeFoldersOf(layout, opts.worktreeFolder, { home, workspace: ws, ...(opts.worktreeRoots ? { roots: opts.worktreeRoots } : {}), ...(opts.configDir ? { configDir: opts.configDir } : {}) });
+    out.folders.push(...f.folders);
+    out.locations.push(...f.locations);
+    out.readOnly.push(...f.held);
+    out.problems.push(...f.problems);
+  }
+  // Every other worktree there now, unless the session made it: its admin dir read-only whole (not rewritten,
+  // renamed, removed or pruned), and its `.git` file when that is in the workspace. One made later is in the
+  // writable `worktrees/` until the spec is next built: its integrity is checked instead (worktree-entries.ts).
+  const ownEntries = opts.ownEntries ? new Set(opts.ownEntries.map((e) => resolve(e))) : null;
+  for (const a of admins) {
+    if (ownEntries ? ownEntries.has(resolve(a.dir)) : isOwnWorktree(a, out.folders)) continue;
+    if (!isLink(a.dir)) out.readOnly.push(a.dir);
+    if (a.dotgit && a.dotgit !== dotgit && within(realOr(a.dotgit), realOr(ws)) && lexists(a.dotgit) && !isLink(a.dotgit)) out.readOnly.push(a.dotgit);
+  }
+  // Submodules checked out inside the workspace: their `.git` files too.
+  for (const f of submoduleCheckouts(join(common, "modules"))) {
     if (f && f !== dotgit && within(f, ws) && lexists(f) && !isLink(f)) out.readOnly.push(f);
   }
   out.gitDirs.push(common, ...(own ? [own] : []));
@@ -826,7 +1051,16 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const env = inputs.hidden?.env ?? process.env;
   const home = inputs.hidden?.home ?? env.HOME ?? homedir();
   const workspace = resolve(inputs.workspace);
-  const git = inputs.git === false ? { writable: [], readOnly: [], gitDirs: [] } : gitWorkspacePaths(workspace, home);
+  const sandboxCfg = sandboxConfigOf(inputs.config);
+  const git: GitPaths =
+    inputs.git === false
+      ? { writable: [], readOnly: [], gitDirs: [], folders: [], locations: [], problems: [] }
+      : gitWorkspacePaths(workspace, home, {
+          worktreeRoots: sandboxCfg.worktreeRoots,
+          configDir: inputs.hidden?.configDir ?? getConfigDir(),
+          ...(inputs.worktreeFolder ? { worktreeFolder: inputs.worktreeFolder } : {}),
+          ...(inputs.ownWorktreeEntries ? { ownEntries: inputs.ownWorktreeEntries } : {}),
+        });
   const projectConfig = inputs.projectConfig === false ? [] : projectDirsOf(inputs.workdir ?? workspace, workspace).flatMap((dir) => projectConfigPaths(dir, home));
   const cache = inputs.cache === false ? null : sandboxCacheDir(home, env);
   const own = [...(inputs.backendState ?? []).map((p) => resolve(p)), ...git.writable, ...(cache ? [cache] : [])];
@@ -844,15 +1078,22 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     ...(inputs.backendReadable ?? []).map((p) => resolve(p)),
     // The allowlist, less what `sandbox.hiddenPaths` hides: an explicit hide wins.
     ...allowed,
+    // The worktree locations holding the session's folders, read-only: a worktree added elsewhere in one fails
+    // (it isn't hidden away into a scratch dir), and the repository's other worktrees there are readable.
+    ...git.locations.filter((l) => !userHidden.some((u) => within(l, u))),
   ];
-  // What stays visible inside the hidden home: a hidden path there matters only inside one of these.
-  const shown = [workspace, tempDir, ...own, ...ownReal, ...reexposed, ...reexposed.map(realOr)];
-  const hidden = [
+  const hiddenAll = [
     ...(homeHidden ? [homeHidden] : []),
     ...hiddenPathsFor(inputs.config, inputs.hidden),
     ...homeCredentialFilesIn(reexposed),
     ...(root ? [root] : []),
-  ].filter(
+  ];
+  // The session's worktree folders: writable, but never inside something hidden (a root configured in a hidden
+  // path), and, unlike the backend's own state, never taking a hidden path inside them out of the hidden list.
+  const locations = git.folders.filter((l) => !hiddenAll.some((h) => h !== homeHidden && (within(l, h) || within(l, realOr(h)))));
+  // What stays visible inside the hidden home: a hidden path there matters only inside one of these.
+  const shown = [workspace, tempDir, ...own, ...ownReal, ...locations, ...reexposed, ...reexposed.map(realOr)];
+  const hidden = hiddenAll.filter(
     (h, i, all) =>
       all.indexOf(h) === i &&
       // The backend's own state stays reachable by it; nothing it holds is taken out otherwise.
@@ -860,21 +1101,28 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
       // Inside the hidden home, only what is inside something shown needs hiding again.
       (!homeHidden || h === homeHidden || !within(h, homeHidden) || shown.some((x) => within(h, x))),
   );
-  return {
+  // The container runtime's sockets, when the owner opted in: reachable at their own paths, `DOCKER_HOST` the first.
+  const sockets = inputs.dockerSocket ? dockerSocketPaths(home, env) : [];
+  const exposed = new Set(sockets.flatMap((s) => [s, realOr(s)]));
+  const spec: SandboxSpec = {
     sessionId: inputs.sessionId,
     workspace,
     tempDir,
-    writable: own,
+    writable: [...own, ...locations],
     hidden,
     readOnly: [...git.readOnly, ...projectConfig],
     gitDirs: git.gitDirs,
-    ...(cache ? { env: toolchainCacheEnv(cache, home, env) } : {}),
-    pinned: protectedAncestors(hidden, [workspace, tempDir, ...own]),
+    ...(locations.length > 0 ? { worktreeFolders: locations } : {}),
+    ...(cache || sockets.length > 0 ? { env: { ...(cache ? toolchainCacheEnv(cache, home, env) : {}), ...(sockets[0] ? { DOCKER_HOST: `unix://${sockets[0]}` } : {}) } } : {}),
+    pinned: protectedAncestors(hidden, [workspace, tempDir, ...own, ...locations]),
     reexposed,
-    containerSockets: containerSocketPaths(home, env),
+    containerSockets: containerSocketPaths(home, env).filter((p) => !exposed.has(p) && !exposed.has(realOr(p))),
+    ...((inputs.hideLocalServices ?? inputs.network.mode !== "on") ? { serviceSockets: localServiceSocketPaths() } : {}),
+    ...(sockets.length > 0 ? { dockerSockets: sockets } : {}),
     network: inputs.network,
-    unsetEnv: SANDBOX_UNSET_ENV,
+    unsetEnv: sockets.length > 0 ? SANDBOX_UNSET_ENV.filter((n) => n !== "DOCKER_HOST") : SANDBOX_UNSET_ENV,
   };
+  return spec;
 }
 
 function sandboxRootOrNull(): string | null {

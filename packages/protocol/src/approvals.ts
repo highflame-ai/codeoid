@@ -40,6 +40,8 @@ export interface PendingToolApproval {
   /** Whether it runs inside the session's OS sandbox, and why not (#448; as on the card). */
   sandboxed?: boolean;
   sandboxNote?: string;
+  /** The sandbox lets commands reach the container runtime (Docker access). */
+  sandboxDocker?: boolean;
 }
 
 export interface SessionApprovalsResultMsg {

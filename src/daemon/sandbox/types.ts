@@ -116,8 +116,32 @@ export interface SandboxSpec {
    * `~/.config/gh` out from under the rule that hides it.
    */
   pinned?: readonly string[];
+  /**
+   * The session's own folder in each of the repository's worktree locations
+   * (in {@link writable} too): where a command checks a new worktree out
+   * (`<repo>-worktrees/<folder>`, `.worktrees/<folder>`,
+   * `<root>/<repo>/<folder>`; worktrees.ts). Nothing else of a location is
+   * writable. What a backend's own sandbox must also let it write (Codex's
+   * writable roots).
+   */
+  worktreeFolders?: readonly string[];
   /** Container runtime sockets (and their dirs): never reachable, they are root-equivalent. */
   containerSockets: readonly string[];
+  /**
+   * Local services' sockets (and their dirs) that let a connection in by who
+   * the user is (Postgres, MySQL, Redis: policy.ts `localServiceSocketPaths`):
+   * hidden like {@link containerSockets} while the session's network is off
+   * or an allowlist (#448 round 11); absent with the network on.
+   */
+  serviceSockets?: readonly string[];
+  /**
+   * Container runtime sockets the owner let commands reach
+   * (`sandbox.docker.socket` / a session's `dockerSocket`, off by default):
+   * each reachable at its own path, `DOCKER_HOST` naming the first
+   * ({@link env}). Root-equivalent, so never without the owner's choice;
+   * never the client's credentials (`~/.docker/config.json` stays hidden).
+   */
+  dockerSockets?: readonly string[];
   network: NetworkPolicy;
   /** Environment variables removed from what runs inside (an agent socket, a desktop bus). */
   unsetEnv: readonly string[];
