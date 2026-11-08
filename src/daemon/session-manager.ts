@@ -9162,7 +9162,7 @@ mcpHub: this.#mcpHub,
       requestId: msg.id,
       data: {
         enabled: registry !== undefined,
-        default: { provider: config.provider, network: config.network, allowedHosts: config.allowedHosts, dockerSocket: config.docker.socket },
+        default: { provider: config.provider, network: config.network, allowedHosts: config.allowedHosts, dockerSocket: config.docker.socket, projectRoots: config.projectRoots ?? ["@parent"] },
         auto: registry?.autoId() ?? null,
         providers,
       },

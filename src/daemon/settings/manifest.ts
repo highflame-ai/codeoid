@@ -238,6 +238,12 @@ const sandbox: SettingsTab = {
           envVar: "CODEOID_SANDBOX_WORKTREE_ROOTS",
           applies: "next-session",
         }),
+        cfg("sandbox.projectRoots", "Project roots (readable)", "Where sandboxed commands may read other repositories, read-only — and see what other sessions did in their checkouts there. @parent is the parent of the session's repository (e.g. ~/Workspace for a session in ~/Workspace/codeoid), the default. ~ expands. Credentials and secret files (.env, .npmrc, …) stay hidden inside. Writing elsewhere is per session: /sandbox add <dir>, or the agent asks (request_directory). Refused: /, your home or a dir holding it, a hidden dir of your home, ~/Library, codeoid's config dir, a system dir; empty: none.", {
+          kind: "string[]",
+          envVar: "CODEOID_SANDBOX_PROJECT_ROOTS",
+          default: ["@parent"],
+          applies: "next-session",
+        }),
         cfg("sandbox.docker.socket", "Docker access", "Let sandboxed commands reach the container runtime's socket (Docker, rootless Docker, Podman; Docker Desktop on macOS) — for tests that start containers (testcontainers). Docker access can reach the whole machine: a container can mount /. Sessions say \"sandboxed, Docker access\"; a session can turn it on for itself (asked of its owner).", {
           kind: "boolean",
           envVar: "CODEOID_SANDBOX_DOCKER_SOCKET",
