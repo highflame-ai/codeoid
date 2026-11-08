@@ -363,6 +363,39 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(r.toolResult ?? "").not.toContain("RAN");
     expect(existsSync(join(outside, "keep.txt"))).toBe(true);
   }, 120_000);
+
+  test("project roots and added dirs (working across repositories): the root shown around the workspace (its read binds land after its write binds), b read-only and its .env hidden; added, b writable", async () => {
+    const home = join(root, "home");
+    const ws = join(home, "Workspace", "a");
+    const b = join(home, "Workspace", "b");
+    for (const d of [ws, b, join(home, "Workspace", "c")]) mkdirSync(d, { recursive: true });
+    writeFileSync(join(b, "README.md"), "bravo readme\n");
+    writeFileSync(join(b, ".env"), "PLANTED-B-ENV\n");
+    const command = [
+      `cat ${join(b, "README.md")}`,
+      `cat ${join(b, ".env")} 2>/dev/null || echo ENV-HIDDEN`,
+      `echo a > ${join(ws, "own.txt")} && echo WS-WRITABLE`,
+      `echo b > ${join(b, "new.txt")} 2>/dev/null && echo B-WRITTEN || echo B-READ-ONLY`,
+      `echo c > ${join(home, "Workspace", "c", "new.txt")} 2>/dev/null && echo C-WRITTEN || echo C-READ-ONLY`,
+    ].join("; ");
+    const env = { CODEOID_PROBE_WORKSPACE: ws, CODEOID_PROBE_PROJECT_ROOTS: join(home, "Workspace") };
+    const r = await probe("off", command, ["policy"], env);
+    expect(r.result).toBe("success");
+    expect(r.toolResult).toContain("bravo readme");
+    expect(r.toolResult).toContain("ENV-HIDDEN");
+    expect(r.toolResult).not.toContain("PLANTED-B-ENV");
+    expect(r.toolResult).toContain("WS-WRITABLE");
+    expect(r.toolResult).toContain("B-READ-ONLY");
+    expect(r.toolResult).toContain("C-READ-ONLY");
+    const added = await probe("off", command, ["policy"], { ...env, CODEOID_PROBE_ADDED_DIRS: b });
+    expect(added.result).toBe("success");
+    expect(added.toolResult).toContain("WS-WRITABLE");
+    expect(added.toolResult).toContain("B-WRITTEN");
+    expect(added.toolResult).toContain("PLANTED-B-ENV");
+    expect(added.toolResult).toContain("C-READ-ONLY");
+    expect(existsSync(join(b, "new.txt"))).toBe(true);
+    expect(existsSync(join(home, "Workspace", "c", "new.txt"))).toBe(false);
+  }, 300_000);
 });
 
 /**

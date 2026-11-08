@@ -7994,8 +7994,17 @@ export class Session {
         : "Your commands can read only the workspace and the toolchains the sandbox shows.",
     );
     if (added.length > 0) lines.push(`Besides the workspace, they can write ${added.map((d) => `${d}/`).join(", ")} (git structure and project settings there read-only, as in the workspace).`);
-    lines.push("To write in another directory, call the `request_directory` tool (path, reason). What it grants is writable from your next turn.");
+    if (this.#requestDirectoryMounted()) lines.push("To write in another directory, call the `request_directory` tool (path, reason). What it grants is writable from your next turn.");
+    else lines.push("To write in another directory, ask the owner to add it (`/sandbox add <dir>`).");
     return lines.join("\n");
+  }
+
+  /** Whether this session's backend has the sandbox's `request_directory` (sandbox/request-directory.ts). */
+  #requestDirectoryMounted(): boolean {
+    const id = this.#provider.id;
+    if (id === "claude" || id === "qwen" || id === "pi") return true;
+    if (id === "codex" || id === "gemini-cli" || id === "opencode") return this.#sandboxMcp?.(this.id) !== undefined;
+    return false;
   }
 
   /**

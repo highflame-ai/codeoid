@@ -24,7 +24,8 @@
  * CLI start in the same workspace, the one that runs its `git status`);
  * the second one's system prompt is told as `system`. A workspace of the
  * test's own: `CODEOID_PROBE_WORKSPACE`; the session's worktree folder
- * name: `CODEOID_PROBE_WORKTREE_FOLDER`. Run in its own
+ * name: `CODEOID_PROBE_WORKTREE_FOLDER`; its project roots and added dirs
+ * (comma-separated): `CODEOID_PROBE_PROJECT_ROOTS`, `CODEOID_PROBE_ADDED_DIRS`. Run in its own
  * process: a test file that mocks the SDK module must not see this one.
  * canUseTool here allows a sandboxed call and DENIES one asking to run
  * outside the sandbox, as codeoid's gate would until its owner says yes.
@@ -124,6 +125,9 @@ const spec = policy
       dockerSocket: process.env.CODEOID_PROBE_DOCKER_SOCKET === "1",
       // CODEOID_PROBE_WORKTREE_FOLDER: the session's worktree folder name (sandbox/worktrees.ts).
       ...(process.env.CODEOID_PROBE_WORKTREE_FOLDER ? { worktreeFolder: process.env.CODEOID_PROBE_WORKTREE_FOLDER } : {}),
+      // CODEOID_PROBE_PROJECT_ROOTS / CODEOID_PROBE_ADDED_DIRS (comma-separated): working across repositories.
+      ...(process.env.CODEOID_PROBE_PROJECT_ROOTS ? { projectRoots: process.env.CODEOID_PROBE_PROJECT_ROOTS.split(",") } : {}),
+      ...(process.env.CODEOID_PROBE_ADDED_DIRS ? { addedDirs: process.env.CODEOID_PROBE_ADDED_DIRS.split(",").map((dir) => ({ dir })) } : {}),
     })
   : {
       sessionId: "probe",
