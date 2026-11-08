@@ -125,6 +125,22 @@ export interface SandboxSpec {
    * writable roots).
    */
   worktreeFolders?: readonly string[];
+  /**
+   * The session's project roots (`sandbox.projectRoots`, policy.ts
+   * `resolveProjectRoots`): readable whole, read-only, with what the hidden
+   * list hides in them hidden again (in {@link reexposed} too). Other
+   * repositories, other sessions' checkouts.
+   */
+  projectRoots?: readonly string[];
+  /**
+   * Directories the session was given to write besides its workspace
+   * (`SessionSandboxSetting.addedDirs`): each treated as a workspace (in
+   * {@link writable}, its git structure and project settings in
+   * {@link readOnly}, its repository's worktree folder in
+   * {@link worktreeFolders}). What a backend's own sandbox must also let it
+   * write (Codex's writable roots).
+   */
+  addedDirs?: readonly string[];
   /** Container runtime sockets (and their dirs): never reachable, they are root-equivalent. */
   containerSockets: readonly string[];
   /**

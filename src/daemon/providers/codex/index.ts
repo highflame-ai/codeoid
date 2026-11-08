@@ -70,6 +70,7 @@ import { buildCodexEnv, withExtraEnv } from "../env.js";
 import { CodexRpcProcess } from "./rpc.js";
 import { EFFORT_LEVELS, type EffortLevel, type SessionMode } from "../../../protocol/types.js";
 import { MEMORY_MCP_SERVER_NAME, MEMORY_MCP_TOKEN_ENV, type MemoryMcpMount } from "../../memory/mcp-http.js";
+import { REQUEST_DIRECTORY_WAIT_MS, SANDBOX_MCP_SERVER_NAME, SANDBOX_MCP_TOKEN_ENV, type SandboxMcpMount } from "../../sandbox/request-directory.js";
 import {
   BLACKBOARD_MCP_SERVER_NAME,
   BLACKBOARD_MCP_TOKEN_ENV,
@@ -126,6 +127,8 @@ export interface CodexProviderInit {
    * server list (per turn for claude), by which time it is set.
    */
   blackboardMcp?: () => { url: string; token: string } | undefined;
+  /** The sandbox's `request_directory` over the daemon's `/mcp/sandbox` (sandbox/request-directory.ts). */
+  sandboxMcp?: () => SandboxMcpMount | undefined;
 
   /** Cross-backend MCP registry — external servers mount natively via `-c
    *  mcp_servers.*` (codex owns its client); approval flows through canUseTool. */
@@ -242,7 +245,7 @@ export function codexSandboxPolicy(rt: SandboxRuntime | null, fallback: SandboxM
       // What of them must stay read-only is held so by codeoid's bubblewrap around the app-server (gitWorkspacePaths).
       // And the sandbox's cache dir, where the toolchains' caches are pointed (SandboxSpec.env), and the repository's
       // worktree folders, where a command checks a new worktree out (sandbox/worktrees.ts).
-      writableRoots: [...new Set([workdir, ...tempRoots(rt.spec), ...(rt.spec.gitDirs ?? []), ...cacheRoots(rt.spec), ...(rt.spec.worktreeFolders ?? [])])],
+      writableRoots: [...new Set([workdir, ...tempRoots(rt.spec), ...(rt.spec.gitDirs ?? []), ...cacheRoots(rt.spec), ...(rt.spec.worktreeFolders ?? []), ...(rt.spec.addedDirs ?? [])])],
       networkAccess: rt.spec.network.mode === "on",
       excludeTmpdirEnvVar: false,
       excludeSlashTmp: false,
@@ -389,6 +392,7 @@ export class CodexProvider implements SessionProvider {
   #memoryMcp: MemoryMcpMount | null;
   /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
   readonly #blackboardMcp: (() => { url: string; token: string } | undefined) | null;
+  readonly #sandboxMcp: (() => SandboxMcpMount | undefined) | null;
   #mcpRegistry: McpServerView | null;
   /** Live scoped token for the mounted memory endpoint; revoked on teardown. */
   #memoryToken: string | null = null;
@@ -493,6 +497,7 @@ export class CodexProvider implements SessionProvider {
     this.#workspaceId = init.workspaceId ?? init.sessionId;
     this.#memoryMcp = init.memoryMcp ?? null;
     this.#blackboardMcp = init.blackboardMcp ?? null;
+    this.#sandboxMcp = init.sandboxMcp ?? null;
     this.#mcpRegistry = init.mcpRegistry ?? null;
     this.#proxy = new McpProxyLease(
       init.mcpProxy,
@@ -660,6 +665,26 @@ export class CodexProvider implements SessionProvider {
         "-c", `${key}.bearer_token_env_var=${JSON.stringify(BLACKBOARD_MCP_TOKEN_ENV)}`,
       ],
       env: { [BLACKBOARD_MCP_TOKEN_ENV]: mount.token },
+    };
+  }
+
+  /**
+   * `-c mcp_servers.codeoid_sandbox.*`: the sandbox's `request_directory`,
+   * same shape as the blackboard's (the session's token, owned by the
+   * SessionManager). Its call waits on the owner's answer, so its timeout
+   * is past the session's own wait (REQUEST_DIRECTORY_WAIT_MS).
+   */
+  #sandboxMcpSpawn(): { args: string[]; env: Record<string, string> } {
+    const mount = this.#sandboxMcp?.();
+    if (!mount) return { args: [], env: {} };
+    const key = `mcp_servers.${SANDBOX_MCP_SERVER_NAME}`;
+    return {
+      args: [
+        "-c", `${key}.url=${JSON.stringify(mount.url)}`,
+        "-c", `${key}.bearer_token_env_var=${JSON.stringify(SANDBOX_MCP_TOKEN_ENV)}`,
+        "-c", `${key}.tool_timeout_sec=${Math.ceil(REQUEST_DIRECTORY_WAIT_MS / 1000) + 60}`,
+      ],
+      env: { [SANDBOX_MCP_TOKEN_ENV]: mount.token },
     };
   }
 
@@ -930,6 +955,7 @@ export class CodexProvider implements SessionProvider {
       // the user's auth + config; these just add the one server.
       const mcp = this.#memoryMcpSpawn();
       const bb = this.#blackboardMcpSpawn();
+      const sbx = this.#sandboxMcpSpawn();
       const reg = this.#registryMcpArgs();
       const shellEnv = codexShellEnvExcludeArgs();
       // Without the exclude, the proxy token would reach the commands codex runs.
@@ -946,7 +972,7 @@ export class CodexProvider implements SessionProvider {
       const env = withExtraEnv(
         await applyCodexAccount(
           this.#resolveAccount?.() ?? null,
-          { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...reg.env, ...oauth.env },
+          { ...buildCodexEnv(), ...mcp.env, ...bb.env, ...sbx.env, ...reg.env, ...oauth.env },
           { command: this.#command, argsPrefix: this.#argsPrefix },
         ),
         this.#extraEnv,
@@ -970,7 +996,7 @@ export class CodexProvider implements SessionProvider {
       this.#proc = new CodexRpcProcess({
         command: this.#command,
         argsPrefix: this.#argsPrefix,
-        args: [...mcp.args, ...bb.args, ...reg.args, ...oauth.args, ...(shellEnv ?? [])],
+        args: [...mcp.args, ...bb.args, ...sbx.args, ...reg.args, ...oauth.args, ...(shellEnv ?? [])],
         cwd: opts.workdir,
         env: procEnv,
         ...(handle?.wrap ? { wrap: handle.wrap.bind(handle) } : {}),

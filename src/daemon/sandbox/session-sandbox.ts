@@ -22,7 +22,8 @@ import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
-import { buildSandboxSpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
+import { buildSandboxSpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
+import { addedDirProblem, normalizeSandboxDir, PROJECT_ROOT_PARENT, resolveProjectRoots } from "./project-roots.js";
 import { ENTRY_GRACE_MS, WorktreeEntryGuard, type WorktreeEntryFinding } from "./worktree-entries.js";
 import { existingFolderName, mainCheckoutOf, sessionFolderName, worktreeFoldersOf, worktreeLocationDirs, worktreeRootNotes } from "./worktrees.js";
 import type { SandboxRegistry } from "./registry.js";
@@ -142,6 +143,10 @@ export interface EffectiveSandbox {
   network: NetworkPolicy;
   /** The host's container runtime socket is reachable (`sandbox.docker.socket` / the session's `dockerSocket`): root-equivalent. */
   dockerSocket: boolean;
+  /** Project roots as set (`@parent`, or absolute with `~` expanded): readable (project-roots.ts). */
+  projectRoots: string[];
+  /** Directories the session writes besides its workspace, absolute. */
+  addedDirs: string[];
 }
 
 /** The setting a session ends up with: its own fields over the config's. */
@@ -151,13 +156,29 @@ export function effectiveSetting(config: SandboxConfig, setting: SessionSandboxS
     ...(setting?.network ? { mode: setting.network } : {}),
     ...(setting?.allowedHosts ? { allow: setting.allowedHosts } : {}),
   });
-  return { choice, network, dockerSocket: setting?.dockerSocket ?? config.docker.socket ?? false };
+  const home = process.env.HOME ?? homedir();
+  const roots = (setting?.projectRoots ?? config.projectRoots ?? [PROJECT_ROOT_PARENT]).map((r) => (r === PROJECT_ROOT_PARENT ? r : (normalizeSandboxDir(r, home) ?? r)));
+  const added = (setting?.addedDirs ?? []).map((d) => normalizeSandboxDir(d, home)).filter((d): d is string => d !== null);
+  return { choice, network, dockerSocket: setting?.dockerSocket ?? config.docker.socket ?? false, projectRoots: [...new Set(roots)], addedDirs: [...new Set(added)] };
+}
+
+/** The setting's fields that only say which directories are readable or writable: a change to them alone is applied between turns, never restarting work (SessionSandbox.set). */
+const DIR_FIELDS = ["projectRoots", "addedDirs"] as const;
+
+function withoutDirs(setting: SessionSandboxSetting | undefined): string {
+  const { projectRoots: _r, addedDirs: _a, ...rest } = setting ?? {};
+  return JSON.stringify(Object.entries(rest).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+/** Whether `before` → `after` changes only the readable roots or the added directories. */
+export function onlyDirsChanged(before: SessionSandboxSetting | undefined, after: SessionSandboxSetting | undefined): boolean {
+  return withoutDirs(before) === withoutDirs(after) && DIR_FIELDS.some((k) => JSON.stringify(before?.[k] ?? null) !== JSON.stringify(after?.[k] ?? null));
 }
 
 /** A setting in words, for a change's line and audit: "bwrap, network on, Docker access". */
 export function describeSandbox(e: EffectiveSandbox): string {
   if (e.choice === SANDBOX_OFF) return "off";
-  return `${e.choice}, network ${e.network.mode}${e.network.mode === "allowlist" ? ` (${(e.network.allow ?? []).join(", ")})` : ""}${e.dockerSocket ? ", Docker access" : ""}`;
+  return `${e.choice}, network ${e.network.mode}${e.network.mode === "allowlist" ? ` (${(e.network.allow ?? []).join(", ")})` : ""}${e.dockerSocket ? ", Docker access" : ""}${e.addedDirs.length > 0 ? `, also writes ${e.addedDirs.join(", ")}` : ""}`;
 }
 
 /** Why a setting is malformed (an unknown provider, a host that isn't one), or null. */
@@ -167,6 +188,8 @@ export function sandboxSettingProblem(setting: SessionSandboxSetting, registry: 
   }
   const bad = (setting.allowedHosts ?? []).filter((h) => !validAllowedHost(h));
   if (bad.length > 0) return `not a host an allowlist can name: ${bad.slice(0, 3).join(", ")}`;
+  const notAbsolute = [...(setting.addedDirs ?? []), ...(setting.projectRoots ?? []).filter((r) => r !== PROJECT_ROOT_PARENT)].filter((d) => normalizeSandboxDir(d) === null);
+  if (notAbsolute.length > 0) return `not an absolute path: ${notAbsolute.slice(0, 3).join(", ")}`;
   return null;
 }
 
@@ -178,17 +201,21 @@ function networkWidth(mode: NetworkMode): number {
 /**
  * Whether moving from `before` to `after` lets commands do more: the sandbox
  * turned off, the network wider, an allowlist with a host it didn't have,
- * the container runtime's socket let in (root on the machine). Switching
- * provider counts as widening (a different boundary).
+ * the container runtime's socket let in (root on the machine), a directory
+ * added to what commands write or a project root to what they read.
+ * Switching provider counts as widening (a different boundary).
  */
 export function widens(
-  before: { choice: string; network: NetworkPolicy; dockerSocket?: boolean },
-  after: { choice: string; network: NetworkPolicy; dockerSocket?: boolean },
+  before: { choice: string; network: NetworkPolicy; dockerSocket?: boolean; projectRoots?: readonly string[]; addedDirs?: readonly string[] },
+  after: { choice: string; network: NetworkPolicy; dockerSocket?: boolean; projectRoots?: readonly string[]; addedDirs?: readonly string[] },
 ): boolean {
   if (after.choice === SANDBOX_OFF && before.choice !== SANDBOX_OFF) return true;
   if (before.choice === SANDBOX_OFF) return false;
   if (after.choice !== before.choice) return true;
   if (after.dockerSocket === true && before.dockerSocket !== true) return true;
+  // A directory written, or a root read, that wasn't: the owner's call (removing one narrows).
+  if ((after.addedDirs ?? []).some((d) => !(before.addedDirs ?? []).includes(d))) return true;
+  if ((after.projectRoots ?? []).some((r) => !(before.projectRoots ?? []).includes(r))) return true;
   const b = networkWidth(before.network.mode);
   const a = networkWidth(after.network.mode);
   if (a !== b) return a > b;
@@ -214,6 +241,37 @@ export function workspaceProblem(workspace: string): string | null {
   return resolve(workspace) === "/" ? "a session working in / can't be sandboxed (the whole filesystem would be its writable workspace) — give it a project directory" : null;
 }
 
+/** What the limits line says of a session whose workspace is the home. */
+export const HOME_WORKSPACE_NOTE =
+  "the workspace is your home: commands can read and write all of it but what the sandbox hides (credential stores, the agents' logins, codeoid's own dirs) — only credentials are protected";
+
+/**
+ * A session's project roots and added directories for its sandbox's
+ * workspace `top` (project-roots.ts): what is used, and what isn't and why.
+ * An added dir inside the workspace is dropped (writable already).
+ */
+export function sandboxDirsOf(
+  top: string,
+  rootEntries: readonly string[],
+  addedDirs: readonly string[],
+  config?: CodeoidConfig,
+): { roots: string[]; added: string[]; notes: string[]; homeWorkspace: boolean } {
+  const home = resolve(process.env.HOME ?? homedir());
+  const configDir = getConfigDir();
+  const homeWorkspace = resolve(top) === home;
+  const r = resolveProjectRoots(rootEntries, top, { home, configDir });
+  const notes = [...(homeWorkspace ? [HOME_WORKSPACE_NOTE] : []), ...(homeWorkspace ? [] : r.notes)];
+  const hidden = addedDirs.length > 0 ? hiddenPathsFor(config) : [];
+  const added: string[] = [];
+  for (const d of addedDirs) {
+    if (resolve(d) === resolve(top) || resolve(d).startsWith(`${resolve(top)}/`)) continue;
+    const problem = addedDirProblem(d, { home, configDir, hidden });
+    if (problem) notes.push(`added directory ${d}: ${problem}: not writable`);
+    else added.push(resolve(d));
+  }
+  return { roots: homeWorkspace ? [] : r.roots, added, notes, homeWorkspace };
+}
+
 /** What a setting resolves to for a backend now (no side effects beyond a cached probe). */
 export async function resolveSandbox(opts: {
   registry: SandboxRegistry;
@@ -222,8 +280,10 @@ export async function resolveSandbox(opts: {
   backendId: string;
   /** The session's working directory: `/` can't be a sandbox's workspace. */
   workspace?: string;
+  /** The daemon's whole config: what an added directory may not be in (its data dirs: policy.ts `hiddenPathsFor`). */
+  codeoidConfig?: CodeoidConfig;
 }): Promise<{ info: SessionSandboxInfo; provider: SandboxProvider | null; plan: ConfinementPlan | null; network: NetworkPolicy }> {
-  const { choice, network, dockerSocket } = effectiveSetting(opts.config, opts.setting);
+  const { choice, network, dockerSocket, projectRoots, addedDirs } = effectiveSetting(opts.config, opts.setting);
   const base = {
     choice,
     network: network.mode,
@@ -270,7 +330,9 @@ export async function resolveSandbox(opts: {
   // `sandbox.worktreeRoots` refused here, or missing and not beside the repository (never made): said (worktrees.ts).
   const layout = top !== null && opts.config.worktreeRoots.length > 0 ? gitLayoutOf(top) : null;
   const rootNotes = layout ? worktreeRootNotes(layout, { roots: opts.config.worktreeRoots, configDir: getConfigDir() }) : [];
-  const limits = [...c.plan.limits, ...(net.note ? [net.note] : []), ...(gitNote ? [gitNote] : []), ...(topNote ? [topNote] : []), ...(dockerNote ? [dockerNote] : []), ...rootNotes];
+  // Working across repositories: the project roots it reads, the directories it writes besides its workspace.
+  const dirs = top !== null ? sandboxDirsOf(top, projectRoots, addedDirs, opts.codeoidConfig) : { roots: [], added: [], notes: [], homeWorkspace: false };
+  const limits = [...c.plan.limits, ...(net.note ? [net.note] : []), ...(gitNote ? [gitNote] : []), ...(topNote ? [topNote] : []), ...(dockerNote ? [dockerNote] : []), ...rootNotes, ...dirs.notes];
   const applied: NetworkPolicy = net.mode === "allowlist" ? network : { mode: net.mode };
   return {
     info: {
@@ -284,6 +346,9 @@ export async function resolveSandbox(opts: {
       via: c.plan.via,
       ...(limits.length > 0 ? { limits } : {}),
       ...(dockerSocket ? { dockerSocket: true } : {}),
+      ...(dirs.roots.length > 0 ? { projectRoots: dirs.roots } : {}),
+      ...(dirs.added.length > 0 ? { addedDirs: dirs.added } : {}),
+      ...(dirs.homeWorkspace ? { homeWorkspace: true } : {}),
       enforced: !net.widened,
     },
     provider,
@@ -322,6 +387,12 @@ export class SessionSandbox {
   #folders = new Set<string>();
   /** The repository's worktree entries as git makes them (#448 round 11, worktree-entries.ts). */
   readonly #entries = new WorktreeEntryGuard();
+  /** The same for each added directory's repository that isn't the workspace's, by its git dir. */
+  readonly #addedEntries = new Map<string, WorktreeEntryGuard>();
+  /** The project roots and added directories the last resolution applied (the runtime's: a change waits for the next). */
+  #dirs: { roots: string[]; added: string[] } = { roots: [], added: [] };
+  /** The setting's directories changed since the last resolution, nothing else (applied between turns: Session). */
+  #dirsStale = false;
   /** The spec last built for the session: what its commands can write, for the entries' look. */
   #lastSpec: SandboxSpec | null = null;
   #entriesRecheck: ReturnType<typeof setTimeout> | null = null;
@@ -405,9 +476,32 @@ export class SessionSandbox {
    * cut off by a change of setting) or the session closes.
    */
   async set(setting: SessionSandboxSetting | undefined): Promise<void> {
-    this.#setting = setting && Object.keys(setting).length > 0 ? { ...setting } : undefined;
-    this.#stale = true;
+    const next = setting && Object.keys(setting).length > 0 ? { ...setting } : undefined;
+    // Only which directories are read or written: the runtime stands until Session applies it between turns.
+    if (onlyDirsChanged(this.#setting, next) && !this.#stale) this.#dirsStale = true;
+    else this.#stale = true;
+    this.#setting = next;
     this.#generation += 1;
+  }
+
+  /**
+   * Whether the setting's directories (project roots, added dirs) changed
+   * since the last resolution: applied by the next {@link refresh}, which
+   * Session runs only between turns with no background work (a Claude query
+   * rebuilt mid-work would end it; a process backend is restarted).
+   */
+  get dirsPending(): boolean {
+    return this.#dirsStale;
+  }
+
+  /** The added directories the running sandbox has (SandboxSpec.addedDirs as resolved): what host-side file tools are held to. */
+  appliedAddedDirs(): string[] {
+    return [...this.#dirs.added];
+  }
+
+  /** The project roots the running sandbox reads. */
+  appliedProjectRoots(): string[] {
+    return [...this.#dirs.roots];
   }
 
   /**
@@ -425,7 +519,7 @@ export class SessionSandbox {
     let r: Awaited<ReturnType<typeof resolveSandbox>>;
     for (;;) {
       const generation = this.#generation;
-      r = await resolveSandbox({ registry: this.#registry, config: this.config, setting: this.#setting, backendId, workspace: this.#workdir });
+      r = await resolveSandbox({ registry: this.#registry, config: this.config, setting: this.#setting, backendId, workspace: this.#workdir, ...(this.#config ? { codeoidConfig: this.#config } : {}) });
       if (generation === this.#generation) break;
     }
     if (this.#closed) {
@@ -435,6 +529,9 @@ export class SessionSandbox {
     this.#info = r.info;
     this.#resolvedFor = backendId;
     this.#stale = false;
+    this.#dirsStale = false;
+    const dirs = { roots: [...(r.info.projectRoots ?? [])], added: [...(r.info.addedDirs ?? [])] };
+    this.#dirs = dirs;
     if (r.info.state !== "on" || !r.provider || !r.plan) {
       this.#runtime = null;
       return r.info;
@@ -448,7 +545,7 @@ export class SessionSandbox {
     const hideLocalServices = (r.info.networkRequested ?? r.info.network) !== "on";
     const open = (backendState: readonly string[] = [], o: OpenOptions = {}) => {
       if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
-      return this.#spec(o.backendNetwork ? { mode: "on" } : r.network, backendState, o.readable ?? [], dockerSocket, hideLocalServices);
+      return this.#spec(o.backendNetwork ? { mode: "on" } : r.network, backendState, o.readable ?? [], dockerSocket, hideLocalServices, dirs);
     };
     // Built (and the temp dir made) when a backend first needs it, then kept: a worktree added or removed in the
     // repository never rebuilds it (#448 round 11: that would rebuild a Claude query, its background tasks with it).
@@ -598,12 +695,22 @@ export class SessionSandbox {
     return this.#handles.size;
   }
 
-  #spec(network: NetworkPolicy, backendState: readonly string[], readable: readonly string[] = [], dockerSocket = false, hideLocalServices = network.mode !== "on"): SandboxSpec {
+  #spec(
+    network: NetworkPolicy,
+    backendState: readonly string[],
+    readable: readonly string[] = [],
+    dockerSocket = false,
+    hideLocalServices = network.mode !== "on",
+    dirs: { roots: readonly string[]; added: readonly string[] } = this.#dirs,
+  ): SandboxSpec {
     // A monorepo's package: the repository's top (#448 round 9); the session's cwd stays the workdir.
     const workspace = sandboxWorkspaceOf(this.#workdir);
-    const folder = this.#worktreeFolderName(workspace);
-    // The repository's worktree entries looked at first: the spec holds every one the session didn't make.
-    if (folder) this.#checkEntries();
+    const folder = this.#worktreeFolderName(workspace, dirs.added);
+    // The repositories' worktree entries looked at first: the spec holds every one the session didn't make.
+    if (folder) {
+      this.#checkEntries();
+      for (const d of dirs.added) this.#checkEntriesOf(d);
+    }
     const spec = buildSandboxSpec({
       backendReadable: readable,
       sessionId: this.#sessionId,
@@ -616,10 +723,29 @@ export class SessionSandbox {
       ...(folder ? { worktreeFolder: folder, ownWorktreeEntries: this.#entries.ownEntries() } : {}),
       dockerSocket,
       hideLocalServices,
+      projectRoots: dirs.roots,
+      addedDirs: dirs.added.map((dir) => {
+        const guard = this.#guardFor(dir);
+        return { dir, ...(folder && guard ? { ownWorktreeEntries: guard.ownEntries() } : {}) };
+      }),
     });
     for (const f of spec.worktreeFolders ?? []) this.#folders.add(f);
     this.#lastSpec = spec;
     return spec;
+  }
+
+  /** The worktree-entry guard of an added dir's repository: the workspace's own when it is the same repository; null outside one. */
+  #guardFor(dir: string): WorktreeEntryGuard | null {
+    const common = gitLayoutOf(dir)?.common;
+    if (!common) return null;
+    const mine = gitLayoutOf(sandboxWorkspaceOf(this.#workdir))?.common;
+    if (mine && resolve(mine) === resolve(common)) return this.#entries;
+    let g = this.#addedEntries.get(resolve(common));
+    if (!g) {
+      g = new WorktreeEntryGuard();
+      this.#addedEntries.set(resolve(common), g);
+    }
+    return g;
   }
 
   /**
@@ -631,23 +757,28 @@ export class SessionSandbox {
    */
   checkWorktreeEntries(): void {
     if (this.#closed || !this.#runtime) return;
-    if (!this.#worktreeFolderName(sandboxWorkspaceOf(this.#workdir))) return;
+    if (!this.#worktreeFolderName(sandboxWorkspaceOf(this.#workdir), this.#dirs.added)) return;
     this.#checkEntries();
+    for (const d of this.#dirs.added) this.#checkEntriesOf(d);
   }
 
   #checkEntries(): void {
+    this.#checkEntriesOf(sandboxWorkspaceOf(this.#workdir), this.#entries);
+  }
+
+  /** {@link checkWorktreeEntries} for the repository `workspace` is in (the workspace's, or an added dir's), with its guard. */
+  #checkEntriesOf(workspace: string, guard: WorktreeEntryGuard | null = this.#guardFor(workspace)): void {
     try {
-      const workspace = sandboxWorkspaceOf(this.#workdir);
       const layout = gitLayoutOf(workspace);
       const folder = this.#folderName;
-      if (!layout?.common || !folder) return;
+      if (!layout?.common || !folder || !guard) return;
       const opts = { roots: this.config.worktreeRoots, configDir: getConfigDir() };
       const main = mainCheckoutOf(layout);
       const last = this.#lastSpec;
       // Before the first spec, the folders as they are (nothing is made for a look).
       const folders = last ? [...(last.worktreeFolders ?? [])] : worktreeFoldersOf(layout, folder, { ...opts, workspace, make: false }).folders;
       const dot = main ? join(main, ".worktrees") : null;
-      const { findings, pending } = this.#entries.check({
+      const { findings, pending } = guard.check({
         common: layout.common,
         main,
         ownFolders: folders,
@@ -676,13 +807,14 @@ export class SessionSandbox {
    */
   prepareFolders(): void {
     if (this.#closed || this.#folders.size === 0 || [...this.#folders].every((f) => existsSync(f))) return;
-    try {
-      const workspace = sandboxWorkspaceOf(this.#workdir);
-      const layout = gitLayoutOf(workspace);
-      if (!layout || !this.#folderName) return;
-      worktreeFoldersOf(layout, this.#folderName, { roots: this.config.worktreeRoots, configDir: getConfigDir(), workspace });
-    } catch {
-      /* a folder that can't be made: a worktree add there fails, as outside one */
+    for (const workspace of [sandboxWorkspaceOf(this.#workdir), ...this.#dirs.added]) {
+      try {
+        const layout = gitLayoutOf(workspace);
+        if (!layout || !this.#folderName) continue;
+        worktreeFoldersOf(layout, this.#folderName, { roots: this.config.worktreeRoots, configDir: getConfigDir(), workspace });
+      } catch {
+        /* a folder that can't be made: a worktree add there fails, as outside one */
+      }
     }
   }
 
@@ -712,11 +844,12 @@ export class SessionSandbox {
    * or a daemon restart keeps it), else its name and short id. Null outside
    * a repository codeoid can verify.
    */
-  #worktreeFolderName(workspace: string): string | null {
+  #worktreeFolderName(workspace: string, added: readonly string[] = []): string | null {
     if (this.#folderName) return this.#folderName;
-    const layout = gitLayoutOf(workspace);
-    if (!layout?.common) return null;
-    const { locations } = worktreeLocationDirs(layout, { roots: this.config.worktreeRoots, configDir: getConfigDir() });
+    // The workspace's repository first, then each added dir's: one name in every repository the session writes.
+    const layouts = [workspace, ...added].map((d) => gitLayoutOf(d)).filter((l) => l?.common);
+    if (layouts.length === 0) return null;
+    const locations = layouts.flatMap((l) => (l ? worktreeLocationDirs(l, { roots: this.config.worktreeRoots, configDir: getConfigDir() }).locations : []));
     this.#folderName = existingFolderName(locations, this.#sessionId) ?? sessionFolderName(this.#name(), this.#sessionId);
     return this.#folderName;
   }

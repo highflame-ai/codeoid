@@ -8,6 +8,7 @@
  *   - ZeroID JWT verification on every connection
  */
 
+import { SANDBOX_MCP_PATH } from "./sandbox/request-directory.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -628,6 +629,8 @@ export class DaemonServer {
     this.#manager.setBlackboardUrl(
       `http://127.0.0.1:${this.#config.port}${BLACKBOARD_MCP_PATH}`,
     );
+    // The sandbox's `request_directory` (sandbox/request-directory.ts): loopback too.
+    this.#manager.setSandboxMcpUrl(`http://127.0.0.1:${this.#config.port}${SANDBOX_MCP_PATH}`);
     this.#manager.setMcp(this.#mcpRegistry, this.#mcpHub, mcpOAuth);
     const mcpCount = this.#mcpRegistry.list().filter((s) => !s.builtin).length;
     if (mcpCount > 0) console.log(`[codeoid] mcp: ${mcpCount} external server(s) registered`);
@@ -684,6 +687,13 @@ export class DaemonServer {
         // request 401s anyway.
         if (url.pathname === BLACKBOARD_MCP_PATH) {
           return self.#manager.blackboardMcp.handle(req);
+        }
+
+        // The sandbox's `request_directory` (sandbox/request-directory.ts): a session's token is its scope, and only
+        // the agents on this host (loopback peers, whatever the daemon binds) reach it.
+        if (url.pathname === SANDBOX_MCP_PATH) {
+          if (!isLoopbackAddress(server.requestIP(req)?.address)) return new Response("Forbidden", { status: 403 });
+          return self.#manager.sandboxMcp.handle(req);
         }
 
         // OAuth MCP relay (#396): Codex, the Gemini CLI and Qwen mount OAuth

@@ -146,6 +146,7 @@ export function claudeSandboxSettings(
   const allSockets = sockets.length > 0 && platform === "linux";
   if (sockets.length > 0) Object.assign(network, allSockets ? { allowAllUnixSockets: true } : { allowUnixSockets: sockets });
   const envVars = credentialEnvNames(env, spec.unsetEnv).map((name) => ({ name, mode: "deny" as const }));
+  const roots = new Set(spec.projectRoots ?? []);
   return {
     enabled: true,
     failIfUnavailable: true,
@@ -167,7 +168,15 @@ export function claudeSandboxSettings(
       // Inside the denied home: the allowlist, and what is written (a workspace in it). Not a worktree location
       // holding the session's folder: the CLI lays what is readable over what is writable, which would make the
       // folder read-only (#448 round 10); the location stays the denied home's scratch dir there.
-      allowRead: physical([spec.workspace, tempDir, ...spec.writable, ...spec.reexposed.filter((r) => !holdsFolder(r, spec.worktreeFolders ?? [])), ...sockets]),
+      // The project roots the same way (they hold the workspace): each split around what is writable in it (readAround).
+      allowRead: physical([
+        spec.workspace,
+        tempDir,
+        ...spec.writable,
+        ...spec.reexposed.filter((r) => !roots.has(r) && !holdsFolder(r, spec.worktreeFolders ?? [])),
+        ...readAround([...roots], [spec.workspace, tempDir, ...spec.writable]),
+        ...sockets,
+      ]),
     },
     network,
     ...(envVars.length > 0 ? { credentials: { envVars } } : {}),
@@ -179,6 +188,46 @@ export function claudeSandboxSettings(
 function holdsFolder(dir: string, folders: readonly string[]): boolean {
   const d = resolve(dir);
   return folders.some((f) => resolve(f) !== d && resolve(f).startsWith(`${d}/`));
+}
+
+/**
+ * `readable` as the CLI's `allowRead` can show it without hiding what is
+ * writable: it lays every `allowRead` bind after every `allowWrite` one, so
+ * a readable dir holding a writable one (a project root holding the
+ * workspace) would make that one read-only. Such a dir is shown entry by
+ * entry instead, all but the way down to the writable ones (which
+ * `allowWrite` shows). An entry made in it after the query started isn't
+ * shown (docs/sandbox.md, Limits). Bounded.
+ */
+export function readAround(readable: readonly string[], writable: readonly string[], limit = 4000): string[] {
+  const out: string[] = [];
+  const inside = (child: string, parent: string) => child !== parent && child.startsWith(`${parent}/`);
+  const writes = writable.flatMap((w) => [resolve(w), physicalOf(w)]);
+  let budget = limit;
+  const split = (dir: string, keep: string[]): void => {
+    let names: string[] = [];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (--budget < 0) return;
+      const at = join(dir, name);
+      const held = keep.filter((w) => w === at || inside(w, at));
+      if (held.length === 0) out.push(at);
+      else if (!held.includes(at)) split(at, held);
+    }
+  };
+  for (const r of readable) {
+    for (const base of new Set([resolve(r), physicalOf(r)])) {
+      const keep = writes.filter((w) => w === base || inside(w, base));
+      if (keep.includes(base)) continue;
+      if (keep.length === 0) out.push(base);
+      else split(base, keep);
+    }
+  }
+  return [...new Set(out)];
 }
 
 /**

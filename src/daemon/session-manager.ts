@@ -8,6 +8,8 @@
  *   - Graceful drain on shutdown
  */
 
+import { addedDirProblem, PROJECT_ROOT_PARENT, sandboxDirProblem } from "./sandbox/project-roots.js";
+import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
@@ -138,12 +140,12 @@ import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./m
 import type { McpRegistry } from "./mcp/registry.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
 import { effectiveSetting, openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
-import { sandboxConfigOf } from "./sandbox/policy.js";
+import { hiddenPathsFor, sandboxConfigOf } from "./sandbox/policy.js";
 import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
 import { isOAuthServer, type McpServerSpec, OAUTH_UNSUPPORTED_BACKENDS } from "./mcp/types.js";
-import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
+import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, getConfigDir, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { endpointNameOf, endpointProviderId, ORCHESTRATOR_ROLE, type ProviderInfo } from "../protocol/types.js";
 import type {
@@ -427,6 +429,10 @@ export class SessionManager {
   /** Goal-blackboard MCP endpoint + the loopback URL children mount it from.
    *  Always constructed: with no minted tokens every request fails closed. */
   readonly #blackboardMcp = new BlackboardMcpHttp();
+  /** The sandbox's `request_directory` for the URL-mounting backends (sandbox/request-directory.ts): one token per session. */
+  readonly #sandboxMcp = new SandboxMcpHttp((sessionId, input) => this.#requestDirectoryFor(sessionId, input));
+  #sandboxMcpUrl?: string;
+  readonly #sandboxMcpTokens = new Map<string, string>();
   #blackboardUrl?: string;
   /** Per-goal artifact store, lazily built on the shared DB connection. */
   #blackboard?: Blackboard;
@@ -993,6 +999,7 @@ export class SessionManager {
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
           claudeAccounts: this.#claudeAccounts,
           accounts: this.#accounts,
           claudeAccount: meta.claudeAccount ?? null,
@@ -1373,6 +1380,8 @@ mcpHub: this.#mcpHub,
         return this.#loopWorkerGuard(msg, "change the mode of") ?? this.#setMode(msg, auth);
       case "session.set_sandbox":
         return this.#loopWorkerGuard(msg, "change the sandbox of") ?? this.#setSandbox(msg, auth);
+      case "session.sandbox_dir":
+        return this.#loopWorkerGuard(msg, "change the sandbox of") ?? this.#sandboxDir(msg, auth);
       case "sandbox.providers":
         return this.#sandboxProviders(msg, auth);
       case "session.pin":
@@ -1771,6 +1780,7 @@ mcpHub: this.#mcpHub,
               transcriptStore: this.#transcriptStore,
               providers: this.#providers,
               sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
               claudeAccounts: this.#claudeAccounts,
               hooks: this.#hooks,
               ...(this.#identityManager
@@ -3887,6 +3897,37 @@ mcpHub: this.#mcpHub,
     this.#blackboardUrl = url;
   }
 
+  /** The URL backends mount the sandbox's `request_directory` from (loopback, as the blackboard's). */
+  setSandboxMcpUrl(url: string): void {
+    this.#sandboxMcpUrl = url;
+  }
+
+  get sandboxMcp(): SandboxMcpHttp {
+    return this.#sandboxMcp;
+  }
+
+  /** A session's `/mcp/sandbox` mount: its own token, minted once. None without a sandbox or the endpoint. */
+  readonly #sandboxMcpFor = (sessionId: string): SandboxMcpMount | undefined => {
+    if (!this.#sandboxMcpUrl || !this.#sandboxRegistry) return undefined;
+    let token = this.#sandboxMcpTokens.get(sessionId);
+    if (!token) {
+      token = this.#sandboxMcp.mint(sessionId);
+      this.#sandboxMcpTokens.set(sessionId, token);
+    }
+    return { url: this.#sandboxMcpUrl, token };
+  };
+
+  /** A `request_directory` call over `/mcp/sandbox`: the session decides it. A gone session's token is let go. */
+  async #requestDirectoryFor(sessionId: string, input: RequestDirectoryInput): Promise<string> {
+    const session = this.#sessions.get(sessionId);
+    if (!session) {
+      this.#sandboxMcp.revokeSession(sessionId);
+      this.#sandboxMcpTokens.delete(sessionId);
+      return "Refused: this session is gone.";
+    }
+    return session.requestDirectory(input);
+  }
+
   /** Inject the cross-backend MCP registry + daemon-owned client pool. Sessions
    *  hand both to every provider so the registry's servers mount on all backends. */
   setMcp(registry: McpRegistry, hub: McpHub, oauth?: McpOAuth): void {
@@ -4334,7 +4375,7 @@ mcpHub: this.#mcpHub,
       if (!this.#sandboxRegistry) {
         return { type: "response.error", requestId: msg.id, error: "This daemon has no OS sandbox", code: "invalid_request" };
       }
-      const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry) ?? (await this.#sandboxUnavailable(msg.sandbox));
+      const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry) ?? this.#sandboxDirsProblem(msg.sandbox) ?? (await this.#sandboxUnavailable(msg.sandbox));
       if (problem) return { type: "response.error", requestId: msg.id, error: problem, code: "invalid_request" };
       const refused = this.#widerSandboxRefusal(msg.sandbox, auth, "create a session");
       if (refused) return { type: "response.error", requestId: msg.id, error: refused, code: "forbidden" };
@@ -4363,6 +4404,7 @@ mcpHub: this.#mcpHub,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
       ...(msg.sandbox && Object.keys(msg.sandbox).length > 0 ? { sandbox: msg.sandbox } : {}),
       claudeAccounts: this.#claudeAccounts,
       // The Claude choice also when the session lands elsewhere: it applies if it is switched to Claude.
@@ -4758,6 +4800,7 @@ mcpHub: this.#mcpHub,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
           claudeAccounts: this.#claudeAccounts,
           // The collaboration runs on the accounts its lead was created on.
           claudeAccount: parent.claudeAccount,
@@ -5177,6 +5220,7 @@ mcpHub: this.#mcpHub,
         transcriptStore: this.#transcriptStore,
         providers: this.#providers,
         sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
         claudeAccounts: this.#claudeAccounts,
         // A fork continues the same conversation — on the same accounts,
         // thinking as hard (#417).
@@ -5433,6 +5477,7 @@ mcpHub: this.#mcpHub,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
@@ -5721,6 +5766,7 @@ mcpHub: this.#mcpHub,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
@@ -6732,6 +6778,7 @@ mcpHub: this.#mcpHub,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -6832,6 +6879,7 @@ mcpHub: this.#mcpHub,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -7118,6 +7166,7 @@ mcpHub: this.#mcpHub,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -9038,6 +9087,53 @@ mcpHub: this.#mcpHub,
     const result = await session.setSandbox(msg.sandbox, auth);
     if (!result.ok) return { type: "response.error", requestId: msg.id, error: result.error, code: "invalid_request" };
     return { type: "response.ok", requestId: msg.id, data: { ...(result.pending ? { pending: true } : {}), sandbox: session.sandboxInfo } };
+  }
+
+  /**
+   * Why a setting's directories can't be used (docs/sandbox.md, "Working
+   * across repositories"), or null: a project root refused
+   * (project-roots.ts `sandboxDirProblem`), an added dir that can't be one
+   * (`addedDirProblem`: the home, `/`, a hidden or settings dir, one the
+   * sandbox hides, one holding a PATH entry, one that isn't there).
+   */
+  #sandboxDirsProblem(setting: SessionSandboxSetting): string | null {
+    const configDir = getConfigDir();
+    for (const r of setting.projectRoots ?? []) {
+      if (r === PROJECT_ROOT_PARENT) continue;
+      const problem = sandboxDirProblem(r, { configDir });
+      if (problem) return `not a project root: ${problem}`;
+    }
+    const hidden = (setting.addedDirs ?? []).length > 0 ? hiddenPathsFor(this.#config) : [];
+    for (const d of setting.addedDirs ?? []) {
+      const problem = addedDirProblem(d, { configDir, hidden });
+      if (problem) return `can't add ${d}: ${problem}`;
+    }
+    return null;
+  }
+
+  /**
+   * `session.sandbox_dir`: add a directory to what a session's commands
+   * write, or remove one. Owner only, with session:approve; adding is a
+   * widening, so never a delegated token's, and asked of the owner on the
+   * session (owner-only confirm) before it lands.
+   */
+  async #sandboxDir(msg: Extract<ClientMessage, { type: "session.sandbox_dir" }>, auth: AuthContext): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:approve", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    if (session.createdBy !== auth.sub) {
+      return { type: "response.error", requestId: msg.id, error: "Only the session's owner can change the directories its sandbox writes", code: "forbidden" };
+    }
+    if (msg.action === "add" && auth.delegationDepth > 0) {
+      this.#store.audit(auth.sub, "session.sandbox_dir_refused", session.id, `${msg.path}: delegated token`);
+      return { type: "response.error", requestId: msg.id, error: "A delegated token cannot add a directory to a session's sandbox", code: "forbidden" };
+    }
+    if (!this.#sandboxRegistry) return { type: "response.error", requestId: msg.id, error: "This daemon has no OS sandbox", code: "invalid_request" };
+    const result = await session.changeSandboxDir(msg.action, msg.path, auth);
+    if (!result.ok) return { type: "response.error", requestId: msg.id, error: result.error, code: "invalid_request" };
+    return { type: "response.ok", requestId: msg.id, data: { ...(result.pending ? { pending: true } : {}), message: result.message, sandbox: session.sandboxInfo } };
   }
 
   /** `sandbox.providers` (#448): what the daemon has and whether each runs here. */

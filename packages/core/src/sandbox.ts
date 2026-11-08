@@ -20,13 +20,42 @@ export interface SandboxBadge {
 /** Why Docker access is a warning, wherever it is shown (a tooltip, a card). */
 export const DOCKER_ACCESS_WHY = "Docker access can reach the whole machine (a container can mount /)";
 
+/** What a session working in its home is told (the chip and its tooltip). */
+export const HOME_WORKSPACE_LINE = "sandboxed: workspace is your home — only credentials are protected";
+
+/**
+ * What the sandbox reads and writes besides the workspace, in words (a
+ * tooltip, a card): "reads ~/Workspace (read-only); also writes ~/Workspace/b".
+ * Null when there is nothing beyond the workspace.
+ */
+export function sandboxDirsText(info: Pick<SessionSandboxInfo, "projectRoots" | "addedDirs" | "pendingDirs"> | undefined): string | null {
+  if (!info) return null;
+  const parts: string[] = [];
+  if (info.projectRoots?.length) parts.push(`reads ${info.projectRoots.join(", ")} (read-only)`);
+  if (info.addedDirs?.length) parts.push(`also writes ${info.addedDirs.join(", ")}`);
+  const add = info.pendingDirs?.add ?? [];
+  const remove = info.pendingDirs?.remove ?? [];
+  if (add.length > 0 || remove.length > 0) {
+    parts.push(`from the next turn: ${[...add.map((d) => `+${d}`), ...remove.map((d) => `−${d}`)].join(", ")}`);
+  }
+  return parts.length > 0 ? parts.join("; ") : null;
+}
+
 /** The session header's badge. Null on a daemon without sandboxing. */
 export function sandboxBadge(info: SessionSandboxInfo | undefined): SandboxBadge | null {
   if (!info) return null;
   switch (info.state) {
     case "on": {
       const net = info.networkRequested ? `network ${info.network} (asked: ${info.networkRequested})` : `network ${info.network}`;
-      const limits = info.limits?.length ? `\n${info.limits.map((l) => `• ${l}`).join("\n")}` : "";
+      const dirs = sandboxDirsText(info);
+      const limits = `${dirs ? `\nIt ${dirs}.` : ""}${info.limits?.length ? `\n${info.limits.map((l) => `• ${l}`).join("\n")}` : ""}`;
+      if (info.homeWorkspace && !info.dockerSocket) {
+        return {
+          text: HOME_WORKSPACE_LINE,
+          tone: "warn",
+          title: `Sandboxed, but the workspace is your home: commands can read and change all of it but the credentials the sandbox hides. ${info.via ?? info.providerName ?? info.provider ?? "on"}, ${net}.${limits}`,
+        };
+      }
       if (info.dockerSocket) {
         return {
           text: info.enforced ? "sandboxed, Docker access" : "sandboxed partly, Docker access",
@@ -60,7 +89,8 @@ export function sandboxSummary(info: SessionSandboxInfo | undefined): string | n
     case "on": {
       const net = info.networkRequested ? `network ${info.network} (asked ${info.networkRequested})` : `network ${info.network}`;
       const hosts = info.network === "allowlist" && info.allowedHosts?.length ? ` [${info.allowedHosts.join(", ")}]` : "";
-      return `sandbox: ${info.providerName ?? info.provider}, ${net}${hosts}${info.dockerSocket ? ", Docker access (can reach the whole machine)" : ""}${info.enforced ? "" : " — not everything asked is enforced"}`;
+      const dirs = sandboxDirsText(info);
+      return `sandbox: ${info.providerName ?? info.provider}, ${net}${hosts}${info.dockerSocket ? ", Docker access (can reach the whole machine)" : ""}${info.homeWorkspace ? ", workspace is your home (only credentials are protected)" : ""}${dirs ? `; ${dirs}` : ""}${info.enforced ? "" : " — not everything asked is enforced"}`;
     }
     case "off":
       return "sandbox: off";

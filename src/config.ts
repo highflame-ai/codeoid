@@ -18,6 +18,7 @@ import type { ModelPrice } from "./daemon/pricing/index.js";
 import type { SandboxConfig } from "./daemon/sandbox/policy.js";
 import { DEFAULT_HOME_READABLE } from "./daemon/sandbox/home-readable.js";
 import { validAllowedHost } from "./daemon/sandbox/hosts.js";
+import { PROJECT_ROOT_PARENT, sandboxDirProblem } from "./daemon/sandbox/dir-rules.js";
 import { worktreeRootProblem } from "./daemon/sandbox/worktrees.js";
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, rmSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -294,6 +295,27 @@ const SandboxSchema = z
       )
       .max(64)
       .default([]),
+    /**
+     * Where sandboxed commands read other repositories, read-only (docs/sandbox.md,
+     * "Working across repositories"): `@parent` (the parent of the session's
+     * repository, the default), or absolute paths (`~` expands). `[]`: none.
+     * Refused as worktree roots are (never `/`, the home, a hidden dir of it, …);
+     * a default that would be the home falls back to none, said on the session.
+     */
+    projectRoots: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(4096)
+          .superRefine((root, ctx) => {
+            if (root === PROJECT_ROOT_PARENT) return;
+            const problem = sandboxDirProblem(root, { configDir: getConfigDir() });
+            if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `not a project root: ${problem}` });
+          }),
+      )
+      .max(64)
+      .default([PROJECT_ROOT_PARENT]),
     /** The bwrap binary (default: on PATH). */
     bwrapPath: z.string().refine(isAbsolute, "must be an absolute path").optional(),
     docker: z
@@ -305,7 +327,7 @@ const SandboxSchema = z
       })
       .default({ image: "node:22-bookworm-slim", socket: false }),
   })
-  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], docker: { image: "node:22-bookworm-slim", socket: false } });
+  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], projectRoots: [PROJECT_ROOT_PARENT], docker: { image: "node:22-bookworm-slim", socket: false } });
 
 const CompressSchema = z
   .object({
@@ -1819,6 +1841,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_SANDBOX_DOCKER_IMAGE", path: "sandbox.docker.image", kind: "string" },
   { env: "CODEOID_SANDBOX_DOCKER_SOCKET", path: "sandbox.docker.socket", kind: "boolean" },
   { env: "CODEOID_SANDBOX_WORKTREE_ROOTS", path: "sandbox.worktreeRoots", kind: "csv" },
+  { env: "CODEOID_SANDBOX_PROJECT_ROOTS", path: "sandbox.projectRoots", kind: "csv" },
   { env: "CODEOID_ROUTINES_MAX_CONCURRENT", path: "routines.maxConcurrentRuns", kind: "int" },
   { env: "CODEOID_MCP_CONTROL_ACTIONS", path: "mcpControl.allowActions", kind: "boolean" },
   { env: "CODEOID_MAX_SESSIONS_PER_USER", path: "rateLimit.maxSessionsPerUser", kind: "int" },

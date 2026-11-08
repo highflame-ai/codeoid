@@ -48,6 +48,7 @@ import { mcpToolPrefix, resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { LOOP_MCP_SERVER_NAME, LOOP_REPORT_TOOL_FQ } from "../../loops/tools.js";
+import { buildSandboxMcpServer, REQUEST_DIRECTORY_TOOL_FQ, type RequestDirectoryInput, SANDBOX_MCP_SERVER_NAME } from "../../sandbox/request-directory.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import { type CodeoidConfig, getConfigDir } from "../../../config.js";
 import { assessShellCommandSync } from "../../risk/shell-risk.js";
@@ -196,6 +197,8 @@ export interface ClaudeProviderInit {
    * server list (per turn for claude), by which time it is set.
    */
   blackboardMcp?: () => { url: string; token: string } | undefined;
+  /** The sandbox's `request_directory`, decided by the session (sandbox/request-directory.ts): mounted in-process. */
+  requestDirectory?: (input: RequestDirectoryInput) => Promise<string>;
   /** Cross-backend MCP registry — external servers are mounted natively on the
    *  SDK (claude owns its own MCP client); approval flows through canUseTool. */
   mcpRegistry?: McpServerView;
@@ -1077,6 +1080,8 @@ export class ClaudeProvider implements SessionProvider {
       // so the external-server timeout doesn't apply.
       ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
       ...(init.loop ? { [LOOP_MCP_SERVER_NAME]: init.loop } : {}),
+      // The sandbox's ask for a directory to write (sandbox/request-directory.ts): in-process, no token.
+      ...(init.requestDirectory ? { [SANDBOX_MCP_SERVER_NAME]: buildSandboxMcpServer(init.sessionId, (_id, input) => (init.requestDirectory as (i: RequestDirectoryInput) => Promise<string>)(input)) } : {}),
       // Collaboration children only — the role-scoped goal blackboard. Mounted
       // over HTTP rather than in-process precisely so the SAME surface works on
       // gemini/codex; claude deliberately gets no privileged path here (#245).
@@ -1119,6 +1124,8 @@ export class ClaudeProvider implements SessionProvider {
       // deliberately absent so they still ride the owner's approval flow.
       ...(this.#init.fleet ? FLEET_TOOL_NAMES.map((t) => `mcp__codeoid_fleet__${t}`) : []),
       ...(this.#init.loop ? [LOOP_REPORT_TOOL_FQ] : []),
+      // An ask itself: the session decides it (owner's confirm, or the project roots in autonomous mode).
+      ...(this.#init.requestDirectory ? [REQUEST_DIRECTORY_TOOL_FQ] : []),
     ];
     this.#autoApprovedTools = new Set(autoApprovedToolNames);
     if (this.#consumerTask && this.#inputQueue && !this.#inputQueue.closed) {
@@ -1404,7 +1411,7 @@ export class ClaudeProvider implements SessionProvider {
               // project settings (read-only to commands; this tool runs outside the sandbox) goes
               // to codeoid's gate (asked, or refused in autonomous mode): never on an allow rule. Fail-closed.
               if (sandbox?.plan.fileTools === false) {
-                const held = heldWriteDecision(input, opts.workdir);
+                const held = heldWriteDecision(input, opts.workdir, sandbox.spec.addedDirs ?? []);
                 if (held) return held;
                 // And in autonomous mode any file tool beyond what the sandbox allows its commands
                 // (#448 rounds 8, 9): to the gate, which refuses it, never on an allow rule. Fail-closed.
@@ -2905,10 +2912,11 @@ export function claudeCatalogEntry(m: {
 export function heldWriteDecision(
   input: PreToolUseHookInput,
   workdir: string,
+  addedDirs: readonly string[] = [],
 ): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "ask"; permissionDecisionReason: string } } | null {
   let reason: string;
   try {
-    const held = heldWriteOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, workdir, protectedWriteTargets(workdir));
+    const held = heldWriteOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, workdir, protectedWriteTargets(workdir, undefined, addedDirs));
     if (!held) return null;
     reason = heldWriteReason(held);
   } catch {

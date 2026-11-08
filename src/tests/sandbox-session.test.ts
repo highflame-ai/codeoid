@@ -368,14 +368,14 @@ describe("fallback: unattended work refuses, interactive work says so", () => {
 describe("the approval card and the gate", () => {
   test("a shell call on a sandboxed session: sandboxed, with the provider and network", async () => {
     const r = await gateCall("Bash", { command: "ls" });
-    expect(r.card).toMatchObject({ sandboxed: true, sandboxNote: "sandboxed: fake-bwrap, network on" });
+    expect(r.card).toMatchObject({ sandboxed: true, sandboxNote: `sandboxed: fake-bwrap, network on; reads ${root} (read-only)` });
   });
 
   test("a sandbox with Docker access: every card says so, as a warning (#448 follow-up)", async () => {
     const r = await gateCall("Bash", { command: "ls" }, { sandbox: { dockerSocket: true } });
-    expect(r.card).toMatchObject({ sandboxed: true, sandboxDocker: true, sandboxNote: "sandboxed, Docker access: fake-bwrap, network on" });
-    expect(r.pending[0]).toMatchObject({ sandboxDocker: true, sandboxNote: "sandboxed, Docker access: fake-bwrap, network on" });
-    expect(approvalSandboxLine(r.card as Card)).toBe("⚠️ sandboxed, Docker access: fake-bwrap, network on");
+    expect(r.card).toMatchObject({ sandboxed: true, sandboxDocker: true, sandboxNote: `sandboxed, Docker access: fake-bwrap, network on; reads ${root} (read-only)` });
+    expect(r.pending[0]).toMatchObject({ sandboxDocker: true, sandboxNote: `sandboxed, Docker access: fake-bwrap, network on; reads ${root} (read-only)` });
+    expect(approvalSandboxLine(r.card as Card)).toBe(`⚠️ sandboxed, Docker access: fake-bwrap, network on; reads ${root} (read-only)`);
     const file = await gateCall("Write", { file_path: join(workdir, "a.ts"), content: "x" }, { sandbox: { dockerSocket: true } });
     expect(file.card).toMatchObject({ sandboxed: false, sandboxDocker: true });
     expect(approvalSandboxLine(file.card as Card)).toBe("⚠️ runs in the backend's own process, outside the sandbox (the sandbox has Docker access)");
@@ -1012,9 +1012,18 @@ describe("round 8 of the #448 audit: host-side file tools are held to the sandbo
 
   test("the sandbox decides what a read reaches: the home's allowlist is readable; the host's /tmp is to Claude's own sandbox, not to opencode's under bubblewrap (its /tmp is the session's)", async () => {
     expect((await gateCall("Read", { file_path: join(homedir(), ".gitconfig") }, { mode: "autonomous" })).behavior).toBe("allow");
-    const outside = join(root, "elsewhere", "notes.txt");
-    expect((await gateCall("Read", { file_path: outside }, { mode: "autonomous" })).behavior).toBe("allow");
-    expectOutside(await gateCall("Read", { file_path: outside }, { mode: "autonomous", backend: "opencode" }), "read", outside);
+    // Outside every project root (the workdir's parent is the default one): another dir of the host's /tmp.
+    const other = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-sbx-elsewhere-")));
+    try {
+      const outside = join(other, "notes.txt");
+      expect((await gateCall("Read", { file_path: outside }, { mode: "autonomous" })).behavior).toBe("allow");
+      expectOutside(await gateCall("Read", { file_path: outside }, { mode: "autonomous", backend: "opencode" }), "read", outside);
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+    // Inside the project root, beside the workdir: readable to its commands, so to its file tools.
+    const sibling = join(root, "elsewhere", "notes.txt");
+    expect((await gateCall("Read", { file_path: sibling }, { mode: "autonomous", backend: "opencode" })).behavior).toBe("allow");
   });
 
   test("a write through a link out of the workspace is judged where it lands", async () => {
