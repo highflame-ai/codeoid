@@ -13,7 +13,8 @@ import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { type ForkPoint, RewindError, SendStoppedError, Session, type AttachedClient, type WindowScope } from "./session.js";
+import { type ForkPoint, RewindError, type SendHold, SendStoppedError, SHUTDOWN_AUTH, Session, type AttachedClient, type WindowScope } from "./session.js";
+import type { CanonicalTurn } from "./providers/canonical.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
 import { type CompareState, type CompareTargetState, type ErrorCode, LIMITS, backendHasAccounts, DEFAULT_ACCOUNT, type AccountKind, type ClaudeAccountKind } from "../protocol/types.js";
@@ -33,7 +34,6 @@ import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEn
 import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption, shellArg } from "./mcp/adopt.js";
 import { readWorkdirServers } from "./mcp/workdir-servers.js";
 import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcpUrl, serverProgram, shownLabel, visibleCompact, visibleVerbatim } from "./mcp/redact.js";
-import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import { BackendLoginBroker, BackendLoginError, type LoginOutcome, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore } from "./claude-accounts.js";
 import { AccountError, type AccountStore, LOGIN_KINDS, validateAccountName } from "./accounts.js";
@@ -364,6 +364,15 @@ function toFleetEventWire(row: DispatchEventRow): FleetEventWire {
  *  configured value is `session.resumeMaxSessions`. */
 const RESUME_MAX_SESSIONS_DEFAULT = 200;
 const RESUME_DEADLINE_MS = 20_000;
+/**
+ * At shutdown, how long drain waits, after the turns ended, for what their
+ * ends started (Session.turnEndWork: the #448 git check, the end snapshot,
+ * hooks) and for routine runs to record theirs. Measured: the settings-commit
+ * look over a 3000-commit repository, and the end snapshot of a 20 000-file
+ * workspace, each well under a second; the margin is for a large repository
+ * on a loaded machine.
+ */
+export const TURN_END_SETTLE_MS = 5_000;
 /** Per-session transcript read budget on resume. Scrollback keeps at most
  * 20 MiB / 5000 messages — parsing history past that would be evicted on
  * arrival, so cap the read slightly above the scrollback byte cap. */
@@ -406,6 +415,71 @@ export function cutRowsAfterTurn<T extends { message: DaemonMessage }>(
  */
 const RESUME_CANONICAL_MAX_BYTES = 4 * 1024 * 1024;
 
+/**
+ * Messages that name a session but never read its scrollback or canonical
+ * history: they don't load a resumed session's (lazy session loading). A
+ * notice one of them adds is kept for the load (`Session#buffer`); anything
+ * that does read the history loads it there (`Session#hydrateNow`).
+ */
+const NO_HISTORY_MESSAGES: ReadonlySet<string> = new Set([
+  "session.detach",
+  "session.destroy",
+  "session.interrupt",
+  "session.ui_response",
+  "session.commands",
+  "session.set_mode",
+  "session.set_sandbox",
+  "session.pin",
+  "session.unpin",
+  "session.rename",
+  "session.turns",
+  "session.approvals",
+  "session.set_model",
+  "session.set_effort",
+  "session.set_account",
+  "session.set_claude_account",
+  "session.mcp_reconnect",
+  "session.mcp_refresh",
+  "session.export",
+  "claude.config",
+  "mcp.approve",
+  "mcp.approve.preview",
+  "fs.list",
+  "fs.read",
+  "fs.browse_dir",
+  "blackboard.index",
+  "blackboard.read",
+  "collaboration.panels",
+  "compare.get",
+  "compare.list",
+  "compare.keep",
+  "mcp.adopt",
+]);
+
+/**
+ * The scopes each history-reading message's handler requires (every group,
+ * any scope within one): a caller without them is refused there, so its
+ * message loads nothing. Types not listed load for any caller of the tenant.
+ */
+const HISTORY_SCOPES: Readonly<Record<string, ReadonlyArray<readonly Scope[]>>> = {
+  "session.attach": [[SCOPES.SESSION_ATTACH, SCOPES.SESSION_WATCH]],
+  "scrollback.page": [[SCOPES.SESSION_ATTACH, SCOPES.SESSION_WATCH]],
+  "session.send": [[SCOPES.SESSION_SEND]],
+  "session.part_action": [[SCOPES.SESSION_SEND]],
+  "session.rotate": [[SCOPES.SESSION_SEND]],
+  "session.rewind": [[SCOPES.SESSION_SEND]],
+  "session.approve": [[SCOPES.SESSION_APPROVE]],
+  "session.set_provider": [[SCOPES.SESSION_APPROVE]],
+  "session.fork": [[SCOPES.SESSION_CREATE]],
+  "session.compare": [[SCOPES.SESSION_CREATE], [SCOPES.SESSION_SEND]],
+};
+
+/** Whether `auth` holds the scopes `type`'s handler requires before it reads a session's history. */
+function mayReadHistory(type: string, auth: AuthContext): boolean {
+  const groups = HISTORY_SCOPES[type];
+  return !groups || groups.every((any) => any.some((scope) => hasScope(auth.scopes as string[], scope)));
+}
+
 /** Sort key for resume ordering: most-recently-active first. Falls back to
  * createdAt, then 0, so a malformed timestamp never throws. */
 function resumeSortKey(m: { lastActivityAt?: string; createdAt?: string }): number {
@@ -422,6 +496,12 @@ const LOOP_WORKER_PROVIDERS: ReadonlySet<string> = new Set(["claude"]);
 
 export class SessionManager {
   #sessions = new Map<string, Session>();
+  /** Per session, the newest message waiting on its history's load (`#historyGate`): the next one waits behind it. */
+  #historyGates = new Map<string, Promise<DaemonMessage | null>>();
+  /** Clients with messages waiting on a load, and how many. */
+  #clientsWaiting = new Map<string, number>();
+  /** Of those, the ones that disconnected meanwhile (`disconnectClient`). */
+  #clientsGone = new Set<string>();
   #store: Store;
   #transcriptStore: TranscriptStore;
   #identityManager?: AgentIdentityManager;
@@ -958,6 +1038,7 @@ export class SessionManager {
       if (m.collaboration) goalConfigs.set(m.sessionId, m.collaboration);
     }
     const deadline = Date.now() + RESUME_DEADLINE_MS;
+    const lazyLoad = this.#config?.session?.lazyLoad ?? true;
     let resumed = 0;
     let skippedDeadline = 0;
     let resumedChildren = 0;
@@ -1084,54 +1165,22 @@ mcpHub: this.#mcpHub,
         session.adoptReportedBackgroundTasks(meta.reportedBackgroundTasks);
         session.adoptKnownBackgroundTasks(meta.knownBackgroundTasks);
 
-        // Restore scrollback from transcript, seeding the seq counter past
-        // the persisted tail so new appends continue the monotonic sequence.
-        // Byte-budgeted + deadline-aware: one huge transcript can neither
-        // OOM the daemon nor eat the whole resume window by itself.
-        const loadStats: { truncated?: boolean } = {};
-        const entries = await this.#transcriptStore.loadTranscript(meta.sessionId, {
-          maxBytes: RESUME_TRANSCRIPT_MAX_BYTES,
-          deadlineAt: deadline,
-          stats: loadStats,
-        });
-        const messages = entries.map((e) => e.message);
-        const maxSeq = entries.reduce((max, e) => Math.max(max, e.seq), -1);
-        session.restoreScrollback(messages, maxSeq + 1, entries.map((e) => e.bytes), {
-          partialHistory: loadStats.truncated === true,
-        });
-        // The backend-neutral conversation (#354). Without it a restored
-        // session forked / switched backend with no history, and stateless
-        // backends answered the next prompt with no memory of the session.
-        // Sessions from before the log existed are rebuilt from the
-        // transcript once, then read from the log.
-        try {
-          const canonical = await this.#transcriptStore.loadCanonical(meta.sessionId, {
-            maxBytes: RESUME_CANONICAL_MAX_BYTES,
-          });
-          const index = await this.#transcriptStore.loadTurnIndex(meta.sessionId);
-          // No log: a session from before it existed. Rebuild once from the
-          // WHOLE transcript (the scrollback window above may be a tail) and
-          // persist it — a long session's history must not shrink to the
-          // window, or to just the next turn on the following restart.
-          let rebuildFrom = messages;
-          if (!canonical && loadStats.truncated === true) {
-            const all = await this.#transcriptStore.loadTranscript(meta.sessionId, { deadlineAt: deadline });
-            rebuildFrom = all.map((e) => e.message);
-          }
-          const history =
-            canonical?.turns ?? (rebuildFrom.length > 0 ? canonicalFromTranscript(rebuildFrom, providerId) : []);
-          session.restoreTurns(history, index ?? turnIndexFromHistory(history), {
-            persistHistory: !canonical && history.length > 0,
-            persistIndex: !index && history.some((t) => t.turnId),
-            partial: canonical?.partial ?? false,
-          });
-          if (meta.redactedBackings) session.adoptRedactedBackings(meta.redactedBackings);
-          if (meta.backingFresh) await session.reseedFreshBacking();
-        } catch (err) {
-          console.error(
-            `[codeoid/resume] canonical history restore failed for ${meta.sessionId} (session resumes without it): ${err instanceof Error ? err.message : String(err)}`,
-          );
-        }
+        // The history (scrollback + canonical conversation) loads the first
+        // time something uses the session (`session.lazyLoad`, default on):
+        // only what it reports and appends with before then is read here.
+        // Sessions from before the canonical log or the turn index load now,
+        // since the load rebuilds and persists them.
+        if (meta.redactedBackings) session.adoptRedactedBackings(meta.redactedBackings);
+        const loadNow = !(await session.prepareResume({
+          transcriptMaxBytes: RESUME_TRANSCRIPT_MAX_BYTES,
+          canonicalMaxBytes: RESUME_CANONICAL_MAX_BYTES,
+          deadlineMs: RESUME_DEADLINE_MS,
+          providerId,
+          backingFresh: meta.backingFresh === true,
+        }));
+        // A fresh backing is re-seeded at resume, as before: it is rare (a
+        // rewind not yet followed by a turn) and its backend is owed it now.
+        if (loadNow || !lazyLoad || meta.backingFresh) await session.ensureHydrated({ deadlineAt: deadline, atResume: true });
 
         this.#sessions.set(session.id, session);
         // Track a resumed child's mount so teardown revokes it. Without this a
@@ -1152,8 +1201,12 @@ mcpHub: this.#mcpHub,
         // "Concurrent session limit reached" until the user
         // /destroys some.
         resumed++;
-      } catch {
-        // Skip sessions that fail to resume
+      } catch (err) {
+        // Skip sessions that fail to resume (a transcript that can't be
+        // read): left on disk as they are, tried again at the next start.
+        console.error(
+          `[codeoid/resume] could not resume ${meta.sessionId}: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     }
 
@@ -1334,6 +1387,49 @@ mcpHub: this.#mcpHub,
       rawToken?: string;
     },
   ): Promise<DaemonMessage> {
+    // A resumed session loads its history the first time it is used. Only
+    // then is there an await here: handlers that claim state synchronously
+    // (a rewind's stop point) keep doing so before the caller's next call.
+    const gate = this.#historyGate(msg, auth);
+    if (!gate) return this.#route(msg, auth, client, opts);
+    return this.#routeAfterLoad(gate, msg, auth, client, opts);
+  }
+
+  /** `handle`, once the session `msg` names has loaded its history (`#historyGate`). */
+  async #routeAfterLoad(
+    gate: { session: Session; wait: Promise<DaemonMessage | null> },
+    msg: ClientMessage,
+    auth: AuthContext,
+    client: AttachedClient,
+    opts?: { rawToken?: string },
+  ): Promise<DaemonMessage> {
+    // A prompt waiting on the load is a send preparing its turn: the drain
+    // sees it, and a Stop meanwhile stops it, as a queued send.
+    const hold = msg.type === "session.send" ? gate.session.holdSend() : undefined;
+    this.#clientsWaiting.set(client.id, (this.#clientsWaiting.get(client.id) ?? 0) + 1);
+    try {
+      const unloadable = await gate.wait;
+      if (unloadable) return unloadable;
+      return await this.#route(msg, auth, client, opts, hold);
+    } finally {
+      hold?.release();
+      const waiting = (this.#clientsWaiting.get(client.id) ?? 1) - 1;
+      if (waiting > 0) this.#clientsWaiting.set(client.id, waiting);
+      else {
+        this.#clientsWaiting.delete(client.id);
+        // Gone while its messages waited: what they attached it to lets go of it.
+        if (this.#clientsGone.delete(client.id)) this.disconnectClient(client.id);
+      }
+    }
+  }
+
+  async #route(
+    msg: ClientMessage,
+    auth: AuthContext,
+    client: AttachedClient,
+    opts?: { rawToken?: string },
+    sendHold?: SendHold,
+  ): Promise<DaemonMessage> {
     switch (msg.type) {
       case "ping":
         // Liveness heartbeat — lets a client detect a half-open/zombie
@@ -1366,7 +1462,7 @@ mcpHub: this.#mcpHub,
       case "session.detach":
         return this.#detach(msg, client);
       case "session.send":
-        return this.#send(msg, auth);
+        return this.#send(msg, auth, sendHold);
       case "session.interrupt":
         return this.#interrupt(msg, auth);
       case "session.approve":
@@ -1583,6 +1679,51 @@ mcpHub: this.#mcpHub,
         };
       }
     }
+  }
+
+  /**
+   * Load the history of the session `msg` names (lazy session loading), so
+   * every handler finds it in memory: the one place a client's use of a
+   * session loads it. Only for a session the caller's tenant owns, with the
+   * scope its handler needs (`HISTORY_SCOPES`), and not for messages that
+   * never read it (`NO_HISTORY_MESSAGES`). While a load is awaited here,
+   * every later message naming that session waits behind it, whether it
+   * reads the history or not, so they are handled in the order they came
+   * (an interrupt never overtakes the prompt it stops); other sessions'
+   * don't. Null when nothing waits; `wait` resolves to an error response
+   * when the transcript can't be read.
+   */
+  #historyGate(msg: ClientMessage, auth: AuthContext): { session: Session; wait: Promise<DaemonMessage | null> } | null {
+    const id = (msg as { sessionId?: unknown }).sessionId;
+    if (typeof id !== "string") return null;
+    const session = this.#sessions.get(id);
+    if (!session || session.accountId !== auth.accountId || session.projectId !== auth.projectId) return null;
+    const load = (): Promise<DaemonMessage | null> | null => {
+      if (NO_HISTORY_MESSAGES.has(msg.type) || !session.historyPending || !mayReadHistory(msg.type, auth)) return null;
+      if (this.#refusedBeforeHistory(msg, auth)) return null;
+      return session.ensureHydrated().then(
+        () => null,
+        (err): DaemonMessage => {
+          console.error(
+            `[codeoid/resume] could not load the history of ${id}: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return {
+            type: "response.error",
+            requestId: (msg as { id?: string }).id ?? "",
+            error: "The session's history could not be loaded from disk — try again, or see the daemon's log.",
+            code: "internal",
+          };
+        },
+      );
+    };
+    const behind = this.#historyGates.get(id);
+    const wait = behind ? behind.then(load) : load();
+    if (!wait) return null;
+    this.#historyGates.set(id, wait);
+    void wait.finally(() => {
+      if (this.#historyGates.get(id) === wait) this.#historyGates.delete(id);
+    });
+    return { session, wait };
   }
 
   async #sessionExport(
@@ -1812,6 +1953,10 @@ mcpHub: this.#mcpHub,
           },
         },
       );
+
+      // The imported log's lines are seqs 1..N: the session's own appends
+      // continue past them, so its seqs only grow along the log.
+      this.#sessions.get(result.newSessionId)?.restoreScrollback([], result.importedMessages + 1);
 
       return {
         type: "session.import.result",
@@ -3960,6 +4105,9 @@ mcpHub: this.#mcpHub,
 
   /** Remove a client from all sessions (e.g. on disconnect). */
   disconnectClient(clientId: string): void {
+    // A message of its own still waiting on a session's load runs after
+    // this: whatever it attaches the client to is let go of then.
+    if (this.#clientsWaiting.has(clientId)) this.#clientsGone.add(clientId);
     for (const session of this.#sessions.values()) {
       session.detach(clientId);
     }
@@ -3987,16 +4135,27 @@ mcpHub: this.#mcpHub,
   }
 
   /**
-   * Graceful drain — wait for all in-flight sessions to reach idle.
+   * Graceful drain: stop every turn and wait for each to record its end.
    * Used during shutdown.
    *
-   * Each working session is interrupted **once**. The previous loop
-   * re-interrupted on every poll iteration; if the SDK subprocess
-   * was mid HTTP retry and didn't respond within 500 ms, drain
-   * piled up duplicate "interrupted by system:shutdown" info rows
-   * (up to 20 in a 10-s window) and 20× the audit log churn. Track
-   * a per-session "already interrupted" set, then poll status until
-   * idle or deadline.
+   * From its start no turn starts: every session refuses sends, interrupts a
+   * turn its backend starts on its own and delivers no wake (`beginDrain`).
+   * Each running turn is interrupted **once** (a re-interrupt per poll piled
+   * up duplicate "interrupted by system:shutdown" rows when the SDK was mid
+   * HTTP retry). Then drain waits, polling, for every turn that hasn't
+   * recorded its end, the ones stopped just before it began included: idle
+   * isn't ended, since a session goes idle once its backend acknowledges the
+   * interrupt and the turn's result follows. Each is waited for at most its
+   * backend's settle bound (`Session.interruptSettleMs`), all at once, so a
+   * backend that never ends the turn holds shutdown that long, not to the
+   * deadline; it is named in the log and left. Then, all at once, what the
+   * turns' ends started and don't await is waited for (`Session.turnEndWork`:
+   * the #448 git check's audit row and warning line, the end snapshot, hooks)
+   * and the routine runs record their rows, spend included, at most
+   * `TURN_END_SETTLE_MS` together; then the transcript writes are flushed.
+   * The store closes after drain, so nothing a turn's end started is cut off.
+   *
+   * One-way: the manager refuses every send from then on. It is shutdown's.
    */
   async drain(timeoutMs = 10_000): Promise<void> {
     try {
@@ -4007,7 +4166,13 @@ mcpHub: this.#mcpHub,
     }
   }
 
+  /** Set when drain begins: no session.send is taken from then on. */
+  #draining = false;
+
   async #drain(timeoutMs: number): Promise<void> {
+    // Before anything else: nothing starts a turn from here on.
+    this.#draining = true;
+    for (const s of this.#sessions.values()) s.beginDrain();
     // An abandoned login is a live pty holding an open OAuth attempt. Kill
     // those first, and unconditionally — they are not work worth draining.
     this.#backendLogin.dispose();
@@ -4019,31 +4184,102 @@ mcpHub: this.#mcpHub,
     for (const t of this.#evidenceTimers) clearTimeout(t);
     this.#evidenceTimers = [];
     const deadline = Date.now() + timeoutMs;
-    const systemAuth: AuthContext = {
-      sub: "system:shutdown",
-      scopes: [],
-      delegationDepth: 0,
-      accountId: "",
-      projectId: "",
-    };
-    const interrupted = new Set<string>();
+    const remaining = () => Math.max(0, deadline - Date.now());
+    // Per turn (its run; the session for a send still preparing): when drain
+    // first found it, so a turn started after an interrupt is a new one.
+    const since = new Map<object, number>();
+    const givenUp = new Set<object>();
+    // Turns usually settle within milliseconds of the interrupt: look again
+    // soon, backing off only to 50 ms.
+    let pollMs = 10;
     while (Date.now() < deadline) {
-      const working = [...this.#sessions.values()].filter(
-        (s) =>
-          s.status === "thinking" ||
-          s.status === "tool_running" ||
-          s.status === "waiting_approval" ||
+      let waiting = 0;
+      for (const session of this.#sessions.values()) {
+        // A session made since drain began.
+        session.beginDrain();
+        const working =
+          session.status === "thinking" ||
+          session.status === "tool_running" ||
+          session.status === "waiting_approval" ||
           // Looks idle, but a queued send is about to start a turn: stop it
           // too, or it starts after shutdown began.
-          s.preparingTurn,
-      );
-      if (working.length === 0) return;
-      for (const session of working) {
-        if (interrupted.has(session.id)) continue;
-        void session.interrupt(systemAuth);
-        interrupted.add(session.id);
+          session.preparingTurn;
+        if (!working && !session.turnUnsettled) continue;
+        const key = session.drainKey;
+        if (givenUp.has(key)) continue;
+        const first = since.get(key);
+        if (first === undefined) {
+          since.set(key, Date.now());
+          // Stopped already (by its owner, a routine, or as it started): only waited for.
+          if (working && !session.interruptRequested) void session.interrupt(SHUTDOWN_AUTH).catch(() => {});
+        } else if (Date.now() - first >= session.interruptSettleMs) {
+          givenUp.add(key);
+          console.warn(
+            `[codeoid/session-manager] drain: session ${session.id.slice(0, 8)} (${session.name}) didn't end its turn within ${session.interruptSettleMs} ms of the interrupt; going on without it`,
+          );
+          continue;
+        }
+        waiting++;
       }
-      await Bun.sleep(500);
+      // A message waiting on a session's load is handled after it: wait for
+      // it too (a prompt among them is preparing, and is stopped above).
+      if (waiting === 0 && this.#historyGates.size === 0) break;
+      await Bun.sleep(Math.min(pollMs, remaining()));
+      pollMs = Math.min(pollMs * 2, 50);
+    }
+    await this.#settleTurnEnds(Math.min(remaining(), TURN_END_SETTLE_MS));
+    await this.#flushTranscripts(deadline);
+  }
+
+  /**
+   * Wait, at most `boundMs`, for what every session's turn end started
+   * (`Session.turnEndWork`) and for the routine runs to record their final
+   * rows, spend included (they do once their turn has ended, or once drain
+   * gave up on it): all at once. The store closes next.
+   */
+  async #settleTurnEnds(boundMs: number): Promise<void> {
+    const pending = new Set<Session>();
+    const work = [...this.#sessions.values()].map((s) => {
+      pending.add(s);
+      return s.turnEndWork().then(() => void pending.delete(s));
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const [routinesEnded] = await Promise.all([
+      this.#routines ? this.#routines.settled(boundMs) : Promise.resolve(true),
+      Promise.race([
+        Promise.all(work),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, boundMs);
+          timer.unref?.();
+        }),
+      ]),
+    ]);
+    clearTimeout(timer);
+    for (const s of pending) {
+      console.warn(`[codeoid/session-manager] drain: session ${s.id.slice(0, 8)} (${s.name}) didn't finish its turn's end within ${boundMs} ms (its git check, snapshot or hooks); going on without it`);
+    }
+    if (!routinesEnded) console.warn("[codeoid/session-manager] drain: a routine run didn't record its end in time");
+  }
+
+  /**
+   * Await the transcript store's writes until none is in flight, within the
+   * deadline. A settled write's handler may start another (the turn index
+   * written as a turn ends), so look again after each round.
+   */
+  async #flushTranscripts(deadline: number): Promise<void> {
+    for (let round = 0; round < 10 && Date.now() < deadline; round++) {
+      // One macrotask first: a handler a settled write woke may start the next write there.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      if (this.#transcriptStore.pendingWrites === 0) return;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        this.#transcriptStore.flush(),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, Math.max(0, deadline - Date.now()));
+          timer.unref?.();
+        }),
+      ]);
+      clearTimeout(timer);
     }
   }
 
@@ -5028,26 +5264,26 @@ mcpHub: this.#mcpHub,
         code: "invalid_request",
       };
     }
-    if (msg.afterTurnId) {
-      try {
-        point = await parent.forkPoint(msg.afterTurnId);
-      } catch (err) {
-        return {
-          type: "response.error",
-          requestId: msg.id,
-          error: err instanceof Error ? err.message : String(err),
-          code:
-            err instanceof RewindError
-              ? err.code === "not_found"
-                ? "not_found"
-                : err.code === "restore_failed"
-                  ? "internal"
-                  : "invalid_request" // before_rotation, busy: pick another point / wait
-              : "internal",
-        };
-      }
+    let parentHistory: readonly CanonicalTurn[];
+    try {
+      if (msg.afterTurnId) point = await parent.forkPoint(msg.afterTurnId);
+      parentHistory = point ? point.history : await parent.fullCanonicalHistory();
+    } catch (err) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: err instanceof Error ? err.message : String(err),
+        code:
+          err instanceof RewindError
+            ? err.code === "not_found"
+              ? "not_found"
+              : err.code === "restore_failed" || err.code === "history_unavailable"
+                ? "internal"
+                : "invalid_request" // before_rotation, busy: pick another point / wait
+            : "internal",
+      };
     }
-    const history = (point ? point.history : await parent.fullCanonicalHistory()).map((t) => ({ ...t }));
+    const history = parentHistory.map((t) => ({ ...t }));
     // From an earlier turn: the parent's background launches after that turn
     // are its own business, not news for the fork's model (they stay foreign).
     // Only the parent's unfinished work matters, and it is looked for in the
@@ -5666,7 +5902,9 @@ mcpHub: this.#mcpHub,
     // COMPLETE (or ask for input) on GENUINELY NEW final text — never on the
     // PRIOR phase's ⟦PHASE-COMPLETE⟧ that still sits in lastAssistantText (e.g.
     // behind a tools-only turn whose own text is empty). Without this, phase N
-    // "completes" instantly by reading phase N-1's marker.
+    // "completes" instantly by reading phase N-1's marker. A pipeline resumed
+    // after a restart drives a session whose history may not be loaded yet.
+    if (session.historyPending) await session.ensureHydrated();
     let textAtSend = session.lastAssistantText ?? "";
     // Every NEW assistant text this phase produced, in order. The phase's
     // summary is the whole of what the model said across its turns, not only
@@ -6704,6 +6942,27 @@ mcpHub: this.#mcpHub,
     };
   }
 
+  /**
+   * A history-reading message its handler refuses before it reads the
+   * history, for a reason other than scope (`#loopWorkerGuard`, a delegated
+   * approval of a loop worker's): it loads nothing. A handler that goes on
+   * after all loads the history itself.
+   */
+  #refusedBeforeHistory(msg: ClientMessage, auth: AuthContext): boolean {
+    const id = (msg as { sessionId?: unknown }).sessionId;
+    if (typeof id !== "string") return false;
+    switch (msg.type) {
+      case "session.rotate":
+      case "session.rewind":
+      case "session.set_provider":
+        return this.#isLiveLoopWorker(id);
+      case "session.approve":
+        return auth.delegationDepth > 0 && this.#isLiveLoopWorker(id);
+      default:
+        return false;
+    }
+  }
+
   /** The session works in an active loop run's worktree: its current worker,
    *  or an earlier one (replaced after a restart) still holding the same tree. */
   #isLiveLoopWorker(sessionId: string): boolean {
@@ -7272,6 +7531,11 @@ mcpHub: this.#mcpHub,
       },
 
       workerStatus: (sessionId: string) => this.#sessions.get(sessionId)?.status ?? null,
+
+      prepareWorkerDigest: async (task: DispatchTaskRow): Promise<void> => {
+        const worker = this.#sessionForTask(task.workerSessionId, task);
+        if (worker?.historyPending) await worker.ensureHydrated().catch(() => {});
+      },
 
       buildWorkerDigest: (task: DispatchTaskRow): string => {
         const worker = this.#sessionForTask(task.workerSessionId, task);
@@ -8214,6 +8478,8 @@ mcpHub: this.#mcpHub,
 
   async #freezeBranch(t: CompareRunRow["targets"][number], s: Session): Promise<void> {
     const turnId = t.baseTurnId!;
+    // A branch settled after a restart may not have loaded its history yet.
+    if (s.historyPending) await s.ensureHydrated().catch(() => {});
     const status: "idle" | "error" = s.status === "error" ? "error" : "idle";
     // Nothing after the compared turn yet: the branch's totals are that turn's
     // (a fork starts with none). Read before awaiting — the user may go on.
@@ -8460,7 +8726,7 @@ mcpHub: this.#mcpHub,
           type: "response.error",
           requestId: msg.id,
           error: err.message,
-          code: err.code === "not_found" ? "not_found" : "invalid_request",
+          code: err.code === "not_found" ? "not_found" : err.code === "history_unavailable" ? "internal" : "invalid_request",
         };
       }
       throw err;
@@ -8506,6 +8772,7 @@ mcpHub: this.#mcpHub,
   #send(
     msg: Extract<ClientMessage, { type: "session.send" }>,
     auth: AuthContext,
+    hold?: SendHold,
   ): DaemonMessage | Promise<DaemonMessage> {
     if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) {
       return { type: "response.error", requestId: msg.id, error: "Missing scope: session:send", code: "forbidden" };
@@ -8521,6 +8788,12 @@ mcpHub: this.#mcpHub,
     // question) instead of a second conversation the controller can't see.
     const loopRun = this.#liveLoopRunOf(session.id);
     if (loopRun) return this.#steerFromSend(msg, auth, loopRun);
+
+    // Shutting down: no turn starts. Said here, not as a line in a stream the client may not get.
+    // Before the duplicate check: a refused send doesn't mark its clientMsgId seen.
+    if (this.#draining) {
+      return { type: "response.error", requestId: msg.id, error: "The daemon is shutting down: the message wasn't sent", code: "internal" };
+    }
 
     // Duplicate-send suppression (`send.idempotency`): a client that
     // couldn't observe whether its send survived a dropped socket resends
@@ -8548,7 +8821,7 @@ mcpHub: this.#mcpHub,
     // returned a false "ok" and dropped the error — silent data loss).
     // priority controls mid-turn insertion semantics (default "later" = FIFO).
     session
-      .send(msg.text, auth, msg.attachments, msg.priority)
+      .send(msg.text, auth, msg.attachments, msg.priority, hold)
       .catch((err) => {
         // Stopped before its turn started: the user already got a notice.
         if (err instanceof SendStoppedError) return;

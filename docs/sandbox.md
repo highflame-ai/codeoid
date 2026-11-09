@@ -1352,7 +1352,8 @@ session's first turn) and that changes one of
 `.qwen/settings.json`, `.codex/`, `.pi/` (at any depth: a session may start
 in a subdirectory; against each parent, a root commit against nothing) is
 named in a warning line, with its files (event `sandbox.settings_committed`,
-audited `session.settings_committed`). **Review those commits
+audited `session.settings_committed`; a turn interrupted by a shutdown
+gets its look before the daemon exits, at most 5 s). **Review those commits
 (`git show <commit>`) before a session runs where they are checked out.**
 The look runs the daemon's hardened git (nothing the repository's config
 names runs; only names are compared) and reads at most 500 new commits per

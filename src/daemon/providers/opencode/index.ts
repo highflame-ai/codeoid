@@ -343,6 +343,13 @@ export class OpencodeProvider implements SessionProvider {
   readonly appliesToolInputRewrite = false;
   /** A background subagent's result is handed to the model by opencode, which then runs the main agent itself. */
   readonly continuesAfterBackgroundWork = true;
+  /**
+   * An interrupt before the prompt started ends the turn after a second ask
+   * (250 ms), the settle timer (300 ms) and the read-back with its total
+   * (`SPEND_READ_MS` + 250): 1.8 s on 2.2.5, mid-reply a few ms (I71). A feed
+   * gap's longer read-back (`INTERRUPT_SETTLE_MS`) isn't waited for at shutdown.
+   */
+  readonly interruptSettleMs = 3_000;
   readonly effortChange = "turn" as const;
 
   onRecoveryNeeded: ((content: string) => void) | undefined;

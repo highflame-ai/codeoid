@@ -59,7 +59,7 @@ Hooks are declared in `~/.codeoid/config.json`. No plugin loading, no JS API —
 | `tool_call` | Before a tool executes, **before** the approval gate | block; mutate input |
 | `tool_result` | After a tool completes | patch the recorded output |
 | `before_turn` | A fresh turn is starting (not mid-turn injections) | append to the system prompt |
-| `after_turn` | Turn finished, carries the normalized result | observe |
+| `after_turn` | Turn finished, carries the normalized result. A shutdown waits for it (at most 5 s, with the rest of the turn's end) | observe |
 | `session_start` | Session created (`source`: `"new"` \| `"resume"`) | observe |
 | `session_end` | Session destroyed | observe |
 | `provider_switched` | Backend switched mid-session (`from`, `to`, `seeded`) | observe |

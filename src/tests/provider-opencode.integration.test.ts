@@ -641,6 +641,55 @@ describe("opencode (real binary)", () => {
     await p.teardown();
   }, 180_000);
 
+  maybeScripted("I71 an interrupted turn ends, its spend read, within the settle bound the provider declares for a daemon's drain", async () => {
+    const p = provider();
+    const took: number[] = [];
+    // Mid-reply, at a tool's gate, and before the prompt has started: where a shutdown finds a turn.
+    for (let i = 0; i < 9; i++) {
+      let at = 0;
+      let release = () => {};
+      const parked = new Promise<void>((r) => {
+        release = r;
+      });
+      const atGate = i % 3 === 1;
+      const atStart = i % 3 === 2;
+      const run = p.runTurn(
+        atGate
+          ? opts('[[tool:shell {"command":"echo held","description":"Held at the gate"}]]', {
+              canUseTool: async () => {
+                release();
+                await Bun.sleep(60_000);
+                return { behavior: "deny", message: "no" };
+              },
+            })
+          : opts("[[slow:300]] [[text:a b c d e f g h i j k l m n o p q r s t]]"),
+      );
+      if (atStart) {
+        at = Date.now();
+        void run.interrupt();
+      } else if (atGate) {
+        void parked.then(() => {
+          at = Date.now();
+          void run.interrupt();
+        });
+      }
+      for await (const e of run.events) {
+        if (!atGate && !atStart && !at && e.type === "text_delta") {
+          at = Date.now();
+          void run.interrupt();
+        }
+        if (e.type === "turn_done" || e.type === "error") {
+          if (e.type === "turn_done") expect(e.result.stopReason).toBe("interrupted");
+          break;
+        }
+      }
+      took.push(Date.now() - at);
+    }
+    console.log(`[opencode integration] I71: interrupt to turn end ${took.join(", ")} ms (bound ${p.interruptSettleMs} ms)`);
+    for (const ms of took) expect(ms).toBeLessThan(p.interruptSettleMs);
+    await p.teardown();
+  }, 180_000);
+
   maybeScripted("I12 Code Mode is hidden: a script can't run, so its fetch can't get past the gate", async () => {
     // On 2.2.2 a Code Mode script's fetch runs without asking anything. The
     // session rules deny `execute`, which takes the tool away on 2.2.x.

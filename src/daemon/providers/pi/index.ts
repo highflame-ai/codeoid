@@ -298,13 +298,17 @@ export class PiProvider implements SessionProvider {
     this.#gatedToolIds.clear();
     this.#hasQueried = true;
 
-    void this.#startTurn(opts).catch((err) => {
+    // An interrupt before the prompt went out (pi still starting, its model
+    // or level being set) has nothing to abort yet: the prompt mustn't go out after it.
+    const turn = { aborted: false };
+    void this.#startTurn(opts, turn).catch((err) => {
       this.#failTurn(err instanceof Error ? err.message : String(err));
     });
 
     return {
       events: queue,
       interrupt: async () => {
+        turn.aborted = true;
         this.#proc?.send({ type: "abort" });
       },
       pushMidTurn: (content, priority) => {
@@ -319,7 +323,8 @@ export class PiProvider implements SessionProvider {
     };
   }
 
-  async #startTurn(opts: TurnOpts): Promise<void> {
+  async #startTurn(opts: TurnOpts, turn: { aborted: boolean }): Promise<void> {
+    const queue = this.#turnQueue;
     await this.#ensureProcess(opts);
 
     if (!this.#bridgeReady) {
@@ -338,6 +343,12 @@ export class PiProvider implements SessionProvider {
     const level = opts.effort ?? this.#defaultThinkingLevel;
     if (level && level !== this.#thinkingLevel) await this.#setThinkingLevel(level);
 
+    if (turn.aborted) {
+      // Interrupted before pi had a prompt to abort: the turn ends here, its
+      // history seed kept for the next prompt.
+      if (this.#turnQueue === queue) this.#endAborted();
+      return;
+    }
     let message = opts.userMessage;
     if (this.#pendingHistorySeed) {
       message = `${this.#pendingHistorySeed}\n\n${message}`;
@@ -616,6 +627,30 @@ export class PiProvider implements SessionProvider {
     queue.close();
     this.#turnQueue = null;
     this.#canUseTool = null;
+  }
+
+  /** End a turn interrupted before its prompt was sent: nothing ran, nothing was spent. */
+  #endAborted(): void {
+    const queue = this.#turnQueue;
+    if (!queue) return;
+    this.#turnQueue = null;
+    this.#canUseTool = null;
+    queue.push({
+      type: "turn_done",
+      result: {
+        providerId: this.id,
+        model: this.#model ?? "pi-default",
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        totalCostUsd: 0,
+        costSource: "backend",
+        durationMs: Date.now() - this.#turnStartedAt,
+        stopReason: "interrupted",
+      },
+    });
+    queue.close();
   }
 
   /**

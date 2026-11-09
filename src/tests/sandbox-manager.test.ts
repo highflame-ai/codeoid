@@ -367,6 +367,8 @@ describe("Docker access (#448 follow-up): an opt-in widening, the owner's own", 
     expect(await m.handle({ type: "session.ui_response", id: "u", sessionId: id, requestId, confirmed: true } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
     for (let i = 0; i < 100 && !audits.some((a) => a.action === "session.set_sandbox"); i++) await Bun.sleep(10);
     expect(audits.filter((a) => a.action === "session.set_sandbox").at(-1)?.detail).toContain("→ auto, network on, Docker access");
+    // The session's info follows the audited change once its sandbox is re-resolved.
+    for (let i = 0; i < 100 && m.findByName(info?.name as string, AUTH)?.toInfo().sandbox?.dockerSocket !== true; i++) await Bun.sleep(10);
     expect(m.findByName(info?.name as string, AUTH)?.toInfo().sandbox?.dockerSocket).toBe(true);
     // Off again: narrowing, applied without asking, by a delegated token too.
     const narrowed = await m.handle({ type: "session.set_sandbox", id: "x", sessionId: id, sandbox: { dockerSocket: false } }, DELEGATED, { ...CLIENT, auth: DELEGATED });

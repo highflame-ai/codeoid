@@ -95,6 +95,14 @@ export const DEFAULT_DISPATCH_CONFIG: DispatchConfig = {
   holdMaxMs: 2 * 60 * 60_000,
 };
 
+/**
+ * A send refused because the daemon is shutting down (session.ts's
+ * DaemonStoppingError, by name: this module stays free of the session's).
+ */
+function isDaemonStopping(err: unknown): boolean {
+  return err instanceof Error && err.name === "DaemonStoppingError";
+}
+
 /** Thrown by host methods when retrying can never succeed (target gone, bad input). */
 export class NonRetryableDispatchError extends Error {}
 
@@ -138,6 +146,8 @@ export interface DispatcherHost {
   workerStatus(sessionId: string): SessionStatus | null;
   /** Compressed completion digest for a finished worker — never raw transcript. */
   buildWorkerDigest(task: DispatchTaskRow): string;
+  /** Load what `buildWorkerDigest` reads (a resumed worker's history), before it runs. */
+  prepareWorkerDigest?(task: DispatchTaskRow): Promise<void>;
   /** Tear down a finished worker session (best-effort). */
   destroyWorker(sessionId: string, reason: string): Promise<void>;
   /**
@@ -304,6 +314,7 @@ export class Dispatcher {
 
   start(): void {
     if (!this.#config.enabled || this.#timer) return;
+    this.#stopped = false;
     this.#timer = setInterval(() => {
       void this.tick();
     }, this.#config.tickMs);
@@ -312,7 +323,11 @@ export class Dispatcher {
     void this.tick(); // first pass immediately: boot-time reclaim + resume
   }
 
+  /** Set by stop(): a tick still in flight claims nothing more. */
+  #stopped = false;
+
   stop(): void {
+    this.#stopped = true;
     if (this.#timer) {
       clearInterval(this.#timer);
       this.#timer = null;
@@ -740,6 +755,8 @@ export class Dispatcher {
     //    starve the rest of the queue).
     const touched: string[] = [];
     for (;;) {
+      // The daemon is stopping: what is still queued waits for the next start.
+      if (this.#stopped) return;
       const task = this.#store.dispatchClaimNext(
         this.bootId,
         Date.now(),
@@ -814,6 +831,18 @@ export class Dispatcher {
       this.#host.audit("dispatch.spawned", `task=${task.id} worker=${sessionId}`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
+      // The daemon began shutting down before the work started (its send was
+      // refused, the worker torn down): nothing ran, so no attempt is spent.
+      // Back to the queue untouched, for the next start. Only a claim: a
+      // grouped send is marked running with its target before delivery (a
+      // retry takes it as delivered), and an attempt is its stopped loop's.
+      const current = isDaemonStopping(err) && task.kind !== "attempt" ? this.#store.dispatchGet(task.id) : null;
+      if (current?.status === "claimed" && current.generation === task.generation) {
+        this.#unwatchTask(task.id);
+        this.#store.dispatchRelease(task.id, Date.now());
+        this.#host.audit("dispatch.released", `task=${task.id} reason=daemon_stopping`);
+        return;
+      }
       const retryable = !(err instanceof NonRetryableDispatchError);
       const now = Date.now();
       const status = this.#store.dispatchFail(task.id, task.generation, message, now, {
@@ -1048,6 +1077,7 @@ export class Dispatcher {
 
     try {
       // Digest BEFORE teardown — it reads the live session + memory.
+      await this.#host.prepareWorkerDigest?.(task);
       const digest = this.#host.buildWorkerDigest(task);
       if (status === "idle") {
         // The read above and this write are not one transaction; the store's

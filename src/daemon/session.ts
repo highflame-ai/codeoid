@@ -131,7 +131,8 @@ import type { Store } from "./store.js";
 import type { AgentIdentityManager } from "./agent-identity.js";
 import { ScrollbackBuffer } from "./scrollback.js";
 import { reconcileResumedMessage } from "./resume-reconcile.js";
-import type { TranscriptStore } from "./transcript.js";
+import type { TranscriptEntry, TranscriptFileMark, TranscriptStore } from "./transcript.js";
+import { canonicalFromTranscript, turnIndexFromHistory } from "./canonical-restore.js";
 import {
   backgroundLaunchIds,
   FOREIGN_AGENT_DENY,
@@ -283,6 +284,21 @@ const SUBAGENT_REGISTRATION_FENCE_MS = 5_000;
 const BACKGROUND_WAKE_FALLBACK_MS = 20_000;
 /** How long a send waits for an ended run's last events before its own turn replaces it. */
 const ENDED_RUN_DRAIN_MS = 5_000;
+/**
+ * How long a daemon shutting down waits for an interrupted turn to end, when
+ * its backend declares no bound of its own (`SessionProvider.interruptSettleMs`):
+ * Claude's result follows the interrupt receipt, Codex's turn/completed its
+ * reply, within well under a second.
+ */
+export const DRAIN_SETTLE_MS = 2_000;
+/** The principal a daemon shutting down interrupts turns as. */
+export const SHUTDOWN_AUTH: AuthContext = {
+  sub: "system:shutdown",
+  scopes: [],
+  delegationDepth: 0,
+  accountId: "",
+  projectId: "",
+};
 /** How long a destroy waits for its look at the session's commits (#checkSettingsCommits) before it goes on without it. */
 const DESTROY_COMMIT_CHECK_MS = 15_000;
 
@@ -776,7 +792,7 @@ export interface ForkPoint {
 /** A rewind that can't proceed (unknown turn, a turn that wouldn't stop). */
 export class RewindError extends Error {
   constructor(
-    readonly code: "not_found" | "busy" | "restore_failed" | "before_rotation",
+    readonly code: "not_found" | "busy" | "restore_failed" | "before_rotation" | "history_unavailable",
     message: string,
   ) {
     super(message);
@@ -857,9 +873,17 @@ const TURN_INDEX_KEEP = 1000;
 const TURN_INDEX_SLACK = 200;
 
 export class SendStoppedError extends Error {
-  constructor() {
-    super("Stopped before the agent started on this message");
+  constructor(message = "Stopped before the agent started on this message") {
+    super(message);
     this.name = "SendStoppedError";
+  }
+}
+
+/** A send refused because the daemon is shutting down: no turn starts once drain began. */
+export class DaemonStoppingError extends SendStoppedError {
+  constructor() {
+    super("The daemon is shutting down: no new turn starts");
+    this.name = "DaemonStoppingError";
   }
 }
 
@@ -887,6 +911,90 @@ export function writesClaudeSettingsFile(target: string, workdir: string): boole
  * counts as spending.
  */
 /** What one turn's event consumer counted (#430): model work, requests sent, usage reports received. */
+/**
+ * How a resumed session loads its history (`Session.prepareResume`): the
+ * resume read budgets, which SessionManager owns, and what its meta says.
+ */
+export interface ResumeHistoryPlan {
+  /** Newest transcript bytes read into the scrollback. */
+  transcriptMaxBytes: number;
+  /** Newest canonical-log bytes read into the history. */
+  canonicalMaxBytes: number;
+  /** Time a load may spend parsing the transcript before it keeps what it has. */
+  deadlineMs: number;
+  /** The backend a history rebuilt from the transcript is for (a session from before the log). */
+  providerId: string;
+  /** The meta's `backingFresh`: the backend is re-seeded from the history once it is loaded. */
+  backingFresh: boolean;
+}
+
+/**
+ * A resumed session whose history isn't loaded yet (lazy session loading):
+ * what it needs meanwhile, and what the load must add.
+ */
+interface Dehydrated {
+  plan: ResumeHistoryPlan;
+  /**
+   * The log's files as they were at resume: the load reads them up to there,
+   * exactly what an eager resume read, whatever this process appended since
+   * and whatever their seqs.
+   */
+  files: TranscriptFileMark[];
+  /** Messages appended since (on disk too), pushed onto the scrollback after the load, as if live. */
+  appended: SessionMessage[];
+  /** The session had a turn index on disk (else the load rebuilds it from the history). */
+  hadIndex: boolean;
+  /** The turn index or canonical log couldn't be read at resume: the load reads the index again, and fails as a resume did. */
+  indexUnread?: boolean;
+  /** The newest canonical turn, for `lastTurnId` / `lastTurnRole`. */
+  lastTurn: Pick<CanonicalTurn, "role" | "turnId"> | null;
+  /** A teardown owed the backend a re-seed from the history (`#reseedAfterTeardown`): paid on load. */
+  reseed: boolean;
+  /** The load in flight. */
+  loading?: Promise<void>;
+}
+
+/**
+ * The canonical log (or turn index) couldn't be read when a resume loaded
+ * the history (`Session#historyUnread`): what the session holds in memory is
+ * only what came since.
+ */
+interface HistoryUnread {
+  plan: ResumeHistoryPlan;
+  /** The turn index wasn't read either: it is read again with the log. */
+  indexUnread: boolean;
+  /** The last read's error, logged once per distinct one. */
+  error: string;
+  /** The read in flight. */
+  retry?: Promise<void>;
+}
+
+/** Why going back or forking is refused while the log couldn't be read. */
+const HISTORY_UNREAD_REFUSAL =
+  "This session's earlier conversation couldn't be read from disk, so going back or forking now would lose it. Nothing was changed — try again, or see the daemon's log.";
+
+/** A send counted as preparing before it reaches `Session.send` (`Session.holdSend`). */
+export interface SendHold {
+  /** The Stop generation when it arrived: a Stop since stops it. */
+  readonly stopGen: number;
+  /** Take the count over (true once; false after `take` or `release`). */
+  take(): boolean;
+  /** Give the count back, unless taken. */
+  release(): void;
+}
+
+/** What a history load read, for `Session#installHistory`. */
+interface LoadedHistory {
+  entries: TranscriptEntry[];
+  truncated: boolean;
+  canonical: { turns: CanonicalTurn[]; partial: boolean } | null;
+  /** The whole transcript, when there's no log to read and the scrollback read was a tail. */
+  rebuildFrom?: DaemonMessage[];
+  /** The turn index, read by the load (`Dehydrated.indexUnread`). */
+  index?: TurnIndexEntry[] | null;
+  canonicalError?: unknown;
+}
+
 interface TurnCounts {
   activity: boolean;
   requests: number;
@@ -1050,7 +1158,8 @@ export class Session {
   #transcriptStore: TranscriptStore;
   #identityManager?: AgentIdentityManager;
   #agentIdentity: MessageIdentity;
-  #scrollback = new ScrollbackBuffer();
+  /** The replay buffer. Read it as `#scrollback`, which loads a resumed session's history first. */
+  #scrollbackBuffer = new ScrollbackBuffer();
   /**
    * Identity of this Session instance's replay buffer (`replay.resume`).
    * A client cursor (`sinceSeq`) is only valid against the buffer that
@@ -1106,7 +1215,8 @@ export class Session {
   // this to detect a turn whose event stream has gone silent (hung tool / dead
   // subprocess) so the session can self-recover instead of wedging forever.
   #lastEventAt = 0;
-  #accumulator = new CanonicalHistoryAccumulator();
+  /** The canonical history. Read it as `#accumulator`, which loads a resumed session's history first. */
+  #historyAccumulator = new CanonicalHistoryAccumulator();
   /**
    * The turn messages are currently attributed to (#354): minted when a
    * prompt (or a background continuation) starts a turn, stamped on every
@@ -1115,6 +1225,8 @@ export class Session {
   #currentTurnId: string | null = null;
   /** In-flight workspace snapshot per turn, so destroy can wait for them. */
   #pendingCheckpoints = new Set<Promise<unknown>>();
+  /** Work a turn's end started and doesn't await (the #448 git check, `after_turn` hooks): see turnEndWork. */
+  readonly #turnEndJobs = new Set<Promise<unknown>>();
   /** The session's turns, oldest first (#354) — see #indexTurn. */
   #turnIndex: TurnIndexEntry[] = [];
   /**
@@ -1122,7 +1234,7 @@ export class Session {
    * bounded resume read). Features that need the whole conversation (going
    * back to, or forking from, an old turn) load the full log on demand.
    */
-  #canonicalPartial = false;
+  #canonicalPartialFlag = false;
   /** Pluggable seed policy for switch/fork. Default `transcript` (no change);
    *  `CODEOID_CONTEXT_STRATEGY=vws` opts into the compact session map. */
   #contextStrategy: ContextStrategy = selectContextStrategy();
@@ -1236,8 +1348,8 @@ export class Session {
   } | null = null;
   /** Set by a turn_done whose seed overflowed; the consumer's exit retries it. */
   #seedOverflowRetry = false;
-  /** The last turn failed with "prompt too long" — /rotate then skips its min-turns guard. */
-  #promptTooLong = false;
+  /** The last turn failed with "prompt too long" — /rotate then skips its min-turns guard. Derived from the scrollback on resume. */
+  #promptTooLongFlag = false;
   // Execution mode + turn budget (autonomous mode only).
   // Default `guarded` (≈ Claude Code's default): read-only tools (Read/Grep/Glob
   // + memory) auto-approve, while Write/Edit/Bash and other mutations prompt.
@@ -1658,8 +1770,14 @@ export class Session {
     // Durable canonical history (#354): every change is appended to the
     // session's log so forks, backend switches and rewinds after a restart
     // still carry the conversation.
-    this.#accumulator.onChange = (change) => {
+    this.#historyAccumulator.onChange = (change) => {
       if (this.#destroyed) return;
+      // Never write a history that couldn't be read over the log it lost;
+      // what is appended still is (`#historyUnread`).
+      if (change.op === "replace" && this.#historyUnread) {
+        console.error(`[codeoid/session ${this.id}] canonical history not rewritten: the log couldn't be read, and would lose its turns`);
+        return;
+      }
       void this.#transcriptStore.recordCanonical(this.id, change);
     };
     this.#identityManager = opts.identityManager;
@@ -2124,9 +2242,8 @@ export class Session {
     // A backend that can't resume its own conversation (the Gemini CLI
     // starts a new ACP session) is handed the history, as after an MCP
     // rebuild — an account switch must never start the conversation over.
-    if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
-      await this.#seedProviderFromHistory();
-    }
+    // Deferred to the load for a session whose history isn't loaded yet.
+    await this.#reseedAfterTeardown();
   }
 
   /**
@@ -2431,6 +2548,7 @@ export class Session {
     // Rejecting here means we never tear down an actively-running provider.
     const busy = this.#switchBusyReason();
     if (busy) return busy;
+    if (this.#loadPending) await this.ensureHydrated();
 
     const previous = this.#provider.id;
 
@@ -2574,6 +2692,8 @@ export class Session {
   }
   /** turnId of the newest turn in the canonical history (null before any, or when unstamped). */
   get lastTurnId(): string | null {
+    // Before the history loads: the newest turn of its log.
+    if (this.#dehydrated) return this.#dehydrated.lastTurn?.turnId ?? null;
     return this.#accumulator.history.at(-1)?.turnId ?? null;
   }
   /** Number of turns (user + assistant) in the canonical history. */
@@ -2609,6 +2729,7 @@ export class Session {
    * length watermark was not).
    */
   get lastTurnRole(): "user" | "assistant" | undefined {
+    if (this.#dehydrated) return this.#dehydrated.lastTurn?.role;
     const h = this.#accumulator.history;
     return h[h.length - 1]?.role;
   }
@@ -2936,9 +3057,7 @@ export class Session {
     }
     if (view.fingerprint === this.#mcpBuiltWith) return false;
     await this.#teardownProvider(); // records what's applied, and lets go of what was removed
-    if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
-      await this.#seedProviderFromHistory();
-    }
+    await this.#reseedAfterTeardown();
     return true;
   }
 
@@ -4110,6 +4229,7 @@ export class Session {
     maxBytes?: number,
   ): Promise<{ messages: SessionMessage[]; hasMore: boolean; source: "buffer" | "transcript" }> {
     const budget = Math.min(Math.max(1, maxBytes ?? PAGE_DEFAULT_BYTES), PAGE_MAX_BYTES);
+    if (this.#loadPending) await this.ensureHydrated();
 
     if (beforeMessageId === undefined) {
       const tail = this.#scrollback.readTailChunked(budget, budget);
@@ -4363,6 +4483,7 @@ export class Session {
     data: Record<string, unknown> | undefined,
     sender: AuthContext,
   ): Promise<{ ok: true } | { ok: false; code: "not_found" | "invalid_request"; error: string }> {
+    if (this.#loadPending) await this.ensureHydrated();
     const msg = this.#scrollback.getMessage(messageId) as SessionMessage | undefined;
     if (!msg) {
       return { ok: false, code: "not_found", error: "Message not found" };
@@ -4436,7 +4557,11 @@ export class Session {
     sender: AuthContext,
     attachments?: readonly Attachment[],
     priority?: "now" | "next" | "later",
+    /** Counted as preparing since it arrived (`holdSend`): this send takes it over. */
+    hold?: SendHold,
   ): Promise<void> {
+    // Shutting down: nothing is recorded, nothing starts.
+    if (this.#draining) throw new DaemonStoppingError();
     // Before anything is recorded: a session whose Claude account was removed
     // must not quietly run on some other credential.
     this.assertAccountUsable();
@@ -4447,11 +4572,17 @@ export class Session {
     // A send is "preparing" from the moment it is queued until its turn has
     // started (or it failed): drain() must treat that as work, and a Stop in
     // that window must cancel it — see #stoppedBeforeStart.
-    const stopGen = this.#stopGen;
-    this.#preparingSends++;
+    const held = hold?.take() === true;
+    const stopGen = held ? hold!.stopGen : this.#stopGen;
+    if (!held) this.#preparingSends++;
     const next = this.#sendChain
       .catch(() => undefined)
-      .then(() => this.#sendInner(text, sender, attachments, priority, stopGen))
+      // A resumed session loads its history before its first turn.
+      .then(() =>
+        this.#dehydrated || this.#historyUnread
+          ? this.ensureHydrated().then(() => this.#sendInner(text, sender, attachments, priority, stopGen))
+          : this.#sendInner(text, sender, attachments, priority, stopGen),
+      )
       .finally(() => {
         this.#preparingSends--;
       });
@@ -4460,6 +4591,30 @@ export class Session {
       () => undefined,
     );
     return next;
+  }
+
+  /**
+   * Count a send as preparing before it reaches send(): one the daemon holds
+   * while the session's history loads (`SessionManager.handle`). The drain
+   * sees it, and a Stop meanwhile stops it as it stops a queued send. Hand
+   * it to send(), which takes it over, or release() it.
+   */
+  holdSend(): SendHold {
+    this.#preparingSends++;
+    let held = true;
+    return {
+      stopGen: this.#stopGen,
+      take: () => {
+        const was = held;
+        held = false;
+        return was;
+      },
+      release: () => {
+        if (!held) return;
+        held = false;
+        this.#preparingSends--;
+      },
+    };
   }
 
   /** Sends queued or preparing their turn (see send()). */
@@ -4472,6 +4627,62 @@ export class Session {
    */
   get preparingTurn(): boolean {
     return this.#preparingSends > 0;
+  }
+
+  /** Set by the daemon's drain: no turn starts from here on. */
+  #draining = false;
+
+  /**
+   * The daemon is shutting down: a send is refused from here on, a turn the
+   * backend starts on its own is interrupted as it starts, and no wake is
+   * delivered. Turns already running are drain's to interrupt and wait for.
+   */
+  beginDrain(): void {
+    this.#draining = true;
+    if (this.#backgroundWakeFallback) {
+      clearTimeout(this.#backgroundWakeFallback);
+      this.#backgroundWakeFallback = null;
+    }
+  }
+
+  /** What drain tells one turn from the next by: the running turn's run, else the session (a send still preparing). */
+  get drainKey(): object {
+    return this.#activeRun ?? this;
+  }
+
+  /** The running turn was already asked to stop (by its owner, a routine, or as it started during a drain). */
+  get interruptRequested(): boolean {
+    return this.#activeRun !== null && this.#turnInterrupted;
+  }
+
+  /** Hold `job`, started by a turn's end and not awaited, until it settles: turnEndWork waits for it. */
+  #keepTurnEnd(job: Promise<unknown>): void {
+    this.#turnEndJobs.add(job);
+    const done = () => this.#turnEndJobs.delete(job);
+    void job.then(done, done);
+  }
+
+  /**
+   * Settles once the work this session's turn ends started and don't await
+   * has: the #448 git and settings-commit check (its audit row and warning
+   * line), the end (and any start) snapshot, `after_turn` hooks. Drain
+   * awaits it, bounded, before the transcripts flush and the store closes,
+   * so a shutdown cuts none of it off. A job that starts another (a
+   * snapshot chained behind one) is waited for too. Never rejects.
+   */
+  async turnEndWork(): Promise<void> {
+    const waited = new Set<Promise<unknown>>();
+    for (;;) {
+      const jobs = [...this.#turnEndJobs, ...this.#pendingCheckpoints].filter((j) => !waited.has(j));
+      if (jobs.length === 0) return;
+      for (const j of jobs) waited.add(j);
+      await Promise.allSettled(jobs);
+    }
+  }
+
+  /** How long drain waits for this session's interrupted turn to end before it gives up on it. */
+  get interruptSettleMs(): number {
+    return this.#provider.interruptSettleMs ?? DRAIN_SETTLE_MS;
   }
 
   /** Per-turn loop controls, reset when a turn starts. */
@@ -4883,6 +5094,8 @@ export class Session {
     this.#provider.onRecoveryNeeded = (content: string) => {
       const recoverySender = this.#currentSender ?? sender;
       this.#sendChain = this.#sendChain.then(async () => {
+        // The daemon is draining: no turn starts (the prompt is already in the transcript).
+        if (this.#draining) return;
         // Reset to a fresh backing session for recovery.
         const newBackingId = randomUUID();
         this.#provider.resetToNewSession(newBackingId);
@@ -5602,6 +5815,8 @@ export class Session {
     this.#setStatus("thinking");
     this.#onTurnStarted();
     this.#broadcastInfoUpdate();
+    // Shutting down: consumed, so its end and spend are recorded, but stopped at once.
+    if (this.#draining) void this.interrupt(SHUTDOWN_AUTH).catch(() => {});
   }
 
   /**
@@ -5661,7 +5876,7 @@ export class Session {
    */
   #armBackgroundWakeFallback(): void {
     if (this.#backgroundWakeFallback) return;
-    if (this.#destroyed) return;
+    if (this.#destroyed || this.#draining) return;
     this.#backgroundWakeFallback = setTimeout(() => {
       this.#backgroundWakeFallback = null;
       this.#maybeDeliverBackgroundReports({ fallback: true });
@@ -5746,6 +5961,8 @@ export class Session {
     // interrupt) would inject a duplicate turn beside the backend's own.
     if (this.#provider.continuesAfterBackgroundWork && !opts.fallback) return;
     if (this.#destroyed) return;
+    // Shutting down: no turn starts (its refused send would requeue and retry at once).
+    if (this.#draining) return;
     // Mid-rewind: these reports belong to turns being taken back (#355).
     if (this.#rewinding) return;
     if (this.#deliveringBackgroundReports) return;
@@ -6414,7 +6631,8 @@ export class Session {
       .catch(() => undefined)
       .then(async () => {
         // A send, switch or fork re-seed got here first — it owns the session now.
-        if (this.#destroyed || this.#pendingSeed !== seed || this.#activeRun) return;
+        // Nor once the daemon is draining: no turn starts.
+        if (this.#destroyed || this.#draining || this.#pendingSeed !== seed || this.#activeRun) return;
         await this.#teardownProvider();
         const newBackingId = randomUUID();
         this.#provider.resetToNewSession(newBackingId);
@@ -6954,11 +7172,383 @@ export class Session {
     };
   }
 
+  // ── Lazy session loading ──────────────────────────────────────────────
+  //
+  // A resumed session starts with its metadata only (`prepareResume`): its
+  // scrollback and canonical history stay on disk until something uses them,
+  // and load exactly as a resume used to load them. Entry points await
+  // `ensureHydrated()`; the synchronous internals read the two through
+  // `#scrollback` / `#accumulator`, which load them first if nothing has
+  // (`#hydrateNow`, logged: a path that should have awaited).
+
+  /** Set while the history isn't loaded; null once it is (and for every session not resumed). */
+  #dehydrated: Dehydrated | null = null;
+  /** Work the load leaves the backend (a re-seed), awaited by `ensureHydrated()`. */
+  #afterHydrate: Promise<void> | null = null;
+  /**
+   * The canonical log couldn't be read when a resume loaded the history: the
+   * session runs without it, as a resume always did, but the history in
+   * memory is only what came since. It is never written over the log (going
+   * back or forking is refused, `#assertHistoryRead`), turns are still
+   * appended to it, and every use reads it again (`#rereadHistory`) until it
+   * can. Null otherwise.
+   */
+  #historyUnread: HistoryUnread | null = null;
+  /** Loads `#hydrateNow` had to do synchronously, daemon-wide (tests read it). */
+  static syncHydrations = 0;
+
+  get #scrollback(): ScrollbackBuffer {
+    if (this.#dehydrated) this.#hydrateNow("scrollback");
+    return this.#scrollbackBuffer;
+  }
+
+  get #accumulator(): CanonicalHistoryAccumulator {
+    if (this.#dehydrated) this.#hydrateNow("history");
+    return this.#historyAccumulator;
+  }
+
+  get #canonicalPartial(): boolean {
+    if (this.#dehydrated) this.#hydrateNow("history");
+    return this.#canonicalPartialFlag;
+  }
+
+  set #canonicalPartial(v: boolean) {
+    if (this.#dehydrated) this.#hydrateNow("history");
+    this.#canonicalPartialFlag = v;
+  }
+
+  get #promptTooLong(): boolean {
+    if (this.#dehydrated) this.#hydrateNow("scrollback");
+    return this.#promptTooLongFlag;
+  }
+
+  set #promptTooLong(v: boolean) {
+    if (this.#dehydrated) this.#hydrateNow("scrollback");
+    this.#promptTooLongFlag = v;
+  }
+
+  /** The history isn't in place yet (or couldn't be read), or a load's re-seed is still running: await `ensureHydrated()`. */
+  get #loadPending(): boolean {
+    return this.#dehydrated !== null || this.#afterHydrate !== null || this.#historyUnread !== null;
+  }
+
+  /** `ensureHydrated()` has work to do (a load, or a load's re-seed still running). */
+  get historyPending(): boolean {
+    return this.#loadPending;
+  }
+
+  /** Whether the scrollback and canonical history are in memory. */
+  get hydrated(): boolean {
+    return this.#dehydrated === null;
+  }
+
+  /**
+   * Resume this session from disk without loading its history: only what it
+   * reports and appends with before the load — the seq its log continues
+   * from, the newest canonical turn, the turn index (small) — is read, from
+   * the files' ends. `#seq` continues past the log, the backend is told it
+   * has a conversation to resume, and a fresh backing's flags are set, as a
+   * full resume sets them. Returns false when the history must be loaded now:
+   * a session from before the canonical log or the turn index (the load
+   * rebuilds and persists them), or one whose log or index couldn't be read
+   * (the load fails as a resume did: the history is resumed without).
+   * Rejects when the transcript is there but can't be read: the session
+   * can't resume, as when a resume couldn't load it — never as one with no
+   * history, whose seq starts over and whose backend starts a new conversation.
+   */
+  async prepareResume(plan: ResumeHistoryPlan): Promise<boolean> {
+    const tail = await this.#transcriptStore.transcriptTail(this.id);
+    let canonical: Awaited<ReturnType<TranscriptStore["canonicalTail"]>> = null;
+    let index: TurnIndexEntry[] | null = null;
+    let indexUnread = false;
+    try {
+      [canonical, index] = await Promise.all([
+        this.#transcriptStore.canonicalTail(this.id),
+        this.#transcriptStore.loadTurnIndex(this.id),
+      ]);
+    } catch {
+      indexUnread = true;
+    }
+    if (tail.nextSeq > this.#seq) this.#seq = tail.nextSeq;
+    // A session with prior scrollback already exists in its backend's own
+    // store — the next send() must resume it, not re-create it.
+    if (tail.hasEntries) this.#provider.setHasQueried(true);
+    this.#dehydrated = {
+      plan,
+      files: tail.files,
+      appended: [],
+      hadIndex: index !== null,
+      ...(indexUnread ? { indexUnread } : {}),
+      lastTurn: canonical?.last ?? null,
+      reseed: false,
+    };
+    if (index) {
+      this.#turnIndex = index;
+      this.#currentTurnId = index.at(-1)?.turnId ?? null;
+      this.#endSnapshotTurn = this.#currentTurnId;
+    }
+    if (plan.backingFresh) {
+      // reseedFreshBacking's flags; its seed waits for the history.
+      this.#backingFresh = true;
+      this.#provider.setHasQueried(false);
+    }
+    // An empty index over a non-empty history names its current turn from the history.
+    return !indexUnread && canonical !== null && index !== null && (index.length > 0 || canonical.last === null);
+  }
+
+  /**
+   * Load the history of a session resumed by `prepareResume`, if it isn't
+   * loaded: idempotent, and concurrent callers share one load. Rejects when
+   * the transcript, canonical log or turn index can't be read (the session
+   * stays unloaded; the next call tries again). At resume (`atResume`) a
+   * canonical log that can't be read is logged and the session goes on
+   * without it, as a resume always did (`#historyUnread`); each later call
+   * reads it again. Resolves once a fresh backing has been re-seeded too.
+   */
+  ensureHydrated(opts: { deadlineAt?: number; atResume?: boolean } = {}): Promise<void> {
+    const d = this.#dehydrated;
+    if (!d && this.#historyUnread) return this.#rereadHistory().then(() => this.#afterHydrate ?? undefined);
+    if (!d) return this.#afterHydrate ?? Promise.resolve();
+    if (!d.loading) {
+      const loading = this.#hydrate(d, opts.deadlineAt, opts.atResume === true).then(() => this.#afterHydrate ?? undefined);
+      d.loading = loading;
+      loading.catch(() => {
+        if (d.loading === loading) d.loading = undefined;
+      });
+    }
+    return d.loading;
+  }
+
+  async #hydrate(d: Dehydrated, deadlineAt = Date.now() + d.plan.deadlineMs, atResume = false): Promise<void> {
+    const started = performance.now();
+    // The window an eager resume read: the log as it was at the restart.
+    // What was appended since is left out (it is in memory).
+    const stats: { truncated?: boolean } = {};
+    const window = { maxBytes: d.plan.transcriptMaxBytes, deadlineAt, stats, asOf: d.files };
+    const entries = await this.#transcriptStore.loadTranscript(this.id, window);
+    const loaded: LoadedHistory = { entries, truncated: stats.truncated === true, canonical: null };
+    try {
+      loaded.canonical = await this.#transcriptStore.loadCanonical(this.id, { maxBytes: d.plan.canonicalMaxBytes });
+      if (d.indexUnread) loaded.index = await this.#transcriptStore.loadTurnIndex(this.id);
+      // No log: a session from before it existed. Rebuild once from the
+      // WHOLE transcript (the scrollback window may be a tail) and persist it
+      // — a long session's history must not shrink to the window.
+      if (!loaded.canonical && loaded.truncated) {
+        const all = await this.#transcriptStore.loadTranscript(this.id, { deadlineAt, asOf: d.files });
+        loaded.rebuildFrom = all.map((e) => e.message);
+      }
+    } catch (err) {
+      // After the resume, the session is used: it must not go on without its
+      // conversation. The request fails, and the next use loads it again.
+      if (!atResume) throw err;
+      loaded.canonicalError = err;
+    }
+    // Loaded synchronously meanwhile (#hydrateNow): that load stands.
+    if (this.#dehydrated !== d) return;
+    this.#installHistory(d, loaded, atResume ? null : started);
+  }
+
+  /**
+   * Load the history now, synchronously: a synchronous path needs it and
+   * nothing awaited `ensureHydrated()` first. Correct, but it blocks the
+   * daemon for the read, so it is logged with where it came from.
+   */
+  #hydrateNow(what: string): void {
+    const d = this.#dehydrated;
+    if (!d) return;
+    const started = performance.now();
+    Session.syncHydrations++;
+    const where = new Error().stack?.split("\n").slice(3, 6).map((l) => l.trim()).join(" < ") ?? "";
+    console.warn(`[codeoid/session ${this.id}] ${what} needed before it was loaded — loading it synchronously (${where})`);
+    const stats: { truncated?: boolean } = {};
+    const deadlineAt = Date.now() + d.plan.deadlineMs;
+    const window = { maxBytes: d.plan.transcriptMaxBytes, deadlineAt, stats, asOf: d.files };
+    // Any read error throws, the session left unloaded, as in `#hydrate`.
+    const entries = this.#transcriptStore.loadTranscriptSync(this.id, window);
+    const loaded: LoadedHistory = { entries, truncated: stats.truncated === true, canonical: null };
+    loaded.canonical = this.#transcriptStore.loadCanonicalSync(this.id, { maxBytes: d.plan.canonicalMaxBytes });
+    if (d.indexUnread) loaded.index = this.#transcriptStore.loadTurnIndexSync(this.id);
+    if (!loaded.canonical && loaded.truncated) {
+      loaded.rebuildFrom = this.#transcriptStore
+        .loadTranscriptSync(this.id, { deadlineAt, asOf: d.files })
+        .map((e) => e.message);
+    }
+    this.#installHistory(d, loaded, started);
+  }
+
+  /** Put a load's history in place, as a resume did: one synchronous step. */
+  #installHistory(d: Dehydrated, loaded: LoadedHistory, started: number | null): void {
+    this.#dehydrated = null;
+    const { entries } = loaded;
+    // Restore scrollback from transcript. Byte-budgeted + deadline-aware: one
+    // huge transcript can neither OOM the daemon nor stall the load. The seq
+    // counter continues past the log's newest line (prepareResume), and now
+    // past its highest seq too: a log whose seqs went back down (an older
+    // daemon restarted them, an import) holds it further up.
+    const messages = entries.map((e) => e.message);
+    const maxSeq = entries.reduce((max, e) => Math.max(max, e.seq), -1);
+    this.restoreScrollback(messages, maxSeq + 1, entries.map((e) => e.bytes), {
+      partialHistory: loaded.truncated,
+      markQueried: false,
+    });
+    // The backend-neutral conversation (#354). Without it a restored session
+    // forked / switched backend with no history, and stateless backends
+    // answered the next prompt with no memory of the session.
+    let canonicalError = loaded.canonicalError;
+    if (canonicalError === undefined) {
+      try {
+        const rebuildFrom = loaded.rebuildFrom ?? messages;
+        const history =
+          loaded.canonical?.turns ??
+          (rebuildFrom.length > 0 ? canonicalFromTranscript(rebuildFrom, d.plan.providerId) : []);
+        // The index read at resume, or by the load when it couldn't be then.
+        const index = loaded.index !== undefined ? loaded.index : d.hadIndex ? this.#turnIndex : null;
+        this.restoreTurns(history, index ?? turnIndexFromHistory(history), {
+          persistHistory: !loaded.canonical && history.length > 0,
+          persistIndex: !index && history.some((t) => t.turnId),
+          partial: loaded.canonical?.partial ?? false,
+        });
+      } catch (err) {
+        canonicalError = err;
+      }
+    }
+    if (canonicalError !== undefined) {
+      const error = canonicalError instanceof Error ? canonicalError.message : String(canonicalError);
+      this.#historyUnread = { plan: d.plan, indexUnread: d.indexUnread === true, error };
+      console.error(
+        `[codeoid/resume] canonical history restore failed for ${this.id} (session resumes without it, and reads it again on its next use): ${error}`,
+      );
+    }
+    // What this process appended before the load, in order, as it was pushed live.
+    for (const msg of d.appended) this.#scrollbackBuffer.push(msg);
+    const reseedFresh = d.plan.backingFresh && canonicalError === undefined;
+    if (reseedFresh || d.reseed) {
+      const after: Promise<void> = (async () => {
+        if (reseedFresh) await this.reseedFreshBacking();
+        if (d.reseed) await this.#reseedAfterTeardown();
+      })()
+        .catch((err) => {
+          console.error(
+            `[codeoid/resume] canonical history restore failed for ${this.id} (session resumes without it): ${err instanceof Error ? err.message : String(err)}`,
+          );
+        })
+        .finally(() => {
+          if (this.#afterHydrate === after) this.#afterHydrate = null;
+        });
+      this.#afterHydrate = after;
+    }
+    if (started === null) return; // part of the resume: not worth a line per session
+    const ms = Math.round(performance.now() - started);
+    console.log(
+      `[codeoid/session ${this.id.slice(0, 8)}] history loaded: ${this.#scrollbackBuffer.length} message(s), ${this.#historyAccumulator.history.length} turn(s) in ${ms}ms`,
+    );
+  }
+
+  /**
+   * Read the canonical log again, for a session that couldn't at resume
+   * (`#historyUnread`): never rejects, the session goes on without it until
+   * a read succeeds. Not while a turn runs (its reply is being built in the
+   * history), and a read that something changed the history or the turn
+   * list under is dropped: the next use reads again.
+   */
+  #rereadHistory(): Promise<void> {
+    const u = this.#historyUnread;
+    if (!u || this.#turnActive() || this.#destroyed) return Promise.resolve();
+    u.retry ??= this.#reread(u).finally(() => {
+      u.retry = undefined;
+    });
+    return u.retry;
+  }
+
+  async #reread(u: HistoryUnread): Promise<void> {
+    const history = this.#historyAccumulator.history;
+    const indexed = this.#turnIndex;
+    let canonical: Awaited<ReturnType<TranscriptStore["loadCanonical"]>>;
+    let index: TurnIndexEntry[] | null = null;
+    try {
+      canonical = await this.#transcriptStore.loadCanonical(this.id, { maxBytes: u.plan.canonicalMaxBytes });
+      if (u.indexUnread) index = await this.#transcriptStore.loadTurnIndex(this.id);
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err);
+      if (error !== u.error) {
+        u.error = error;
+        console.error(`[codeoid/session ${this.id}] canonical history still can't be read (the session goes on without it): ${error}`);
+      }
+      return;
+    }
+    if (
+      this.#historyUnread !== u ||
+      this.#destroyed ||
+      this.#turnActive() ||
+      this.#historyAccumulator.history !== history ||
+      this.#historyAccumulator.history.length !== history.length ||
+      this.#turnIndex !== indexed ||
+      this.#turnIndex.length !== indexed.length
+    ) {
+      return;
+    }
+    // What this process appended since is in the log too. No log: nothing was
+    // written since, and nothing on disk to keep.
+    const turns = canonical?.turns ?? history;
+    try {
+      const turnIndex = u.indexUnread ? (index ?? turnIndexFromHistory(turns)) : indexed;
+      this.restoreTurns(turns, turnIndex, {
+        persistHistory: false,
+        persistIndex: u.indexUnread && !index && turns.some((t) => t.turnId),
+        partial: canonical?.partial ?? false,
+      });
+    } catch (err) {
+      console.error(`[codeoid/session ${this.id}] canonical history read again but not restored: ${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    this.#historyUnread = null;
+    console.log(`[codeoid/session ${this.id.slice(0, 8)}] canonical history read again: ${turns.length} turn(s)`);
+    // A fresh backing no turn has used yet is owed the history it missed.
+    if (u.plan.backingFresh && this.#backingFresh && turns.length > 0) {
+      await this.reseedFreshBacking().catch((err) => {
+        console.error(
+          `[codeoid/session ${this.id}] re-seeding the backend from the history read again failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
+    }
+  }
+
+  /** Refuse what would rewrite the canonical log from a history that couldn't be read (`#historyUnread`). */
+  #assertHistoryRead(): void {
+    if (this.#historyUnread) throw new RewindError("history_unavailable", HISTORY_UNREAD_REFUSAL);
+  }
+
+  /**
+   * A backend that can't resume its own conversation (the Gemini CLI starts
+   * a new ACP session) is handed the history after a teardown. A session
+   * whose history isn't loaded owes it until the load: nothing reaches the
+   * backend before then.
+   */
+  async #reseedAfterTeardown(): Promise<void> {
+    if (!RESEED_AFTER_TEARDOWN.has(this.#provider.id)) return;
+    if (this.#dehydrated) {
+      this.#dehydrated.reseed = true;
+      return;
+    }
+    if (this.#accumulator.history.length > 0) await this.#seedProviderFromHistory();
+  }
+
+  /**
+   * Push a message onto the scrollback — or, history not loaded yet, keep it
+   * for the load, which pushes it after what it restores, as if it had been
+   * pushed live (the load reads the log as it was before it was appended).
+   */
+  #buffer(msg: SessionMessage): void {
+    if (this.#dehydrated) this.#dehydrated.appended.push(msg);
+    else this.#scrollbackBuffer.push(msg);
+  }
+
   restoreScrollback(
     messages: DaemonMessage[],
     nextSeq?: number,
     sizeHints?: ReadonlyArray<number | undefined>,
-    opts?: { partialHistory?: boolean },
+    /** `markQueried: false`: the caller has told the backend already (`prepareResume`). */
+    opts?: { partialHistory?: boolean; markQueried?: boolean },
   ): void {
     // Restart-restore with a byte-budgeted transcript window: the buffer
     // holds only the tail, so history paging must know disk has more.
@@ -6993,7 +7583,7 @@ export class Session {
     }
     // A session with prior scrollback already exists in Claude Code's own
     // persistent session store — next send() must use `resume`, not re-create.
-    if (messages.length > 0) {
+    if (messages.length > 0 && opts?.markQueried !== false) {
       this.#provider.setHasQueried(true);
     }
   }
@@ -7324,14 +7914,20 @@ export class Session {
   get turnInFlight(): boolean {
     // A continuation still to come (background results to deliver, a wake
     // armed) is a turn on its way: its spend belongs with this one's (#430).
+    // Not once the daemon is draining: none is delivered then.
+    if (this.#draining) return this.turnUnsettled;
     return (
-      this.#activeRun !== null ||
-      this.#drainingConsumers > 0 ||
+      this.turnUnsettled ||
       this.#backgroundWakeFallback !== null ||
       // Reports that can still be delivered (a wake runs at rest); after an
       // error they wait for the next turn, which is no turn on its way.
       (this.#pendingBackgroundReports.length > 0 && (this.#status === "idle" || this.#status === "waiting_approval"))
     );
+  }
+
+  /** A turn is running, or its consumer hasn't recorded its end (spend included) yet. */
+  get turnUnsettled(): boolean {
+    return this.#activeRun !== null || this.#drainingConsumers > 0;
   }
 
   /** Every live background task, a shell or a watcher included (#430). */
@@ -7922,9 +8518,7 @@ export class Session {
     // Switched since to a backend that takes it per turn: nothing to rebuild.
     if (this.#provider.effortChange !== "restart") return;
     await this.#teardownProvider();
-    if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
-      await this.#seedProviderFromHistory();
-    }
+    await this.#reseedAfterTeardown();
   }
 
   /**
@@ -7968,6 +8562,7 @@ export class Session {
    * then rotating is the only way forward, however few turns there are.
    */
   async manualRotate(sender: AuthContext): Promise<boolean> {
+    if (this.#loadPending) await this.ensureHydrated();
     const stuck = this.#promptTooLong || this.#status === "error";
     if (!stuck && this.#usage.numTurns < (this.#config?.autoRotate.minTurnsBeforeRotate ?? 3)) {
       const infoMsg = this.#makeMessage(
@@ -8048,6 +8643,9 @@ export class Session {
     // CRITICAL: reset the provider so it creates a fresh session rather
     // than trying to resume an id that has no persisted history.
     this.#provider.resetToNewSession(newBackingId);
+    // A rotation empties the log whatever it held: one that couldn't be read
+    // (`#historyUnread`) loses nothing by it, and is now what memory holds.
+    this.#historyUnread = null;
     this.#accumulator.reset();
     // Re-snapshot the frozen workspace index for the fresh context (the rotated
     // session gets an up-to-date orientation; within the context it stays stable
@@ -9556,6 +10154,13 @@ export class Session {
           this.#commitStreamed(this.#activeAssistantMsg);
           this.#broadcastRaw(this.#activeAssistantMsg);
           this.#activeAssistantMsg = null;
+        } else if (event.content && this.#turnInterrupted) {
+          // A stopped turn's last reply, shown whole: animating it held the
+          // turn's end, and so a shutdown's drain, for up to half a second.
+          const msg = this.#makeMessage("assistant", event.content, this.#agentIdentity, []);
+          msg.parts = [{ kind: "text", text: event.content, markdown: true }];
+          this.#commitStreamed(msg);
+          this.#broadcastRaw(msg);
         } else if (event.content) {
           // No preceding text_delta — the SDK returned the response as a batch
           // (happens for mid-turn now-priority continuations). Simulate streaming
@@ -9941,10 +10546,11 @@ export class Session {
         // finally reconciles sub-agents alongside tools. Sweeping here too would
         // just be a redundant pass a few statements earlier.
         // Hook seam: observe-only (git-checkpoint per turn, usage export).
-        this.#hookBus?.emit("after_turn", this.#hookContext(), {
+        const hooks = this.#hookBus?.emit("after_turn", this.#hookContext(), {
           result: event.result,
         });
-        void this.#checkGitControl(SYSTEM_IDENTITY.sub);
+        if (hooks) this.#keepTurnEnd(hooks);
+        this.#keepTurnEnd(this.#checkGitControl(SYSTEM_IDENTITY.sub));
         this.#tidyWorktreeFolders();
         if (event.result.isError) {
           const errText = event.result.errorMessage ?? "Turn ended with an error";
@@ -10361,7 +10967,8 @@ export class Session {
    * transcript.
    */
   #throwIfStoppedBeforeStart(stopGen: number): void {
-    if (stopGen === this.#stopGen && !this.#destroyed) return;
+    // A send queued before drain began doesn't start its turn after it.
+    if (stopGen === this.#stopGen && !this.#destroyed && !this.#draining) return;
     if (!this.#destroyed) {
       const note = this.#makeMessage(
         "info",
@@ -10560,6 +11167,8 @@ export class Session {
 
   /** The whole canonical history: from the log when memory holds only its tail. */
   async fullCanonicalHistory(): Promise<readonly CanonicalTurn[]> {
+    if (this.#loadPending) await this.ensureHydrated();
+    this.#assertHistoryRead();
     if (!this.#canonicalPartial) return this.#accumulator.history;
     const full = await this.#transcriptStore.loadCanonical(this.id);
     return full && full.turns.length >= this.#accumulator.history.length ? full.turns : this.#accumulator.history;
@@ -10610,6 +11219,8 @@ export class Session {
    * all of it comes from codeoid's own records.
    */
   async forkPoint(turnId: string): Promise<ForkPoint> {
+    if (this.#loadPending) await this.ensureHydrated();
+    this.#assertHistoryRead();
     // One copy of the turn list: a rewind during the awaits below must not
     // make the turns and the conversation disagree.
     const index = this.#turnIndex.map((e) => ({ ...e }));
@@ -10831,6 +11442,8 @@ export class Session {
 
   /** What going back to before `turnId` would remove, restore and not undo. */
   async #planRewind(turnId: string, restoreFiles: boolean): Promise<RewindOutcome> {
+    if (this.#loadPending) await this.ensureHydrated();
+    this.#assertHistoryRead();
     const pos = this.#turnIndex.findIndex((e) => e.turnId === turnId);
     if (pos === -1) throw new RewindError("not_found", "That turn isn't in this session (or is older than its turn list).");
     const removedIds = this.#turnIndex.slice(pos).map((e) => e.turnId);
@@ -10979,6 +11592,9 @@ export class Session {
     if (this.rewindNeedsStop && opts.canStop !== true) {
       throw new RewindError("busy", "The session is busy; going back would stop it, which needs session:interrupt.");
     }
+    if (this.#loadPending) await this.ensureHydrated();
+    // Before anything is stopped: the log couldn't be read, so nothing changes.
+    this.#assertHistoryRead();
     this.#rewinding = true;
     try {
       return await this.#rewindStopped(turnId, opts, sender);
@@ -11253,7 +11869,9 @@ export class Session {
 
   /** Persist to transcript + scrollback buffer + memory chunker */
   #persistAndBuffer(msg: SessionMessage): void {
-    this.#scrollback.push(msg);
+    // A notice for a session whose history isn't loaded (a mode change, a
+    // rename) doesn't load it: it is kept for the load.
+    this.#buffer(msg);
     // Log instead of swallowing — a silently-dropped transcript write means a
     // turn that's missing on resume with no trace. (Scrollback above is the
     // in-memory handoff source and is synchronous, so device-handoff replay

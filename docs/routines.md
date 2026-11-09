@@ -142,7 +142,7 @@ So a routine that asks "is anything wrong?" stays quiet on the days when nothing
 | `over_budget` | It crossed `--max-cost` and was stopped. Counts toward the failure pause. |
 | `skipped` | It didn't run: the last run was still going (`--overlap skip`), a run was already queued behind it (`--overlap queue`), a persistent routine's session was busy, waiting on you, or had your background work going, the daily spend cap was reached, the routine was paused before it started, or the fire was missed during downtime. |
 | `cancelled` | You cancelled it (`codeoid routine cancel <runId>`). |
-| `interrupted` | The daemon stopped while it was in flight. |
+| `interrupted` | The daemon stopped while it was in flight. Its spend up to the stop is recorded before the daemon exits (unless its backend didn't end the turn within its settle bound, 2 s, opencode 3 s: then the run is recorded with its cost unknown). |
 
 A `needs_attention` run keeps tracking its session after it ends.
 When you approve and the agent finishes, the run's cost and summary are updated, so the spend counts toward the daily cap and the history shows what was actually done.

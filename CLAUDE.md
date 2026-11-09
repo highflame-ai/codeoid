@@ -150,6 +150,7 @@ Sessions live in the daemon. Clients are stateless.
 - **Scrollback buffer**: circular ring (5000 entries / 20MB) replayed on attach
 - **Transcript persistence**: JSONL per session, user prompts written before API call
 - **Session resume**: on daemon restart, meta files scanned, sessions rebuilt, scrollback restored
+- **Lazy loading** (`session.lazyLoad`, default on): a resumed session holds its metadata only (`Session.prepareResume`: the log's next seq and a mark of each of its files, its newest canonical turn, the turn index) and loads its scrollback and canonical history the first time it is used, exactly as a resume loaded them: the load reads the files as they stood at resume (`LoadTranscriptOptions.asOf`: by identity and size, so whatever was appended since is left out, whatever its seqs; an old log's seqs can go back down), and `#seq` then continues past the highest seq loaded. A transcript that can't be read at start fails the session's resume (logged, left on disk), as before. A transcript, canonical log or turn index that can't be read at a later load fails that use (the session left unloaded, read again on the next). A canonical log that can't be read when the history loads at resume (`lazyLoad: false`, or a session loaded then) leaves the session running without it, as before, but never written over (`Session#historyUnread`): going back or forking from it is refused (`RewindError` `history_unavailable`), a whole rewrite of it is never written (a rotation, which empties it anyway, excepted), turns are still appended, and each use reads it again (`#rereadHistory`, not mid-turn). Entry points await `Session.ensureHydrated()` (one shared load): `SessionManager.handle` for any message naming a session (less `NO_HISTORY_MESSAGES`, less a caller without the scopes its handler needs, `HISTORY_SCOPES`, and less what a loop worker's guard refuses, `#refusedBeforeHistory`; while one waits, every later message naming that session waits behind it, `#historyGate`, so they run in arrival order; a prompt waiting is a preparing send, `Session.holdSend`, which the drain stops and waits out; a client gone meanwhile is detached after), `send`, and the async history readers; `#scrollback` / `#accumulator` are getters that load synchronously, logged, if anything reaches them first (`Session.syncHydrations`). A notice while unloaded is appended at the next seq and kept for the load (`#buffer`); a re-seed owed by a teardown waits for it (`#reseedAfterTeardown`). Sessions from before the canonical log or turn index, or with a fresh backing, load at resume.
 
 Detach from terminal -> attach from Telegram -> same session, same context, scrollback replayed.
 
@@ -161,8 +162,25 @@ retries the turn on that model instead of failing it. There is no daemon-side
 retry manager.
 
 **Graceful shutdown**: cleanup registry runs in LIFO order on SIGTERM/SIGINT/SIGHUP.
-Sessions drained (in-flight work interrupted), store flushed, WebSockets closed,
-frontends stopped. 30-second grace period before forced exit.
+Sessions drained: from its start no turn starts (a send is refused, a turn
+the backend starts on its own is interrupted as it starts, no wake, recovery
+or seed retry runs: `Session.beginDrain`); in-flight work is interrupted once
+per turn, and every turn not yet recorded (one its owner, a routine or a loop
+stopped just before included) is waited for until its end, spend included, is
+recorded — a backend acknowledges an interrupt before the turn's result
+arrives — but at most its backend's settle bound (`interruptSettleMs`,
+`DRAIN_SETTLE_MS` 2 s; opencode 3 s), all sessions at once, then named in the
+log and left; then, at once and at most `TURN_END_SETTLE_MS` (5 s), what
+each turn's end started and doesn't await (`Session.turnEndWork`: the #448
+git/settings-commit check's audit row and warning line, the end snapshot,
+`after_turn` hooks) and the routine runs' final rows, spend included
+(`RoutineService.settled`: a run waits as long as drain waits for its turn,
+then records it, cost unknown if drain gave up on it); then the transcript
+writes are flushed; polled at 10 ms backing off to 50 ms, bounded by drain's
+10 s, never a fixed wait. Drain is one-way: the manager refuses sends after it.
+A dispatch task whose start a stopping daemon refused goes back to the queue,
+no attempt spent, and a stopped dispatcher claims nothing more. Store flushed,
+WebSockets closed, frontends stopped. 30-second grace period before forced exit.
 
 **One daemon per data dir**: `codeoid start` locks each dir the daemon owns
 (`daemonOwnedDirs`: the database's, transcripts, opencode's database and data

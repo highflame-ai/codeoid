@@ -183,6 +183,8 @@ describe("project roots and added directories through the SessionManager", () =>
     expect(await m.handle({ type: "session.ui_response", id: "u", sessionId: id, requestId, confirmed: true } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
     await until(() => audits.some((a) => a.action === "session.sandbox_dir_added"));
     expect(audits.find((a) => a.action === "session.sandbox_dir_added")?.detail).toBe(`${sibling} by=owner`);
+    // The audit row is written as the setting changes; the session's info follows once its sandbox is re-resolved.
+    await until(() => (m.findByName(info?.name as string, AUTH)?.toInfo()?.sandbox?.addedDirs?.length ?? 0) > 0);
     const after = m.findByName(info?.name as string, AUTH)?.toInfo();
     expect(after?.sandbox?.addedDirs).toEqual([sibling]);
     expect(sandboxSummary(after?.sandbox)).toContain(`also writes ${sibling}`);

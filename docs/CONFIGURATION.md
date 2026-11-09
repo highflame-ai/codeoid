@@ -87,6 +87,9 @@ CODEOID_RESUME_MAX_SESSIONS=200          # sessions restored from disk at startu
                                         #   Resume is also time-boxed, so raising this costs
                                         #   startup time; the remainder stays on disk and loads
                                         #   on a later restart.
+CODEOID_SESSION_LAZY_LOAD=true          # a resumed session loads its scrollback and history the
+                                        #   first time it is used (opened, sent to, forked, …),
+                                        #   not at start; false loads every session's at start
 CODEOID_IDLE_RELEASE_MINUTES=30         # minutes idle before a session's backend process and
                                         #   everything it started (MCP servers, commands still
                                         #   running) are stopped; the next message resumes it

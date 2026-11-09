@@ -93,6 +93,12 @@ const general: SettingsTab = {
           default: 200,
           advanced: true,
         }),
+        cfg("session.lazyLoad", "Load history on first use", "A resumed session loads its scrollback and history the first time it is opened or used, not at daemon start. Off loads every session's at start (more memory).", {
+          kind: "boolean",
+          envVar: "CODEOID_SESSION_LAZY_LOAD",
+          default: true,
+          advanced: true,
+        }),
       ],
     },
     {

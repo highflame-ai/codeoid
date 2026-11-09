@@ -581,6 +581,11 @@ function commandDigest(command: string | undefined): string {
 
 /** Midnight UTC of the day `ms` falls in — the daily spend cap's window. */
 /** How long a stop on a held session gets to land before it's tried again, and how often it is. */
+/**
+ * At shutdown a run's wind-down polls every 10 ms for its turn to end; this
+ * many polls (about drain's 10 s) back up `settled()`, which ends it sooner.
+ */
+const STOPPING_POLLS = 1_000;
 const STOP_RETRY_MS = 10_000;
 const STOP_TRIES = 3;
 
@@ -662,6 +667,8 @@ export class RoutineService {
   #timer: ReturnType<typeof setInterval> | null = null;
   #ticking = false;
   readonly #live = new Map<string, LiveRun>();
+  /** Each live run's execution, until it has recorded its end. */
+  readonly #running = new Set<Promise<void>>();
   /** sessionId → the live run waiting on it. */
   readonly #bySession = new Map<string, LiveRun>();
   /**
@@ -675,6 +682,12 @@ export class RoutineService {
   /** Routines being deleted: nothing fires or starts for them, and a run that ends meanwhile (its loop cancelled) tells no one. */
   readonly #deleting = new Set<string>();
   #stopped = false;
+  /**
+   * Set by `settled()` at shutdown: the daemon's drain has waited for every
+   * turn as long as it will (each its backend's settle bound). A run whose
+   * turn hasn't ended by now records its row with the cost unknown.
+   */
+  #settling = false;
 
   constructor(
     store: RoutineStore,
@@ -711,6 +724,7 @@ export class RoutineService {
   start(): void {
     if (!this.config.enabled || this.#timer) return;
     this.#stopped = false;
+    this.#settling = false;
     // First: a run whose loop started but which died before it recorded the
     // loop (or was closed as interrupted for it) follows that loop again.
     this.#relinkLoops();
@@ -734,6 +748,27 @@ export class RoutineService {
       live.abort.abort();
       live.wake();
     }
+  }
+
+  /**
+   * After `stop()`, at shutdown, once the daemon's drain has waited for the
+   * turns: resolves true once every live run has recorded its end (its row,
+   * spend included), false after `timeoutMs`. A run whose turn drain gave up
+   * on records it now, the cost unknown. Drain awaits it before the store closes.
+   */
+  async settled(timeoutMs: number): Promise<boolean> {
+    this.#settling = true;
+    if (this.#running.size === 0) return true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const ended = await Promise.race([
+      Promise.allSettled([...this.#running]).then(() => true),
+      new Promise<false>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+    clearTimeout(timer);
+    return ended;
   }
 
   /**
@@ -976,11 +1011,13 @@ export class RoutineService {
         abort: new AbortController(),
       };
       this.#live.set(run.id, live);
-      void this.#execute(routine, run, live).finally(() => {
+      const running = this.#execute(routine, run, live).finally(() => {
         this.#live.delete(run.id);
+        this.#running.delete(running);
         if (live.sessionId) this.#bySession.delete(live.sessionId);
         this.#drainQueue();
       });
+      this.#running.add(running);
     }
   }
 
@@ -1247,9 +1284,14 @@ export class RoutineService {
         if (force) await this.#host.interrupt(id, { turnOnly: true }).catch(() => {});
         let stoppedTasks = false;
         let quiet = 0;
-        for (let i = 0; i < 100; i++) {
+        // Stopping: as long as the daemon's drain waits for the turn (its
+        // backend's settle bound), not a fixed count; `settled()` ends it.
+        // STOPPING_POLLS only backs that up, for a stop with no drain after it.
+        for (let i = 0; i < (this.#stopped ? STOPPING_POLLS : 100); i++) {
           const info = this.#host.info(id);
           if (!info) return;
+          // Drain has given up on the turn: record the run now, before the store closes.
+          if (this.#settling && info.turnInFlight) break;
           if (info.turnInFlight && info.lastTurnId !== turnAtStop) {
             turnAtStop = info.lastTurnId;
             unsettled = true;
@@ -1272,12 +1314,14 @@ export class RoutineService {
               stoppedTasks = true;
               quiet = 0;
               await this.#host.stopBackgroundTasks(id, left).catch(() => {});
-            } else if (!(force || stoppedTasks) || ++quiet >= 3) {
+            } else if (!(force || stoppedTasks) || ++quiet >= 3 || this.#stopped) {
               // After a stop, a few quiet polls: a wake that slipped in shows up as a turn.
+              // Not when the daemon is stopping: no wake is delivered then, and the store closes next.
               return;
             }
           }
-          await this.#sleep(100);
+          // Stopping: the row is written as soon as the turn has ended, before the store closes.
+          await this.#sleep(this.#stopped ? 10 : 100);
         }
         unsettled = true;
       };
