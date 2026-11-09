@@ -167,6 +167,9 @@ export function claudeSandboxSettings(
       // between the workspace and a hidden path in it (nothing renames it away).
       // A pinned dir holding something writable (an added dir's dir on the way to the workspace) isn't denied:
       // the CLI's denial takes the subtree, which would make that read-only; the gate checks the pins instead.
+      // Nor a dir held in place (spec.heldInPlace: the working directory and its way up, a held path's parents,
+      // #448 round 14): the CLI binds every dir from a writable root down to what it binds in it, so each is a
+      // mount point already, no rename (checked on the real CLI: sandbox-claude-real.test.ts "held in place").
       denyWrite: physical([...claudeSettingsPaths(spec.workspace, env), ...denyAround(spec.readOnly ?? [], spec.writable), ...(spec.pinned ?? []).filter((p) => !holdsWritable(p, [spec.workspace, ...spec.writable]))]),
       // Local services' sockets too while the network is off (spec.serviceSockets): those in the host's /tmp are
       // behind its seccomp's unix socket block, or the denied /tmp with every socket allowed.

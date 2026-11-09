@@ -23,7 +23,9 @@
  * offline, with an environment of its own) or not, and a second query after the first (a new
  * CLI start in the same workspace, the one that runs its `git status`);
  * the second one's system prompt is told as `system`. A workspace of the
- * test's own: `CODEOID_PROBE_WORKSPACE`; the session's worktree folder
+ * test's own: `CODEOID_PROBE_WORKSPACE`; the session's cwd below it
+ * (a monorepo's package; the CLI then loads the project's settings):
+ * `CODEOID_PROBE_WORKDIR`; the session's worktree folder
  * name: `CODEOID_PROBE_WORKTREE_FOLDER`; its project roots and added dirs
  * (comma-separated): `CODEOID_PROBE_PROJECT_ROOTS`, `CODEOID_PROBE_ADDED_DIRS`. Run in its own
  * process: a test file that mocks the SDK module must not see this one.
@@ -117,6 +119,9 @@ const spec = policy
   ? buildSandboxSpec({
       sessionId: "probe",
       workspace,
+      // CODEOID_PROBE_WORKDIR: the session's cwd below the workspace (a monorepo's package), which the CLI starts in
+      // with the project's settings (a new Claude start there loads them).
+      ...(process.env.CODEOID_PROBE_WORKDIR ? { workdir: process.env.CODEOID_PROBE_WORKDIR } : {}),
       tempDir: join(root, "tmp"),
       network: network === "allowlist" ? { mode: network, allow: [allowHost] } : { mode: network },
       config: { sandbox: config } as never,
@@ -174,12 +179,12 @@ async function run(): Promise<void> {
   for await (const m of query({
     prompt: "run the probe",
     options: {
-      cwd: workspace,
+      cwd: process.env.CODEOID_PROBE_WORKDIR || workspace,
       env: cliEnv,
       sandbox,
       ...(nativeEnv ? { mcpServers: { probe: { type: "stdio" as const, command: process.execPath, args: [join(import.meta.dir, "env-dump.ts"), join(root, "mcp-env.json")] } } } : {}),
       permissionMode: "default",
-      settingSources: [],
+      settingSources: process.env.CODEOID_PROBE_WORKDIR ? ["project", "user"] : [],
       // The preset's context carries the CLI's git status (what its own git found).
       ...(gitMode ? { systemPrompt: { type: "preset" as const, preset: "claude_code" as const } } : {}),
       canUseTool: async (name, input) => {

@@ -118,6 +118,17 @@ export interface SandboxSpec {
    */
   pinned?: readonly string[];
   /**
+   * Directories held in place as {@link pinned} ones are (a mount point, a
+   * denied rename), what is in them writable, but never read-only on
+   * Claude's own sandbox (whose denial takes a subtree; its CLI binds the
+   * working directory's ancestors itself): the working directory and each
+   * dir between it and the workspace, and each dir between a writable root
+   * and a path held read-only in it (#448 round 14). Moved aside, each
+   * would take what is held in it along and leave its place to a planted
+   * copy (a package's `.claude/settings.json`).
+   */
+  heldInPlace?: readonly string[];
+  /**
    * The session's own folder in each of the repository's worktree locations
    * (in {@link writable} too): where a command checks a new worktree out
    * (`<repo>-worktrees/<folder>`, `.worktrees/<folder>`,

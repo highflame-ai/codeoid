@@ -13,7 +13,8 @@
  *   --ro-bind /dev/null <f>  a hidden file or socket: empty, and nothing to connect to
  *   --ro-bind <p> <p>        read-only inside something writable (what of a repository decides its config,
  *                            hooks and git dir; the project settings agent CLIs run code from)
- *   --bind <d> <d>           a pinned directory: a mount point, so it can't be renamed, still writable inside
+ *   --bind <d> <d>           a pinned directory, or one held in place: a mount point, so it can't be renamed,
+ *                            still writable inside
  *   --ro-bind <s> <s>        a container runtime socket the owner let in (spec.dockerSockets; off by default):
  *                            connecting needs no write to the mount, and it can't be removed or replaced
  *   --setenv                 the toolchains' caches in the sandbox's cache dir (spec.env)
@@ -137,8 +138,9 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
     seen.add(`o:${at}`);
     mounts.push({ kind: "ro-bind", src: at, path: at });
   }
-  // Every dir between a writable root and a hidden path in it: a mount point nothing can rename, still writable inside.
-  for (const p of spec.pinned ?? []) {
+  // Every dir between a writable root and a hidden path in it, and every dir held in place (the working directory
+  // and its way up to the workspace, a held path's parents): a mount point nothing can rename, still writable inside.
+  for (const p of [...(spec.pinned ?? []), ...(spec.heldInPlace ?? [])]) {
     const at = realOr(p);
     // Never one a hidden dir in its writable root covers (or is): its bind would show the real dir again. One in
     // a hidden dir the root is shown again in (the hidden home) is shown already.

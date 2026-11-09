@@ -453,6 +453,68 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(r.toolResult).not.toContain("Read-only file system");
     expect(r.toolResult).not.toContain("LINKROOT-B-ENV");
   }, 300_000);
+  /** A repository at `dir`, one commit, made on the host with no hook and no global config. */
+  function repo(dir: string, home: string): void {
+    mkdirSync(dir, { recursive: true });
+    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, GIT_CONFIG_NOSYSTEM: "1" };
+    const g = (args: string[]) => Bun.spawnSync(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=t", "-c", "user.email=t@example.invalid", ...args], { cwd: dir, env });
+    writeFileSync(join(dir, "README.md"), "readme\n");
+    g(["init", "-q", "-b", "main"]);
+    g(["add", "-A"]);
+    g(["commit", "-qm", "init"]);
+  }
+
+  test("held in place on Claude's own sandbox (#448 round 14): a monorepo package session can't move its package dir, nor the dir above it, to plant the package's project settings", async () => {
+    const home = join(root, "home");
+    const top = join(home, "Workspace", "mono14");
+    const pkg = join(top, "packages", "app");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "index.js"), "1\n");
+    repo(top, home);
+    const command = [
+      `cd ${join(top, "packages")} && mv app app-old 2>&1; echo mv-pkg=$?`,
+      `cd ${top} && mv packages packages-old 2>&1; echo mv-parent=$?`,
+      `echo '{"hooks":{}}' > ${join(pkg, ".claude", "settings.json")} 2>&1 || echo SETTINGS-HELD`,
+      `echo w > ${join(pkg, "own.txt")} && echo PKG-WRITABLE`,
+    ].join("; ");
+    const r = await probe("off", command, ["policy"], { CODEOID_PROBE_WORKSPACE: top, CODEOID_PROBE_WORKDIR: pkg });
+    expect(r.result).toBe("success");
+    expect(r.toolResult).toContain("mv-pkg=1");
+    expect(r.toolResult).toContain("mv-parent=1");
+    expect(r.toolResult).toContain("Device or resource busy");
+    expect(r.toolResult).toContain("SETTINGS-HELD");
+    expect(r.toolResult).toContain("PKG-WRITABLE");
+    expect(existsSync(join(top, "packages", "app-old"))).toBe(false);
+    expect(existsSync(join(top, "packages-old"))).toBe(false);
+    expect(existsSync(join(pkg, ".claude", "settings.json"))).toBe(false);
+  }, 300_000);
+
+  test("held in place on Claude's own sandbox (#448 round 14): a repository inside an added dir can't be moved aside to plant its project settings; a workspace inside an added dir can't have the dir between them moved", async () => {
+    const home = join(root, "home");
+    const W = join(home, "Workspace");
+    const ws = join(W, "a14");
+    const b = join(W, "b14");
+    repo(ws, home);
+    repo(join(b, "lib"), home);
+    const nested = await probe(
+      "off",
+      [`cd ${b} && mv lib lib-old 2>&1; echo mv-lib=$?`, `echo x > ${join(b, "lib", "new.txt")} && echo LIB-WRITABLE`].join("; "),
+      ["policy"],
+      { CODEOID_PROBE_WORKSPACE: ws, CODEOID_PROBE_ADDED_DIRS: b },
+    );
+    expect(nested.result).toBe("success");
+    expect(nested.toolResult).toContain("mv-lib=1");
+    expect(nested.toolResult).toContain("LIB-WRITABLE");
+    expect(existsSync(join(b, "lib-old"))).toBe(false);
+    // A workspace inside an owner-added dir, two levels down: the dir between them stays (findings-s L1).
+    const A = join(W, "outer14");
+    const inner = join(A, "mid", "ws");
+    repo(inner, home);
+    const between = await probe("off", `cd ${A} && mv mid mid2 2>&1; echo mv-mid=$?`, ["policy"], { CODEOID_PROBE_WORKSPACE: inner, CODEOID_PROBE_ADDED_DIRS: A });
+    expect(between.result).toBe("success");
+    expect(between.toolResult).toContain("mv-mid=1");
+    expect(existsSync(join(A, "mid2"))).toBe(false);
+  }, 300_000);
 });
 
 /**

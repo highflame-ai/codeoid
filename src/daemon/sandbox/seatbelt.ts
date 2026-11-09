@@ -118,7 +118,7 @@ export function seatbeltProfile(
   // A repository's hooks and config: not writable, with everything in them.
   for (const p of (spec.readOnly ?? []).map(real)) rules.push({ path: p, kind: "read-only" });
   // Every dir between a writable root and a hidden path in it: the directory itself not writable (so no rename), its contents still.
-  for (const p of (spec.pinned ?? []).map(real)) rules.push({ path: p, kind: "pinned" });
+  for (const p of [...(spec.pinned ?? []), ...(spec.heldInPlace ?? [])].map(real)) rules.push({ path: p, kind: "pinned" });
   const rank = (r: Rule) => (r.kind === "hide" ? 0 : 1);
   rules.sort((a, b) => depth(a.path) - depth(b.path) || rank(a) - rank(b));
 

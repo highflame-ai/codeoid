@@ -1115,7 +1115,9 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   };
   refuse(pinProblem(workspace, "the workspace", { ...(stored[workspace] ? { stored: stored[workspace] } : { mayBeMissing: true }) }));
   const workdir = inputs.workdir !== undefined ? resolve(inputs.workdir) : null;
-  if (workdir && workdir !== workspace) refuse(pinProblem(workdir, "the working directory", { mayBeMissing: true }));
+  // The working directory by its identity too (#448 round 14): one moved aside and replaced, even by a real
+  // directory, is another directory, never bound or snapshotted as the session's.
+  if (workdir && workdir !== workspace) refuse(pinProblem(workdir, "the working directory", stored[workdir] ? { stored: stored[workdir] } : { mayBeMissing: true }));
   // Each added dir as a workspace of its own (never one inside the workspace: it is writable already), and only
   // while it still is what was granted: a directory at its real path, no git or settings dir, every repository and
   // settings dir in it found (project-roots.ts; Session says when one is dropped). One pinned that changed refuses.
@@ -1247,9 +1249,17 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   // something writable.
   const readOnly = [...new Set([...git.readOnly, ...projectConfig].map(realOr))].filter(inWritable);
   // Held in place (no rename, still writable inside): every dir between a writable root and a hidden path in it,
-  // and between two nested writable roots.
+  // and between two nested writable roots (pinned); the working directory and every dir between it and the
+  // workspace (a monorepo's package dir moved aside takes its held settings with it, #448 round 14), and every
+  // dir between a writable root and a path held read-only in it (heldInPlace).
   const pinned = [...new Set([...protectedAncestors(hidden, [workspace, tempDir, ...own, ...addedDirs, ...locations]), ...nestedRootAncestors([workspace, tempDir, ...addedDirs, ...locations], hidden)])];
   // paths: a look (is the working directory there), no write
+  const heldInPlace = [
+    ...new Set([
+      ...(workdir && workdir !== workspace && within(workdir, workspace) && existsSync(workdir) ? [workdir, ...heldAncestors([workdir], [workspace], hidden)] : []),
+      ...heldAncestors(readOnly, writableRoots, hidden),
+    ]),
+  ].filter((p) => !pinned.includes(p));
   // Everything bound by name, as it is now (pinned.ts): checked again at every launch, and bound as it is here.
   // Not what is hidden (a link there hides more), nor the home's allowlist or a program's location (shown by
   // where a link leads, by design), nor the owner's container sockets: none is where a sandbox writes.
@@ -1268,7 +1278,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   for (const w of ownReal) pin(pinOf(w, "a writable directory of the session's"));
   pin(pinOf(tempDir, "the session's temp dir"));
   for (const p of readOnly) pin(pinOf(p, "a path held read-only", { mayBeMissing: true }));
-  for (const p of pinned) pin(pinOf(p, "a directory held in place"));
+  for (const p of [...pinned, ...heldInPlace]) pin(pinOf(p, "a directory held in place"));
   // Made and removed by codeoid between turns, as the folders in them (SessionSandbox.tidyFolders): checked against links.
   for (const l of git.locations) pin(pinOf(realOr(l), "a worktree location", { mayBeMissing: true, noId: true }));
   // The container runtime's sockets, when the owner opted in: reachable at their own paths, `DOCKER_HOST` the first.
@@ -1287,6 +1297,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     ...(addedDirs.length > 0 ? { addedDirs } : {}),
     ...(cache || sockets.length > 0 ? { env: { ...(cache ? toolchainCacheEnv(cache, home, env) : {}), ...(sockets[0] ? { DOCKER_HOST: `unix://${sockets[0]}` } : {}) } } : {}),
     pinned,
+    ...(heldInPlace.length > 0 ? { heldInPlace } : {}),
     pins,
     reexposed,
     containerSockets: containerSocketPaths(home, env).filter((p) => !exposed.has(p) && !exposed.has(realOr(p))),
@@ -1373,6 +1384,31 @@ export function nestedRootAncestors(roots: readonly string[], hidden: readonly s
       if (inner === outer || !within(inner, outer)) continue;
       for (let a = dirname(inner); a !== outer && within(a, outer); a = dirname(a)) {
         if (hiddenReal.some((h) => within(a, h) && within(h, outer) && h !== outer)) continue;
+        out.add(a);
+      }
+    }
+  }
+  return [...out];
+}
+
+/**
+ * The directories between a writable root and a path held in it (`held`:
+ * a path held read-only, the working directory), from the path's parent up,
+ * strictly inside the root: pinned (SandboxSpec.pinned), so none can be
+ * moved aside with what is held in it and made again around a planted copy
+ * (#448 round 14: a monorepo package's `.claude/`, a submodule's hooks).
+ * Never one hidden, or in a hidden dir inside the root. Real paths.
+ */
+export function heldAncestors(held: readonly string[], roots: readonly string[], hidden: readonly string[] = [], exists: (p: string) => boolean = existsSync): string[] {
+  const real = roots.map(realOr);
+  const hiddenReal = hidden.map(realOr);
+  const out = new Set<string>();
+  for (const p of held.map(realOr)) {
+    if (!exists(p)) continue;
+    for (const root of real) {
+      if (p === root || !within(p, root)) continue;
+      for (let a = dirname(p); a !== root && within(a, root); a = dirname(a)) {
+        if (hiddenReal.some((h) => within(a, h) && within(h, root) && h !== root)) continue;
         out.add(a);
       }
     }

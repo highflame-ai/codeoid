@@ -710,17 +710,32 @@ export class SessionSandbox {
     return this.#workspace();
   }
 
-  /** Pin the workspace when it isn't (a new session, or one from before pins): as it is now, at its real path. */
+  /**
+   * Pin the workspace and the working directory when they aren't (a new
+   * session, or one from before pins: the working directory's identity from
+   * #448 round 14): as they are now, at their real paths.
+   */
   #pinWorkspace(): void {
     const pins = this.#setting?.pins;
     const workdir = resolve(this.#workdir);
-    if (pins?.workspace && pins.workdir === workdir) return;
+    if (pins?.workspace && pins.workdir === workdir) {
+      if (pins.ids[workdir] || pins.workspace === workdir) return;
+      // Pinned before the working directory was: its identity now.
+      const record = pinRecord(workdir);
+      if (!record) return;
+      this.#setting = { ...(this.#setting ?? {}), pins: { ...pins, ids: { ...pins.ids, [workdir]: record } } };
+      this.#pinsChanged = true;
+      return;
+    }
     const workspace = sandboxWorkspaceOf(workdir);
     const record = pinRecord(workspace);
     if (!record) return;
     const ids = { ...(pins?.ids ?? {}) };
     if (pins?.workspace && pins.workspace !== workspace) delete ids[pins.workspace];
+    if (pins?.workdir && pins.workdir !== workdir && pins.workdir !== workspace) delete ids[pins.workdir];
     ids[workspace] = record;
+    const own = workdir === workspace ? record : pinRecord(workdir);
+    if (own) ids[workdir] = own;
     this.#setting = { ...(this.#setting ?? {}), pins: { workdir, workspace, ids } };
     this.#pinsChanged = true;
   }
@@ -749,7 +764,7 @@ export class SessionSandbox {
     const workdir = resolve(this.#workdir);
     const problem =
       pinProblem(workspace, "the workspace", { ...(ids[workspace] ? { stored: ids[workspace] } : { mayBeMissing: true }) }) ??
-      (workdir !== workspace ? pinProblem(workdir, "the working directory", { mayBeMissing: true }) : null) ??
+      (workdir !== workspace ? pinProblem(workdir, "the working directory", ids[workdir] ? { stored: ids[workdir] } : { mayBeMissing: true }) : null) ??
       this.#dirs.added.map((d) => pinProblem(d, "added directory", ids[d] ? { stored: ids[d] } : {})).find((p) => p !== null) ??
       this.#dirs.roots.map((r) => pinProblem(r, "project root", ids[r] ? { stored: ids[r] } : {})).find((p) => p !== null) ??
       // Everything else the running sandbox binds by name (#448 round 14: a dir held in place, a path held
