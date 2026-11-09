@@ -2,10 +2,14 @@
  * The {@link SandboxHandle} of a local provider that confines a program by
  * wrapping its argv (bwrap, sandbox-exec, `docker run`): spawn and exec are
  * the wrapped argv run as a child of the daemon, and close ends every child it
- * started that is still running.
+ * started that is still running. Every wrap first checks the spec's pinned
+ * directories (pinned.ts) and refuses when one isn't what it was, and the argv
+ * it hands back checks them again right before the program starts, so a
+ * launcher written from it once checks at each run (#448 round 13).
  */
 
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { pinGuardArgv, pinRefusal, pinsProblem, SandboxPinError } from "./pinned.js";
 import type { SandboxExecOptions, SandboxExecResult, SandboxHandle, SandboxSpawnOptions, SandboxSpec } from "./types.js";
 
 export type ArgvWrapper = (argv: readonly string[], opts: SandboxSpawnOptions) => { argv: string[]; env: Record<string, string> };
@@ -30,13 +34,17 @@ export class LocalSandboxHandle implements SandboxHandle {
 
   wrap(argv: readonly string[], opts: SandboxSpawnOptions): { argv: string[]; env: Record<string, string> } {
     if (this.#closed) throw new Error(`the ${this.providerId} sandbox for session ${this.spec.sessionId} is closed`);
-    return this.#wrap(argv, opts);
+    const problem = pinsProblem(this.spec.pins);
+    if (problem) throw new SandboxPinError(pinRefusal(problem));
+    const wrapped = this.#wrap(argv, opts);
+    return { ...wrapped, argv: pinGuardArgv(this.spec.pins, wrapped.argv) };
   }
 
   spawn(command: string, args: readonly string[], opts: SandboxSpawnOptions): ChildProcessWithoutNullStreams {
     const wrapped = this.wrap([command, ...args], opts);
     const [bin, ...rest] = wrapped.argv;
     if (!bin) throw new Error("empty sandbox argv");
+    // paths: the wrapped argv, its pins just checked by wrap (and again by the guard in it); its cwd is inside the sandbox it starts
     const child = spawn(bin, rest, { cwd: opts.cwd, env: wrapped.env, stdio: ["pipe", "pipe", "pipe"] });
     this.#children.add(child);
     child.once("exit", () => this.#children.delete(child));

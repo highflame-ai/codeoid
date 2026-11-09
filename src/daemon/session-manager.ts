@@ -8,6 +8,8 @@
  *   - Graceful drain on shutdown
  */
 
+import { addedDirProblem, type OtherCheckout, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
+import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
@@ -137,13 +139,15 @@ import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
-import { effectiveSetting, openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
-import { sandboxConfigOf } from "./sandbox/policy.js";
+import { canonicalAddedDirs, effectiveSetting, openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { checkPinned, type PinnedDir, PinnedPathError } from "./sandbox/pinned.js";
+import { sandboxRootIfMade } from "./sandbox/root.js";
+import { hiddenPathsFor, sandboxConfigOf } from "./sandbox/policy.js";
 import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
 import { isOAuthServer, type McpServerSpec, OAUTH_UNSUPPORTED_BACKENDS } from "./mcp/types.js";
-import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
+import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, getConfigDir, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { endpointNameOf, endpointProviderId, ORCHESTRATOR_ROLE, type ProviderInfo } from "../protocol/types.js";
 import type {
@@ -507,6 +511,10 @@ export class SessionManager {
   /** Goal-blackboard MCP endpoint + the loopback URL children mount it from.
    *  Always constructed: with no minted tokens every request fails closed. */
   readonly #blackboardMcp = new BlackboardMcpHttp();
+  /** The sandbox's `request_directory` for the URL-mounting backends (sandbox/request-directory.ts): one token per session. */
+  readonly #sandboxMcp = new SandboxMcpHttp((sessionId, input) => this.#requestDirectoryFor(sessionId, input));
+  #sandboxMcpUrl?: string;
+  readonly #sandboxMcpTokens = new Map<string, string>();
   #blackboardUrl?: string;
   /** Per-goal artifact store, lazily built on the shared DB connection. */
   #blackboard?: Blackboard;
@@ -1074,6 +1082,8 @@ export class SessionManager {
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           accounts: this.#accounts,
           claudeAccount: meta.claudeAccount ?? null,
@@ -1469,6 +1479,8 @@ mcpHub: this.#mcpHub,
         return this.#loopWorkerGuard(msg, "change the mode of") ?? this.#setMode(msg, auth);
       case "session.set_sandbox":
         return this.#loopWorkerGuard(msg, "change the sandbox of") ?? this.#setSandbox(msg, auth);
+      case "session.sandbox_dir":
+        return this.#loopWorkerGuard(msg, "change the sandbox of") ?? this.#sandboxDir(msg, auth);
       case "sandbox.providers":
         return this.#sandboxProviders(msg, auth);
       case "session.pin":
@@ -1912,6 +1924,8 @@ mcpHub: this.#mcpHub,
               transcriptStore: this.#transcriptStore,
               providers: this.#providers,
               sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
               claudeAccounts: this.#claudeAccounts,
               hooks: this.#hooks,
               ...(this.#identityManager
@@ -1991,7 +2005,7 @@ mcpHub: this.#mcpHub,
       };
     }
     try {
-      const snapshot = await readClaudeConfig(session.workdir);
+      const snapshot = await readClaudeConfig(session.pinnedWorkdir("reading the project's MCP config").path);
       // Read for the drawer only — what a session applies changes on its first
       // turn or a refresh. Freshly, before the rows: a row and its fingerprint
       // are of the files as they are now.
@@ -3750,7 +3764,8 @@ mcpHub: this.#mcpHub,
     }
     if (session.filesPending) return this.#stillPreparing(msg.id);
     try {
-      return await handleFsRead(msg, session.workdir);
+      // In the working directory as pinned (#448 round 14): one swapped for a link is never read through.
+      return await handleFsRead(msg, session.pinnedWorkdir("reading a file for a client").path);
     } catch (err) {
       return this.#fsErr(msg.id, err);
     }
@@ -4030,6 +4045,54 @@ mcpHub: this.#mcpHub,
    */
   setBlackboardUrl(url: string): void {
     this.#blackboardUrl = url;
+  }
+
+  /** The URL backends mount the sandbox's `request_directory` from (loopback, as the blackboard's). */
+  setSandboxMcpUrl(url: string): void {
+    this.#sandboxMcpUrl = url;
+  }
+
+  get sandboxMcp(): SandboxMcpHttp {
+    return this.#sandboxMcp;
+  }
+
+  /** A session's `/mcp/sandbox` mount: its own token, minted once. None without a sandbox or the endpoint. */
+  readonly #sandboxMcpFor = (sessionId: string): SandboxMcpMount | undefined => {
+    if (!this.#sandboxMcpUrl || !this.#sandboxRegistry) return undefined;
+    let token = this.#sandboxMcpTokens.get(sessionId);
+    if (!token) {
+      token = this.#sandboxMcp.mint(sessionId);
+      this.#sandboxMcpTokens.set(sessionId, token);
+    }
+    return { url: this.#sandboxMcpUrl, token };
+  };
+
+  /**
+   * The checkouts every other session's commands write (its workspace, its
+   * worktree folders, its added directories): an autonomous
+   * `request_directory` never touches one, the owner's card says it
+   * (#448 round 13, project-roots.ts `checkoutOverlap`).
+   */
+  readonly #sandboxCheckoutsFor = (sessionId: string): OtherCheckout[] => {
+    const out: OtherCheckout[] = [];
+    for (const s of this.#sessions.values()) {
+      if (s.id === sessionId) continue;
+      out.push({ dir: s.sandboxWorkspace, what: `session "${s.name}"'s workspace` });
+      for (const f of s.sandboxWorktreeFolders()) out.push({ dir: f, what: `session "${s.name}"'s worktree folder` });
+      for (const d of s.sandboxAddedDirs()) out.push({ dir: d, what: `a directory session "${s.name}" writes` });
+    }
+    return out;
+  };
+
+  /** A `request_directory` call over `/mcp/sandbox`: the session decides it. A gone session's token is let go. */
+  async #requestDirectoryFor(sessionId: string, input: RequestDirectoryInput): Promise<string> {
+    const session = this.#sessions.get(sessionId);
+    if (!session) {
+      this.#sandboxMcp.revokeSession(sessionId);
+      this.#sandboxMcpTokens.delete(sessionId);
+      return "Refused: this session is gone.";
+    }
+    return session.requestDirectory(input);
   }
 
   /** Inject the cross-backend MCP registry + daemon-owned client pool. Sessions
@@ -4570,11 +4633,13 @@ mcpHub: this.#mcpHub,
       if (!this.#sandboxRegistry) {
         return { type: "response.error", requestId: msg.id, error: "This daemon has no OS sandbox", code: "invalid_request" };
       }
-      const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry) ?? (await this.#sandboxUnavailable(msg.sandbox));
+      const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry) ?? this.#sandboxDirsProblem(msg.sandbox) ?? (await this.#sandboxUnavailable(msg.sandbox));
       if (problem) return { type: "response.error", requestId: msg.id, error: problem, code: "invalid_request" };
       const refused = this.#widerSandboxRefusal(msg.sandbox, auth, "create a session");
       if (refused) return { type: "response.error", requestId: msg.id, error: refused, code: "forbidden" };
     }
+    // Each added dir kept by where it really is now: what is bound, never where a link there leads later.
+    const sandboxSetting = msg.sandbox ? canonicalAddedDirs(msg.sandbox) : undefined;
 
     let goalSessionId = "";
     const orchestratorFleet = collaboration
@@ -4599,7 +4664,9 @@ mcpHub: this.#mcpHub,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
-      ...(msg.sandbox && Object.keys(msg.sandbox).length > 0 ? { sandbox: msg.sandbox } : {}),
+      sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
+      ...(sandboxSetting && Object.keys(sandboxSetting).length > 0 ? { sandbox: sandboxSetting } : {}),
       claudeAccounts: this.#claudeAccounts,
       // The Claude choice also when the session lands elsewhere: it applies if it is switched to Claude.
       claudeAccount: msg.claudeAccount || null,
@@ -4994,6 +5061,8 @@ mcpHub: this.#mcpHub,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           // The collaboration runs on the accounts its lead was created on.
           claudeAccount: parent.claudeAccount,
@@ -5308,21 +5377,30 @@ mcpHub: this.#mcpHub,
       if (branch) worktree = { path: bound, branch, createdByCodeoid: false };
     } else if (msg.isolate !== false || msg.baseBranch) {
       // baseBranch implies isolation (a base needs its own worktree).
-      if (await isGitRepo(parent.workdir)) {
+      // The parent's working directory as pinned (#448 round 14): its files are what the fork carries, never what a
+      // link put in its place leads to; checked again once the worktree is made.
+      let parentPin: PinnedDir;
+      try {
+        parentPin = parent.pinnedWorkdir("forking it");
+      } catch (err) {
+        if (!(err instanceof PinnedPathError)) throw err;
+        return { type: "response.error", requestId: msg.id, error: err.message, code: "invalid_request" };
+      }
+      if (await isGitRepo(parentPin.path)) {
         try {
           // From an earlier turn: start the worktree at the commit the repo
           // was on then (recorded with the snapshot), so git history matches
           // the files rolled in below; make sure the parent's subdirectory
           // exists so the snapshot lands where it belongs.
           let rollHead = point?.files && "checkpointId" in point.files ? point.files.head : undefined;
-          recipe = await loadSetupRecipe(parent.workdir);
+          recipe = await loadSetupRecipe(parentPin.path);
           // Whether the command can run at all is known only once the base
           // commit is checked out (commandGate): create clean whenever a
           // trusted recipe has one, then decide.
           const mayRun = !!recipe && !("error" in recipe) && !!recipe.recipe.command && commandRefusal(policy, recipe.root, recipe.recipeHash, auth.sub) === null;
           const make = (baseCommit?: string) =>
             createForkWorktree({
-              workdir: parent.workdir,
+              workdir: parentPin.path,
               label: msg.name ?? parentInfo.name,
               shortId: worktreeShortId,
               ...(msg.baseBranch ? { baseBranch: msg.baseBranch } : {}),
@@ -5339,6 +5417,7 @@ mcpHub: this.#mcpHub,
             headGone = true;
             return make();
           });
+          checkPinned(parentPin, "forking it");
           // Fork runs in the parent's equivalent subdir of the worktree; the
           // worktree ROOT (wt.path) is what we remove on destroy.
           // Same checks as any session's workdir (safe-root, protected dirs),
@@ -5413,6 +5492,8 @@ mcpHub: this.#mcpHub,
         transcriptStore: this.#transcriptStore,
         providers: this.#providers,
         sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
         claudeAccounts: this.#claudeAccounts,
         // A fork continues the same conversation — on the same accounts,
         // thinking as hard (#417).
@@ -5669,6 +5750,8 @@ mcpHub: this.#mcpHub,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
@@ -5959,6 +6042,8 @@ mcpHub: this.#mcpHub,
       transcriptStore: this.#transcriptStore,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
@@ -6671,12 +6756,14 @@ mcpHub: this.#mcpHub,
           // The worker runs unattended: refused here when its sandbox can't hold (#448).
           if (msg.sandbox) {
             if (!this.#sandboxRegistry) return err("This daemon has no OS sandbox", "invalid_request");
-            const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry);
+            const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry) ?? this.#sandboxDirsProblem(msg.sandbox);
             if (problem) return err(problem, "invalid_request");
             const wider = this.#widerSandboxRefusal(msg.sandbox, auth, "start a loop");
             if (wider) return err(wider, "forbidden");
           }
-          const sandboxRefused = await this.#unattendedSandboxRefusal(provider, msg.sandbox);
+          // Each added dir kept by where it really is now.
+          const loopSandbox = msg.sandbox ? canonicalAddedDirs(msg.sandbox) : undefined;
+          const sandboxRefused = await this.#unattendedSandboxRefusal(provider, loopSandbox);
           if (sandboxRefused) return err(`The loop can't start: ${sandboxRefused}`, "invalid_request");
           const run = svc.startRun(
             {
@@ -6685,7 +6772,7 @@ mcpHub: this.#mcpHub,
               checks: msg.checks,
               provider,
               ...(msg.model ? { model: msg.model } : {}),
-              ...(msg.sandbox ? { sandbox: msg.sandbox } : {}),
+              ...(loopSandbox ? { sandbox: loopSandbox } : {}),
               ...(msg.toolBudget !== undefined ? { toolBudget: msg.toolBudget } : {}),
               ...(msg.limits ? { limits: msg.limits } : {}),
             },
@@ -6991,6 +7078,8 @@ mcpHub: this.#mcpHub,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -7091,6 +7180,8 @@ mcpHub: this.#mcpHub,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -7219,7 +7310,13 @@ mcpHub: this.#mcpHub,
       providerIds: () => this.#providers.ids(),
       ...(this.#sandboxRegistry
         ? {
-            sandboxProblem: (s: SessionSandboxSetting) => sandboxSettingProblem(s, this.#sandboxRegistry as SandboxRegistry),
+            // A routine's directories checked when it is defined, as a session's are when it is created (#448 round 13).
+            sandboxProblem: (s: SessionSandboxSetting) => sandboxSettingProblem(s, this.#sandboxRegistry as SandboxRegistry) ?? this.#sandboxDirsProblem(s),
+            sandboxCanonical: (s: SessionSandboxSetting) => {
+              // By real path; never a pin (each run's session pins what it binds when it starts).
+              const { pins: _p, agentDirs: _a, ...rest } = canonicalAddedDirs(s);
+              return rest;
+            },
           }
         : {}),
       normalizeWorkdir: (p) => normalizeWorkdir(p),
@@ -7377,6 +7474,8 @@ mcpHub: this.#mcpHub,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
+      sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -8257,7 +8356,14 @@ mcpHub: this.#mcpHub,
     );
     if (badModel) return refuse(`Model "${badModel.model}" isn't available on ${badModel.providerId}`);
     // Agents sharing one folder would edit each other's files.
-    if (!(await isGitRepo(parent.workdir))) {
+    let parentDir: string;
+    try {
+      parentDir = parent.pinnedWorkdir("comparing backends from it").path;
+    } catch (err) {
+      if (!(err instanceof PinnedPathError)) throw err;
+      return refuse(err.message);
+    }
+    if (!(await isGitRepo(parentDir))) {
       return refuse("Compare needs a git repository: each branch runs in its own worktree, so they can't edit each other's files.");
     }
     const label = (t: { providerId: string; model?: string }) => `${t.providerId}${t.model ? `:${t.model}` : ""}`;
@@ -9232,6 +9338,11 @@ mcpHub: this.#mcpHub,
         this.#store.audit(auth.sub, "session.sandbox_refused", session.id, "set_mode autonomous: sandbox off, not the owner's own token");
         return { type: "response.error", requestId: msg.id, error: "This session's sandbox is off: only its owner, with their own token, can make it autonomous", code: "forbidden" };
       }
+      // Docker access (root on the machine) is the owner's choice too.
+      if (session.sandboxInfo?.dockerSocket === true && (auth.delegationDepth > 0 || auth.sub !== session.createdBy)) {
+        this.#store.audit(auth.sub, "session.sandbox_refused", session.id, "set_mode autonomous: Docker access, not the owner's own token");
+        return { type: "response.error", requestId: msg.id, error: "This session's sandbox has Docker access: only its owner, with their own token, can make it autonomous", code: "forbidden" };
+      }
     }
     session.setMode(msg.mode, msg.maxTurns, auth);
     return { type: "response.ok", requestId: msg.id };
@@ -9250,11 +9361,11 @@ mcpHub: this.#mcpHub,
     const cfg = sandboxConfigOf(this.#config);
     if (!widens(effectiveSetting(cfg, undefined), effectiveSetting(cfg, setting))) return null;
     const refusal = !hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)
-      ? `Missing scope: session:approve (needed to ${what} with a sandbox off or wider than the daemon's)`
+      ? `Missing scope: session:approve (needed to ${what} with a sandbox off, wider than the daemon's, or with Docker access)`
       : auth.delegationDepth > 0
-        ? `A delegated token can't ${what} with a sandbox off or wider than the daemon's`
+        ? `A delegated token can't ${what} with a sandbox off, wider than the daemon's, or with Docker access`
         : owner !== undefined && owner !== auth.sub
-          ? `Only the session's owner can ${what} with its sandbox (off or wider than the daemon's)`
+          ? `Only the session's owner can ${what} with its sandbox (off, wider than the daemon's, or with Docker access)`
           : null;
     if (refusal) this.#store.audit(auth.sub, "session.sandbox_wider_refused", "", `${what}: ${refusal}`);
     return refusal;
@@ -9308,6 +9419,55 @@ mcpHub: this.#mcpHub,
     return { type: "response.ok", requestId: msg.id, data: { ...(result.pending ? { pending: true } : {}), sandbox: session.sandboxInfo } };
   }
 
+  /**
+   * Why a setting's directories can't be used (docs/sandbox.md, "Working
+   * across repositories"), or null: a project root refused
+   * (project-roots.ts `projectRootProblem`: the home, `/`, the host's temp
+   * dir, …), an added dir that can't be one (`addedDirProblem`: the home,
+   * `/`, a hidden dir, a git or project settings dir or one in it, one the
+   * sandbox hides, one holding a PATH entry, one that isn't there, one too
+   * big to look through for the repositories in it).
+   */
+  #sandboxDirsProblem(setting: SessionSandboxSetting): string | null {
+    const configDir = getConfigDir();
+    for (const r of setting.projectRoots ?? []) {
+      if (r === PROJECT_ROOT_PARENT) continue;
+      const problem = projectRootProblem(r, { configDir });
+      if (problem) return `not a project root: ${problem}`;
+    }
+    const hidden = (setting.addedDirs ?? []).length > 0 ? [...hiddenPathsFor(this.#config), ...daemonSandboxRoot()] : [];
+    for (const d of setting.addedDirs ?? []) {
+      const problem = addedDirProblem(d, { configDir, hidden });
+      if (problem) return `can't add ${d}: ${problem}`;
+    }
+    return null;
+  }
+
+  /**
+   * `session.sandbox_dir`: add a directory to what a session's commands
+   * write, or remove one. Owner only, with session:approve; adding is a
+   * widening, so never a delegated token's, and asked of the owner on the
+   * session (owner-only confirm) before it lands.
+   */
+  async #sandboxDir(msg: Extract<ClientMessage, { type: "session.sandbox_dir" }>, auth: AuthContext): Promise<DaemonMessage> {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:approve", code: "forbidden" };
+    }
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return { type: "response.error", requestId: msg.id, error: "Session not found", code: "not_found" };
+    if (session.createdBy !== auth.sub) {
+      return { type: "response.error", requestId: msg.id, error: "Only the session's owner can change the directories its sandbox writes", code: "forbidden" };
+    }
+    if (msg.action === "add" && auth.delegationDepth > 0) {
+      this.#store.audit(auth.sub, "session.sandbox_dir_refused", session.id, `${msg.path}: delegated token`);
+      return { type: "response.error", requestId: msg.id, error: "A delegated token cannot add a directory to a session's sandbox", code: "forbidden" };
+    }
+    if (!this.#sandboxRegistry) return { type: "response.error", requestId: msg.id, error: "This daemon has no OS sandbox", code: "invalid_request" };
+    const result = await session.changeSandboxDir(msg.action, msg.path, auth);
+    if (!result.ok) return { type: "response.error", requestId: msg.id, error: result.error, code: "invalid_request" };
+    return { type: "response.ok", requestId: msg.id, data: { ...(result.pending ? { pending: true } : {}), message: result.message, sandbox: session.sandboxInfo } };
+  }
+
   /** `sandbox.providers` (#448): what the daemon has and whether each runs here. */
   async #sandboxProviders(msg: Extract<ClientMessage, { type: "sandbox.providers" }>, auth: AuthContext): Promise<DaemonMessage> {
     if (!hasScope(auth.scopes as string[], SCOPES.SESSION_CREATE)) {
@@ -9334,7 +9494,7 @@ mcpHub: this.#mcpHub,
       requestId: msg.id,
       data: {
         enabled: registry !== undefined,
-        default: { provider: config.provider, network: config.network, allowedHosts: config.allowedHosts },
+        default: { provider: config.provider, network: config.network, allowedHosts: config.allowedHosts, dockerSocket: config.docker.socket, projectRoots: config.projectRoots ?? ["@parent"] },
         auto: registry?.autoId() ?? null,
         providers,
       },
@@ -9433,7 +9593,13 @@ mcpHub: this.#mcpHub,
     }
     const session = this.#getOwnedSession(msg.sessionId, auth);
     if (!session) return fail("Session not found", "not_found");
-    const read = await readWorkdirServers(session.workdir);
+    let pinned: string;
+    try {
+      pinned = session.pinnedWorkdir("reading the project's MCP config").path;
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+    const read = await readWorkdirServers(pinned);
     if (!read) return fail("Claude's config can't be read just now (it may be mid-write) — try again");
     if (read.repoUnreadable) return fail("The project's .mcp.json can't be read just now (mid-edit, not JSON, or too big) — try again once it can");
     const repo = read.servers.filter((w) => w.origin === "claude-repo" && w.name === msg.server && (msg.path === undefined || w.path === msg.path));
@@ -9502,7 +9668,13 @@ mcpHub: this.#mcpHub,
     }
     const session = this.#getOwnedSession(msg.sessionId, auth);
     if (!session) return fail("Session not found", "not_found");
-    const read = await readWorkdirServers(session.workdir);
+    let pinned: string;
+    try {
+      pinned = session.pinnedWorkdir("reading the project's MCP config").path;
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+    const read = await readWorkdirServers(pinned);
     if (!read) return fail("Claude's config can't be read just now (it may be mid-write) — try again");
     if (read.repoUnreadable) return fail("The project's .mcp.json can't be read just now (mid-edit, not JSON, or too big) — try again once it can");
     const repo = read.servers.filter(
@@ -9747,4 +9919,10 @@ async function resolveImportPath(
 
 function tenantOf(auth: AuthContext): McpTenant {
   return { accountId: auth.accountId, projectId: auth.projectId };
+}
+
+/** codeoid's private dir (sandbox/root.ts), when made: no added dir is in it. */
+function daemonSandboxRoot(): string[] {
+  const root = sandboxRootIfMade();
+  return root ? [root] : [];
 }

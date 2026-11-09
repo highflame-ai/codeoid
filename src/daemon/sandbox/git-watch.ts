@@ -3,7 +3,9 @@
  * command, outside any sandbox, that `git status` and a diff don't show
  * (#448): its config, hooks (the hooks dir's, and `core.hooksPath`'s when it
  * points into the repository: husky's `.husky/_`), attributes, and what
- * names its git dirs (`commondir`, a worktree's `gitdir`, the `.git` file).
+ * names its git dirs (`commondir`, a worktree's `gitdir`, the `.git` file;
+ * a worktree as `git worktree add` makes one, naming its own repository,
+ * isn't news: an agent may add one).
  *
  * The sandbox holds most of these read-only, as defence in depth; it doesn't
  * guarantee the workspace is safe to run (it is the agent's output, and is
@@ -24,7 +26,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { lstatSync, readdirSync, readFileSync, readlinkSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { hardenedGit } from "../git-env.js";
@@ -38,6 +40,7 @@ const DIR_LIMIT = 200;
 /** Label → fingerprint of each watched file (absent: not in the map). */
 export type GitControlSnapshot = ReadonlyMap<string, string>;
 
+// paths: a look (a file's fingerprint), no write
 function fingerprint(p: string): string | null {
   try {
     const st = lstatSync(p);
@@ -50,6 +53,7 @@ function fingerprint(p: string): string | null {
   }
 }
 
+// paths: a look, no write
 function readlinkOr(p: string): string {
   try {
     return readlinkSync(p);
@@ -59,6 +63,7 @@ function readlinkOr(p: string): string {
 }
 
 /** codeoid's own placeholders read as absent: an empty `config.worktree`, a `commondir` of `.`. */
+// paths: a look, no write
 function placeholder(p: string, name: string): boolean {
   try {
     const text = readFileSync(p, "utf8");
@@ -68,6 +73,28 @@ function placeholder(p: string, name: string): boolean {
   }
 }
 
+/**
+ * A worktree's git dir as git makes it: a dir (a link git would follow
+ * anywhere isn't, #448 round 11), `commondir` naming its repository
+ * (`common`, as `../..` from there), no `config.worktree` but codeoid's empty one.
+ */
+// paths: a look, no write
+function plainWorktree(dir: string, common: string): boolean {
+  try {
+    if (!lstatSync(dir).isDirectory() || lstatSync(join(dir, "commondir")).isSymbolicLink()) return false;
+    const named = resolve(dir, readFileSync(join(dir, "commondir"), "utf8").trim());
+    if (named !== resolve(common) && named !== realOr(common)) return false;
+  } catch {
+    return false;
+  }
+  try {
+    return readFileSync(join(dir, "config.worktree"), "utf8") === "";
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT";
+  }
+}
+
+// paths: a look, no write
 function entries(dir: string): string[] {
   try {
     return readdirSync(dir).sort().slice(0, DIR_LIMIT);
@@ -77,8 +104,9 @@ function entries(dir: string): string[] {
 }
 
 /** `core.hooksPath` as the repository's own config files set it (the last one wins), or null. */
-function hooksPathOf(configs: readonly string[]): string | null {
+export function hooksPathOf(configs: readonly string[]): string | null {
   let found: string | null = null;
+  // paths: a look (a config's text), no write
   for (const file of configs) {
     let text = "";
     try {
@@ -97,8 +125,111 @@ function hooksPathOf(configs: readonly string[]): string | null {
   return found;
 }
 
+/** A worktree admin dir's group in a snapshot: its key ends in `/`, its value says whether git made it as is. */
+const WORKTREE_GROUP = "worktree:";
+
+/** What {@link gitControlSnapshot} is told of the session (#448 round 10). */
+export interface GitControlOptions {
+  /**
+   * The session's own worktree folders (sandbox/worktrees.ts): a checkout in
+   * them whose `.git` doesn't name its own admin dir (one git would follow
+   * to a planted git dir, with its config, at the user's next `git status`
+   * there) is watched, and an admin dir whose checkout is in them is the
+   * session's (its `gitdir` may move with `git worktree move`).
+   */
+  ownFolders?: readonly string[];
+}
+
+/** At most this many dirs are looked at in the session's worktree folders. */
+const FOLDER_DIR_LIMIT = 500;
+
+/**
+ * The `.git` entries under the session's worktree folders that don't name
+ * their own admin dir in `common` back: a `.git` file naming any other git
+ * dir, or a `.git` dir (a repository of its own, whose config git obeys
+ * there). Every worktree git records as checked out in a folder is looked
+ * at; then, breadth first, the folders' dirs to depth 3 (bounded, never
+ * through a link, not inside a checkout) for one planted besides.
+ */
+function strayGitEntries(folders: readonly string[], common: string): string[] {
+  const out = new Set<string>();
+  if (folders.length === 0) return [];
+  const commonReal = realOr(common);
+  const real = folders.map(realOr);
+  // paths: a look, no write
+  const check = (dotgit: string): boolean => {
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(dotgit);
+    } catch {
+      return false;
+    }
+    if (!st.isFile() || !namesOwnAdmin(dotgit, commonReal)) out.add(dotgit);
+    return true;
+  };
+  // The worktrees git knows of there: each one's `.git`, as its admin dir's `gitdir` names it.
+  // paths: a look at git's records of worktrees, no write
+  for (const w of entries(join(common, "worktrees"))) {
+    try {
+      const dotgit = resolve(join(common, "worktrees", w), readFileSync(join(common, "worktrees", w, "gitdir"), "utf8").trim());
+      const at = realOr(dirname(dotgit));
+      if (real.some((f) => within(at, f) && at !== f)) check(join(at, ".git"));
+    } catch {
+      /* no gitdir */
+    }
+  }
+  // paths: a look through the session's worktree folders, no write
+  let budget = FOLDER_DIR_LIMIT;
+  let level = [...real];
+  for (let depth = 0; depth <= 3 && level.length > 0; depth++) {
+    const next: string[] = [];
+    for (const dir of level) {
+      if (--budget < 0) return [...out];
+      if (check(join(dir, ".git")) && depth > 0) continue;
+      for (const n of entries(dir)) {
+        if (n === ".git") continue;
+        try {
+          if (lstatSync(join(dir, n)).isDirectory()) next.push(join(dir, n));
+        } catch {
+          /* gone meanwhile */
+        }
+      }
+    }
+    level = next;
+  }
+  return [...out];
+}
+
+// paths: for comparing paths in a look, no write
+function realOr(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
+
+/** A worktree's `.git` file as git makes it: naming `<common>/worktrees/<n>`, whose `gitdir` names this file back. */
+// paths: a look, no write
+function namesOwnAdmin(dotgit: string, commonReal: string): boolean {
+  try {
+    const m = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotgit, "utf8"));
+    if (!m?.[1]) return false;
+    const admin = realOr(resolve(dirname(dotgit), m[1]));
+    if (dirname(admin) !== join(commonReal, "worktrees")) return false;
+    const back = readFileSync(join(admin, "gitdir"), "utf8").trim();
+    return realOr(resolve(admin, back)) === realOr(dotgit);
+  } catch {
+    return false;
+  }
+}
+
+function within(child: string, parent: string): boolean {
+  return child === parent || child.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
+}
+
 /** What a workspace's repository has now that git runs or obeys (see the module's comment); empty without a repository. */
-export function gitControlSnapshot(workspace: string, home: string = process.env.HOME ?? homedir()): GitControlSnapshot {
+export function gitControlSnapshot(workspace: string, home: string = process.env.HOME ?? homedir(), opts: GitControlOptions = {}): GitControlSnapshot {
   const out = new Map<string, string>();
   try {
     const layout = gitLayoutOf(workspace, home);
@@ -124,7 +255,35 @@ export function gitControlSnapshot(workspace: string, home: string = process.env
     for (const n of ["config", "config.worktree", "commondir"]) watch(join(common, n));
     watch(join(common, "info", "attributes"));
     watchDir(join(common, "hooks"));
-    for (const w of entries(join(common, "worktrees"))) for (const n of ["commondir", "gitdir", "config.worktree"]) watch(join(common, "worktrees", w, n));
+    // Every worktree's admin dir, as a group ({@link gitControlChanges}): what names its repository and its checkout,
+    // and its own config. One that appears as `git worktree add` makes one (its repository's `commondir`, no config
+    // of its own) isn't news, nor one that goes; one changed meanwhile is, or one that appears naming anything else.
+    // paths: a look at git's records of worktrees, no write
+    const own = (opts.ownFolders ?? []).map(realOr);
+    for (const w of entries(join(common, "worktrees"))) {
+      const dir = join(common, "worktrees", w);
+      let checkout: string | null = null;
+      try {
+        checkout = dirname(realOr(resolve(dir, readFileSync(join(dir, "gitdir"), "utf8").trim())));
+      } catch {
+        /* no gitdir */
+      }
+      const mine = checkout !== null && own.some((f) => within(checkout as string, f) && checkout !== f);
+      out.set(`${label(dir)}/`, `${WORKTREE_GROUP}${plainWorktree(dir, common) ? "plain" : "custom"}`);
+      // The session's own may move (`git worktree move` rewrites its `gitdir`): only what names its git dirs.
+      for (const n of mine ? ["commondir", "config.worktree"] : ["commondir", "gitdir", "config.worktree"]) watch(join(dir, n));
+    }
+    // A checkout in the session's own worktree folders whose `.git` git would follow elsewhere (#448 round 10).
+    // paths: a look, no write
+    for (const g of strayGitEntries(opts.ownFolders ?? [], common)) {
+      let f: string | null = null;
+      try {
+        f = lstatSync(g).isDirectory() ? `dir:${fingerprint(join(g, "config")) ?? "-"}:${fingerprint(join(g, "HEAD")) ?? "-"}` : fingerprint(g);
+      } catch {
+        /* gone meanwhile */
+      }
+      if (f !== null) out.set(label(g), f);
+    }
     const hooksPath = hooksPathOf([join(common, "config"), join(common, "config.worktree"), ...(layout.own ? [join(layout.own, "config.worktree")] : [])]);
     if (hooksPath) {
       const dir = hooksPath.startsWith("~/") ? join(home, hooksPath.slice(2)) : resolve(top, hooksPath);
@@ -137,10 +296,26 @@ export function gitControlSnapshot(workspace: string, home: string = process.env
   return out;
 }
 
-/** What changed between two snapshots (added, removed or different), by label. */
+/**
+ * What changed between two snapshots (added, removed or different), by
+ * label. A worktree admin dir's files count as a group: one that appeared
+ * as git makes one, or went, isn't a change; one that was there and changed
+ * is, and so is one that appeared naming another repository or carrying a
+ * config of its own.
+ */
 export function gitControlChanges(before: GitControlSnapshot, after: GitControlSnapshot): string[] {
+  const groups = [...new Set([...before.keys(), ...after.keys()])].filter((k) => k.endsWith("/") && ((before.get(k) ?? after.get(k)) ?? "").startsWith(WORKTREE_GROUP));
+  const groupOf = (k: string) => groups.find((g) => k.startsWith(g) && k !== g);
   const out: string[] = [];
-  for (const k of new Set([...before.keys(), ...after.keys()])) if (before.get(k) !== after.get(k)) out.push(k);
+  for (const k of new Set([...before.keys(), ...after.keys()])) {
+    if (groups.includes(k) || before.get(k) === after.get(k)) continue;
+    const g = groupOf(k);
+    if (g) {
+      if (!after.has(g)) continue;
+      if (!before.has(g) && after.get(g) === `${WORKTREE_GROUP}plain`) continue;
+    }
+    out.push(k);
+  }
   return out.sort();
 }
 

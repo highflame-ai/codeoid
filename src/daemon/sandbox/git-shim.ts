@@ -42,6 +42,7 @@ import { chmodSync, lstatSync, mkdirSync, renameSync, writeFileSync } from "node
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { BASE_OVERRIDES, GIT_BIN, PROGRAM_ENV, REMOTE_PROTOCOLS } from "../git-env.js";
 import { GIT_CONTROL, gitLayoutOf, programLocations } from "./policy.js";
+import { makeAt, pinOf } from "./pinned.js";
 import type { SandboxSpec } from "./types.js";
 
 /** The empty tree's id: `attr.tree` naming it reads no attributes from the working tree (git ≥ 2.46; an older git ignores the key). */
@@ -62,6 +63,7 @@ const ENV_BIN = "/usr/bin/env";
  * can't be read apart). `PATH` (its absolute entries), `HOME` and the
  * caller's `-c` list (`GIT_CONFIG_COUNT`) are handed over apart.
  */
+// paths: names only (the shim's environment allowlist), no path
 export const SHIM_ENV_NAMES: readonly string[] = [
   "USER", "LOGNAME", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_MESSAGES", "LC_MONETARY",
   "LC_NUMERIC", "LC_TIME", "LC_ADDRESS", "LC_IDENTIFICATION", "LC_MEASUREMENT", "LC_NAME", "LC_PAPER",
@@ -120,6 +122,7 @@ export interface GitShimWorktrees {
 }
 
 /** A directory itself, not a link to one. */
+// paths: a look (a directory, not a link), no write
 function realDir(p: string): boolean {
   try {
     const st = lstatSync(p);
@@ -129,6 +132,7 @@ function realDir(p: string): boolean {
   }
 }
 
+// paths: a look (is it a link), no write
 function isLink(p: string): boolean {
   try {
     return lstatSync(p).isSymbolicLink();
@@ -157,7 +161,8 @@ export function cliWorktrees(workspace: string, home?: string): GitShimWorktrees
   if (dirname(resolve(layout.dotgit)) === ws && realDir(claude)) {
     const checkouts = join(claude, "worktrees");
     try {
-      mkdirSync(checkouts, { mode: 0o755 });
+      // Never through a link (pinned.ts: `.claude` pinned for the make, checked again after; #448 round 14).
+      makeAt(checkouts, "dir", "making the CLI's worktree dir");
     } catch {
       /* there already (or can't be: then not opened) */
     }
@@ -187,12 +192,18 @@ export function gitShimSpec(spec: SandboxSpec, opts: { tempParent: string; workt
   const open = opts.worktrees?.open ?? [];
   const keep = opts.worktrees?.keep ?? [];
   const held = (p: string) => !open.some((o) => within(p, o)) || keep.some((k) => within(p, k));
+  // git reaches no container runtime, whatever the session's commands may.
+  const { dockerSockets: _sockets, ...rest } = spec;
+  const { DOCKER_HOST: _host, ...env } = spec.env ?? {};
   return {
-    ...spec,
+    ...rest,
+    ...(spec.env ? { env } : {}),
     tempDir: opts.tempParent,
     privateTemp: true,
     writable: [...spec.writable, ...open],
     readOnly: (spec.readOnly ?? []).filter(held),
+    // Bound by name as the rest (pinned.ts, #448 round 14): never followed to where a link put there leads.
+    pins: [...(spec.pins ?? []), ...open.map((p) => pinOf(p, "a git worktree dir"))],
     network: { mode: "off" },
   };
 }
@@ -208,6 +219,7 @@ export function gitProgramLocations(): string[] {
   if (locations) return locations;
   const out = programLocations(GIT_BIN, []);
   try {
+    // paths: git's own program, asked where its helpers are: no session's directory
     const r = Bun.spawnSync([GIT_BIN, "--exec-path"], { stdin: "ignore", stdout: "pipe", stderr: "ignore", env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
     const dir = r.exitCode === 0 ? r.stdout.toString().trim() : "";
     if (dir.startsWith("/")) out.push(...programLocations(join(dir, "git"), []).filter((d) => d === dir));
@@ -387,6 +399,7 @@ export function gitShimScript(opts: GitShimOptions): string {
 }
 
 /** Write {@link gitShimScript} as `<dir>/git` (0700, atomically: a git started meanwhile gets the old one or the new one) and return `dir`. */
+// paths: the session's launcher dir: the daemon's private dir, which no sandbox sees
 export function writeGitShim(dir: string, opts: GitShimOptions): string {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, "git");

@@ -380,6 +380,43 @@ export interface SessionSandboxSetting {
   network?: SandboxNetworkMode;
   /** Hosts allowed with `network: "allowlist"` (`example.com`, `*.example.com`). */
   allowedHosts?: string[];
+  /**
+   * Let commands reach the host's container runtime socket (testcontainers,
+   * `docker run`): off by default (`sandbox.docker.socket`). Root on the
+   * machine: turning it on is a widening, asked of the owner.
+   */
+  dockerSocket?: boolean;
+  /**
+   * Where the session's commands read other repositories, read-only
+   * (docs/sandbox.md, "Working across repositories"): absolute paths (`~`
+   * expands) or `@parent`, the parent of the session's repository. Absent:
+   * `sandbox.projectRoots` (by default `@parent`); `[]`: none. One the
+   * daemon's default doesn't have is a widening.
+   */
+  projectRoots?: string[];
+  /**
+   * Directories the session's commands may write besides its workspace,
+   * absolute: each treated as a workspace (its git structure and project
+   * settings held, its own worktree folder). Adding one is a widening (the
+   * owner's own decision; `session.sandbox_dir`, or the agent's
+   * `request_directory`).
+   */
+  addedDirs?: string[];
+  /**
+   * Kept by the daemon, never sent by a client (the schema refuses it): the
+   * added directories the agent added itself (an autonomous
+   * `request_directory`). Credential files in one stay hidden as in a
+   * project root; in one the owner added they are the session's to use.
+   */
+  agentDirs?: string[];
+  /**
+   * Kept by the daemon, never sent by a client (the schema refuses it): what
+   * each directory the sandbox binds by name was when it was pinned (#448
+   * round 13): `workspace` (the sandbox's workspace, a monorepo's top) as
+   * found for `workdir` (another session's, a fork's, isn't used), and
+   * `ids`, by real path, `dev:ino@boot`.
+   */
+  pins?: { workdir?: string; workspace?: string; ids: Record<string, string> };
 }
 
 export type SandboxNetworkMode = "on" | "off" | "allowlist";
@@ -415,6 +452,19 @@ export interface SessionSandboxInfo {
   via?: string;
   /** What isn't confined this way, in plain words. */
   limits?: string[];
+  /** Commands can reach the container runtime's socket (the owner's opt-in): it can reach the whole machine. */
+  dockerSocket?: boolean;
+  /** The project roots commands read (read-only), resolved: other repositories, other sessions' checkouts. */
+  projectRoots?: string[];
+  /** The directories commands write besides the workspace, as the running sandbox has them. */
+  addedDirs?: string[];
+  /**
+   * Added (or removed) directories not applied yet: they take effect at the
+   * session's next turn (once no turn or background work is running).
+   */
+  pendingDirs?: { add: string[]; remove: string[] };
+  /** The workspace is the home itself: commands read and write all of it but the credentials the sandbox hides. */
+  homeWorkspace?: boolean;
   /** Everything asked is enforced: what an autonomous session, a routine or a loop needs to start. */
   enforced: boolean;
 }
@@ -1070,6 +1120,8 @@ export interface ToolWaitingConfirmationState {
   sandboxed?: boolean;
   /** Why not, or what's asked: "not sandboxed: bubblewrap is not installed", "asks to run outside the sandbox". */
   sandboxNote?: string;
+  /** It runs inside a sandbox whose commands can reach the container runtime (Docker access): said as a warning. */
+  sandboxDocker?: boolean;
 }
 
 /** How risky a shell command is, and why (#431). */
@@ -1255,6 +1307,7 @@ export type ClientMessage =
   | SessionDestroyMsg
   | SessionSetModeMsg
   | SessionSetSandboxMsg
+  | SessionSandboxDirMsg
   | SandboxProvidersMsg
   | SessionPinMsg
   | SessionUnpinMsg
@@ -1829,6 +1882,22 @@ export interface SessionSetSandboxMsg extends BaseClientMsg {
   type: "session.set_sandbox";
   sessionId: string;
   sandbox: SessionSandboxSetting;
+}
+
+/**
+ * Add a directory to what a session's commands may write, or remove one
+ * (docs/sandbox.md, "Working across repositories"). Owner only, with
+ * session:approve and an undelegated token. Removing applies at once (from
+ * the next turn); adding is a widening, asked of the owner on the session
+ * (`data: { pending: true }`), and lands on a yes. It takes effect at the
+ * session's next turn with no background work running.
+ */
+export interface SessionSandboxDirMsg extends BaseClientMsg {
+  type: "session.sandbox_dir";
+  sessionId: string;
+  action: "add" | "remove";
+  /** Absolute (`~` expands). */
+  path: string;
 }
 
 /** The sandbox providers this daemon has, and whether each runs here (#448). Needs session:create. */

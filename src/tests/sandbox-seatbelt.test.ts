@@ -92,6 +92,27 @@ describe("seatbeltProfile", () => {
     expect(text).toContain('"/Users/u/repo/opencode.json"');
   });
 
+  test("Docker access (#448 follow-up): a socket the owner let in is allowed last, its file and a connection to it, the network off too; Docker Desktop's link by both paths", () => {
+    const { text } = readable(spec({ containerSockets: [], dockerSockets: ["/var/run/docker.sock"], network: { mode: "off" } }));
+    const lines = text.split("\n");
+    const deny = lines.indexOf("(deny network*)");
+    for (const p of ["/var/run/docker.sock", "/private/var/run/docker.sock"]) {
+      const file = lines.indexOf(`(allow file-read* file-write-data (literal ${JSON.stringify(p)}))`);
+      const conn = lines.indexOf(`(allow network-outbound (remote unix-socket (path-literal ${JSON.stringify(p)})))`);
+      expect(file).toBeGreaterThan(deny);
+      expect(conn).toBeGreaterThan(deny);
+    }
+    expect(readable(spec()).text).not.toContain("(allow network-outbound");
+  });
+
+  test("worktrees (#448 follow-up): worktrees/ and a worktree location writable but not renamable; another worktree's git dir and checkout read-only", () => {
+    const { text } = readable(spec({ writable: ["/Users/u/repo/.git", "/Users/u/repo/.git/worktrees", "/Users/u/repo-worktrees"], readOnly: ["/Users/u/repo/.git/worktrees/theirs", "/Users/u/repo-worktrees/theirs"] }));
+    for (const p of ["/Users/u/repo/.git/worktrees", "/Users/u/repo-worktrees"]) {
+      expect(text).toContain(`(deny file-write* (literal ${JSON.stringify(p)}))`);
+    }
+    for (const p of ["/Users/u/repo/.git/worktrees/theirs", "/Users/u/repo-worktrees/theirs"]) expect(text).toMatch(new RegExp(`\\(deny file-write\\* [^\\n]*${p.replace(/[/.]/g, "\\$&")}`));
+  });
+
   test("a repository's hooks and config can't be written, with what is in them", () => {
     const { text } = readable(spec({ readOnly: ["/Users/u/repo/.git/hooks", "/Users/u/repo/.git/config"] }));
     expect(text).toContain('"/Users/u/repo/.git/hooks"');

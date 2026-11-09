@@ -23,7 +23,11 @@
  * offline, with an environment of its own) or not, and a second query after the first (a new
  * CLI start in the same workspace, the one that runs its `git status`);
  * the second one's system prompt is told as `system`. A workspace of the
- * test's own: `CODEOID_PROBE_WORKSPACE`. Run in its own
+ * test's own: `CODEOID_PROBE_WORKSPACE`; the session's cwd below it
+ * (a monorepo's package; the CLI then loads the project's settings):
+ * `CODEOID_PROBE_WORKDIR`; the session's worktree folder
+ * name: `CODEOID_PROBE_WORKTREE_FOLDER`; its project roots and added dirs
+ * (comma-separated): `CODEOID_PROBE_PROJECT_ROOTS`, `CODEOID_PROBE_ADDED_DIRS`. Run in its own
  * process: a test file that mocks the SDK module must not see this one.
  * canUseTool here allows a sandboxed call and DENIES one asking to run
  * outside the sandbox, as codeoid's gate would until its owner says yes.
@@ -35,6 +39,7 @@ import { type ClaudeTempDirs, claudeNativeEnv, claudeSandboxSettings, claudeTemp
 import { BwrapSandboxProvider } from "../../daemon/sandbox/bwrap.js";
 import { CWD_FROM_CALLER } from "../../daemon/sandbox/docker.js";
 import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "../../daemon/sandbox/git-shim.js";
+import { unguardedArgv } from "../../daemon/sandbox/pinned.js";
 import { buildSandboxSpec } from "../../daemon/sandbox/policy.js";
 import { daemonTempDir } from "../../daemon/sandbox/root.js";
 import { launcherScript } from "../../daemon/sandbox/session-sandbox.js";
@@ -109,15 +114,26 @@ const env: Record<string, string> = {
   DISABLE_AUTOUPDATER: "1",
   ...(policy ? { ...claudeTempEnv(temp), GIT_CONFIG_NOSYSTEM: "1" } : {}),
 };
-const config = { provider: "auto", network, allowedHosts: [], hiddenPaths: [], homeReadable: ["~/.gitconfig", "~/.bun"], docker: { image: "x" } };
+const config = { provider: "auto", network, allowedHosts: [], hiddenPaths: [], homeReadable: ["~/.gitconfig", "~/.bun"], docker: { image: "x" }, ...(process.env.CODEOID_PROBE_BWRAP_PATH ? { bwrapPath: process.env.CODEOID_PROBE_BWRAP_PATH } : {}) };
 const spec = policy
   ? buildSandboxSpec({
       sessionId: "probe",
       workspace,
+      // CODEOID_PROBE_WORKDIR: the session's cwd below the workspace (a monorepo's package), which the CLI starts in
+      // with the project's settings (a new Claude start there loads them).
+      ...(process.env.CODEOID_PROBE_WORKDIR ? { workdir: process.env.CODEOID_PROBE_WORKDIR } : {}),
       tempDir: join(root, "tmp"),
       network: network === "allowlist" ? { mode: network, allow: [allowHost] } : { mode: network },
       config: { sandbox: config } as never,
-      hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" },
+      // CODEOID_PROBE_RUNTIME_DIR: the desktop runtime dir (hidden), where a planted socket stands in for rootless
+      // Docker's; CODEOID_PROBE_DOCKER_SOCKET=1: the owner let commands reach it (spec.dockerSockets).
+      hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home, ...(process.env.CODEOID_PROBE_RUNTIME_DIR ? { XDG_RUNTIME_DIR: process.env.CODEOID_PROBE_RUNTIME_DIR } : {}) }, daemonTmp: "/tmp" },
+      dockerSocket: process.env.CODEOID_PROBE_DOCKER_SOCKET === "1",
+      // CODEOID_PROBE_WORKTREE_FOLDER: the session's worktree folder name (sandbox/worktrees.ts).
+      ...(process.env.CODEOID_PROBE_WORKTREE_FOLDER ? { worktreeFolder: process.env.CODEOID_PROBE_WORKTREE_FOLDER } : {}),
+      // CODEOID_PROBE_PROJECT_ROOTS / CODEOID_PROBE_ADDED_DIRS (comma-separated): working across repositories.
+      ...(process.env.CODEOID_PROBE_PROJECT_ROOTS ? { projectRoots: process.env.CODEOID_PROBE_PROJECT_ROOTS.split(",") } : {}),
+      ...(process.env.CODEOID_PROBE_ADDED_DIRS ? { addedDirs: process.env.CODEOID_PROBE_ADDED_DIRS.split(",").map((dir) => ({ dir })) } : {}),
     })
   : {
       sessionId: "probe",
@@ -147,7 +163,7 @@ function gitShim(): string {
   if (!wrapped) throw new Error("no wrap");
   const launcher = join(dir, "launch-git");
   writeFileSync(launcher, launcherScript(wrapped.argv), { mode: 0o700 });
-  return writeGitShim(join(dir, "git-bin"), { launcher, provider: wrapped.argv[0] ?? null, caller: "the Claude CLI", home });
+  return writeGitShim(join(dir, "git-bin"), { launcher, provider: unguardedArgv(wrapped.argv)[0] ?? null, caller: "the Claude CLI", home });
 }
 const cliEnv = nativeEnv ? claudeNativeEnv(spec as never, temp, { ...env, SANDBOX_RUNTIME: "1" }, gitMode === "shim" ? gitShim() : undefined) : env;
 // A sign-in started after the session's sandbox was built (#448 round 2): its home where the daemon makes it, the
@@ -163,12 +179,12 @@ async function run(): Promise<void> {
   for await (const m of query({
     prompt: "run the probe",
     options: {
-      cwd: workspace,
+      cwd: process.env.CODEOID_PROBE_WORKDIR || workspace,
       env: cliEnv,
       sandbox,
       ...(nativeEnv ? { mcpServers: { probe: { type: "stdio" as const, command: process.execPath, args: [join(import.meta.dir, "env-dump.ts"), join(root, "mcp-env.json")] } } } : {}),
       permissionMode: "default",
-      settingSources: [],
+      settingSources: process.env.CODEOID_PROBE_WORKDIR ? ["project", "user"] : [],
       // The preset's context carries the CLI's git status (what its own git found).
       ...(gitMode ? { systemPrompt: { type: "preset" as const, preset: "claude_code" as const } } : {}),
       canUseTool: async (name, input) => {

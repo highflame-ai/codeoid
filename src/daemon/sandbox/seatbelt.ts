@@ -12,7 +12,8 @@
  *     workspace hidden again (as bwrap.ts lays its mounts); a repository's
  *     hooks and config not writable; a pinned directory not writable itself
  *     (`literal`: no rename, no removal), what is in it still writable;
- *   - container sockets: not readable, and no connection to them;
+ *   - container sockets: not readable, and no connection to them (but
+ *     those the owner let in, `spec.dockerSockets`: allowed last);
  *   - network off (and an allowlist, which Seatbelt can't enforce by host):
  *     no network at all.
  *
@@ -28,6 +29,7 @@
 
 import { realpathSync, statSync } from "node:fs";
 import { LocalSandboxHandle } from "./local-handle.js";
+import { boundPath } from "./pinned.js";
 import type { NetworkMode, SandboxCapabilities, SandboxHandle, SandboxProbe, SandboxProvider, SandboxSpawnOptions, SandboxSpec } from "./types.js";
 
 export const SEATBELT_PROVIDER_ID = "seatbelt";
@@ -62,13 +64,16 @@ export function seatbeltProfile(
   spec: SandboxSpec,
   fs: { real?: (p: string) => string; isDir?: (p: string) => boolean | null } = {},
 ): SeatbeltProfile {
-  const real = fs.real ?? ((p: string) => {
+  // Everything a rule names by path is pinned: named as it was pinned (the handle checked it is still that, and
+  // the launched argv checks again; #448 round 14), never resolved again here. Only what isn't is resolved.
+  // paths: resolves only what isn't pinned (boundPath): a hidden path, the home's allowlist
+  const real = boundPath(spec.pins, fs.real ?? ((p: string) => {
     try {
       return realpathSync(p);
     } catch {
       return p;
     }
-  });
+  }));
   const isDir = fs.isDir ?? (() => null);
   const params: Record<string, string> = {};
   const names = new Map<string, string>();
@@ -93,7 +98,7 @@ export function seatbeltProfile(
   type Rule = { path: string; kind: "hide" | "write" | "read" | "read-only" | "pinned" };
   const rules: Rule[] = [];
   const seen = new Set<string>();
-  for (const p of [...spec.hidden, ...spec.containerSockets].map(real)) {
+  for (const p of [...spec.hidden, ...spec.containerSockets, ...(spec.serviceSockets ?? [])].map(real)) {
     if (p === "/" || seen.has(`h:${p}`)) continue;
     seen.add(`h:${p}`);
     rules.push({ path: p, kind: "hide" });
@@ -113,7 +118,7 @@ export function seatbeltProfile(
   // A repository's hooks and config: not writable, with everything in them.
   for (const p of (spec.readOnly ?? []).map(real)) rules.push({ path: p, kind: "read-only" });
   // Every dir between a writable root and a hidden path in it: the directory itself not writable (so no rename), its contents still.
-  for (const p of (spec.pinned ?? []).map(real)) rules.push({ path: p, kind: "pinned" });
+  for (const p of [...(spec.pinned ?? []), ...(spec.heldInPlace ?? [])].map(real)) rules.push({ path: p, kind: "pinned" });
   const rank = (r: Rule) => (r.kind === "hide" ? 0 : 1);
   rules.sort((a, b) => depth(a.path) - depth(b.path) || rank(a) - rank(b));
 
@@ -131,12 +136,21 @@ export function seatbeltProfile(
     else if (r.kind === "pinned") lines.push(`(deny file-write* (literal ${param(r.path)}))`);
     else lines.push(`(allow file-read* ${filter(r.path)})`);
   }
-  // Container runtimes: nothing connects to their sockets.
+  // Container runtimes and (the network off) local services: nothing connects to their sockets.
   // (A socket in a container runtime's dir is behind its dir's file rule; connecting needs write access.)
-  for (const s of spec.containerSockets.map(real)) {
+  for (const s of [...spec.containerSockets, ...(spec.serviceSockets ?? [])].map(real)) {
     if (isDir(s) !== true) lines.push(`(deny network-outbound (remote unix-socket (path-literal ${param(s)})))`);
   }
   if (seatbeltNetwork(spec.network.mode) === "off") lines.push("(deny network*)");
+  // Container runtime sockets the owner let in (spec.dockerSockets), last, so they win over the rules above: the file
+  // (by its own path and where it leads: Docker Desktop's `/var/run/docker.sock` links into the home), read and
+  // written as a socket is, never removed or replaced, and a connection to it, the network off or not.
+  for (const s of spec.dockerSockets ?? []) {
+    for (const p of new Set([s, real(s)])) {
+      lines.push(`(allow file-read* file-write-data (literal ${param(p)}))`);
+      lines.push(`(allow network-outbound (remote unix-socket (path-literal ${param(p)})))`);
+    }
+  }
   return { profile: `${lines.join("\n")}\n`, params };
 }
 
@@ -217,6 +231,7 @@ export class SeatbeltSandboxProvider implements SandboxProvider {
   async probe(): Promise<SandboxProbe> {
     if (process.platform !== "darwin") return { available: false, reason: "Seatbelt runs on macOS only" };
     try {
+      // paths: the probe: a fixed argv, in no session's directory
       const proc = Bun.spawn([this.#bin, "-p", "(version 1)(allow default)", "/usr/bin/true"], { stdin: "ignore", stdout: "ignore", stderr: "pipe", timeout: 10_000 });
       const [code, err] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
       if (code === 0) return { available: true, detail: this.#bin };
@@ -232,6 +247,7 @@ export class SeatbeltSandboxProvider implements SandboxProvider {
 
   openSync(spec: SandboxSpec): SandboxHandle {
     const bin = this.#bin;
+    // paths: a look (directory or file) for a rule's form, once the handle checked the pins
     const isDir = (p: string): boolean | null => {
       try {
         return statSync(p).isDirectory();
@@ -243,6 +259,7 @@ export class SeatbeltSandboxProvider implements SandboxProvider {
     if (spec.privateTemp) {
       // The temp dir is made per program, in the spec's (a real path: Seatbelt sees `/private/…`).
       let parent = spec.tempDir;
+      // paths: the session's temp dir: made by the daemon in its private dir, which no sandbox sees
       try {
         parent = realpathSync(parent);
       } catch {

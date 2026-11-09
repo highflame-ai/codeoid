@@ -17,7 +17,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { type Command, program } from "commander";
@@ -1080,6 +1080,10 @@ program
   )
   .option("--network <mode>", "What a sandboxed command may reach: on | off | allowlist (with --allow-host). Default: sandbox.network.")
   .option("--allow-host <host>", "A host the allowlist lets through, repeatable (example.com, *.example.com).", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .option("--docker-socket", "Let the session's sandboxed commands reach the container runtime (testcontainers, docker run). Docker access can reach the whole machine; needs session:approve. Default: sandbox.docker.socket.")
+  .option("--add-dir <dir>", "Another directory its sandboxed commands may write (a second repository), repeatable; treated as a workspace. Needs session:approve (docs/sandbox.md, Working across repositories).", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .option("--project-root <dir>", "Where its sandboxed commands may read other repositories, read-only, repeatable; replaces sandbox.projectRoots (@parent = the repository's parent, the default).", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .option("--no-project-roots", "No project root: its commands read only the workspace (and the toolchains the sandbox shows)")
   .option(
     "--pack <id>",
     "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents). With --collaborate, the collaboration ADOPTS the pack: role names bind strictly to the pack's declared roles.",
@@ -1117,6 +1121,10 @@ program
         sandbox?: string;
         network?: string;
         allowHost: string[];
+        dockerSocket?: boolean;
+        addDir: string[];
+        projectRoot: string[];
+        projectRoots?: boolean;
       },
     ) => {
       const config = loadConfig();
@@ -1194,9 +1202,24 @@ program
     },
   );
 
-/** A session's sandbox setting from `--sandbox` / `--network` / `--allow-host` (#448); undefined when none is given. */
-function sandboxSettingFromFlags(o: { sandbox?: string; network?: string; allowHost?: string[] }): SessionSandboxSetting | undefined {
+/** A directory as the daemon keeps it: `~` left to it (its home), a relative one this shell's. */
+function dirFlag(d: string): string {
+  return d === "~" || d.startsWith("~/") || isAbsolute(d) ? d : resolve(process.cwd(), d);
+}
+
+/**
+ * A session's sandbox setting from `--sandbox` / `--network` / `--allow-host` / `--[no-]docker-socket`
+ * (#448) and `--add-dir` / `--project-root` / `--no-project-roots`; undefined when none is given.
+ */
+function sandboxSettingFromFlags(o: { sandbox?: string; network?: string; allowHost?: string[]; dockerSocket?: boolean; addDir?: string[]; projectRoot?: string[]; projectRoots?: boolean }): SessionSandboxSetting | undefined {
   const out: SessionSandboxSetting = {};
+  if (o.addDir && o.addDir.length > 0) out.addedDirs = o.addDir.map(dirFlag);
+  if (o.projectRoots === false) {
+    if (o.projectRoot && o.projectRoot.length > 0) throw new Error("--no-project-roots and --project-root don't go together");
+    out.projectRoots = [];
+  } else if (o.projectRoot && o.projectRoot.length > 0) {
+    out.projectRoots = o.projectRoot.map((r) => (r === "@parent" ? r : dirFlag(r)));
+  }
   if (o.sandbox) out.provider = o.sandbox;
   if (o.network) {
     if (o.network !== "on" && o.network !== "off" && o.network !== "allowlist") throw new Error("--network is on, off or allowlist");
@@ -1207,6 +1230,7 @@ function sandboxSettingFromFlags(o: { sandbox?: string; network?: string; allowH
     out.network = "allowlist";
     out.allowedHosts = o.allowHost;
   }
+  if (o.dockerSocket !== undefined) out.dockerSocket = o.dockerSocket;
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
@@ -1226,10 +1250,12 @@ sandboxCmd
 
 sandboxCmd
   .command("set <session> [provider]")
-  .description("Change a session's sandbox: auto | bwrap | seatbelt | docker | off, and/or --network. Turning it off or widening it is asked of the owner on the session")
+  .description("Change a session's sandbox: auto | bwrap | seatbelt | docker | off, and/or --network, --docker-socket. Turning it off or widening it (Docker access included) is asked of the owner on the session")
   .option("--network <mode>", "on | off | allowlist")
   .option("--allow-host <host>", "a host the allowlist lets through, repeatable", (v: string, p: string[] = []) => [...p, v], [] as string[])
-  .action(async (session: string, provider: string | undefined, o: { network?: string; allowHost: string[] }) => {
+  .option("--docker-socket", "let its commands reach the container runtime (Docker access can reach the whole machine)")
+  .option("--no-docker-socket", "take Docker access away")
+  .action(async (session: string, provider: string | undefined, o: { network?: string; allowHost: string[]; dockerSocket?: boolean }) => {
     let setting: SessionSandboxSetting | undefined;
     try {
       setting = sandboxSettingFromFlags({ ...(provider ? { sandbox: provider } : {}), ...o });
@@ -1238,7 +1264,7 @@ sandboxCmd
       process.exit(1);
     }
     if (!setting) {
-      console.error("Give a provider (auto | bwrap | seatbelt | docker | off) or --network.");
+      console.error("Give a provider (auto | bwrap | seatbelt | docker | off), --network or --[no-]docker-socket.");
       process.exit(1);
     }
     const client = new TerminalClient(loadConfig());
@@ -1246,6 +1272,22 @@ sandboxCmd
     await client.setSandbox(session, setting);
     client.disconnect();
   });
+
+for (const action of ["add", "remove"] as const) {
+  sandboxCmd
+    .command(`${action} <session> <dir>`)
+    .description(
+      action === "add"
+        ? "Let a session's sandboxed commands write another directory (a second repository), as its workspace: asked of its owner on the session; from its next turn"
+        : "Take a directory the session was given to write away again (from its next turn)",
+    )
+    .action(async (session: string, dir: string) => {
+      const client = new TerminalClient(loadConfig());
+      await client.connect();
+      await client.sandboxDir(session, action, dirFlag(dir));
+      client.disconnect();
+    });
+}
 
 program
   .command("attach <session>")
@@ -1677,6 +1719,7 @@ function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
     .option("--sandbox <provider>", "OS sandbox for its runs: auto | bwrap | seatbelt | docker | off (default: sandbox.provider); a run whose sandbox can't run here doesn't start")
     .option("--network <mode>", "what a sandboxed command may reach: on | off | allowlist")
     .option("--allow-host <host>", "a host the allowlist lets through (repeatable)", collect, [])
+    .option("--docker-socket", "let its runs' commands reach the container runtime (Docker access can reach the whole machine; needs session:approve)")
     .option("--guarded", "every non-read tool waits for your approval")
     .option("--autonomous", "tools auto-approve within --tool-budget (default)")
     .option("--tool-budget <n>", "autonomous tool calls per run (default 50)")
@@ -1741,6 +1784,7 @@ loop
   .option("--sandbox <provider>", "The worker's OS sandbox: auto | bwrap | seatbelt | docker | off (default: sandbox.provider); the run is refused where it can't run")
   .option("--network <mode>", "What the worker's commands may reach: on | off | allowlist")
   .option("--allow-host <host>", "A host the allowlist lets through (repeatable)", collect, [])
+  .option("--docker-socket", "Let the worker's commands and the checks reach the container runtime (tests that start containers). Docker access can reach the whole machine")
   .option("--wait", "Follow the run until it ends")
   .action(
     (
@@ -1758,6 +1802,7 @@ loop
         sandbox?: string;
         network?: string;
         allowHost: string[];
+        dockerSocket?: boolean;
         wait?: boolean;
       },
     ) =>

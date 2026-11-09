@@ -116,6 +116,8 @@ CODEOID_SANDBOX_ALLOWED_HOSTS=          # with allowlist: github.com,*.npmjs.org
 CODEOID_SANDBOX_HIDDEN_PATHS=           # more paths to hide: ~/work/.env
 CODEOID_SANDBOX_HOME_READABLE=          # replaces the home allowlist: ~/.bun,~/.cargo/bin,~/.gitconfig
 CODEOID_SANDBOX_DOCKER_IMAGE=node:22-bookworm-slim
+CODEOID_SANDBOX_DOCKER_SOCKET=false     # Docker access: commands reach the container runtime (root-equivalent)
+CODEOID_SANDBOX_WORKTREE_ROOTS=         # more worktree locations: ~/wt,../shared-worktrees (each repo gets <root>/<repo>/, each session a folder there)
 
 # Forks, backend switches and rewinds (docs/FEATURES.md#how-a-fork-switch-or-rewind-carries-the-conversation)
 CODEOID_NATIVE_CONTINUATION=true        # hand Claude/Codex the conversation in their own form; false = text transcript
@@ -229,7 +231,7 @@ The opencode backend (opencode 2.2.5 or a later 2.2.x) is on by default when an 
 
 ### OS sandbox
 
-Agents' commands run in an OS sandbox, on by default ([sandbox.md](sandbox.md)): the workspace and a private temp dir writable, everything else read-only, your home hidden whole but for a read-only allowlist, credential stores hidden, container sockets unreachable.
+Agents' commands run in an OS sandbox, on by default ([sandbox.md](sandbox.md)): the workspace and a private temp dir writable, the project roots (by default the parent of the session's repository) readable, everything else read-only, your home hidden whole but for a read-only allowlist, credential stores hidden, container sockets unreachable.
 
 ```json
 {
@@ -239,6 +241,7 @@ Agents' commands run in an OS sandbox, on by default ([sandbox.md](sandbox.md)):
     "allowedHosts": [],
     "hiddenPaths": ["~/work/.env"],
     "homeReadable": ["~/.bun", "~/.cargo/bin", "~/.gitconfig", "~/.volta"],
+    "projectRoots": ["@parent", "~/src/shared"],
     "bwrapPath": "/usr/bin/bwrap",
     "docker": { "image": "node:22-bookworm-slim", "runtime": "runsc" }
   }
@@ -246,12 +249,15 @@ Agents' commands run in an OS sandbox, on by default ([sandbox.md](sandbox.md)):
 ```
 
 - `provider` (`CODEOID_SANDBOX`) — `auto` (bubblewrap on Linux, Seatbelt on macOS), `bwrap`, `seatbelt`, `docker`, or `off`. The default for new sessions; each session can choose its own (`codeoid new --sandbox …`, the new-session dialog, `/sandbox`), and turning one off is asked of its owner.
-- `network` (`CODEOID_SANDBOX_NETWORK`) — `on`, `off` or `allowlist`; `allowedHosts` (`CODEOID_SANDBOX_ALLOWED_HOSTS`) for the allowlist. Only Claude's own sandbox enforces an allowlist; elsewhere it means no network, and the session says so.
+- `network` (`CODEOID_SANDBOX_NETWORK`) — `on`, `off` or `allowlist`; `allowedHosts` (`CODEOID_SANDBOX_ALLOWED_HOSTS`) for the allowlist. Only Claude's own sandbox enforces an allowlist; elsewhere it means no network, and the session says so. With `off` or `allowlist`, local services' unix sockets that let a connection in by who you are (Postgres, MySQL/MariaDB, Redis, …) are hidden too ([sandbox.md](sandbox.md#what-is-protected)).
 - `hiddenPaths` (`CODEOID_SANDBOX_HIDDEN_PATHS`) — more paths to hide, on top of codeoid's data, the agent CLIs' logins and the usual credential stores (`~` expands). An entry here also beats `homeReadable`.
 - `homeReadable` (`CODEOID_SANDBOX_HOME_READABLE`, comma separated) — what of your home a sandboxed command may read (read-only); the rest of the home isn't there. Default: toolchains and tool settings that hold no secret (`~/.bun`, `~/.cargo/bin`, `~/.cargo/registry`, `~/.cargo/git`, `~/.rustup`, `~/.nvm`, `~/.npm`, `~/.local/bin`, `~/.local/lib`, `~/.local/share/{pnpm,uv,pipx,mise}`, `~/.local/share/claude/versions`, `~/.pyenv`, `~/go/pkg`, `~/go/bin`, `~/.gitconfig`, `~/.config/git/{config,ignore,attributes}`); a link in one of these works only where it leads into the list (or outside the home): what it leads to elsewhere in the home stays hidden. Setting it replaces the list: never add a file holding a token (`~/.npmrc`).
 - Every `sandbox.*` change through `settings.set` needs an undelegated token, and is audited old → new.
 - `bwrapPath` — the bubblewrap binary (default: on `PATH`). Claude Code's own sandbox on Linux also needs `socat`.
 - `docker.image` (`CODEOID_SANDBOX_DOCKER_IMAGE`) and `docker.runtime` — what a Docker sandbox runs, and `runsc` for gVisor.
+- `docker.socket` (`CODEOID_SANDBOX_DOCKER_SOCKET`, default `false`) — Docker access: sandboxed commands can reach the host's container runtime socket (Docker, rootless Docker, Podman; Docker Desktop on macOS), with `DOCKER_HOST` set, for tests that start containers. Root-equivalent (a container can mount `/`), so every session with it says "sandboxed, Docker access"; a session turns it on for itself with `--docker-socket` / `/sandbox … docker`, asked of its owner ([sandbox.md](sandbox.md#docker-access)).
+- `worktreeRoots` (`CODEOID_SANDBOX_WORKTREE_ROOTS`, comma separated) — more places a sandboxed session may check a git worktree of its repository out, on top of `<repo>-worktrees/` (`~` expands; a relative path is the repository's main checkout's, at most one level up, judged again where it leads: `../.config` of a repository in your home is refused; never inside the checkout). A root may be shared: each repository gets `<root>/<repo>/`, and a sandboxed session writes only its own folder there. A root that doesn't exist is used once you create it (codeoid makes one only beside the repository). The config fails to load on `/`, the home or a dir holding it, anything in a hidden dir of the home (`~/.config`, `~/.local`, …), `~/Library`, codeoid's config dir or a system dir ([sandbox.md](sandbox.md#git-worktrees-inside-the-sandbox)).
+- `projectRoots` (`CODEOID_SANDBOX_PROJECT_ROOTS`, comma separated; Settings > Sandbox > "Project roots (readable)") — where sandboxed commands may read other repositories, read-only: absolute dirs (`~` expands) and `@parent`, the parent of the session's repository (the default: a session in `~/Workspace/codeoid` reads `~/Workspace/*`). `[]` is none. What the sandbox hides stays hidden inside, and so do the credential files anywhere there (`.env*`, `*.pem`, `*.key`, private keys, `.npmrc`, kubeconfigs, Terraform state, a `.git/config` with a token in it, …; a root with more than 20000 directories to look through isn't used, said). The config fails to load on the same places as `worktreeRoots`, and on the host's temp dir or anything in it; a default that would be your home (a repository directly in it) or in a temp dir falls back to none, and a workspace in no repository has no default root, said on the session. A session can have its own at create (`codeoid new --project-root <dir>`, `--no-project-roots`, the new-session dialog); more than the daemon's is a widening (`session:approve`, undelegated). Writing in another directory is per session: `codeoid new --add-dir <dir>`, `/sandbox add <dir>`, `codeoid sandbox add <session> <dir>`, or the agent's `request_directory` ([sandbox.md](sandbox.md#working-across-repositories)).
 - Where the sandbox can't run, interactive sessions run unsandboxed and say so on every approval; autonomous sessions, routines and loops refuse to start. `codeoid sandbox providers` shows what runs here.
 
 ### One daemon per data directory

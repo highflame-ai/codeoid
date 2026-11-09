@@ -141,6 +141,10 @@ import { SqliteEpisodeStore } from "../daemon/memory/store.js";
 import { MEMORY_TOOL_NAMES } from "../daemon/memory/index.js";
 import type { Embedder } from "../daemon/memory/embedder.js";
 import type { EffortLevel } from "../protocol/types.js";
+import { LocalSandboxHandle } from "../daemon/sandbox/local-handle.js";
+import { SandboxRegistry } from "../daemon/sandbox/registry.js";
+import { SessionSandbox } from "../daemon/sandbox/session-sandbox.js";
+import type { SandboxProvider, SandboxSpec } from "../daemon/sandbox/types.js";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -3894,5 +3898,89 @@ describe("ClaudeProvider — the OS sandbox", () => {
       "CLAUDE_CODE_OAUTH_TOKEN",
       "SSH_AUTH_SOCK",
     ]);
+  });
+});
+
+describe("ClaudeProvider — a worktree added elsewhere in the repository (#448 round 11)", () => {
+  let openGate: () => void = () => {};
+  beforeEach(() => {
+    sdkMessages = [];
+    sdkThrowError = null;
+    capturedQueryOpts = null;
+    queryCallCount = 0;
+    sdkGate = new Promise<void>((r) => {
+      openGate = r;
+    });
+  });
+
+  /** bubblewrap as the registry sees it: nothing runs here, the spec is the real policy's. */
+  function fakeBwrap(): SandboxProvider {
+    const open = (spec: SandboxSpec) => new LocalSandboxHandle("bwrap", spec, (argv, o) => ({ argv: [...argv], env: o.env }));
+    return {
+      id: "bwrap",
+      displayName: "bubblewrap",
+      capabilities: { isolation: "os", placement: "local", workspace: "mount", stdioProcess: true, commands: true, wrapsArgv: true, network: ["on", "off"], platforms: ["linux"] },
+      probe: async () => ({ available: true }),
+      open: async (spec) => open(spec),
+      openSync: open,
+    };
+  }
+
+  it("doesn't rebuild the session's query (nor kill its background tasks): the same query, warm, until its own sandbox changes", async () => {
+    const root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-claude-wt-")));
+    const env = { ...process.env, GIT_CONFIG_NOSYSTEM: "1", GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.invalid", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.invalid", HOME: root };
+    const git = (args: string[], cwd: string) => {
+      const r = Bun.spawnSync(["git", ...args], { cwd, env });
+      if (r.exitCode !== 0) throw new Error(r.stderr.toString());
+    };
+    const repo = join(root, "repo");
+    mkdirSync(repo);
+    git(["init", "-q", "-b", "main"], repo);
+    git(["commit", "-q", "--allow-empty", "-m", "i"], repo);
+    git(["worktree", "add", "-q", "-b", "before", join(root, "before")], repo);
+    const registry = new SandboxRegistry("linux", (n) => `/usr/bin/${n}`);
+    registry.register(fakeBwrap());
+    const sbx = new SessionSandbox({ sessionId: "2222bbbb-0000-4000-8000-000000000000", name: "parent", workdir: repo, registry, setting: { provider: "bwrap" } });
+    const events: SessionScopedEvent[] = [];
+    try {
+      expect((await sbx.refresh("claude")).state).toBe("on");
+      expect(sbx.runtimeFor("claude")?.plan.kind).toBe("native");
+      const provider = new ClaudeProvider({
+        sessionId: "test-session",
+        initialBackingId: "test-backing",
+        workspaceId: "ws_test",
+        store: {
+          audit: () => {},
+          getClaudeCodeSessionId: () => null,
+          setClaudeCodeSessionId: () => {},
+          getSkillCommandGrants: () => new Map<string, boolean>(),
+          setSkillCommandGrant: () => {},
+        } as never,
+        sandbox: () => sbx.runtimeFor("claude"),
+      });
+      provider.onSessionEvent = (e) => events.push(e);
+      const turn = (msg: string) => provider.runTurn({ history: [], userMessage: msg, workdir: repo, canUseTool: async () => ({ behavior: "allow" as const }) });
+      turn("t1");
+      const query = capturedQueryOpts;
+      expect(queryCallCount).toBe(1);
+      // A fork of this session (codeoid's checkout beside the repository), your own worktree, another session's.
+      git(["worktree", "add", "-q", "-b", "fork", join(root, "repo-worktrees", "fork-9999eeee")], repo);
+      git(["worktree", "add", "-q", "-b", "yours", join(root, "yours")], repo);
+      git(["worktree", "remove", join(root, "before")], repo);
+      turn("t2");
+      expect(queryCallCount).toBe(1);
+      expect(capturedQueryOpts).toBe(query);
+      expect(events.filter((e) => e.type === "background_tasks")).toEqual([]);
+      // Its own sandbox changed (the network off): that one rebuilds, as before.
+      await sbx.set({ provider: "bwrap", network: "off" });
+      await sbx.refresh("claude");
+      turn("t3");
+      expect(queryCallCount).toBe(2);
+      openGate();
+      await provider.teardown();
+    } finally {
+      await sbx.close();
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

@@ -24,7 +24,7 @@ export const SandboxChip: Component<{ session: SessionInfo }> = (props) => {
       {(b) => (
         <span
           class={`rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider ${TONE[b().tone] ?? TONE.neutral}`}
-          title={`${b().title}\nChange it with /sandbox <auto|off|bwrap|seatbelt|docker> [on|off|allow:host,…]`}
+          title={`${b().title}\nChange it with /sandbox <auto|off|bwrap|seatbelt|docker> [on|off|allow:host,…] [docker|nodocker]; write another directory with /sandbox add <dir>`}
           data-sandbox={props.session.sandbox?.state}
         >
           🛡 {b().text}

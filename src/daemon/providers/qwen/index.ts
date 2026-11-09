@@ -61,6 +61,7 @@ import type { ResolvedAccount } from "../../accounts.js";
 import { qwenAccountEnv } from "../../account-apply.js";
 import { preparePrivateHome, QWEN_HOME_LAYOUT, withLoginsSynced } from "../../sandbox/backend-home.js";
 import { programLocations } from "../../sandbox/policy.js";
+import { buildSandboxMcpServer, type RequestDirectoryInput, SANDBOX_MCP_SERVER_NAME } from "../../sandbox/request-directory.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../../sandbox/types.js";
 
@@ -91,6 +92,8 @@ export interface QwenProviderInit {
   memory?: MemoryEngine;
   /** codeoid_fleet MCP server — conductor sessions only. */
   fleet?: { type: "sdk"; name: string; instance: unknown };
+  /** The sandbox's `request_directory`, decided by the session (sandbox/request-directory.ts): mounted in-process. */
+  requestDirectory?: (input: RequestDirectoryInput) => Promise<string>;
   /** The daemon's OAuth MCP relay (#396): how this backend reaches the
    *  registry's OAuth servers without holding their tokens. */
   mcpProxy?: McpProxyMount;
@@ -438,6 +441,8 @@ export class QwenProvider implements SessionProvider {
           }
         : {}),
       ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
+      // The sandbox's ask for a directory to write (sandbox/request-directory.ts), in-process like memory.
+      ...(init.requestDirectory ? { [SANDBOX_MCP_SERVER_NAME]: buildSandboxMcpServer(init.sessionId, (_id, input) => (init.requestDirectory as (i: RequestDirectoryInput) => Promise<string>)(input)) } : {}),
     };
 
     // An account is an API key with its endpoint; it replaces the configured auth.

@@ -158,7 +158,7 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
     }
 
     case "session.message": {
-      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string; risk?: ToolRisk; sandboxed?: boolean; sandboxNote?: string } }; identity?: { name?: string; type?: string } };
+      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string; risk?: ToolRisk; sandboxed?: boolean; sandboxNote?: string; sandboxDocker?: boolean } }; identity?: { name?: string; type?: string } };
       const id = sm.identity?.name ? `${DIM}${S(sm.identity.name)}${RESET} ` : "";
       switch (sm.role) {
         case "user":
@@ -465,6 +465,22 @@ export class TerminalClient {
     if (line) console.log(data.pending ? `  now: ${line}` : line);
   }
 
+  /** Add a directory to what a session's commands write, or remove one (docs/sandbox.md, Working across repositories). */
+  async sandboxDir(sessionIdOrName: string, action: "add" | "remove", path: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const resp = await this.#request({ type: "session.sandbox_dir", id: randomUUID(), sessionId, action, path });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const data = resp.data as { pending?: boolean; message?: string; sandbox?: SessionSandboxInfo | null };
+    if (data.pending) console.log(`Asked on the session: ${path} is writable once its owner says yes (codeoid approve ${sessionIdOrName}, or the web UI), from its next turn.`);
+    else if (data.message) console.log(data.message);
+    const line = sandboxSummary(data.sandbox ?? undefined);
+    if (line) console.log(`  now: ${line}`);
+  }
+
   /** The daemon's sandbox providers and whether each runs here (#448). */
   async sandboxProviders(): Promise<void> {
     const resp = await this.#request({ type: "sandbox.providers", id: randomUUID() });
@@ -472,12 +488,12 @@ export class TerminalClient {
       this.#printError(resp);
       return;
     }
-    const data = resp.data as { enabled: boolean; auto: string | null; default: { provider: string; network: string }; providers: SandboxProviderWire[] };
+    const data = resp.data as { enabled: boolean; auto: string | null; default: { provider: string; network: string; dockerSocket?: boolean }; providers: SandboxProviderWire[] };
     if (!data.enabled) {
       console.log("This daemon has no OS sandbox.");
       return;
     }
-    console.log(`\n  Default: ${data.default.provider}${data.default.provider === "auto" && data.auto ? ` (${data.auto} here)` : ""}, network ${data.default.network}\n`);
+    console.log(`\n  Default: ${data.default.provider}${data.default.provider === "auto" && data.auto ? ` (${data.auto} here)` : ""}, network ${data.default.network}${data.default.dockerSocket ? ", Docker access (can reach the whole machine)" : ""}\n`);
     for (const p of data.providers) {
       const where = `${p.isolation} isolation, ${p.placement}, network ${p.network.join("/")}`;
       console.log(`  ${p.id.padEnd(10)} ${p.available ? "available" : "not available"}  ${p.displayName} — ${where}`);

@@ -7,8 +7,9 @@
  * scratch dir, outside the host's /tmp; nothing runs outside a sandbox but
  * the one call the gate refuses, which therefore never runs.
  */
+import { createServer } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
@@ -183,8 +184,28 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(listing).not.toContain("codeoid-login-");
   }, 120_000);
 
-  test("a worktree added while a command runs is read-only to it, under Claude's sandbox too (a plain repository's worktrees/ is held whole) (#448 round 3)", async () => {
-    const r2 = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-claude-late-")));
+  test("Docker access: a planted socket in the hidden runtime dir is unreachable by default, and reachable with the owner's option (#448 follow-up)", async () => {
+    if (!Bun.which("python3")) return;
+    const runtime = join(root, "run-user");
+    mkdirSync(runtime, { recursive: true, mode: 0o700 });
+    const sock = join(runtime, "docker.sock");
+    const server = createServer((c) => c.end("PLANTED-RUNTIME\n"));
+    await new Promise<void>((r) => server.listen(sock, r));
+    try {
+      const cmd = `python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(100).decode().strip())' '${sock}' 2>&1 || true`;
+      const hidden = await probe("off", cmd, ["policy"], { CODEOID_PROBE_RUNTIME_DIR: runtime });
+      expect(hidden.result).toBe("success");
+      expect(hidden.toolResult).not.toContain("PLANTED-RUNTIME");
+      const shown = await probe("off", cmd, ["policy"], { CODEOID_PROBE_RUNTIME_DIR: runtime, CODEOID_PROBE_DOCKER_SOCKET: "1" });
+      expect(shown.result).toBe("success");
+      expect(shown.toolResult).toContain("PLANTED-RUNTIME");
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  }, 300_000);
+
+  test("under Claude's sandbox too, a command adds a worktree in its own folder, commits there and removes it; nothing lands elsewhere in the location, and the user's and other sessions' worktrees stay held (#448 round 10)", async () => {
+    const r2 = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-sbx-claude-wt-")));
     try {
       const home = join(r2, "home");
       const repo = join(home, "proj");
@@ -195,35 +216,68 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
       writeFileSync(join(repo, "a.txt"), "a\n");
       git(["add", "."], repo);
       git(["commit", "-qm", "init"], repo);
-      const lateDir = join(repo, ".git", "worktrees", "late");
+      // The user's own worktrees: one beside the repository, one in its -worktrees location; another session's folder.
+      expect(git(["worktree", "add", "-q", "-b", "user", join(r2, "userwt")], repo).exitCode).toBe(0);
+      expect(git(["worktree", "add", "-q", "-b", "userloc", join(home, "proj-worktrees", "userloc")], repo).exitCode).toBe(0);
+      expect(git(["worktree", "add", "-q", "-b", "other", join(home, "proj-worktrees", "other-2222bbbb", "o")], repo).exitCode).toBe(0);
+      const wts = join(repo, ".git", "worktrees");
+      const own = join(home, "proj-worktrees", "agent-1111aaaa");
       const command = [
-        `touch ${join(repo, "started")}`,
-        `i=0; while [ ! -e ${join(repo, "go")} ] && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done`,
-        `echo /elsewhere > ${join(lateDir, "commondir")} 2>/dev/null && echo REWROTE || echo LATE-READ-ONLY`,
-        `echo t > ${join(repo, "t.txt")} && git add t.txt && git -c user.name=t -c user.email=t@example.com commit -qm inside && echo COMMITTED`,
+        `git worktree add -q ${own}/x -b feature/x && echo ADDED`,
+        `cd ${own}/x && echo x > x.txt && git add x.txt && git -c user.name=t -c user.email=t@example.com commit -qm in-worktree && echo COMMITTED`,
+        `cd '${repo}' && git worktree remove ${own}/x && echo REMOVED`,
+        "git worktree add -q ../proj-worktrees/y -b y 2>/dev/null && echo ADDED-ELSEWHERE || echo ELSEWHERE-REFUSED",
+        `echo x > ${join(home, "proj-worktrees", "other-2222bbbb", "o", "x.txt")} 2>/dev/null && echo WROTE-OTHER || echo OTHER-HELD`,
+        `echo /elsewhere > ${join(wts, "userwt", "commondir")} 2>/dev/null && echo REWROTE || echo USER-HELD`,
+        `echo x > ${join(home, "proj-worktrees", "userloc", "x.txt")} 2>/dev/null && echo WROTE-USERLOC || echo USERLOC-HELD`,
+        `echo bad >> ${join(repo, ".git", "config")} 2>/dev/null && echo WROTE-CONFIG || echo CONFIG-HELD`,
       ].join("; ");
-      const file = join(r2, "cmd-late.txt");
+      const file = join(r2, "cmd-wt.txt");
       writeFileSync(file, command);
-      const p = Bun.spawn([process.execPath, PROBE, r2, "off", file, "policy"], { stdout: "pipe", stderr: "pipe", timeout: 90_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1" } });
-      let exited = false;
-      void p.exited.then(() => {
-        exited = true;
-      });
-      for (let i = 0; i < 600 && !exited && !existsSync(join(repo, "started")); i++) await Bun.sleep(100);
-      expect(existsSync(join(repo, "started"))).toBe(true);
-      expect(git(["worktree", "add", "-q", "-b", "late", join(r2, "late")], repo).exitCode).toBe(0);
-      writeFileSync(join(repo, "go"), "");
+      const p = Bun.spawn([process.execPath, PROBE, r2, "off", file, "policy"], { stdout: "pipe", stderr: "pipe", timeout: 90_000, env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", CODEOID_PROBE_WORKTREE_FOLDER: "agent-1111aaaa" } });
       const out = await new Response(p.stdout).text();
       await p.exited;
       const r = JSON.parse(out.trim().split("\n").at(-1) ?? "{}") as { result: string; toolResult: string | null };
       expect(r.result).toBe("success");
-      expect(r.toolResult).toContain("LATE-READ-ONLY");
-      expect(r.toolResult).toContain("COMMITTED");
-      expect(readFileSync(join(lateDir, "commondir"), "utf8")).not.toContain("elsewhere");
+      for (const w of ["ADDED", "COMMITTED", "REMOVED", "OTHER-HELD", "USER-HELD", "USERLOC-HELD", "CONFIG-HELD"]) expect(r.toolResult).toContain(w);
+      expect(git(["log", "--oneline", "feature/x"], repo).stdout.toString()).toContain("in-worktree");
+      expect(readFileSync(join(wts, "userwt", "commondir"), "utf8")).not.toContain("elsewhere");
+      // Elsewhere in a location inside the (denied) home it lands in the CLI's scratch home, never on the host
+      // (docs/sandbox.md: on Claude's own sandbox the location isn't shown, it would cover the session's folder).
+      expect(existsSync(join(home, "proj-worktrees", "y"))).toBe(false);
+      expect(readFileSync(join(home, "proj-worktrees", "other-2222bbbb", "o", "a.txt"), "utf8")).toBe("a\n");
+      expect(existsSync(join(home, "proj-worktrees", "other-2222bbbb", "o", "x.txt"))).toBe(false);
     } finally {
       rmSync(r2, { recursive: true, force: true });
     }
   }, 120_000);
+
+  test("Docker access on Claude's Linux sandbox (every unix socket allowed): a tmux-style socket in the host's /tmp is out of reach, the runtime's isn't (#448 round 10)", async () => {
+    if (!Bun.which("python3")) return;
+    const runtime = join(root, "run-user-tmux");
+    mkdirSync(runtime, { recursive: true, mode: 0o700 });
+    const tmuxDir = realpathSync(mkdtempSync("/tmp/codeoid-test-tmux-"));
+    const sockets = { docker: join(runtime, "docker.sock"), tmux: join(tmuxDir, "default") };
+    const servers = await Promise.all(
+      Object.entries(sockets).map(
+        ([name, at]) =>
+          new Promise<ReturnType<typeof createServer>>((r) => {
+            const s = createServer((c) => c.end(`REACHED-${name.toUpperCase()}\n`));
+            s.listen(at, () => r(s));
+          }),
+      ),
+    );
+    try {
+      const py = (at: string) => `python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); print(s.recv(100).decode().strip())' '${at}' 2>&1 | tail -1`;
+      const r = await probe("off", `${py(sockets.docker)}; ${py(sockets.tmux)}`, ["policy"], { CODEOID_PROBE_RUNTIME_DIR: runtime, CODEOID_PROBE_DOCKER_SOCKET: "1" });
+      expect(r.result).toBe("success");
+      expect(r.toolResult).toContain("REACHED-DOCKER");
+      expect(r.toolResult).not.toContain("REACHED-TMUX");
+    } finally {
+      for (const s of servers) s.close();
+      rmSync(tmuxDir, { recursive: true, force: true });
+    }
+  }, 300_000);
 
   test("the toolchains' cache variables reach only sandboxed commands: never the CLI, its MCP servers, or a command run outside the sandbox (#448 round 3)", async () => {
     mkdirSync(join(root, "home", "proj"), { recursive: true });
@@ -309,6 +363,158 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(r.toolResult ?? "").not.toContain("RAN");
     expect(existsSync(join(outside, "keep.txt"))).toBe(true);
   }, 120_000);
+
+  test("project roots and added dirs (working across repositories): the root shown around the workspace (its read binds land after its write binds), b read-only and its .env hidden; added, b writable", async () => {
+    const home = join(root, "home");
+    const ws = join(home, "Workspace", "a");
+    const b = join(home, "Workspace", "b");
+    for (const d of [ws, b, join(home, "Workspace", "c")]) mkdirSync(d, { recursive: true });
+    writeFileSync(join(b, "README.md"), "bravo readme\n");
+    writeFileSync(join(b, ".env"), "PLANTED-B-ENV\n");
+    const command = [
+      `cat ${join(b, "README.md")}`,
+      `cat ${join(b, ".env")} 2>/dev/null || echo ENV-HIDDEN`,
+      `echo a > ${join(ws, "own.txt")} && echo WS-WRITABLE`,
+      `echo b > ${join(b, "new.txt")} 2>/dev/null && echo B-WRITTEN || echo B-READ-ONLY`,
+      `echo c > ${join(home, "Workspace", "c", "new.txt")} 2>/dev/null && echo C-WRITTEN || echo C-READ-ONLY`,
+    ].join("; ");
+    const env = { CODEOID_PROBE_WORKSPACE: ws, CODEOID_PROBE_PROJECT_ROOTS: join(home, "Workspace") };
+    const r = await probe("off", command, ["policy"], env);
+    expect(r.result).toBe("success");
+    expect(r.toolResult).toContain("bravo readme");
+    expect(r.toolResult).toContain("ENV-HIDDEN");
+    expect(r.toolResult).not.toContain("PLANTED-B-ENV");
+    expect(r.toolResult).toContain("WS-WRITABLE");
+    expect(r.toolResult).toContain("B-READ-ONLY");
+    expect(r.toolResult).toContain("C-READ-ONLY");
+    const added = await probe("off", command, ["policy"], { ...env, CODEOID_PROBE_ADDED_DIRS: b });
+    expect(added.result).toBe("success");
+    expect(added.toolResult).toContain("WS-WRITABLE");
+    expect(added.toolResult).toContain("B-WRITTEN");
+    expect(added.toolResult).toContain("PLANTED-B-ENV");
+    expect(added.toolResult).toContain("C-READ-ONLY");
+    expect(existsSync(join(b, "new.txt"))).toBe(true);
+    expect(existsSync(join(home, "Workspace", "c", "new.txt"))).toBe(false);
+  }, 300_000);
+  test("a project root shows nothing hidden (#448 round 12): not a .env at its top, not where a link in it leads (~/.ssh, the home), not codeoid's private dir in it, not a credential file deeper", async () => {
+    const home = join(root, "home");
+    const W = join(home, "Workspace");
+    const ws = join(W, "a12");
+    const b = join(W, "b12");
+    for (const d of [ws, b, join(home, ".ssh"), join(home, "Documents")]) mkdirSync(d, { recursive: true });
+    writeFileSync(join(home, ".ssh", "id_ed25519"), "LEAK-SSH\n");
+    writeFileSync(join(home, "Documents", "doc.txt"), "LEAK-DOC\n");
+    writeFileSync(join(W, ".env"), "LEAK-ROOT-ENV\n");
+    writeFileSync(join(b, "README.md"), "B12-README\n");
+    writeFileSync(join(b, "id_rsa"), "LEAK-B-KEY\n");
+    mkdirSync(join(W, "b12-worktrees", "fork-1", "x"), { recursive: true });
+    writeFileSync(join(W, "b12-worktrees", "fork-1", ".env"), "LEAK-WT-ENV\n");
+    symlinkSync(join(home, ".ssh"), join(W, "keys"));
+    symlinkSync(join(home, "Documents"), join(W, "notes"));
+    symlinkSync(home, join(W, "home-link"));
+    // codeoid's private dir (its TMPDIR's codeoid-sandbox-*) right in the root, and a sign-in planted there after the spec was built.
+    const signinFile = join(root, "signin12.txt");
+    const command = [
+      `cat ${join(W, "keys", "id_ed25519")} 2>&1`,
+      `cat ${join(home, ".ssh", "id_ed25519")} 2>&1`,
+      `cat ${join(W, "notes", "doc.txt")} 2>&1`,
+      `cat ${join(home, "Documents", "doc.txt")} 2>&1`,
+      `cat ${join(W, ".env")} 2>&1`,
+      `cat ${join(b, "id_rsa")} 2>&1`,
+      `cat ${join(W, "b12-worktrees", "fork-1", ".env")} 2>&1`,
+      `cat "$(cat ${signinFile})/.credentials.json" 2>&1`,
+      `cat ${join(b, "README.md")}`,
+      `echo a > ${join(ws, "own.txt")} && echo WS-WRITABLE`,
+    ].join("; ");
+    const r = await probe("off", command, ["policy"], { CODEOID_PROBE_WORKSPACE: ws, CODEOID_PROBE_PROJECT_ROOTS: W, TMPDIR: W, CODEOID_PROBE_SIGNIN_PATH: signinFile });
+    expect(readFileSync(signinFile, "utf8").startsWith(W)).toBe(true);
+    expect(r.result).toBe("success");
+    expect(r.toolResult).toContain("B12-README");
+    expect(r.toolResult).toContain("WS-WRITABLE");
+    expect(r.toolResult).not.toContain("LEAK");
+    expect(r.toolResult).not.toContain("PLANTED-SIGNIN-TOKEN");
+  }, 300_000);
+
+  test("a project root named through a link (#448 round 13): read and hidden where it really is, the workspace in it writable; every command used to fail", async () => {
+    const home = join(root, "home");
+    const W = join(home, "Workspace13");
+    const ws = join(W, "a");
+    const b = join(W, "b");
+    for (const d of [ws, b]) mkdirSync(d, { recursive: true });
+    writeFileSync(join(b, "README.md"), "B13-README\n");
+    writeFileSync(join(b, ".env"), "LINKROOT-B-ENV\n");
+    const code = join(home, "code13");
+    symlinkSync(W, code);
+    const command = [`cat ${join(b, "README.md")}`, `cat ${join(code, "b", ".env")} 2>&1`, `cat ${join(b, ".env")} 2>&1`, `echo a > ${join(ws, "own.txt")} && echo WS-WRITABLE`].join("; ");
+    const r = await probe("off", command, ["policy"], { CODEOID_PROBE_WORKSPACE: ws, CODEOID_PROBE_PROJECT_ROOTS: code });
+    expect(r.result).toBe("success");
+    expect(r.toolResult).toContain("B13-README");
+    expect(r.toolResult).toContain("WS-WRITABLE");
+    expect(r.toolResult).not.toContain("Read-only file system");
+    expect(r.toolResult).not.toContain("LINKROOT-B-ENV");
+  }, 300_000);
+  /** A repository at `dir`, one commit, made on the host with no hook and no global config. */
+  function repo(dir: string, home: string): void {
+    mkdirSync(dir, { recursive: true });
+    const env = { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: home, GIT_CONFIG_NOSYSTEM: "1" };
+    const g = (args: string[]) => Bun.spawnSync(["git", "-c", "core.hooksPath=/dev/null", "-c", "user.name=t", "-c", "user.email=t@example.invalid", ...args], { cwd: dir, env });
+    writeFileSync(join(dir, "README.md"), "readme\n");
+    g(["init", "-q", "-b", "main"]);
+    g(["add", "-A"]);
+    g(["commit", "-qm", "init"]);
+  }
+
+  test("held in place on Claude's own sandbox (#448 round 14): a monorepo package session can't move its package dir, nor the dir above it, to plant the package's project settings", async () => {
+    const home = join(root, "home");
+    const top = join(home, "Workspace", "mono14");
+    const pkg = join(top, "packages", "app");
+    mkdirSync(pkg, { recursive: true });
+    writeFileSync(join(pkg, "index.js"), "1\n");
+    repo(top, home);
+    const command = [
+      `cd ${join(top, "packages")} && mv app app-old 2>&1; echo mv-pkg=$?`,
+      `cd ${top} && mv packages packages-old 2>&1; echo mv-parent=$?`,
+      `echo '{"hooks":{}}' > ${join(pkg, ".claude", "settings.json")} 2>&1 || echo SETTINGS-HELD`,
+      `echo w > ${join(pkg, "own.txt")} && echo PKG-WRITABLE`,
+    ].join("; ");
+    const r = await probe("off", command, ["policy"], { CODEOID_PROBE_WORKSPACE: top, CODEOID_PROBE_WORKDIR: pkg });
+    expect(r.result).toBe("success");
+    expect(r.toolResult).toContain("mv-pkg=1");
+    expect(r.toolResult).toContain("mv-parent=1");
+    expect(r.toolResult).toContain("Device or resource busy");
+    expect(r.toolResult).toContain("SETTINGS-HELD");
+    expect(r.toolResult).toContain("PKG-WRITABLE");
+    expect(existsSync(join(top, "packages", "app-old"))).toBe(false);
+    expect(existsSync(join(top, "packages-old"))).toBe(false);
+    expect(existsSync(join(pkg, ".claude", "settings.json"))).toBe(false);
+  }, 300_000);
+
+  test("held in place on Claude's own sandbox (#448 round 14): a repository inside an added dir can't be moved aside to plant its project settings; a workspace inside an added dir can't have the dir between them moved", async () => {
+    const home = join(root, "home");
+    const W = join(home, "Workspace");
+    const ws = join(W, "a14");
+    const b = join(W, "b14");
+    repo(ws, home);
+    repo(join(b, "lib"), home);
+    const nested = await probe(
+      "off",
+      [`cd ${b} && mv lib lib-old 2>&1; echo mv-lib=$?`, `echo x > ${join(b, "lib", "new.txt")} && echo LIB-WRITABLE`].join("; "),
+      ["policy"],
+      { CODEOID_PROBE_WORKSPACE: ws, CODEOID_PROBE_ADDED_DIRS: b },
+    );
+    expect(nested.result).toBe("success");
+    expect(nested.toolResult).toContain("mv-lib=1");
+    expect(nested.toolResult).toContain("LIB-WRITABLE");
+    expect(existsSync(join(b, "lib-old"))).toBe(false);
+    // A workspace inside an owner-added dir, two levels down: the dir between them stays (findings-s L1).
+    const A = join(W, "outer14");
+    const inner = join(A, "mid", "ws");
+    repo(inner, home);
+    const between = await probe("off", `cd ${A} && mv mid mid2 2>&1; echo mv-mid=$?`, ["policy"], { CODEOID_PROBE_WORKSPACE: inner, CODEOID_PROBE_ADDED_DIRS: A });
+    expect(between.result).toBe("success");
+    expect(between.toolResult).toContain("mv-mid=1");
+    expect(existsSync(join(A, "mid2"))).toBe(false);
+  }, 300_000);
 });
 
 /**

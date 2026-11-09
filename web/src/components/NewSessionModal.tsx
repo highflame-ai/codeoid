@@ -32,14 +32,29 @@ import type { PackWire, SandboxProviderWire, SessionInfo } from "../protocol/typ
 interface SandboxProvidersData {
   enabled: boolean;
   auto: string | null;
-  default: { provider: string; network: string };
+  default: { provider: string; network: string; dockerSocket?: boolean; projectRoots?: string[] };
   providers: SandboxProviderWire[];
+}
+
+/** A list typed in a field: comma- or newline-separated, trimmed. */
+function dirList(text: string): string[] {
+  return text
+    .split(/[,\n]/)
+    .map((d) => d.trim())
+    .filter(Boolean);
+}
+
+/** What the daemon's default project roots mean, in words. */
+function rootsDefaultLabel(d: SandboxProvidersData | null): string {
+  const roots = d?.default.projectRoots ?? ["@parent"];
+  if (roots.length === 0) return "none";
+  return roots.map((r) => (r === "@parent" ? "the repository's parent" : r)).join(", ");
 }
 
 function sandboxDefaultLabel(d: SandboxProvidersData | null): string {
   if (!d) return "auto";
   const p = d.default.provider === "auto" && d.auto ? `auto: ${d.auto}` : d.default.provider;
-  return `${p}, network ${d.default.network}`;
+  return `${p}, network ${d.default.network}${d.default.dockerSocket ? ", Docker access" : ""}`;
 }
 import DirectoryPicker from "./files/DirectoryPicker";
 import { providerIds, providerLabel } from "../state/providers";
@@ -151,6 +166,11 @@ const NewSessionModal: Component = () => {
   const [sandboxChoice, setSandboxChoice] = createSignal("");
   // "" = the daemon's default network; else on | off.
   const [sandboxNetwork, setSandboxNetwork] = createSignal("");
+  // Docker access (the container runtime's socket): off unless ticked, or the daemon's default has it.
+  const [sandboxDocker, setSandboxDocker] = createSignal(false);
+  // Working across repositories: "" = the daemon's project roots; "none" = none; else a list. Added dirs: writable too.
+  const [sandboxRoots, setSandboxRoots] = createSignal("");
+  const [sandboxAdded, setSandboxAdded] = createSignal("");
   // The sandbox choice is opened on demand ("change"), and only then asks the
   // daemon what it has (absent: an older daemon, or no sandboxing).
   const [sandboxOpen, setSandboxOpen] = createSignal(false);
@@ -438,6 +458,7 @@ const NewSessionModal: Component = () => {
     setPackRole("");
     setSandboxChoice("");
     setSandboxNetwork("");
+    setSandboxDocker(false);
     setSandboxOpen(false);
     setRoles(defaultRoles());
     setWarnings([]);
@@ -576,11 +597,14 @@ const NewSessionModal: Component = () => {
             : {}),
         ...(packId() ? { pack: packId() } : {}),
         ...(packRole() ? { packRole: packRole() } : {}),
-        ...(sandboxChoice() || sandboxNetwork()
+        ...(sandboxChoice() || sandboxNetwork() || sandboxDocker() || sandboxRoots().trim() || sandboxAdded().trim()
           ? {
               sandbox: {
                 ...(sandboxChoice() ? { provider: sandboxChoice() } : {}),
                 ...(sandboxNetwork() ? { network: sandboxNetwork() as "on" | "off" } : {}),
+                ...(sandboxDocker() ? { dockerSocket: true } : {}),
+                ...(sandboxRoots().trim() ? { projectRoots: sandboxRoots().trim().toLowerCase() === "none" ? [] : dirList(sandboxRoots()) } : {}),
+                ...(dirList(sandboxAdded()).length > 0 ? { addedDirs: dirList(sandboxAdded()) } : {}),
               },
             }
           : {}),
@@ -1027,13 +1051,56 @@ const NewSessionModal: Component = () => {
                   <option value="off">network off</option>
                 </select>
               </div>
+              <Show when={sandboxChoice() !== "off" && !sandboxProviders()?.default.dockerSocket}>
+                <label class="flex items-center gap-2 text-[11px] text-fg-muted" title="Docker access can reach the whole machine (a container can mount /)">
+                  <input
+                    type="checkbox"
+                    checked={sandboxDocker()}
+                    onChange={(e) => setSandboxDocker(e.currentTarget.checked)}
+                    disabled={busy()}
+                    aria-label="Docker access"
+                  />
+                  Docker access — for tests that start containers
+                </label>
+              </Show>
+              <Show when={sandboxDocker() && sandboxChoice() !== "off"}>
+                <p class="text-[11px] text-warn">
+                  Docker access can reach the whole machine: a command could start a container that mounts / and read or change anything, your credentials included.
+                </p>
+              </Show>
               <Show when={sandboxChoice() === "off"}>
                 <p class="text-[11px] text-warn">
                   Off: the agent's commands can read your credentials and change any file you can, in every mode.
                 </p>
               </Show>
+              <Show when={sandboxChoice() !== "off"}>
+                <label class="block space-y-1">
+                  <span class="text-[11px] text-fg-muted">Readable project roots — other repositories, read-only</span>
+                  <input
+                    type="text"
+                    value={sandboxRoots()}
+                    onInput={(e) => setSandboxRoots(e.currentTarget.value)}
+                    disabled={busy()}
+                    aria-label="Project roots"
+                    placeholder={`default: ${rootsDefaultLabel(sandboxProviders())} (or "none", or dirs, comma-separated)`}
+                    class="w-full rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
+                  />
+                </label>
+                <label class="block space-y-1">
+                  <span class="text-[11px] text-fg-muted">Also writable — other repositories it may change, each as a workspace</span>
+                  <input
+                    type="text"
+                    value={sandboxAdded()}
+                    onInput={(e) => setSandboxAdded(e.currentTarget.value)}
+                    disabled={busy()}
+                    aria-label="Added directories"
+                    placeholder="none (absolute dirs, comma-separated; ~ expands)"
+                    class="w-full rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
+                  />
+                </label>
+              </Show>
               <p class="text-[11px] text-fg-faint">
-                The workspace and a private temp dir are writable; everything else is read-only and credential stores are hidden. Change it later with /sandbox.
+                The workspace and a private temp dir are writable, and the project roots readable; everything else is read-only and credential stores are hidden. Change it later with /sandbox, or /sandbox add &lt;dir&gt;; the agent can ask for a directory too.
               </p>
             </div>
           </Show>

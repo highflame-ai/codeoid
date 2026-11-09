@@ -35,6 +35,7 @@ import { existsSync, lstatSync, mkdirSync, realpathSync, type Stats, unlinkSync 
 import path from "node:path";
 import { promisify } from "node:util";
 import { GIT_BIN, hardenedGit, safeGitEnv } from "./git-env.js";
+import { noteCodeoidWorktree } from "./sandbox/worktrees.js";
 
 const execFileP = promisify(execFile);
 
@@ -260,6 +261,8 @@ export async function createForkWorktree(opts: {
   }
 
   opts.onPath?.(worktreePath);
+  // codeoid's own: a session's sandbox holds it like the user's, even one started before it was made (sandbox/worktrees.ts).
+  noteCodeoidWorktree(worktreePath);
   try {
     // --end-of-options: treat `base` as a rev, never a flag, so a value
     // starting with '-' can't inject a git option.

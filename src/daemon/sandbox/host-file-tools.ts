@@ -107,6 +107,7 @@ function bothForms(paths: readonly string[]): string[] {
   return [...out];
 }
 
+// paths: a look (does a hidden path exist), no write
 function lexists(p: string): boolean {
   try {
     lstatSync(p);
@@ -130,7 +131,7 @@ export function hostToolBounds(
   spec: SandboxSpec,
   opts: { tempDir?: string; readOnly?: readonly string[]; readable?: readonly string[]; writable?: readonly string[]; markdown?: readonly string[]; hidden?: readonly string[]; searchable?: readonly string[] } = {},
 ): HostToolBounds {
-  const hidden = bothForms([...spec.hidden, ...spec.containerSockets, ...(opts.hidden ?? [])]);
+  const hidden = bothForms([...spec.hidden, ...spec.containerSockets, ...(spec.serviceSockets ?? []), ...(opts.hidden ?? [])]);
   const holdsNothingHidden = (r: string) => !hidden.some((h) => within(h, r));
   const tempDir = opts.tempDir ?? spec.tempDir;
   return {

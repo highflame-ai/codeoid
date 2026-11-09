@@ -31,11 +31,12 @@
  *     its commands.
  */
 
-import { readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { SandboxSettings } from "@anthropic-ai/claude-agent-sdk";
 import { absolutePathEntries, pathWithShim } from "./git-shim.js";
+import { pinRefusal, pinsProblem, SandboxPinError } from "./pinned.js";
 import type { SandboxRuntime } from "./session-sandbox.js";
 import type { SandboxSpec } from "./types.js";
 
@@ -106,6 +107,7 @@ export function claudeNativeEnv(
   ];
   const file = join(temp.cli, "command-env.sh");
   const part = `${file}.${process.pid}.part`;
+  // paths: the CLI's own temp dir: the daemon's, private, which no command can write (claudeTempEnv)
   writeFileSync(part, lines.join("\n"), { mode: 0o600 });
   renameSync(part, file);
   // PATH's absolute entries only (#448 round 5): a relative one (`.`, `node_modules/.bin`) finds a program the CLI starts on the host in the workspace.
@@ -113,9 +115,26 @@ export function claudeNativeEnv(
   return { ...rest, ...claudeTempEnv(temp), CLAUDE_ENV_FILE: file, ...(path === undefined ? {} : { PATH: path }) };
 }
 
+/**
+ * The host's shared temp dirs, denied in Claude's Linux sandbox while
+ * Docker access lets its commands connect to every unix socket they can see
+ * (tmux's `/tmp/tmux-<uid>`, X11's `/tmp/.X11-unix`, `ssh-agent`'s
+ * `/tmp/ssh-*`, an IDE's): what is shown again inside them (the workspace,
+ * the session's temp dirs) stays.
+ */
+export const HOST_SHARED_TEMP: readonly string[] = ["/tmp", "/var/tmp"];
+
 /** The SDK's `sandbox` option for a session whose sandbox is on and native. */
-export function claudeSandboxSettings(rt: Pick<SandboxRuntime, "spec" | "config">, env: Record<string, string | undefined>, temp?: ClaudeTempDirs): SandboxSettings {
+export function claudeSandboxSettings(
+  rt: Pick<SandboxRuntime, "spec" | "config">,
+  env: Record<string, string | undefined>,
+  temp?: ClaudeTempDirs,
+  platform: NodeJS.Platform = process.platform,
+): SandboxSettings {
   const spec = rt.spec;
+  // Every directory the CLI is told to bind by name, checked first (pinned.ts, #448 round 13): never one a link leads from.
+  const problem = pinsProblem(spec.pins);
+  if (problem) throw new SandboxPinError(pinRefusal(problem));
   const tempDir = temp?.commands ?? spec.tempDir;
   const network: NonNullable<SandboxSettings["network"]> =
     spec.network.mode === "off"
@@ -123,7 +142,16 @@ export function claudeSandboxSettings(rt: Pick<SandboxRuntime, "spec" | "config"
       : spec.network.mode === "allowlist"
         ? { allowedDomains: [...(spec.network.allow ?? [])], strictAllowlist: true }
         : {};
+  // Container runtime sockets the owner let in (spec.dockerSockets): the CLI's macOS sandbox allows them by path; its
+  // Linux one can't, and blocks every unix socket a command makes unless all are allowed: there the filesystem holds
+  // which are reachable (every other runtime socket, the desktop's runtime dir, the system bus, the agent's are denied
+  // or hidden), and the host's /tmp (tmux, X11, ssh-agent, an IDE's sockets), which the CLI's sandbox otherwise keeps,
+  // is denied too (#448 round 10): only what the sandbox shows of it (the session's own temp dirs) is there.
+  const sockets = physical(spec.dockerSockets ?? []);
+  const allSockets = sockets.length > 0 && platform === "linux";
+  if (sockets.length > 0) Object.assign(network, allSockets ? { allowAllUnixSockets: true } : { allowUnixSockets: sockets });
   const envVars = credentialEnvNames(env, spec.unsetEnv).map((name) => ({ name, mode: "deny" as const }));
+  const roots = new Set(spec.projectRoots ?? []);
   return {
     enabled: true,
     failIfUnavailable: true,
@@ -138,15 +166,107 @@ export function claudeSandboxSettings(rt: Pick<SandboxRuntime, "spec" | "config"
       // would run outside the sandbox from the CLI's next start. A
       // repository's hooks and config, for the same reason. And every dir
       // between the workspace and a hidden path in it (nothing renames it away).
-      denyWrite: physical([...claudeSettingsPaths(spec.workspace, env), ...denyAround(spec.readOnly ?? [], spec.writable), ...(spec.pinned ?? [])]),
-      denyRead: physical([...spec.hidden, ...spec.containerSockets]),
-      // Inside the denied home: the allowlist, and what is written (a workspace in it).
-      allowRead: physical([spec.workspace, tempDir, ...spec.writable, ...spec.reexposed]),
+      // A pinned dir holding something writable (an added dir's dir on the way to the workspace) isn't denied:
+      // the CLI's denial takes the subtree, which would make that read-only; the gate checks the pins instead.
+      // Nor a dir held in place (spec.heldInPlace: the working directory and its way up, a held path's parents,
+      // #448 round 14): the CLI binds every dir from a writable root down to what it binds in it, so each is a
+      // mount point already, no rename (checked on the real CLI: sandbox-claude-real.test.ts "held in place").
+      denyWrite: physical([...claudeSettingsPaths(spec.workspace, env), ...denyAround(spec.readOnly ?? [], spec.writable), ...(spec.pinned ?? []).filter((p) => !holdsWritable(p, [spec.workspace, ...spec.writable]))]),
+      // Local services' sockets too while the network is off (spec.serviceSockets): those in the host's /tmp are
+      // behind its seccomp's unix socket block, or the denied /tmp with every socket allowed.
+      denyRead: physical([...spec.hidden, ...spec.containerSockets, ...(spec.serviceSockets ?? []).filter((p) => !HOST_SHARED_TEMP.some((t) => p === t || p.startsWith(`${t}/`)) && !p.startsWith("/private/tmp/")), ...(allSockets ? HOST_SHARED_TEMP : [])]),
+      // Inside the denied home: the allowlist, and what is written (a workspace in it). Not a worktree location
+      // holding the session's folder: the CLI lays what is readable over what is writable, which would make the
+      // folder read-only (#448 round 10); the location stays the denied home's scratch dir there.
+      // The project roots the same way (they hold the workspace): each split around what is writable in it (readAround).
+      allowRead: physical([
+        spec.workspace,
+        tempDir,
+        ...spec.writable,
+        ...spec.reexposed.filter((r) => !roots.has(r) && !holdsFolder(r, spec.worktreeFolders ?? [])),
+        ...readAround([...roots], [spec.workspace, tempDir, ...spec.writable], undefined, [...spec.hidden, ...spec.containerSockets, ...(spec.serviceSockets ?? [])]),
+        ...sockets,
+      ]),
     },
     network,
     ...(envVars.length > 0 ? { credentials: { envVars } } : {}),
     ...(rt.config.bwrapPath ? { bwrapPath: rt.config.bwrapPath } : {}),
   };
+}
+
+/** Whether `dir` holds one of `writable` (strictly). */
+function holdsWritable(dir: string, writable: readonly string[]): boolean {
+  const d = physicalOf(dir);
+  return writable.some((w) => physicalOf(w).startsWith(`${d}/`));
+}
+
+/** Whether `dir` holds one of the session's worktree folders (is a location of it). */
+function holdsFolder(dir: string, folders: readonly string[]): boolean {
+  const d = resolve(dir);
+  return folders.some((f) => resolve(f) !== d && resolve(f).startsWith(`${d}/`));
+}
+
+/**
+ * `readable` as the CLI's `allowRead` can show it without hiding what is
+ * writable: it lays every `allowRead` bind after every `allowWrite` one, so
+ * a readable dir holding a writable one (a project root holding the
+ * workspace) would make that one read-only. Such a dir is shown entry by
+ * entry instead, all but the way down to the writable ones (which
+ * `allowWrite` shows). An entry made in it after the query started isn't
+ * shown (docs/sandbox.md, Limits). Bounded.
+ *
+ * Never an entry that is a link (it would be shown by where it leads: the
+ * CLI binds physical paths; left out, it isn't there), nor one that is, or
+ * is in, a `hidden` path: an `allowRead` equal to a `denyRead` path wins in
+ * the CLI. A hidden path strictly inside a shown entry stays hidden: the CLI
+ * lays `denyRead` paths inside an `allowRead` one after it (checked on the
+ * real CLI, #448 round 12).
+ */
+export function readAround(readable: readonly string[], writable: readonly string[], limit = 4000, hidden: readonly string[] = []): string[] {
+  const out: string[] = [];
+  const inside = (child: string, parent: string) => child !== parent && child.startsWith(`${parent}/`);
+  const writes = writable.flatMap((w) => [resolve(w), physicalOf(w)]);
+  const hides = [...new Set(hidden.flatMap((h) => [resolve(h), physicalOf(h)]))];
+  // Only what is hidden in (or is) the readable dir: one holding it (the denied home) is what it is shown in.
+  let inBase: string[] = [];
+  const isHidden = (p: string) => [resolve(p), physicalOf(p)].some((at) => inBase.some((h) => at === h || inside(at, h)));
+  // paths: a look (is it a link: then left out), no write
+  const isLink = (p: string) => {
+    try {
+      return lstatSync(p).isSymbolicLink();
+    } catch {
+      return true;
+    }
+  };
+  let budget = limit;
+  const split = (dir: string, keep: string[]): void => {
+    let names: string[] = [];
+    // paths: a look (a root's entries, to show around what is writable), no write; links left out
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      if (--budget < 0) return;
+      const at = join(dir, name);
+      if (isLink(at) || isHidden(at)) continue;
+      const held = keep.filter((w) => w === at || inside(w, at));
+      if (held.length === 0) out.push(at);
+      else if (!held.includes(at)) split(at, held);
+    }
+  };
+  for (const r of readable) {
+    for (const base of new Set([resolve(r), physicalOf(r)])) {
+      inBase = hides.filter((h) => h === base || inside(h, base));
+      if (isHidden(base)) continue;
+      const keep = writes.filter((w) => w === base || inside(w, base));
+      if (keep.includes(base)) continue;
+      if (keep.length === 0) out.push(base);
+      else split(base, keep);
+    }
+  }
+  return [...new Set(out)];
 }
 
 /**
@@ -163,6 +283,7 @@ export function denyAround(readOnly: readonly string[], writable: readonly strin
   const inside = (child: string, parent: string) => child !== parent && child.startsWith(`${parent}/`);
   const split = (dir: string, keep: string[]): void => {
     let names: string[] = [];
+    // paths: a look (a held dir's entries, to deny around what is writable), no write
     try {
       names = readdirSync(dir);
     } catch {
@@ -191,6 +312,7 @@ export function physicalOf(p: string): string {
   const missing: string[] = [];
   for (let at = resolve(p); ; at = dirname(at)) {
     try {
+      // paths: physical paths for the CLI, after claudeSandboxSettings checked every pin (no link in a pinned path: this changes none); what isn't pinned (a hidden path, a socket) is named where it is
       return join(realpathSync(at), ...missing.reverse());
     } catch {
       if (dirname(at) === at) return resolve(p);

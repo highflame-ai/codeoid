@@ -129,6 +129,30 @@ describe("settings store", () => {
     expect(onDisk.session.turnStallTimeoutMs).toBe(200_000);
   });
 
+  it("the Sandbox tab's Docker access and worktree locations (#448 follow-up): defaults, written, read back, and loaded", () => {
+    const before = getSnapshot();
+    expect(before.values["sandbox.docker.socket"]).toEqual({ value: false, source: "default" });
+    expect(before.values["sandbox.worktreeRoots"]?.value ?? []).toEqual([]);
+    const r = applyPatches([
+      { key: "sandbox.docker.socket", value: true },
+      { key: "sandbox.worktreeRoots", value: ["~/wt", "../shared-worktrees"] },
+    ]);
+    expect(r).toMatchObject({ ok: true, errors: [] });
+    const s = getSnapshot();
+    expect(s.values["sandbox.docker.socket"]).toEqual({ value: true, source: "config" });
+    expect(s.values["sandbox.worktreeRoots"]).toEqual({ value: ["~/wt", "../shared-worktrees"], source: "config" });
+    const onDisk = JSON.parse(readFileSync(configFilePaths().configPath, "utf8"));
+    expect(onDisk.sandbox.docker).toMatchObject({ socket: true });
+    expect(onDisk.sandbox.worktreeRoots).toEqual(["~/wt", "../shared-worktrees"]);
+    const loaded = loadConfig({ raw: onDisk, env: {}, quiet: true });
+    expect(loaded.sandbox?.docker.socket).toBe(true);
+    expect(loaded.sandbox?.worktreeRoots).toEqual(["~/wt", "../shared-worktrees"]);
+    // The env vars override.
+    const env = loadConfig({ raw: {}, env: { CODEOID_SANDBOX_DOCKER_SOCKET: "true", CODEOID_SANDBOX_WORKTREE_ROOTS: "/a,/b" }, quiet: true });
+    expect(env.sandbox?.docker.socket).toBe(true);
+    expect(env.sandbox?.worktreeRoots).toEqual(["/a", "/b"]);
+  });
+
   it("rejects an out-of-range value and writes NOTHING", () => {
     applyPatches([{ key: "memory.enabled", value: false }]); // establish a file
     const before = readFileSync(configFilePaths().configPath, "utf8");

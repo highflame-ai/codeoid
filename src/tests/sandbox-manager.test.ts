@@ -7,6 +7,7 @@
  * up front.
  */
 
+import { sandboxBadge, sandboxSummary } from "@highflame/codeoid-core";
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -75,7 +76,7 @@ function newManager(probe: SandboxProbe = { available: true }, sandbox?: Record<
   const sandboxRegistry = new SandboxRegistry("linux", HOST_HAS);
   sandboxRegistry.register(fake("bwrap", probe));
   sandboxRegistry.register(fake("docker", { available: false, reason: "the Docker daemon isn't reachable" }));
-  const config = { ...mkConfig(tmp), ...(sandbox ? { sandbox: { provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [], docker: { image: "x" }, ...sandbox } } : {}) } as CodeoidConfig;
+  const config = { ...mkConfig(tmp), ...(sandbox ? { sandbox: { provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [], worktreeRoots: [], docker: { image: "x", socket: false }, ...sandbox } } : {}) } as CodeoidConfig;
   const m = new SessionManager(store, transcript, undefined, undefined, undefined, { config, providers: registry, sandboxRegistry });
   managers.push(m);
   return m;
@@ -267,7 +268,7 @@ describe("round 1 of the #448 audit: wider than the daemon's sandbox is the owne
 
   it("a delegated token can't change the daemon's sandbox settings, and is audited", async () => {
     const m = newManager();
-    for (const key of ["sandbox.provider", "sandbox.bwrapPath", "sandbox.docker.image", "sandbox.homeReadable"]) {
+    for (const key of ["sandbox.provider", "sandbox.bwrapPath", "sandbox.docker.image", "sandbox.homeReadable", "sandbox.docker.socket", "sandbox.worktreeRoots"]) {
       const r = await m.handle({ type: "settings.set", id: "s", patches: [{ key, value: "off" }] } as never, DELEGATED, { ...CLIENT, auth: DELEGATED });
       expect(r).toMatchObject({ type: "response.error", code: "forbidden" });
       expect((r as { error: string }).error).toContain("sandbox");
@@ -293,14 +294,14 @@ describe("routines (#448 round 2)", () => {
     sandboxRegistry.register(fake("seatbelt-like", { available: true }));
     const config = {
       ...mkConfig(tmp),
-      sandbox: { provider: "auto", network: "allowlist", allowedHosts: ["a.example"], hiddenPaths: [], homeReadable: [], docker: { image: "x" } },
+      sandbox: { provider: "auto", network: "allowlist", allowedHosts: ["a.example"], hiddenPaths: [], homeReadable: [], worktreeRoots: [], docker: { image: "x", socket: false } },
       routines: { enabled: true, tickMs: 600_000, maxConcurrentRuns: 2, minIntervalSeconds: 60, apiFiresPerHour: 30, missedGraceSeconds: 120 },
     } as CodeoidConfig;
     const m = new SessionManager(store, transcript, undefined, undefined, undefined, { config, providers: registry, sandboxRegistry });
     managers.push(m);
     const call = (spec: Record<string, unknown>, auth: AuthContext) =>
       m.handle({ type: "routine.create", spec: { prompt: "p", workdir, approvals: "guarded", ...spec } } as never, auth, CLIENT) as Promise<DaemonMessage>;
-    for (const [i, sandbox] of [{ provider: "off" }, { provider: "seatbelt-like" }, { network: "on" }, { allowedHosts: ["a.example", "b.example"] }].entries()) {
+    for (const [i, sandbox] of [{ provider: "off" }, { provider: "seatbelt-like" }, { network: "on" }, { allowedHosts: ["a.example", "b.example"] }, { dockerSocket: true }].entries()) {
       const res = await call({ name: `wide-${i}`, sandbox }, NO_APPROVE);
       expect(res).toMatchObject({ type: "response.error", code: "forbidden" });
       expect(res.type === "response.error" && res.error).toContain("session:approve");
@@ -311,5 +312,82 @@ describe("routines (#448 round 2)", () => {
     }
     // With the scope, the owner may.
     expect(await call({ name: "wide-ok", sandbox: { network: "on" } }, AUTH)).toMatchObject({ type: "routine.snapshot" });
+  });
+});
+
+describe("Docker access (#448 follow-up): an opt-in widening, the owner's own", () => {
+  const DELEGATED: AuthContext = { ...AUTH, delegationDepth: 1, delegatedBy: AUTH.sub } as AuthContext;
+  let audits: Array<{ action: string; detail: string }> = [];
+  beforeEach(() => {
+    audits = [];
+    const audit = store.audit.bind(store);
+    store.audit = (subject, action, sessionId, detail) => {
+      audits.push({ action, detail: detail ?? "" });
+      audit(subject, action, sessionId, detail);
+    };
+  });
+
+  it("create with it needs session:approve and an undelegated token; the session says so", async () => {
+    const m = newManager();
+    for (const who of [DELEGATED, NO_APPROVE]) {
+      const r = await create(m, { sandbox: { dockerSocket: true } }, who);
+      expect(r).toMatchObject({ type: "response.error", code: "forbidden" });
+      expect((r as { error: string }).error).toContain("Docker access");
+    }
+    expect(audits.some((a) => a.action === "session.sandbox_wider_refused")).toBe(true);
+    const info = infoOf(await create(m, { sandbox: { dockerSocket: true } }));
+    expect(info?.sandbox).toMatchObject({ state: "on", dockerSocket: true });
+    expect(sandboxBadge(info?.sandbox)).toMatchObject({ text: "sandboxed, Docker access", tone: "warn" });
+    expect(sandboxBadge(info?.sandbox)?.title).toContain("Docker access can reach the whole machine");
+    expect(sandboxSummary(info?.sandbox)).toContain("Docker access (can reach the whole machine)");
+  });
+
+  it("set_sandbox: turning it on is a confirm the owner alone answers; a delegated token can't ask; turning it off applies at once", async () => {
+    const m = newManager();
+    const info = infoOf(await create(m));
+    const id = info?.id as string;
+    expect(await m.handle({ type: "session.set_sandbox", id: "x", sessionId: id, sandbox: { dockerSocket: true } }, DELEGATED, { ...CLIENT, auth: DELEGATED })).toMatchObject({ type: "response.error", code: "forbidden" });
+    const asked: Array<{ requestId: string; title?: string; message?: string }> = [];
+    m.findByName(info?.name as string, AUTH)?.attach({
+      id: "dialogs",
+      auth: AUTH,
+      capabilities: [CAPABILITIES.UI_DIALOGS],
+      send: (msg: { type: string; requestId?: string; request?: { title?: string; message?: string } }) => {
+        if (msg.type === "session.ui_request") asked.push({ requestId: msg.requestId ?? "", ...(msg.request ?? {}) });
+      },
+    } as never);
+    expect(await m.handle({ type: "session.set_sandbox", id: "x", sessionId: id, sandbox: { dockerSocket: true } }, AUTH, CLIENT)).toMatchObject({ data: { pending: true } });
+    for (let i = 0; i < 100 && asked.length === 0; i++) await Bun.sleep(10);
+    expect(audits.some((a) => a.action === "session.sandbox_widen_ask" && a.detail.endsWith("network on, Docker access"))).toBe(true);
+    const requestId = asked[0]?.requestId ?? "";
+    expect(requestId).not.toBe("");
+    for (const who of [DELEGATED, OTHER]) {
+      expect(await m.handle({ type: "session.ui_response", id: "u", sessionId: id, requestId, confirmed: true } as never, who, { ...CLIENT, auth: who })).toMatchObject({ type: "response.error", code: "forbidden" });
+    }
+    expect(await m.handle({ type: "session.ui_response", id: "u", sessionId: id, requestId, confirmed: true } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
+    for (let i = 0; i < 100 && !audits.some((a) => a.action === "session.set_sandbox"); i++) await Bun.sleep(10);
+    expect(audits.filter((a) => a.action === "session.set_sandbox").at(-1)?.detail).toContain("→ auto, network on, Docker access");
+    expect(m.findByName(info?.name as string, AUTH)?.toInfo().sandbox?.dockerSocket).toBe(true);
+    // Off again: narrowing, applied without asking, by a delegated token too.
+    const narrowed = await m.handle({ type: "session.set_sandbox", id: "x", sessionId: id, sandbox: { dockerSocket: false } }, DELEGATED, { ...CLIENT, auth: DELEGATED });
+    expect(narrowed).toMatchObject({ type: "response.ok" });
+    expect(m.findByName(info?.name as string, AUTH)?.toInfo().sandbox?.dockerSocket).toBeUndefined();
+  });
+
+  it("a fork carries it only for its owner, undelegated; autonomous on it is the owner's own call", async () => {
+    const m = newManager();
+    const id = infoOf(await create(m, { sandbox: { dockerSocket: true } }))?.id as string;
+    for (const who of [OTHER, DELEGATED]) {
+      expect(await m.handle({ type: "session.fork", id: "f", sessionId: id } as never, who, { ...CLIENT, auth: who })).toMatchObject({ type: "response.error", code: "forbidden" });
+      expect(await m.handle({ type: "session.set_mode", id: "m", sessionId: id, mode: "autonomous" }, who, { ...CLIENT, auth: who })).toMatchObject({ code: "forbidden" });
+    }
+    expect((await m.handle({ type: "session.fork", id: "f", sessionId: id } as never, AUTH, CLIENT)).type).not.toBe("response.error");
+    expect(await m.handle({ type: "session.set_mode", id: "m", sessionId: id, mode: "autonomous" }, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
+  });
+
+  it("the daemon's default with it: a session gets it without asking for it, and asking for none is narrower", async () => {
+    const m = newManagerWith({ docker: { image: "x", socket: true } });
+    expect(infoOf(await create(m, {}, DELEGATED))?.sandbox?.dockerSocket).toBe(true);
+    expect(infoOf(await create(m, { sandbox: { dockerSocket: false } }, DELEGATED))?.sandbox?.dockerSocket).toBeUndefined();
   });
 });

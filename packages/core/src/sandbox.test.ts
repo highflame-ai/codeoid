@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { SessionSandboxInfo } from "@highflame/codeoid-protocol";
-import { approvalSandboxLine, modeSummary, sandboxBadge, sandboxSummary } from "./sandbox.js";
+import { approvalSandboxLine, approvalSandboxWarns, DOCKER_ACCESS_WHY, HOME_WORKSPACE_LINE, modeSummary, sandboxBadge, sandboxDirsText, sandboxSummary } from "./sandbox.js";
 import { dispatchSlash, parseSlash } from "./slash.js";
 
 const on: SessionSandboxInfo = { choice: "auto", state: "on", provider: "bwrap", providerName: "bubblewrap", network: "off", confinement: "native", via: "Claude Code's sandbox (bubblewrap) with codeoid's policy", enforced: true };
@@ -30,6 +30,27 @@ describe("sandbox display (#448)", () => {
     expect(approvalSandboxLine({})).toBeNull();
   });
 
+  it("Docker access (#448 follow-up): the badge, the summary and every card say so, as a warning, with why", () => {
+    const docker = { ...on, dockerSocket: true };
+    expect(sandboxBadge(docker)).toMatchObject({ text: "sandboxed, Docker access", tone: "warn" });
+    expect(sandboxBadge(docker)?.title).toContain(DOCKER_ACCESS_WHY);
+    expect(sandboxBadge({ ...docker, enforced: false })?.text).toBe("sandboxed partly, Docker access");
+    expect(sandboxSummary(docker)).toBe("sandbox: bubblewrap, network off, Docker access (can reach the whole machine)");
+    const card = { sandboxed: true, sandboxDocker: true, sandboxNote: "sandboxed, Docker access: bubblewrap, network on" };
+    expect(approvalSandboxLine(card)).toBe("⚠️ sandboxed, Docker access: bubblewrap, network on");
+    expect(approvalSandboxWarns(card)).toBe(true);
+    expect(approvalSandboxWarns({ sandboxed: true })).toBe(false);
+    expect(approvalSandboxLine({ sandboxed: false, sandboxDocker: true, sandboxNote: "runs in the backend's own process, outside the sandbox" })).toBe("⚠️ runs in the backend's own process, outside the sandbox (the sandbox has Docker access)");
+  });
+
+  it("/sandbox … docker: Docker access after a provider; docker alone is the provider; nodocker takes it away", () => {
+    expect(parseSlash("/sandbox auto docker")).toEqual({ kind: "sandbox", sandbox: { provider: "auto", dockerSocket: true } });
+    expect(parseSlash("/sandbox bwrap on docker")).toEqual({ kind: "sandbox", sandbox: { provider: "bwrap", network: "on", dockerSocket: true } });
+    expect(parseSlash("/sandbox docker docker")).toEqual({ kind: "sandbox", sandbox: { provider: "docker", dockerSocket: true } });
+    expect(parseSlash("/sandbox docker")).toEqual({ kind: "sandbox", sandbox: { provider: "docker" } });
+    expect(parseSlash("/sandbox nodocker")).toEqual({ kind: "sandbox", sandbox: { dockerSocket: false } });
+  });
+
   it("/sandbox: a provider, a network, an allowlist, off", () => {
     expect(parseSlash("/sandbox off")).toEqual({ kind: "sandbox", sandbox: { provider: "off" } });
     expect(parseSlash("/sandbox auto off")).toEqual({ kind: "sandbox", sandbox: { provider: "auto", network: "off" } });
@@ -57,5 +78,24 @@ describe("the mode line in a list (#448)", () => {
     expect(modeSummary({ mode: "guarded" })).toBeNull();
     expect(modeSummary({ mode: "interactive" })).toBeNull();
     expect(modeSummary({})).toBeNull();
+  });
+});
+
+describe("project roots and added directories (working across repositories)", () => {
+  const on = { choice: "auto", state: "on" as const, provider: "bwrap", providerName: "bubblewrap", network: "on" as const, enforced: true };
+
+  it("the tooltip and the list line say what it reads and writes besides the workspace, and what lands next turn", () => {
+    const info = { ...on, projectRoots: ["/home/u/Workspace"], addedDirs: ["/home/u/Workspace/b"], pendingDirs: { add: ["/srv/c"], remove: [] } };
+    expect(sandboxDirsText(info)).toBe("reads /home/u/Workspace (read-only); also writes /home/u/Workspace/b; from the next turn: +/srv/c");
+    expect(sandboxBadge(info)?.title).toContain("It reads /home/u/Workspace (read-only); also writes /home/u/Workspace/b");
+    expect(sandboxSummary(info)).toBe("sandbox: bubblewrap, network on; reads /home/u/Workspace (read-only); also writes /home/u/Workspace/b; from the next turn: +/srv/c");
+    expect(sandboxDirsText({ ...on, projectRoots: [] })).toBeNull();
+  });
+
+  it("a workspace that is the home: the chip says so", () => {
+    const b = sandboxBadge({ ...on, homeWorkspace: true });
+    expect(b).toMatchObject({ text: HOME_WORKSPACE_LINE, tone: "warn" });
+    expect(HOME_WORKSPACE_LINE).toBe("sandboxed: workspace is your home — only credentials are protected");
+    expect(sandboxSummary({ ...on, homeWorkspace: true })).toContain("workspace is your home (only credentials are protected)");
   });
 });

@@ -299,8 +299,14 @@ export interface RoutineHost {
   audit(subject: string, action: string, sessionId: string | undefined, detail: string): void;
   hasProvider(id: string): boolean;
   providerIds(): string[];
-  /** Why a sandbox setting can't be used (an unknown provider, a bad host), or null (#448). Absent: no sandboxing, any setting is refused. */
+  /**
+   * Why a sandbox setting can't be used (an unknown provider, a bad host, a
+   * project root or added directory that can't be one), or null (#448).
+   * Absent: no sandboxing, any setting is refused.
+   */
   sandboxProblem?(setting: SessionSandboxSetting): string | null;
+  /** The setting as kept: each added directory by its real path, none inside another (#448 round 13). */
+  sandboxCanonical?(setting: SessionSandboxSetting): SessionSandboxSetting;
   /** Expand `~`, resolve, and confirm the directory exists; null when unusable. */
   normalizeWorkdir(path: string): string | null;
   /** Loops, for routines that start one; absent when the daemon has none. */
@@ -1911,7 +1917,8 @@ export class RoutineService {
     if (input.sandbox && Object.keys(input.sandbox).length > 0) {
       const problem = this.#host.sandboxProblem ? this.#host.sandboxProblem(input.sandbox) : "this daemon has no OS sandbox";
       if (problem) bad(`sandbox: ${problem}`);
-      spec.sandbox = { ...input.sandbox };
+      // Kept by where each added directory really is now, as a session's are when granted: a run binds that.
+      spec.sandbox = this.#host.sandboxCanonical ? this.#host.sandboxCanonical(input.sandbox) : { ...input.sandbox };
     }
     if (spec.worktree && spec.session === "persistent") bad("worktree isolation is per run, so it needs session: fresh");
     if (input.loop) spec.loop = this.#normalizeLoop(spec, input.loop, bad);

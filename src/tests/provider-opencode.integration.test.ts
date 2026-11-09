@@ -129,7 +129,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { type CodeoidConfig, getConfigDir, loadConfig } from "../config.js";
@@ -1245,6 +1245,26 @@ describe("opencode (real binary)", () => {
       expect(out).not.toContain("DAEMON-VISIBLE");
       expect(readFileSync(join(outside, "keep.txt"), "utf8")).toBe("keep\n");
       expect(readFileSync(join(ws, "made.txt"), "utf8")).toBe("hi\n");
+      // #448 round 13: the workspace swapped for a link to a planted home after the turn's launcher was written (from
+      // the gate, just before opencode runs the line): the launcher's own check refuses it, nothing read or written.
+      const fakeHome = join(root, "fake-home");
+      mkdirSync(join(fakeHome, ".ssh"), { recursive: true });
+      writeFileSync(join(fakeHome, ".ssh", "id_ed25519"), "PLANTED-KEY\n");
+      const swapThenAllow: ToolApprovalFn = async () => {
+        renameSync(ws, join(root, "ws-moved"));
+        symlinkSync(fakeHome, ws);
+        return { behavior: "allow" };
+      };
+      try {
+        const swapped = output(await collect(p.runTurn(opts(shell(`cat ${join(ws, ".ssh", "id_ed25519")}; echo PWNED > ${join(ws, "planted.txt")}; echo RAN`), { workdir: ws, canUseTool: swapThenAllow }))));
+        expect(swapped).not.toContain("PLANTED-KEY");
+        expect(swapped).not.toContain("RAN");
+        expect(swapped).toContain("not the directory it was");
+        expect(existsSync(join(fakeHome, "planted.txt"))).toBe(false);
+      } finally {
+        rmSync(ws);
+        renameSync(join(root, "ws-moved"), ws);
+      }
       await p.teardown();
       // The sandbox off: the same shell, unsandboxed (only a harmless look).
       const off = provider({ sandbox: () => null });

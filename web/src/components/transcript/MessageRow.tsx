@@ -467,7 +467,7 @@ const WaitingConfirmationBody: Component<{
             {props.state.description}
           </div>
           <RiskLine risk={props.state.risk} />
-          <SandboxLine sandboxed={props.state.sandboxed} sandboxNote={props.state.sandboxNote} />
+          <SandboxLine sandboxed={props.state.sandboxed} sandboxNote={props.state.sandboxNote} sandboxDocker={props.state.sandboxDocker} />
           <LazyJsonDetails value={props.state.input} />
         </div>
       </Match>

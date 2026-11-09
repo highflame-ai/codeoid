@@ -6,7 +6,7 @@
  *   /interrupt               — interrupt current turn
  *   /rotate                  — rotate context (refresh skills/settings)
  *   /mode <i|g|x>            — interactive | guarded | autonomous
- *   /sandbox <auto|off|id> [on|off|allow:host,host] — the session's OS sandbox (#448); off is asked of the owner
+ *   /sandbox <auto|off|id> [on|off|allow:host,host] [docker|nodocker] — the session's OS sandbox (#448); off and Docker access are asked of the owner
  *   /model <id|alias>        — switch model (opus / sonnet / haiku / full id)
  *   /account <name|default|--follow-default> — switch the session's Claude account
  *   /help                    — surface help modal (TODO P6)
@@ -36,6 +36,7 @@ export type SlashCommand =
   | { kind: "rotate" }
   | { kind: "mode"; mode: SessionMode; maxTurns?: number }
   | { kind: "sandbox"; sandbox: SessionSandboxSetting }
+  | { kind: "sandbox-dir"; action: "add" | "remove"; path: string }
   | { kind: "model"; model: string; fallback?: string | null }
   | { kind: "model-picker" }
   | { kind: "effort"; effort: EffortLevel | null }
@@ -94,8 +95,15 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
     case "rotate":
       return { kind: "rotate" };
     case "sandbox": {
-      const usage = "/sandbox <auto|off|bwrap|seatbelt|docker> [on|off|allow:host,host]";
+      const usage = "/sandbox <auto|off|bwrap|seatbelt|docker> [on|off|allow:host,host] [docker|nodocker] — or /sandbox add|remove <dir>";
       if (rest.length === 0) throw new Error(usage);
+      // A directory the session's commands may write besides its workspace (adding asks its owner).
+      const sub = rest[0]?.toLowerCase();
+      if (sub === "add" || sub === "remove" || sub === "rm") {
+        const path = rest.slice(1).join(" ").trim();
+        if (!path) throw new Error(`/sandbox ${sub} <dir>`);
+        return { kind: "sandbox-dir", action: sub === "add" ? "add" : "remove", path };
+      }
       const sandbox: SessionSandboxSetting = {};
       for (const word of rest) {
         const w = word.toLowerCase();
@@ -106,6 +114,11 @@ export function parseSlash(raw: string, opts?: ParseSlashOptions): SlashCommand 
         } else if (w.startsWith("allow:")) {
           sandbox.network = "allowlist";
           sandbox.allowedHosts = word.slice("allow:".length).split(",").filter(Boolean);
+        } else if (w === "docker" && sandbox.provider !== undefined) {
+          // After a provider, `docker` is Docker access (the container runtime's socket), asked of the owner.
+          sandbox.dockerSocket = true;
+        } else if (w === "nodocker" || w === "no-docker") {
+          sandbox.dockerSocket = false;
         } else if (sandbox.provider === undefined) {
           sandbox.provider = w;
         } else {
@@ -326,6 +339,21 @@ export function dispatchSlash(cmd: SlashCommand, ctx: SlashContext): void {
         sandbox: cmd.sandbox,
       });
       return;
+    case "sandbox-dir": {
+      const msg: ClientMessage = { type: "session.sandbox_dir", id: ctx.newRequestId(), sessionId: ctx.sessionId, action: cmd.action, path: cmd.path };
+      if (!ctx.request) {
+        ctx.send(msg);
+        return;
+      }
+      ctx
+        .request(msg)
+        .then((resp) => {
+          const r = (resp as { data?: { message?: string; pending?: boolean } } | undefined)?.data;
+          if (r?.message && !r.pending) ctx.report?.(r.message);
+        })
+        .catch((e) => ctx.report?.(e instanceof Error ? e.message : String(e)));
+      return;
+    }
     case "mode":
       fire({
         type: "session.set_mode",
