@@ -797,8 +797,10 @@ the **parent of the session's repository**: a session in `~/Workspace/codeoid`
 reads `~/Workspace/*`, so `cat`, `grep`, `git log` and `git status` work in
 the repositories beside it, and in the other sessions' checkouts there
 (`~/Workspace/codeoid-worktrees/…`). For a linked worktree (a fork's) it is
-the parent of the repository's main checkout; for a workspace that isn't in
-a repository, the workspace's parent.
+the parent of the repository's main checkout. **A workspace that isn't in a
+repository has no default root**, said on the session ("no project root: the
+workspace isn't in a repository…"): a session in `~/Documents/notes` doesn't
+read all of `~/Documents`. Name roots in `sandbox.projectRoots` for it.
 
 - **Set it** daemon-wide with `sandbox.projectRoots`
   (`CODEOID_SANDBOX_PROJECT_ROOTS`, comma-separated; Settings > Sandbox >
@@ -814,19 +816,42 @@ a repository, the workspace's parent.
   — codeoid's config and data dirs, every agent CLI's login and the other
   [credential stores](#what-is-protected), `sandbox.hiddenPaths`, the
   desktop's runtime dir, container and (with the network off) local service
-  sockets — and the **secret files at the top of each project** under the
-  root (the root itself and each dir directly in it): `.env` and `.env.*`
-  (not `.env.example`, `.sample`, `.template`, `.dist`, `.defaults`,
-  `.schema`), `.envrc`, `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`.
-  Not the session's own: its workspace's and its added directories' are its
-  to use. They are found when the sandbox is built: one made later, or deeper
-  (`~/Workspace/b/config/.env`), isn't hidden; add such paths to
-  `sandbox.hiddenPaths`.
+  sockets — and the **credential files anywhere in the root**, codeoid's own
+  worktrees of the repositories there (`~/Workspace/b-worktrees/<fork>/.env`)
+  included: `.env` and `.env.*` (not `.env.example`, `.env.sample`,
+  `.env.template`), `.envrc`, `.npmrc`, `.pypirc`, `.netrc`,
+  `.git-credentials`, `.vault-token`, `.pgpass`, `*.pem`, `*.key`, `*.p12`,
+  `*.pfx`, `*.jks`, `*.keystore`, private keys (`id_rsa*`, `id_ed25519*`,
+  `id_ecdsa*`, `id_dsa*`, not `.pub`), kubeconfigs (`kubeconfig*`,
+  `*.kubeconfig`), Terraform state and variables (`*.tfstate*`, `*.tfvars`),
+  `credentials` and `credentials.<json|yaml|toml|ini|…>`,
+  `service-account*.json`, `secret(s).<json|yaml|toml|env|…>`, a project's
+  `.claude/settings.local.json`, `.mcp.json` and `.docker/config.json`, and
+  `.ssh/`, `.gnupg/`, `.aws/`, `.azure/`, `.gcloud/`, `.kube/`,
+  `.password-store/` dirs whole. A repository's **`.git/config` carrying a
+  credential** (a remote URL with a user or password in it, an
+  `http.*.extraheader`) is hidden too, and said on the session: git in that
+  repository then can't read its config from this session ("unable to access
+  '.git/config'"). The session's own repository is its workspace, never a
+  root's, so its git is unaffected; its added directories' are its to use too.
+  They are looked for through the root's directories (not through links, not
+  in `node_modules`, `.venv`, `__pycache__`, `.tox`, `.gradle`, `.next`,
+  `.turbo`) when the sandbox is built: one made later isn't hidden; add such
+  paths to `sandbox.hiddenPaths`. **The look is bounded** (20000 directories
+  per root): a root with more to look through isn't used at all (fail
+  closed), said on the session ("project root ~/src: more than 20000
+  directories to look through…: not used — name narrower roots"); name the
+  repositories you need instead of the folder holding them all.
 - **Refused as a root**: `/`, your home or a dir holding it, anything in a
   hidden dir of your home (`~/.config`, `~/.local`, …: where tools load
   programs and settings from), `~/Library`, codeoid's config dir, a system
-  dir (`/etc`, `/usr`, …), a relative path. The config fails to load on one;
-  a session's own is refused at create. **A default that would be your home**
+  dir (`/etc`, `/usr`, …), **the host's temp dir or anything in it**
+  (`/tmp`, `/var/tmp`, the daemon's `TMPDIR`, macOS's `/private/tmp` and
+  `/var/folders`: codeoid's private dir and every program's sockets and
+  scratch files are there), a relative path. The config fails to load on
+  one; a session's own is refused at create. A default in a temp dir (a
+  repository at `/tmp/x/repo`) falls back to no root, said. **A default that
+  would be your home**
   (a repository directly in it, `~/proj`) falls back to no root, said on the
   session ("no project root: the default, the repository's parent (…), is
   your home…"): set `sandbox.projectRoots` to read your other repositories.
@@ -839,13 +864,30 @@ A session can be given **more directories to write**, each treated as its
 workspace is: writable, its repository's git structure (config, hooks,
 `info/`, the other worktrees' admin dirs, …) and project settings
 (`.claude/`, `.mcp.json`, …) held read-only and made first where missing,
+and so are those of **every repository inside it** (a folder of
+repositories: each one's git structure, its project settings at its top, and
+every project settings dir or file and bare repository anywhere in the
+folder, looked for when the sandbox is built, not in `node_modules` and the
+like),
 the session's own [worktree folder](#git-worktrees-inside-the-sandbox) in
 its repository's locations (`~/Workspace/b-worktrees/<session folder>/`), a
 host-side file tool writing its git structure or settings asked about
 ([held writes](#file-tools-that-run-outside-the-sandbox)), and the
 end-of-turn look at its git settings and commits (`sandbox.git_changed`,
-`sandbox.settings_committed`, naming the directory). What the sandbox hides
-stays hidden inside one; its own `.env` is readable.
+`sandbox.settings_committed`, naming the directory; each repository inside
+it too). What the sandbox hides stays hidden inside one; its own `.env` is
+readable.
+
+**An added directory is the directory it was when it was granted.** What is
+kept, and bound, is where the path really leads at that moment (its real
+path): the owner's card names it, and the path asked for when that differs
+("… (`<asked>` leads there)"). At every later build of the sandbox, a kept
+directory that no longer is a directory at that real path, or is reached
+through a link now (replaced by one, removed, moved), is **dropped**: not
+writable, said on the session ("<dir> is no longer writable: …", event
+`sandbox.dir_dropped`), audited (`session.sandbox_dir_dropped`) and taken
+out of the setting; it is never followed to where a link there leads. Add it
+again if it should be.
 
 **Adding one is a widening**, so it is the owner's own decision:
 
@@ -863,23 +905,40 @@ stays hidden inside one; its own `.env` is readable.
   (`path`, `reason`). In **guarded and interactive mode** the owner gets a
   confirm card naming the directory and the agent's reason ("The agent asks
   to write <dir>"), answered by the owner's own token only; the agent reads
-  the answer. In **autonomous mode** a directory under one of the session's
-  project roots (inside it, never the root itself) is added at once, unasked (audited: `by=agent under a
-  project root, autonomous`), and anything else is refused at once with a
-  reason the agent reads ("… isn't under this session's project roots …; the
-  owner can add it (`/sandbox add <dir>`)"). An unattended run (a routine, a
-  loop) is never parked on it: refused, said. The call returns "no answer
+  the answer. In **autonomous mode** only **a repository, or a directory in
+  one, strictly under one of the session's project roots, named by a path
+  with no symbolic link in it** is added at once, unasked (audited: `by=agent
+  a repository under a project root, autonomous`): judged where it really is,
+  and never a root itself, a folder holding repositories, a git or settings
+  dir. Anything else is refused at once with a reason the agent reads ("…
+  isn't in a repository …", "… goes through a symbolic link …", "… isn't
+  under this session's project roots …; the owner can add it (`/sandbox add
+  <dir>`)"). **An unattended run** (a routine's, a loop worker's, a
+  dispatched worker's) follows its mode: in autonomous mode (routines'
+  default, every loop worker) the autonomous rule above, so it can be given
+  a repository under a project root unasked; in guarded or interactive mode
+  it is never parked on the question: refused, said. The call returns "no answer
   yet" if the owner hasn't answered within 8 minutes (45 seconds on opencode,
   whose MCP client gives a call about a minute); the card stays open, a later
   yes still adds the directory, and asking again for the same one waits on
   that card rather than raising another. Audited:
   `session.sandbox_dir_request`, `_added` (`by=agent …`), `_refused`.
-- **Refused as an added dir**: everything refused as a root (above), and a
-  dir that isn't there, isn't a directory, isn't yours, is inside what the
-  sandbox hides (codeoid's data dirs, a credential store, a
-  `sandbox.hiddenPaths` entry, the daemon's temp dir), or holds a dir on
-  the daemon's `PATH` (a program written there would run outside the sandbox
-  at your next command). One inside the workspace is writable already.
+- **Refused as an added dir**: everything refused as a root (above; the
+  host's temp dir itself, but a dir in it may be added), and a dir that
+  isn't there, isn't a directory, isn't yours, is inside what the sandbox
+  hides (codeoid's data dirs, a credential store, a `sandbox.hiddenPaths`
+  entry, the daemon's private dir), holds a dir on the daemon's `PATH` (a
+  program written there would run outside the sandbox at your next
+  command), **is or is inside a project settings dir** (`.claude/`,
+  `.codex/`, `.gemini/`, `.qwen/`, `.pi/`, `.opencode/`), **a `.git` or
+  `.hg` dir, a git dir** (a bare repository, a worktree's admin dir) **or the
+  repository's `core.hooksPath` dir** (git and the agent CLIs run what is
+  there outside the sandbox), or holds more than 20000 directories to look
+  through for the repositories and settings in it ("… couldn't all be
+  protected — add the repositories you need one by one"). One inside the
+  workspace, the session's own worktree folders or its temp dir, or an added
+  dir, is writable already; adding a dir that holds an added one replaces
+  it.
 - **Kept**: in the session's sandbox setting, so a daemon restart and a
   resume keep them, and a fork, a compare and a collaboration's children
   inherit them (a fork carries them for the parent's owner only, undelegated,
@@ -935,8 +994,18 @@ home is the workspace).
   root whole would make the workspace read-only (checked: every command then
   fails). A dir made in the root after the query started isn't shown until
   the next query.
-- The secret files hidden in a root are those at each project's top when the
-  sandbox is built (above).
+- On **Claude's own sandbox**, a link in such a root is left out, not shown
+  by where it leads (the CLI binds real paths: `~/Workspace/keys → ~/.ssh`
+  would show `~/.ssh`), and so is an entry that is itself hidden (a `.env`
+  at the root's top, codeoid's private dir, a `sandbox.hiddenPaths` entry):
+  the CLI lets a readable path equal to a hidden one win. A hidden path
+  deeper in a shown entry stays hidden (checked on the real CLI: it lays a
+  hidden path inside a readable one after it). On bubblewrap a link in a
+  root dangles where it leads into what is hidden.
+- The credential files hidden in a root are those found when the sandbox is
+  built, by name, outside dependency dirs (above); a file of credentials
+  named otherwise (`notes.txt`) is readable. A root too big to look through
+  isn't used.
 - The default root shows **every repository beside yours**, read-only: their
   source, their git history, and any credential in a file not named above. Set
   `sandbox.projectRoots: []` (or `--no-project-roots`) where that is too
@@ -944,6 +1013,11 @@ home is the workspace).
 - An added directory that is **another worktree of the session's own
   repository** is writable, and its own admin dir with it; the rest of the
   repository's structure stays held.
+- The repositories and settings dirs held inside an added directory are those
+  found when the sandbox is built, outside `node_modules` and the like: one
+  the agent makes there later (`git init`, a new `.claude/`) is its own work,
+  as in the workspace (what runs after the agent touched it isn't vouched
+  for).
 
 ## Docker access
 
@@ -1258,7 +1332,20 @@ works, and skip where it doesn't):
   around the workspace is readable, the workspace writable, `b` read-only
   and its `.env` hidden; added, `b` writable; handing the CLI the root whole
   instead makes the workspace read-only (every command fails), which is why
-  it is split.
+  it is split. Round 12: real bubblewrap, an added dir swapped for a link
+  after it was granted and a link kept as one aren't written through (the
+  target untouched); a settings or git dir given as one is left out; a
+  folder of repositories added writes their files but not a repository's
+  hooks or config, its `.claude/` or a `.codex/` deeper; credential files
+  anywhere in a root (a key, a `.pem`, a deep `.env`, a tfstate, `.aws/`,
+  `.claude/settings.local.json`, a sibling worktree's `.env`, a `.git/config`
+  with a token: git there then can't read its config) are hidden, `.pub`
+  readable; a root past the look's bound isn't shown; a repository in the
+  host's temp dir gets no default root. The real Claude CLI: a project root
+  shows no `.env` at its top, nothing a link in it leads to (`~/.ssh`,
+  `~/Documents`, the home), no sign-in in codeoid's private dir inside it, no
+  deeper key or sibling worktree's `.env`, while the rest of the root reads
+  and the workspace writes.
 - `src/tests/sandbox-codex.test.ts`: the app-server started inside real
   bubblewrap can't read a planted credential and can read its own home; codex's
   own sandbox (0.166) works nested inside codeoid's bubblewrap; with the real

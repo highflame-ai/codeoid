@@ -441,20 +441,27 @@ when the network the session asked for is off or an allowlist.
 
 Working across repositories (sandbox/project-roots.ts, dir-rules.ts, request-directory.ts; docs/sandbox.md
 "Working across repositories"): `sandbox.projectRoots` (default `@parent`: the parent of the repository's main
-checkout, `defaultProjectRoot`; the home falls back to none, said) are shown read-only (`SandboxSpec.projectRoots`,
-in `reexposed`), the hidden list hidden inside and `projectRootSecrets` (`.env*`, `.envrc`, `.npmrc`, … at each
-project's top, not the session's own). `SessionSandboxSetting.addedDirs` are writable, each a workspace to
+checkout, `defaultProjectRoot`; none outside a repository, the home or a temp dir falls back to none, said; never
+the host's temp dir or in it, `projectRootProblem`) are shown read-only (`SandboxSpec.projectRoots`, in `reexposed`),
+the hidden list hidden inside and `projectRootSecrets` (credential files by name anywhere in a root and in the
+worktree locations shown, a `.git/config` with a credential, not the session's own; bounded per root, a root past it
+not used: fail closed, said). `SessionSandboxSetting.addedDirs` are kept by their real path when granted
+(`canonicalAddedDirs`, `addedDirReal`) and dropped at a build when that no longer is a directory reached through no
+link (`stillRealDir`; `Session#sayDroppedDirs`: said, audited, out of the setting), writable, each a workspace to
 `buildSandboxSpec` (its `gitWorkspacePaths`, `projectConfigPaths`, worktree folder, a `WorktreeEntryGuard` per
-repository) and to `protectedWriteTargets` and the end-of-turn git look (`#checkAddedGitControl`); validated by
-`addedDirProblem` (`sandboxDirProblem`'s refusals, what the sandbox hides, a PATH entry). Adding a dir or a root
-`widens()`. `session.sandbox_dir` (owner, undelegated, owner-only confirm; remove narrows) and the agent's
+repository; every repository, bare git dir and settings dir inside it, `nestedControl`, bounded: past it refused /
+left out) and to `protectedWriteTargets` and the end-of-turn git look (`#checkAddedGitControl`); validated by
+`addedDirProblem` (`sandboxDirProblem`'s refusals, what the sandbox hides, a PATH entry, a git or settings dir or one
+in it, `controlDirProblem`). Adding a dir or a root `widens()`. `session.sandbox_dir` (owner, undelegated, owner-only confirm; remove narrows) and the agent's
 `request_directory` (`Session#requestDirectory`: guarded/interactive an owner-only confirm with the reason,
-autonomous added under a root else refused, unattended refused; in-process on Claude/Qwen, pi's bridge,
+autonomous (an unattended run's too) only `autonomousGrantProblem`'s: a repository or a dir in one strictly under a
+root, by a path with no link, else refused; guarded unattended refused; in-process on Claude/Qwen, pi's bridge,
 `/mcp/sandbox` loopback with a per-session token for Codex/Gemini CLI/opencode; `isRequestDirectoryTool` skips the
 gate card). A dirs-only change (`onlyDirsChanged`) leaves the runtime until `Session.ensureSandbox` applies it at a
 turn start with no turn, approval or background work (`dirsPending`, `SessionSandboxInfo.pendingDirs`), then
 `#restartForSandboxDirs` restarts a process backend. Claude native shows a root around what is writable
-(`readAround`: its CLI binds allowRead after allowWrite). `homeWorkspace`: the chip says "sandboxed: workspace is
+(`readAround`: its CLI binds allowRead after allowWrite), never a link in it (it would show the target) nor an entry
+that is hidden (an `allowRead` equal to a `denyRead` wins; one strictly inside stays denied, checked on the real CLI). `homeWorkspace`: the chip says "sandboxed: workspace is
 your home — only credentials are protected".
 
 Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell/`
