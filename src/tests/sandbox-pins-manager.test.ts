@@ -74,3 +74,37 @@ describe("every directory the sandbox binds by name is pinned (#448 round 13)", 
     expect(() => t.runtimeSpec()).toThrow("the workspace");
   });
 });
+
+describe("everything the sandbox binds by name is checked at the gate (#448 round 14)", () => {
+  it("a path held read-only in an added dir swapped for a link mid-turn (by another session's command, or on the host): the next tool call refused at the gate (said once, audited), never re-pinned silently", async () => {
+    const m = t.newManager();
+    t.script = [[BASH_CALL("a"), BASH_CALL("b"), DONE], [BASH_CALL("c"), DONE]];
+    const info = infoOf(await t.create(m, { sandbox: { addedDirs: [t.sibling] } }));
+    const session = m.findByName(info?.name as string, AUTH);
+    if (!session) throw new Error("no session");
+    await session.ensureSandbox();
+    const held = join(t.sibling, ".claude");
+    expect(t.runtimeSpec()?.pins?.find((p) => p.path === held)?.what).toBe("a path held read-only");
+    const lines = t.infoLines(m, info?.name as string);
+    void session.send("go", AUTH);
+    await until(() => session.pendingToolApprovals().length > 0);
+    // Meanwhile, something outside this session's sandbox swaps the held settings dir for a link.
+    const elsewhere = join(t.tmp, "planted-claude");
+    mkdirSync(elsewhere);
+    renameSync(held, join(t.tmp, "claude-moved"));
+    symlinkSync(elsewhere, held);
+    await m.handle({ type: "session.approve", id: "a", sessionId: info?.id as string, approvalId: session.pendingToolApprovals()[0]?.approvalId as string, approve: true } as never, AUTH, CLIENT);
+    await until(() => t.decisions().length > 1);
+    const refused = t.decisions()[1] as { behavior: string; message?: string };
+    expect(refused.behavior).toBe("deny");
+    expect(refused.message).toContain(`a path held read-only ${held} is reached through a symbolic link now`);
+    await until(() => session.toInfo().status === "idle");
+    expect(lines.filter((l) => l.includes(`a path held read-only ${held} is reached through a symbolic link now`)).length).toBe(1);
+    expect(t.audits.some((a) => a.action === "session.sandbox_pin_changed" && a.detail.includes(held))).toBe(true);
+    // The next turn's resolution looks again: the link isn't held (nor bound) there, the turn runs.
+    void t.sendWhenReady(session, "again");
+    await until(() => session.pendingToolApprovals().length > 0);
+    expect(t.runtimeSpec()?.readOnly).not.toContain(held);
+    expect(t.runtimeSpec()?.readOnly).not.toContain(elsewhere);
+  });
+});

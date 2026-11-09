@@ -42,6 +42,7 @@ import { chmodSync, lstatSync, mkdirSync, renameSync, writeFileSync } from "node
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { BASE_OVERRIDES, GIT_BIN, PROGRAM_ENV, REMOTE_PROTOCOLS } from "../git-env.js";
 import { GIT_CONTROL, gitLayoutOf, programLocations } from "./policy.js";
+import { pinOf } from "./pinned.js";
 import type { SandboxSpec } from "./types.js";
 
 /** The empty tree's id: `attr.tree` naming it reads no attributes from the working tree (git ≥ 2.46; an older git ignores the key). */
@@ -197,6 +198,8 @@ export function gitShimSpec(spec: SandboxSpec, opts: { tempParent: string; workt
     privateTemp: true,
     writable: [...spec.writable, ...open],
     readOnly: (spec.readOnly ?? []).filter(held),
+    // Bound by name as the rest (pinned.ts, #448 round 14): never followed to where a link put there leads.
+    pins: [...(spec.pins ?? []), ...open.map((p) => pinOf(p, "a git worktree dir"))],
     network: { mode: "off" },
   };
 }

@@ -37,6 +37,7 @@ import { lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve as resolvePath } from "node:path";
 import { LocalSandboxHandle } from "./local-handle.js";
+import { boundPath } from "./pinned.js";
 import type { NetworkMode, SandboxCapabilities, SandboxHandle, SandboxProbe, SandboxProvider, SandboxSpawnOptions, SandboxSpec } from "./types.js";
 
 export const DOCKER_PROVIDER_ID = "docker";
@@ -54,7 +55,8 @@ function within(child: string, parent: string): boolean {
   return child === parent || child.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
 }
 
-function realOr(p: string): string {
+// paths: only for what isn't pinned (boundPath): a hidden path (a link there hides more), the home's allowlist, the owner's socket
+function realOrPath(p: string): string {
   try {
     return realpathSync(p);
   } catch {
@@ -67,7 +69,7 @@ export type DockerPathKind = "dir" | "other" | null;
 
 function pathKind(p: string): DockerPathKind {
   try {
-    const st = lstatSync(realOr(p));
+    const st = lstatSync(realOrPath(p));
     return st.isDirectory() ? "dir" : "other";
   } catch {
     return null;
@@ -109,6 +111,9 @@ function socketGroup(p: string): number | null {
 /** `docker run`'s arguments for `argv` under `spec`. Pure but for `kind` (tests replace it). */
 export function dockerRunArgs(spec: SandboxSpec, argv: readonly string[], o: DockerRunOptions): string[] {
   const kind = o.kind ?? pathKind;
+  // Everything bound by name is pinned: mounted by the path it was pinned at (the handle checked it is still that,
+  // and the launched argv checks again; #448 round 14), never resolved again here. Only what isn't is resolved.
+  const realOr = boundPath(spec.pins, realOrPath);
   const args = [
     "run",
     "--rm",

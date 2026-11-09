@@ -1,6 +1,6 @@
 /**
  * Every directory a sandbox binds by name is pinned (#448 round 13,
- * pins.ts; the real-bwrap side is sandbox-pins-real.test.ts): a directory
+ * pinned.ts; the real-bwrap side is sandbox-pins-real.test.ts): a directory
  * is what was pinned only at its real path, through no link, with its
  * `dev:ino` (the inode alone across a boot); the shell guard a launched argv
  * carries refuses (126) when one isn't; a handle refuses to wrap (bwrap,
@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { claudeSandboxSettings } from "../daemon/sandbox/claude-native.js";
 import { DockerSandboxProvider } from "../daemon/sandbox/docker.js";
 import { LocalSandboxHandle } from "../daemon/sandbox/local-handle.js";
-import { pinGuardArgv, pinProblem, pinRecord, SandboxPinError, sameDir, unguardedArgv } from "../daemon/sandbox/pins.js";
+import { pinGuardArgv, pinProblem, pinRecord, SandboxPinError, sameDir, unguardedArgv } from "../daemon/sandbox/pinned.js";
 import { buildSandboxSpec, nestedRootAncestors, protectedAncestors } from "../daemon/sandbox/policy.js";
 import { resolveProjectRoots } from "../daemon/sandbox/project-roots.js";
 import { SeatbeltSandboxProvider } from "../daemon/sandbox/seatbelt.js";
@@ -139,8 +139,8 @@ describe("pins", () => {
     const base = { sessionId: "s", workspace: ws, tempDir: tmp, network: { mode: "off" as const }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" }, git: false, cache: false };
     const pins = { [ws]: pinRecord(ws) as string, [b]: pinRecord(b) as string, [join(home, "W")]: pinRecord(join(home, "W")) as string };
     const spec = buildSandboxSpec({ ...base, addedDirs: [{ dir: b }], projectRoots: [join(home, "W")], pins });
-    expect(spec.pins?.map((p) => p.what)).toEqual(["the workspace", "added directory", "project root"]);
-    for (const p of spec.pins ?? []) expect(p.id).toMatch(/^\d+:\d+$/);
+    expect(spec.pins?.map((p) => p.what).slice(0, 3)).toEqual(["the workspace", "added directory", "project root"]);
+    for (const p of (spec.pins ?? []).filter((p) => !p.file && !p.mayBeMissing)) expect(p.id).toMatch(/^\d+:\d+$/);
     // b made anew: the build is refused, never laid over whatever is there now.
     renameSync(b, join(d, "b-old"));
     mkdirSync(b);

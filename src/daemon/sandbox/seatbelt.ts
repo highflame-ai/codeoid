@@ -29,6 +29,7 @@
 
 import { realpathSync, statSync } from "node:fs";
 import { LocalSandboxHandle } from "./local-handle.js";
+import { boundPath } from "./pinned.js";
 import type { NetworkMode, SandboxCapabilities, SandboxHandle, SandboxProbe, SandboxProvider, SandboxSpawnOptions, SandboxSpec } from "./types.js";
 
 export const SEATBELT_PROVIDER_ID = "seatbelt";
@@ -63,13 +64,16 @@ export function seatbeltProfile(
   spec: SandboxSpec,
   fs: { real?: (p: string) => string; isDir?: (p: string) => boolean | null } = {},
 ): SeatbeltProfile {
-  const real = fs.real ?? ((p: string) => {
+  // Everything a rule names by path is pinned: named as it was pinned (the handle checked it is still that, and
+  // the launched argv checks again; #448 round 14), never resolved again here. Only what isn't is resolved.
+  // paths: resolves only what isn't pinned (boundPath): a hidden path, the home's allowlist
+  const real = boundPath(spec.pins, fs.real ?? ((p: string) => {
     try {
       return realpathSync(p);
     } catch {
       return p;
     }
-  });
+  }));
   const isDir = fs.isDir ?? (() => null);
   const params: Record<string, string> = {};
   const names = new Map<string, string>();

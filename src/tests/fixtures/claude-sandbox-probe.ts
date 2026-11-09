@@ -37,7 +37,7 @@ import { type ClaudeTempDirs, claudeNativeEnv, claudeSandboxSettings, claudeTemp
 import { BwrapSandboxProvider } from "../../daemon/sandbox/bwrap.js";
 import { CWD_FROM_CALLER } from "../../daemon/sandbox/docker.js";
 import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "../../daemon/sandbox/git-shim.js";
-import { unguardedArgv } from "../../daemon/sandbox/pins.js";
+import { unguardedArgv } from "../../daemon/sandbox/pinned.js";
 import { buildSandboxSpec } from "../../daemon/sandbox/policy.js";
 import { daemonTempDir } from "../../daemon/sandbox/root.js";
 import { launcherScript } from "../../daemon/sandbox/session-sandbox.js";

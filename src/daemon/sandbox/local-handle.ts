@@ -3,13 +3,13 @@
  * wrapping its argv (bwrap, sandbox-exec, `docker run`): spawn and exec are
  * the wrapped argv run as a child of the daemon, and close ends every child it
  * started that is still running. Every wrap first checks the spec's pinned
- * directories (pins.ts) and refuses when one isn't what it was, and the argv
+ * directories (pinned.ts) and refuses when one isn't what it was, and the argv
  * it hands back checks them again right before the program starts, so a
  * launcher written from it once checks at each run (#448 round 13).
  */
 
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { pinGuardArgv, pinRefusal, pinsProblem, SandboxPinError } from "./pins.js";
+import { pinGuardArgv, pinRefusal, pinsProblem, SandboxPinError } from "./pinned.js";
 import type { SandboxExecOptions, SandboxExecResult, SandboxHandle, SandboxSpawnOptions, SandboxSpec } from "./types.js";
 
 export type ArgvWrapper = (argv: readonly string[], opts: SandboxSpawnOptions) => { argv: string[]; env: Record<string, string> };

@@ -36,7 +36,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { SandboxSettings } from "@anthropic-ai/claude-agent-sdk";
 import { absolutePathEntries, pathWithShim } from "./git-shim.js";
-import { pinRefusal, pinsProblem, SandboxPinError } from "./pins.js";
+import { pinRefusal, pinsProblem, SandboxPinError } from "./pinned.js";
 import type { SandboxRuntime } from "./session-sandbox.js";
 import type { SandboxSpec } from "./types.js";
 
@@ -131,7 +131,7 @@ export function claudeSandboxSettings(
   platform: NodeJS.Platform = process.platform,
 ): SandboxSettings {
   const spec = rt.spec;
-  // Every directory the CLI is told to bind by name, checked first (pins.ts, #448 round 13): never one a link leads from.
+  // Every directory the CLI is told to bind by name, checked first (pinned.ts, #448 round 13): never one a link leads from.
   const problem = pinsProblem(spec.pins);
   if (problem) throw new SandboxPinError(pinRefusal(problem));
   const tempDir = temp?.commands ?? spec.tempDir;

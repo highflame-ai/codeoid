@@ -29,6 +29,7 @@
 import { lstatSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { LocalSandboxHandle } from "./local-handle.js";
+import { boundPath } from "./pinned.js";
 import type { NetworkMode, SandboxCapabilities, SandboxHandle, SandboxProbe, SandboxProvider, SandboxSpawnOptions, SandboxSpec } from "./types.js";
 
 export const BWRAP_PROVIDER_ID = "bwrap";
@@ -90,10 +91,11 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
 
   const mounts: Mount[] = [];
   const seen = new Set<string>();
-  // A pinned directory is bound by the path it was pinned at, never by where a link there leads (pins.ts: the
-  // handle checked it is still that directory, and the launched argv checks again).
-  const pinned = new Set((spec.pins ?? []).map((p) => p.path));
-  const realOr = (p: string) => (pinned.has(p) ? p : realOrPath(p));
+  // Everything bound by name is pinned, and bound by the path it was pinned at, never by where a link there leads
+  // (pinned.ts: the handle checked it is still that, and the launched argv checks again; #448 round 14: never
+  // resolved again here). Only what isn't pinned is resolved: a hidden path (a link there hides more), the home's
+  // allowlist (shown where a link leads, by design).
+  const realOr = boundPath(spec.pins, realOrPath);
   const writable = [spec.workspace, ...spec.writable].map(realOr);
   const shownInTmp = [...writable, ...spec.reexposed.flatMap((r) => [resolve(r), realOr(r)]).filter((r) => r !== "/tmp")];
   const hide = (p: string) => {
@@ -128,9 +130,10 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   // Read-only inside something writable (a repository's hooks and config), with everything in it.
   for (const p of spec.readOnly ?? []) {
     const at = realOr(p);
-    // Never one that is hidden (a repository's git config holding a credential, in a dir the agent added): its
-    // bind would show it again over the hiding.
-    if (!kind(at) || seen.has(`o:${at}`) || seen.has(`h:${at}`)) continue;
+    // Never one that is hidden (a repository's git config holding a credential, in a dir the agent added), or in a
+    // hidden dir its writable root shows: its bind would show it again over the hiding.
+    const holder = writable.filter((w) => within(at, w)).sort((x, y) => depth(y) - depth(x))[0];
+    if (!kind(at) || seen.has(`o:${at}`) || seen.has(`h:${at}`) || (holder && hiddenDirs.some((d) => within(at, d) && within(d, holder) && d !== holder))) continue;
     seen.add(`o:${at}`);
     mounts.push({ kind: "ro-bind", src: at, path: at });
   }

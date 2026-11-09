@@ -40,7 +40,7 @@ import {
   stillRealDir,
 } from "./project-roots.js";
 import { ENTRY_GRACE_MS, WorktreeEntryGuard, type WorktreeEntryFinding } from "./worktree-entries.js";
-import { pinProblem, pinRecord, pinRefusal, pinsProblem, SandboxPinError, unguardedArgv } from "./pins.js";
+import { pinProblem, pinRecord, pinRefusal, pinsProblem, SandboxPinError, unguardedArgv } from "./pinned.js";
 import { existingFolderName, mainCheckoutOf, sessionFolderName, worktreeFoldersOf, worktreeLocationDirs, worktreeRootNotes } from "./worktrees.js";
 import type { SandboxRegistry } from "./registry.js";
 import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "./git-shim.js";
@@ -191,7 +191,7 @@ export function effectiveSetting(config: SandboxConfig, setting: SessionSandboxS
 /**
  * `setting` with each added directory `before` didn't have kept by where it
  * really is now, when it is granted (project-roots.ts `addedDirReal`), and
- * pinned there (pins.ts: what it is, `dev:ino`): what is bound is that
+ * pinned there (pinned.ts: what it is, `dev:ino`): what is bound is that
  * directory, never where a link there leads later, nor another one put in
  * its place. One already kept stays as it was (a link put there since is
  * dropped at the next build, never followed). An added dir inside another
@@ -329,7 +329,7 @@ export interface SandboxDirs {
   notes: string[];
   homeWorkspace: boolean;
   dropped: Array<{ dir: string; why: string }>;
-  /** Pins taken now (pins.ts), by real path: a root or added dir seen for the first time. */
+  /** Pins taken now (pinned.ts), by real path: a root or added dir seen for the first time. */
   pinned: Record<string, string>;
   /** The look through the roots for credential files, reused by every spec built from this resolution. */
   scan?: RootScan;
@@ -341,7 +341,7 @@ export interface SandboxDirs {
  * An added dir inside the workspace is dropped (writable already); one that
  * is no longer a directory at the real path it was granted at (a link put
  * there, removed), another directory than the one pinned there
- * (`opts.pins`, pins.ts), or can't be one now, is `dropped`, said. A root
+ * (`opts.pins`, pinned.ts), or can't be one now, is `dropped`, said. A root
  * the same, or too big to look through for credential files, isn't used,
  * said, and so is a repository there whose git config is hidden for the
  * credential in it (never the session's own repository's). A root or added
@@ -589,6 +589,8 @@ export class SessionSandbox {
   #pinsChanged = false;
   /** The spec last built for the session: what its commands can write, for the entries' look. */
   #lastSpec: SandboxSpec | null = null;
+  /** The spec last built under the running resolution: what the gate checks the pins of (pinProblem). */
+  #gateSpec: SandboxSpec | null = null;
   #entriesRecheck: ReturnType<typeof setTimeout> | null = null;
 
   readonly #onWarning: ((text: string) => void) | undefined;
@@ -734,7 +736,7 @@ export class SessionSandbox {
   /**
    * Why the running sandbox's directories aren't what was pinned (the
    * workspace, the working directory, an added dir, a project root, a
-   * worktree folder: pins.ts), in the sentence a refused call carries, or
+   * worktree folder: pinned.ts), in the sentence a refused call carries, or
    * null. Asked at the gate before every tool call: what has changed is
    * never run against, and is looked at again at the next resolution
    * between turns (an added dir or root changed is left out then, said; a
@@ -750,7 +752,10 @@ export class SessionSandbox {
       (workdir !== workspace ? pinProblem(workdir, "the working directory", { mayBeMissing: true }) : null) ??
       this.#dirs.added.map((d) => pinProblem(d, "added directory", ids[d] ? { stored: ids[d] } : {})).find((p) => p !== null) ??
       this.#dirs.roots.map((r) => pinProblem(r, "project root", ids[r] ? { stored: ids[r] } : {})).find((p) => p !== null) ??
-      pinsProblem((this.#lastSpec?.pins ?? []).filter((p) => p.what === "worktree folder"));
+      // Everything else the running sandbox binds by name (#448 round 14: a dir held in place, a path held
+      // read-only, the repository's git dirs, a worktree folder or location): changed by another session's
+      // command or on the host, it is said here, and the next resolution looks again.
+      pinsProblem(this.#gateSpec?.pins);
     if (!problem) return null;
     this.#pinsBroken = true;
     return pinRefusal(problem);
@@ -838,6 +843,8 @@ export class SessionSandbox {
     }
     this.#keepPins(r.pinned);
     this.#pinsBroken = false;
+    // The spec the gate checks is the new resolution's, once built: the last one's pins are its handles' to check.
+    this.#gateSpec = null;
     if (this.#closed) {
       this.#runtime = null;
       return r.info;
@@ -1054,12 +1061,13 @@ export class SessionSandbox {
     try {
       spec = build();
     } catch (err) {
-      // A pinned directory changed (pins.ts): refused, and looked at again at the next resolution.
+      // A pinned directory changed (pinned.ts): refused, and looked at again at the next resolution.
       if (err instanceof SandboxPinError) this.#pinsBroken = true;
       throw err;
     }
     for (const f of spec.worktreeFolders ?? []) this.#folders.add(f);
     this.#lastSpec = spec;
+    this.#gateSpec = spec;
     return spec;
   }
 

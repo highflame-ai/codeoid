@@ -14,7 +14,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameS
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
-import { SandboxPinError } from "../daemon/sandbox/pins.js";
+import { SandboxPinError } from "../daemon/sandbox/pinned.js";
 import { buildSandboxSpec, type SpecInputs } from "../daemon/sandbox/policy.js";
 import { resolveProjectRoots } from "../daemon/sandbox/project-roots.js";
 import { launcherScript } from "../daemon/sandbox/session-sandbox.js";
