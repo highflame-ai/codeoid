@@ -347,11 +347,13 @@ export function resolveProjectRoots(entries: readonly string[], workspace: strin
 
 /**
  * Credential files, by name: dotenv files (not their examples), direnv's,
- * registry and netrc tokens, private keys (not `.pub`), certificates'
- * keystores, kubeconfigs, Terraform state and variables, a vault token,
- * service-account keys, `secrets.*`.
+ * registry and netrc tokens, private keys (not `.pub`: `id_*`, `*_rsa`,
+ * `*_ed25519`, `*_ecdsa`, `*_dsa`, deploy keys, `*.key`, `*.pem`, PuTTY's
+ * `*.ppk`, Apple's `*.p8`), certificates' keystores, kubeconfigs, Terraform
+ * state and variables, a vault token, service-account keys, `secrets.*`.
  */
 const DATA_EXT = "(?:json|ya?ml|toml|ini|env|txt|conf|cfg|properties|xml|csv)";
+const KEY_EXT = "(?:\\.(?:key|pem|ppk|old|bak|orig|backup|[0-9]+))?";
 const SECRET_FILE = new RegExp(
   `^(?:${[
     "\\.env(?:\\.(?!(?:example|sample|template)$)[^/]+)?",
@@ -362,8 +364,12 @@ const SECRET_FILE = new RegExp(
     "\\.git-credentials",
     "\\.vault-token",
     "\\.pgpass",
-    "[^/]*\\.(?:pem|key|p12|pfx|jks|keystore)",
-    "id_(?:rsa|dsa|ecdsa|ed25519)[^/]*(?<!\\.pub)",
+    "[^/]*\\.(?:pem|key|p12|pfx|jks|keystore|ppk|p8)",
+    // Key names (`id_ed25519_work`, `github_rsa`, `deploy_key`): no extension, or a key's or a backup's, never `.pub`
+    // (nor a source file: `id_generator.ts`, `crypto_rsa.go` aren't keys).
+    `id_[^/.]+${KEY_EXT}`,
+    `[^/.]*_(?:rsa|dsa|ecdsa|ed25519)(?:_[^/.]*)?${KEY_EXT}`,
+    `(?:[^/.]*[_-])?deploy[_-]?key(?:[_-][^/.]*)?${KEY_EXT}`,
     "kubeconfig(?:\\.[^/]+)?",
     "[^/]*\\.kubeconfig",
     "[^/]*\\.tfstate(?:\\.[^/]+)?",
@@ -378,18 +384,165 @@ const SECRET_FILE = new RegExp(
 const SECRET_DIRS: ReadonlySet<string> = new Set([".ssh", ".gnupg", ".aws", ".azure", ".gcloud", ".kube", ".password-store"]);
 /** Credential files by where they are: a project's own Claude settings (their `env`), Docker's login. */
 const SECRET_SUFFIXES: readonly string[] = ["/.claude/settings.local.json", "/.docker/config.json", "/.mcp.json"];
+/**
+ * Files that hold a credential only sometimes, judged by what is in them:
+ * Yarn's `.yarnrc.yml` (`npmAuthToken`, `npmAuthIdent`) and `.yarnrc`
+ * (`_authToken`), Composer's `auth.json`.
+ */
+const SECRET_BY_CONTENT: Readonly<Record<string, RegExp>> = {
+  ".yarnrc.yml": /\bnpm(?:AuthToken|AuthIdent|Password)\s*:/,
+  ".yarnrc": /_auth(?:Token)?\b|_password\b/,
+  "auth.json": /"(?:http-basic|github-oauth|gitlab-oauth|gitlab-token|bitbucket-oauth|bearer|forgejo-token|custom-headers)"\s*:/,
+};
 
-/** Whether a git config file carries a credential: a URL with a user or password in it (an https one, or any with a password), or an http extraheader. */
-export function gitConfigHasCredential(file: string): boolean {
-  let text = "";
+/** A small regular file's text, or null (not one, too big, unreadable). */
+function smallText(file: string, max = 1 << 20): string | null {
   try {
     const st = lstatSync(file);
-    if (!st.isFile() || st.size > 1 << 20) return st.isFile();
-    text = readFileSync(file, "utf8");
+    if (!st.isFile() || st.size > max) return null;
+    return readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+/** Whether `file` (named `name`) is one of {@link SECRET_BY_CONTENT}'s holding a credential. */
+function secretByContent(name: string, file: string): boolean {
+  const re = SECRET_BY_CONTENT[name];
+  if (!re) return false;
+  const text = smallText(file);
+  return text !== null && re.test(text);
+}
+
+/**
+ * Whether a git config file carries a credential: a URL with a user or
+ * password in it (an https one, or any with a password), or a token in its
+ * query; an http `extraheader` in any syntax git reads (alone on its line,
+ * after its section's header on the same line, under `[http "<url>"]`, any
+ * case); a credential helper that is a shell snippet printing a password or
+ * a token. A file too big to read is taken to carry one.
+ */
+export function gitConfigHasCredential(file: string): boolean {
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(file);
   } catch {
     return false;
   }
-  return /\b(?:https?|ftps?):\/\/[^\s/"@]+@/i.test(text) || /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:"@]+:[^\s/"@]*@/i.test(text) || /^\s*extraheader\s*=/im.test(text);
+  if (!st.isFile()) return false;
+  if (st.size > 1 << 20) return true;
+  const text = smallText(file);
+  if (text === null) return false;
+  return (
+    /\b(?:https?|ftps?):\/\/[^\s/"@]+@/i.test(text) ||
+    /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:"@]+:[^\s/"@]*@/i.test(text) ||
+    /:\/\/[^\s"]*[?&](?:private[_-]?token|access[_-]?token|token|password|passwd|api[_-]?key|apikey|auth|key)=/i.test(text) ||
+    /(?:^|\])[ \t]*extraheader[ \t]*=/im.test(text) ||
+    /(?:^|\])[ \t]*helper[ \t]*=[ \t]*"?[ \t]*!.*(?:password|token|secret)/im.test(text)
+  );
+}
+
+/** The files a git config pulls in (`include.path`, `includeIf.<cond>.path`), absolute: relative to it, `~/` to the home. */
+export function gitConfigIncludes(file: string, home: string = process.env.HOME ?? homedir()): string[] {
+  const text = smallText(file);
+  if (text === null) return [];
+  const out: string[] = [];
+  let section = "";
+  for (const raw of text.split("\n")) {
+    let line = raw.trim();
+    const head = /^\[\s*([A-Za-z0-9.-]+)(?:\s+"[^"]*")?\s*\]\s*(.*)$/.exec(line);
+    if (head) {
+      section = (head[1] ?? "").toLowerCase();
+      line = head[2] ?? "";
+    }
+    if (section !== "include" && section !== "includeif") continue;
+    const m = /^path\s*=\s*(.*?)\s*$/i.exec(line);
+    if (!m?.[1]) continue;
+    const value = m[1].replace(/^"(.*)"$/, "$1");
+    if (!value) continue;
+    out.push(value.startsWith("~/") ? join(home, value.slice(2)) : isAbsolute(value) ? value : resolve(dirname(file), value));
+  }
+  return out;
+}
+
+/** The credential stores a git config's `credential.helper = store --file <f>` names, absolute (relative to `base`). */
+function credentialStores(file: string, base: string, home: string): string[] {
+  const text = smallText(file);
+  if (text === null) return [];
+  const out: string[] = [];
+  for (const m of text.matchAll(/(?:^|\])[ \t]*helper[ \t]*=[ \t]*"?[ \t]*store\b[^\n]*?--file(?:[ \t]*=[ \t]*|[ \t]+)("?)([^"\s]+)\1/gim)) {
+    const f = m[2] ?? "";
+    if (!f) continue;
+    out.push(f.startsWith("~/") ? join(home, f.slice(2)) : isAbsolute(f) ? f : resolve(base, f));
+  }
+  return out;
+}
+
+/** Whether Mercurial's `hgrc` carries a credential: an `[auth]` section, or a URL with a user or password. */
+function hgrcHasCredential(file: string): boolean {
+  const text = smallText(file);
+  if (text === null) return false;
+  return /^\s*\[auth\]/im.test(text) || /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:"@]+:[^\s/"@]*@/i.test(text);
+}
+
+/**
+ * The credentials git may read in the git dir `gitDir` (a repository's
+ * `.git`, a bare one, a submodule's): every config git reads there
+ * (`config`, `config.worktree`, each worktree's `config.worktree`, each
+ * submodule's under `modules/`, bounded) carrying one, every file they
+ * include, a `store --file` they name, and a credential file by name at its
+ * top (`credentials`, `.git-credentials`). Configs in `configs`.
+ */
+function gitDirSecrets(gitDir: string, home: string, out: { found: string[]; configs: string[] }, budget = { left: 200 }, depth = 0): void {
+  if (depth > 4 || --budget.left < 0) return;
+  const top = basename(gitDir) === ".git" ? dirname(gitDir) : gitDir;
+  const configs = [join(gitDir, "config"), join(gitDir, "config.worktree")];
+  for (const w of listDirNames(join(gitDir, "worktrees"))) configs.push(join(gitDir, "worktrees", w, "config.worktree"), join(gitDir, "worktrees", w, "config"));
+  const seen = new Set<string>();
+  const look = (config: string, level: number): void => {
+    if (seen.has(config) || level > 5) return;
+    seen.add(config);
+    if (gitConfigHasCredential(config)) {
+      out.found.push(config);
+      out.configs.push(config);
+    }
+    for (const store of credentialStores(config, top, home)) out.found.push(store);
+    for (const inc of gitConfigIncludes(config, home)) look(inc, level + 1);
+  };
+  for (const c of configs) look(c, 0);
+  for (const name of listFileNames(gitDir)) if (SECRET_FILE.test(name)) out.found.push(join(gitDir, name));
+  const walkModules = (dir: string, level: number): void => {
+    if (level > 4) return;
+    for (const name of listDirNames(dir)) {
+      if (--budget.left < 0) return;
+      const sub = join(dir, name);
+      // A submodule's git dir (one with a config is read by git as one, whatever else it has), and a submodule
+      // named with a slash (`libs/a`): its git dir a level down.
+      if (gitDirShape(sub) || smallText(join(sub, "config")) !== null) gitDirSecrets(sub, home, out, budget, depth + 1);
+      if (!gitDirShape(sub)) walkModules(sub, level + 1);
+    }
+  };
+  walkModules(join(gitDir, "modules"), 0);
+}
+
+function listDirNames(dir: string): string[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+
+function listFileNames(dir: string): string[] {
+  try {
+    return readdirSync(dir, { withFileTypes: true })
+      .filter((e) => e.isFile())
+      .map((e) => e.name);
+  } catch {
+    return [];
+  }
 }
 
 /** What the look through project roots found ({@link projectRootSecrets}). */
@@ -405,15 +558,18 @@ export interface RootSecrets {
 /**
  * The credential files anywhere under the `roots` (and the session's own
  * worktree locations, `locations`), hidden like the credential stores are:
- * {@link SECRET_FILE} by name, {@link SECRET_DIRS} whole, a repository's
- * `.git/config` carrying a credential ({@link gitConfigHasCredential}); but
- * in `writable` (the session's own workspace and added dirs: its own
- * project's `.env` is its to use). Looked for through directories (not
- * through links, not in {@link SCAN_SKIPPED_DIRS}) when the spec is built:
- * one made later isn't hidden. A root with more than `limit` directories
- * to look through is in `over`, and isn't to be used.
+ * {@link SECRET_FILE} by name, {@link SECRET_DIRS} whole,
+ * {@link SECRET_BY_CONTENT} by what is in them, every git config git may read
+ * in a repository's git dir or a bare one carrying a credential (and what
+ * it includes, a credential store it names: {@link gitDirSecrets}), a
+ * Mercurial `hgrc` with one; but in `writable` (the session's own workspace
+ * and the dirs its owner added: its own project's `.env` is its to use).
+ * Looked for through directories (not through links, not in
+ * {@link SCAN_SKIPPED_DIRS}) when the spec is built: one made later isn't
+ * hidden. A root with more than `limit` directories to look through is in
+ * `over`, and isn't to be used.
  */
-export function projectRootSecrets(roots: readonly string[], writable: readonly string[], limit = PROJECT_ROOT_SCAN_LIMIT): RootSecrets {
+export function projectRootSecrets(roots: readonly string[], writable: readonly string[], limit = PROJECT_ROOT_SCAN_LIMIT, home: string = process.env.HOME ?? homedir()): RootSecrets {
   const out: RootSecrets = { hidden: [], gitConfigs: [], over: [] };
   const mine = writable.flatMap((w) => [resolve(w), realOr(w)]);
   const owned = (p: string) => mine.some((w) => within(p, w));
@@ -422,14 +578,19 @@ export function projectRootSecrets(roots: readonly string[], writable: readonly 
     const top = resolve(root);
     if (seenRoots.has(top)) continue;
     seenRoots.add(top);
+    const git = { found: [] as string[], configs: [] as string[] };
     const found: string[] = [];
-    const configs: string[] = [];
     const queue = [top];
     let seen = 0;
     let over = false;
     while (queue.length > 0 && !over) {
       const d = queue.shift() as string;
       if (owned(d) || owned(realOr(d))) continue;
+      // A bare repository (or any git dir by its shape): its configs, never walked as files.
+      if (gitDirShape(d)) {
+        gitDirSecrets(d, home, git);
+        continue;
+      }
       let entries: Dirent[];
       try {
         entries = readdirSync(d, { withFileTypes: true });
@@ -441,12 +602,9 @@ export function projectRootSecrets(roots: readonly string[], writable: readonly 
         const at = join(d, e.name);
         if (e.isDirectory()) {
           if (SECRET_DIRS.has(e.name)) found.push(at);
-          else if (e.name === ".git") {
-            const config = join(at, "config");
-            if (gitConfigHasCredential(config)) {
-              found.push(config);
-              configs.push(config);
-            }
+          else if (e.name === ".git") gitDirSecrets(at, home, git);
+          else if (e.name === ".hg") {
+            if (hgrcHasCredential(join(at, "hgrc"))) found.push(join(at, "hgrc"));
           } else if (!SCAN_SKIPPED_DIRS.has(e.name)) {
             if (++seen > limit) {
               over = true;
@@ -457,21 +615,26 @@ export function projectRootSecrets(roots: readonly string[], writable: readonly 
           continue;
         }
         if (!e.isFile()) continue;
-        if (SECRET_FILE.test(e.name) || SECRET_SUFFIXES.some((s) => at.endsWith(s))) found.push(at);
+        if (SECRET_FILE.test(e.name) || SECRET_SUFFIXES.some((s) => at.endsWith(s)) || secretByContent(e.name, at)) found.push(at);
       }
     }
     if (over) out.over.push(root);
     else {
-      out.hidden.push(...found.filter((p) => !owned(p)));
-      out.gitConfigs.push(...configs.filter((p) => !owned(p)));
+      // What git reads that is in the root (an include or a store elsewhere is hidden where the sandbox hides it).
+      const inRoot = (p: string) => within(resolve(p), top) || within(realOr(p), realOr(top));
+      out.hidden.push(...[...found, ...git.found.filter(inRoot)].filter((p, i, all) => !owned(p) && all.indexOf(p) === i));
+      out.gitConfigs.push(...git.configs.filter((p, i, all) => inRoot(p) && !owned(p) && all.indexOf(p) === i));
     }
   }
   return out;
 }
 
-/** The repository a hidden `.git/config` belongs to, for what is said about it. */
+/** The repository a hidden git config belongs to (`<repo>/.git/config`, a bare one's, a submodule's or a worktree's), for what is said about it. */
 export function repositoryOfConfig(config: string): string {
-  return basename(dirname(config)) === ".git" ? dirname(dirname(config)) : dirname(config);
+  const parts = config.split("/");
+  const i = parts.lastIndexOf(".git");
+  if (i > 0) return parts.slice(0, i).join("/") || "/";
+  return dirname(config);
 }
 
 /** Whether `p` is in one of `dirs` (as written or where it really is). */
