@@ -13,7 +13,7 @@
  * starts on it.
  */
 
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, renameSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
@@ -40,7 +40,7 @@ import {
   stillRealDir,
 } from "./project-roots.js";
 import { ENTRY_GRACE_MS, WorktreeEntryGuard, type WorktreeEntryFinding } from "./worktree-entries.js";
-import { pinProblem, pinRecord, pinRefusal, pinsProblem, SandboxPinError, unguardedArgv } from "./pinned.js";
+import { inPinnedDirSync, type PinnedDir, pinDir, realPathOnce, removeEmptyDir, pinProblem, pinRecord, pinRefusal, pinsProblem, SandboxPinError, unguardedArgv } from "./pinned.js";
 import { existingFolderName, mainCheckoutOf, sessionFolderName, worktreeFoldersOf, worktreeLocationDirs, worktreeRootNotes } from "./worktrees.js";
 import type { SandboxRegistry } from "./registry.js";
 import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "./git-shim.js";
@@ -740,6 +740,18 @@ export class SessionSandbox {
     this.#pinsChanged = true;
   }
 
+  /**
+   * The working directory as the daemon uses it on the host (pinned.ts
+   * {@link PinnedDir}: checkpoints, going back a turn, a fork's files, the
+   * end-of-turn git looks), pinned when it wasn't yet. Throws
+   * {@link PinnedPathError} (for `op`) when it isn't the directory pinned.
+   */
+  workdirPin(op: string): PinnedDir {
+    this.#pinWorkspace();
+    const workdir = resolve(this.#workdir);
+    return pinDir(workdir, "the working directory", this.#setting?.pins?.ids[workdir] ?? null, op);
+  }
+
   /** Keep what a resolution pinned (roots, added dirs seen for the first time). */
   #keepPins(pinned: Record<string, string> | undefined): void {
     if (!pinned || Object.keys(pinned).length === 0 || this.#closed) return;
@@ -1130,14 +1142,18 @@ export class SessionSandbox {
       // Before the first spec, the folders as they are (nothing is made for a look).
       const folders = last ? [...(last.worktreeFolders ?? [])] : worktreeFoldersOf(layout, folder, { ...opts, workspace, make: false }).folders;
       const dot = main ? join(main, ".worktrees") : null;
-      const { findings, pending } = guard.check({
-        common: layout.common,
+      // In the repository's git dir as it is now, pinned for the look (pinned.ts, #448 round 14): what the guard
+      // restores is written there, never where a link put in its place leads; changed meanwhile, it is refused.
+      const commonDir = layout.common;
+      const common = pinDir(realPathOnce(commonDir), "the repository's git dir", null, "the look at its worktree entries");
+      const { findings, pending } = inPinnedDirSync(common, "the look at its worktree entries", () => guard.check({
+        common: commonDir,
         main,
         ownFolders: folders,
         writable: [workspace, ...(this.#tempDir ? [this.#tempDir] : []), ...folders, ...(last?.writable ?? [])],
         readOnly: last?.readOnly ?? [],
         locations: [...worktreeLocationDirs(layout, opts).locations.map((l) => l.dir), ...(dot ? [dot] : [])],
-      });
+      }));
       if (pending && !this.#entriesRecheck) {
         // An entry git may still be making: looked at once it is done.
         this.#entriesRecheck = setTimeout(() => {
@@ -1179,14 +1195,8 @@ export class SessionSandbox {
    */
   tidyFolders(): void {
     for (const f of this.#folders) {
-      for (const dir of [f, dirname(f)]) {
-        try {
-          if (!lstatSync(dir).isDirectory()) break;
-          rmdirSync(dir);
-        } catch {
-          break;
-        }
-      }
+      // Empty ones only, never through a link (pinned.ts, #448 round 14): the folder, then its location.
+      for (const dir of [f, dirname(f)]) if (!removeEmptyDir(dir)) break;
     }
   }
 

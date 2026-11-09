@@ -30,6 +30,12 @@
  *   - It works in non-git directories too, identically.
  *   - The child gets a minimal environment, never the daemon's (which holds
  *     credentials — see providers/env.ts).
+ *   - The work tree is a pinned directory (sandbox/pinned.ts, #448 round
+ *     14): the session's working directory as it was when the session was
+ *     made, checked before every snapshot, look and restore and again after,
+ *     and given to git as the cwd it starts in. One an agent moved aside and
+ *     replaced (by a link to the home, or another directory) is refused,
+ *     never snapshotted, written into or deleted from.
  *
  * The cost of self-containment is one compressed copy of the work tree on a
  * session's first snapshot; later snapshots store only what changed (git
@@ -47,6 +53,7 @@ import { existsSync } from "node:fs";
 import { appendFile, copyFile, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
+import { inPinnedDir, PinnedPathError, type PinnedDir, pinDir } from "./sandbox/pinned.js";
 import { daemonTempDir } from "./sandbox/root.js";
 
 const execFileP = promisify(execFile);
@@ -78,7 +85,24 @@ export const DEFAULT_CHECKPOINT_LIMITS: CheckpointLimits = {
   timeoutMs: 30_000,
 };
 
-export type CheckpointResult = { ok: true; sha: string; late: boolean } | { ok: false; reason: string };
+/** `pinned`: refused because the work tree isn't the directory pinned (PinnedPathError), nothing taken. */
+export type CheckpointResult = { ok: true; sha: string; late: boolean } | { ok: false; reason: string; pinned?: true };
+
+/**
+ * A snapshot's work tree: the caller's pinned directory (Session: the
+ * working directory as pinned when the session was made), or a path pinned
+ * now (it must be a directory at its real path, reached through no link).
+ */
+export type WorkTree = string | PinnedDir;
+
+function workTreeOf(w: WorkTree, op: string): PinnedDir {
+  return typeof w === "string" ? pinDir(w, "the working directory", null, op) : w;
+}
+
+/** A failure as a result: one of the work tree's pin marked so. */
+function failure(err: unknown): { ok: false; reason: string; pinned?: true } {
+  return { ok: false, reason: err instanceof Error ? err.message : String(err), ...(err instanceof PinnedPathError ? { pinned: true as const } : {}) };
+}
 
 /** A recorded checkpoint. `late`: the turn had already started while the files were being read. */
 export interface CheckpointRecord {
@@ -288,7 +312,7 @@ const inFlight = new Set<string>();
  */
 export async function createCheckpoint(opts: {
   root: string;
-  workdir: string;
+  workdir: WorkTree;
   sessionId: string;
   turnId: string;
   limits?: Partial<CheckpointLimits>;
@@ -336,21 +360,29 @@ export async function createCheckpoint(opts: {
       await prune(shadow, keep, t, { reclaimNow: true }).catch(() => {});
       if (keep === 0) break;
     }
-    // The user repo's HEAD, so a fork from this point can start from the same
-    // commit. Read BEFORE the files: a commit landing mid-snapshot then shows
-    // as the files' uncommitted edits, never as reverts of a newer commit.
-    // rev-parse only reads (no hooks, fsmonitor off).
-    const head = await run(["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: opts.workdir, env: gitEnv({}), timeoutMs: t })
-      .then((o) => o.trim())
-      .catch(() => "");
-    const staged = await stageWorkTree(shadow, opts.workdir, limits, opts.excludeDirs, opts.excludePaths);
-    if (!staged.ok) return staged;
-    const late = opts.isLate?.() === true;
-    const { env, first } = staged;
-    const tree = (await run(["write-tree"], { cwd: opts.workdir, env, timeoutMs: t })).trim();
+    // The files, read in the pinned work tree (checked before and after: a snapshot of a directory put in its
+    // paths: the work tree pinned (workTreeOf) and checked before and after (inPinnedDir) for the git runs in it; the rest is the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
+    // place is never recorded, #448 round 14).
+    const work = workTreeOf(opts.workdir, "a snapshot of the files");
+    const read = await inPinnedDir(work, "a snapshot of the files", async (wd) => {
+      // The user repo's HEAD, so a fork from this point can start from the same
+      // commit. Read BEFORE the files: a commit landing mid-snapshot then shows
+      // as the files' uncommitted edits, never as reverts of a newer commit.
+      // rev-parse only reads (no hooks, fsmonitor off).
+      const head = await run(["rev-parse", "--verify", "-q", "HEAD^{commit}"], { cwd: wd, env: gitEnv({}), timeoutMs: t })
+        .then((o) => o.trim())
+        .catch(() => "");
+      const staged = await stageWorkTree(shadow, wd, limits, opts.excludeDirs, opts.excludePaths);
+      if (!staged.ok) return staged;
+      const late = opts.isLate?.() === true;
+      const tree = (await run(["write-tree"], { cwd: wd, env: staged.env, timeoutMs: t })).trim();
+      return { ok: true as const, head, late, tree, env: staged.env, first: staged.first };
+    });
+    if (!read.ok) return read;
+    const { head, late, tree, first } = read;
     const message = `codeoid checkpoint\n\nsession: ${opts.sessionId}\nturn: ${opts.turnId}\n`;
-    const sha = (await run(["commit-tree", tree, "-F", "-"], { cwd: opts.workdir, env, timeoutMs: t, input: message })).trim();
     const shadowEnv = gitEnv({ GIT_DIR: shadow });
+    const sha = (await run(["commit-tree", tree, "-F", "-"], { cwd: shadow, env: shadowEnv, timeoutMs: t, input: message })).trim();
     await run(["update-ref", `refs/turns/${opts.turnId}`, sha], { cwd: shadow, env: shadowEnv, timeoutMs: t });
     await appendFile(
       path.join(shadow, "turns.log"),
@@ -363,7 +395,7 @@ export async function createCheckpoint(opts: {
     if (first) await run(["repack", "-a", "-d", "-q"], { cwd: shadow, env: shadowEnv, timeoutMs: t * 4 }).catch(() => {});
     return { ok: true, sha, late };
   } catch (err) {
-    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+    return failure(err);
   } finally {
     inFlight.delete(shadow);
   }
@@ -371,7 +403,9 @@ export async function createCheckpoint(opts: {
 
 /**
  * Stage the work tree into the shadow index — bounded by the limits — so
- * `write-tree` yields its snapshot. Caller holds the shadow's in-flight slot.
+ * `write-tree` yields its snapshot. Caller holds the shadow's in-flight slot,
+ * and has checked `workdir` (a pinned dir's path): every git here starts in
+ * it and takes it as `.`, never resolving the path again.
  */
 async function stageWorkTree(
   shadow: string,
@@ -385,7 +419,7 @@ async function stageWorkTree(
     // A lock left by a snapshot killed mid-write (crash, forced shutdown).
     // Ours are serialized by `inFlight`, so any lock here now is stale.
     await rm(path.join(shadow, "index.lock"), { force: true });
-    const env = gitEnv({ GIT_DIR: shadow, GIT_WORK_TREE: workdir });
+    const env = gitEnv({ GIT_DIR: shadow, GIT_WORK_TREE: "." });
     const inside = (p: string) => {
       const rel = path.relative(workdir, p);
       return rel && !rel.startsWith("..") && !path.isAbsolute(rel) ? rel.split(path.sep).join("/") : null;
@@ -449,24 +483,27 @@ async function stageWorkTree(
  */
 export async function currentTree(opts: {
   root: string;
-  workdir: string;
+  workdir: WorkTree;
   sessionId: string;
   excludeDirs?: readonly string[];
   excludePaths?: readonly string[];
   limits?: Partial<CheckpointLimits>;
-}): Promise<{ ok: true; tree: string } | { ok: false; reason: string }> {
+}): Promise<{ ok: true; tree: string } | { ok: false; reason: string; pinned?: true }> {
   const limits = { ...DEFAULT_CHECKPOINT_LIMITS, ...opts.limits };
   const shadow = shadowRepoPath(opts.root, opts.sessionId);
   if (inFlight.has(shadow)) return { ok: false, reason: "a snapshot is still running" };
   inFlight.add(shadow);
   try {
     await ensureShadow(shadow, limits.timeoutMs);
-    const staged = await stageWorkTree(shadow, opts.workdir, limits, opts.excludeDirs, opts.excludePaths);
-    if (!staged.ok) return staged;
-    const tree = (await run(["write-tree"], { cwd: opts.workdir, env: staged.env, timeoutMs: limits.timeoutMs })).trim();
-    return { ok: true, tree };
+    const work = workTreeOf(opts.workdir, "reading the current files");
+    return await inPinnedDir(work, "reading the current files", async (wd) => {
+      const staged = await stageWorkTree(shadow, wd, limits, opts.excludeDirs, opts.excludePaths);
+      if (!staged.ok) return staged;
+      const tree = (await run(["write-tree"], { cwd: wd, env: staged.env, timeoutMs: limits.timeoutMs })).trim();
+      return { ok: true as const, tree };
+    });
   } catch (err) {
-    return { ok: false, reason: err instanceof Error ? err.message : String(err) };
+    return failure(err);
   } finally {
     inFlight.delete(shadow);
   }
@@ -529,7 +566,7 @@ export async function diffTrees(root: string, sessionId: string, from: string, t
  */
 export async function restoreTree(opts: {
   root: string;
-  workdir: string;
+  workdir: WorkTree;
   sessionId: string;
   from: string;
   to: string;
@@ -541,34 +578,43 @@ export async function restoreTree(opts: {
   const tmpIndex = path.join(shadow, `index.restore-${process.pid}-${Date.now()}`);
   const t = DEFAULT_CHECKPOINT_LIMITS.timeoutMs * 2;
   try {
-    const env = gitEnv({ GIT_DIR: shadow, GIT_WORK_TREE: opts.workdir, GIT_INDEX_FILE: tmpIndex });
+    // Only into the pinned work tree: checked before, and after (a rename racing the restore is said, never taken
+    // as done); every git starts in it and takes it as `.`, never resolving its path again (#448 round 14).
+    const work = workTreeOf(opts.workdir, "putting the files back");
     let target = opts.to;
     if (opts.keep && opts.keep.length > 0) target = await treeKeeping(shadow, opts.to, opts.from, opts.keep, t);
-    // Start from the shadow index — {@link currentTree} just staged `from`
-    // into it, so its stat cache spares a full re-hash on a big tree — then
-    // make it exactly `from` (a one-tree merge keeps the cached stats).
-    try {
-      await copyFile(path.join(shadow, "index"), tmpIndex);
-      await run(["read-tree", "-m", opts.from], { cwd: opts.workdir, env, timeoutMs: t });
-    } catch {
-      await rm(tmpIndex, { force: true }).catch(() => {});
-      await run(["read-tree", opts.from], { cwd: opts.workdir, env, timeoutMs: t });
-    }
-    // Stat-refresh so read-tree can verify the work tree still matches `from`.
-    await run(["update-index", "--refresh"], { cwd: opts.workdir, env, timeoutMs: t }).catch(() => {});
-    try {
-      await run(["read-tree", "-m", "-u", opts.from, target], { cwd: opts.workdir, env, timeoutMs: t });
-    } catch (err) {
-      const stderr = String((err as { stderr?: unknown }).stderr ?? "").trim();
-      if (/not uptodate|would be overwritten/.test(stderr)) {
-        throw new RestoreConflictError(`files changed since the preview, nothing was restored (${stderr.split("\n")[0]})`);
-      }
-      throw err;
-    }
+    await inPinnedDir(work, "putting the files back", (wd) => restoreInto(shadow, wd, tmpIndex, opts.from, target, t));
   } finally {
     inFlight.delete(shadow);
     await rm(tmpIndex, { force: true }).catch(() => {});
     await rm(`${tmpIndex}.lock`, { force: true }).catch(() => {});
+  }
+}
+
+/** {@link restoreTree}'s git work, in the checked work tree `wd` (each git starts there and takes it as `.`). */
+// paths: in the work tree's path restoreTree checked (inPinnedDir), git given it as `.` (it never writes through a symlinked parent); the index is the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
+async function restoreInto(shadow: string, wd: string, tmpIndex: string, from: string, target: string, t: number): Promise<void> {
+  const env = gitEnv({ GIT_DIR: shadow, GIT_WORK_TREE: ".", GIT_INDEX_FILE: tmpIndex });
+  // Start from the shadow index — {@link currentTree} just staged `from`
+  // into it, so its stat cache spares a full re-hash on a big tree — then
+  // make it exactly `from` (a one-tree merge keeps the cached stats).
+  try {
+    await copyFile(path.join(shadow, "index"), tmpIndex);
+    await run(["read-tree", "-m", from], { cwd: wd, env, timeoutMs: t });
+  } catch {
+    await rm(tmpIndex, { force: true }).catch(() => {});
+    await run(["read-tree", from], { cwd: wd, env, timeoutMs: t });
+  }
+  // Stat-refresh so read-tree can verify the work tree still matches `from`.
+  await run(["update-index", "--refresh"], { cwd: wd, env, timeoutMs: t }).catch(() => {});
+  try {
+    await run(["read-tree", "-m", "-u", from, target], { cwd: wd, env, timeoutMs: t });
+  } catch (err) {
+    const stderr = String((err as { stderr?: unknown }).stderr ?? "").trim();
+    if (/not uptodate|would be overwritten/.test(stderr)) {
+      throw new RestoreConflictError(`files changed since the preview, nothing was restored (${stderr.split("\n")[0]})`);
+    }
+    throw err;
   }
 }
 
@@ -830,12 +876,13 @@ export async function shadowGit(
   root: string,
   sessionId: string,
   args: string[],
-  opts: { workdir?: string; timeoutMs?: number; input?: string } = {},
+  opts: { timeoutMs?: number; input?: string } = {},
 ): Promise<string> {
   const shadow = shadowRepoPath(root, sessionId);
+  // The shadow repository only: a work tree is reached through the pinned functions above, never here.
   return run(args, {
-    cwd: opts.workdir ?? shadow,
-    env: gitEnv({ GIT_DIR: shadow, ...(opts.workdir ? { GIT_WORK_TREE: opts.workdir } : {}) }),
+    cwd: shadow,
+    env: gitEnv({ GIT_DIR: shadow }),
     timeoutMs: opts.timeoutMs ?? DEFAULT_CHECKPOINT_LIMITS.timeoutMs,
     ...(opts.input !== undefined ? { input: opts.input } : {}),
   });

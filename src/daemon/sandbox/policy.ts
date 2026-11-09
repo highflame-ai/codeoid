@@ -23,7 +23,7 @@
  *   - network per policy.
  */
 
-import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CodeoidConfig } from "../../config.js";
@@ -34,7 +34,7 @@ import { cliCredentialFiles, registeredSecretLocations } from "../secret-paths.j
 import { DEFAULT_HOME_READABLE } from "./home-readable.js";
 import { validAllowedHost } from "./hosts.js";
 import { sandboxRoot } from "./root.js";
-import { type PathPin, dirIdentity, pinOf, pinProblem, pinRefusal, SandboxPinError } from "./pinned.js";
+import { makeAt, makeInPinned, type PathPin, dirIdentity, pinDir, pinOf, pinProblem, pinRefusal, replaceInPinned, SandboxPinError } from "./pinned.js";
 import { controlDirProblem, nestedControl, type NestedControl, projectRootSecrets, type RootScan, rootScanKey, stillRealDir } from "./project-roots.js";
 import { isOwnWorktree, worktreeAdminsOf, worktreeFoldersOf } from "./worktrees.js";
 import type { NetworkMode, NetworkPolicy, SandboxSpec } from "./types.js";
@@ -907,11 +907,12 @@ function isLink(p: string): boolean {
 /** A dir (`"dir"`) or a file with `content`, made only where nothing (not even a link) is: never through one. Whether it was made. */
 function makeIfMissing(p: string, content: string): boolean {
   try {
-    if (content === "dir") mkdirSync(p, { mode: 0o755 });
-    else writeFileSync(p, content, { flag: "wx", mode: 0o644 });
-    return true;
+    // In its directory as it is now (a workspace, working directory or added dir the build just checked against its
+    // pin, or a git dir its layout vouched for), pinned for the make: never through a link, the file `O_EXCL |
+    // O_NOFOLLOW`, the directory checked again after (pinned.ts, #448 round 14).
+    return makeAt(p, content === "dir" ? "dir" : { content, mode: 0o644 }, "making a placeholder");
   } catch {
-    /* there already, or a repository codeoid can't write either */
+    /* there already, or a repository codeoid can't write either, or its directory changed */
     return false;
   }
 }
@@ -932,7 +933,9 @@ function excludePlaceholders(workspace: string, home: string, names: readonly st
   const info = join(layout.common, "info");
   const exclude = join(info, "exclude");
   try {
-    if (!lexists(info)) mkdirSync(info, { mode: 0o755 });
+    // The git dir pinned for the write: `info/` made and `exclude` replaced whole, never through a link (pinned.ts).
+    const common = pinDir(realOr(layout.common), "the repository's git dir", null, "listing placeholders in info/exclude");
+    makeInPinned(common, "info", "dir", "listing placeholders in info/exclude");
     if (isLink(info) || isLink(exclude)) return;
     const rel = relative(dirname(layout.dotgit), resolve(workspace));
     if (rel.startsWith("..") || isAbsolute(rel)) return;
@@ -941,7 +944,7 @@ function excludePlaceholders(workspace: string, home: string, names: readonly st
     const add = names.map((n) => `/${rel ? `${rel.split(sep).join("/")}/` : ""}${n}`).filter((l) => !lines.includes(l));
     if (add.length === 0) return;
     const head = lines.includes(EXCLUDE_MARK) ? [] : [EXCLUDE_MARK];
-    writeFileSync(exclude, `${have}${have && !have.endsWith("\n") ? "\n" : ""}${[...head, ...add].join("\n")}\n`, { flag: "w" });
+    replaceInPinned(common, "info/exclude", `${have}${have && !have.endsWith("\n") ? "\n" : ""}${[...head, ...add].join("\n")}\n`, "listing placeholders in info/exclude");
   } catch {
     /* a repository codeoid can't write: the placeholder shows in `git status` */
   }

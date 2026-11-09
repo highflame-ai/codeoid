@@ -99,6 +99,7 @@ import {
   numstatTrees,
   restoreTree,
 } from "./checkpoints.js";
+import { type PinnedDir, PinnedPathError, pinDir, pinRecord } from "./sandbox/pinned.js";
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
 import type { EffortChangeResult, EffortLevel, RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
 import { LIMITS } from "../protocol/types.js";
@@ -1272,6 +1273,10 @@ export class Session {
   readonly #dirRequests = new Map<string, Promise<string>>();
   /** The pin change last said on the session (#sandboxPinRefusal): said once per change. */
   #pinSaid: string | null = null;
+  /** The working directory's identity when there is no sandbox to keep it (an embedder): taken at its first use. */
+  #ownWorkdirRecord: string | null = null;
+  /** The change of the working directory last said (#workdirChanged): said once per change. */
+  #workdirChangeSaid: string | null = null;
   #requestDirectoryWaitMs: number | undefined;
   /** Started for unattended work: turns need an enforced sandbox (SessionCreateOptions.requireSandbox). */
   #requireSandbox = false;
@@ -3715,8 +3720,11 @@ export class Session {
     this.#sandbox?.checkWorktreeEntries();
     const before = this.#gitBaseline;
     if (!before) return Promise.all([commits, added]).then(() => {});
+    // In the working directory as pinned (#448 round 14): one swapped for a link is said, never looked into.
+    const workdir = this.#pinnedWorkdirOrSay("the look at the repository's git settings");
+    if (!workdir) return Promise.all([commits, added]).then(() => {});
     try {
-      const now = gitControlSnapshot(this.workdir, undefined, { ownFolders: this.#sandbox?.worktreeFolders() ?? [] });
+      const now = gitControlSnapshot(workdir.path, undefined, { ownFolders: this.#sandbox?.worktreeFolders() ?? [] });
       const changed = gitControlChanges(before, now);
       this.#gitBaseline = now;
       if (changed.length > 0) {
@@ -3783,9 +3791,12 @@ export class Session {
       const baseline = this.#refBaseline;
       if (!baseline) return;
       const before = await baseline;
-      const now = await refTips(this.workdir);
+      // In the working directory as pinned (#448 round 14): git never runs where a link put in its place leads.
+      const workdir = this.#pinnedWorkdirOrSay("the look at the session's commits");
+      if (!workdir) return;
+      const now = await refTips(workdir.path);
       if (now === null) return;
-      const found = before === null ? { commits: [], more: false } : await settingsCommits(this.workdir, before, now);
+      const found = before === null ? { commits: [], more: false } : await settingsCommits(workdir.path, before, now);
       if (found === null) return;
       this.#refBaseline = Promise.resolve(now);
       if (found.commits.length === 0) return;
@@ -4540,8 +4551,6 @@ export class Session {
     await this.ensureSandbox();
     // Directories added or removed since the backend started: it starts again in the sandbox that has them.
     await this.#restartForSandboxDirs();
-    // Its worktree folders, removed while empty at the last turn's end, are there again for this one's commands.
-    this.#sandbox?.prepareFolders();
     // A pinned directory changed since the last resolution (#448 round 13): looked at again now, so an added dir or a
     // root that changed is left out (said) before the turn; one that still is (the workspace) refuses it below.
     if (this.#sandbox?.info?.state === "on" && this.#sandbox.pinProblem() && this.#mayApplySandboxDirs()) {
@@ -4559,10 +4568,15 @@ export class Session {
       throw new SandboxRequiredError(`Not started: ${sandboxRefused}`);
     }
     this.#store.audit(sender.sub, "session.send", this.id);
-    // What of the repository git runs at the user's next command, as it is before the agent works (#448).
-    if (this.#sandbox && !this.#gitBaseline) this.#gitBaseline = gitControlSnapshot(this.workdir, undefined, { ownFolders: this.#sandbox.worktreeFolders() });
+    // Its worktree folders, removed while empty at the last turn's end, are there again for this one's commands: only
+    // once its directories are what was pinned (#448 round 14), and never made through a link (worktrees.ts).
+    this.#sandbox?.prepareFolders();
+    // What of the repository git runs at the user's next command, as it is before the agent works (#448), in the
+    // working directory as pinned (checked just above with the sandbox's pins).
+    const baselineDir = this.#sandbox && (!this.#gitBaseline || !this.#refBaseline) ? this.#pinnedWorkdirOrSay("the look at the repository's git settings") : null;
+    if (baselineDir && !this.#gitBaseline) this.#gitBaseline = gitControlSnapshot(baselineDir.path, undefined, { ownFolders: this.#sandbox?.worktreeFolders() ?? [] });
     // And the commits its refs name, so a commit made from here on can be told (#448 round 6).
-    if (this.#sandbox && !this.#refBaseline) this.#refBaseline = refTips(this.workdir);
+    if (baselineDir && !this.#refBaseline) this.#refBaseline = refTips(baselineDir.path);
     await this.#refBaseline;
     // The same for each added directory's repository, from the first turn it is writable in.
     // Every repository inside one too (a folder of them).
@@ -6502,7 +6516,9 @@ export class Session {
       const t0 = Date.now();
       try {
         await execFileP("sh", ["-c", command], {
-          cwd: this.workdir,
+          // In the fork's working directory as pinned (#448 round 14): changed meanwhile, the setup is refused (said).
+          // paths: the pinned workdir, checked here
+          cwd: this.pinnedWorkdir("running the fork's setup command").path,
           timeout: FORK_SETUP_TIMEOUT_MS,
           maxBuffer: 8 * 1024 * 1024,
         });
@@ -10330,6 +10346,68 @@ export class Session {
   }
 
   /**
+   * The working directory as the daemon uses it on the host (#448 round 14,
+   * sandbox/pinned.ts): its real path and identity, taken when the session
+   * first resolved its sandbox (kept with the setting) or, without one, at
+   * the first use. Checkpoints, going back a turn, a fork's files and the
+   * end-of-turn git looks take it from here, never by the path alone: one
+   * moved aside and replaced (by a link to the home, or another directory)
+   * is refused, said and audited ({@link #workdirChanged}), never followed.
+   */
+  #pinnedWorkdir(op: string): PinnedDir {
+    if (this.#sandbox) {
+      const pin = this.#sandbox.workdirPin(op);
+      if (this.#sandbox.takePinsChanged()) this.#saveMetaNow();
+      return pin;
+    }
+    this.#ownWorkdirRecord ??= pinRecord(this.workdir);
+    return pinDir(this.workdir, "the working directory", this.#ownWorkdirRecord, op);
+  }
+
+  /**
+   * The working directory as pinned, for a host-side use of it from outside
+   * the session (a client's file read, a fork's worktree and the files it
+   * carries, the project's MCP config): throws {@link PinnedPathError}, said
+   * on the session and audited, when it changed under the session.
+   */
+  pinnedWorkdir(op: string): PinnedDir {
+    try {
+      return this.#pinnedWorkdir(op);
+    } catch (err) {
+      if (err instanceof PinnedPathError) this.#workdirChanged(err);
+      throw err;
+    }
+  }
+
+  /**
+   * {@link #pinnedWorkdir}, or null when it changed: said on the session
+   * once per change (event `workdir.changed`) and audited
+   * (`session.workdir_changed`).
+   */
+  #pinnedWorkdirOrSay(op: string): PinnedDir | null {
+    try {
+      const pin = this.#pinnedWorkdir(op);
+      this.#workdirChangeSaid = null;
+      return pin;
+    } catch (err) {
+      if (!(err instanceof PinnedPathError)) throw err;
+      this.#workdirChanged(err);
+      return null;
+    }
+  }
+
+  /** A use of the working directory refused because it changed under the session: said once per change, audited every time. */
+  #workdirChanged(err: PinnedPathError): void {
+    this.#store.audit(SYSTEM_IDENTITY.sub, "session.workdir_changed", this.id, err.message.slice(0, 2000));
+    const said = `${err.path}: ${err.reason}`;
+    if (this.#workdirChangeSaid === said || this.#destroyed) return;
+    this.#workdirChangeSaid = said;
+    const note = this.#makeMessage("info", `⚠ ${err.message}.`, SYSTEM_IDENTITY, undefined, undefined, { event: "workdir.changed" });
+    this.#persistAndBuffer(note);
+    this.#broadcastRaw(note);
+  }
+
+  /**
    * Snapshot the workspace for `turnId` (see checkpoints.ts). Waits at most
    * `waitMs` (0 = don't wait) so a slow snapshot on a huge tree delays the
    * turn by a bounded amount; if the turn starts first, the snapshot is
@@ -10342,13 +10420,16 @@ export class Session {
   ): Promise<void> {
     if (!this.#checkpointsEnabled() || this.#destroyed) return;
     const cfg = this.#config?.session.checkpoints;
+    // Only of the working directory as pinned (#448 round 14): one an agent swapped for a link is never read.
+    const workdir = this.#pinnedWorkdirOrSay("a snapshot of the files");
+    if (!workdir) return;
     let started = false;
     // Serialized: a turn's start snapshot waits for the previous turn's end
     // snapshot (within its wait budget) instead of being skipped.
     const job = this.#checkpointChain.then(() =>
       createCheckpoint({
         root: this.#checkpointRoot,
-        workdir: this.workdir,
+        workdir,
         sessionId: this.id,
         turnId,
         // Late = the agent may have been editing while it was taken: for a
@@ -10362,6 +10443,8 @@ export class Session {
     ).then((r) => {
       if (!r.ok) {
         console.error(`[codeoid/session ${this.id.slice(0, 8)}] checkpoint skipped for turn ${turnId.slice(0, 8)}: ${r.reason}`);
+        // It changed while being read: said, as before it.
+        if (r.pinned) this.#pinnedWorkdirOrSay("a snapshot of the files");
       }
       return r;
     });
@@ -10550,19 +10633,27 @@ export class Session {
     checkpointId: string,
     opts: { asEndOf?: string; within?: string } = {},
   ): Promise<{ restored: number; removed: number }> {
-    // Only ever write inside the fork's own worktree, resolved — a symlinked
-    // folder must not carry the roll somewhere else.
+    // Only ever into the working directory as pinned (#448 round 14), never a
+    // link or another directory put in its place.
+    let workdir: PinnedDir;
+    try {
+      workdir = this.#pinnedWorkdir("putting a fork's files in place");
+    } catch (err) {
+      if (err instanceof PinnedPathError) this.#workdirChanged(err);
+      throw err;
+    }
+    // And only inside the fork's own worktree: the pinned path is real; the
+    // worktree is codeoid's own, just made, resolved once to compare.
     if (opts.within) {
-      const real = (p: string) => {
-        try {
-          return realpathSync(p);
-        } catch {
-          return null;
-        }
-      };
-      const root = real(opts.within);
-      const here = real(this.workdir);
-      if (!root || !here || (here !== root && !here.startsWith(`${root}/`))) {
+      let root: string | null = null;
+      try {
+        // paths: the fork's own worktree, just made by codeoid, resolved once to compare with the pinned workdir
+        root = realpathSync(opts.within);
+      } catch {
+        root = null;
+      }
+      const here = workdir.path;
+      if (!root || (here !== root && !here.startsWith(`${root}/`))) {
         throw new Error("this fork's folder isn't inside its own worktree");
       }
     }
@@ -10571,13 +10662,16 @@ export class Session {
       if (!rec) throw new Error("that snapshot isn't available to this session");
       const now = await currentTree({
         root: this.#checkpointRoot,
-        workdir: this.workdir,
+        workdir,
         sessionId: this.id,
         excludeDirs: this.#protectedDirs(),
         excludePaths: this.#setupPaths(),
         limits: this.#checkpointLimits(),
       });
-      if (!now.ok) throw new Error(now.reason);
+      if (!now.ok) {
+        if (now.pinned) this.#pinnedWorkdirOrSay("putting a fork's files in place");
+        throw new Error(now.reason);
+      }
       const changes = await diffTrees(this.#checkpointRoot, this.id, rec.sha, now.tree);
       if (changes.length === 0) return { restored: 0, removed: 0 };
       const protectedHit = changes.find((c) => this.#isProtectedPath(c.path));
@@ -10587,11 +10681,14 @@ export class Session {
       const kept = new Set(keep);
       await restoreTree({
         root: this.#checkpointRoot,
-        workdir: this.workdir,
+        workdir,
         sessionId: this.id,
         from: now.tree,
         to: rec.sha,
         ...(keep.length > 0 ? { keep } : {}),
+      }).catch((err) => {
+        if (err instanceof PinnedPathError) this.#workdirChanged(err);
+        throw err;
       });
       return {
         restored: changes.filter((c) => c.status !== "A" && !kept.has(c.path)).length,
@@ -10718,15 +10815,30 @@ export class Session {
     if (!start) {
       return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: "there is no snapshot of the files from when that turn started" };
     }
+    // The working directory as pinned (#448 round 14): one moved aside and replaced is never read or written.
+    let workdir: PinnedDir;
+    try {
+      workdir = this.#pinnedWorkdir("going back a turn");
+    } catch (err) {
+      if (!(err instanceof PinnedPathError)) throw err;
+      this.#workdirChanged(err);
+      throw new RewindError("restore_failed", `${err.message}. Nothing was changed.`);
+    }
     const now = await currentTree({
       root: this.#checkpointRoot,
-      workdir: this.workdir,
+      workdir,
       sessionId: this.id,
       excludeDirs: this.#protectedDirs(),
       excludePaths: this.#setupPaths(),
       limits: this.#checkpointLimits(),
     });
-    if (!now.ok) return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: `the current files couldn't be read: ${now.reason}` };
+    if (!now.ok) {
+      if (now.pinned) {
+        this.#pinnedWorkdirOrSay("going back a turn");
+        throw new RewindError("restore_failed", `${now.reason}. Nothing was changed.`);
+      }
+      return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: `the current files couldn't be read: ${now.reason}` };
+    }
     const changes = await diffTrees(this.#checkpointRoot, this.id, start.sha, now.tree);
 
     // Never delete a file the snapshot didn't hold because it was IGNORED
@@ -10744,14 +10856,15 @@ export class Session {
     // Paths left alone because something else occupies them now (reported).
     const skipped: string[] = [];
     for (const c of changes) {
-      // Never through a symlinked parent (git wouldn't either; say so).
-      if (await hasSymlinkedParent(this.workdir, c.path)) {
+      // Never through a symlinked parent (git wouldn't either; say so). Looks in the pinned directory just
+      // checked (read only); the restore checks it again.
+      if (await hasSymlinkedParent(workdir.path, c.path)) {
         keep.add(c.path);
         skipped.push(c.path);
         continue;
       }
       if (c.status === "A") continue;
-      if (c.status === "D" && (await existsOnDisk(this.workdir, c.path))) {
+      if (c.status === "D" && (await existsOnDisk(workdir.path, c.path))) {
         keep.add(c.path);
         skipped.push(c.path);
         continue;
@@ -10760,7 +10873,7 @@ export class Session {
       for (let k = 1; k < parts.length; k++) {
         const parent = parts.slice(0, k).join("/");
         if (createdSet.has(parent)) break;
-        if (await isNonDirectory(this.workdir, parent)) {
+        if (await isNonDirectory(workdir.path, parent)) {
           keep.add(c.path);
           skipped.push(c.path);
           break;
@@ -10893,10 +11006,12 @@ export class Session {
       const protectedHit = plan_.fileChanges.find((c) => this.#isProtectedPath(c.path));
       if (protectedHit) throw new RewindError("restore_failed", `refusing to restore a path in codeoid's own data: ${protectedHit.path}`);
       try {
+        // Into the working directory as pinned (#448 round 14), checked again before and after the write.
+        const workdir = this.#pinnedWorkdir("going back a turn");
         await this.#serializedCheckpointOp(() =>
           restoreTree({
             root: this.#checkpointRoot,
-            workdir: this.workdir,
+            workdir,
             sessionId: this.id,
             from: plan_.currentTreeSha!,
             to: plan_.checkpointSha!,
@@ -10904,6 +11019,7 @@ export class Session {
           }),
         );
       } catch (err) {
+        if (err instanceof PinnedPathError) this.#workdirChanged(err);
         this.#auditRewind(sender, turnId, plan_, `failed: ${err instanceof Error ? err.message : String(err)}`, opts.force);
         throw new RewindError("restore_failed", `The files couldn't be restored: ${err instanceof Error ? err.message : String(err)}. ${wasBusy ? "The running turn was stopped; the conversation was not changed." : "Nothing was changed."}`);
       }

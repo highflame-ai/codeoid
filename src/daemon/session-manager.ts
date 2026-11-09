@@ -140,6 +140,7 @@ import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./m
 import type { McpRegistry } from "./mcp/registry.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
 import { canonicalAddedDirs, effectiveSetting, openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { checkPinned, type PinnedDir, PinnedPathError } from "./sandbox/pinned.js";
 import { sandboxRootIfMade } from "./sandbox/root.js";
 import { hiddenPathsFor, sandboxConfigOf } from "./sandbox/policy.js";
 import { redactCommand } from "./skill-command.js";
@@ -1859,7 +1860,7 @@ mcpHub: this.#mcpHub,
       };
     }
     try {
-      const snapshot = await readClaudeConfig(session.workdir);
+      const snapshot = await readClaudeConfig(session.pinnedWorkdir("reading the project's MCP config").path);
       // Read for the drawer only — what a session applies changes on its first
       // turn or a refresh. Freshly, before the rows: a row and its fingerprint
       // are of the files as they are now.
@@ -3618,7 +3619,8 @@ mcpHub: this.#mcpHub,
     }
     if (session.filesPending) return this.#stillPreparing(msg.id);
     try {
-      return await handleFsRead(msg, session.workdir);
+      // In the working directory as pinned (#448 round 14): one swapped for a link is never read through.
+      return await handleFsRead(msg, session.pinnedWorkdir("reading a file for a client").path);
     } catch (err) {
       return this.#fsErr(msg.id, err);
     }
@@ -5139,21 +5141,30 @@ mcpHub: this.#mcpHub,
       if (branch) worktree = { path: bound, branch, createdByCodeoid: false };
     } else if (msg.isolate !== false || msg.baseBranch) {
       // baseBranch implies isolation (a base needs its own worktree).
-      if (await isGitRepo(parent.workdir)) {
+      // The parent's working directory as pinned (#448 round 14): its files are what the fork carries, never what a
+      // link put in its place leads to; checked again once the worktree is made.
+      let parentPin: PinnedDir;
+      try {
+        parentPin = parent.pinnedWorkdir("forking it");
+      } catch (err) {
+        if (!(err instanceof PinnedPathError)) throw err;
+        return { type: "response.error", requestId: msg.id, error: err.message, code: "invalid_request" };
+      }
+      if (await isGitRepo(parentPin.path)) {
         try {
           // From an earlier turn: start the worktree at the commit the repo
           // was on then (recorded with the snapshot), so git history matches
           // the files rolled in below; make sure the parent's subdirectory
           // exists so the snapshot lands where it belongs.
           let rollHead = point?.files && "checkpointId" in point.files ? point.files.head : undefined;
-          recipe = await loadSetupRecipe(parent.workdir);
+          recipe = await loadSetupRecipe(parentPin.path);
           // Whether the command can run at all is known only once the base
           // commit is checked out (commandGate): create clean whenever a
           // trusted recipe has one, then decide.
           const mayRun = !!recipe && !("error" in recipe) && !!recipe.recipe.command && commandRefusal(policy, recipe.root, recipe.recipeHash, auth.sub) === null;
           const make = (baseCommit?: string) =>
             createForkWorktree({
-              workdir: parent.workdir,
+              workdir: parentPin.path,
               label: msg.name ?? parentInfo.name,
               shortId: worktreeShortId,
               ...(msg.baseBranch ? { baseBranch: msg.baseBranch } : {}),
@@ -5170,6 +5181,7 @@ mcpHub: this.#mcpHub,
             headGone = true;
             return make();
           });
+          checkPinned(parentPin, "forking it");
           // Fork runs in the parent's equivalent subdir of the worktree; the
           // worktree ROOT (wt.path) is what we remove on destroy.
           // Same checks as any session's workdir (safe-root, protected dirs),
@@ -8080,7 +8092,14 @@ mcpHub: this.#mcpHub,
     );
     if (badModel) return refuse(`Model "${badModel.model}" isn't available on ${badModel.providerId}`);
     // Agents sharing one folder would edit each other's files.
-    if (!(await isGitRepo(parent.workdir))) {
+    let parentDir: string;
+    try {
+      parentDir = parent.pinnedWorkdir("comparing backends from it").path;
+    } catch (err) {
+      if (!(err instanceof PinnedPathError)) throw err;
+      return refuse(err.message);
+    }
+    if (!(await isGitRepo(parentDir))) {
       return refuse("Compare needs a git repository: each branch runs in its own worktree, so they can't edit each other's files.");
     }
     const label = (t: { providerId: string; model?: string }) => `${t.providerId}${t.model ? `:${t.model}` : ""}`;
@@ -9301,7 +9320,13 @@ mcpHub: this.#mcpHub,
     }
     const session = this.#getOwnedSession(msg.sessionId, auth);
     if (!session) return fail("Session not found", "not_found");
-    const read = await readWorkdirServers(session.workdir);
+    let pinned: string;
+    try {
+      pinned = session.pinnedWorkdir("reading the project's MCP config").path;
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+    const read = await readWorkdirServers(pinned);
     if (!read) return fail("Claude's config can't be read just now (it may be mid-write) — try again");
     if (read.repoUnreadable) return fail("The project's .mcp.json can't be read just now (mid-edit, not JSON, or too big) — try again once it can");
     const repo = read.servers.filter((w) => w.origin === "claude-repo" && w.name === msg.server && (msg.path === undefined || w.path === msg.path));
@@ -9370,7 +9395,13 @@ mcpHub: this.#mcpHub,
     }
     const session = this.#getOwnedSession(msg.sessionId, auth);
     if (!session) return fail("Session not found", "not_found");
-    const read = await readWorkdirServers(session.workdir);
+    let pinned: string;
+    try {
+      pinned = session.pinnedWorkdir("reading the project's MCP config").path;
+    } catch (err) {
+      return fail(err instanceof Error ? err.message : String(err));
+    }
+    const read = await readWorkdirServers(pinned);
     if (!read) return fail("Claude's config can't be read just now (it may be mid-write) — try again");
     if (read.repoUnreadable) return fail("The project's .mcp.json can't be read just now (mid-edit, not JSON, or too big) — try again once it can");
     const repo = read.servers.filter(

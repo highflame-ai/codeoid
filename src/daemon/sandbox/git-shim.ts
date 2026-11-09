@@ -42,7 +42,7 @@ import { chmodSync, lstatSync, mkdirSync, renameSync, writeFileSync } from "node
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { BASE_OVERRIDES, GIT_BIN, PROGRAM_ENV, REMOTE_PROTOCOLS } from "../git-env.js";
 import { GIT_CONTROL, gitLayoutOf, programLocations } from "./policy.js";
-import { pinOf } from "./pinned.js";
+import { makeAt, pinOf } from "./pinned.js";
 import type { SandboxSpec } from "./types.js";
 
 /** The empty tree's id: `attr.tree` naming it reads no attributes from the working tree (git ≥ 2.46; an older git ignores the key). */
@@ -158,7 +158,8 @@ export function cliWorktrees(workspace: string, home?: string): GitShimWorktrees
   if (dirname(resolve(layout.dotgit)) === ws && realDir(claude)) {
     const checkouts = join(claude, "worktrees");
     try {
-      mkdirSync(checkouts, { mode: 0o755 });
+      // Never through a link (pinned.ts: `.claude` pinned for the make, checked again after; #448 round 14).
+      makeAt(checkouts, "dir", "making the CLI's worktree dir");
     } catch {
       /* there already (or can't be: then not opened) */
     }

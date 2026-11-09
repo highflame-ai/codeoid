@@ -30,9 +30,10 @@
  * its own output, like the workspace.
  */
 
-import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
+import { makeAt } from "./pinned.js";
 import type { GitLayout } from "./policy.js";
 
 function within(child: string, parent: string): boolean {
@@ -289,7 +290,8 @@ export function worktreeFoldersOf(
   const mk = (p: string): void => {
     if (!make) return;
     try {
-      mkdirSync(p, { mode: 0o755 });
+      // Never through a link (pinned.ts: its parent pinned for the make, checked again after; #448 round 14).
+      makeAt(p, "dir", "making a worktree folder");
     } catch {
       /* there already, or can't be made: then only an existing one is used */
     }
