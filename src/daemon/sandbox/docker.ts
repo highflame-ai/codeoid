@@ -166,10 +166,14 @@ export function dockerRunArgs(spec: SandboxSpec, argv: readonly string[], o: Doc
   }
   // Every dir between a mounted writable root and a hidden path in it: a mount point (no rename), still writable (Docker mounts parents first).
   const hiddenAt = spec.hidden.map(realOr);
+  const writableAt = [workspace, ...spec.writable.map(realOr)];
   for (const p of [...(spec.pinned ?? []), ...(spec.heldInPlace ?? [])]) {
     const at = realOr(p);
-    // Never one a hidden path covers (or is): its mount would show the real dir again.
-    if (kind(at) === "dir" && inMounted(at) && !hiddenAt.some((h) => within(at, h))) bind(at, at, false);
+    // Never one a hidden path in its writable root covers (or is): its mount would show the real dir again. One in a
+    // hidden dir the root is mounted from (the hidden home holding the workspace) is the root's: mounted (#448
+    // round 14, as bubblewrap's since round 13).
+    const holder = writableAt.filter((w) => within(at, w)).sort((x, y) => y.length - x.length)[0];
+    if (kind(at) === "dir" && inMounted(at) && !hiddenAt.some((h) => within(at, h) && (!holder || (within(h, holder) && h !== holder)))) bind(at, at, false);
   }
   // A hidden path inside something mounted is covered again.
   for (const h of [...spec.hidden, ...spec.containerSockets, ...(spec.serviceSockets ?? [])]) {

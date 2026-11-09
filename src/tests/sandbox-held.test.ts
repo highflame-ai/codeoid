@@ -9,7 +9,11 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { bwrapArgs } from "../daemon/sandbox/bwrap.js";
+import { claudeSandboxSettings } from "../daemon/sandbox/claude-native.js";
+import { dockerRunArgs } from "../daemon/sandbox/docker.js";
 import { buildSandboxSpec } from "../daemon/sandbox/policy.js";
+import { seatbeltProfile } from "../daemon/sandbox/seatbelt.js";
 
 const made: string[] = [];
 function scratch(): string {
@@ -42,5 +46,32 @@ describe("every path a spec binds is pinned; the working directory and its way u
     expect(spec.heldInPlace).toEqual(expect.arrayContaining([pkg, join(top, "packages")]));
     // Every path a provider binds by name (but the hidden list, the home's allowlist, sockets) is one of them.
     for (const p of [spec.workspace, spec.tempDir, ...spec.writable, ...(spec.readOnly ?? []), ...(spec.pinned ?? []), ...(spec.heldInPlace ?? [])]) expect(byPath.has(p)).toBe(true);
+  });
+
+  test("every provider holds them in place: bubblewrap and Docker bind each at its own path (writable), Seatbelt denies writing the dir itself; Claude's sandbox doesn't deny them (its CLI binds them)", () => {
+    const d = scratch();
+    const home = join(d, "home");
+    const top = join(home, "W", "mono");
+    const pkg = join(top, "packages", "app");
+    mkdirSync(pkg, { recursive: true });
+    Bun.spawnSync(["git", "init", "-q"], { cwd: top });
+    const tmp = join(d, "tmp");
+    mkdirSync(tmp);
+    const spec = buildSandboxSpec({ sessionId: "s", workspace: top, workdir: pkg, tempDir: tmp, network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" }, cache: false });
+    const held = [pkg, join(top, "packages")];
+    expect(spec.heldInPlace).toEqual(expect.arrayContaining(held));
+    const bw = bwrapArgs(spec, pkg).join(" ");
+    for (const h of held) expect(bw).toContain(`--bind ${h} ${h}`);
+    const docker = dockerRunArgs(spec, ["true"], { image: "x", cwd: pkg, envNames: [], uid: 1, gid: 1 }).join(" ");
+    for (const h of held) expect(docker).toContain(`source=${h},target=${h}`);
+    const sb = seatbeltProfile(spec, { isDir: () => true });
+    const names = Object.entries(sb.params);
+    for (const h of held) {
+      const name = names.find(([, v]) => v === h)?.[0];
+      expect(name).toBeDefined();
+      expect(sb.profile).toContain(`(deny file-write* (literal (param "${name}")))`);
+    }
+    const native = claudeSandboxSettings({ spec, config: { bwrapPath: undefined } } as never, { HOME: home });
+    for (const h of held) expect(native.filesystem?.denyWrite).not.toContain(h);
   });
 });
