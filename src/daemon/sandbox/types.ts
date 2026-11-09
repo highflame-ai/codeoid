@@ -19,6 +19,7 @@
  */
 
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import type { PathPin } from "./pins.js";
 
 /** How strong the boundary is: OS namespaces/profiles, a separate kernel (gVisor), a VM. */
 export type IsolationTier = "os" | "kernel" | "hardware";
@@ -141,6 +142,15 @@ export interface SandboxSpec {
    * write (Codex's writable roots).
    */
   addedDirs?: readonly string[];
+  /**
+   * The directories bound by name (the workspace, the working directory,
+   * added directories, project roots, worktree folders), each with what it
+   * was when the spec was built (pins.ts, #448 round 13): checked again at
+   * every launch, which is refused when one is reached through a link or is
+   * another directory now. A provider binds each by this path, never by
+   * where it leads.
+   */
+  pins?: readonly PathPin[];
   /** Container runtime sockets (and their dirs): never reachable, they are root-equivalent. */
   containerSockets: readonly string[];
   /**

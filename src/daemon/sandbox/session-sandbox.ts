@@ -38,6 +38,7 @@ import {
   stillRealDir,
 } from "./project-roots.js";
 import { ENTRY_GRACE_MS, WorktreeEntryGuard, type WorktreeEntryFinding } from "./worktree-entries.js";
+import { pinProblem, pinRecord, pinRefusal, pinsProblem, SandboxPinError, unguardedArgv } from "./pins.js";
 import { existingFolderName, mainCheckoutOf, sessionFolderName, worktreeFoldersOf, worktreeLocationDirs, worktreeRootNotes } from "./worktrees.js";
 import type { SandboxRegistry } from "./registry.js";
 import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "./git-shim.js";
@@ -177,29 +178,58 @@ export function effectiveSetting(config: SandboxConfig, setting: SessionSandboxS
 
 /**
  * `setting` with each added directory `before` didn't have kept by where it
- * really is now, when it is granted (project-roots.ts `addedDirReal`): what
- * is bound is that directory, never where a link there leads later. One
- * already kept stays as it was (a link put there since is dropped at the
- * next build, never followed).
+ * really is now, when it is granted (project-roots.ts `addedDirReal`), and
+ * pinned there (pins.ts: what it is, `dev:ino`): what is bound is that
+ * directory, never where a link there leads later, nor another one put in
+ * its place. One already kept stays as it was (a link put there since is
+ * dropped at the next build, never followed). An added dir inside another
+ * one isn't kept twice (the outer holds it).
  */
 export function canonicalAddedDirs(setting: SessionSandboxSetting, before?: SessionSandboxSetting): SessionSandboxSetting {
   if (!setting.addedDirs) return setting;
   const had = new Set(before?.addedDirs ?? []);
-  const dirs = setting.addedDirs.map((d) => (had.has(d) ? d : (addedDirReal(d) ?? d)));
-  return { ...setting, addedDirs: [...new Set(dirs)] };
+  const unique = [...new Set(setting.addedDirs.map((d) => (had.has(d) ? d : (addedDirReal(d) ?? d))))];
+  const inside = (d: string, o: string) => d !== o && d.startsWith(o.endsWith("/") ? o : `${o}/`);
+  const dirs = unique.filter((d) => !unique.some((o) => inside(d, o)));
+  const ids: Record<string, string> = { ...(setting.pins?.ids ?? before?.pins?.ids ?? {}) };
+  // A dir no longer added has no pin; one granted now is pinned as it is now (a grant again is a grant anew).
+  for (const d of before?.addedDirs ?? []) if (!dirs.includes(d)) delete ids[d];
+  for (const d of dirs) {
+    if (had.has(d)) continue;
+    const record = pinRecord(d);
+    if (record) ids[d] = record;
+    else delete ids[d];
+  }
+  const { pins: _p, ...rest } = setting;
+  const pins = setting.pins ?? before?.pins;
+  return {
+    ...rest,
+    addedDirs: dirs,
+    ...(Object.keys(ids).length > 0 || pins ? { pins: { ...(pins ?? {}), ids } } : {}),
+  };
 }
 
 /** The setting's fields that only say which directories are readable or writable: a change to them alone is applied between turns, never restarting work (SessionSandbox.set). */
 const DIR_FIELDS = ["projectRoots", "addedDirs"] as const;
 
 function withoutDirs(setting: SessionSandboxSetting | undefined): string {
-  const { projectRoots: _r, addedDirs: _a, ...rest } = setting ?? {};
+  // `pins` is what the daemon keeps of the directories, not a choice: no change of it is one of the setting.
+  const { projectRoots: _r, addedDirs: _a, pins: _p, ...rest } = setting ?? {};
   return JSON.stringify(Object.entries(rest).sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function dirsChanged(before: SessionSandboxSetting | undefined, after: SessionSandboxSetting | undefined): boolean {
+  return DIR_FIELDS.some((k) => JSON.stringify(before?.[k] ?? null) !== JSON.stringify(after?.[k] ?? null));
 }
 
 /** Whether `before` → `after` changes only the readable roots or the added directories. */
 export function onlyDirsChanged(before: SessionSandboxSetting | undefined, after: SessionSandboxSetting | undefined): boolean {
-  return withoutDirs(before) === withoutDirs(after) && DIR_FIELDS.some((k) => JSON.stringify(before?.[k] ?? null) !== JSON.stringify(after?.[k] ?? null));
+  return withoutDirs(before) === withoutDirs(after) && dirsChanged(before, after);
+}
+
+/** Whether `before` → `after` changes nothing but what the daemon keeps of the directories (their pins). */
+function sameSetting(before: SessionSandboxSetting | undefined, after: SessionSandboxSetting | undefined): boolean {
+  return withoutDirs(before) === withoutDirs(after) && !dirsChanged(before, after);
 }
 
 /** A setting in words, for a change's line and audit: "bwrap, network on, Docker access". */
@@ -272,23 +302,41 @@ export function workspaceProblem(workspace: string): string | null {
 export const HOME_WORKSPACE_NOTE =
   "the workspace is your home: commands can read and write all of it but what the sandbox hides (credential stores, the agents' logins, codeoid's own dirs) — only credentials are protected";
 
+/** What {@link sandboxDirsOf} gives back. */
+export interface SandboxDirs {
+  roots: string[];
+  added: string[];
+  notes: string[];
+  homeWorkspace: boolean;
+  dropped: Array<{ dir: string; why: string }>;
+  /** Pins taken now (pins.ts), by real path: a root or added dir seen for the first time. */
+  pinned: Record<string, string>;
+}
+
 /**
  * A session's project roots and added directories for its sandbox's
  * workspace `top` (project-roots.ts): what is used, and what isn't and why.
  * An added dir inside the workspace is dropped (writable already); one that
  * is no longer a directory at the real path it was granted at (a link put
- * there, removed), or can't be one now, is `dropped`, said. A root too big
- * to look through for credential files isn't used, said, and so is a
- * repository there whose git config is hidden for the credential in it.
+ * there, removed), another directory than the one pinned there
+ * (`opts.pins`, pins.ts), or can't be one now, is `dropped`, said. A root
+ * the same, or too big to look through for credential files, isn't used,
+ * said, and so is a repository there whose git config is hidden for the
+ * credential in it (never the session's own repository's). A root or added
+ * dir with no pin is pinned now (`pinned`). The agent's own added dirs
+ * (`opts.agentDirs`) keep a root's credential hiding.
  */
 export function sandboxDirsOf(
   top: string,
   rootEntries: readonly string[],
   addedDirs: readonly string[],
   config?: CodeoidConfig,
-): { roots: string[]; added: string[]; notes: string[]; homeWorkspace: boolean; dropped: Array<{ dir: string; why: string }> } {
+  opts: { pins?: Readonly<Record<string, string>> } = {},
+): SandboxDirs {
   const home = resolve(process.env.HOME ?? homedir());
   const configDir = getConfigDir();
+  const pins = opts.pins ?? {};
+  const pinned: Record<string, string> = {};
   const homeWorkspace = resolve(top) === home;
   const r = resolveProjectRoots(rootEntries, top, { home, configDir });
   const notes = [...(homeWorkspace ? [HOME_WORKSPACE_NOTE] : []), ...(homeWorkspace ? [] : r.notes)];
@@ -297,15 +345,38 @@ export function sandboxDirsOf(
   const dropped: Array<{ dir: string; why: string }> = [];
   for (const d of addedDirs) {
     if (resolve(d) === resolve(top) || resolve(d).startsWith(`${resolve(top)}/`)) continue;
-    const problem = stillRealDir(d)
-      ? addedDirProblem(d, { home, configDir, hidden })
-      : `it is no longer the directory it was when added (${linkInPath(d) ? `${linkInPath(d)} is a symbolic link now` : "removed, or not a directory"})`;
+    const stored = pins[resolve(d)];
+    const changed = stored ? pinProblem(d, "it", { stored }) : null;
+    const problem = changed
+      ? `it is no longer the directory it was when added: ${changed.replace(/^it \S+ /, "it ")}`
+      : stillRealDir(d)
+        ? addedDirProblem(d, { home, configDir, hidden })
+        : `it is no longer the directory it was when added (${linkInPath(d) ? `${linkInPath(d)} is a symbolic link now` : "removed, or not a directory"})`;
     if (problem) {
       notes.push(`added directory ${d}: ${problem}: not writable`);
       dropped.push({ dir: d, why: problem });
-    } else added.push(resolve(d));
+      continue;
+    }
+    added.push(resolve(d));
+    if (!stored) {
+      const record = pinRecord(d);
+      if (record) pinned[resolve(d)] = record;
+    }
   }
-  let roots = homeWorkspace ? [] : r.roots;
+  let roots: string[] = [];
+  for (const root of homeWorkspace ? [] : r.roots) {
+    const stored = pins[root];
+    const changed = stored ? pinProblem(root, "project root", { stored }) : null;
+    if (changed) {
+      notes.push(`${changed}: not used — set the session's project roots again to use it as it is now`);
+      continue;
+    }
+    roots.push(root);
+    if (!stored) {
+      const record = pinRecord(root);
+      if (record) pinned[root] = record;
+    }
+  }
   if (roots.length > 0) {
     const secrets = projectRootSecrets(roots, [top, ...added]);
     for (const over of secrets.over) {
@@ -319,7 +390,7 @@ export function sandboxDirsOf(
     }
     if (secrets.gitConfigs.length > 5) notes.push(`and ${secrets.gitConfigs.length - 5} more repositories' git configs holding a credential: hidden`);
   }
-  return { roots, added, notes, homeWorkspace, dropped };
+  return { roots, added, notes, homeWorkspace, dropped, pinned };
 }
 
 /** The repositories an added dir holds besides its own (a folder of them): the end-of-turn git look covers each. */
@@ -337,7 +408,17 @@ export async function resolveSandbox(opts: {
   workspace?: string;
   /** The daemon's whole config: what an added directory may not be in (its data dirs: policy.ts `hiddenPathsFor`). */
   codeoidConfig?: CodeoidConfig;
-}): Promise<{ info: SessionSandboxInfo; provider: SandboxProvider | null; plan: ConfinementPlan | null; network: NetworkPolicy; droppedDirs?: Array<{ dir: string; why: string }> }> {
+  /** The sandbox's workspace as pinned for the session (default: the workspace's, policy.ts `sandboxWorkspaceOf`). */
+  top?: string;
+}): Promise<{
+  info: SessionSandboxInfo;
+  provider: SandboxProvider | null;
+  plan: ConfinementPlan | null;
+  network: NetworkPolicy;
+  droppedDirs?: Array<{ dir: string; why: string }>;
+  /** Roots and added dirs pinned by this resolution (sandboxDirsOf). */
+  pinned?: Record<string, string>;
+}> {
   const { choice, network, dockerSocket, projectRoots, addedDirs } = effectiveSetting(opts.config, opts.setting);
   const base = {
     choice,
@@ -367,7 +448,7 @@ export async function resolveSandbox(opts: {
   // A repository whose `.git` names a git dir codeoid can't verify: held read-only, said (policy.ts gitWorkspacePaths).
   const gitNote = opts.workspace !== undefined && c.plan.kind !== "no-shell" ? gitLayoutProblem(opts.workspace) : null;
   // A monorepo's package: what its commands may write is the whole repository (#448 round 9).
-  const top = opts.workspace !== undefined && c.plan.kind !== "no-shell" ? sandboxWorkspaceOf(opts.workspace) : null;
+  const top = opts.workspace !== undefined && c.plan.kind !== "no-shell" ? (opts.top ?? sandboxWorkspaceOf(opts.workspace)) : null;
   const topNote = top && opts.workspace !== undefined && top !== resolve(opts.workspace) ? `the workspace is the repository's top (${top}), which the working directory is inside: all of it is readable and writable, its git structure and every project settings dir on the way held read-only` : null;
   // The container runtime's socket, when the owner let it in: said, and said when there is none to reach.
   const home = process.env.HOME ?? homedir();
@@ -386,7 +467,10 @@ export async function resolveSandbox(opts: {
   const layout = top !== null && opts.config.worktreeRoots.length > 0 ? gitLayoutOf(top) : null;
   const rootNotes = layout ? worktreeRootNotes(layout, { roots: opts.config.worktreeRoots, configDir: getConfigDir() }) : [];
   // Working across repositories: the project roots it reads, the directories it writes besides its workspace.
-  const dirs = top !== null ? sandboxDirsOf(top, projectRoots, addedDirs, opts.codeoidConfig) : { roots: [], added: [], notes: [], homeWorkspace: false, dropped: [] };
+  const dirs: SandboxDirs =
+    top !== null
+      ? sandboxDirsOf(top, projectRoots, addedDirs, opts.codeoidConfig, { ...(opts.setting?.pins ? { pins: opts.setting.pins.ids } : {}) })
+      : { roots: [], added: [], notes: [], homeWorkspace: false, dropped: [], pinned: {} };
   const limits = [...c.plan.limits, ...(net.note ? [net.note] : []), ...(gitNote ? [gitNote] : []), ...(topNote ? [topNote] : []), ...(dockerNote ? [dockerNote] : []), ...rootNotes, ...dirs.notes];
   const applied: NetworkPolicy = net.mode === "allowlist" ? network : { mode: net.mode };
   return {
@@ -410,6 +494,7 @@ export async function resolveSandbox(opts: {
     plan: c.plan,
     network: applied,
     ...(dirs.dropped.length > 0 ? { droppedDirs: dirs.dropped } : {}),
+    ...(Object.keys(dirs.pinned).length > 0 ? { pinned: dirs.pinned } : {}),
   };
 }
 
@@ -450,6 +535,10 @@ export class SessionSandbox {
   #droppedDirs: Array<{ dir: string; why: string }> = [];
   /** The setting's directories changed since the last resolution, nothing else (applied between turns: Session). */
   #dirsStale = false;
+  /** A pinned directory was found changed (pinProblem): the next resolution between turns looks at them again. */
+  #pinsBroken = false;
+  /** Pins were taken since the setting was last saved (takePinsChanged). */
+  #pinsChanged = false;
   /** The spec last built for the session: what its commands can write, for the entries' look. */
   #lastSpec: SandboxSpec | null = null;
   #entriesRecheck: ReturnType<typeof setTimeout> | null = null;
@@ -532,13 +621,91 @@ export class SessionSandbox {
    * backend is torn down (Session restarts it, idle: a running turn is never
    * cut off by a change of setting) or the session closes.
    */
-  async set(setting: SessionSandboxSetting | undefined): Promise<void> {
-    const next = setting && Object.keys(setting).length > 0 ? canonicalAddedDirs({ ...setting }, this.#setting) : undefined;
-    // Only which directories are read or written: the runtime stands until Session applies it between turns.
-    if (onlyDirsChanged(this.#setting, next) && !this.#stale) this.#dirsStale = true;
-    else this.#stale = true;
+  async set(setting: SessionSandboxSetting | undefined, opts: { repinRoots?: boolean } = {}): Promise<void> {
+    let next = setting && Object.keys(setting).length > 0 ? canonicalAddedDirs({ ...setting }, this.#setting) : undefined;
+    // The project roots set again (the owner's own): each pinned anew at the next resolution, as it is then.
+    if (opts.repinRoots && next?.pins) {
+      const keep = new Set([...(next.addedDirs ?? []), ...(next.pins.workspace ? [next.pins.workspace] : [])]);
+      next = { ...next, pins: { ...next.pins, ids: Object.fromEntries(Object.entries(next.pins.ids).filter(([k]) => keep.has(k))) } };
+    }
+    if (sameSetting(this.#setting, next)) {
+      if (opts.repinRoots) this.#dirsStale = true;
+    } else if (onlyDirsChanged(this.#setting, next) && !this.#stale) {
+      // Only which directories are read or written: the runtime stands until Session applies it between turns.
+      this.#dirsStale = true;
+    } else this.#stale = true;
     this.#setting = next;
     this.#generation += 1;
+  }
+
+  /** Whether pins were taken (or let go) since the last call: the setting holding them is saved then (Session). */
+  takePinsChanged(): boolean {
+    const changed = this.#pinsChanged;
+    this.#pinsChanged = false;
+    return changed;
+  }
+
+  /**
+   * The sandbox's workspace: the one pinned for this working directory (the
+   * repository's top in a monorepo, found once), else as found now.
+   */
+  #workspace(): string {
+    const pins = this.#setting?.pins;
+    if (pins?.workspace && pins.workdir === resolve(this.#workdir)) return pins.workspace;
+    return sandboxWorkspaceOf(this.#workdir);
+  }
+
+  /** The sandbox's workspace (the repository's top in a monorepo), as pinned for the session. */
+  get workspace(): string {
+    return this.#workspace();
+  }
+
+  /** Pin the workspace when it isn't (a new session, or one from before pins): as it is now, at its real path. */
+  #pinWorkspace(): void {
+    const pins = this.#setting?.pins;
+    const workdir = resolve(this.#workdir);
+    if (pins?.workspace && pins.workdir === workdir) return;
+    const workspace = sandboxWorkspaceOf(workdir);
+    const record = pinRecord(workspace);
+    if (!record) return;
+    const ids = { ...(pins?.ids ?? {}) };
+    if (pins?.workspace && pins.workspace !== workspace) delete ids[pins.workspace];
+    ids[workspace] = record;
+    this.#setting = { ...(this.#setting ?? {}), pins: { workdir, workspace, ids } };
+    this.#pinsChanged = true;
+  }
+
+  /** Keep what a resolution pinned (roots, added dirs seen for the first time). */
+  #keepPins(pinned: Record<string, string> | undefined): void {
+    if (!pinned || Object.keys(pinned).length === 0 || this.#closed) return;
+    const pins = this.#setting?.pins ?? { ids: {} };
+    this.#setting = { ...(this.#setting ?? {}), pins: { ...pins, ids: { ...pins.ids, ...pinned } } };
+    this.#pinsChanged = true;
+  }
+
+  /**
+   * Why the running sandbox's directories aren't what was pinned (the
+   * workspace, the working directory, an added dir, a project root, a
+   * worktree folder: pins.ts), in the sentence a refused call carries, or
+   * null. Asked at the gate before every tool call: what has changed is
+   * never run against, and is looked at again at the next resolution
+   * between turns (an added dir or root changed is left out then, said; a
+   * workspace changed keeps every call refused until it is put back).
+   */
+  pinProblem(): string | null {
+    if (this.#closed || !this.#runtime) return null;
+    const ids = this.#setting?.pins?.ids ?? {};
+    const workspace = this.#workspace();
+    const workdir = resolve(this.#workdir);
+    const problem =
+      pinProblem(workspace, "the workspace", { ...(ids[workspace] ? { stored: ids[workspace] } : { mayBeMissing: true }) }) ??
+      (workdir !== workspace ? pinProblem(workdir, "the working directory", { mayBeMissing: true }) : null) ??
+      this.#dirs.added.map((d) => pinProblem(d, "added directory", ids[d] ? { stored: ids[d] } : {})).find((p) => p !== null) ??
+      this.#dirs.roots.map((r) => pinProblem(r, "project root", ids[r] ? { stored: ids[r] } : {})).find((p) => p !== null) ??
+      pinsProblem((this.#lastSpec?.pins ?? []).filter((p) => p.what === "worktree folder"));
+    if (!problem) return null;
+    this.#pinsBroken = true;
+    return pinRefusal(problem);
   }
 
   /**
@@ -548,7 +715,7 @@ export class SessionSandbox {
    * rebuilt mid-work would end it; a process backend is restarted).
    */
   get dirsPending(): boolean {
-    return this.#dirsStale;
+    return this.#dirsStale || this.#pinsBroken;
   }
 
   /** The added directories the running sandbox has (SandboxSpec.addedDirs as resolved): what host-side file tools are held to. */
@@ -576,8 +743,10 @@ export class SessionSandbox {
     const gone = new Set(dirs.map((d) => resolve(d)));
     const kept = this.#setting.addedDirs.filter((d) => !gone.has(resolve(normalizeSandboxDir(d) ?? d)));
     if (kept.length === this.#setting.addedDirs.length) return;
-    const { addedDirs: _old, ...rest } = this.#setting;
-    this.#setting = kept.length > 0 ? { ...rest, addedDirs: kept } : Object.keys(rest).length > 0 ? rest : undefined;
+    const { addedDirs: _old, pins, ...rest } = this.#setting;
+    const ids = Object.fromEntries(Object.entries(pins?.ids ?? {}).filter(([k]) => !gone.has(k)));
+    const base: SessionSandboxSetting = { ...rest, ...(pins ? { pins: { ...pins, ids } } : {}) };
+    this.#setting = kept.length > 0 ? { ...base, addedDirs: kept } : Object.keys(base).length > 0 ? base : undefined;
     this.#droppedDirs = this.#droppedDirs.filter((d) => !gone.has(resolve(d.dir)));
   }
 
@@ -606,9 +775,20 @@ export class SessionSandbox {
     let r: Awaited<ReturnType<typeof resolveSandbox>>;
     for (;;) {
       const generation = this.#generation;
-      r = await resolveSandbox({ registry: this.#registry, config: this.config, setting: this.#setting, backendId, workspace: this.#workdir, ...(this.#config ? { codeoidConfig: this.#config } : {}) });
+      this.#pinWorkspace();
+      r = await resolveSandbox({
+        registry: this.#registry,
+        config: this.config,
+        setting: this.#setting,
+        backendId,
+        workspace: this.#workdir,
+        top: this.#workspace(),
+        ...(this.#config ? { codeoidConfig: this.#config } : {}),
+      });
       if (generation === this.#generation) break;
     }
+    this.#keepPins(r.pinned);
+    this.#pinsBroken = false;
     if (this.#closed) {
       this.#runtime = null;
       return r.info;
@@ -745,7 +925,8 @@ export class SessionSandbox {
       const handle = this.#track(provider.openSync(spec));
       // In the caller's own directory, or not at all: one the sandbox hides isn't swapped for another (bwrap's `$HOME`).
       launcher = this.#writeLauncher(handle, [GIT_BIN], [], "git", CWD_FROM_CALLER);
-      program = handle.wrap?.([GIT_BIN], { cwd: "", env: {} }).argv[0] ?? null;
+      // The provider's own program (past the pin guard's shell): when it is gone, git runs defused.
+      program = handle.wrap ? (unguardedArgv(handle.wrap([GIT_BIN], { cwd: "", env: {} }).argv)[0] ?? null) : null;
     }
     return writeGitShim(dir, { launcher, provider: program, caller, home: homedir() });
   }
@@ -791,15 +972,15 @@ export class SessionSandbox {
     hideLocalServices = network.mode !== "on",
     dirs: { roots: readonly string[]; added: readonly string[] } = this.#dirs,
   ): SandboxSpec {
-    // A monorepo's package: the repository's top (#448 round 9); the session's cwd stays the workdir.
-    const workspace = sandboxWorkspaceOf(this.#workdir);
+    // A monorepo's package: the repository's top (#448 round 9), as pinned; the session's cwd stays the workdir.
+    const workspace = this.#workspace();
     const folder = this.#worktreeFolderName(workspace, dirs.added);
     // The repositories' worktree entries looked at first: the spec holds every one the session didn't make.
     if (folder) {
       this.#checkEntries();
       for (const d of dirs.added) this.#checkEntriesOf(d);
     }
-    const spec = buildSandboxSpec({
+    const build = () => buildSandboxSpec({
       backendReadable: readable,
       sessionId: this.#sessionId,
       workspace,
@@ -816,7 +997,16 @@ export class SessionSandbox {
         const guard = this.#guardFor(dir);
         return { dir, ...(folder && guard ? { ownWorktreeEntries: guard.ownEntries() } : {}) };
       }),
+      ...(this.#setting?.pins ? { pins: this.#setting.pins.ids } : {}),
     });
+    let spec: SandboxSpec;
+    try {
+      spec = build();
+    } catch (err) {
+      // A pinned directory changed (pins.ts): refused, and looked at again at the next resolution.
+      if (err instanceof SandboxPinError) this.#pinsBroken = true;
+      throw err;
+    }
     for (const f of spec.worktreeFolders ?? []) this.#folders.add(f);
     this.#lastSpec = spec;
     return spec;
@@ -826,7 +1016,7 @@ export class SessionSandbox {
   #guardFor(dir: string): WorktreeEntryGuard | null {
     const common = gitLayoutOf(dir)?.common;
     if (!common) return null;
-    const mine = gitLayoutOf(sandboxWorkspaceOf(this.#workdir))?.common;
+    const mine = gitLayoutOf(this.#workspace())?.common;
     if (mine && resolve(mine) === resolve(common)) return this.#entries;
     let g = this.#addedEntries.get(resolve(common));
     if (!g) {
@@ -845,13 +1035,13 @@ export class SessionSandbox {
    */
   checkWorktreeEntries(): void {
     if (this.#closed || !this.#runtime) return;
-    if (!this.#worktreeFolderName(sandboxWorkspaceOf(this.#workdir), this.#dirs.added)) return;
+    if (!this.#worktreeFolderName(this.#workspace(), this.#dirs.added)) return;
     this.#checkEntries();
     for (const d of this.#dirs.added) this.#checkEntriesOf(d);
   }
 
   #checkEntries(): void {
-    this.#checkEntriesOf(sandboxWorkspaceOf(this.#workdir), this.#entries);
+    this.#checkEntriesOf(this.#workspace(), this.#entries);
   }
 
   /** {@link checkWorktreeEntries} for the repository `workspace` is in (the workspace's, or an added dir's), with its guard. */
@@ -895,7 +1085,7 @@ export class SessionSandbox {
    */
   prepareFolders(): void {
     if (this.#closed || this.#folders.size === 0 || [...this.#folders].every((f) => existsSync(f))) return;
-    for (const workspace of [sandboxWorkspaceOf(this.#workdir), ...this.#dirs.added]) {
+    for (const workspace of [this.#workspace(), ...this.#dirs.added]) {
       try {
         const layout = gitLayoutOf(workspace);
         if (!layout || !this.#folderName) continue;

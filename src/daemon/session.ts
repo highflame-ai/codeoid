@@ -230,7 +230,7 @@ import { CLAUDE_ALL_SOCKETS_NOTE, describeSandbox, resolveSandbox, SandboxRequir
 import { type WorktreeEntryFinding, worktreeEntryLine, worktreeEntryWarning } from "./sandbox/worktree-entries.js";
 import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
 import { worktreeFolderNote } from "./sandbox/worktrees.js";
-import { hiddenPathsFor, protectedWriteTargets, sandboxWorkspaceOf, userHiddenPaths } from "./sandbox/policy.js";
+import { hiddenPathsFor, protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
 import { addedDirProblem, addedDirReal, autonomousGrantProblem, inAnyDir, nestedControl, normalizeSandboxDir } from "./sandbox/project-roots.js";
 import { sandboxRootIfMade } from "./sandbox/root.js";
 import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
@@ -1267,6 +1267,8 @@ export class Session {
   readonly #addedGitBaselines = new Map<string, { git: GitControlSnapshot; refs: Promise<string[] | null> }>();
   /** The agent's `request_directory` questions still open, by directory: a repeat request joins its answer. */
   readonly #dirRequests = new Map<string, Promise<string>>();
+  /** The pin change last said on the session (#sandboxPinRefusal): said once per change. */
+  #pinSaid: string | null = null;
   #requestDirectoryWaitMs: number | undefined;
   /** Started for unattended work: turns need an enforced sandbox (SessionCreateOptions.requireSandbox). */
   #requireSandbox = false;
@@ -3167,6 +3169,8 @@ export class Session {
     if (sbx.resolvedFor(this.#provider.id) && sbx.info && !applyDirs) return sbx.info;
     const before = JSON.stringify(sbx.info);
     const info = await sbx.refresh(this.#provider.id);
+    // Pins taken by this resolution (the workspace, a root seen first: #448 round 13) are kept with the setting.
+    if (sbx.takePinsChanged()) this.#saveMetaNow();
     this.#sayDroppedDirs();
     if (applyDirs) {
       // A backend running now runs in the old sandbox: restarted before its next turn (#restartForSandboxDirs).
@@ -3177,6 +3181,30 @@ export class Session {
     }
     if (JSON.stringify(info) !== before || applyDirs) this.#broadcastInfoUpdate();
     return info;
+  }
+
+  /**
+   * Why no tool call may run now because a directory the sandbox binds by
+   * name isn't what was pinned (SessionSandbox.pinProblem, #448 round 13),
+   * or null. Said on the session once per change (event
+   * `sandbox.pin_changed`, audit `session.sandbox_pin_changed`).
+   */
+  #sandboxPinRefusal(): string | null {
+    const sbx = this.#sandbox;
+    if (!sbx || sbx.info?.state !== "on") return null;
+    const problem = sbx.pinProblem();
+    if (!problem) {
+      this.#pinSaid = null;
+      return null;
+    }
+    if (this.#pinSaid !== problem) {
+      this.#pinSaid = problem;
+      this.#store.audit(SYSTEM_IDENTITY.sub, "session.sandbox_pin_changed", this.id, problem.slice(0, 2000));
+      const note = this.#makeMessage("info", `🛡 Sandbox: ${problem}.`, SYSTEM_IDENTITY, undefined, undefined, { event: "sandbox.pin_changed" });
+      this.#persistAndBuffer(note);
+      this.#broadcastRaw(note);
+    }
+    return problem;
   }
 
   /** Whether a change of the sandbox's directories may be applied now: no turn, approval or background work. */
@@ -3284,7 +3312,8 @@ export class Session {
         this.#broadcastRaw(note);
         return false;
       }
-      await sbx.set(next);
+      // Project roots set again: each pinned anew, as it is now (#448 round 13).
+      await sbx.set(next, { repinRoots: setting.projectRoots !== undefined });
       this.#store.audit(sender.sub, "session.set_sandbox", this.id, answeredBy && answeredBy !== sender.sub ? `${change} (confirmed by ${answeredBy})` : change);
       this.#saveMetaNow();
       // A backend running now runs in the old sandbox: restarted before its next turn.
@@ -3348,7 +3377,7 @@ export class Session {
     const home = process.env.HOME ?? homedir();
     const written = normalizeSandboxDir(raw, home) ?? resolvePath(this.workdir, raw.trim());
     const dir = addedDirReal(written, home) ?? written;
-    const workspace = sandboxWorkspaceOf(this.workdir);
+    const workspace = sbx.workspace;
     if (inAnyDir(dir, [workspace])) return { dir, written, already: `${dir} is in the session's workspace (${workspace}), which its commands write already` };
     const folder = sbx.worktreeFolders().find((f) => inAnyDir(dir, [f]));
     if (folder) return { dir, written, already: `${dir} is in the session's own worktree folder (${folder}), which its commands write already` };
@@ -4446,7 +4475,15 @@ export class Session {
     await this.#restartForSandboxDirs();
     // Its worktree folders, removed while empty at the last turn's end, are there again for this one's commands.
     this.#sandbox?.prepareFolders();
+    // A pinned directory changed since the last resolution (#448 round 13): looked at again now, so an added dir or a
+    // root that changed is left out (said) before the turn; one that still is (the workspace) refuses it below.
+    if (this.#sandbox?.info?.state === "on" && this.#sandbox.pinProblem() && this.#mayApplySandboxDirs()) {
+      await this.ensureSandbox();
+      await this.#restartForSandboxDirs();
+    }
     const sandboxRefused =
+      // A directory the sandbox binds by name isn't what was pinned: no command of this turn could run (#sandboxPinRefusal).
+      this.#sandboxPinRefusal() ??
       this.sandboxRefusal() ??
       // Its backend still runs in the sandbox it had before a change: not what the session reports.
       (this.#sandboxRestartPending && this.#sandboxRequired() ? "its backend still runs in its previous sandbox (it restarts once the session is idle)" : null);
@@ -8621,6 +8658,17 @@ export class Session {
       // runs — not even a read — until a new budget re-arms the session.
       if (this.#budgetExhausted) return this.#endAttemptOnBudget(approvalId, toolName, sender);
 
+      // A directory the sandbox binds by name isn't what was pinned (#448
+      // round 13: the workspace, an added dir, a root swapped for a link):
+      // no call runs against it, in any mode, approved or not.
+      const pinRefusal = this.#sandboxPinRefusal();
+      if (pinRefusal) {
+        this.#approvalPatchKeys.delete(approvalId);
+        this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: pinRefusal });
+        this.#store.audit(sender.sub, "session.sandbox_pin_refuse", this.id, `tool=${toolName}`);
+        return { behavior: "deny" as const, message: pinRefusal };
+      }
+
       // Hook gate — the policy layer, run BEFORE the approval gate. A hook
       // block is a policy deny that never prompts the user (and never burns
       // the autonomous budget — #shouldAutoApprove runs after this); an
@@ -9484,9 +9532,11 @@ export class Session {
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
         // Autonomous mode refuses it outright (#autonomousRefusal): no approval card either.
         const deniedFirst = networkAsk || budgetDenied || secret?.action === "deny" || risk?.secret?.action === "deny";
+        // A pinned directory changed (#448 round 13): the gate refuses every call (#sandboxPinRefusal).
+        const pinned = budgetDenied ? null : this.#sandboxPinRefusal();
         // Beyond the sandbox, a host-side file tool is refused in autonomous mode (#outsideSandbox).
-        const outside = deniedFirst ? null : this.#outsideSandboxRefusal(event.name, event.input, event.shellCwd);
-        const refused = deniedFirst ? null : outside ? { reason: hostFileBreachReason(outside) } : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
+        const outside = deniedFirst || pinned ? null : this.#outsideSandboxRefusal(event.name, event.input, event.shellCwd);
+        const refused = pinned ? { reason: pinned } : deniedFirst ? null : outside ? { reason: hostFileBreachReason(outside) } : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
         const toolMsg = this.#makeMessage(
           "tool_call",
           `${event.name}(${Object.keys(event.input).join(", ")})`,

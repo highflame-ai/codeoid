@@ -36,6 +36,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { SandboxSettings } from "@anthropic-ai/claude-agent-sdk";
 import { absolutePathEntries, pathWithShim } from "./git-shim.js";
+import { pinRefusal, pinsProblem, SandboxPinError } from "./pins.js";
 import type { SandboxRuntime } from "./session-sandbox.js";
 import type { SandboxSpec } from "./types.js";
 
@@ -130,6 +131,9 @@ export function claudeSandboxSettings(
   platform: NodeJS.Platform = process.platform,
 ): SandboxSettings {
   const spec = rt.spec;
+  // Every directory the CLI is told to bind by name, checked first (pins.ts, #448 round 13): never one a link leads from.
+  const problem = pinsProblem(spec.pins);
+  if (problem) throw new SandboxPinError(pinRefusal(problem));
   const tempDir = temp?.commands ?? spec.tempDir;
   const network: NonNullable<SandboxSettings["network"]> =
     spec.network.mode === "off"
@@ -161,7 +165,9 @@ export function claudeSandboxSettings(
       // would run outside the sandbox from the CLI's next start. A
       // repository's hooks and config, for the same reason. And every dir
       // between the workspace and a hidden path in it (nothing renames it away).
-      denyWrite: physical([...claudeSettingsPaths(spec.workspace, env), ...denyAround(spec.readOnly ?? [], spec.writable), ...(spec.pinned ?? [])]),
+      // A pinned dir holding something writable (an added dir's dir on the way to the workspace) isn't denied:
+      // the CLI's denial takes the subtree, which would make that read-only; the gate checks the pins instead.
+      denyWrite: physical([...claudeSettingsPaths(spec.workspace, env), ...denyAround(spec.readOnly ?? [], spec.writable), ...(spec.pinned ?? []).filter((p) => !holdsWritable(p, [spec.workspace, ...spec.writable]))]),
       // Local services' sockets too while the network is off (spec.serviceSockets): those in the host's /tmp are
       // behind its seccomp's unix socket block, or the denied /tmp with every socket allowed.
       denyRead: physical([...spec.hidden, ...spec.containerSockets, ...(spec.serviceSockets ?? []).filter((p) => !HOST_SHARED_TEMP.some((t) => p === t || p.startsWith(`${t}/`)) && !p.startsWith("/private/tmp/")), ...(allSockets ? HOST_SHARED_TEMP : [])]),
@@ -182,6 +188,12 @@ export function claudeSandboxSettings(
     ...(envVars.length > 0 ? { credentials: { envVars } } : {}),
     ...(rt.config.bwrapPath ? { bwrapPath: rt.config.bwrapPath } : {}),
   };
+}
+
+/** Whether `dir` holds one of `writable` (strictly). */
+function holdsWritable(dir: string, writable: readonly string[]): boolean {
+  const d = physicalOf(dir);
+  return writable.some((w) => physicalOf(w).startsWith(`${d}/`));
 }
 
 /** Whether `dir` holds one of the session's worktree folders (is a location of it). */

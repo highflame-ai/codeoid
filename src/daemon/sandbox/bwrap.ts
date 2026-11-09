@@ -51,7 +51,7 @@ export function pathKind(p: string): PathKind {
 }
 
 /** The real path when it exists, else the path. */
-function realOr(p: string): string {
+function realOrPath(p: string): string {
   try {
     return realpathSync(p);
   } catch {
@@ -90,6 +90,10 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
 
   const mounts: Mount[] = [];
   const seen = new Set<string>();
+  // A pinned directory is bound by the path it was pinned at, never by where a link there leads (pins.ts: the
+  // handle checked it is still that directory, and the launched argv checks again).
+  const pinned = new Set((spec.pins ?? []).map((p) => p.path));
+  const realOr = (p: string) => (pinned.has(p) ? p : realOrPath(p));
   const writable = [spec.workspace, ...spec.writable].map(realOr);
   const shownInTmp = [...writable, ...spec.reexposed.flatMap((r) => [resolve(r), realOr(r)]).filter((r) => r !== "/tmp")];
   const hide = (p: string) => {
@@ -131,8 +135,10 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   // Every dir between a writable root and a hidden path in it: a mount point nothing can rename, still writable inside.
   for (const p of spec.pinned ?? []) {
     const at = realOr(p);
-    // Never one a hidden dir covers (or is): its bind would show the real dir again.
-    if (kind(at) !== "dir" || seen.has(`o:${at}`) || hiddenDirs.some((d) => within(at, d))) continue;
+    // Never one a hidden dir in its writable root covers (or is): its bind would show the real dir again. One in
+    // a hidden dir the root is shown again in (the hidden home) is shown already.
+    const holder = writable.filter((w) => within(at, w)).sort((x, y) => depth(y) - depth(x))[0];
+    if (kind(at) !== "dir" || seen.has(`o:${at}`) || hiddenDirs.some((d) => within(at, d) && (!holder || (within(d, holder) && d !== holder)))) continue;
     seen.add(`o:${at}`);
     mounts.push({ kind: "bind", src: at, path: at });
   }

@@ -37,6 +37,7 @@ import { type ClaudeTempDirs, claudeNativeEnv, claudeSandboxSettings, claudeTemp
 import { BwrapSandboxProvider } from "../../daemon/sandbox/bwrap.js";
 import { CWD_FROM_CALLER } from "../../daemon/sandbox/docker.js";
 import { cliWorktrees, gitProgramLocations, gitShimSpec, writeGitShim } from "../../daemon/sandbox/git-shim.js";
+import { unguardedArgv } from "../../daemon/sandbox/pins.js";
 import { buildSandboxSpec } from "../../daemon/sandbox/policy.js";
 import { daemonTempDir } from "../../daemon/sandbox/root.js";
 import { launcherScript } from "../../daemon/sandbox/session-sandbox.js";
@@ -157,7 +158,7 @@ function gitShim(): string {
   if (!wrapped) throw new Error("no wrap");
   const launcher = join(dir, "launch-git");
   writeFileSync(launcher, launcherScript(wrapped.argv), { mode: 0o700 });
-  return writeGitShim(join(dir, "git-bin"), { launcher, provider: wrapped.argv[0] ?? null, caller: "the Claude CLI", home });
+  return writeGitShim(join(dir, "git-bin"), { launcher, provider: unguardedArgv(wrapped.argv)[0] ?? null, caller: "the Claude CLI", home });
 }
 const cliEnv = nativeEnv ? claudeNativeEnv(spec as never, temp, { ...env, SANDBOX_RUNTIME: "1" }, gitMode === "shim" ? gitShim() : undefined) : env;
 // A sign-in started after the session's sandbox was built (#448 round 2): its home where the daemon makes it, the

@@ -34,6 +34,7 @@ import { cliCredentialFiles, registeredSecretLocations } from "../secret-paths.j
 import { DEFAULT_HOME_READABLE } from "./home-readable.js";
 import { validAllowedHost } from "./hosts.js";
 import { sandboxRoot } from "./root.js";
+import { type PathPin, dirIdentity, pinProblem, pinRefusal, SandboxPinError } from "./pins.js";
 import { controlDirProblem, nestedControl, type NestedControl, projectRootSecrets, stillRealDir } from "./project-roots.js";
 import { isOwnWorktree, worktreeAdminsOf, worktreeFoldersOf } from "./worktrees.js";
 import type { NetworkMode, NetworkPolicy, SandboxSpec } from "./types.js";
@@ -470,6 +471,14 @@ export interface SpecInputs {
   addedDirs?: readonly { dir: string; ownWorktreeEntries?: readonly string[] }[];
   /** How many directories a root's or an added dir's look goes through (project-roots.ts; default theirs): tests. */
   scanLimit?: number;
+  /**
+   * What each bound directory was when it was pinned (pins.ts `pinRecord`,
+   * by real path: the workspace, added dirs, project roots; #448 round 13):
+   * one that isn't that directory now, or is reached through a link, refuses
+   * the build ({@link SandboxPinError}). One with no record is pinned as it
+   * is now (and a link-named one is never bound).
+   */
+  pins?: Readonly<Record<string, string>>;
 }
 
 /** The home a spec hides: absolute, and not `/` (nothing is left to show then). */
@@ -1091,13 +1100,26 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const workspace = resolve(inputs.workspace);
   const sandboxCfg = sandboxConfigOf(inputs.config);
   const configDir = inputs.hidden?.configDir ?? getConfigDir();
+  // Every directory bound by name, checked first (#448 round 13, pins.ts): one reached through a link, or another
+  // directory than the one pinned, refuses the build; it is never followed to where the link leads.
+  const stored = inputs.pins ?? {};
+  const refuse = (problem: string | null): void => {
+    if (problem) throw new SandboxPinError(pinRefusal(problem));
+  };
+  refuse(pinProblem(workspace, "the workspace", { ...(stored[workspace] ? { stored: stored[workspace] } : { mayBeMissing: true }) }));
+  const workdir = inputs.workdir !== undefined ? resolve(inputs.workdir) : null;
+  if (workdir && workdir !== workspace) refuse(pinProblem(workdir, "the working directory", { mayBeMissing: true }));
   // Each added dir as a workspace of its own (never one inside the workspace: it is writable already), and only
   // while it still is what was granted: a directory at its real path, no git or settings dir, every repository and
-  // settings dir in it found (project-roots.ts; Session says when one is dropped).
+  // settings dir in it found (project-roots.ts; Session says when one is dropped). One pinned that changed refuses.
   const added = (inputs.addedDirs ?? [])
     .map((a) => ({ ...a, dir: resolve(a.dir) }))
     .filter((a, i, all) => !within(a.dir, workspace) && all.findIndex((b) => b.dir === a.dir) === i)
-    .filter((a) => stillRealDir(a.dir) && controlDirProblem(a.dir, home) === null)
+    .filter((a) => {
+      const record = stored[a.dir];
+      if (record) refuse(pinProblem(a.dir, "added directory", { stored: record }));
+      return stillRealDir(a.dir) && controlDirProblem(a.dir, home) === null;
+    })
     .map((a) => ({ ...a, nested: nestedControl(a.dir, inputs.scanLimit) }))
     .filter((a) => a.nested.complete);
   const gitOf = (dir: string, ownEntries: readonly string[] | undefined): GitPaths =>
@@ -1151,9 +1173,17 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const inHidden = (p: string) => [...baseHidden, ...(root ? [root] : [])].some((h) => within(p, h) || within(realOr(p), realOr(h)));
   const addedDirs = added.map((a) => a.dir).filter((d) => !inHidden(d) && !userHidden.some((u) => within(d, u)));
   const writableDirs = [workspace, ...addedDirs];
+  // Each root by its real path (a root named through a link is hidden in where it really is), pinned as the rest.
+  const rootCandidates = (inputs.projectRoots ?? [])
+    .map((r) => resolve(r))
+    .map((r) => {
+      const record = stored[r];
+      if (record) refuse(pinProblem(r, "project root", { stored: record }));
+      return dirIdentity(r) !== null ? r : realOr(r);
+    })
+    .filter((r, i, all) => dirIdentity(r) !== null && all.indexOf(r) === i && !userHidden.some((u) => within(r, u)) && !inHidden(r));
   // The credential files anywhere in a root (not the session's own: its workspace, its added dirs); a root too big
   // to look through whole isn't shown at all (fail closed: resolveSandbox says so).
-  const rootCandidates = (inputs.projectRoots ?? []).map((r) => resolve(r)).filter((r, i, all) => all.indexOf(r) === i && !userHidden.some((u) => within(r, u)) && !inHidden(r));
   const rootSecrets = projectRootSecrets(rootCandidates, writableDirs, inputs.scanLimit);
   const roots = rootCandidates.filter((r) => !rootSecrets.over.includes(r));
   // The worktree locations shown (other sessions' checkouts of this repository, their copied `.env`s): the same.
@@ -1192,6 +1222,18 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
       // Inside the hidden home, only what is inside something shown needs hiding again.
       (!homeHidden || h === homeHidden || !within(h, homeHidden) || shown.some((x) => within(h, x))),
   );
+  // What is bound by name, as it is now (pins.ts): checked again at every launch.
+  const pinOf = (path: string, what: string, mayBeMissing = false): PathPin => {
+    const id = mayBeMissing ? null : dirIdentity(path);
+    return { path, what, ...(id ? { id } : {}), ...(mayBeMissing || !id ? { mayBeMissing: true } : {}) };
+  };
+  const pins: PathPin[] = [
+    pinOf(workspace, "the workspace"),
+    ...(workdir && workdir !== workspace ? [pinOf(workdir, "the working directory", true)] : []),
+    ...addedDirs.map((d) => pinOf(d, "added directory")),
+    ...roots.map((r) => pinOf(r, "project root")),
+    ...locations.map((f) => pinOf(f, "worktree folder", true)),
+  ];
   // The container runtime's sockets, when the owner opted in: reachable at their own paths, `DOCKER_HOST` the first.
   const sockets = inputs.dockerSocket ? dockerSocketPaths(home, env) : [];
   const exposed = new Set(sockets.flatMap((s) => [s, realOr(s)]));
@@ -1207,7 +1249,8 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     ...(roots.length > 0 ? { projectRoots: roots } : {}),
     ...(addedDirs.length > 0 ? { addedDirs } : {}),
     ...(cache || sockets.length > 0 ? { env: { ...(cache ? toolchainCacheEnv(cache, home, env) : {}), ...(sockets[0] ? { DOCKER_HOST: `unix://${sockets[0]}` } : {}) } } : {}),
-    pinned: protectedAncestors(hidden, [workspace, tempDir, ...own, ...addedDirs, ...locations]),
+    pinned: [...new Set([...protectedAncestors(hidden, [workspace, tempDir, ...own, ...addedDirs, ...locations]), ...nestedRootAncestors([workspace, tempDir, ...addedDirs, ...locations], hidden)])],
+    pins,
     reexposed,
     containerSockets: containerSocketPaths(home, env).filter((p) => !exposed.has(p) && !exposed.has(realOr(p))),
     ...((inputs.hideLocalServices ?? inputs.network.mode !== "on") ? { serviceSockets: localServiceSocketPaths() } : {}),
@@ -1264,10 +1307,35 @@ export function protectedAncestors(hidden: readonly string[], writableRoots: rea
     for (const w of roots) {
       if (at === w || !within(at, w)) continue;
       for (let a = dirname(at); a !== w && within(a, w); a = dirname(a)) {
-        // A dir that is hidden itself, or inside a hidden one, is never pinned: a pin binds
-        // the real dir, which would show it again (the home in a workspace of /home). Hidden,
-        // it is a mount point of its own (no rename) or not there at all.
-        if (hiddenReal.some((h) => within(a, h))) continue;
+        // A dir that is hidden itself, or inside a hidden one in the root, is never pinned: a pin
+        // binds the real dir, which would show it again (the home in a workspace of /home). Hidden,
+        // it is a mount point of its own (no rename) or not there at all. One the root shows again
+        // (the root in the hidden home) is pinned.
+        if (hiddenReal.some((h) => within(a, h) && within(h, w) && h !== w)) continue;
+        out.add(a);
+      }
+    }
+  }
+  return [...out];
+}
+
+/**
+ * The directories strictly between a writable root and another one bound
+ * inside it (a workspace in an added dir, a worktree folder in one): pinned
+ * too (SandboxSpec.pinned), so no command can move a parent aside and put a
+ * link where the inner root was (#448 round 13). Never one hidden, or in a
+ * hidden dir inside the outer root (a pin would show it). Real paths.
+ */
+export function nestedRootAncestors(roots: readonly string[], hidden: readonly string[] = [], exists: (p: string) => boolean = existsSync): string[] {
+  const real = roots.map(realOr);
+  const hiddenReal = hidden.map(realOr);
+  const out = new Set<string>();
+  for (const inner of real) {
+    if (!exists(inner)) continue;
+    for (const outer of real) {
+      if (inner === outer || !within(inner, outer)) continue;
+      for (let a = dirname(inner); a !== outer && within(a, outer); a = dirname(a)) {
+        if (hiddenReal.some((h) => within(a, h) && within(h, outer) && h !== outer)) continue;
         out.add(a);
       }
     }

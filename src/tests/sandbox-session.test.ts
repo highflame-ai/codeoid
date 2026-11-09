@@ -32,6 +32,13 @@ import { TranscriptStore } from "../daemon/transcript.js";
 import { type AuthContext, CAPABILITIES, type SessionMessage, type SessionMode, type SessionSandboxSetting, type SessionUiRequestMsg } from "../protocol/types.js";
 
 const AUTH: AuthContext = { sub: "u", scopes: [], delegationDepth: 0, accountId: "a", projectId: "p" };
+
+/** A setting without what the daemon keeps of its directories (their pins, #448 round 13): undefined when that was all. */
+function withoutPins(setting: SessionSandboxSetting | undefined): SessionSandboxSetting | undefined {
+  if (!setting) return setting;
+  const { pins: _p, ...rest } = setting;
+  return Object.keys(rest).length > 0 ? rest : undefined;
+}
 const BASE_CONFIG = {
   workspaceIndex: { enabled: false, episodeThreshold: 5, timeThresholdMs: 60_000, debounceMs: 15_000 },
   compress: { enabled: false, excludeCommands: [], excludePatterns: [], compressPipes: false, minBytes: 1024 },
@@ -425,7 +432,8 @@ describe("changing a session's sandbox", () => {
     const r = await session.setSandbox({ network: "off" }, AUTH);
     expect(r).toEqual({ ok: true });
     expect(session.sandboxInfo).toMatchObject({ network: "off", state: "on" });
-    expect(session.sandboxSetting).toEqual({ network: "off" });
+    // What the daemon keeps of the directories (their pins, #448 round 13) aside.
+    expect(withoutPins(session.sandboxSetting)).toEqual({ network: "off" });
   });
 
   test("widening (off) is asked on the session; a yes applies it, a no doesn't", async () => {
@@ -809,7 +817,7 @@ describe("round 1 of the #448 audit", () => {
     const second = sbx.refresh("opencode");
     release();
     await Promise.all([first, second]);
-    expect(sbx.setting).toEqual({ network: "off" });
+    expect(withoutPins(sbx.setting)).toEqual({ network: "off" });
     expect(sbx.resolvedFor("opencode")).toBe(true);
     expect(sbx.info?.network).toBe("off");
     expect(sbx.runtime?.spec.network).toEqual({ mode: "off" });
@@ -924,7 +932,7 @@ describe("round 1 of the #448 audit", () => {
     const busy = await session.setSandbox({ network: "off" }, AUTH);
     expect(busy).toMatchObject({ ok: false });
     expect((busy as { error: string }).error).toContain("busy");
-    expect(session.sandboxSetting).toBeUndefined();
+    expect(withoutPins(session.sandboxSetting)).toBeUndefined();
     await session.interrupt(AUTH);
     await until(() => !session.pendingToolApprovals().length);
     provider.onSessionEvent?.({ type: "background_tasks", tasks: [{ id: "bg1", kind: "local_bash", description: "dev server", status: "running" }] });

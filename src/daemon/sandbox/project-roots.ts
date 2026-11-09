@@ -306,6 +306,8 @@ export interface ResolvedRoots {
  * that would be the home (a repository directly in it), the host's temp
  * dir or another refused place falling back to no root, said; anything else
  * refused by {@link projectRootProblem} or not there, said and not used.
+ * Each by its real path (one named through a link is read where it really
+ * is, said).
  */
 export function resolveProjectRoots(entries: readonly string[], workspace: string, ctx: DirContext = {}): ResolvedRoots {
   const home = resolve(ctx.home ?? process.env.HOME ?? homedir());
@@ -337,10 +339,13 @@ export function resolveProjectRoots(entries: readonly string[], workspace: strin
       if (!isDefault) out.notes.push(`project root ${entry} (${at}) isn't a directory here: not used`);
       continue;
     }
+    // By where it really is (#448 round 13): what is hidden in it, what is shown around the workspace and its pin
+    // are all of the real dirs, never of a link's path (bubblewrap binds a link's path whole, before them).
     const real = realOr(at);
     if (seen.has(real)) continue;
     seen.add(real);
-    out.roots.push(at);
+    if (real !== at && !isDefault) out.notes.push(`project root ${entry} is ${real} (where it really is): read there`);
+    out.roots.push(real);
   }
   return out;
 }

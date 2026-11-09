@@ -402,6 +402,14 @@ export interface SessionSandboxSetting {
    * `request_directory`).
    */
   addedDirs?: string[];
+  /**
+   * Kept by the daemon, never sent by a client (the schema refuses it): what
+   * each directory the sandbox binds by name was when it was pinned (#448
+   * round 13): `workspace` (the sandbox's workspace, a monorepo's top) as
+   * found for `workdir` (another session's, a fork's, isn't used), and
+   * `ids`, by real path, `dev:ino@boot`.
+   */
+  pins?: { workdir?: string; workspace?: string; ids: Record<string, string> };
 }
 
 export type SandboxNetworkMode = "on" | "off" | "allowlist";

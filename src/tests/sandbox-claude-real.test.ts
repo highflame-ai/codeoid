@@ -434,6 +434,25 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(r.toolResult).not.toContain("LEAK");
     expect(r.toolResult).not.toContain("PLANTED-SIGNIN-TOKEN");
   }, 300_000);
+
+  test("a project root named through a link (#448 round 13): read and hidden where it really is, the workspace in it writable; every command used to fail", async () => {
+    const home = join(root, "home");
+    const W = join(home, "Workspace13");
+    const ws = join(W, "a");
+    const b = join(W, "b");
+    for (const d of [ws, b]) mkdirSync(d, { recursive: true });
+    writeFileSync(join(b, "README.md"), "B13-README\n");
+    writeFileSync(join(b, ".env"), "LINKROOT-B-ENV\n");
+    const code = join(home, "code13");
+    symlinkSync(W, code);
+    const command = [`cat ${join(b, "README.md")}`, `cat ${join(code, "b", ".env")} 2>&1`, `cat ${join(b, ".env")} 2>&1`, `echo a > ${join(ws, "own.txt")} && echo WS-WRITABLE`].join("; ");
+    const r = await probe("off", command, ["policy"], { CODEOID_PROBE_WORKSPACE: ws, CODEOID_PROBE_PROJECT_ROOTS: code });
+    expect(r.result).toBe("success");
+    expect(r.toolResult).toContain("B13-README");
+    expect(r.toolResult).toContain("WS-WRITABLE");
+    expect(r.toolResult).not.toContain("Read-only file system");
+    expect(r.toolResult).not.toContain("LINKROOT-B-ENV");
+  }, 300_000);
 });
 
 /**
