@@ -467,12 +467,25 @@ turn start with no turn, approval or background work (`dirsPending`, `SessionSan
 (`readAround`: its CLI binds allowRead after allowWrite), never a link in it (it would show the target) nor an entry
 that is hidden (an `allowRead` equal to a `denyRead` wins; one strictly inside stays denied, checked on the real CLI). `homeWorkspace`: the chip says "sandboxed: workspace is
 your home — only credentials are protected".
-Every directory a sandbox binds by name (workspace, workdir, added dirs, roots, worktree folders) is pinned
-(sandbox/pins.ts, #448 round 13, docs/sandbox.md "Directories bound by name are pinned"): real path and `dev:ino`,
-taken once (`SessionSandboxSetting.pins`, daemon-kept), checked at every `buildSandboxSpec`, every
-`LocalSandboxHandle.wrap` and again in the launched argv (`pinGuardArgv`: a launcher checks at each run), in
-`claudeSandboxSettings`, and at the gate (`Session#sandboxPinRefusal`); a changed one refuses, never followed. Dirs
-between nested writable roots are pinned too (`nestedRootAncestors`).
+Every path a session uses goes through one module, sandbox/pinned.ts (#448 rounds 13, 14, docs/sandbox.md
+"Pinned paths"). Every path a sandbox binds by name (workspace, workdir, added dirs, roots, worktree folders and
+locations, writable git/state/cache dirs, temp dir, `readOnly`, `pinned`, `heldInPlace`) is pinned (`SandboxSpec.pins`,
+`pinOf`): real path and `dev:ino` (a held file, a codeoid-made folder: links only), the workspace's and the workdir's
+taken once (`SessionSandboxSetting.pins`, daemon-kept), the rest at each build; bound as pinned, never `realpath`'d at a
+launch (`boundPath`: only hidden paths, the allowlist, sockets are resolved); checked at every `buildSandboxSpec`,
+every `LocalSandboxHandle.wrap` and again in the launched argv (`pinGuardArgv`, one `stat`: a launcher checks at each
+run), in `claudeSandboxSettings`, and at the gate (`Session#sandboxPinRefusal`, all of the gate spec's pins); a changed
+one refuses, never followed. Held in place (mount points; Seatbelt `literal`): dirs between nested writable roots
+(`nestedRootAncestors`), and (`SandboxSpec.heldInPlace`, `heldAncestors`) the workdir and its way up to the
+workspace and every dir between a writable root and a held path (a package's `.claude/`); Claude native leaves those
+to the CLI, which binds them itself (real-CLI test). The daemon's own work in the workdir (checkpoints, rewind,
+`rollFilesTo`, fork creation and setup, `fs.read`, MCP config reads, end-of-turn git looks) takes
+`Session#pinnedWorkdir` (`PinnedDir`: `inPinnedDir` checks before and after, git with it as cwd and
+`GIT_WORK_TREE=.`); a change refuses, said (`workdir.changed`) and audited (`session.workdir_changed`). Daemon-side
+makes go through `makeAt`/`makeInPinned`/`replaceInPinned` (O_EXCL|O_NOFOLLOW), removes through `removeEmptyDir`.
+`src/tests/pinned-paths-static.test.ts` fails on a direct fs/spawn/cwd/`GIT_WORK_TREE` use in sandbox/, session.ts
+or checkpoints.ts without a `// paths: <why>` comment. An agent's own grant that another session comes to share is
+let go at the next turn (`Session#dropSharedAgentDirs`).
 
 Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell/`
 parses a command line with tree-sitter-bash (WASM, vendored `tree-sitter-bash.wasm`;

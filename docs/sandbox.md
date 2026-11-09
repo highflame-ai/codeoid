@@ -781,52 +781,129 @@ Limits (defence in depth, as the rest of git's structure):
 - On Seatbelt `worktrees/` and each session folder are kept from being renamed
   by a `literal` write denial (not verified on a Mac: see below).
 
-## Directories bound by name are pinned
+<a id="directories-bound-by-name-are-pinned"></a>
 
-The sandbox lays each directory it shows by its path: the workspace (a
-monorepo's repository top, when that is the workspace), the working
-directory, each added directory, each project root, the session's worktree
-folders. A path is only a name: a command (another session's, or this
-one's from a directory it may write) could move a directory aside and put a
-symbolic link where it was, and the next command's sandbox would lay where
-the link leads (your home, writable) at that path. So each one is **pinned**
-(#448 round 13):
+## Pinned paths
 
-- **Taken once**: by its real path, with its identity (device and inode),
-  when the session is created (the workspace, the working directory's
-  repository top found then and kept), when a directory is granted, when a
-  root is first resolved. Kept with the session's setting (`pins`, never set
-  by a client), so a restart keeps it; across a reboot only the inode is
-  compared (device numbers are given out anew at boot).
+The sandbox lays each path it binds by name: the workspace (a monorepo's
+repository top, when that is the workspace), the working directory, each
+added directory, each project root, the session's worktree folders and
+locations, the repository's git dirs and the session's other writable dirs,
+its temp dir, every path it holds read-only, every directory it holds in
+place. And the daemon works in a session's directories itself: its
+snapshots, going back a turn, a fork's files. A path is only a name: a
+command (another session's, or this one's from a directory it may write)
+could move a directory aside and put a symbolic link (or another directory)
+where it was, and the next use would lay, read or write where the link leads
+(your home, writable; the daemon's private dir; a rewind writing into the
+home). So every such path is **pinned** (#448 rounds 13 and 14), and goes
+through one module, `src/daemon/sandbox/pinned.ts`:
+
+- **Taken once**: by its real path, with its identity (device and inode) for
+  a directory, when the session is created (the workspace, its repository top
+  found then and kept, and the working directory), when a directory is
+  granted, when a root is first resolved, and at each spec build for the rest.
+  Kept with the session's setting (`pins`, never set by a client), so a
+  restart keeps it; across a reboot only the inode is compared (device
+  numbers are given out anew at boot). A held file (a repository's `config`,
+  a project's `.mcp.json`) and what codeoid makes and removes itself (a
+  worktree folder, a worktree location) are checked against links only.
+- **Bound as pinned, never resolved again**: bubblewrap, Docker and Seatbelt
+  name a pinned path as it was pinned, never by where it leads at a launch.
+  Not pinned, by design: what is hidden (a link there hides more), the home's
+  allowlist and a program's location (shown where a link leads), the owner's
+  container sockets; none of them is where a sandbox writes.
 - **Checked every time**: at every build of a sandbox, at every launch of a
-  program inside one (bubblewrap, Seatbelt, Docker: the handle checks, and
-  the argv it hands back checks again in the shell right before the program
-  starts, so a launcher written once — a process backend's, opencode's shell
-  launcher, the git shim — checks at each run), when Claude's own sandbox is
-  given its settings, and at the gate before every tool call. A directory
-  that is **reached through a symbolic link now, is another directory than
-  the one pinned (moved aside and made again), or is gone** is never
-  followed: the build or launch is refused ("codeoid sandbox: … is not the
-  directory it was …: not run", exit 126), every tool call is refused with
-  the same reason (`session.sandbox_pin_refuse`), and the session says what
-  changed, once (event `sandbox.pin_changed`, audit
-  `session.sandbox_pin_changed`).
+  program inside one (the handle checks, and the argv it hands back checks
+  again in the shell right before the program starts, with one `stat`, so a
+  launcher written once — a process backend's, opencode's shell launcher,
+  the git shim — checks at each run), when Claude's own sandbox is given its
+  settings, and at the gate before every tool call. A path that is **reached
+  through a symbolic link now, is another directory than the one pinned
+  (moved aside and made again), or is gone** is never followed: the build or
+  launch is refused ("codeoid sandbox: … is not the directory it was …: not
+  run", exit 126), every tool call is refused with the same reason
+  (`session.sandbox_pin_refuse`), and the session says what changed, once
+  (event `sandbox.pin_changed`, audit `session.sandbox_pin_changed`) — a dir
+  another session's command swapped included ("a directory held in place …
+  is reached through a symbolic link now"), which is never re-pinned
+  silently.
 - **What happens next**: an added directory that changed is dropped at the
   session's next turn (said, as below); a root that changed isn't used, said
   ("…: not used — set the session's project roots again to use it as it is
-  now"; setting them pins them anew). **A workspace that changed stops the
-  session's commands** until it is the directory it was again: every call is
-  refused, turn after turn; nothing is ever bound where the link leads.
-- **No rename from inside**: every directory between a writable directory
-  and another one shown inside it (a workspace in an added dir: `b/vendor`
-  between `b` and the workspace `b/vendor/lib`; a worktree folder in one) is
-  a mount point of its own on bubblewrap, so a command can't move it aside
-  ("Device or resource busy"). (This also made the same protection for a
-  hidden file's directories apply in a workspace in your home, where it
-  never did.) On Claude's own sandbox such a directory isn't denied (its
-  denial takes the subtree, which would make the workspace read-only): the
-  gate's check, and the CLI's own bind, which doesn't follow a link put
-  there (checked on the real CLI), hold it.
+  now"; setting them pins them anew); anything else bound is looked at again
+  by the next turn's resolution. **A workspace or working directory that
+  changed stops the session's commands** until it is the directory it was
+  again: every call is refused, turn after turn; nothing is ever bound where
+  the link leads.
+- **No rename from inside**: a directory that holds something the sandbox
+  shows or holds can't be moved aside by a command. On bubblewrap and Docker
+  each is a mount point of its own (`mv`: "Device or resource busy"), on
+  Seatbelt the directory itself isn't writable:
+  - every directory between a writable directory and another one shown
+    inside it (a workspace in an added dir: `b/vendor` between `b` and the
+    workspace `b/vendor/lib`; a worktree folder in one);
+  - every directory between a writable directory and a hidden path in it;
+  - **the working directory and every directory between it and the
+    workspace**, and every directory between a writable directory and a
+    path held read-only in it (#448 round 14). A monorepo package session's
+    package dir (`packages/app`) and `packages/` can't be moved aside to
+    leave a planted `packages/app/.claude/settings.json` in their place, which
+    a later Claude start there (a provider switch, a fork onto Claude, a new
+    session) would load and run its hooks from on the host; neither can a
+    repository inside an added directory (`b/lib`, its `.claude/` held), nor
+    a submodule's git dir.
+
+  On Claude's own sandbox such a directory isn't denied (its denial takes the
+  subtree, which would make the workspace read-only): the CLI binds every
+  directory from a writable root down to what it binds inside it, so each is
+  a mount point there too. Checked on the real CLI
+  (`sandbox-claude-real.test.ts`, "held in place"): moving a package dir, the
+  dir above it, a repository inside an added dir, and the dir between a
+  workspace and the added dir holding it all fail ("Device or resource
+  busy"). The gate's check holds what the CLI doesn't.
+
+### The daemon's own work in a session's directories
+
+The daemon reads and writes the working directory itself, outside every
+sandbox: the snapshot at each turn's start and end, going back a turn, a fork
+from a turn (the worktree, the files it carries, the files it rolls back), a
+fork's setup command, a client's file read, the project's MCP config, the
+end-of-turn git looks. Each takes the working directory as pinned
+(`PinnedDir`), checks it before and again after, and runs git with it as the
+directory git starts in (`GIT_WORK_TREE=.`), so even a swap racing it can't
+send the work elsewhere unnoticed. One that changed is refused, never
+followed: "`<path>` changed under the session: it is reached through a
+symbolic link now (…); going back a turn refused (never followed)", said on
+the session once per change (event `workdir.changed`) and audited
+(`session.workdir_changed`). Nothing of where the link leads is copied into
+the session's snapshots, written or deleted. This holds for a session
+without a sandbox too (its working directory is pinned at its first use).
+
+What codeoid makes in a session's directories (the project settings'
+placeholders, its entries in `info/exclude`, worktree folders, the CLI's
+worktree dir) is made through the same module: in a directory checked before
+and after, each directory on the way never a link, a file opened
+`O_CREAT | O_EXCL | O_NOFOLLOW`, a file rewritten whole beside it and renamed
+over it; an empty worktree folder is removed only where no part of its path
+is a link. The look at the repository's worktree entries runs with the
+repository's git dir pinned.
+
+A static check (`src/tests/pinned-paths-static.test.ts`) fails when a direct
+file-system use, a spawned program, a `cwd` or a `GIT_WORK_TREE` appears in
+the sandbox, session or checkpoint modules without a `// paths:` comment
+saying why it is safe (the daemon's own dir, the user's own config no sandbox
+writes, a look, a path already checked through `pinned.ts`).
+
+### An agent's own grant, shared later
+
+A directory the agent added itself (an autonomous `request_directory`) is
+never one another session writes (above). When another session comes to
+work there afterwards (made in it, or given it), the next turn's resolution
+lets the agent's grant go: said ("…, which the agent added, is no longer
+writable: … is session "infra"'s workspace"), audited
+(`session.sandbox_dir_dropped`). The owner can add it as theirs if both
+should write it.
 
 ## Working across repositories
 
@@ -918,7 +995,7 @@ read all of `~/Documents`. Name roots in `sandbox.projectRoots` for it.
 - **A root named through a link** (`~/code` → `~/Workspace`, or to
   `/data/code`) is used **where it really is**, said ("project root ~/code is
   /home/you/Workspace (where it really is): read there"): what is hidden in
-  it is hidden there, and it is [pinned](#directories-bound-by-name-are-pinned)
+  it is hidden there, and it is [pinned](#pinned-paths)
   there. (Named by the link, bubblewrap showed its credential files through
   the link's path, and Claude's sandbox made every command fail.)
 - **Refused as a root**: `/`, your home or a dir holding it, anything in a
@@ -1053,7 +1130,7 @@ again if it should be.
   directories are checked when it is defined or edited, as a session's are
   when it is created (one that can't be added refuses the routine), and kept
   by their real path (`~/…` and a link-named one included); each run's
-  session [pins](#directories-bound-by-name-are-pinned) them when it starts.
+  session [pins](#pinned-paths) them when it starts.
   An added dir inside another isn't kept twice: the outer one holds it.
 
 `request_directory`, per backend:
@@ -1126,13 +1203,28 @@ home is the workspace).
   repository** (the owner's to add; never added autonomously) is writable,
   and its own admin dir with it; the rest of the repository's structure
   stays held.
-- [Pins](#directories-bound-by-name-are-pinned) are checked right before a
+- [Pins](#pinned-paths) are checked right before a
   program starts, by path: a process **outside** this session's sandboxes
   that writes the parent of a bound directory (another session the owner let
   write the same tree, which its card warned of) and swaps it back and forth
-  could still land a swap between the check and bubblewrap's bind. Within
-  the session's own sandboxes the parents can't be moved (mount points), and
-  no autonomous grant overlaps another session's checkout.
+  could still land a swap between the check and bubblewrap's bind; the same
+  between the daemon's own check of the working directory and the start of
+  the git it runs there (the check after it says so, but can't take back
+  what that git did). Within the session's own sandboxes the parents, the
+  working directory and the dirs on its way up can't be moved (mount
+  points), and no autonomous grant overlaps another session's checkout (one
+  that comes to, is let go at the next turn).
+- A path held but **missing when the sandbox was built** (a worktree folder
+  removed while empty, a location) is checked against links only, and only
+  when it is there: one made between the launch's check and its bind isn't
+  checked. Its location is read-only to every sandbox, so only a process
+  outside them could make it.
+- The credential files hidden in a root or an agent's own added directory
+  are those **found when the sandbox was resolved** (each turn's start at
+  most): one your own tools write there meanwhile (an `.env` an env pull
+  makes, a token written into that repository's `.git/config`), or one
+  another session renames within a directory it writes, is readable to the
+  session's commands until its next resolution.
 - The keys hidden in a root are found by name; a private key named
   otherwise (`notes.txt`) is readable.
 - The repositories and settings dirs held inside an added directory are those
@@ -1482,7 +1574,24 @@ works, and skip where it doesn't):
   shows no `.env` at its top, nothing a link in it leads to (`~/.ssh`,
   `~/Documents`, the home), no sign-in in codeoid's private dir inside it, no
   deeper key or sibling worktree's `.env`, while the rest of the root reads
-  and the workspace writes.
+  and the workspace writes. Round 14, real bubblewrap:
+  `src/tests/sandbox-held-real.test.ts`: a monorepo package session can't
+  move its package dir or `packages/` aside, nor put a link where its working
+  directory was, nor write the package's `.claude/settings.json`, while it
+  writes the package and runs git; a repository inside an added dir can't be
+  moved aside; a working directory made anew refuses the build by its
+  identity. `src/tests/sandbox-bound-pinned-real.test.ts`: a dir held in
+  place in one session's spec (an agent dir's hidden `.env`'s dir) swapped by
+  another session's command for a link to a planted daemon dir or another
+  repository refuses the first session's next command, by the handle and by
+  a launcher written before (exit 126), and nothing lands there; a held
+  `.claude/` swapped for a link refuses too. The real Claude CLI: the same
+  moves fail there ("Device or resource busy"), the dir between a workspace
+  and the added dir holding it included. Through the real SessionManager and
+  real git (`src/tests/workdir-pinned.test.ts`): a package dir swapped for a
+  link to a planted home (or made anew) between turns isn't snapshotted;
+  going back a turn, a fork from an earlier turn and a client's file read
+  are refused, said and audited; the planted home is untouched.
 - `src/tests/sandbox-codex.test.ts`: the app-server started inside real
   bubblewrap can't read a planted credential and can read its own home; codex's
   own sandbox (0.166) works nested inside codeoid's bubblewrap; with the real
