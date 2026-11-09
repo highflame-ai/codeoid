@@ -443,9 +443,11 @@ Working across repositories (sandbox/project-roots.ts, dir-rules.ts, request-dir
 "Working across repositories"): `sandbox.projectRoots` (default `@parent`: the parent of the repository's main
 checkout, `defaultProjectRoot`; none outside a repository, the home or a temp dir falls back to none, said; never
 the host's temp dir or in it, `projectRootProblem`) are shown read-only (`SandboxSpec.projectRoots`, in `reexposed`),
-the hidden list hidden inside and `projectRootSecrets` (credential files by name anywhere in a root and in the
-worktree locations shown, a `.git/config` with a credential, not the session's own; bounded per root, a root past it
-not used: fail closed, said). `SessionSandboxSetting.addedDirs` are kept by their real path when granted
+the hidden list hidden inside and `projectRootSecrets` (credential files by name or content anywhere in a root and in the
+worktree locations shown, every git config git reads with a credential: `gitDirSecrets`, bare, `modules/**`,
+`worktrees/*`, includes, a store; not the session's own; bounded per root, a root past it not used: fail closed, said;
+looked through once per resolution, `projectRootSecretsAsync`, reused by its specs: `rootScan`); a root named through
+a link is used by its real path. `SessionSandboxSetting.addedDirs` are kept by their real path when granted
 (`canonicalAddedDirs`, `addedDirReal`) and dropped at a build when that no longer is a directory reached through no
 link (`stillRealDir`; `Session#sayDroppedDirs`: said, audited, out of the setting), writable, each a workspace to
 `buildSandboxSpec` (its `gitWorkspacePaths`, `projectConfigPaths`, worktree folder, a `WorktreeEntryGuard` per
@@ -455,7 +457,9 @@ left out) and to `protectedWriteTargets` and the end-of-turn git look (`#checkAd
 in it, `controlDirProblem`). Adding a dir or a root `widens()`. `session.sandbox_dir` (owner, undelegated, owner-only confirm; remove narrows) and the agent's
 `request_directory` (`Session#requestDirectory`: guarded/interactive an owner-only confirm with the reason,
 autonomous (an unattended run's too) only `autonomousGrantProblem`'s: a repository or a dir in one strictly under a
-root, by a path with no link, else refused; guarded unattended refused; in-process on Claude/Qwen, pi's bridge,
+root, by a path with no link, never another session's or codeoid's checkout (`checkoutOverlap`, SessionManager's
+`sandboxCheckouts`; the owner's card warns), else refused; what the agent added itself (`agentDirs`) keeps a root's
+credential hiding, the owner's are the session's own (the card says so); guarded unattended refused; in-process on Claude/Qwen, pi's bridge,
 `/mcp/sandbox` loopback with a per-session token for Codex/Gemini CLI/opencode; `isRequestDirectoryTool` skips the
 gate card). A dirs-only change (`onlyDirsChanged`) leaves the runtime until `Session.ensureSandbox` applies it at a
 turn start with no turn, approval or background work (`dirsPending`, `SessionSandboxInfo.pendingDirs`), then
@@ -463,6 +467,12 @@ turn start with no turn, approval or background work (`dirsPending`, `SessionSan
 (`readAround`: its CLI binds allowRead after allowWrite), never a link in it (it would show the target) nor an entry
 that is hidden (an `allowRead` equal to a `denyRead` wins; one strictly inside stays denied, checked on the real CLI). `homeWorkspace`: the chip says "sandboxed: workspace is
 your home — only credentials are protected".
+Every directory a sandbox binds by name (workspace, workdir, added dirs, roots, worktree folders) is pinned
+(sandbox/pins.ts, #448 round 13, docs/sandbox.md "Directories bound by name are pinned"): real path and `dev:ino`,
+taken once (`SessionSandboxSetting.pins`, daemon-kept), checked at every `buildSandboxSpec`, every
+`LocalSandboxHandle.wrap` and again in the launched argv (`pinGuardArgv`: a launcher checks at each run), in
+`claudeSandboxSettings`, and at the gate (`Session#sandboxPinRefusal`); a changed one refuses, never followed. Dirs
+between nested writable roots are pinned too (`nestedRootAncestors`).
 
 Shell commands are approved by risk (#431, docs/approvals.md): `src/daemon/shell/`
 parses a command line with tree-sitter-bash (WASM, vendored `tree-sitter-bash.wasm`;

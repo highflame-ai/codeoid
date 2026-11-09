@@ -256,6 +256,17 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A directory the sandbox binds by name is never followed to where a link put there leads** (#448).
+  The workspace (a monorepo's top), the working directory, every added directory, every project root and the session's worktree folders are pinned when the session is created, the directory granted or the root first resolved: by real path and identity. Every sandbox build, every launch inside one (bubblewrap, Seatbelt, Docker, a launcher script written once included), Claude's own sandbox settings and every tool call at the gate check it first; one swapped for a link, made anew or gone refuses the command, and the session says what changed. A changed added dir is dropped at the next turn; a changed workspace stops the session's commands until it is put back. The dirs between a writable directory and another shown inside it can't be moved aside from inside (this also restores the same protection for a hidden file's dirs in a workspace under the home). Before, a session granted the repository holding its own workspace, or a directory inside another session's checkout, could get the home bound writable.
+
+- **A directory the agent added itself keeps a project root's credential hiding** (#448).
+  An autonomous `request_directory` grant no longer makes the repository's `.env`, keys or a token in its git config readable; one the owner adds (or approves) still does, and the owner's card now says so. An autonomous grant is also refused for another session's workspace, worktree folder or added directory (or a dir in or holding one), a checkout in a worktree location (forks, loops, `--worktree`), and the session's own main checkout from a fork; the owner's card warns of the same.
+
+- **More credentials are hidden in a project root** (#448).
+  Every git config git may read with a credential (a bare mirror's, a submodule's under `.git/modules`, a worktree's `config.worktree`, a file one includes, a credential store in the git dir), `extraheader` in every syntax git accepts, inline credential helpers and tokens in a URL's query; private keys by their usual names (`*_rsa`, `*_ed25519`, `id_*`, deploy keys, `*.ppk`, `*.p8`); a Mercurial `hgrc`, Yarn's `.yarnrc.yml` and Composer's `auth.json` holding one. A root named through a link is read and hidden where it really is (on bubblewrap its credential files showed through the link's path; on Claude's sandbox every command failed).
+
+- **A routine's added directories are checked and kept by their real path when it is defined** (#448), so a `~/…` or link-named one works at every run instead of being dropped, and one that can't be added is refused up front. A fork in a linked worktree is no longer told its own repository's git config is hidden. The look through roots for credentials no longer holds up the daemon and is done once per resolution, and a default root too big to look through says what counts and what to set.
+
 - **Agents in a sandboxed session can read other Claude sessions' transcripts again.**
   `~/.claude/projects` is on the sandbox's read-only home allowlist by default: shell commands and Claude's file tools can look up what another session did, never change it. Remove it from `sandbox.homeReadable` to hide them (a secret once pasted into a session is in its transcript).
 
