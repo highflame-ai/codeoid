@@ -188,6 +188,7 @@ function gitEnv(extra: Record<string, string>): Record<string, string> {
 /** Belt and braces on top of the shadow repo's own config. */
 const SAFE_FLAGS = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"];
 
+// paths: a git, with the cwd each caller gives: the shadow repository, or a work tree's path inside inPinnedDir (checked before and after)
 async function run(
   args: string[],
   opts: { cwd: string; env: Record<string, string>; timeoutMs: number; input?: string },
@@ -208,6 +209,7 @@ async function run(
  * directory and renamed into place, so a crash can't leave a repo that looks
  * ready but lacks its configuration.
  */
+// paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 async function ensureShadow(shadow: string, timeoutMs: number): Promise<void> {
   if (existsSync(path.join(shadow, "HEAD"))) return;
   const parent = path.dirname(shadow);
@@ -239,6 +241,7 @@ async function ensureShadow(shadow: string, timeoutMs: number): Promise<void> {
   }
 }
 
+// paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 async function shadowSizeBytes(shadow: string, timeoutMs: number): Promise<number> {
   const out = await run(["count-objects", "-v"], { cwd: shadow, env: gitEnv({ GIT_DIR: shadow }), timeoutMs });
   let kib = 0;
@@ -258,6 +261,7 @@ type OrderEntry = { turnId: string; sha: string; late: boolean; head?: string };
 
 const orderLine = (e: OrderEntry): string => `${e.turnId} ${e.sha}${e.late ? " late" : ""}${e.head ? ` head=${e.head}` : ""}\n`;
 
+// paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 async function readOrder(shadow: string): Promise<OrderEntry[]> {
   try {
     const raw = await readFile(path.join(shadow, "turns.log"), "utf8");
@@ -287,6 +291,7 @@ async function readOrder(shadow: string): Promise<OrderEntry[]> {
  * names and retry. (Nested repositories are recorded as a pointer to their
  * checked-out commit, never their files — git's model for embedded repos.)
  */
+// paths: in the work tree's path stageWorkTree was given inside inPinnedDir (checked before and after), git given it as `.`
 async function addAll(workdir: string, env: Record<string, string>, timeoutMs: number, extra: string[]): Promise<void> {
   const excludes = [...extra];
   for (let attempt = 0; attempt < 20; attempt++) {
@@ -392,6 +397,7 @@ export async function createCheckpoint(opts: {
     await prune(shadow, limits.maxPerSession, t).catch(() => {});
     // A first snapshot of a big tree leaves one loose object per file; pack
     // them so the store stays compact and cheap to copy for forks.
+    // paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
     if (first) await run(["repack", "-a", "-d", "-q"], { cwd: shadow, env: shadowEnv, timeoutMs: t * 4 }).catch(() => {});
     return { ok: true, sha, late };
   } catch (err) {
@@ -407,6 +413,7 @@ export async function createCheckpoint(opts: {
  * and has checked `workdir` (a pinned dir's path): every git here starts in
  * it and takes it as `.`, never resolving the path again.
  */
+// paths: in the work tree's path its caller checked (inPinnedDir), git given it as `.`; the index and objects are the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 async function stageWorkTree(
   shadow: string,
   workdir: string,
@@ -481,6 +488,7 @@ async function stageWorkTree(
  * (same scope and exclusions as a snapshot), without recording a checkpoint
  * — what "go back a turn" compares a snapshot against.
  */
+// paths: the work tree pinned and checked before and after (inPinnedDir); the index is the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 export async function currentTree(opts: {
   root: string;
   workdir: WorkTree;
@@ -564,6 +572,7 @@ export async function diffTrees(root: string, sessionId: string, from: string, t
  * directories, a deleted file whose path is now taken by an ignored one):
  * the target is `to` with those entries taken from `from`.
  */
+// paths: the work tree pinned and checked before and after (inPinnedDir); the index is the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 export async function restoreTree(opts: {
   root: string;
   workdir: WorkTree;
@@ -627,6 +636,7 @@ export class RestoreConflictError extends Error {
 }
 
 /** Tree `to`, with each path in `keep` as it is in `from` (or absent when `from` lacks it). */
+// paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 async function treeKeeping(shadow: string, to: string, from: string, keep: readonly string[], timeoutMs: number): Promise<string> {
   const tmp = path.join(shadow, `index.keep-${process.pid}-${Date.now()}`);
   const env = gitEnv({ GIT_DIR: shadow, GIT_INDEX_FILE: tmp, GIT_LITERAL_PATHSPECS: "1" });
@@ -648,6 +658,7 @@ async function treeKeeping(shadow: string, to: string, from: string, keep: reado
 }
 
 /** Drop all but the newest `keep` checkpoints, and the objects only they held. */
+// paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 async function prune(shadow: string, keep: number, timeoutMs: number, opts: { reclaimNow?: boolean } = {}): Promise<void> {
   const order = await readOrder(shadow);
   const excess = order.length - Math.max(0, keep);
@@ -678,6 +689,7 @@ const RECLAIM_EVERY = 20;
  * Every checkpoint of a session, oldest first: `turnId → sha`. Trusts only
  * entries whose ref still points at the commit the daemon recorded.
  */
+// paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 export async function listCheckpoints(
   root: string,
   sessionId: string,
@@ -717,6 +729,7 @@ export async function listCheckpoints(
  * session is destroyed. `turnIds` limits the copy; default all. Objects are
  * fetched, so the copy is self-contained and survives the source repo.
  */
+// paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 export async function copyCheckpoints(opts: {
   root: string;
   fromSessionId: string;
@@ -749,6 +762,7 @@ export async function copyCheckpoints(opts: {
  * Remove shadow repositories that belong to no known session — left behind
  * by a crash between destroy's steps, or by state lost outside the daemon.
  */
+// paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 export async function sweepCheckpoints(root: string, knownSessionIds: ReadonlySet<string>): Promise<number> {
   let removed = 0;
   let names: string[];
@@ -768,6 +782,7 @@ export async function sweepCheckpoints(root: string, knownSessionIds: ReadonlySe
 }
 
 /** Delete one checkpoint (a snapshot for a turn that never started). */
+// paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 export async function deleteCheckpoint(root: string, sessionId: string, turnId: string): Promise<void> {
   if (!SAFE_ID.test(turnId)) return;
   const shadow = shadowRepoPath(root, sessionId);
@@ -779,6 +794,7 @@ export async function deleteCheckpoint(root: string, sessionId: string, turnId: 
 }
 
 /** Rewrite turns.log atomically — a torn rewrite would hide every snapshot. */
+// paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 async function writeOrder(shadow: string, entries: readonly OrderEntry[]): Promise<void> {
   const file = path.join(shadow, "turns.log");
   const tmp = `${file}.tmp`;
@@ -787,6 +803,7 @@ async function writeOrder(shadow: string, entries: readonly OrderEntry[]): Promi
 }
 
 /** Delete a session's checkpoints (session destroy). Never throws. */
+// paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 export async function deleteCheckpoints(root: string, sessionId: string): Promise<void> {
   try {
     await rm(shadowRepoPath(root, sessionId), { recursive: true, force: true });
@@ -796,6 +813,7 @@ export async function deleteCheckpoints(root: string, sessionId: string): Promis
 }
 
 /** {@link shadowGit} with literal pathspecs (a file named `*` is that file). */
+// paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 export function shadowGitLiteral(root: string, sessionId: string, args: string[]): Promise<string> {
   const shadow = shadowRepoPath(root, sessionId);
   return run(args, {
@@ -812,6 +830,7 @@ export function shadowGitLiteral(root: string, sessionId: string, args: string[]
  * since. The snapshot's ignore files are materialized in a scratch directory
  * and asked with `check-ignore --no-index`; nothing in the workdir is read.
  */
+// paths: a scratch repository in the daemon's private dir, and the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides): no work tree
 export async function ignoredUnderTree(root: string, sessionId: string, sha: string, paths: readonly string[]): Promise<string[]> {
   if (paths.length === 0) return [];
   const shadow = shadowRepoPath(root, sessionId);
@@ -872,6 +891,7 @@ export async function ignoredUnderTree(root: string, sessionId: string, sha: str
  * Run git against a session's shadow repository (for the features that read
  * or restore checkpoints). Same hardened environment as snapshots.
  */
+// paths: the shadow repository: the daemon's own, in its transcripts dir (which every sandbox hides)
 export async function shadowGit(
   root: string,
   sessionId: string,

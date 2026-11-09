@@ -297,6 +297,7 @@ interface CopiedLogin {
 /** Larger isn't a login. */
 const LOGIN_LIMIT = 256 * 1024;
 
+// paths: a look (a login's text), no write
 function readSmallFile(p: string): string | null {
   try {
     const st = lstatSync(p);
@@ -322,6 +323,7 @@ function syncLogins(copied: CopiedLogin[]): LoginSync {
     if (merged.text === c.held) continue;
     // The real one must still be what was copied: a refresh someone else saved meanwhile isn't overwritten.
     if (readSmallFile(c.real) !== c.held) continue;
+    // paths: the user's own login file, in the backend's config dir (every sandbox hides it): written beside it (O_EXCL) and renamed over it, never through a link
     const part = join(dirname(c.real), `.${basename(c.real)}.codeoid-${process.pid}-${randomBytes(4).toString("hex")}`);
     try {
       writeFileSync(part, merged.text, { mode: 0o600, flag: "wx" });
@@ -373,6 +375,7 @@ export function withLoginsSynced(handle: SandboxHandle, home: Pick<PrivateHome, 
   };
 }
 
+// paths: the user's own backend config (every sandbox hides it) and the session's state dir (the daemon's, in its transcripts dir, which every sandbox hides): found where they are once, at a backend's start
 function realOr(p: string): string {
   try {
     return realpathSync(p);
@@ -399,6 +402,7 @@ export function preparePrivateHome(
   const extraFiles = opts.extraFiles ?? {};
   const copied: CopiedLogin[] = [];
   const out: PrivateHome = { home: target, writable: [target], readable: [], syncLogins: () => syncLogins(copied) };
+  // paths: into the private home: fresh, made by the daemon in its private dir for this start
   const link = (name: string, to: string) => {
     try {
       symlinkSync(to, join(target, name));
@@ -415,6 +419,7 @@ export function preparePrivateHome(
       copyEntryDir(join(target, name));
       continue;
     }
+    // paths: the session's state dir: the daemon's own (its transcripts dir, which every sandbox hides); bound writable only at its own path (a mount point in the backend's sandbox, and pinned by the spec)
     const own = join(opts.state, name);
     try {
       mkdirSync(own, { recursive: true, mode: 0o700 });
@@ -425,6 +430,7 @@ export function preparePrivateHome(
     link(name, at);
     out.writable.push(at);
   }
+  // paths: a look at the user's own backend config dir (every sandbox hides it), no write
   let names: string[] = [];
   try {
     names = readdirSync(source);
@@ -437,6 +443,7 @@ export function preparePrivateHome(
     const refresh = layout.refreshable?.[name];
     if (refresh) {
       // A private copy it may save a refresh to; written back when its process ends.
+      // paths: copied from the user's own backend config into the private home made for this start (O_EXCL)
       const real = realOr(from);
       const held = readSmallFile(real);
       if (held !== null) {
@@ -461,6 +468,7 @@ export function preparePrivateHome(
   return out;
 }
 
+// paths: the private home made for this start: the daemon's own
 function copyEntryDir(to: string): void {
   try {
     mkdirSync(to, { mode: 0o700 });
@@ -470,6 +478,7 @@ function copyEntryDir(to: string): void {
 }
 
 /** A small file copied (0600), a directory made empty, anything else left out. */
+// paths: from the user's own backend config (every sandbox hides it) into the private home made for this start
 function copyEntry(from: string, to: string, o: { fileOnly?: boolean; anySize?: boolean } = {}): void {
   let st: ReturnType<typeof statSync>;
   try {

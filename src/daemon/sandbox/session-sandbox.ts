@@ -923,6 +923,7 @@ export class SessionSandbox {
       claudeTemp: () => this.#ensureClaudeTemp(),
       gitShim: (caller) => {
         // Checked at each query: one removed meanwhile (a temp cleaner) is written again rather than leave the CLI the host's git.
+        // paths: a look at the shim in the session's launcher dir (the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees))
         if (!gitShim || !existsSync(join(gitShim, "git"))) gitShim = this.#writeGitShim(provider, caller);
         return gitShim;
       },
@@ -941,6 +942,7 @@ export class SessionSandbox {
     return this.#sessionId.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "session";
   }
 
+  // paths: the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees)
   #privateHome(key: string): string {
     if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
     if (!this.#homesDir) this.#homesDir = mkdtempSync(join(sandboxRoot(), `home-${this.#sessionSlug()}-`));
@@ -951,6 +953,7 @@ export class SessionSandbox {
   }
 
   /** The session's state root: under the transcripts dir when there is one, else (an embedder, tests) with its private homes. */
+  // paths: the session's state dir: the daemon's own, in its transcripts dir (which every sandbox hides); a backend writes inside it, never replaces it (each dir it is given is a mount point there)
   #stateRoot(): string {
     const dir = this.#config?.transcriptDir;
     const safe = this.#sessionId.replace(/[^A-Za-z0-9_-]/g, "") || "session";
@@ -959,6 +962,7 @@ export class SessionSandbox {
     return join(this.#homesDir, ".state");
   }
 
+  // paths: the session's state dir: the daemon's own, in its transcripts dir (which every sandbox hides); a backend writes inside it, never replaces it (each dir it is given is a mount point there)
   #stateDir(key: string): string {
     if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
     const dir = join(this.#stateRoot(), key.replace(/[^A-Za-z0-9_-]/g, "") || "backend");
@@ -967,10 +971,12 @@ export class SessionSandbox {
   }
 
   /** Remove what the session's backends kept across starts (with the session: its destroy). */
+  // paths: the session's state dir: the daemon's own, in its transcripts dir (which every sandbox hides); a backend writes inside it, never replaces it (each dir it is given is a mount point there)
   removeState(): void {
     rmSync(this.#stateRoot(), { recursive: true, force: true });
   }
 
+  // paths: the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees)
   #ensureClaudeTemp(): ClaudeTempDirs {
     if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
     if (!this.#claudeTemp) {
@@ -984,6 +990,7 @@ export class SessionSandbox {
     return this.#claudeTemp;
   }
 
+  // paths: the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees)
   #ensureLauncherDir(): string {
     if (!this.#launcherDir) this.#launcherDir = mkdtempSync(`${launcherRoot()}${this.#sessionSlug()}-`);
     return this.#launcherDir;
@@ -999,6 +1006,7 @@ export class SessionSandbox {
     if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
     const launcherDir = this.#ensureLauncherDir();
     // Gone (a temp cleaner, #448 round 5): made again, so a CLI started now finds the shim, not the host's git.
+    // paths: the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees)
     mkdirSync(launcherDir, { recursive: true, mode: 0o700 });
     const dir = join(launcherDir, "git-bin");
     let launcher: string | null = null;
@@ -1009,12 +1017,14 @@ export class SessionSandbox {
       // In the caller's own directory, or not at all: one the sandbox hides isn't swapped for another (bwrap's `$HOME`).
       launcher = this.#writeLauncher(handle, [GIT_BIN], [], "git", CWD_FROM_CALLER);
       // The provider's own program (past the pin guard's shell): when it is gone, git runs defused.
+      // paths: no cwd: the wrapped argv's program only
       program = handle.wrap ? (unguardedArgv(handle.wrap([GIT_BIN], { cwd: "", env: {} }).argv)[0] ?? null) : null;
     }
     return writeGitShim(dir, { launcher, provider: program, caller, home: homedir() });
   }
 
   /** Where the shim's git gets a fresh temp dir per run where the provider needs a real one (Seatbelt): its own, not the session's. */
+  // paths: the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees)
   #ensureGitTempDir(): string {
     if (!this.#gitTempDir) this.#gitTempDir = mkdtempSync(join(sandboxRoot(), `git-tmp-${this.#sessionSlug()}-`));
     mkdirSync(this.#gitTempDir, { recursive: true, mode: 0o700 });
@@ -1029,6 +1039,7 @@ export class SessionSandbox {
     const wrapped = handle.wrap(argv, { cwd, env: Object.fromEntries(envNames.map((n) => [n, ""])) });
     const path = join(launcherDir, `launch-${name ? name.replace(/[^A-Za-z0-9_-]/g, "") : ++this.#launchers}`);
     // Written beside it and renamed over it: a caller running it meanwhile gets the old one or the new one, whole.
+    // paths: the session's launcher dir (the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees)): written beside the launcher and renamed over it
     const part = `${path}.${++this.#launchers}.part`;
     writeFileSync(part, launcherScript(wrapped.argv), { mode: 0o700 });
     renameSync(part, path);
@@ -1174,6 +1185,7 @@ export class SessionSandbox {
    * need them there). Never through a link (worktrees.ts `worktreeFoldersOf`).
    */
   prepareFolders(): void {
+    // paths: a look (are the folders there): they are made through makeAt (worktrees.ts)
     if (this.#closed || this.#folders.size === 0 || [...this.#folders].every((f) => existsSync(f))) return;
     for (const workspace of [this.#workspace(), ...this.#dirs.added]) {
       try {
@@ -1230,6 +1242,7 @@ export class SessionSandbox {
   }
 
   /** The session's private temp dir (made on first use, 0700). */
+  // paths: the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees)
   #ensureTempDir(): string {
     if (!this.#tempDir) this.#tempDir = mkdtempSync(join(sandboxRoot(), `tmp-${this.#sessionSlug()}-`));
     return this.#tempDir;
@@ -1247,10 +1260,12 @@ export class SessionSandbox {
     this.#closed = true;
     this.#runtime = null;
     await this.#closeHandles();
+    // paths: the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees)
     if (this.#tempDir) {
       rmSync(this.#tempDir, { recursive: true, force: true });
       this.#tempDir = null;
     }
+    // paths: the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees)
     for (const dir of [this.#launcherDir, this.#homesDir, this.#gitTempDir, this.#claudeTemp ? join(this.#claudeTemp.cli, "..") : null]) {
       if (dir) rmSync(dir, { recursive: true, force: true });
     }
@@ -1353,6 +1368,7 @@ export async function openCheckSandbox(opts: {
   if (rootProblem) return { kind: "refused", reason: rootProblem };
   const mode: NetworkMode = provider.capabilities.network.includes(network.mode) ? network.mode : "off";
   const safe = opts.label.replace(/[^A-Za-z0-9_-]/g, "").slice(0, 32) || "check";
+  // paths: a check's temp dir: the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees)
   const tempDir = mkdtempSync(join(sandboxRoot(), `check-${safe}-`));
   let handle: SandboxHandle;
   try {
@@ -1368,11 +1384,13 @@ export async function openCheckSandbox(opts: {
     });
     handle = await provider.open(spec);
   } catch (err) {
+    // paths: a check's temp dir: the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees)
     // Nothing opened: nothing of it is left behind.
     rmSync(tempDir, { recursive: true, force: true });
     throw err;
   }
   if (!handle.wrap) {
+    // paths: a check's temp dir: the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees)
     await handle.close();
     rmSync(tempDir, { recursive: true, force: true });
     return { kind: "refused", reason: `${provider.displayName} can't run a local command` };
@@ -1380,6 +1398,7 @@ export async function openCheckSandbox(opts: {
   return {
     kind: "on",
     wrap: handle.wrap.bind(handle),
+    // paths: a check's temp dir: the daemon's private dir (sandboxRoot: 0700, its own, which no sandbox sees)
     close: async () => {
       await handle.close();
       rmSync(tempDir, { recursive: true, force: true });

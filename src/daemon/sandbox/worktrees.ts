@@ -40,6 +40,7 @@ function within(child: string, parent: string): boolean {
   return child === parent || child.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
 }
 
+// paths: a repository's layout, found once at a spec build (a link from the main checkout's parent down is refused: `linked`); what it gives is pinned by the spec, and made only through makeAt
 function realOr(p: string): string {
   try {
     return realpathSync(p);
@@ -48,6 +49,7 @@ function realOr(p: string): string {
   }
 }
 
+// paths: a look (is it a link: then refused), no write
 function isLink(p: string): boolean {
   try {
     return lstatSync(p).isSymbolicLink();
@@ -57,6 +59,7 @@ function isLink(p: string): boolean {
 }
 
 /** A dir of the daemon user's own, not a link. */
+// paths: a look, no write
 function ownDir(p: string): boolean {
   try {
     const st = lstatSync(p);
@@ -345,6 +348,7 @@ export function existingFolderName(locations: readonly WorktreeLocation[], sessi
   const suffix = `-${sessionShortId(sessionId)}`;
   for (const loc of locations) {
     let names: string[] = [];
+    // paths: a look (which folder names a location holds), no write
     try {
       names = readdirSync(loc.dir).filter((n) => n.endsWith(suffix) && n.length > suffix.length);
     } catch {
@@ -377,6 +381,7 @@ export interface WorktreeAdmin {
 export function worktreeAdminsOf(common: string, limit = 500): WorktreeAdmin[] {
   const dir = join(common, "worktrees");
   let names: string[] = [];
+  // paths: a look at the repository's worktree admin dirs, no write
   try {
     names = readdirSync(dir, { withFileTypes: true })
       .filter((e) => e.isDirectory())

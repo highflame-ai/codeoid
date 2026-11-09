@@ -67,6 +67,7 @@ function realOrPath(p: string): string {
 /** What exists at a path: a directory, something else, nothing. */
 export type DockerPathKind = "dir" | "other" | null;
 
+// paths: a look at what is there, no write: a pinned path the handle checked first
 function pathKind(p: string): DockerPathKind {
   try {
     const st = lstatSync(realOrPath(p));
@@ -100,6 +101,7 @@ export interface DockerRunOptions {
 /** Where a container runtime socket the owner let in is mounted inside the container (`DOCKER_HOST` names it). */
 export const CONTAINER_DOCKER_SOCKET = "/var/run/docker.sock";
 
+// paths: the owner's container socket (opted in), outside every sandbox's writes: a look at its group
 function socketGroup(p: string): number | null {
   try {
     return statSync(p).gid;
@@ -242,6 +244,7 @@ export class DockerSandboxProvider implements SandboxProvider {
     const docker = this.#client();
     if (!docker) return { available: false, reason: "the docker client isn't installed" };
     try {
+      // paths: the probe: a fixed argv, in no session's directory
       const proc = Bun.spawn([docker, "version", "--format", "{{.Server.Version}}"], { stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 10_000 });
       const [code, out, err] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
       if (code === 0 && out.trim()) return { available: true, detail: `Docker ${out.trim()}` };
@@ -277,6 +280,7 @@ export class DockerSandboxProvider implements SandboxProvider {
           // A launcher (no cwd: it runs from wherever it is started, maybe many at once) names none.
           ...(opts.cwd ? { name: `codeoid-${safe}-${randomBytes(4).toString("hex")}` } : {}),
           handle: handleId,
+          // paths: the container's own working directory (-w), inside it
           cwd: opts.cwd,
           envNames: Object.keys(opts.env),
           uid,
@@ -287,6 +291,7 @@ export class DockerSandboxProvider implements SandboxProvider {
       env: { ...opts.env, ...clientEnv },
     });
     // Containers outlive a killed client: remove every one this handle started.
+    // paths: docker ps / rm by this handle's label: no path
     const onClose = () =>
       new Promise<void>((resolve) => {
         execFile(docker, ["ps", "-aq", "--filter", `label=codeoid.handle=${handleId}`], { env: { ...clientEnv } }, (err, out) => {

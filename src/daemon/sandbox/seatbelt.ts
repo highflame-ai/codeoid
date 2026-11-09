@@ -231,6 +231,7 @@ export class SeatbeltSandboxProvider implements SandboxProvider {
   async probe(): Promise<SandboxProbe> {
     if (process.platform !== "darwin") return { available: false, reason: "Seatbelt runs on macOS only" };
     try {
+      // paths: the probe: a fixed argv, in no session's directory
       const proc = Bun.spawn([this.#bin, "-p", "(version 1)(allow default)", "/usr/bin/true"], { stdin: "ignore", stdout: "ignore", stderr: "pipe", timeout: 10_000 });
       const [code, err] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
       if (code === 0) return { available: true, detail: this.#bin };
@@ -246,6 +247,7 @@ export class SeatbeltSandboxProvider implements SandboxProvider {
 
   openSync(spec: SandboxSpec): SandboxHandle {
     const bin = this.#bin;
+    // paths: a look (directory or file) for a rule's form, once the handle checked the pins
     const isDir = (p: string): boolean | null => {
       try {
         return statSync(p).isDirectory();
@@ -257,6 +259,7 @@ export class SeatbeltSandboxProvider implements SandboxProvider {
     if (spec.privateTemp) {
       // The temp dir is made per program, in the spec's (a real path: Seatbelt sees `/private/…`).
       let parent = spec.tempDir;
+      // paths: the session's temp dir: made by the daemon in its private dir, which no sandbox sees
       try {
         parent = realpathSync(parent);
       } catch {

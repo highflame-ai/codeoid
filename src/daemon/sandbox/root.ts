@@ -18,6 +18,7 @@ import { join } from "node:path";
 let root: string | null = null;
 
 /** The directory (made on first use; made again, at the same path, if a temp cleaner removed it). */
+// paths: the daemon's private dir: made 0700 by it, exclusive, never a link, which no sandbox sees
 export function sandboxRoot(): string {
   if (!root) {
     const made = mkdtempSync(join(tmpdir(), "codeoid-sandbox-"));
@@ -53,6 +54,7 @@ export function sandboxRootIfMade(): string | null {
  * A fresh private dir of the daemon's own, `<root>/<prefix>XXXXXX`: under the
  * root every sandbox hides, whenever it is made (a sign-in started after a
  * session's sandbox was built is hidden from it too).
+ // paths: the daemon's private dir (sandboxRoot)
  */
 export function daemonTempDir(prefix: string): string {
   return mkdtempSync(join(sandboxRoot(), prefix));
@@ -63,6 +65,7 @@ export function daemonTempPath(name: string): string {
   return join(sandboxRoot(), name);
 }
 
+// paths: a look at the host's temp dir for daemons' private dirs, no write
 /** Every daemon's root in `tmp` (this one's, another's, a killed one's): `codeoid-sandbox-*`. */
 export function sandboxRootsIn(tmp: string = tmpdir()): string[] {
   try {

@@ -711,6 +711,7 @@ function planHash(parts: readonly string[]): string {
 }
 
 /** Whether `rel` exists in `workdir` as something other than a directory (links not followed). */
+// paths: a look (no write) in the working directory as pinned, just checked by #planRewind; the restore checks it again
 async function isNonDirectory(workdir: string, rel: string): Promise<boolean> {
   try {
     return !(await lstat(join(workdir, rel))).isDirectory();
@@ -724,6 +725,7 @@ async function isNonDirectory(workdir: string, rel: string): Promise<boolean> {
  * not followed). Exact: on a case-insensitive filesystem `lstat("readme.md")`
  * also finds `README.md`, which would make a case-only rename look occupied.
  */
+// paths: a look (no write) in the working directory as pinned, just checked by #planRewind; the restore checks it again
 async function existsOnDisk(workdir: string, rel: string): Promise<boolean> {
   try {
     await lstat(join(workdir, rel));
@@ -741,6 +743,7 @@ async function existsOnDisk(workdir: string, rel: string): Promise<boolean> {
 }
 
 /** Whether any parent directory of `rel` inside `workdir` is a symlink. */
+// paths: a look (no write) in the working directory as pinned, just checked by #planRewind; the restore checks it again
 async function hasSymlinkedParent(workdir: string, rel: string): Promise<boolean> {
   const parts = rel.split("/");
   for (let k = 1; k < parts.length; k++) {
@@ -808,6 +811,7 @@ export function irreversibleEffects(turns: readonly CanonicalTurn[], ctx: { work
         const call = tc.input.call && typeof tc.input.call === "object" ? shellCallOf(inner, tc.input.call as Record<string, unknown>) : null;
         if (!call) continue;
         const places = Array.isArray(tc.input.paths) ? tc.input.paths.filter((p): p is string => typeof p === "string" && p.length > 0) : [];
+        // paths: judging what a recorded command would reach (outsideEffects): no use of the path
         if ((places.length > 0 ? places : [ctx.workdir]).some((cwd) => outsideEffects(call.command, { ...ctx, cwd: resolvePath(ctx.workdir, cwd) }))) {
           out.push({ tool: inner, detail: shorten(call.command) });
         }
@@ -2259,6 +2263,7 @@ export class Session {
       if (!rt) throw new Error("no runtime");
       const own = this.#provider.hostFiles?.() ?? {};
       const bounds = hostToolBoundsFor(rt, this.#provider.id, this.#provider.hostReadable?.() ?? [], own, userHiddenPaths(this.#config));
+      // paths: judging a tool call's input against the sandbox's bounds: no use of the path
       return hostFileToolBreach(toolName, input, { bounds, workdir: this.workdir, ...(shellCwd !== undefined ? { cwd: shellCwd } : {}) });
     } catch {
       return { path: "(couldn't be judged)", access: "read", why: "unresolved" };
@@ -8929,6 +8934,7 @@ export class Session {
       // daemon's credential files or a process environment is refused; one
       // searching a directory that holds them is asked about (refused in
       // autonomous mode), never auto-run.
+      // paths: judging a tool call's input (secretPathVerdict): no use of the path
       const secret = secretPathVerdict(toolName, effectiveInput, { workdir: this.workdir, configDir: getConfigDir(), cwd: shellCwd });
       // A shell command is judged by what it runs (#431): one naming a
       // credential file is refused like the file tools; a risky one asks.
@@ -9633,6 +9639,7 @@ export class Session {
         // as canUseTool's synchronous section, always after it).
         const risk = this.#shellRisk(event.name, event.input, event.shellCwd);
         const held = this.#heldWrite(event.name, event.input);
+        // paths: judging a tool call's input (secretPathVerdict): no use of the path
         const secret = secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir(), cwd: event.shellCwd });
         // Claude's sandbox asking for a host: decided by the session's network alone (#448).
         const networkAsk = event.name === SANDBOX_NETWORK_TOOL && this.#sandbox?.info?.state === "on";

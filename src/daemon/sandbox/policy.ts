@@ -259,6 +259,7 @@ const TEMP_SERVICE_SOCKET = /^(?:\.s\.PGSQL\.\d+(?:\.lock)?|mysqlx?\.sock(?:\.lo
 export function localServiceSocketPaths(tempDirs: readonly string[] = ["/tmp", "/private/tmp", "/var/tmp"]): string[] {
   const out = [...LOCAL_SERVICE_SOCKET_DIRS];
   for (const t of tempDirs) {
+    // paths: a look at the host's temp dirs (which local service sockets are there), no write
     let names: string[] = [];
     try {
       names = readdirSync(t);
@@ -304,6 +305,7 @@ export function dockerSocketPaths(
 }
 
 /** A socket the daemon's user can connect to (writable: `/var/run/docker.sock` of a user not in the docker group isn't). */
+// paths: a look, no write
 function socketAt(p: string): boolean {
   try {
     if (!statSync(p).isSocket()) return false;
@@ -316,6 +318,7 @@ function socketAt(p: string): boolean {
 
 /** The runtime sockets {@link dockerSocketPaths} looks for that exist but the daemon's user can't connect to (said, not shown). */
 export function unconnectableDockerSockets(home: string, env: Record<string, string | undefined> = process.env, platform: NodeJS.Platform = process.platform): string[] {
+  // paths: a look, no write
   const exists = (p: string) => {
     try {
       return statSync(p).isSocket();
@@ -383,6 +386,7 @@ export function hiddenPathsFor(config: CodeoidConfig | undefined, inputs: Hidden
     if (isAbsolute(abs)) out.push(abs);
   }
   const all = new Set<string>();
+  // paths: the hidden list, by the path as given and where it leads: hiding more, never less
   for (const p of out) {
     const abs = resolve(p);
     all.add(abs);
@@ -517,6 +521,7 @@ export function homeCredentialFilesIn(readable: readonly string[]): string[] {
   const out: string[] = [];
   for (const r of readable) {
     if (!r.endsWith(`${sep}.nvm`)) continue;
+    // paths: a look at a program's install (where node versions are), no write
     let versions: string[] = [];
     try {
       versions = readdirSync(join(r, "versions", "node"));
@@ -585,6 +590,7 @@ const WORKTREE_CONTROL = ["commondir", "gitdir", "config.worktree"] as const;
 /** Made when missing, so there is something to hold read-only: empty dirs, and an empty `config.worktree` (read only where the config turns it on). */
 const GIT_PLACEHOLDER_DIRS = ["hooks", "info", "modules", "remotes", "branches", "worktrees"] as const;
 
+// paths: a look, no write
 function readGitFile(dotgit: string): string | null {
   try {
     const m = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotgit, "utf8"));
@@ -633,6 +639,7 @@ export function gitLayoutOf(workspace: string, home: string = process.env.HOME ?
     if (dirname(dir) === dir) break;
   }
   if (!dotgit) return null;
+  // paths: a look, no write
   let st: ReturnType<typeof lstatSync>;
   try {
     st = lstatSync(dotgit);
@@ -741,6 +748,7 @@ export function gitWorkspacePaths(workspace: string, home: string = process.env.
   const layout = gitLayoutOf(ws, home);
   if (!layout) return out;
   const { dotgit, own } = layout;
+  // paths: looks (what the repository's layout is), no write; what is made goes through makeAt
   // A `.git` dir right at the top of the workspace: git's fallback when it is made invalid must find nothing.
   if (dirname(dotgit) === ws && !isLink(dotgit) && lstatSync(dotgit).isDirectory()) {
     const head = join(ws, "HEAD");
@@ -748,6 +756,7 @@ export function gitWorkspacePaths(workspace: string, home: string = process.env.
     if (emptyDir(head)) out.readOnly.push(head);
   }
   const common = layout.common;
+  // paths: looks, no write
   if (!common) {
     // Not a layout codeoid can verify: nothing of it is writable, the `.git` file can't be rewritten.
     if (lexists(dotgit) && !isLink(dotgit) && within(dotgit, ws) && !lstatSync(dotgit).isDirectory()) out.readOnly.push(dotgit);
@@ -856,6 +865,7 @@ export function gitLayoutProblem(workspace: string, home: string = process.env.H
 }
 
 /** An empty directory (not a link). */
+// paths: a look, no write
 function emptyDir(p: string): boolean {
   try {
     return lstatSync(p).isDirectory() && readdirSync(p).length === 0;
@@ -865,6 +875,7 @@ function emptyDir(p: string): boolean {
 }
 
 /** git's own record that `gitDir` is the submodule git dir checked out at `dotgit`'s dir: its `core.worktree` names it back. */
+// paths: a look at git's records, no write
 function validSubmodule(gitDir: string, dotgit: string): boolean {
   try {
     if (!lstatSync(gitDir).isDirectory() || !gitDirShape(gitDir)) return false;
@@ -879,6 +890,7 @@ function validSubmodule(gitDir: string, dotgit: string): boolean {
 }
 
 /** A git dir as git checks one: `objects/` and `HEAD`. */
+// paths: a look, no write
 export function gitDirShape(dir: string): boolean {
   try {
     return lstatSync(join(dir, "objects")).isDirectory() && lstatSync(join(dir, "HEAD")).isFile();
@@ -887,6 +899,7 @@ export function gitDirShape(dir: string): boolean {
   }
 }
 
+// paths: a look, no write
 function lexists(p: string): boolean {
   try {
     lstatSync(p);
@@ -896,6 +909,7 @@ function lexists(p: string): boolean {
   }
 }
 
+// paths: a look, no write
 function isLink(p: string): boolean {
   try {
     return lstatSync(p).isSymbolicLink();
@@ -939,6 +953,7 @@ function excludePlaceholders(workspace: string, home: string, names: readonly st
     if (isLink(info) || isLink(exclude)) return;
     const rel = relative(dirname(layout.dotgit), resolve(workspace));
     if (rel.startsWith("..") || isAbsolute(rel)) return;
+    // paths: a look (the file's current text, before replaceInPinned writes it whole)
     const have = lexists(exclude) ? readFileSync(exclude, "utf8") : "";
     const lines = have.split("\n");
     const add = names.map((n) => `/${rel ? `${rel.split(sep).join("/")}/` : ""}${n}`).filter((l) => !lines.includes(l));
@@ -950,6 +965,7 @@ function excludePlaceholders(workspace: string, home: string, names: readonly st
   }
 }
 
+// paths: a look, no write
 function listDirs(dir: string): string[] {
   try {
     return readdirSync(dir, { withFileTypes: true })
@@ -961,6 +977,7 @@ function listDirs(dir: string): string[] {
 }
 
 /** The `.git` file a worktree's git dir names as its checkout's (its `gitdir` file), absolute. */
+// paths: a look at git's records, no write
 function gitdirTarget(worktreeGitDir: string): string | null {
   try {
     const named = readFileSync(join(worktreeGitDir, "gitdir"), "utf8").trim();
@@ -981,6 +998,7 @@ function submoduleCheckouts(modules: string, depth = 0, budget = { left: 200 }):
   for (const name of listDirs(modules)) {
     if (--budget.left < 0) break;
     const dir = join(modules, name);
+    // paths: a look at git's records, no write
     if (gitDirShape(dir)) {
       try {
         const m = /^\s*worktree\s*=\s*(.+?)\s*$/im.exec(readFileSync(join(dir, "config"), "utf8"));
@@ -998,6 +1016,7 @@ function submoduleCheckouts(modules: string, depth = 0, budget = { left: 200 }):
 }
 
 /** git's own record that `gitDir` is the worktree whose `.git` file is `dotgit`, in a real repository `common`. */
+// paths: a look at git's records, no write
 function validWorktree(gitDir: string, common: string, dotgit: string): boolean {
   try {
     if (!lstatSync(common).isDirectory() || !lstatSync(join(common, "objects")).isDirectory() || !lstatSync(join(common, "HEAD")).isFile()) return false;
@@ -1068,6 +1087,7 @@ export function projectConfigPaths(workspace: string, home: string = process.env
 export function sandboxCacheDir(home: string, env: Record<string, string | undefined> = process.env): string | null {
   const xdg = env.XDG_CACHE_HOME && isAbsolute(env.XDG_CACHE_HOME) ? env.XDG_CACHE_HOME : join(home, ".cache");
   const dir = join(xdg, "codeoid-sandbox");
+  // paths: the sandboxes' cache dir in the user's own cache dir: made by the daemon; in a sandbox it is a mount point (no rename) under a home that is read-only there
   try {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     const st = lstatSync(dir);
@@ -1099,6 +1119,7 @@ export function toolchainCacheEnv(cacheDir: string, home: string, env: Record<st
   // The user's own downloads (read-only inside, `~/go/pkg` is on the allowlist) before the network.
   const gopath = env.GOPATH?.split(":")[0] || join(home, "go");
   const downloaded = join(env.GOMODCACHE || join(gopath, "pkg", "mod"), "cache", "download");
+  // paths: a look, no write
   if (existsSync(downloaded)) out.GOPROXY = `file://${downloaded},${env.GOPROXY || "https://proxy.golang.org,direct"}`;
   return out;
 }
@@ -1336,6 +1357,7 @@ function sandboxRootOrNull(): string | null {
   }
 }
 
+// paths: at a spec build only: a path found where it really is, once (a workspace or added dir the build just checked against its pin, the repository's layout, the daemon's or the user's own dirs); whatever of it is bound is pinned there (pinOf) and never resolved again at a launch
 function realOr(p: string): string {
   try {
     return realpathSync(p);
@@ -1472,6 +1494,7 @@ export function programLocations(
 }
 
 /** The nearest directory at or above `file`'s holding a `package.json`, below `/`. */
+// paths: a look at a program's install, no write
 function packageRoot(file: string): string | null {
   for (let dir = dirname(file); dir !== dirname(dir); dir = dirname(dir)) {
     try {
@@ -1484,6 +1507,7 @@ function packageRoot(file: string): string | null {
 }
 
 /** The program a script's `#!` line runs (`env`'s argument for `#!/usr/bin/env x`), or null. */
+// paths: a look at a program's first line, no write
 function shebangProgram(file: string): string | null {
   let head = "";
   try {

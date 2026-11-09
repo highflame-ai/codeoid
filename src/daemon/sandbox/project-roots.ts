@@ -41,6 +41,7 @@ function within(child: string, parent: string): boolean {
   return child === parent || child.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
 }
 
+// paths: a look, no write
 function lexists(p: string): boolean {
   try {
     lstatSync(p);
@@ -50,6 +51,7 @@ function lexists(p: string): boolean {
   }
 }
 
+// paths: a root or an added dir found by its real path once, when first resolved or granted; then pinned (pinRecord) and checked at every use (pinned.ts)
 function realOr(p: string): string {
   try {
     return realpathSync(p);
@@ -67,6 +69,7 @@ export const ADDED_DIR_SCAN_LIMIT = 20_000;
 export const PROJECT_ROOT_SCAN_LIMIT = 20_000;
 
 /** The first component of `p` as written (absolute) that is a symbolic link, or null (none, or a missing one first). */
+// paths: a look (which component is a link), no write
 export function linkInPath(p: string): string | null {
   let at = "";
   for (const part of resolve(p).split("/").filter(Boolean)) {
@@ -81,6 +84,7 @@ export function linkInPath(p: string): string | null {
 }
 
 /** Where `dir` (`~` expanded; absolute) really is, or null when it isn't there: what is stored and bound when it is added. */
+// paths: an added dir found by its real path once, when granted; then pinned (pinRecord) and checked at every use (pinned.ts)
 export function addedDirReal(dir: string, home: string = process.env.HOME ?? homedir()): string | null {
   const abs = normalizeSandboxDir(dir, home);
   if (abs === null) return null;
@@ -96,6 +100,7 @@ export function addedDirReal(dir: string, home: string = process.env.HOME ?? hom
  * still a directory there, reached through no link: one replaced by a link,
  * or removed, is dropped (said on the session), never followed.
  */
+// paths: a check (still a directory at its real path, no link), no write
 export function stillRealDir(stored: string): boolean {
   const at = resolve(stored);
   if (linkInPath(at) !== null) return false;
@@ -170,6 +175,7 @@ export function nestedControl(dir: string, limit = ADDED_DIR_SCAN_LIMIT): Nested
       out.gitDirs.push(d);
       continue;
     }
+    // paths: a look through an added dir (what repositories and settings dirs it holds), no write
     let entries: Dirent[];
     try {
       entries = readdirSync(d, { withFileTypes: true });
@@ -238,6 +244,7 @@ export function addedDirProblem(dir: string, ctx: AddedDirContext = {}): string 
     const again = sandboxDirProblem(real, ctx);
     if (again) return `${dir} leads to ${real}, which ${again.startsWith(`${real} `) ? again.slice(real.length + 1) : `can't be added: ${again}`}`;
   }
+  // paths: a look, no write
   let st: ReturnType<typeof lstatSync>;
   try {
     st = lstatSync(real);
@@ -393,6 +400,7 @@ export function resolveProjectRoots(entries: readonly string[], workspace: strin
       );
       continue;
     }
+    // paths: a look, no write; a root is used by its real path, pinned at its first resolution
     let dir = false;
     try {
       dir = lstatSync(realOr(at)).isDirectory();
@@ -466,6 +474,7 @@ const SECRET_BY_CONTENT: Readonly<Record<string, RegExp>> = {
 };
 
 /** A small regular file's text, or null (not one, too big, unreadable). */
+// paths: a look (a config's text, for credentials), no write
 function smallText(file: string, max = 1 << 20): string | null {
   try {
     const st = lstatSync(file);
@@ -492,6 +501,7 @@ function secretByContent(name: string, file: string): boolean {
  * case); a credential helper that is a shell snippet printing a password or
  * a token. A file too big to read is taken to carry one.
  */
+// paths: a look (a git config's text, for credentials), no write
 export function gitConfigHasCredential(file: string): boolean {
   let st: ReturnType<typeof lstatSync>;
   try {
@@ -595,6 +605,7 @@ function gitDirSecrets(gitDir: string, home: string, out: { found: string[]; con
   walkModules(join(gitDir, "modules"), 0);
 }
 
+// paths: a look, no write
 function listDirNames(dir: string): string[] {
   try {
     return readdirSync(dir, { withFileTypes: true })
@@ -605,6 +616,7 @@ function listDirNames(dir: string): string[] {
   }
 }
 
+// paths: a look, no write
 function listFileNames(dir: string): string[] {
   try {
     return readdirSync(dir, { withFileTypes: true })
@@ -696,6 +708,7 @@ function* scanRootSecrets(roots: readonly string[], writable: readonly string[],
         gitDirSecrets(d, home, git);
         continue;
       }
+      // paths: a look through a root (credential files), no write
       let entries: Dirent[];
       try {
         entries = readdirSync(d, { withFileTypes: true });

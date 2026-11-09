@@ -21,6 +21,7 @@ function within(child: string, parent: string): boolean {
   return child === parent || child.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
 }
 
+// paths: a refusal rule, checked by the path as given and where it leads; a directory it lets through is used by its real path, pinned (project-roots.ts, pinned.ts)
 function realOr(p: string): string {
   try {
     return realpathSync(p);

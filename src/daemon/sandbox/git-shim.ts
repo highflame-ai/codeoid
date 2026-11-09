@@ -63,6 +63,7 @@ const ENV_BIN = "/usr/bin/env";
  * can't be read apart). `PATH` (its absolute entries), `HOME` and the
  * caller's `-c` list (`GIT_CONFIG_COUNT`) are handed over apart.
  */
+// paths: names only (the shim's environment allowlist), no path
 export const SHIM_ENV_NAMES: readonly string[] = [
   "USER", "LOGNAME", "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "LC_COLLATE", "LC_MESSAGES", "LC_MONETARY",
   "LC_NUMERIC", "LC_TIME", "LC_ADDRESS", "LC_IDENTIFICATION", "LC_MEASUREMENT", "LC_NAME", "LC_PAPER",
@@ -121,6 +122,7 @@ export interface GitShimWorktrees {
 }
 
 /** A directory itself, not a link to one. */
+// paths: a look (a directory, not a link), no write
 function realDir(p: string): boolean {
   try {
     const st = lstatSync(p);
@@ -130,6 +132,7 @@ function realDir(p: string): boolean {
   }
 }
 
+// paths: a look (is it a link), no write
 function isLink(p: string): boolean {
   try {
     return lstatSync(p).isSymbolicLink();
@@ -216,6 +219,7 @@ export function gitProgramLocations(): string[] {
   if (locations) return locations;
   const out = programLocations(GIT_BIN, []);
   try {
+    // paths: git's own program, asked where its helpers are: no session's directory
     const r = Bun.spawnSync([GIT_BIN, "--exec-path"], { stdin: "ignore", stdout: "pipe", stderr: "ignore", env: { PATH: process.env.PATH ?? "/usr/bin:/bin" } });
     const dir = r.exitCode === 0 ? r.stdout.toString().trim() : "";
     if (dir.startsWith("/")) out.push(...programLocations(join(dir, "git"), []).filter((d) => d === dir));
@@ -395,6 +399,7 @@ export function gitShimScript(opts: GitShimOptions): string {
 }
 
 /** Write {@link gitShimScript} as `<dir>/git` (0700, atomically: a git started meanwhile gets the old one or the new one) and return `dir`. */
+// paths: the session's launcher dir: the daemon's private dir, which no sandbox sees
 export function writeGitShim(dir: string, opts: GitShimOptions): string {
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   const path = join(dir, "git");

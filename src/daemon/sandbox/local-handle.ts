@@ -44,6 +44,7 @@ export class LocalSandboxHandle implements SandboxHandle {
     const wrapped = this.wrap([command, ...args], opts);
     const [bin, ...rest] = wrapped.argv;
     if (!bin) throw new Error("empty sandbox argv");
+    // paths: the wrapped argv, its pins just checked by wrap (and again by the guard in it); its cwd is inside the sandbox it starts
     const child = spawn(bin, rest, { cwd: opts.cwd, env: wrapped.env, stdio: ["pipe", "pipe", "pipe"] });
     this.#children.add(child);
     child.once("exit", () => this.#children.delete(child));

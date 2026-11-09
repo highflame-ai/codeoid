@@ -107,6 +107,7 @@ export function claudeNativeEnv(
   ];
   const file = join(temp.cli, "command-env.sh");
   const part = `${file}.${process.pid}.part`;
+  // paths: the CLI's own temp dir: the daemon's, private, which no command can write (claudeTempEnv)
   writeFileSync(part, lines.join("\n"), { mode: 0o600 });
   renameSync(part, file);
   // PATH's absolute entries only (#448 round 5): a relative one (`.`, `node_modules/.bin`) finds a program the CLI starts on the host in the workspace.
@@ -229,6 +230,7 @@ export function readAround(readable: readonly string[], writable: readonly strin
   // Only what is hidden in (or is) the readable dir: one holding it (the denied home) is what it is shown in.
   let inBase: string[] = [];
   const isHidden = (p: string) => [resolve(p), physicalOf(p)].some((at) => inBase.some((h) => at === h || inside(at, h)));
+  // paths: a look (is it a link: then left out), no write
   const isLink = (p: string) => {
     try {
       return lstatSync(p).isSymbolicLink();
@@ -239,6 +241,7 @@ export function readAround(readable: readonly string[], writable: readonly strin
   let budget = limit;
   const split = (dir: string, keep: string[]): void => {
     let names: string[] = [];
+    // paths: a look (a root's entries, to show around what is writable), no write; links left out
     try {
       names = readdirSync(dir);
     } catch {
@@ -280,6 +283,7 @@ export function denyAround(readOnly: readonly string[], writable: readonly strin
   const inside = (child: string, parent: string) => child !== parent && child.startsWith(`${parent}/`);
   const split = (dir: string, keep: string[]): void => {
     let names: string[] = [];
+    // paths: a look (a held dir's entries, to deny around what is writable), no write
     try {
       names = readdirSync(dir);
     } catch {
@@ -308,6 +312,7 @@ export function physicalOf(p: string): string {
   const missing: string[] = [];
   for (let at = resolve(p); ; at = dirname(at)) {
     try {
+      // paths: physical paths for the CLI, after claudeSandboxSettings checked every pin (no link in a pinned path: this changes none); what isn't pinned (a hidden path, a socket) is named where it is
       return join(realpathSync(at), ...missing.reverse());
     } catch {
       if (dirname(at) === at) return resolve(p);

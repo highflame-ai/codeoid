@@ -31,6 +31,9 @@
  *     so what is checked and what is used can't be one open directory; a
  *     directory is created without following a link, a file opened with
  *     `O_NOFOLLOW | O_EXCL` ({@link makeInPinned}).
+ *
+ * Nothing else in the sandbox, session or checkpoint modules resolves such a
+ * path itself (src/tests/pinned-paths-static.test.ts).
  */
 
 import { closeSync, constants, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmdirSync, unlinkSync, writeSync } from "node:fs";

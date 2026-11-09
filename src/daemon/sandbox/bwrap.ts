@@ -38,6 +38,7 @@ export const BWRAP_PROVIDER_ID = "bwrap";
 /** What is at a path: a directory, anything else that exists, or nothing. */
 export type PathKind = "dir" | "other" | null;
 
+// paths: a look at what is there, no write: a pinned path the handle checked first, and bwrap binds as pinned
 export function pathKind(p: string): PathKind {
   try {
     const st = lstatSync(p);
@@ -53,6 +54,7 @@ export function pathKind(p: string): PathKind {
 }
 
 /** The real path when it exists, else the path. */
+// paths: only for what isn't pinned (boundPath): a hidden path (a link there hides more), the home's allowlist (shown where it leads, by design)
 function realOrPath(p: string): string {
   try {
     return realpathSync(p);
@@ -238,6 +240,7 @@ export class BwrapSandboxProvider implements SandboxProvider {
     // (an AppArmor restriction, a container) fail here.
     const argv = [bin, "--die-with-parent", "--unshare-pid", "--unshare-net", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--", "/bin/sh", "-c", "exit 0"];
     try {
+      // paths: the probe: a fixed argv, in no session's directory
       const proc = Bun.spawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "pipe", timeout: 10_000 });
       const [code, err] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
       if (code === 0) return { available: true, detail: bin };
