@@ -104,7 +104,9 @@ describe("the checkouts an autonomous grant never touches", () => {
     const awt = join(root, "a-worktrees", "s1");
     mkdirSync(join(root, "a-worktrees"));
     git(["worktree", "add", "-q", awt, "-b", "s"], a);
-    expect(checkoutOverlap(a, [], { workspace: awt })).toContain("another checkout of this session's own repository");
+    expect(checkoutOverlap(a, [], { workspace: awt })).toContain(`${a} is another checkout of this session's own repository (${a}, its main checkout)`);
+    mkdirSync(join(a, "src"));
+    expect(checkoutOverlap(join(a, "src"), [], { workspace: awt })).toContain(`${join(a, "src")} is in another checkout`);
     // A checkout holding codeoid's in-checkout location.
     mkdirSync(join(b, ".worktrees"));
     expect(checkoutOverlap(b, [], opts)).toContain("holds");

@@ -334,7 +334,7 @@ export function checkoutOverlap(
     const mine = gitLayoutOf(resolve(opts.workspace), home);
     if (mine?.common && realOr(mine.common) === realOr(layout.common)) {
       const top = layout.kind === "worktree" ? dirname(layout.dotgit) : (main ?? dirname(layout.dotgit));
-      return `${at} is in another checkout of this session's own repository (${realOr(top)}${top === main ? ", its main checkout" : ""})`;
+      return `${at} ${at === realOr(top) ? "is" : "is in"} another checkout of this session's own repository (${realOr(top)}${top === main ? ", its main checkout" : ""})`;
     }
   }
   return null;
