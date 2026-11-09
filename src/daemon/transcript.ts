@@ -13,7 +13,7 @@
  *   - Use append-only JSONL — no reads on the hot path
  */
 
-import { existsSync, mkdirSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, mkdirSync, openSync, read, readFileSync, readSync, statSync } from "node:fs";
 import { appendFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CanonicalHistoryChange, CanonicalToolCall, CanonicalTurn } from "./providers/canonical.js";
@@ -130,6 +130,20 @@ export interface LoadTranscriptOptions {
    * paging (`scrollback.page`) knows older messages exist on disk.
    */
   stats?: { truncated?: boolean };
+  /**
+   * Read the log as it was when these marks were taken (`transcriptTail`):
+   * each file up to its size then, wherever rotation has moved it since. What
+   * a resumed session appended before its scrollback was loaded, which it
+   * holds itself (`Session#hydrate`), is left out whatever its seqs.
+   */
+  asOf?: readonly TranscriptFileMark[];
+}
+
+/** One transcript file as it was at a moment: which file (it may be renamed by rotation) and its size then. */
+export interface TranscriptFileMark {
+  dev: number;
+  ino: number;
+  size: number;
 }
 
 /** Tuning knobs, injectable for tests. */
@@ -390,27 +404,56 @@ export class TranscriptStore {
 
   async #readCanonicalOnce(sessionId: string, maxBytes?: number): Promise<{ turns: CanonicalTurn[]; partial: boolean }> {
     const path = this.canonicalPath(sessionId);
-    const size = Bun.file(path).size;
-    const offset = maxBytes !== undefined && size > maxBytes ? size - maxBytes : 0;
+    const offset = canonicalOffset(Bun.file(path).size, maxBytes);
     const turns: CanonicalTurn[] = [];
     for await (const line of readLines(path, offset)) {
-      if (!line.trim()) continue;
-      try {
-        const entry = JSON.parse(line) as { op?: string; turn?: CanonicalTurn };
-        if (entry.op === "append" && entry.turn && (entry.turn.role === "user" || entry.turn.role === "assistant")) {
-          turns.push(entry.turn);
-        }
-      } catch {
-        // torn line
+      const turn = canonicalTurnOf(line);
+      if (turn) turns.push(turn);
+    }
+    return canonicalWindow(turns, offset);
+  }
+
+  /**
+   * `loadCanonical` read synchronously, for a session whose history a
+   * synchronous path needs before anything awaited loading it
+   * (`Session#hydrateNow`). Doesn't wait for pending writes: the caller only
+   * reads a log nothing has appended to in this process.
+   */
+  loadCanonicalSync(sessionId: string, opts: { maxBytes?: number } = {}): { turns: CanonicalTurn[]; partial: boolean } | null {
+    const path = this.canonicalPath(sessionId);
+    const size = fileSize(path);
+    if (size === null) return null;
+    let window = opts.maxBytes;
+    for (;;) {
+      const offset = canonicalOffset(size, window);
+      const turns: CanonicalTurn[] = [];
+      for (const line of readLinesSync(path, offset)) {
+        const turn = canonicalTurnOf(line);
+        if (turn) turns.push(turn);
       }
+      const r = canonicalWindow(turns, offset);
+      if (!r.partial || r.turns.length > 0 || window === undefined) return r;
+      window *= 2;
     }
-    const partial = offset > 0;
-    if (partial) {
-      // A tail read may start mid-turn: drop leading assistant turns.
-      const firstUser = turns.findIndex((t) => t.role === "user");
-      turns.splice(0, firstUser === -1 ? turns.length : firstUser);
-    }
-    return { turns, partial };
+  }
+
+  /**
+   * The newest turn of a session's canonical log, read from the end of the
+   * file only: what a resumed session reports (`lastTurnId`, `lastTurnRole`)
+   * before its history is loaded. Null when the session has no log;
+   * `last: null` for an empty one.
+   */
+  async canonicalTail(sessionId: string): Promise<{ last: Pick<CanonicalTurn, "role" | "turnId"> | null } | null> {
+    await this.#canonicalChain.get(sessionId);
+    const path = this.canonicalPath(sessionId);
+    if (fileSize(path) === null) return null;
+    let last: CanonicalTurn | null = null;
+    tailLines(path, (line) => {
+      last = canonicalTurnOf(line);
+      return last !== null;
+    });
+    const turn = last as CanonicalTurn | null;
+    return { last: turn ? { role: turn.role, ...(turn.turnId !== undefined ? { turnId: turn.turnId } : {}) } : null };
   }
 
   /** Append one turn-index entry (#354). Serialized per session; never throws. */
@@ -437,17 +480,23 @@ export class TranscriptStore {
     await this.#turnIndexChain.get(sessionId);
     const file = Bun.file(this.turnIndexPath(sessionId));
     if (!(await file.exists())) return null;
-    const out: TurnIndexEntry[] = [];
-    for (const line of (await file.text()).split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const e = JSON.parse(line) as TurnIndexEntry;
-        if (typeof e.turnId === "string" && (e.kind === "prompt" || e.kind === "background")) out.push(e);
-      } catch {
-        // torn line
-      }
+    return turnIndexOf(await file.text());
+  }
+
+  /**
+   * `loadTurnIndex` read synchronously (`Session#hydrateNow`). Doesn't wait
+   * for pending writes: the caller only reads an index nothing has written
+   * to in this process.
+   */
+  loadTurnIndexSync(sessionId: string): TurnIndexEntry[] | null {
+    let text: string;
+    try {
+      text = readFileSync(this.turnIndexPath(sessionId), "utf-8");
+    } catch (err) {
+      if (isMissing(err)) return null;
+      throw err;
     }
-    return out;
+    return turnIndexOf(text);
   }
 
   async #writeAtomic(path: string, body: string): Promise<void> {
@@ -505,13 +554,7 @@ export class TranscriptStore {
   async append(sessionId: string, msg: DaemonMessage, seq: number): Promise<void> {
     if (!PERSISTED_TYPES.has(msg.type)) return;
 
-    const entry: TranscriptEntry = {
-      seq,
-      timestamp: "timestamp" in msg ? (msg as { timestamp: string }).timestamp : new Date().toISOString(),
-      message: capPersistedToolOutput(msg),
-    };
-
-    const line = `${JSON.stringify(entry)}\n`;
+    const line = transcriptLine(msg, seq);
 
     // True append. The previous implementation read the entire file
     // and rewrote it with the new line concatenated — O(n) per append,
@@ -704,32 +747,77 @@ export class TranscriptStore {
     sessionId: string,
     opts: LoadTranscriptOptions = {},
   ): Promise<TranscriptEntry[]> {
-    // Oldest → newest: [.N, …, .1, live].
-    const candidates: string[] = [];
-    for (let i = this.#maxRotatedSegments; i >= 1; i--) {
-      candidates.push(this.#segmentPath(sessionId, i));
+    const merged = new TranscriptMerge();
+    let sinceDeadlineCheck = 0;
+    outer: for (const part of this.#transcriptWindow(sessionId, opts)) {
+      const lines = part.mark ? this.#readMarked(sessionId, part.mark, part.offset, opts) : readLines(part.path, part.offset);
+      for await (const line of lines) {
+        if (++sinceDeadlineCheck >= DEADLINE_CHECK_EVERY) {
+          sinceDeadlineCheck = 0;
+          if (deadlineHit(sessionId, opts, merged.size)) break outer;
+        }
+        merged.add(line);
+      }
     }
-    candidates.push(this.transcriptPath(sessionId));
+    return merged.entries();
+  }
+
+  /**
+   * `loadTranscript` read synchronously (same window, deadline and merge),
+   * for a session whose scrollback a synchronous path needs before anything
+   * awaited loading it (`Session#hydrateNow`).
+   */
+  loadTranscriptSync(sessionId: string, opts: LoadTranscriptOptions = {}): TranscriptEntry[] {
+    const merged = new TranscriptMerge();
+    let sinceDeadlineCheck = 0;
+    outer: for (const part of this.#transcriptWindow(sessionId, opts)) {
+      const lines = part.mark ? this.#readMarkedSync(sessionId, part.mark, part.offset, opts) : readLinesSync(part.path, part.offset);
+      for (const line of lines) {
+        if (++sinceDeadlineCheck >= DEADLINE_CHECK_EVERY) {
+          sinceDeadlineCheck = 0;
+          if (deadlineHit(sessionId, opts, merged.size)) break outer;
+        }
+        merged.add(line);
+      }
+    }
+    return merged.entries();
+  }
+
+  /**
+   * The files (and start offsets) holding the newest `opts.maxBytes` of a
+   * session's log, oldest first: the files as they are, or as `opts.asOf`
+   * marked them. Sets `opts.stats.truncated` when older history is left out.
+   */
+  #transcriptWindow(
+    sessionId: string,
+    opts: LoadTranscriptOptions,
+  ): Array<{ path: string; offset: number; mark?: TranscriptFileMark }> {
+    // Oldest → newest: [.N, …, .1, live].
+    const candidates: Array<{ path: string; size: number; mark?: TranscriptFileMark }> = opts.asOf
+      ? opts.asOf.map((mark) => ({ path: "", size: mark.size, mark }))
+      : this.#transcriptFiles(sessionId).flatMap((path) => {
+          const size = fileSize(path);
+          return size === null ? [] : [{ path, size }];
+        });
 
     // Walk newest-first, keeping files while budget remains; the oldest
     // surviving file may enter mid-way (offset > 0, first partial line
     // dropped by the reader).
-    const chosen: Array<{ path: string; offset: number }> = [];
+    const chosen: Array<{ path: string; offset: number; mark?: TranscriptFileMark }> = [];
     let budget = opts.maxBytes ?? Number.POSITIVE_INFINITY;
     let skippedBytes = 0;
     for (let i = candidates.length - 1; i >= 0; i--) {
-      const f = Bun.file(candidates[i]!);
-      if (!(await f.exists())) continue;
+      const { path, size, mark } = candidates[i]!;
       if (budget <= 0) {
-        skippedBytes += f.size;
+        skippedBytes += size;
         continue;
       }
-      if (f.size <= budget) {
-        chosen.unshift({ path: candidates[i]!, offset: 0 });
-        budget -= f.size;
+      if (size <= budget) {
+        chosen.unshift({ path, offset: 0, ...(mark ? { mark } : {}) });
+        budget -= size;
       } else {
-        skippedBytes += f.size - budget;
-        chosen.unshift({ path: candidates[i]!, offset: f.size - budget });
+        skippedBytes += size - budget;
+        chosen.unshift({ path, offset: size - budget, ...(mark ? { mark } : {}) });
         budget = 0;
       }
     }
@@ -739,84 +827,110 @@ export class TranscriptStore {
         `[codeoid] transcript ${sessionId}: replay window capped at ${opts.maxBytes} bytes — ${skippedBytes} bytes of older history left on disk (still exported by share.pack).`,
       );
     }
+    return chosen;
+  }
 
-    // Merge entries by messageId — later entries update earlier ones.
-    const byMessageId = new Map<string, TranscriptEntry>();
-    const order: string[] = [];
-    let sinceDeadlineCheck = 0;
+  /** A session's log files, oldest first: [.N, …, .1, live]. */
+  #transcriptFiles(sessionId: string): string[] {
+    const files: string[] = [];
+    for (let i = this.#maxRotatedSegments; i >= 1; i--) files.push(this.#segmentPath(sessionId, i));
+    files.push(this.transcriptPath(sessionId));
+    return files;
+  }
 
-    outer: for (const { path, offset } of chosen) {
-      for await (const line of readLines(path, offset)) {
-        if (++sinceDeadlineCheck >= DEADLINE_CHECK_EVERY) {
-          sinceDeadlineCheck = 0;
-          if (opts.deadlineAt !== undefined && Date.now() > opts.deadlineAt) {
-            if (opts.stats) opts.stats.truncated = true;
-            console.warn(
-              `[codeoid] transcript ${sessionId}: resume deadline hit mid-parse — replaying the ${order.length} message(s) merged so far.`,
-            );
-            break outer;
-          }
-        }
-        if (!line.trim()) continue;
-        let entry: TranscriptEntry;
-        try {
-          entry = JSON.parse(line);
-        } catch {
-          continue; // Skip corrupted lines
-        }
-        // Valid JSON isn't necessarily a valid entry — `null`, arrays, or
-        // primitives would throw on the field accesses below. Skip them the
-        // same way as corrupted lines.
-        if (
-          entry === null ||
-          typeof entry !== "object" ||
-          Array.isArray(entry) ||
-          typeof entry.message !== "object" ||
-          entry.message === null
-        ) {
-          continue;
-        }
-        const bytes = Buffer.byteLength(line, "utf-8");
-
-        const msg = entry.message;
-        const messageId = (msg as { messageId?: string }).messageId;
-
-        if (!messageId) {
-          // No messageId (e.g. status_change) — keep as-is with synthetic key
-          const key = `_seq_${entry.seq}`;
-          byMessageId.set(key, { ...entry, bytes });
-          order.push(key);
-          continue;
-        }
-
-        if (byMessageId.has(messageId)) {
-          // Update: merge the newer entry over the older one
-          const existing = byMessageId.get(messageId)!;
-          const existingMsg = existing.message as unknown as Record<string, unknown>;
-          const newMsg = msg as unknown as Record<string, unknown>;
-
-          // Shallow merge — newer fields overwrite older, preserving what's not in the update
-          for (const [k, v] of Object.entries(newMsg)) {
-            if (v !== undefined) existingMsg[k] = v;
-          }
-          // Deep merge tool state specifically
-          if (newMsg.tool && existingMsg.tool) {
-            Object.assign(existingMsg.tool as Record<string, unknown>, newMsg.tool as Record<string, unknown>);
-          }
-          existing.seq = entry.seq; // update seq to latest
-          // The merged message is at least as large as its latest full line —
-          // good enough for scrollback's byte accounting.
-          existing.bytes = Math.max(existing.bytes ?? 0, bytes);
-        } else {
-          // First occurrence — insert
-          byMessageId.set(messageId, { ...entry, message: { ...msg as object } as typeof msg, bytes });
-          order.push(messageId);
-        }
+  /**
+   * Open the file `mark` names, wherever rotation has moved it since: null
+   * when it is gone (rotated out of retention; logged, and the read flagged
+   * as missing history).
+   */
+  #openMarked(sessionId: string, mark: TranscriptFileMark, opts: LoadTranscriptOptions): number | null {
+    for (const path of this.#transcriptFiles(sessionId).reverse()) {
+      let fd: number;
+      try {
+        fd = openSync(path, "r");
+      } catch (err) {
+        if (isMissing(err)) continue;
+        throw err;
       }
+      const st = fstatSync(fd);
+      if (st.dev === mark.dev && st.ino === mark.ino) return fd;
+      closeSync(fd);
     }
+    if (opts.stats) opts.stats.truncated = true;
+    console.warn(`[codeoid] transcript ${sessionId}: a file of the log was rotated out before it was read — ${mark.size} bytes of older history left out.`);
+    return null;
+  }
 
-    // "Went back a turn" (#355): hide what was taken back.
-    return applyRewinds(order.map((key) => byMessageId.get(key)!));
+  /** The lines of the file `mark` names, from `offset` up to its size then. */
+  async *#readMarked(
+    sessionId: string,
+    mark: TranscriptFileMark,
+    offset: number,
+    opts: LoadTranscriptOptions,
+  ): AsyncGenerator<string> {
+    const fd = this.#openMarked(sessionId, mark, opts);
+    if (fd === null) return;
+    try {
+      const lines = new LineSplitter(offset > 0);
+      const buf = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+      for (let pos = offset; pos < mark.size; ) {
+        const n = await readAt(fd, buf, Math.min(buf.length, mark.size - pos), pos);
+        if (n <= 0) break;
+        pos += n;
+        yield* lines.push(buf.subarray(0, n));
+      }
+      yield* lines.end();
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  /** `#readMarked`, synchronously. */
+  *#readMarkedSync(sessionId: string, mark: TranscriptFileMark, offset: number, opts: LoadTranscriptOptions): Generator<string> {
+    const fd = this.#openMarked(sessionId, mark, opts);
+    if (fd === null) return;
+    try {
+      yield* readFdLinesSync(fd, offset, mark.size);
+    } finally {
+      closeSync(fd);
+    }
+  }
+
+  /**
+   * The newest end of a session's log, read from the tail of its newest
+   * file holding an entry, and a mark of each of its files as they are now
+   * (`LoadTranscriptOptions.asOf`): what a resumed session needs to keep
+   * appending before its scrollback is loaded, and to load it later exactly
+   * as it is now. `nextSeq` is one past the newest entry's seq: the highest
+   * in a log whose seqs only grow; one whose seqs went back down (an older
+   * daemon restarted them, an import) continues past the highest once its
+   * scrollback is loaded (`Session#installHistory`). `hasEntries`: the log
+   * holds any entry at all, with a seq or not. Throws when a file is there
+   * but can't be read.
+   */
+  async transcriptTail(sessionId: string): Promise<{ nextSeq: number; hasEntries: boolean; files: TranscriptFileMark[] }> {
+    await this.#appendChain.get(sessionId);
+    const paths = this.#transcriptFiles(sessionId);
+    const files: TranscriptFileMark[] = [];
+    for (const path of paths) {
+      const st = fileStat(path);
+      if (st) files.push({ dev: st.dev, ino: st.ino, size: st.size });
+    }
+    let hasEntries = false;
+    for (let i = paths.length - 1; i >= 0; i--) {
+      if (!fileSize(paths[i]!)) continue;
+      let newest: number | null = null;
+      tailLines(paths[i]!, (line) => {
+        const entry = transcriptEntryOf(line);
+        if (!entry) return false;
+        hasEntries = true;
+        if (typeof entry.seq !== "number" || !Number.isFinite(entry.seq)) return false;
+        newest = entry.seq;
+        return true;
+      });
+      if (newest !== null) return { nextSeq: (newest as number) + 1, hasEntries, files };
+    }
+    return { nextSeq: 0, hasEntries, files };
   }
 
   /**
@@ -884,6 +998,302 @@ export function applyRewinds<T extends { message: DaemonMessage }>(rows: T[]): T
     out.push(row);
   }
   return out;
+}
+
+/** A turn index file's entries (torn lines left out). */
+function turnIndexOf(text: string): TurnIndexEntry[] {
+  const out: TurnIndexEntry[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const e = JSON.parse(line) as TurnIndexEntry;
+      if (typeof e.turnId === "string" && (e.kind === "prompt" || e.kind === "background")) out.push(e);
+    } catch {
+      // torn line
+    }
+  }
+  return out;
+}
+
+/** One transcript line for `msg` at `seq`, as `append` writes it. */
+function transcriptLine(msg: DaemonMessage, seq: number): string {
+  const entry: TranscriptEntry = {
+    seq,
+    timestamp: "timestamp" in msg ? (msg as { timestamp: string }).timestamp : new Date().toISOString(),
+    message: withoutBufferSeq(capPersistedToolOutput(msg)),
+  };
+  return `${JSON.stringify(entry)}\n`;
+}
+
+/**
+ * A message without the replay buffer's `seq` stamp: a cursor into one daemon
+ * run's scrollback, meaningless once it is read back after a restart (the
+ * replay frame's `maxSeq` is the client's cursor), and present or not
+ * depending on whether the session's scrollback was in memory when it was
+ * appended (lazy session loading).
+ */
+function withoutBufferSeq(msg: DaemonMessage): DaemonMessage {
+  if (msg.type !== "session.message" || (msg as { seq?: number }).seq === undefined) return msg;
+  const { seq: _seq, ...rest } = msg as SessionMessage;
+  return rest as DaemonMessage;
+}
+
+/** A transcript line's entry, or null for a blank, torn or malformed line. */
+function transcriptEntryOf(line: string): TranscriptEntry | null {
+  if (!line.trim()) return null;
+  let entry: TranscriptEntry;
+  try {
+    entry = JSON.parse(line);
+  } catch {
+    return null; // Skip corrupted lines
+  }
+  // Valid JSON isn't necessarily a valid entry — `null`, arrays, or
+  // primitives would throw on the field accesses below. Skip them the
+  // same way as corrupted lines.
+  if (
+    entry === null ||
+    typeof entry !== "object" ||
+    Array.isArray(entry) ||
+    typeof entry.message !== "object" ||
+    entry.message === null
+  ) {
+    return null;
+  }
+  return entry;
+}
+
+/**
+ * A transcript's lines merged by messageId, in file order — later entries
+ * update earlier ones — with rewinds applied (`entries()`).
+ */
+class TranscriptMerge {
+  #byMessageId = new Map<string, TranscriptEntry>();
+  #order: string[] = [];
+
+  get size(): number {
+    return this.#order.length;
+  }
+
+  add(line: string): void {
+    const entry = transcriptEntryOf(line);
+    if (!entry) return;
+    const bytes = Buffer.byteLength(line, "utf-8");
+
+    const msg = entry.message;
+    const messageId = (msg as { messageId?: string }).messageId;
+
+    if (!messageId) {
+      // No messageId (e.g. status_change) — keep as-is with synthetic key
+      const key = `_seq_${entry.seq}`;
+      this.#byMessageId.set(key, { ...entry, bytes });
+      this.#order.push(key);
+      return;
+    }
+
+    const existing = this.#byMessageId.get(messageId);
+    if (existing) {
+      // Update: merge the newer entry over the older one
+      const existingMsg = existing.message as unknown as Record<string, unknown>;
+      const newMsg = msg as unknown as Record<string, unknown>;
+
+      // Shallow merge — newer fields overwrite older, preserving what's not in the update
+      for (const [k, v] of Object.entries(newMsg)) {
+        if (v !== undefined) existingMsg[k] = v;
+      }
+      // Deep merge tool state specifically
+      if (newMsg.tool && existingMsg.tool) {
+        Object.assign(existingMsg.tool as Record<string, unknown>, newMsg.tool as Record<string, unknown>);
+      }
+      existing.seq = entry.seq; // update seq to latest
+      // The merged message is at least as large as its latest full line —
+      // good enough for scrollback's byte accounting.
+      existing.bytes = Math.max(existing.bytes ?? 0, bytes);
+    } else {
+      // First occurrence — insert
+      this.#byMessageId.set(messageId, { ...entry, message: { ...msg as object } as typeof msg, bytes });
+      this.#order.push(messageId);
+    }
+  }
+
+  entries(): TranscriptEntry[] {
+    // "Went back a turn" (#355): hide what was taken back.
+    return applyRewinds(this.#order.map((key) => this.#byMessageId.get(key)!));
+  }
+}
+
+/** Whether a transcript read ran past its deadline (logged, and flagged in `opts.stats`). */
+function deadlineHit(sessionId: string, opts: LoadTranscriptOptions, merged: number): boolean {
+  if (opts.deadlineAt === undefined || Date.now() <= opts.deadlineAt) return false;
+  if (opts.stats) opts.stats.truncated = true;
+  console.warn(
+    `[codeoid] transcript ${sessionId}: resume deadline hit mid-parse — replaying the ${merged} message(s) merged so far.`,
+  );
+  return true;
+}
+
+/** A canonical log line's turn, or null for a blank, torn or foreign line. */
+function canonicalTurnOf(line: string): CanonicalTurn | null {
+  if (!line.trim()) return null;
+  try {
+    const entry = JSON.parse(line) as { op?: string; turn?: CanonicalTurn };
+    if (entry.op === "append" && entry.turn && (entry.turn.role === "user" || entry.turn.role === "assistant")) {
+      return entry.turn;
+    }
+  } catch {
+    // torn line
+  }
+  return null;
+}
+
+/** Where a canonical read of the newest `maxBytes` starts. */
+function canonicalOffset(size: number, maxBytes: number | undefined): number {
+  return maxBytes !== undefined && size > maxBytes ? size - maxBytes : 0;
+}
+
+/** The turns read from `offset` on, as a history: a tail starts at a prompt. */
+function canonicalWindow(turns: CanonicalTurn[], offset: number): { turns: CanonicalTurn[]; partial: boolean } {
+  const partial = offset > 0;
+  if (partial) {
+    // A tail read may start mid-turn: drop leading assistant turns.
+    const firstUser = turns.findIndex((t) => t.role === "user");
+    turns.splice(0, firstUser === -1 ? turns.length : firstUser);
+  }
+  return { turns, partial };
+}
+
+/** Bytes read per step by the synchronous and marked readers. */
+const READ_CHUNK_BYTES = 1024 * 1024;
+
+/** A missing file (or a missing dir on its path): what the readers treat as no file. */
+function isMissing(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException).code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/** A regular file's stat, or null when there is none at `path`. Throws when it can't be looked at. */
+function fileStat(path: string): import("node:fs").Stats | null {
+  let st: import("node:fs").Stats;
+  try {
+    st = statSync(path);
+  } catch (err) {
+    if (isMissing(err)) return null;
+    throw err;
+  }
+  return st.isFile() ? st : null;
+}
+
+/** A regular file's size, or null when there is none at `path`. Throws when it can't be looked at. */
+function fileSize(path: string): number | null {
+  return fileStat(path)?.size ?? null;
+}
+
+/** `pread`, awaited. */
+function readAt(fd: number, buf: Buffer, length: number, position: number): Promise<number> {
+  return new Promise((resolve, reject) => {
+    read(fd, buf, 0, length, position, (err, n) => (err ? reject(err) : resolve(n)));
+  });
+}
+
+/**
+ * A byte stream cut into lines, as the readers yield them: with `dropFirst`
+ * (a read starting mid-file) the first, partial line is left out.
+ */
+class LineSplitter {
+  #decoder = new TextDecoder();
+  #remainder = "";
+  #dropFirst: boolean;
+
+  constructor(dropFirst: boolean) {
+    this.#dropFirst = dropFirst;
+  }
+
+  *push(bytes: Uint8Array): Generator<string> {
+    this.#remainder += this.#decoder.decode(bytes, { stream: true });
+    const lines = this.#remainder.split("\n");
+    this.#remainder = lines.pop()!;
+    for (const line of lines) {
+      if (this.#dropFirst) {
+        this.#dropFirst = false;
+        continue;
+      }
+      yield line;
+    }
+  }
+
+  *end(): Generator<string> {
+    this.#remainder += this.#decoder.decode();
+    if (this.#remainder && !this.#dropFirst) yield this.#remainder;
+  }
+}
+
+/** `readLines`, synchronously. */
+function* readLinesSync(path: string, offset: number): Generator<string> {
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw err;
+  }
+  try {
+    yield* readFdLinesSync(fd, offset, Number.POSITIVE_INFINITY);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** An open file's lines from `offset` up to `end`. */
+function* readFdLinesSync(fd: number, offset: number, end: number): Generator<string> {
+  const lines = new LineSplitter(offset > 0);
+  const buf = Buffer.allocUnsafe(READ_CHUNK_BYTES);
+  for (let pos = offset; pos < end; ) {
+    const n = readSync(fd, buf, 0, Math.min(buf.length, end - pos), pos);
+    if (n <= 0) break;
+    pos += n;
+    yield* lines.push(buf.subarray(0, n));
+  }
+  yield* lines.end();
+}
+
+/**
+ * Hand a file's whole lines to `take`, newest first, reading backwards from
+ * its end in growing windows, until `take` returns true or the file's start
+ * is reached. For the few newest lines of a log too big to read whole.
+ */
+function tailLines(path: string, take: (line: string) => boolean): void {
+  let fd: number;
+  try {
+    fd = openSync(path, "r");
+  } catch (err) {
+    // Gone since it was looked at: nothing to read. Anything else (a file
+    // that can't be read) is the caller's to fail on, never an empty log.
+    if (isMissing(err)) return;
+    throw err;
+  }
+  try {
+    const size = fstatSync(fd).size;
+    let window = 64 * 1024;
+    for (;;) {
+      const start = Math.max(0, size - window);
+      const buf = Buffer.allocUnsafe(size - start);
+      let read = 0;
+      while (read < buf.length) {
+        const n = readSync(fd, buf, read, buf.length - read, start + read);
+        if (n <= 0) break;
+        read += n;
+      }
+      const lines = buf.subarray(0, read).toString("utf-8").split("\n");
+      // Mid-file, the first line is cut: the next, wider window reads it whole.
+      const from = start > 0 ? 1 : 0;
+      for (let i = lines.length - 1; i >= from; i--) {
+        if (take(lines[i]!)) return;
+      }
+      if (start === 0) return;
+      window *= 4;
+    }
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /**

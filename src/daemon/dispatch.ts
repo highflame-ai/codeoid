@@ -146,6 +146,8 @@ export interface DispatcherHost {
   workerStatus(sessionId: string): SessionStatus | null;
   /** Compressed completion digest for a finished worker — never raw transcript. */
   buildWorkerDigest(task: DispatchTaskRow): string;
+  /** Load what `buildWorkerDigest` reads (a resumed worker's history), before it runs. */
+  prepareWorkerDigest?(task: DispatchTaskRow): Promise<void>;
   /** Tear down a finished worker session (best-effort). */
   destroyWorker(sessionId: string, reason: string): Promise<void>;
   /**
@@ -1075,6 +1077,7 @@ export class Dispatcher {
 
     try {
       // Digest BEFORE teardown — it reads the live session + memory.
+      await this.#host.prepareWorkerDigest?.(task);
       const digest = this.#host.buildWorkerDigest(task);
       if (status === "idle") {
         // The read above and this write are not one transaction; the store's
