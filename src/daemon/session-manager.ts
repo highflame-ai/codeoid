@@ -7039,7 +7039,13 @@ mcpHub: this.#mcpHub,
       providerIds: () => this.#providers.ids(),
       ...(this.#sandboxRegistry
         ? {
-            sandboxProblem: (s: SessionSandboxSetting) => sandboxSettingProblem(s, this.#sandboxRegistry as SandboxRegistry),
+            // A routine's directories checked when it is defined, as a session's are when it is created (#448 round 13).
+            sandboxProblem: (s: SessionSandboxSetting) => sandboxSettingProblem(s, this.#sandboxRegistry as SandboxRegistry) ?? this.#sandboxDirsProblem(s),
+            sandboxCanonical: (s: SessionSandboxSetting) => {
+              // By real path; never a pin (each run's session pins what it binds when it starts).
+              const { pins: _p, agentDirs: _a, ...rest } = canonicalAddedDirs(s);
+              return rest;
+            },
           }
         : {}),
       normalizeWorkdir: (p) => normalizeWorkdir(p),

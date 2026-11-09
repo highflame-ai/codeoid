@@ -35,7 +35,7 @@ import { DEFAULT_HOME_READABLE } from "./home-readable.js";
 import { validAllowedHost } from "./hosts.js";
 import { sandboxRoot } from "./root.js";
 import { type PathPin, dirIdentity, pinProblem, pinRefusal, SandboxPinError } from "./pins.js";
-import { controlDirProblem, nestedControl, type NestedControl, projectRootSecrets, stillRealDir } from "./project-roots.js";
+import { controlDirProblem, nestedControl, type NestedControl, projectRootSecrets, type RootScan, rootScanKey, stillRealDir } from "./project-roots.js";
 import { isOwnWorktree, worktreeAdminsOf, worktreeFoldersOf } from "./worktrees.js";
 import type { NetworkMode, NetworkPolicy, SandboxSpec } from "./types.js";
 
@@ -479,6 +479,13 @@ export interface SpecInputs {
    * is now (and a link-named one is never bound).
    */
   pins?: Readonly<Record<string, string>>;
+  /**
+   * The look through the roots (and the agent's own added dirs) for
+   * credential files the session's resolution already made
+   * (project-roots.ts `projectRootSecretsAsync`): used when it was of the
+   * same dirs, else looked again.
+   */
+  rootScan?: RootScan;
 }
 
 /** The home a spec hides: absolute, and not `/` (nothing is left to show then). */
@@ -1174,7 +1181,9 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const addedKept = added.filter((a) => !inHidden(a.dir) && !userHidden.some((u) => within(a.dir, u)));
   // The session's own: its workspace and the dirs its owner added (their credentials are its to use, as the
   // workspace's are). A dir the agent added itself (autonomous `request_directory`) keeps the hiding a root has.
-  const writableDirs = [workspace, ...addedKept.filter((a) => !a.agent).map((a) => a.dir)];
+  // Its repository's git dir too (a fork's worktree uses its main checkout's): git there reads its config.
+  const ownCommon = inputs.git === false ? null : (gitLayoutOf(workspace, home)?.common ?? null);
+  const writableDirs = [workspace, ...(ownCommon ? [ownCommon] : []), ...addedKept.filter((a) => !a.agent).map((a) => a.dir)];
   const agentDirs = addedKept.filter((a) => a.agent).map((a) => a.dir);
   // Each root by its real path (a root named through a link is hidden in where it really is), pinned as the rest.
   const rootCandidates = (inputs.projectRoots ?? [])
@@ -1187,7 +1196,9 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     .filter((r, i, all) => dirIdentity(r) !== null && all.indexOf(r) === i && !userHidden.some((u) => within(r, u)) && !inHidden(r));
   // The credential files anywhere in a root and in an agent's own added dir (not the session's own); a root or such
   // a dir too big to look through whole isn't shown at all, nor written (fail closed: resolveSandbox says so).
-  const rootSecrets = projectRootSecrets([...rootCandidates, ...agentDirs], writableDirs, inputs.scanLimit);
+  const scanned = [...rootCandidates, ...agentDirs];
+  const rootSecrets =
+    inputs.rootScan && inputs.scanLimit === undefined && inputs.rootScan.key === rootScanKey(scanned, writableDirs) ? inputs.rootScan.result : projectRootSecrets(scanned, writableDirs, inputs.scanLimit);
   const roots = rootCandidates.filter((r) => !rootSecrets.over.includes(r));
   const addedDirs = addedKept.map((a) => a.dir).filter((d) => !rootSecrets.over.includes(d));
   // The worktree locations shown (other sessions' checkouts of this repository, their copied `.env`s): the same.

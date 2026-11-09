@@ -357,6 +357,8 @@ export function defaultProjectRoot(workspace: string, home: string = process.env
 export interface ResolvedRoots {
   /** Absolute, existing dirs, deduplicated (by where they really are). */
   roots: string[];
+  /** The one that is the default ({@link PROJECT_ROOT_PARENT}), when it is used. */
+  defaultRoot?: string;
   /** What wasn't used, and why (the sandbox's limits say it). */
   notes: string[];
 }
@@ -408,6 +410,7 @@ export function resolveProjectRoots(entries: readonly string[], workspace: strin
     seen.add(real);
     if (real !== at && !isDefault) out.notes.push(`project root ${entry} is ${real} (where it really is): read there`);
     out.roots.push(real);
+    if (isDefault) out.defaultRoot = real;
   }
   return out;
 }
@@ -637,7 +640,41 @@ export interface RootSecrets {
  * `over`, and isn't to be used.
  */
 export function projectRootSecrets(roots: readonly string[], writable: readonly string[], limit = PROJECT_ROOT_SCAN_LIMIT, home: string = process.env.HOME ?? homedir()): RootSecrets {
+  const scan = scanRootSecrets(roots, writable, limit, home);
+  for (let step = scan.next(); ; step = scan.next()) if (step.done) return step.value;
+}
+
+/**
+ * {@link projectRootSecrets} without holding the daemon's event loop: it
+ * lets other work run every few hundred directories (a root of tens of
+ * thousands takes a tenth of a second or more). What a session's
+ * resolution runs; its result is reused by every spec built from it.
+ */
+export async function projectRootSecretsAsync(roots: readonly string[], writable: readonly string[], limit = PROJECT_ROOT_SCAN_LIMIT, home: string = process.env.HOME ?? homedir()): Promise<RootSecrets> {
+  const scan = scanRootSecrets(roots, writable, limit, home);
+  for (let step = scan.next(); ; step = scan.next()) {
+    if (step.done) return step.value;
+    await new Promise<void>((r) => setImmediate(r));
+  }
+}
+
+/** What a scan was of, to reuse its result only for the same roots and the same own dirs (buildSandboxSpec). */
+export function rootScanKey(roots: readonly string[], owned: readonly string[]): string {
+  return JSON.stringify([roots.map((r) => resolve(r)), owned.map((o) => resolve(o))]);
+}
+
+/** A scan's result with what it was of ({@link rootScanKey}). */
+export interface RootScan {
+  key: string;
+  result: RootSecrets;
+}
+
+/** How many directories {@link scanRootSecrets} looks through between yields. */
+const SCAN_SLICE = 500;
+
+function* scanRootSecrets(roots: readonly string[], writable: readonly string[], limit: number, home: string): Generator<void, RootSecrets> {
   const out: RootSecrets = { hidden: [], gitConfigs: [], over: [] };
+  let slice = 0;
   const mine = writable.flatMap((w) => [resolve(w), realOr(w)]);
   const owned = (p: string) => mine.some((w) => within(p, w));
   const seenRoots = new Set<string>();
@@ -652,6 +689,7 @@ export function projectRootSecrets(roots: readonly string[], writable: readonly 
     let over = false;
     while (queue.length > 0 && !over) {
       const d = queue.shift() as string;
+      if (++slice % SCAN_SLICE === 0) yield;
       if (owned(d) || owned(realOr(d))) continue;
       // A bare repository (or any git dir by its shape): its configs, never walked as files.
       if (gitDirShape(d)) {

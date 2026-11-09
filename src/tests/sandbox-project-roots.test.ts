@@ -86,7 +86,7 @@ describe("project roots", () => {
     expect(resolveProjectRoots(["@parent"], repo, { home }).roots).toEqual([join(home, "Workspace")]);
   });
 
-  test("a repository directly in the home: no default root, said; the home itself as a workspace: none either", () => {
+  test("a repository directly in the home: no default root, said; the home itself as a workspace: none either", async () => {
     const home = join(base, "home");
     const repo = join(home, "proj");
     mkdirSync(repo, { recursive: true });
@@ -95,7 +95,7 @@ describe("project roots", () => {
     expect(r.roots).toEqual([]);
     expect(r.notes[0]).toContain("no project root: the default, the repository's parent");
     expect(r.notes[0]).toContain("set sandbox.projectRoots");
-    const dirs = sandboxDirsOf(process.env.HOME as string, ["@parent"], []);
+    const dirs = await sandboxDirsOf(process.env.HOME as string, ["@parent"], []);
     expect(dirs).toMatchObject({ roots: [], homeWorkspace: true });
     expect(dirs.notes[0]).toContain("only credentials are protected");
   });
@@ -456,7 +456,7 @@ function workspaceLayout() {
 }
 
 describe("an added directory is what it was when granted (#448 round 12)", () => {
-  test("kept by its real path; replaced by a link later, it is dropped at the next build (said), never followed", () => {
+  test("kept by its real path; replaced by a link later, it is dropped at the next build (said), never followed", async () => {
     const { home, root, a, docs, spec } = workspaceLayout();
     const c = join(root, "c");
     mkdirSync(c);
@@ -479,7 +479,7 @@ describe("an added directory is what it was when granted (#448 round 12)", () =>
     // A stored link (as an older daemon kept one) isn't followed either.
     expect(spec({ addedDirs: [{ dir: link }] }).writable).not.toContain(docs);
     process.env.HOME = home;
-    const dirs = sandboxDirsOf(a, [], [c]);
+    const dirs = await sandboxDirsOf(a, [], [c]);
     expect(dirs.added).toEqual([]);
     expect(dirs.dropped[0]?.dir).toBe(c);
     expect(dirs.notes.join("\n")).toContain(`${c} is a symbolic link now`);
@@ -610,7 +610,7 @@ describe("credentials inside project roots (#448 round 12)", () => {
     expect(found.hidden.sort()).toEqual([...secret, ...dirs, ...worktrees].sort());
   });
 
-  test("a repository's .git/config carrying a credential is hidden (said: git there can't read its config); a plain one isn't", () => {
+  test("a repository's .git/config carrying a credential is hidden (said: git there can't read its config); a plain one isn't", async () => {
     const { home, root, a, b } = workspaceLayout();
     const c = join(root, "c");
     const d = join(root, "d");
@@ -625,7 +625,7 @@ describe("credentials inside project roots (#448 round 12)", () => {
     expect(found.gitConfigs.sort()).toEqual([join(b, ".git", "config"), join(d, ".git", "config")]);
     expect(found.hidden).not.toContain(join(c, ".git", "config"));
     process.env.HOME = home;
-    const notes = sandboxDirsOf(a, [root], []).notes.join("\n");
+    const notes = (await sandboxDirsOf(a, [root], [])).notes.join("\n");
     expect(notes).toContain(`${join(b, ".git", "config")} holds a credential`);
     expect(notes).toContain(`git in ${b} can't read its config`);
   });

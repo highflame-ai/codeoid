@@ -31,8 +31,10 @@ import {
   normalizeSandboxDir,
   PROJECT_ROOT_PARENT,
   PROJECT_ROOT_SCAN_LIMIT,
-  projectRootSecrets,
+  projectRootSecretsAsync,
   repositoryOfConfig,
+  type RootScan,
+  rootScanKey,
   resolveProjectRoots,
   SCAN_SKIPPED_DIRS,
   stillRealDir,
@@ -329,6 +331,8 @@ export interface SandboxDirs {
   dropped: Array<{ dir: string; why: string }>;
   /** Pins taken now (pins.ts), by real path: a root or added dir seen for the first time. */
   pinned: Record<string, string>;
+  /** The look through the roots for credential files, reused by every spec built from this resolution. */
+  scan?: RootScan;
 }
 
 /**
@@ -344,13 +348,13 @@ export interface SandboxDirs {
  * dir with no pin is pinned now (`pinned`). The agent's own added dirs
  * (`opts.agentDirs`) keep a root's credential hiding.
  */
-export function sandboxDirsOf(
+export async function sandboxDirsOf(
   top: string,
   rootEntries: readonly string[],
   addedDirs: readonly string[],
   config?: CodeoidConfig,
-  opts: { pins?: Readonly<Record<string, string>>; agentDirs?: readonly string[] } = {},
-): SandboxDirs {
+  opts: { pins?: Readonly<Record<string, string>>; agentDirs?: readonly string[]; scanLimit?: number } = {},
+): Promise<SandboxDirs> {
   const home = resolve(process.env.HOME ?? homedir());
   const configDir = getConfigDir();
   const pins = opts.pins ?? {};
@@ -397,18 +401,28 @@ export function sandboxDirsOf(
   }
   const agent = new Set((opts.agentDirs ?? []).map((d) => resolve(d)));
   const agentAdded = added.filter((d) => agent.has(d));
+  let scan: RootScan | undefined;
   if (roots.length > 0 || agentAdded.length > 0) {
-    // The session's own: its workspace and what its owner added; the agent's own added dirs are looked through as a root is.
-    const secrets = projectRootSecrets([...roots, ...agentAdded], [top, ...added.filter((d) => !agent.has(d))]);
+    // The session's own: its workspace, its repository's git dir (a fork's worktree uses the main checkout's), and
+    // what its owner added; the agent's own added dirs are looked through as a root is. Without holding the
+    // daemon's event loop; every spec built from this resolution reuses it.
+    const layout = gitLayoutOf(top, home);
+    const own = [top, ...(layout?.common ? [layout.common] : []), ...added.filter((d) => !agent.has(d))];
+    const scanned = [...roots, ...agentAdded];
+    const limit = opts.scanLimit ?? PROJECT_ROOT_SCAN_LIMIT;
+    const secrets = await projectRootSecretsAsync(scanned, own, limit);
+    scan = { key: rootScanKey(scanned, own), result: secrets };
     for (const over of secrets.over) {
       if (agent.has(over)) {
-        const why = `more than ${PROJECT_ROOT_SCAN_LIMIT} directories to look through for credential files (${[...SCAN_SKIPPED_DIRS].slice(0, 2).join(", ")} and the like aside), which stay hidden in a directory the agent added itself`;
+        const why = `more than ${limit} directories to look through for credential files (${[...SCAN_SKIPPED_DIRS].slice(0, 2).join(", ")} and the like aside), which stay hidden in a directory the agent added itself`;
         notes.push(`added directory ${over}: ${why}: not writable — the owner can add it (\`/sandbox add\`), or a narrower one`);
         dropped.push({ dir: over, why });
         continue;
       }
       notes.push(
-        `project root ${over}: more than ${PROJECT_ROOT_SCAN_LIMIT} directories to look through for credential files (${[...SCAN_SKIPPED_DIRS].slice(0, 2).join(", ")} and the like aside): not used — name narrower roots in sandbox.projectRoots (or the session's own), the repositories you need`,
+        over === r.defaultRoot
+          ? `no project root: the default, the repository's parent (${over}), holds more than ${limit} directories to look through for credential files (build outputs such as target/, build/, dist/ and vendor/ count; ${[...SCAN_SKIPPED_DIRS].slice(0, 3).join(", ")} and the like don't): not used, so other repositories aren't readable — set sandbox.projectRoots (or the session's own) to the repositories you need`
+          : `project root ${over}: more than ${limit} directories to look through for credential files (${[...SCAN_SKIPPED_DIRS].slice(0, 2).join(", ")} and the like aside): not used — name narrower roots in sandbox.projectRoots (or the session's own), the repositories you need`,
       );
     }
     roots = roots.filter((x) => !secrets.over.includes(x));
@@ -421,7 +435,7 @@ export function sandboxDirsOf(
       if (i >= 0) added.splice(i, 1);
     }
   }
-  return { roots, added, notes, homeWorkspace, dropped, pinned };
+  return { roots, added, notes, homeWorkspace, dropped, pinned, ...(scan ? { scan } : {}) };
 }
 
 /** The repositories an added dir holds besides its own (a folder of them): the end-of-turn git look covers each. */
@@ -449,6 +463,8 @@ export async function resolveSandbox(opts: {
   droppedDirs?: Array<{ dir: string; why: string }>;
   /** Roots and added dirs pinned by this resolution (sandboxDirsOf). */
   pinned?: Record<string, string>;
+  /** The look through the roots for credential files (sandboxDirsOf), for the specs built from this resolution. */
+  rootScan?: RootScan;
 }> {
   const { choice, network, dockerSocket, projectRoots, addedDirs, agentDirs } = effectiveSetting(opts.config, opts.setting);
   const base = {
@@ -500,7 +516,7 @@ export async function resolveSandbox(opts: {
   // Working across repositories: the project roots it reads, the directories it writes besides its workspace.
   const dirs: SandboxDirs =
     top !== null
-      ? sandboxDirsOf(top, projectRoots, addedDirs, opts.codeoidConfig, { ...(opts.setting?.pins ? { pins: opts.setting.pins.ids } : {}), agentDirs })
+      ? await sandboxDirsOf(top, projectRoots, addedDirs, opts.codeoidConfig, { ...(opts.setting?.pins ? { pins: opts.setting.pins.ids } : {}), agentDirs })
       : { roots: [], added: [], notes: [], homeWorkspace: false, dropped: [], pinned: {} };
   const limits = [...c.plan.limits, ...(net.note ? [net.note] : []), ...(gitNote ? [gitNote] : []), ...(topNote ? [topNote] : []), ...(dockerNote ? [dockerNote] : []), ...rootNotes, ...dirs.notes];
   const applied: NetworkPolicy = net.mode === "allowlist" ? network : { mode: net.mode };
@@ -526,6 +542,7 @@ export async function resolveSandbox(opts: {
     network: applied,
     ...(dirs.dropped.length > 0 ? { droppedDirs: dirs.dropped } : {}),
     ...(Object.keys(dirs.pinned).length > 0 ? { pinned: dirs.pinned } : {}),
+    ...(dirs.scan ? { rootScan: dirs.scan } : {}),
   };
 }
 
@@ -562,7 +579,7 @@ export class SessionSandbox {
   /** The same for each added directory's repository that isn't the workspace's, by its git dir. */
   readonly #addedEntries = new Map<string, WorktreeEntryGuard>();
   /** The project roots and added directories the last resolution applied (the runtime's: a change waits for the next). */
-  #dirs: { roots: string[]; added: string[] } = { roots: [], added: [] };
+  #dirs: { roots: string[]; added: string[]; scan?: RootScan } = { roots: [], added: [] };
   #droppedDirs: Array<{ dir: string; why: string }> = [];
   /** The setting's directories changed since the last resolution, nothing else (applied between turns: Session). */
   #dirsStale = false;
@@ -829,7 +846,7 @@ export class SessionSandbox {
     this.#resolvedFor = backendId;
     this.#stale = false;
     this.#dirsStale = false;
-    const dirs = { roots: [...(r.info.projectRoots ?? [])], added: [...(r.info.addedDirs ?? [])] };
+    const dirs = { roots: [...(r.info.projectRoots ?? [])], added: [...(r.info.addedDirs ?? [])], ...(r.rootScan ? { scan: r.rootScan } : {}) };
     this.#dirs = dirs;
     this.#droppedDirs = r.droppedDirs ?? [];
     if (r.info.state !== "on" || !r.provider || !r.plan) {
@@ -1002,7 +1019,7 @@ export class SessionSandbox {
     readable: readonly string[] = [],
     dockerSocket = false,
     hideLocalServices = network.mode !== "on",
-    dirs: { roots: readonly string[]; added: readonly string[] } = this.#dirs,
+    dirs: { roots: readonly string[]; added: readonly string[]; scan?: RootScan } = this.#dirs,
   ): SandboxSpec {
     // A monorepo's package: the repository's top (#448 round 9), as pinned; the session's cwd stays the workdir.
     const workspace = this.#workspace();
@@ -1031,6 +1048,7 @@ export class SessionSandbox {
         return { dir, ...(agent.has(dir) ? { agent: true } : {}), ...(folder && guard ? { ownWorktreeEntries: guard.ownEntries() } : {}) };
       }),
       ...(this.#setting?.pins ? { pins: this.#setting.pins.ids } : {}),
+      ...(dirs.scan ? { rootScan: dirs.scan } : {}),
     });
     let spec: SandboxSpec;
     try {
