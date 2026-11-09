@@ -3,10 +3,12 @@
  * workspace (docs/sandbox.md, "Working across repositories"). The tool only
  * asks; the session decides (Session#requestDirectory): in guarded and
  * interactive mode its owner answers a confirm card naming the directory and
- * the reason (owner-only, audited); in autonomous mode one under the
- * session's project roots is added unasked (audited) and anything else is
- * refused at once, with a reason the agent reads. Never parks an unattended
- * run. What is added takes effect at the session's next turn.
+ * the reason (owner-only, audited); in autonomous mode (an unattended run's
+ * too) a repository, or a dir in one, under the session's project roots,
+ * named by a path with no link in it, is added unasked (audited) and
+ * anything else is refused at once, with a reason the agent reads. Never
+ * parks an unattended run. What is added is the directory the path really
+ * is then, and takes effect at the session's next turn.
  *
  * Delivered the way codeoid's other session tools are: in-process (the
  * Claude Agent SDK's server, which Qwen's SDK takes as is), and over the
@@ -50,8 +52,8 @@ export type RequestDirectoryHandler = (sessionId: string, input: RequestDirector
 export const REQUEST_DIRECTORY_DESCRIPTION = [
   "Ask for write access to a directory outside your workspace (another repository, say), for this session's sandboxed commands.",
   "Your commands can already read the session's project roots; this is for writing. Give the absolute path and why you need it.",
-  "Interactive and guarded mode: the owner is asked and decides. Autonomous mode: a directory under the project roots is added at once; anything else is refused.",
-  "An added directory is writable from your next turn: finish this turn after it is granted. Never your home, /, or a dir of credentials or settings.",
+  "Interactive and guarded mode: the owner is asked and decides. Autonomous mode: a repository (or a directory in one) under the project roots, named by its real path (no symbolic link in it), is added at once; anything else is refused.",
+  "An added directory is writable from your next turn: finish this turn after it is granted. Never your home, /, a git or settings dir (.git, .claude, …), or a dir of credentials.",
 ].join(" ");
 
 const REASON_MAX = 1000;

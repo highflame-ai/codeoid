@@ -231,7 +231,8 @@ import { type WorktreeEntryFinding, worktreeEntryLine, worktreeEntryWarning } fr
 import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
 import { worktreeFolderNote } from "./sandbox/worktrees.js";
 import { hiddenPathsFor, protectedWriteTargets, sandboxWorkspaceOf, userHiddenPaths } from "./sandbox/policy.js";
-import { addedDirProblem, inAnyDir, normalizeSandboxDir } from "./sandbox/project-roots.js";
+import { addedDirProblem, addedDirReal, autonomousGrantProblem, inAnyDir, nestedControl, normalizeSandboxDir } from "./sandbox/project-roots.js";
+import { sandboxRootIfMade } from "./sandbox/root.js";
 import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -3166,6 +3167,7 @@ export class Session {
     if (sbx.resolvedFor(this.#provider.id) && sbx.info && !applyDirs) return sbx.info;
     const before = JSON.stringify(sbx.info);
     const info = await sbx.refresh(this.#provider.id);
+    this.#sayDroppedDirs();
     if (applyDirs) {
       // A backend running now runs in the old sandbox: restarted before its next turn (#restartForSandboxDirs).
       if (PROCESS_BACKENDS.has(this.#provider.id) && this.#provider.hasQueried) this.#sandboxDirsRestart = true;
@@ -3335,21 +3337,65 @@ export class Session {
 
   /**
    * Why `raw` can't be added to what the session's commands write, or the
-   * directory it names (absolute; a relative one is the workdir's) with
-   * `already` when it is writable now (the workspace, an added dir).
+   * directory it names: where it really is now (what is kept and bound:
+   * project-roots.ts `addedDirReal`), with `written` (absolute; a relative
+   * one is the workdir's) and `already` when it is writable now (the
+   * workspace, the session's worktree folders or temp dir, an added dir).
    */
-  #sandboxDirCheck(raw: string): { dir: string; already?: string } | { error: string } {
+  #sandboxDirCheck(raw: string): { dir: string; written: string; already?: string } | { error: string } {
     const sbx = this.#sandbox;
     if (!sbx) return { error: "this daemon has no OS sandbox" };
     const home = process.env.HOME ?? homedir();
-    const dir = normalizeSandboxDir(raw, home) ?? resolvePath(this.workdir, raw.trim());
+    const written = normalizeSandboxDir(raw, home) ?? resolvePath(this.workdir, raw.trim());
+    const dir = addedDirReal(written, home) ?? written;
     const workspace = sandboxWorkspaceOf(this.workdir);
-    if (inAnyDir(dir, [workspace])) return { dir, already: `${dir} is in the session's workspace (${workspace}), which its commands write already` };
+    if (inAnyDir(dir, [workspace])) return { dir, written, already: `${dir} is in the session's workspace (${workspace}), which its commands write already` };
+    const folder = sbx.worktreeFolders().find((f) => inAnyDir(dir, [f]));
+    if (folder) return { dir, written, already: `${dir} is in the session's own worktree folder (${folder}), which its commands write already` };
+    const temp = sbx.tempDirPath;
+    if (temp && inAnyDir(dir, [temp])) return { dir, written, already: `${dir} is in the session's temp dir, which its commands write already` };
     const added = sbx.effective().addedDirs;
     const holder = added.find((d) => inAnyDir(dir, [d]));
-    if (holder) return { dir, already: holder === dir ? `${dir} is added already` : `${dir} is in ${holder}, which is added already` };
-    const problem = addedDirProblem(dir, { home, configDir: getConfigDir(), hidden: hiddenPathsFor(this.#config) });
-    return problem ? { error: problem } : { dir };
+    if (holder) return { dir, written, already: holder === dir ? `${dir} is added already` : `${dir} is in ${holder}, which is added already` };
+    const root = sandboxRootIfMade();
+    const hidden = [...hiddenPathsFor(this.#config), ...(root ? [root] : [])];
+    const problem = addedDirProblem(written, { home, configDir: getConfigDir(), hidden });
+    return problem ? { error: problem } : { dir, written };
+  }
+
+  /** What stays read-only in `dir` once added, in words, for the owner's confirm: true for what is there. */
+  #addedDirProtection(dir: string): string {
+    const nested = nestedControl(dir);
+    const repos = nested.repos.filter((r) => r !== dir).length;
+    return `its git structure and project settings stay read-only, as in the workspace${repos > 0 ? `, and so do those of the ${repos} ${repos === 1 ? "repository" : "repositories"} inside it` : ""}`;
+  }
+
+  /** The added dirs once `dir` is added: any of them inside it go (it holds them now). */
+  #withAddedDir(dir: string): string[] {
+    return [...this.#sandbox!.effective().addedDirs.filter((d) => !inAnyDir(d, [dir])), dir];
+  }
+
+  /**
+   * Say on the session (and audit) each added directory the last resolution
+   * left out because it no longer is what was granted, or can't be one now
+   * (SessionSandbox.droppedDirs), and take it out of the setting: never
+   * followed to where a link put there leads, never added back unasked.
+   */
+  #sayDroppedDirs(): void {
+    const sbx = this.#sandbox;
+    const dropped = sbx?.droppedDirs() ?? [];
+    if (!sbx || dropped.length === 0) return;
+    sbx.forget(dropped.map((d) => d.dir));
+    for (const d of dropped) {
+      this.#store.audit(SYSTEM_IDENTITY.sub, "session.sandbox_dir_dropped", this.id, `${d.dir}: ${d.why}`.slice(0, 2000));
+      const note = this.#makeMessage("info", `🛡 Sandbox: ${d.dir} is no longer writable: ${d.why}. Add it again (\`/sandbox add\`) if it should be.`, SYSTEM_IDENTITY, undefined, undefined, {
+        event: "sandbox.dir_dropped",
+        path: d.dir,
+      });
+      this.#persistAndBuffer(note);
+      this.#broadcastRaw(note);
+    }
+    this.#saveMetaNow();
   }
 
   /** When an added or removed directory takes effect, in words. */
@@ -3404,7 +3450,9 @@ export class Session {
     if (!sbx) return { ok: false, error: "this daemon has no OS sandbox" };
     const current = sbx.effective().addedDirs;
     if (action === "remove") {
-      const dir = normalizeSandboxDir(raw) ?? resolvePath(this.workdir, raw.trim());
+      const written = normalizeSandboxDir(raw) ?? resolvePath(this.workdir, raw.trim());
+      // Kept by where it really was when added: named either way.
+      const dir = current.includes(written) ? written : (addedDirReal(written) ?? written);
       if (!current.includes(dir)) return { ok: false, error: `${dir} isn't one of the session's added directories${current.length > 0 ? ` (${current.join(", ")})` : ""}` };
       const when = this.#dirsWhen();
       await this.#changeSandboxDirs(current.filter((d) => d !== dir), { who: sender.sub, action: "session.sandbox_dir_removed", detail: dir }, `Sandbox: ${dir} is no longer writable (${when})`);
@@ -3414,13 +3462,14 @@ export class Session {
     if ("error" in check) return { ok: false, error: check.error };
     if (check.already) return { ok: true, message: check.already };
     const dir = check.dir;
-    this.#store.audit(sender.sub, "session.sandbox_dir_ask", this.id, dir);
+    const via = check.written !== dir ? ` (${check.written} leads there)` : "";
+    this.#store.audit(sender.sub, "session.sandbox_dir_ask", this.id, `${dir}${via}`);
     let answeredBy: string | undefined;
     void this.requestUserInput(
       {
         method: "confirm",
         title: `Let "${this.name}" write ${dir}?`,
-        message: `Its sandboxed commands could change and commit files in ${dir} (its git structure and project settings stay read-only, as in the workspace). It takes effect ${this.#dirsWhen()}.`,
+        message: `Its sandboxed commands could change and commit files in ${dir}${via} (${this.#addedDirProtection(dir)}). It takes effect ${this.#dirsWhen()}.`,
       },
       { ownerOnly: true, onAnswer: (sub) => {
           answeredBy = sub;
@@ -3434,12 +3483,12 @@ export class Session {
           return;
         }
         const again = this.#sandboxDirCheck(dir);
-        if ("error" in again || again.already) {
-          opts.onDecided?.(false, "error" in again ? again.error : again.already);
+        if ("error" in again || again.already || again.dir !== dir) {
+          opts.onDecided?.(false, "error" in again ? again.error : (again.already ?? `${dir} isn't the directory it was when asked (it leads to ${again.dir} now)`));
           return;
         }
         const when = this.#dirsWhen();
-        await this.#changeSandboxDirs([...sbx.effective().addedDirs, dir], { who: answeredBy ?? sender.sub, action: "session.sandbox_dir_added", detail: `${dir} by=owner` }, `Sandbox: ${dir} is writable (${when})`);
+        await this.#changeSandboxDirs(this.#withAddedDir(dir), { who: answeredBy ?? sender.sub, action: "session.sandbox_dir_added", detail: `${dir} by=owner` }, `Sandbox: ${dir} is writable (${when})`);
         opts.onDecided?.(true);
       },
       () => opts.onDecided?.(false, "failed"),
@@ -3474,18 +3523,18 @@ export class Session {
     if ("error" in check) return refuse(check.error);
     if (check.already) return `Nothing to add: ${check.already}.`;
     const dir = check.dir;
+    const via = check.written !== dir ? ` (${check.written} leads there)` : "";
     const grant = async (by: string, how: string): Promise<string> => {
       const when = this.#dirsWhen();
-      await this.#changeSandboxDirs([...sbx.effective().addedDirs, dir], { who: by, action: "session.sandbox_dir_added", detail: `${dir} by=agent ${how} reason=${input.reason}` }, `Sandbox: ${dir} is writable, as the agent asked (${how}; ${when})`);
+      await this.#changeSandboxDirs(this.#withAddedDir(dir), { who: by, action: "session.sandbox_dir_added", detail: `${dir} by=agent ${how} reason=${input.reason}` }, `Sandbox: ${dir} is writable, as the agent asked (${how}; ${when})`);
       return `Added: ${dir} is writable to your commands ${when.replace("the session's", "your")}. Finish this turn; it isn't writable yet in this one.`;
     };
+    // Autonomous (an unattended run's too: a routine's, a loop worker's, a dispatched worker's): only a repository
+    // (or a dir in one) strictly under a project root, named by its real path; anything else is the owner's to add.
     if (this.#mode === "autonomous") {
-      const roots = sbx.appliedProjectRoots();
-      // Strictly under one: a root itself (every repository in it) is the owner's to add.
-      if (roots.some((r) => inAnyDir(dir, [r]) && !inAnyDir(r, [dir]))) return grant(SYSTEM_IDENTITY.sub, "under a project root, autonomous");
-      return refuse(
-        `${dir} isn't under this session's project roots (${roots.length > 0 ? roots.join(", ") : "none"}); in autonomous mode nothing else is added. The owner can add it (\`/sandbox add ${dir}\`)`,
-      );
+      const why = autonomousGrantProblem(check.written, dir, sbx.appliedProjectRoots());
+      if (!why) return grant(SYSTEM_IDENTITY.sub, "a repository under a project root, autonomous");
+      return refuse(`${why}. The owner can add it (\`/sandbox add ${dir}\`)`);
     }
     // One card per directory: a repeat request while it is open waits on the same answer.
     let pending = this.#dirRequests.get(dir);
@@ -3495,7 +3544,7 @@ export class Session {
         {
           method: "confirm",
           title: `The agent asks to write ${dir}`,
-          message: `"${this.name}" asks for its sandboxed commands to write ${dir} (its git structure and project settings stay read-only).\n\nIts reason: ${input.reason}`,
+          message: `"${this.name}" asks for its sandboxed commands to write ${dir}${via} (${this.#addedDirProtection(dir)}).\n\nIts reason: ${input.reason}`,
         },
         {
           ownerOnly: true,
@@ -3519,6 +3568,7 @@ export class Session {
         const again = this.#sandboxDirCheck(dir);
         if ("error" in again) return refuse(again.error);
         if (again.already) return `Nothing to add: ${again.already}.`;
+        if (again.dir !== dir) return refuse(`${dir} isn't the directory it was when asked (it leads to ${again.dir} now)`);
         return grant(answeredBy ?? this.createdBy, "the owner approved");
       });
       this.#dirRequests.set(dir, pending);
@@ -4411,7 +4461,8 @@ export class Session {
     if (this.#sandbox && !this.#refBaseline) this.#refBaseline = refTips(this.workdir);
     await this.#refBaseline;
     // The same for each added directory's repository, from the first turn it is writable in.
-    for (const dir of this.#sandbox?.appliedAddedDirs() ?? []) {
+    // Every repository inside one too (a folder of them).
+    for (const dir of this.#sandbox?.appliedRepositories() ?? []) {
       if (this.#addedGitBaselines.has(dir)) continue;
       const base = { git: gitControlSnapshot(dir, undefined, { ownFolders: this.#sandbox?.worktreeFolders() ?? [] }), refs: refTips(dir) };
       this.#addedGitBaselines.set(dir, base);

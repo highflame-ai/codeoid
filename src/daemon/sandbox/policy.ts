@@ -34,7 +34,7 @@ import { cliCredentialFiles, registeredSecretLocations } from "../secret-paths.j
 import { DEFAULT_HOME_READABLE } from "./home-readable.js";
 import { validAllowedHost } from "./hosts.js";
 import { sandboxRoot } from "./root.js";
-import { projectRootSecrets } from "./project-roots.js";
+import { controlDirProblem, nestedControl, type NestedControl, projectRootSecrets, stillRealDir } from "./project-roots.js";
 import { isOwnWorktree, worktreeAdminsOf, worktreeFoldersOf } from "./worktrees.js";
 import type { NetworkMode, NetworkPolicy, SandboxSpec } from "./types.js";
 
@@ -454,18 +454,22 @@ export interface SpecInputs {
   /**
    * The session's project roots, resolved (project-roots.ts
    * `resolveProjectRoots`): readable whole, read-only, what the hidden list
-   * hides in them hidden again, and the secret files at each project's top
-   * there (`projectRootSecrets`).
+   * hides in them hidden again, and the credential files anywhere in them
+   * (`projectRootSecrets`); one too big to look through isn't shown.
    */
   projectRoots?: readonly string[];
   /**
    * Directories the session writes besides its workspace, validated
-   * (project-roots.ts `addedDirProblem`): each as a workspace is, its git
-   * structure and project settings held, its repository's worktree folder
-   * writable. `ownWorktreeEntries`: as {@link ownWorktreeEntries}, for its
-   * repository.
+   * (project-roots.ts `addedDirProblem`), each kept by its real path: each
+   * as a workspace is, its git structure and project settings held, and
+   * every repository and settings dir inside it (`nestedControl`), its
+   * repository's worktree folder writable; left out when it no longer is a
+   * directory at that path, or is too big to look through.
+   * `ownWorktreeEntries`: as {@link ownWorktreeEntries}, for its repository.
    */
   addedDirs?: readonly { dir: string; ownWorktreeEntries?: readonly string[] }[];
+  /** How many directories a root's or an added dir's look goes through (project-roots.ts; default theirs): tests. */
+  scanLimit?: number;
 }
 
 /** The home a spec hides: absolute, and not `/` (nothing is left to show then). */
@@ -802,8 +806,15 @@ export function gitWorkspacePaths(workspace: string, home: string = process.env.
 export function protectedWriteTargets(workdir: string, home: string = process.env.HOME ?? homedir(), addedDirs: readonly string[] = []): HeldPath[] {
   const ws = sandboxWorkspaceOf(workdir, home);
   const out: HeldPath[] = [];
-  // The workspace, and each dir the session was given to write (SpecInputs.addedDirs), as the spec holds them.
-  for (const [top, dirs] of [[ws, projectDirsOf(workdir, ws)] as const, ...addedDirs.map((d) => [resolve(d), [resolve(d)]] as const)]) {
+  // The workspace, and each dir the session was given to write (SpecInputs.addedDirs), as the spec holds them:
+  // with every repository in it, and its settings dirs and bare repositories wherever they are.
+  const nested = addedDirs.map((d) => ({ dir: resolve(d), control: nestedControlCached(resolve(d)) }));
+  for (const n of nested) {
+    for (const at of n.control.settings) out.push({ at, whole: true, what: "settings" });
+    for (const at of n.control.gitDirs) out.push({ at, whole: true, what: "git" });
+  }
+  const tops = [[ws, projectDirsOf(workdir, ws)] as const, ...nested.flatMap((n) => [n.dir, ...nestedRepos(n.dir, n.control)].map((d) => [d, [d]] as const))];
+  for (const [top, dirs] of tops) {
     const layout = gitLayoutOf(top, home);
     if (layout) {
       for (const p of [layout.dotgit, layout.common, layout.own, layout.named]) if (p) out.push({ at: p, whole: true, what: "git" });
@@ -852,7 +863,7 @@ function validSubmodule(gitDir: string, dotgit: string): boolean {
 }
 
 /** A git dir as git checks one: `objects/` and `HEAD`. */
-function gitDirShape(dir: string): boolean {
+export function gitDirShape(dir: string): boolean {
   try {
     return lstatSync(join(dir, "objects")).isDirectory() && lstatSync(join(dir, "HEAD")).isFile();
   } catch {
@@ -1080,8 +1091,15 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const workspace = resolve(inputs.workspace);
   const sandboxCfg = sandboxConfigOf(inputs.config);
   const configDir = inputs.hidden?.configDir ?? getConfigDir();
-  // Each added dir as a workspace of its own (never one inside the workspace: it is writable already).
-  const added = (inputs.addedDirs ?? []).map((a) => ({ ...a, dir: resolve(a.dir) })).filter((a, i, all) => !within(a.dir, workspace) && all.findIndex((b) => b.dir === a.dir) === i);
+  // Each added dir as a workspace of its own (never one inside the workspace: it is writable already), and only
+  // while it still is what was granted: a directory at its real path, no git or settings dir, every repository and
+  // settings dir in it found (project-roots.ts; Session says when one is dropped).
+  const added = (inputs.addedDirs ?? [])
+    .map((a) => ({ ...a, dir: resolve(a.dir) }))
+    .filter((a, i, all) => !within(a.dir, workspace) && all.findIndex((b) => b.dir === a.dir) === i)
+    .filter((a) => stillRealDir(a.dir) && controlDirProblem(a.dir, home) === null)
+    .map((a) => ({ ...a, nested: nestedControl(a.dir, inputs.scanLimit) }))
+    .filter((a) => a.nested.complete);
   const gitOf = (dir: string, ownEntries: readonly string[] | undefined): GitPaths =>
     gitWorkspacePaths(dir, home, {
       worktreeRoots: sandboxCfg.worktreeRoots,
@@ -1099,12 +1117,25 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
       if (own) addedOwn.add(resolve(own));
       for (const k of ["writable", "readOnly", "gitDirs", "folders", "locations", "problems"] as const) for (const p of g[k]) if (!git[k].includes(p)) git[k].push(p);
     }
+    // The repositories inside an added dir (a folder of them): their git structure read-only, as the workspace's.
+    for (const top of added.flatMap((a) => nestedRepos(a.dir, a.nested))) {
+      const g = gitWorkspacePaths(top, home, { worktreeRoots: sandboxCfg.worktreeRoots, configDir });
+      for (const p of g.readOnly) if (!git.readOnly.includes(p)) git.readOnly.push(p);
+      for (const p of g.problems) if (!git.problems.includes(p)) git.problems.push(p);
+    }
+    // Never the workspace's own worktree git dir, wherever a look holds the rest of `worktrees/`.
+    const wsOwn = gitLayoutOf(workspace, home)?.own;
+    if (wsOwn && added.length > 0) addedOwn.add(resolve(wsOwn));
     if (addedOwn.size > 0) git.readOnly = git.readOnly.filter((p) => !addedOwn.has(resolve(p)));
   }
   const projectConfig =
     inputs.projectConfig === false
       ? []
-      : [...projectDirsOf(inputs.workdir ?? workspace, workspace), ...added.map((a) => a.dir)].flatMap((dir) => projectConfigPaths(dir, home));
+      : [
+          ...[...projectDirsOf(inputs.workdir ?? workspace, workspace), ...added.map((a) => a.dir), ...added.flatMap((a) => nestedRepos(a.dir, a.nested))].flatMap((dir) => projectConfigPaths(dir, home)),
+          // Settings dirs and files anywhere else in an added dir, and bare repositories there: held as they are.
+          ...added.flatMap((a) => [...a.nested.settings, ...a.nested.gitDirs]).filter((p) => lexists(p) && !isLink(p)),
+        ].filter((p, i, all) => all.indexOf(p) === i);
   const cache = inputs.cache === false ? null : sandboxCacheDir(home, env);
   const own = [...(inputs.backendState ?? []).map((p) => resolve(p)), ...git.writable, ...(cache ? [cache] : [])];
   const ownReal = own.map(realOr);
@@ -1118,8 +1149,15 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const baseHidden = hiddenPathsFor(inputs.config, inputs.hidden);
   // What the hidden list hides, the home aside: no root or added dir is inside it (validated; again here).
   const inHidden = (p: string) => [...baseHidden, ...(root ? [root] : [])].some((h) => within(p, h) || within(realOr(p), realOr(h)));
-  const roots = (inputs.projectRoots ?? []).map((r) => resolve(r)).filter((r, i, all) => all.indexOf(r) === i && !userHidden.some((u) => within(r, u)) && !inHidden(r));
   const addedDirs = added.map((a) => a.dir).filter((d) => !inHidden(d) && !userHidden.some((u) => within(d, u)));
+  const writableDirs = [workspace, ...addedDirs];
+  // The credential files anywhere in a root (not the session's own: its workspace, its added dirs); a root too big
+  // to look through whole isn't shown at all (fail closed: resolveSandbox says so).
+  const rootCandidates = (inputs.projectRoots ?? []).map((r) => resolve(r)).filter((r, i, all) => all.indexOf(r) === i && !userHidden.some((u) => within(r, u)) && !inHidden(r));
+  const rootSecrets = projectRootSecrets(rootCandidates, writableDirs, inputs.scanLimit);
+  const roots = rootCandidates.filter((r) => !rootSecrets.over.includes(r));
+  // The worktree locations shown (other sessions' checkouts of this repository, their copied `.env`s): the same.
+  const locationSecrets = projectRootSecrets(git.locations, [...writableDirs, ...git.folders]);
   // A link in the allowlist leads only where the allowlist (or what is outside the home) shows: what it
   // leads to elsewhere in the home stays hidden (a project of yours, with its `.env`), and the link dangles.
   const reexposed = [
@@ -1128,17 +1166,17 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     ...allowed,
     // The worktree locations holding the session's folders, read-only: a worktree added elsewhere in one fails
     // (it isn't hidden away into a scratch dir), and the repository's other worktrees there are readable.
-    ...git.locations.filter((l) => !userHidden.some((u) => within(l, u))),
+    ...git.locations.filter((l) => !userHidden.some((u) => within(l, u)) && !locationSecrets.over.includes(l)),
     // The project roots: other repositories, read-only.
     ...roots,
   ];
-  const writableDirs = [workspace, ...addedDirs];
   const hiddenAll = [
     ...(homeHidden ? [homeHidden] : []),
     ...baseHidden,
     ...homeCredentialFilesIn(reexposed),
-    // The secret files at the top of each project under a root (not the session's own: its workspace, its added dirs).
-    ...projectRootSecrets(roots, writableDirs),
+    // The credential files under a root and in the worktree locations shown.
+    ...rootSecrets.hidden,
+    ...locationSecrets.hidden,
     ...(root ? [root] : []),
   ];
   // The session's worktree folders: writable, but never inside something hidden (a root configured in a hidden
@@ -1178,6 +1216,22 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     unsetEnv: sockets.length > 0 ? SANDBOX_UNSET_ENV.filter((n) => n !== "DOCKER_HOST") : SANDBOX_UNSET_ENV,
   };
   return spec;
+}
+
+/** nestedControl, looked again at most every few seconds: the gate asks it of every file tool call. */
+const nestedCache = new Map<string, { at: number; control: NestedControl }>();
+function nestedControlCached(dir: string): NestedControl {
+  const hit = nestedCache.get(dir);
+  if (hit && Date.now() - hit.at < 5_000) return hit.control;
+  const control = nestedControl(dir);
+  if (nestedCache.size > 64) nestedCache.clear();
+  nestedCache.set(dir, { at: Date.now(), control });
+  return control;
+}
+
+/** The repositories inside an added dir `dir` (nestedControl), but its own: each held as a workspace's is. */
+function nestedRepos(dir: string, nested: NestedControl): string[] {
+  return nested.repos.filter((r) => resolve(r) !== resolve(dir));
 }
 
 function sandboxRootOrNull(): string | null {

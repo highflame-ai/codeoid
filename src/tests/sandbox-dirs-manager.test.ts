@@ -10,8 +10,8 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { sandboxBadge, sandboxSummary } from "@highflame/codeoid-core";
 import type { CodeoidConfig } from "../config.js";
@@ -84,15 +84,28 @@ function newManager(): SessionManager {
   return new SessionManager(store, transcript, undefined, undefined, undefined, { config: config(), providers: registry, sandboxRegistry });
 }
 
+const realHome = process.env.HOME;
+function git(args: string[], cwd: string): void {
+  const r = Bun.spawnSync(["git", ...args], { cwd, env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: cwd, GIT_CONFIG_NOSYSTEM: "1" } });
+  if (r.exitCode !== 0) throw new Error(`git ${args.join(" ")}: ${r.stderr.toString()}`);
+}
+
 beforeEach(() => {
   specs = [];
-  tmp = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-sbx-dirs-")));
-  // <tmp>/projects/{work,sibling}: the default project root is <tmp>/projects.
+  // Not the host's temp dir (no project root is in one), with a home of the test's own beside it (the projects are
+  // in no hidden dir of it).
+  const parent = process.env.CODEOID_TEST_SANDBOX_DIR ?? join(homedir(), ".cache");
+  mkdirSync(parent, { recursive: true });
+  tmp = realpathSync(mkdtempSync(join(parent, "codeoid-sbx-dirs-")));
+  process.env.HOME = join(tmp, "home");
+  mkdirSync(process.env.HOME);
+  // <tmp>/projects/{work,sibling}, each a repository: the default project root is <tmp>/projects.
   root = join(tmp, "projects");
   workdir = join(root, "work");
   sibling = join(root, "sibling");
   elsewhere = join(tmp, "elsewhere");
   for (const d of [workdir, sibling, elsewhere]) mkdirSync(d, { recursive: true });
+  for (const d of [workdir, sibling]) git(["init", "-q"], d);
   // codeoid's own data beside the projects, never around them (an added dir is never in what the sandbox hides).
   mkdirSync(join(tmp, "data"));
   store = new Store(join(tmp, "data", "codeoid.db"));
@@ -112,6 +125,7 @@ afterEach(async () => {
   try {
     store.close();
   } catch {}
+  process.env.HOME = realHome;
   rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -181,7 +195,8 @@ describe("project roots and added directories through the SessionManager", () =>
     const m = newManager();
     const id = infoOf(await create(m))?.id as string;
     const add = (path: string) => m.handle({ type: "session.sandbox_dir", id: "d", sessionId: id, action: "add", path }, AUTH, CLIENT);
-    for (const bad of ["/", homedir(), "~", join(homedir(), ".config"), join(tmp, "missing"), "/usr"]) {
+    const home = process.env.HOME as string;
+    for (const bad of ["/", home, "~", join(home, ".config"), join(tmp, "missing"), "/usr"]) {
       expect(await add(bad)).toMatchObject({ type: "response.error", code: "invalid_request" });
     }
     const inside = await add(join(workdir));
@@ -275,5 +290,112 @@ describe("project roots and added directories through the SessionManager", () =>
       release?.();
     }
     expect(session?.toInfo().sandbox?.addedDirs).toBeUndefined();
+  });
+});
+
+describe("an added directory is what it is when granted (#448 round 12)", () => {
+  async function autonomous(m: SessionManager) {
+    const info = infoOf(await create(m));
+    expect(await m.handle({ type: "session.set_mode", id: "m", sessionId: info?.id as string, mode: "autonomous" }, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
+    const session = m.findByName(info?.name as string, AUTH);
+    await session?.ensureSandbox();
+    return { info, session };
+  }
+
+  it("autonomous: a link (its own worktree folder's, leading anywhere of yours) is refused; so are a folder of repositories, a settings or git dir; a repository is added by its real path", async () => {
+    const m = newManager();
+    const { session } = await autonomous(m);
+    // The agent's own worktree folder is writable to it and under the root: a link there, to a dir of yours.
+    const folder = join(root, "work-worktrees", "agent-folder");
+    mkdirSync(folder, { recursive: true });
+    symlinkSync(elsewhere, join(folder, "x"));
+    const viaLink = await session?.requestDirectory({ path: join(folder, "x"), reason: "r" });
+    expect(viaLink).toContain("Refused:");
+    expect(viaLink).toContain("goes through a symbolic link");
+    // A plain folder holding repositories: the owner's to add (every repository in it at once).
+    const clients = join(root, "clients");
+    mkdirSync(join(clients, "beta"), { recursive: true });
+    git(["init", "-q"], join(clients, "beta"));
+    expect(await session?.requestDirectory({ path: clients, reason: "r" })).toContain(`Refused: ${clients} isn't in a repository`);
+    // What runs outside the sandbox: never writable.
+    for (const control of [join(sibling, ".claude"), join(sibling, ".git"), join(sibling, ".git", "hooks")]) {
+      mkdirSync(control, { recursive: true });
+      expect(await session?.requestDirectory({ path: control, reason: "r" })).toContain("Refused:");
+    }
+    expect(session?.toInfo().sandbox?.addedDirs).toBeUndefined();
+    // A repository under the root: added, by where it really is.
+    const alias = join(root, "sibling-alias");
+    symlinkSync(sibling, alias);
+    expect(await session?.requestDirectory({ path: alias, reason: "r" })).toContain("goes through a symbolic link");
+    expect(await session?.requestDirectory({ path: join(sibling, "src", "..", "."), reason: "r" })).toContain(`Added: ${sibling}`);
+    expect(session?.sandboxSetting?.addedDirs).toEqual([sibling]);
+  });
+
+  it("guarded: the owner's card names where a link leads, and what is kept is that directory", async () => {
+    const m = newManager();
+    const info = infoOf(await create(m));
+    const session = m.findByName(info?.name as string, AUTH);
+    await session?.ensureSandbox();
+    const asked = dialogs(m, info?.name as string);
+    const link = join(root, "work-worktrees", "agent-folder", "docs");
+    mkdirSync(join(root, "work-worktrees", "agent-folder"), { recursive: true });
+    symlinkSync(elsewhere, link);
+    const pending = session?.requestDirectory({ path: link, reason: "notes" }) as Promise<string>;
+    await until(() => asked.length > 0);
+    expect(asked[0]?.title).toBe(`The agent asks to write ${elsewhere}`);
+    expect(asked[0]?.message).toContain(`${link} leads there`);
+    await m.handle({ type: "session.ui_response", id: "u", sessionId: info?.id as string, requestId: asked[0]?.requestId as string, confirmed: true } as never, AUTH, CLIENT);
+    expect(await pending).toContain(`Added: ${elsewhere}`);
+    expect(session?.sandboxSetting?.addedDirs).toEqual([elsewhere]);
+  });
+
+  it("a folder of repositories added by the owner: the card says their git structure and settings stay read-only", async () => {
+    const m = newManager();
+    const info = infoOf(await create(m));
+    const session = m.findByName(info?.name as string, AUTH);
+    await session?.ensureSandbox();
+    const clients = join(root, "clients");
+    for (const r of ["beta", "gamma"]) {
+      mkdirSync(join(clients, r), { recursive: true });
+      git(["init", "-q"], join(clients, r));
+    }
+    const asked = dialogs(m, info?.name as string);
+    await m.handle({ type: "session.sandbox_dir", id: "d", sessionId: info?.id as string, action: "add", path: clients }, AUTH, CLIENT);
+    await until(() => asked.length > 0);
+    expect(asked[0]?.message).toContain("and so do those of the 2 repositories inside it");
+  });
+
+  it("replaced by a link after it was granted: dropped at the next build, said and audited, out of the setting; never followed", async () => {
+    const m = newManager();
+    const { session } = await autonomous(m);
+    expect(await session?.requestDirectory({ path: sibling, reason: "r" })).toContain(`Added: ${sibling}`);
+    await session?.send("one", AUTH);
+    await until(() => session?.toInfo().status === "idle");
+    expect(session?.toInfo().sandbox?.addedDirs).toEqual([sibling]);
+    // Swapped (by whatever can write its parent) for a link to a dir of yours.
+    renameSync(sibling, join(tmp, "moved"));
+    symlinkSync(elsewhere, sibling);
+    const infos: string[] = [];
+    session?.attach({ id: "watch", auth: AUTH, send: (msg: { type: string; role?: string; content?: string }) => void (msg.type === "session.message" && msg.role === "info" && infos.push(String(msg.content))) } as never);
+    specs = [];
+    await session?.setSandbox({ ...(session?.sandboxSetting ?? {}), network: "off" }, AUTH);
+    await session?.ensureSandbox();
+    expect(session?.toInfo().sandbox?.addedDirs).toBeUndefined();
+    expect(session?.sandboxSetting?.addedDirs ?? []).toEqual([]);
+    expect(infos.some((t) => t.includes(`${sibling} is no longer writable`) && t.includes("symbolic link"))).toBe(true);
+    expect(audits.some((a) => a.action === "session.sandbox_dir_dropped" && a.detail.startsWith(sibling))).toBe(true);
+    for (const spec of specs) expect(spec.writable).not.toContain(elsewhere);
+  });
+
+  it("an unattended run in autonomous mode (a routine's, a loop worker's) follows the autonomous rule: a repository under a root, never anything else", async () => {
+    const m = newManager();
+    const { session } = await autonomous(m);
+    const release = session?.beginUnattended();
+    try {
+      expect(await session?.requestDirectory({ path: elsewhere, reason: "x" })).toContain("isn't under this session's project roots");
+      expect(await session?.requestDirectory({ path: sibling, reason: "x" })).toContain(`Added: ${sibling}`);
+    } finally {
+      release?.();
+    }
   });
 });

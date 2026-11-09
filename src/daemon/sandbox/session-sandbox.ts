@@ -23,7 +23,20 @@ import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinem
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
 import { buildSandboxSpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
-import { addedDirProblem, normalizeSandboxDir, PROJECT_ROOT_PARENT, resolveProjectRoots } from "./project-roots.js";
+import {
+  addedDirProblem,
+  addedDirReal,
+  linkInPath,
+  nestedControl,
+  normalizeSandboxDir,
+  PROJECT_ROOT_PARENT,
+  PROJECT_ROOT_SCAN_LIMIT,
+  projectRootSecrets,
+  repositoryOfConfig,
+  resolveProjectRoots,
+  SCAN_SKIPPED_DIRS,
+  stillRealDir,
+} from "./project-roots.js";
 import { ENTRY_GRACE_MS, WorktreeEntryGuard, type WorktreeEntryFinding } from "./worktree-entries.js";
 import { existingFolderName, mainCheckoutOf, sessionFolderName, worktreeFoldersOf, worktreeLocationDirs, worktreeRootNotes } from "./worktrees.js";
 import type { SandboxRegistry } from "./registry.js";
@@ -162,6 +175,20 @@ export function effectiveSetting(config: SandboxConfig, setting: SessionSandboxS
   return { choice, network, dockerSocket: setting?.dockerSocket ?? config.docker.socket ?? false, projectRoots: [...new Set(roots)], addedDirs: [...new Set(added)] };
 }
 
+/**
+ * `setting` with each added directory `before` didn't have kept by where it
+ * really is now, when it is granted (project-roots.ts `addedDirReal`): what
+ * is bound is that directory, never where a link there leads later. One
+ * already kept stays as it was (a link put there since is dropped at the
+ * next build, never followed).
+ */
+export function canonicalAddedDirs(setting: SessionSandboxSetting, before?: SessionSandboxSetting): SessionSandboxSetting {
+  if (!setting.addedDirs) return setting;
+  const had = new Set(before?.addedDirs ?? []);
+  const dirs = setting.addedDirs.map((d) => (had.has(d) ? d : (addedDirReal(d) ?? d)));
+  return { ...setting, addedDirs: [...new Set(dirs)] };
+}
+
 /** The setting's fields that only say which directories are readable or writable: a change to them alone is applied between turns, never restarting work (SessionSandbox.set). */
 const DIR_FIELDS = ["projectRoots", "addedDirs"] as const;
 
@@ -248,14 +275,18 @@ export const HOME_WORKSPACE_NOTE =
 /**
  * A session's project roots and added directories for its sandbox's
  * workspace `top` (project-roots.ts): what is used, and what isn't and why.
- * An added dir inside the workspace is dropped (writable already).
+ * An added dir inside the workspace is dropped (writable already); one that
+ * is no longer a directory at the real path it was granted at (a link put
+ * there, removed), or can't be one now, is `dropped`, said. A root too big
+ * to look through for credential files isn't used, said, and so is a
+ * repository there whose git config is hidden for the credential in it.
  */
 export function sandboxDirsOf(
   top: string,
   rootEntries: readonly string[],
   addedDirs: readonly string[],
   config?: CodeoidConfig,
-): { roots: string[]; added: string[]; notes: string[]; homeWorkspace: boolean } {
+): { roots: string[]; added: string[]; notes: string[]; homeWorkspace: boolean; dropped: Array<{ dir: string; why: string }> } {
   const home = resolve(process.env.HOME ?? homedir());
   const configDir = getConfigDir();
   const homeWorkspace = resolve(top) === home;
@@ -263,13 +294,37 @@ export function sandboxDirsOf(
   const notes = [...(homeWorkspace ? [HOME_WORKSPACE_NOTE] : []), ...(homeWorkspace ? [] : r.notes)];
   const hidden = addedDirs.length > 0 ? hiddenPathsFor(config) : [];
   const added: string[] = [];
+  const dropped: Array<{ dir: string; why: string }> = [];
   for (const d of addedDirs) {
     if (resolve(d) === resolve(top) || resolve(d).startsWith(`${resolve(top)}/`)) continue;
-    const problem = addedDirProblem(d, { home, configDir, hidden });
-    if (problem) notes.push(`added directory ${d}: ${problem}: not writable`);
-    else added.push(resolve(d));
+    const problem = stillRealDir(d)
+      ? addedDirProblem(d, { home, configDir, hidden })
+      : `it is no longer the directory it was when added (${linkInPath(d) ? `${linkInPath(d)} is a symbolic link now` : "removed, or not a directory"})`;
+    if (problem) {
+      notes.push(`added directory ${d}: ${problem}: not writable`);
+      dropped.push({ dir: d, why: problem });
+    } else added.push(resolve(d));
   }
-  return { roots: homeWorkspace ? [] : r.roots, added, notes, homeWorkspace };
+  let roots = homeWorkspace ? [] : r.roots;
+  if (roots.length > 0) {
+    const secrets = projectRootSecrets(roots, [top, ...added]);
+    for (const over of secrets.over) {
+      notes.push(
+        `project root ${over}: more than ${PROJECT_ROOT_SCAN_LIMIT} directories to look through for credential files (${[...SCAN_SKIPPED_DIRS].slice(0, 2).join(", ")} and the like aside): not used — name narrower roots in sandbox.projectRoots (or the session's own), the repositories you need`,
+      );
+    }
+    roots = roots.filter((x) => !secrets.over.includes(x));
+    for (const c of secrets.gitConfigs.slice(0, 5)) {
+      notes.push(`${c} holds a credential (a remote URL with a user or password in it, or an http extraheader): hidden, so git in ${repositoryOfConfig(c)} can't read its config from this session`);
+    }
+    if (secrets.gitConfigs.length > 5) notes.push(`and ${secrets.gitConfigs.length - 5} more repositories' git configs holding a credential: hidden`);
+  }
+  return { roots, added, notes, homeWorkspace, dropped };
+}
+
+/** The repositories an added dir holds besides its own (a folder of them): the end-of-turn git look covers each. */
+export function addedRepositories(addedDirs: readonly string[]): string[] {
+  return [...new Set(addedDirs.flatMap((d) => nestedControl(d).repos.filter((r) => resolve(r) !== resolve(d))))];
 }
 
 /** What a setting resolves to for a backend now (no side effects beyond a cached probe). */
@@ -282,7 +337,7 @@ export async function resolveSandbox(opts: {
   workspace?: string;
   /** The daemon's whole config: what an added directory may not be in (its data dirs: policy.ts `hiddenPathsFor`). */
   codeoidConfig?: CodeoidConfig;
-}): Promise<{ info: SessionSandboxInfo; provider: SandboxProvider | null; plan: ConfinementPlan | null; network: NetworkPolicy }> {
+}): Promise<{ info: SessionSandboxInfo; provider: SandboxProvider | null; plan: ConfinementPlan | null; network: NetworkPolicy; droppedDirs?: Array<{ dir: string; why: string }> }> {
   const { choice, network, dockerSocket, projectRoots, addedDirs } = effectiveSetting(opts.config, opts.setting);
   const base = {
     choice,
@@ -331,7 +386,7 @@ export async function resolveSandbox(opts: {
   const layout = top !== null && opts.config.worktreeRoots.length > 0 ? gitLayoutOf(top) : null;
   const rootNotes = layout ? worktreeRootNotes(layout, { roots: opts.config.worktreeRoots, configDir: getConfigDir() }) : [];
   // Working across repositories: the project roots it reads, the directories it writes besides its workspace.
-  const dirs = top !== null ? sandboxDirsOf(top, projectRoots, addedDirs, opts.codeoidConfig) : { roots: [], added: [], notes: [], homeWorkspace: false };
+  const dirs = top !== null ? sandboxDirsOf(top, projectRoots, addedDirs, opts.codeoidConfig) : { roots: [], added: [], notes: [], homeWorkspace: false, dropped: [] };
   const limits = [...c.plan.limits, ...(net.note ? [net.note] : []), ...(gitNote ? [gitNote] : []), ...(topNote ? [topNote] : []), ...(dockerNote ? [dockerNote] : []), ...rootNotes, ...dirs.notes];
   const applied: NetworkPolicy = net.mode === "allowlist" ? network : { mode: net.mode };
   return {
@@ -354,6 +409,7 @@ export async function resolveSandbox(opts: {
     provider,
     plan: c.plan,
     network: applied,
+    ...(dirs.dropped.length > 0 ? { droppedDirs: dirs.dropped } : {}),
   };
 }
 
@@ -391,6 +447,7 @@ export class SessionSandbox {
   readonly #addedEntries = new Map<string, WorktreeEntryGuard>();
   /** The project roots and added directories the last resolution applied (the runtime's: a change waits for the next). */
   #dirs: { roots: string[]; added: string[] } = { roots: [], added: [] };
+  #droppedDirs: Array<{ dir: string; why: string }> = [];
   /** The setting's directories changed since the last resolution, nothing else (applied between turns: Session). */
   #dirsStale = false;
   /** The spec last built for the session: what its commands can write, for the entries' look. */
@@ -476,7 +533,7 @@ export class SessionSandbox {
    * cut off by a change of setting) or the session closes.
    */
   async set(setting: SessionSandboxSetting | undefined): Promise<void> {
-    const next = setting && Object.keys(setting).length > 0 ? { ...setting } : undefined;
+    const next = setting && Object.keys(setting).length > 0 ? canonicalAddedDirs({ ...setting }, this.#setting) : undefined;
     // Only which directories are read or written: the runtime stands until Session applies it between turns.
     if (onlyDirsChanged(this.#setting, next) && !this.#stale) this.#dirsStale = true;
     else this.#stale = true;
@@ -502,6 +559,36 @@ export class SessionSandbox {
   /** The project roots the running sandbox reads. */
   appliedProjectRoots(): string[] {
     return [...this.#dirs.roots];
+  }
+
+  /** The added directories the last resolution left out, and why (project-roots.ts `stillRealDir`, `addedDirProblem`): Session says it, and drops them. */
+  droppedDirs(): Array<{ dir: string; why: string }> {
+    return [...this.#droppedDirs];
+  }
+
+  /**
+   * Take `dirs` out of the setting's added directories, as the last
+   * resolution already left them out (droppedDirs): nothing to apply, so the
+   * runtime stands; a dir there again later isn't added again unasked.
+   */
+  forget(dirs: readonly string[]): void {
+    if (!this.#setting?.addedDirs) return;
+    const gone = new Set(dirs.map((d) => resolve(d)));
+    const kept = this.#setting.addedDirs.filter((d) => !gone.has(resolve(normalizeSandboxDir(d) ?? d)));
+    if (kept.length === this.#setting.addedDirs.length) return;
+    const { addedDirs: _old, ...rest } = this.#setting;
+    this.#setting = kept.length > 0 ? { ...rest, addedDirs: kept } : Object.keys(rest).length > 0 ? rest : undefined;
+    this.#droppedDirs = this.#droppedDirs.filter((d) => !gone.has(resolve(d.dir)));
+  }
+
+  /** The session's temp dir, once made (its commands write it): null before. */
+  get tempDirPath(): string | null {
+    return this.#tempDir;
+  }
+
+  /** The repositories the session writes besides its workspace: its added dirs, and every repository inside one. */
+  appliedRepositories(): string[] {
+    return [...new Set([...this.#dirs.added, ...addedRepositories(this.#dirs.added)])];
   }
 
   /**
@@ -532,6 +619,7 @@ export class SessionSandbox {
     this.#dirsStale = false;
     const dirs = { roots: [...(r.info.projectRoots ?? [])], added: [...(r.info.addedDirs ?? [])] };
     this.#dirs = dirs;
+    this.#droppedDirs = r.droppedDirs ?? [];
     if (r.info.state !== "on" || !r.provider || !r.plan) {
       this.#runtime = null;
       return r.info;

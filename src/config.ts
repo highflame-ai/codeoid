@@ -18,7 +18,7 @@ import type { ModelPrice } from "./daemon/pricing/index.js";
 import type { SandboxConfig } from "./daemon/sandbox/policy.js";
 import { DEFAULT_HOME_READABLE } from "./daemon/sandbox/home-readable.js";
 import { validAllowedHost } from "./daemon/sandbox/hosts.js";
-import { PROJECT_ROOT_PARENT, sandboxDirProblem } from "./daemon/sandbox/dir-rules.js";
+import { PROJECT_ROOT_PARENT, projectRootProblem } from "./daemon/sandbox/dir-rules.js";
 import { worktreeRootProblem } from "./daemon/sandbox/worktrees.js";
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, rmSync } from "node:fs";
 import { randomBytes } from "node:crypto";
@@ -299,8 +299,9 @@ const SandboxSchema = z
      * Where sandboxed commands read other repositories, read-only (docs/sandbox.md,
      * "Working across repositories"): `@parent` (the parent of the session's
      * repository, the default), or absolute paths (`~` expands). `[]`: none.
-     * Refused as worktree roots are (never `/`, the home, a hidden dir of it, …);
-     * a default that would be the home falls back to none, said on the session.
+     * Refused as worktree roots are (never `/`, the home, a hidden dir of it, …),
+     * and never the host's temp dir or anything in it; a default that would be
+     * the home or in a temp dir falls back to none, said on the session.
      */
     projectRoots: z
       .array(
@@ -310,7 +311,7 @@ const SandboxSchema = z
           .max(4096)
           .superRefine((root, ctx) => {
             if (root === PROJECT_ROOT_PARENT) return;
-            const problem = sandboxDirProblem(root, { configDir: getConfigDir() });
+            const problem = projectRootProblem(root, { configDir: getConfigDir() });
             if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `not a project root: ${problem}` });
           }),
       )

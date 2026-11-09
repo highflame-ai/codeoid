@@ -99,7 +99,7 @@ function entries(dir: string): string[] {
 }
 
 /** `core.hooksPath` as the repository's own config files set it (the last one wins), or null. */
-function hooksPathOf(configs: readonly string[]): string | null {
+export function hooksPathOf(configs: readonly string[]): string | null {
   let found: string | null = null;
   for (const file of configs) {
     let text = "";

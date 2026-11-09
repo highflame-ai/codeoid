@@ -10,10 +10,10 @@
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CodeoidConfig } from "../config.js";
+import { type CodeoidConfig, loadConfig } from "../config.js";
 import { codexSandboxPolicy } from "../daemon/providers/codex/index.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
@@ -21,10 +21,20 @@ import { isRequestDirectoryTool, isSafeTool } from "../daemon/providers/tool-saf
 import { claudeSandboxSettings, readAround } from "../daemon/sandbox/claude-native.js";
 import { LocalSandboxHandle } from "../daemon/sandbox/local-handle.js";
 import { buildSandboxSpec, protectedWriteTargets } from "../daemon/sandbox/policy.js";
-import { addedDirProblem, defaultProjectRoot, projectRootSecrets, resolveProjectRoots, sandboxDirProblem } from "../daemon/sandbox/project-roots.js";
+import {
+  addedDirProblem,
+  autonomousGrantProblem,
+  defaultProjectRoot,
+  nestedControl,
+  projectRootProblem,
+  projectRootSecrets,
+  resolveProjectRoots,
+  sandboxDirProblem,
+  stillRealDir,
+} from "../daemon/sandbox/project-roots.js";
 import { SandboxRegistry } from "../daemon/sandbox/registry.js";
 import { SANDBOX_MCP_TOKEN_ENV, SandboxMcpHttp } from "../daemon/sandbox/request-directory.js";
-import { effectiveSetting, onlyDirsChanged, type SandboxRuntime, sandboxDirsOf, SessionSandbox, widens } from "../daemon/sandbox/session-sandbox.js";
+import { canonicalAddedDirs, effectiveSetting, onlyDirsChanged, type SandboxRuntime, sandboxDirsOf, SessionSandbox, widens } from "../daemon/sandbox/session-sandbox.js";
 import { sandboxConfigOf } from "../daemon/sandbox/policy.js";
 import type { SandboxProvider, SandboxSpec } from "../daemon/sandbox/types.js";
 import { Session } from "../daemon/session.js";
@@ -41,13 +51,26 @@ function git(args: string[], cwd: string): void {
 }
 
 let base: string;
+/** Not the host's temp dir: no project root is in one (dir-rules.ts `projectRootProblem`). */
+function scratchParent(): string {
+  const dir = process.env.CODEOID_TEST_SANDBOX_DIR ?? join(homedir(), ".cache");
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+const realHome = process.env.HOME;
 beforeEach(() => {
-  base = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-roots-")));
+  base = realpathSync(mkdtempSync(join(scratchParent(), "codeoid-roots-")));
+  // A home of the test's own, beside the projects: they are in no hidden dir of it (~/.cache is one of yours).
+  process.env.HOME = join(base, "fakehome");
+  mkdirSync(process.env.HOME);
 });
-afterEach(() => rmSync(base, { recursive: true, force: true }));
+afterEach(() => {
+  process.env.HOME = realHome;
+  rmSync(base, { recursive: true, force: true });
+});
 
 describe("project roots", () => {
-  test("the default is the repository's parent; a linked worktree's is its main checkout's; outside a repository, the workspace's parent", () => {
+  test("the default is the repository's parent; a linked worktree's is its main checkout's; outside a repository, none (said)", () => {
     const home = join(base, "home");
     const repo = join(home, "Workspace", "app");
     mkdirSync(join(repo, "packages", "ui"), { recursive: true });
@@ -56,7 +79,10 @@ describe("project roots", () => {
     expect(defaultProjectRoot(repo, home)).toBe(join(home, "Workspace"));
     const plain = join(home, "notes", "today");
     mkdirSync(plain, { recursive: true });
-    expect(defaultProjectRoot(plain, home)).toBe(join(home, "notes"));
+    expect(defaultProjectRoot(plain, home)).toBeNull();
+    const none = resolveProjectRoots(["@parent"], plain, { home });
+    expect(none.roots).toEqual([]);
+    expect(none.notes[0]).toContain("the workspace isn't in a repository, so there is no default");
     expect(resolveProjectRoots(["@parent"], repo, { home }).roots).toEqual([join(home, "Workspace")]);
   });
 
@@ -69,7 +95,7 @@ describe("project roots", () => {
     expect(r.roots).toEqual([]);
     expect(r.notes[0]).toContain("no project root: the default, the repository's parent");
     expect(r.notes[0]).toContain("set sandbox.projectRoots");
-    const dirs = sandboxDirsOf(homedir(), ["@parent"], []);
+    const dirs = sandboxDirsOf(process.env.HOME as string, ["@parent"], []);
     expect(dirs).toMatchObject({ roots: [], homeWorkspace: true });
     expect(dirs.notes[0]).toContain("only credentials are protected");
   });
@@ -100,14 +126,14 @@ describe("project roots", () => {
     expect(addedDirProblem(join(home, "file"), { home })).toContain("isn't a directory");
   });
 
-  test("the secret files at a project's top are hidden, not their examples, and not the session's own", () => {
+  test("the secret files anywhere in a root are hidden, not their examples, and not the session's own", () => {
     const root = join(base, "Workspace");
     for (const p of ["a", "b", "c/deep"]) mkdirSync(join(root, p), { recursive: true });
     for (const f of [".env", ".env.production", ".envrc", ".npmrc", ".env.example", ".env.sample", "README.md"]) writeFileSync(join(root, "b", f), "x");
     writeFileSync(join(root, "a", ".env"), "mine");
     writeFileSync(join(root, "c", "deep", ".env"), "deep");
-    const found = projectRootSecrets([root], [join(root, "a")]).sort();
-    expect(found).toEqual([".env", ".env.production", ".envrc", ".npmrc"].map((f) => join(root, "b", f)).sort());
+    const found = projectRootSecrets([root], [join(root, "a")]).hidden.sort();
+    expect(found).toEqual([...[".env", ".env.production", ".envrc", ".npmrc"].map((f) => join(root, "b", f)), join(root, "c", "deep", ".env")].sort());
   });
 });
 
@@ -398,6 +424,244 @@ describe("applied between turns, never mid-work", () => {
       await session.destroy(AUTH).catch(() => {});
       await transcripts.flush().catch(() => {});
       store.close();
+    }
+  });
+});
+
+/** `<home>/Workspace/{a,b}`, each a repository, and a dir of yours outside every root. */
+function workspaceLayout() {
+  const home = join(base, "home");
+  const root = join(home, "Workspace");
+  const a = join(root, "a");
+  const b = join(root, "b");
+  const docs = join(home, "Documents");
+  for (const r of [a, b]) {
+    mkdirSync(r, { recursive: true });
+    git(["init", "-q", "-b", "main"], r);
+  }
+  mkdirSync(docs, { recursive: true });
+  const tmp = join(base, "tmp");
+  mkdirSync(tmp, { recursive: true });
+  const spec = (over: Partial<Parameters<typeof buildSandboxSpec>[0]> = {}) =>
+    buildSandboxSpec({
+      sessionId: "s",
+      workspace: a,
+      tempDir: tmp,
+      network: { mode: "off" },
+      hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" },
+      projectRoots: [root],
+      ...over,
+    });
+  return { home, root, a, b, docs, tmp, spec };
+}
+
+describe("an added directory is what it was when granted (#448 round 12)", () => {
+  test("kept by its real path; replaced by a link later, it is dropped at the next build (said), never followed", () => {
+    const { home, root, a, docs, spec } = workspaceLayout();
+    const c = join(root, "c");
+    mkdirSync(c);
+    const link = join(root, "a-worktrees", "s-1234abcd", "x");
+    mkdirSync(join(root, "a-worktrees", "s-1234abcd"), { recursive: true });
+    symlinkSync(docs, link);
+    // What is kept is where it really is when granted.
+    expect(canonicalAddedDirs({ addedDirs: [link, c] }).addedDirs).toEqual([docs, c]);
+    expect(canonicalAddedDirs({ addedDirs: [link] }, { addedDirs: [link] }).addedDirs).toEqual([link]);
+    expect(stillRealDir(c)).toBe(true);
+    expect(spec({ addedDirs: [{ dir: c }] }).writable).toContain(c);
+    // c swapped for a link to a dir of yours.
+    renameSync(c, join(root, "c-old"));
+    symlinkSync(docs, c);
+    expect(stillRealDir(c)).toBe(false);
+    const after = spec({ addedDirs: [{ dir: c }] });
+    expect(after.addedDirs).toBeUndefined();
+    expect(after.writable).not.toContain(c);
+    expect(after.writable).not.toContain(docs);
+    // A stored link (as an older daemon kept one) isn't followed either.
+    expect(spec({ addedDirs: [{ dir: link }] }).writable).not.toContain(docs);
+    process.env.HOME = home;
+    const dirs = sandboxDirsOf(a, [], [c]);
+    expect(dirs.added).toEqual([]);
+    expect(dirs.dropped[0]?.dir).toBe(c);
+    expect(dirs.notes.join("\n")).toContain(`${c} is a symbolic link now`);
+  });
+
+  test("autonomous: only by a path with no link in it, strictly under a root, in a repository", () => {
+    const { home, root, b, docs } = workspaceLayout();
+    const clients = join(root, "clients");
+    mkdirSync(join(clients, "beta"), { recursive: true });
+    git(["init", "-q"], join(clients, "beta"));
+    mkdirSync(join(b, "src"));
+    symlinkSync(b, join(root, "b-alias"));
+    expect(autonomousGrantProblem(b, b, [root], home)).toBeNull();
+    expect(autonomousGrantProblem(join(b, "src"), join(b, "src"), [root], home)).toBeNull();
+    expect(autonomousGrantProblem(join(clients, "beta"), join(clients, "beta"), [root], home)).toBeNull();
+    expect(autonomousGrantProblem(join(root, "b-alias"), b, [root], home)).toContain("goes through a symbolic link");
+    expect(autonomousGrantProblem(clients, clients, [root], home)).toContain("isn't in a repository");
+    expect(autonomousGrantProblem(root, root, [root], home)).toContain("isn't under this session's project roots");
+    expect(autonomousGrantProblem(docs, docs, [root], home)).toContain("isn't under this session's project roots");
+  });
+
+  test("a git or project settings dir, or one inside it, is never added: what is in it runs outside the sandbox", () => {
+    const { home, root, b } = workspaceLayout();
+    const bare = join(root, "server.git");
+    mkdirSync(bare);
+    git(["init", "-q", "--bare"], bare);
+    git(["config", "core.hooksPath", ".husky"], b);
+    const refused = [
+      ...[".claude", ".codex", ".gemini", ".qwen", ".pi", ".opencode"].map((d) => join(b, d)),
+      join(b, ".claude", "hooks"),
+      join(b, ".git"),
+      join(b, ".git", "hooks"),
+      join(b, ".git", "info"),
+      bare,
+      join(bare, "hooks"),
+      join(b, ".husky"),
+    ];
+    for (const d of refused) {
+      mkdirSync(d, { recursive: true });
+      expect([d, addedDirProblem(d, { home, path: "/usr/bin" })]).toEqual([d, expect.stringMatching(/settings dir|\.git dir|git dir|hooks dir/)]);
+    }
+    expect(addedDirProblem(b, { home, path: "/usr/bin" })).toBeNull();
+  });
+
+  test("a folder of repositories: each repository's git structure and every settings dir in it held, as the workspace's", () => {
+    const { home, root, spec } = workspaceLayout();
+    const clients = join(root, "clients");
+    for (const r of ["beta", "gamma"]) {
+      mkdirSync(join(clients, r), { recursive: true });
+      git(["init", "-q"], join(clients, r));
+    }
+    mkdirSync(join(clients, "beta", ".claude"));
+    mkdirSync(join(clients, "notes", "deep", ".codex"), { recursive: true });
+    mkdirSync(join(clients, "web", "node_modules", "x", ".git"), { recursive: true });
+    const nested = nestedControl(clients);
+    expect(nested.complete).toBe(true);
+    expect(nested.repos.sort()).toEqual([join(clients, "beta"), join(clients, "gamma")]);
+    const s = spec({ addedDirs: [{ dir: clients }] });
+    expect(s.writable).toContain(clients);
+    for (const held of [
+      join(clients, "beta", ".git", "config"),
+      join(clients, "beta", ".git", "hooks"),
+      join(clients, "gamma", ".git", "hooks"),
+      join(clients, "beta", ".claude"),
+      join(clients, "gamma", ".mcp.json"),
+      join(clients, "notes", "deep", ".codex"),
+    ]) {
+      expect([held, s.readOnly?.includes(held)]).toEqual([held, true]);
+    }
+    const targets = protectedWriteTargets(join(root, "a"), home, [clients]).map((h) => h.at);
+    for (const t of [join(clients, "beta", ".git"), join(clients, "beta", ".claude"), join(clients, "notes", "deep", ".codex")]) expect(targets).toContain(t);
+  });
+
+  test("the look through an added dir is bounded, and fails closed: past it, refused, and left out of the spec", () => {
+    const { home, root, spec } = workspaceLayout();
+    const big = join(root, "big");
+    for (let i = 0; i < 5; i++) mkdirSync(join(big, `d${i}`), { recursive: true });
+    expect(nestedControl(big, 3).complete).toBe(false);
+    expect(addedDirProblem(big, { home, path: "/usr/bin", scanLimit: 3 })).toContain("holds more than 3 directories");
+    expect(addedDirProblem(big, { home, path: "/usr/bin" })).toBeNull();
+    expect(spec({ addedDirs: [{ dir: big }], scanLimit: 3 }).writable).not.toContain(big);
+    expect(spec({ addedDirs: [{ dir: big }] }).writable).toContain(big);
+  });
+});
+
+describe("credentials inside project roots (#448 round 12)", () => {
+  test("hidden by name anywhere in a root (codeoid's worktrees of sibling repositories too), not their examples, not the session's own", () => {
+    const { root, a, b } = workspaceLayout();
+    const secret = [
+      ".env",
+      ".env.production.local",
+      ".envrc",
+      ".npmrc",
+      ".pypirc",
+      ".netrc",
+      ".git-credentials",
+      ".vault-token",
+      "server.pem",
+      "tls.key",
+      "id_rsa",
+      "id_ed25519",
+      "id_ecdsa_old",
+      "cert.p12",
+      "cert.pfx",
+      "kubeconfig",
+      "dev.kubeconfig",
+      "terraform.tfstate",
+      "terraform.tfstate.backup",
+      "prod.tfvars",
+      "credentials.json",
+      "service-account-prod.json",
+      "secrets.yaml",
+      "config/.env",
+      "config/secrets.yml",
+      ".claude/settings.local.json",
+      ".mcp.json",
+      ".docker/config.json",
+    ].map((f) => join(b, f));
+    const dirs = [".aws", ".ssh", ".kube", ".gnupg"].map((d) => join(b, d));
+    const plain = [".env.example", ".env.sample", ".env.template", "id_rsa.pub", "id_ed25519.pub", "README.md", "credentials.ts", "secrets.py", "keys.txt", "node_modules/pkg/.env"].map((f) => join(b, f));
+    const worktrees = [join(root, "b-worktrees", "fork-1234", ".env"), join(root, "b-worktrees", "other-abcd", "feat", ".env")];
+    for (const f of [...secret, ...plain, ...worktrees, ...dirs.map((d) => join(d, "credentials")), join(a, ".env"), join(a, "id_rsa")]) {
+      mkdirSync(join(f, ".."), { recursive: true });
+      writeFileSync(f, "x");
+    }
+    const found = projectRootSecrets([root], [a]);
+    expect(found.over).toEqual([]);
+    expect(found.hidden.sort()).toEqual([...secret, ...dirs, ...worktrees].sort());
+  });
+
+  test("a repository's .git/config carrying a credential is hidden (said: git there can't read its config); a plain one isn't", () => {
+    const { home, root, a, b } = workspaceLayout();
+    const c = join(root, "c");
+    const d = join(root, "d");
+    for (const r of [c, d]) {
+      mkdirSync(r);
+      git(["init", "-q"], r);
+    }
+    git(["remote", "add", "origin", "https://x:ghp_PLANTED@example.invalid/b.git"], b);
+    git(["remote", "add", "origin", "ssh://git@example.invalid/c.git"], c);
+    git(["config", "http.https://example.invalid/.extraheader", "Authorization: Bearer PLANTED"], d);
+    const found = projectRootSecrets([root], [a]);
+    expect(found.gitConfigs.sort()).toEqual([join(b, ".git", "config"), join(d, ".git", "config")]);
+    expect(found.hidden).not.toContain(join(c, ".git", "config"));
+    process.env.HOME = home;
+    const notes = sandboxDirsOf(a, [root], []).notes.join("\n");
+    expect(notes).toContain(`${join(b, ".git", "config")} holds a credential`);
+    expect(notes).toContain(`git in ${b} can't read its config`);
+  });
+
+  test("the look through a root is bounded and fails closed: a root past it isn't shown, said", () => {
+    const { root, a, spec } = workspaceLayout();
+    for (let i = 0; i < 5; i++) mkdirSync(join(root, `p${i}`, "src"), { recursive: true });
+    expect(projectRootSecrets([root], [a], 4).over).toEqual([root]);
+    const s = spec({ scanLimit: 4 });
+    expect(s.projectRoots).toBeUndefined();
+    expect(s.reexposed).not.toContain(root);
+    expect(spec().projectRoots).toEqual([root]);
+  });
+});
+
+describe("project roots: never the host's temp dir, none outside a repository (#448 round 12)", () => {
+  test("/tmp, anything in it, /var/tmp's and TMPDIR's: refused as roots (the config too); a temp dir itself isn't an added dir", () => {
+    for (const bad of ["/tmp", "/tmp/work", "/var/tmp/x", join(tmpdir(), "x")]) expect([bad, projectRootProblem(bad)]).toEqual([bad, expect.stringContaining("temp dir")]);
+    expect(sandboxDirProblem("/tmp")).toContain("temp dir");
+    expect(sandboxDirProblem("/var/tmp")).toContain("temp dir");
+    expect(projectRootProblem(join(base, "projects"))).toBeNull();
+    expect(() => loadConfig({ raw: { sandbox: { projectRoots: ["/tmp/projects"] } }, env: {}, quiet: true })).toThrow(/temp dir/);
+  });
+
+  test("a repository in the host's temp dir: no default root, said", () => {
+    const t = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-roots-tmp-")));
+    try {
+      const repo = join(t, "a");
+      mkdirSync(repo);
+      git(["init", "-q"], repo);
+      const r = resolveProjectRoots(["@parent"], repo, { home: join(base, "home") });
+      expect(r.roots).toEqual([]);
+      expect(r.notes[0]).toContain("no project root: the default, the repository's parent");
+      expect(r.notes[0]).toContain("temp dir");
+    } finally {
+      rmSync(t, { recursive: true, force: true });
     }
   });
 });

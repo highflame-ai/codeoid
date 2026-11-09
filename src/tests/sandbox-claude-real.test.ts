@@ -9,7 +9,7 @@
  */
 import { createServer } from "node:net";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
@@ -395,6 +395,44 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(added.toolResult).toContain("C-READ-ONLY");
     expect(existsSync(join(b, "new.txt"))).toBe(true);
     expect(existsSync(join(home, "Workspace", "c", "new.txt"))).toBe(false);
+  }, 300_000);
+  test("a project root shows nothing hidden (#448 round 12): not a .env at its top, not where a link in it leads (~/.ssh, the home), not codeoid's private dir in it, not a credential file deeper", async () => {
+    const home = join(root, "home");
+    const W = join(home, "Workspace");
+    const ws = join(W, "a12");
+    const b = join(W, "b12");
+    for (const d of [ws, b, join(home, ".ssh"), join(home, "Documents")]) mkdirSync(d, { recursive: true });
+    writeFileSync(join(home, ".ssh", "id_ed25519"), "LEAK-SSH\n");
+    writeFileSync(join(home, "Documents", "doc.txt"), "LEAK-DOC\n");
+    writeFileSync(join(W, ".env"), "LEAK-ROOT-ENV\n");
+    writeFileSync(join(b, "README.md"), "B12-README\n");
+    writeFileSync(join(b, "id_rsa"), "LEAK-B-KEY\n");
+    mkdirSync(join(W, "b12-worktrees", "fork-1", "x"), { recursive: true });
+    writeFileSync(join(W, "b12-worktrees", "fork-1", ".env"), "LEAK-WT-ENV\n");
+    symlinkSync(join(home, ".ssh"), join(W, "keys"));
+    symlinkSync(join(home, "Documents"), join(W, "notes"));
+    symlinkSync(home, join(W, "home-link"));
+    // codeoid's private dir (its TMPDIR's codeoid-sandbox-*) right in the root, and a sign-in planted there after the spec was built.
+    const signinFile = join(root, "signin12.txt");
+    const command = [
+      `cat ${join(W, "keys", "id_ed25519")} 2>&1`,
+      `cat ${join(home, ".ssh", "id_ed25519")} 2>&1`,
+      `cat ${join(W, "notes", "doc.txt")} 2>&1`,
+      `cat ${join(home, "Documents", "doc.txt")} 2>&1`,
+      `cat ${join(W, ".env")} 2>&1`,
+      `cat ${join(b, "id_rsa")} 2>&1`,
+      `cat ${join(W, "b12-worktrees", "fork-1", ".env")} 2>&1`,
+      `cat "$(cat ${signinFile})/.credentials.json" 2>&1`,
+      `cat ${join(b, "README.md")}`,
+      `echo a > ${join(ws, "own.txt")} && echo WS-WRITABLE`,
+    ].join("; ");
+    const r = await probe("off", command, ["policy"], { CODEOID_PROBE_WORKSPACE: ws, CODEOID_PROBE_PROJECT_ROOTS: W, TMPDIR: W, CODEOID_PROBE_SIGNIN_PATH: signinFile });
+    expect(readFileSync(signinFile, "utf8").startsWith(W)).toBe(true);
+    expect(r.result).toBe("success");
+    expect(r.toolResult).toContain("B12-README");
+    expect(r.toolResult).toContain("WS-WRITABLE");
+    expect(r.toolResult).not.toContain("LEAK");
+    expect(r.toolResult).not.toContain("PLANTED-SIGNIN-TOKEN");
   }, 300_000);
 });
 

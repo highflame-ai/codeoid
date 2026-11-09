@@ -8,7 +8,7 @@
  *   - Graceful drain on shutdown
  */
 
-import { addedDirProblem, PROJECT_ROOT_PARENT, sandboxDirProblem } from "./sandbox/project-roots.js";
+import { addedDirProblem, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
 import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -139,7 +139,8 @@ import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
-import { effectiveSetting, openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { canonicalAddedDirs, effectiveSetting, openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { sandboxRootIfMade } from "./sandbox/root.js";
 import { hiddenPathsFor, sandboxConfigOf } from "./sandbox/policy.js";
 import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
@@ -4380,6 +4381,8 @@ mcpHub: this.#mcpHub,
       const refused = this.#widerSandboxRefusal(msg.sandbox, auth, "create a session");
       if (refused) return { type: "response.error", requestId: msg.id, error: refused, code: "forbidden" };
     }
+    // Each added dir kept by where it really is now: what is bound, never where a link there leads later.
+    const sandboxSetting = msg.sandbox ? canonicalAddedDirs(msg.sandbox) : undefined;
 
     let goalSessionId = "";
     const orchestratorFleet = collaboration
@@ -4405,7 +4408,7 @@ mcpHub: this.#mcpHub,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
-      ...(msg.sandbox && Object.keys(msg.sandbox).length > 0 ? { sandbox: msg.sandbox } : {}),
+      ...(sandboxSetting && Object.keys(sandboxSetting).length > 0 ? { sandbox: sandboxSetting } : {}),
       claudeAccounts: this.#claudeAccounts,
       // The Claude choice also when the session lands elsewhere: it applies if it is switched to Claude.
       claudeAccount: msg.claudeAccount || null,
@@ -6479,12 +6482,14 @@ mcpHub: this.#mcpHub,
           // The worker runs unattended: refused here when its sandbox can't hold (#448).
           if (msg.sandbox) {
             if (!this.#sandboxRegistry) return err("This daemon has no OS sandbox", "invalid_request");
-            const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry);
+            const problem = sandboxSettingProblem(msg.sandbox, this.#sandboxRegistry) ?? this.#sandboxDirsProblem(msg.sandbox);
             if (problem) return err(problem, "invalid_request");
             const wider = this.#widerSandboxRefusal(msg.sandbox, auth, "start a loop");
             if (wider) return err(wider, "forbidden");
           }
-          const sandboxRefused = await this.#unattendedSandboxRefusal(provider, msg.sandbox);
+          // Each added dir kept by where it really is now.
+          const loopSandbox = msg.sandbox ? canonicalAddedDirs(msg.sandbox) : undefined;
+          const sandboxRefused = await this.#unattendedSandboxRefusal(provider, loopSandbox);
           if (sandboxRefused) return err(`The loop can't start: ${sandboxRefused}`, "invalid_request");
           const run = svc.startRun(
             {
@@ -6493,7 +6498,7 @@ mcpHub: this.#mcpHub,
               checks: msg.checks,
               provider,
               ...(msg.model ? { model: msg.model } : {}),
-              ...(msg.sandbox ? { sandbox: msg.sandbox } : {}),
+              ...(loopSandbox ? { sandbox: loopSandbox } : {}),
               ...(msg.toolBudget !== undefined ? { toolBudget: msg.toolBudget } : {}),
               ...(msg.limits ? { limits: msg.limits } : {}),
             },
@@ -9092,18 +9097,20 @@ mcpHub: this.#mcpHub,
   /**
    * Why a setting's directories can't be used (docs/sandbox.md, "Working
    * across repositories"), or null: a project root refused
-   * (project-roots.ts `sandboxDirProblem`), an added dir that can't be one
-   * (`addedDirProblem`: the home, `/`, a hidden or settings dir, one the
-   * sandbox hides, one holding a PATH entry, one that isn't there).
+   * (project-roots.ts `projectRootProblem`: the home, `/`, the host's temp
+   * dir, …), an added dir that can't be one (`addedDirProblem`: the home,
+   * `/`, a hidden dir, a git or project settings dir or one in it, one the
+   * sandbox hides, one holding a PATH entry, one that isn't there, one too
+   * big to look through for the repositories in it).
    */
   #sandboxDirsProblem(setting: SessionSandboxSetting): string | null {
     const configDir = getConfigDir();
     for (const r of setting.projectRoots ?? []) {
       if (r === PROJECT_ROOT_PARENT) continue;
-      const problem = sandboxDirProblem(r, { configDir });
+      const problem = projectRootProblem(r, { configDir });
       if (problem) return `not a project root: ${problem}`;
     }
-    const hidden = (setting.addedDirs ?? []).length > 0 ? hiddenPathsFor(this.#config) : [];
+    const hidden = (setting.addedDirs ?? []).length > 0 ? [...hiddenPathsFor(this.#config), ...daemonSandboxRoot()] : [];
     for (const d of setting.addedDirs ?? []) {
       const problem = addedDirProblem(d, { configDir, hidden });
       if (problem) return `can't add ${d}: ${problem}`;
@@ -9575,4 +9582,10 @@ async function resolveImportPath(
 
 function tenantOf(auth: AuthContext): McpTenant {
   return { accountId: auth.accountId, projectId: auth.projectId };
+}
+
+/** codeoid's private dir (sandbox/root.ts), when made: no added dir is in it. */
+function daemonSandboxRoot(): string[] {
+  const root = sandboxRootIfMade();
+  return root ? [root] : [];
 }
