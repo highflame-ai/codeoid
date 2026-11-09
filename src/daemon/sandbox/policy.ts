@@ -468,7 +468,7 @@ export interface SpecInputs {
    * directory at that path, or is too big to look through.
    * `ownWorktreeEntries`: as {@link ownWorktreeEntries}, for its repository.
    */
-  addedDirs?: readonly { dir: string; ownWorktreeEntries?: readonly string[] }[];
+  addedDirs?: readonly { dir: string; ownWorktreeEntries?: readonly string[]; agent?: boolean }[];
   /** How many directories a root's or an added dir's look goes through (project-roots.ts; default theirs): tests. */
   scanLimit?: number;
   /**
@@ -1171,8 +1171,11 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const baseHidden = hiddenPathsFor(inputs.config, inputs.hidden);
   // What the hidden list hides, the home aside: no root or added dir is inside it (validated; again here).
   const inHidden = (p: string) => [...baseHidden, ...(root ? [root] : [])].some((h) => within(p, h) || within(realOr(p), realOr(h)));
-  const addedDirs = added.map((a) => a.dir).filter((d) => !inHidden(d) && !userHidden.some((u) => within(d, u)));
-  const writableDirs = [workspace, ...addedDirs];
+  const addedKept = added.filter((a) => !inHidden(a.dir) && !userHidden.some((u) => within(a.dir, u)));
+  // The session's own: its workspace and the dirs its owner added (their credentials are its to use, as the
+  // workspace's are). A dir the agent added itself (autonomous `request_directory`) keeps the hiding a root has.
+  const writableDirs = [workspace, ...addedKept.filter((a) => !a.agent).map((a) => a.dir)];
+  const agentDirs = addedKept.filter((a) => a.agent).map((a) => a.dir);
   // Each root by its real path (a root named through a link is hidden in where it really is), pinned as the rest.
   const rootCandidates = (inputs.projectRoots ?? [])
     .map((r) => resolve(r))
@@ -1182,10 +1185,11 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
       return dirIdentity(r) !== null ? r : realOr(r);
     })
     .filter((r, i, all) => dirIdentity(r) !== null && all.indexOf(r) === i && !userHidden.some((u) => within(r, u)) && !inHidden(r));
-  // The credential files anywhere in a root (not the session's own: its workspace, its added dirs); a root too big
-  // to look through whole isn't shown at all (fail closed: resolveSandbox says so).
-  const rootSecrets = projectRootSecrets(rootCandidates, writableDirs, inputs.scanLimit);
+  // The credential files anywhere in a root and in an agent's own added dir (not the session's own); a root or such
+  // a dir too big to look through whole isn't shown at all, nor written (fail closed: resolveSandbox says so).
+  const rootSecrets = projectRootSecrets([...rootCandidates, ...agentDirs], writableDirs, inputs.scanLimit);
   const roots = rootCandidates.filter((r) => !rootSecrets.over.includes(r));
+  const addedDirs = addedKept.map((a) => a.dir).filter((d) => !rootSecrets.over.includes(d));
   // The worktree locations shown (other sessions' checkouts of this repository, their copied `.env`s): the same.
   const locationSecrets = projectRootSecrets(git.locations, [...writableDirs, ...git.folders]);
   // A link in the allowlist leads only where the allowlist (or what is outside the home) shows: what it
@@ -1214,11 +1218,13 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const locations = git.folders.filter((l) => !hiddenAll.some((h) => h !== homeHidden && (within(l, h) || within(l, realOr(h)))));
   // What stays visible inside the hidden home: a hidden path there matters only inside one of these.
   const shown = [workspace, tempDir, ...own, ...ownReal, ...locations, ...addedDirs, ...addedDirs.map(realOr), ...reexposed, ...reexposed.map(realOr)];
+  // A credential the look found stays hidden even in a git dir commits write (an agent's own added dir's).
+  const credentials = new Set(rootSecrets.hidden);
   const hidden = hiddenAll.filter(
     (h, i, all) =>
       all.indexOf(h) === i &&
       // The backend's own state stays reachable by it; nothing it holds is taken out otherwise.
-      ![...own, ...ownReal].some((o) => within(h, o)) &&
+      (credentials.has(h) || ![...own, ...ownReal].some((o) => within(h, o))) &&
       // Inside the hidden home, only what is inside something shown needs hiding again.
       (!homeHidden || h === homeHidden || !within(h, homeHidden) || shown.some((x) => within(h, x))),
   );

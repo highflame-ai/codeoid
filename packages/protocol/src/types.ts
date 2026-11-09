@@ -403,6 +403,13 @@ export interface SessionSandboxSetting {
    */
   addedDirs?: string[];
   /**
+   * Kept by the daemon, never sent by a client (the schema refuses it): the
+   * added directories the agent added itself (an autonomous
+   * `request_directory`). Credential files in one stay hidden as in a
+   * project root; in one the owner added they are the session's to use.
+   */
+  agentDirs?: string[];
+  /**
    * Kept by the daemon, never sent by a client (the schema refuses it): what
    * each directory the sandbox binds by name was when it was pinned (#448
    * round 13): `workspace` (the sandbox's workspace, a monorepo's top) as

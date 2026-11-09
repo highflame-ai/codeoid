@@ -128,7 +128,9 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   // Read-only inside something writable (a repository's hooks and config), with everything in it.
   for (const p of spec.readOnly ?? []) {
     const at = realOr(p);
-    if (!kind(at) || seen.has(`o:${at}`)) continue;
+    // Never one that is hidden (a repository's git config holding a credential, in a dir the agent added): its
+    // bind would show it again over the hiding.
+    if (!kind(at) || seen.has(`o:${at}`) || seen.has(`h:${at}`)) continue;
     seen.add(`o:${at}`);
     mounts.push({ kind: "ro-bind", src: at, path: at });
   }

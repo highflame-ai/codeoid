@@ -33,12 +33,21 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { hooksPathOf } from "./git-watch.js";
 import { gitDirShape, gitLayoutOf, PROJECT_CONFIG_DIRS, PROJECT_CONFIG_FILES } from "./policy.js";
 import { type DirContext, hostTempRoots, normalizeSandboxDir, PROJECT_ROOT_PARENT, projectRootProblem, sandboxDirProblem } from "./dir-rules.js";
-import { mainCheckoutOf } from "./worktrees.js";
+import { mainCheckoutOf, worktreeLocationDirs } from "./worktrees.js";
 
 export { type DirContext, hostTempRoots, normalizeSandboxDir, PROJECT_ROOT_PARENT, projectRootProblem, sandboxDirProblem };
 
 function within(child: string, parent: string): boolean {
   return child === parent || child.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
+}
+
+function lexists(p: string): boolean {
+  try {
+    lstatSync(p);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function realOr(p: string): string {
@@ -275,6 +284,59 @@ export function autonomousGrantProblem(written: string, real: string, roots: rea
   const layout = gitLayoutOf(real, home);
   const top = layout?.common ? (layout.kind === "worktree" || layout.kind === "submodule" ? dirname(layout.dotgit) : (mainCheckoutOf(layout) ?? dirname(layout.dotgit))) : null;
   if (!top || !within(real, realOr(top))) return `${real} isn't in a repository; in autonomous mode only a repository under a project root (or a directory in one) is added`;
+  return null;
+}
+
+/** A checkout another session works in (its workspace, a worktree folder of its): what an autonomous grant never touches. */
+export interface OtherCheckout {
+  dir: string;
+  /** In words: `session "x"'s workspace`. */
+  what: string;
+}
+
+/**
+ * Why `real` (a real path) touches a checkout that isn't the session's own,
+ * or null (#448 round 13): it is, is inside or holds one of `others` (other
+ * sessions' workspaces and worktree folders, which their commands write: a
+ * swap there would be bound here); it is a checkout in one of its
+ * repository's worktree locations (`<repo>-worktrees/<name>`,
+ * `<main>/.worktrees/<name>`, `sandbox.worktreeRoots`'s: codeoid's fork,
+ * loop and `--worktree` checkouts, other sessions' folders) that isn't one
+ * of `ownFolders`, or holds such a location; or it is another checkout of
+ * the session's own repository (`workspace`'s: its main checkout, seen from
+ * a fork's worktree). An autonomous grant of one is refused; the owner's
+ * card says it.
+ */
+export function checkoutOverlap(
+  real: string,
+  others: readonly OtherCheckout[],
+  opts: { workspace: string; ownFolders?: readonly string[]; worktreeRoots?: readonly string[]; configDir?: string; home?: string },
+): string | null {
+  const at = resolve(real);
+  const home = resolve(opts.home ?? process.env.HOME ?? homedir());
+  for (const o of others) {
+    const dir = realOr(resolve(o.dir));
+    if (within(at, dir)) return `${at} ${at === dir ? "is" : "is in"} ${o.what} (${dir}), which that session's commands write`;
+    if (within(dir, at)) return `${at} holds ${o.what} (${dir}), which that session's commands write`;
+  }
+  const own = (opts.ownFolders ?? []).map((f) => realOr(resolve(f)));
+  const layout = gitLayoutOf(at, home);
+  if (layout?.common) {
+    const main = mainCheckoutOf(layout);
+    const locations = [
+      ...worktreeLocationDirs(layout, { roots: opts.worktreeRoots ?? [], home, ...(opts.configDir ? { configDir: opts.configDir } : {}) }).locations.map((l) => l.dir),
+      ...(main ? [join(main, ".worktrees")] : []),
+    ].map((l) => realOr(l));
+    for (const l of locations) {
+      if (within(at, l) && at !== l && !own.some((f) => within(at, f))) return `${at} is in ${l}, a worktree location: the checkouts there are other sessions' and codeoid's own (forks, loops, --worktree)`;
+      if (within(l, at) && lexists(l)) return `${at} holds ${l}, a worktree location: the checkouts there are other sessions' and codeoid's own (forks, loops, --worktree)`;
+    }
+    const mine = gitLayoutOf(resolve(opts.workspace), home);
+    if (mine?.common && realOr(mine.common) === realOr(layout.common)) {
+      const top = layout.kind === "worktree" ? dirname(layout.dotgit) : (main ?? dirname(layout.dotgit));
+      return `${at} is in another checkout of this session's own repository (${realOr(top)}${top === main ? ", its main checkout" : ""})`;
+    }
+  }
   return null;
 }
 

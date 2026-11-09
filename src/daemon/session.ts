@@ -231,7 +231,7 @@ import { type WorktreeEntryFinding, worktreeEntryLine, worktreeEntryWarning } fr
 import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
 import { worktreeFolderNote } from "./sandbox/worktrees.js";
 import { hiddenPathsFor, protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
-import { addedDirProblem, addedDirReal, autonomousGrantProblem, inAnyDir, nestedControl, normalizeSandboxDir } from "./sandbox/project-roots.js";
+import { addedDirProblem, addedDirReal, autonomousGrantProblem, checkoutOverlap, inAnyDir, nestedControl, normalizeSandboxDir, type OtherCheckout } from "./sandbox/project-roots.js";
 import { sandboxRootIfMade } from "./sandbox/root.js";
 import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
 import {
@@ -549,6 +549,8 @@ export interface SessionCreateOptions {
    * what the URL-mounting backends (Codex, the Gemini CLI, opencode) mount.
    */
   sandboxMcp?: (sessionId: string) => SandboxMcpMount | undefined;
+  /** The checkouts other sessions work in (SessionManager): what an autonomous `request_directory` never touches (#448 round 13). */
+  sandboxCheckouts?: (sessionId: string) => OtherCheckout[];
   /**
    * Pre-built codeoid_fleet MCP server (conductor sessions only). Built by
    * the SessionManager because its tools close over the manager's tenant-
@@ -959,6 +961,7 @@ export class Session {
    *  attached after construction (see attachBlackboard). */
   #blackboardMcp?: { url: string; token: string };
   #sandboxMcp?: (sessionId: string) => SandboxMcpMount | undefined;
+  #sandboxCheckouts?: (sessionId: string) => OtherCheckout[];
   readonly createdBy: string;
   readonly createdAt: string;
   /**
@@ -1591,6 +1594,7 @@ export class Session {
     this.collaborationRole = opts.collaborationRole;
     this.#blackboardMcp = opts.blackboardMcp;
     this.#sandboxMcp = opts.sandboxMcp;
+    this.#sandboxCheckouts = opts.sandboxCheckouts;
     this.#requestDirectoryWaitMs = opts.requestDirectoryWaitMs;
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
@@ -3224,6 +3228,21 @@ export class Session {
     await this.#releaseBackendNow("system:sandbox-dirs");
   }
 
+  /** The sandbox's workspace (a monorepo's repository top, as pinned), or the workdir without a sandbox. */
+  get sandboxWorkspace(): string {
+    return this.#sandbox?.workspace ?? this.workdir;
+  }
+
+  /** The session's own worktree folders (its commands write them): none without a sandbox. */
+  sandboxWorktreeFolders(): string[] {
+    return this.#sandbox?.worktreeFolders() ?? [];
+  }
+
+  /** The directories the session's commands write besides its workspace, as set. */
+  sandboxAddedDirs(): string[] {
+    return this.#sandbox?.effective().addedDirs ?? [];
+  }
+
   /** The session's own sandbox setting (persisted; a fork and a collaboration's children inherit it). */
   get sandboxSetting(): SessionSandboxSetting | undefined {
     return this.#sandbox?.setting;
@@ -3371,7 +3390,7 @@ export class Session {
    * one is the workdir's) and `already` when it is writable now (the
    * workspace, the session's worktree folders or temp dir, an added dir).
    */
-  #sandboxDirCheck(raw: string): { dir: string; written: string; already?: string } | { error: string } {
+  #sandboxDirCheck(raw: string): { dir: string; written: string; already?: string; agentHeld?: true } | { error: string } {
     const sbx = this.#sandbox;
     if (!sbx) return { error: "this daemon has no OS sandbox" };
     const home = process.env.HOME ?? homedir();
@@ -3383,20 +3402,47 @@ export class Session {
     if (folder) return { dir, written, already: `${dir} is in the session's own worktree folder (${folder}), which its commands write already` };
     const temp = sbx.tempDirPath;
     if (temp && inAnyDir(dir, [temp])) return { dir, written, already: `${dir} is in the session's temp dir, which its commands write already` };
-    const added = sbx.effective().addedDirs;
+    const { addedDirs: added, agentDirs } = sbx.effective();
     const holder = added.find((d) => inAnyDir(dir, [d]));
-    if (holder) return { dir, written, already: holder === dir ? `${dir} is added already` : `${dir} is in ${holder}, which is added already` };
+    // The agent's own: added already, but its credentials stay hidden there — the owner may add it as theirs.
+    const agentHeld = holder !== undefined && agentDirs.includes(holder) ? ({ agentHeld: true } as const) : {};
+    if (holder) return { dir, written, already: holder === dir ? `${dir} is added already` : `${dir} is in ${holder}, which is added already`, ...agentHeld };
     const root = sandboxRootIfMade();
     const hidden = [...hiddenPathsFor(this.#config), ...(root ? [root] : [])];
     const problem = addedDirProblem(written, { home, configDir: getConfigDir(), hidden });
     return problem ? { error: problem } : { dir, written };
   }
 
-  /** What stays read-only in `dir` once added, in words, for the owner's confirm: true for what is there. */
+  /**
+   * What stays read-only in `dir` once the owner adds it, in words, for the
+   * owner's confirm: true for what is there. Its credential files become
+   * readable to the session's commands, as the workspace's are (only a
+   * directory the agent added itself keeps a project root's hiding); and a
+   * checkout another session works in is said (#448 round 13).
+   */
   #addedDirProtection(dir: string): string {
     const nested = nestedControl(dir);
     const repos = nested.repos.filter((r) => r !== dir).length;
-    return `its git structure and project settings stay read-only, as in the workspace${repos > 0 ? `, and so do those of the ${repos} ${repos === 1 ? "repository" : "repositories"} inside it` : ""}`;
+    const overlap = this.#checkoutOverlapOf(dir);
+    const held = `its git structure and project settings stay read-only, as in the workspace${repos > 0 ? `, and so do those of the ${repos} ${repos === 1 ? "repository" : "repositories"} inside it` : ""}`;
+    const warning = overlap ? `. Warning: ${overlap} — a change either session makes there (a directory swapped for a link included) the other one runs against` : "";
+    return `${held}; its credential files (.env files, keys, a token in a git config) become readable to its commands, as the workspace's are${warning}`;
+  }
+
+  /** Why `dir` touches another session's or codeoid's checkout (project-roots.ts `checkoutOverlap`), or null. */
+  #checkoutOverlapOf(dir: string): string | null {
+    const sbx = this.#sandbox;
+    if (!sbx) return null;
+    try {
+      return checkoutOverlap(dir, this.#sandboxCheckouts?.(this.id) ?? [], {
+        workspace: sbx.workspace,
+        ownFolders: sbx.worktreeFolders(),
+        worktreeRoots: sbx.config.worktreeRoots,
+        configDir: getConfigDir(),
+      });
+    } catch {
+      return null;
+    }
   }
 
   /** The added dirs once `dir` is added: any of them inside it go (it holds them now). */
@@ -3440,10 +3486,15 @@ export class Session {
    * turn that starts with nothing running (#ensureSandbox). Never restarts
    * work: the backend picks it up between turns.
    */
-  async #changeSandboxDirs(next: readonly string[], audit: { who: string; action: string; detail: string }, line: string): Promise<void> {
+  async #changeSandboxDirs(next: readonly string[], audit: { who: string; action: string; detail: string }, line: string, grant?: { dir: string; by: "owner" | "agent" }): Promise<void> {
     const sbx = this.#sandbox;
     if (!sbx) return;
-    await sbx.set({ ...(sbx.setting ?? {}), addedDirs: [...next] });
+    // Who added each: the agent's own keep a project root's credential hiding (#448 round 13).
+    const agent = new Set(sbx.effective().agentDirs.filter((d) => next.includes(d)));
+    if (grant?.by === "agent") agent.add(grant.dir);
+    else if (grant) agent.delete(grant.dir);
+    const { agentDirs: _old, ...rest } = sbx.setting ?? {};
+    await sbx.set({ ...rest, addedDirs: [...next], ...(agent.size > 0 ? { agentDirs: [...agent] } : {}) });
     this.#store.audit(audit.who, audit.action, this.id, audit.detail.slice(0, 2000));
     this.#saveMetaNow();
     const note = this.#makeMessage("info", `🛡 ${line}`, SYSTEM_IDENTITY, undefined, undefined, { event: "sandbox.dirs_changed", addedDirs: [...next] });
@@ -3489,7 +3540,10 @@ export class Session {
     }
     const check = this.#sandboxDirCheck(raw);
     if ("error" in check) return { ok: false, error: check.error };
-    if (check.already) return { ok: true, message: check.already };
+    // One the agent added itself is the owner's to add as theirs (its credentials readable then); anything else
+    // writable already has nothing to add.
+    const upgrade = check.already !== undefined && check.agentHeld === true && current.includes(check.dir);
+    if (check.already && !upgrade) return { ok: true, message: check.already };
     const dir = check.dir;
     const via = check.written !== dir ? ` (${check.written} leads there)` : "";
     this.#store.audit(sender.sub, "session.sandbox_dir_ask", this.id, `${dir}${via}`);
@@ -3512,12 +3566,18 @@ export class Session {
           return;
         }
         const again = this.#sandboxDirCheck(dir);
-        if ("error" in again || again.already || again.dir !== dir) {
+        const stillUpgrade = upgrade && !("error" in again) && again.agentHeld === true && again.dir === dir;
+        if ("error" in again || (again.already && !stillUpgrade) || again.dir !== dir) {
           opts.onDecided?.(false, "error" in again ? again.error : (again.already ?? `${dir} isn't the directory it was when asked (it leads to ${again.dir} now)`));
           return;
         }
         const when = this.#dirsWhen();
-        await this.#changeSandboxDirs(this.#withAddedDir(dir), { who: answeredBy ?? sender.sub, action: "session.sandbox_dir_added", detail: `${dir} by=owner` }, `Sandbox: ${dir} is writable (${when})`);
+        await this.#changeSandboxDirs(
+          this.#withAddedDir(dir),
+          { who: answeredBy ?? sender.sub, action: "session.sandbox_dir_added", detail: `${dir} by=owner` },
+          `Sandbox: ${dir} is writable (${when})`,
+          { dir, by: "owner" },
+        );
         opts.onDecided?.(true);
       },
       () => opts.onDecided?.(false, "failed"),
@@ -3553,16 +3613,23 @@ export class Session {
     if (check.already) return `Nothing to add: ${check.already}.`;
     const dir = check.dir;
     const via = check.written !== dir ? ` (${check.written} leads there)` : "";
-    const grant = async (by: string, how: string): Promise<string> => {
+    const grant = async (by: string, how: string, granted: "owner" | "agent"): Promise<string> => {
       const when = this.#dirsWhen();
-      await this.#changeSandboxDirs(this.#withAddedDir(dir), { who: by, action: "session.sandbox_dir_added", detail: `${dir} by=agent ${how} reason=${input.reason}` }, `Sandbox: ${dir} is writable, as the agent asked (${how}; ${when})`);
-      return `Added: ${dir} is writable to your commands ${when.replace("the session's", "your")}. Finish this turn; it isn't writable yet in this one.`;
+      await this.#changeSandboxDirs(
+        this.#withAddedDir(dir),
+        { who: by, action: "session.sandbox_dir_added", detail: `${dir} by=agent ${how} reason=${input.reason}` },
+        `Sandbox: ${dir} is writable, as the agent asked (${how}; ${when})`,
+        { dir, by: granted },
+      );
+      const hidden = granted === "agent" ? " Its credential files (.env files, keys, a token in a git config) stay hidden to you, as in a project root." : "";
+      return `Added: ${dir} is writable to your commands ${when.replace("the session's", "your")}.${hidden} Finish this turn; it isn't writable yet in this one.`;
     };
     // Autonomous (an unattended run's too: a routine's, a loop worker's, a dispatched worker's): only a repository
-    // (or a dir in one) strictly under a project root, named by its real path; anything else is the owner's to add.
+    // (or a dir in one) strictly under a project root, named by its real path, never another session's or codeoid's
+    // checkout; its credential files stay hidden. Anything else is the owner's to add.
     if (this.#mode === "autonomous") {
-      const why = autonomousGrantProblem(check.written, dir, sbx.appliedProjectRoots());
-      if (!why) return grant(SYSTEM_IDENTITY.sub, "a repository under a project root, autonomous");
+      const why = autonomousGrantProblem(check.written, dir, sbx.appliedProjectRoots()) ?? this.#checkoutOverlapOf(dir);
+      if (!why) return grant(SYSTEM_IDENTITY.sub, "a repository under a project root, autonomous", "agent");
       return refuse(`${why}. The owner can add it (\`/sandbox add ${dir}\`)`);
     }
     // One card per directory: a repeat request while it is open waits on the same answer.
@@ -3598,7 +3665,7 @@ export class Session {
         if ("error" in again) return refuse(again.error);
         if (again.already) return `Nothing to add: ${again.already}.`;
         if (again.dir !== dir) return refuse(`${dir} isn't the directory it was when asked (it leads to ${again.dir} now)`);
-        return grant(answeredBy ?? this.createdBy, "the owner approved");
+        return grant(answeredBy ?? this.createdBy, "the owner approved", "owner");
       });
       this.#dirRequests.set(dir, pending);
     }

@@ -8,7 +8,7 @@
  *   - Graceful drain on shutdown
  */
 
-import { addedDirProblem, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
+import { addedDirProblem, type OtherCheckout, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
 import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -1001,6 +1001,7 @@ export class SessionManager {
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           accounts: this.#accounts,
           claudeAccount: meta.claudeAccount ?? null,
@@ -1782,6 +1783,7 @@ mcpHub: this.#mcpHub,
               providers: this.#providers,
               sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
               claudeAccounts: this.#claudeAccounts,
               hooks: this.#hooks,
               ...(this.#identityManager
@@ -3918,6 +3920,23 @@ mcpHub: this.#mcpHub,
     return { url: this.#sandboxMcpUrl, token };
   };
 
+  /**
+   * The checkouts every other session's commands write (its workspace, its
+   * worktree folders, its added directories): an autonomous
+   * `request_directory` never touches one, the owner's card says it
+   * (#448 round 13, project-roots.ts `checkoutOverlap`).
+   */
+  readonly #sandboxCheckoutsFor = (sessionId: string): OtherCheckout[] => {
+    const out: OtherCheckout[] = [];
+    for (const s of this.#sessions.values()) {
+      if (s.id === sessionId) continue;
+      out.push({ dir: s.sandboxWorkspace, what: `session "${s.name}"'s workspace` });
+      for (const f of s.sandboxWorktreeFolders()) out.push({ dir: f, what: `session "${s.name}"'s worktree folder` });
+      for (const d of s.sandboxAddedDirs()) out.push({ dir: d, what: `a directory session "${s.name}" writes` });
+    }
+    return out;
+  };
+
   /** A `request_directory` call over `/mcp/sandbox`: the session decides it. A gone session's token is let go. */
   async #requestDirectoryFor(sessionId: string, input: RequestDirectoryInput): Promise<string> {
     const session = this.#sessions.get(sessionId);
@@ -4408,6 +4427,7 @@ mcpHub: this.#mcpHub,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
       ...(sandboxSetting && Object.keys(sandboxSetting).length > 0 ? { sandbox: sandboxSetting } : {}),
       claudeAccounts: this.#claudeAccounts,
       // The Claude choice also when the session lands elsewhere: it applies if it is switched to Claude.
@@ -4804,6 +4824,7 @@ mcpHub: this.#mcpHub,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           // The collaboration runs on the accounts its lead was created on.
           claudeAccount: parent.claudeAccount,
@@ -5224,6 +5245,7 @@ mcpHub: this.#mcpHub,
         providers: this.#providers,
         sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
         claudeAccounts: this.#claudeAccounts,
         // A fork continues the same conversation — on the same accounts,
         // thinking as hard (#417).
@@ -5481,6 +5503,7 @@ mcpHub: this.#mcpHub,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
@@ -5770,6 +5793,7 @@ mcpHub: this.#mcpHub,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
@@ -6784,6 +6808,7 @@ mcpHub: this.#mcpHub,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -6885,6 +6910,7 @@ mcpHub: this.#mcpHub,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -7172,6 +7198,7 @@ mcpHub: this.#mcpHub,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,

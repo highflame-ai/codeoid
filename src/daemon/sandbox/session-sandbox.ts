@@ -161,6 +161,8 @@ export interface EffectiveSandbox {
   projectRoots: string[];
   /** Directories the session writes besides its workspace, absolute. */
   addedDirs: string[];
+  /** Those the agent added itself (an autonomous `request_directory`): a project root's credential hiding stays in them. */
+  agentDirs: string[];
 }
 
 /** The setting a session ends up with: its own fields over the config's. */
@@ -173,7 +175,15 @@ export function effectiveSetting(config: SandboxConfig, setting: SessionSandboxS
   const home = process.env.HOME ?? homedir();
   const roots = (setting?.projectRoots ?? config.projectRoots ?? [PROJECT_ROOT_PARENT]).map((r) => (r === PROJECT_ROOT_PARENT ? r : (normalizeSandboxDir(r, home) ?? r)));
   const added = (setting?.addedDirs ?? []).map((d) => normalizeSandboxDir(d, home)).filter((d): d is string => d !== null);
-  return { choice, network, dockerSocket: setting?.dockerSocket ?? config.docker.socket ?? false, projectRoots: [...new Set(roots)], addedDirs: [...new Set(added)] };
+  const agent = new Set((setting?.agentDirs ?? []).map((d) => normalizeSandboxDir(d, home)));
+  return {
+    choice,
+    network,
+    dockerSocket: setting?.dockerSocket ?? config.docker.socket ?? false,
+    projectRoots: [...new Set(roots)],
+    addedDirs: [...new Set(added)],
+    agentDirs: [...new Set(added)].filter((d) => agent.has(d)),
+  };
 }
 
 /**
@@ -183,10 +193,15 @@ export function effectiveSetting(config: SandboxConfig, setting: SessionSandboxS
  * directory, never where a link there leads later, nor another one put in
  * its place. One already kept stays as it was (a link put there since is
  * dropped at the next build, never followed). An added dir inside another
- * one isn't kept twice (the outer holds it).
+ * one isn't kept twice (the outer holds it). The agent's own (`agentDirs`)
+ * are those still added.
  */
 export function canonicalAddedDirs(setting: SessionSandboxSetting, before?: SessionSandboxSetting): SessionSandboxSetting {
-  if (!setting.addedDirs) return setting;
+  if (!setting.addedDirs) {
+    if (!setting.agentDirs) return setting;
+    const { agentDirs: _a, ...rest } = setting;
+    return rest;
+  }
   const had = new Set(before?.addedDirs ?? []);
   const unique = [...new Set(setting.addedDirs.map((d) => (had.has(d) ? d : (addedDirReal(d) ?? d))))];
   const inside = (d: string, o: string) => d !== o && d.startsWith(o.endsWith("/") ? o : `${o}/`);
@@ -200,21 +215,24 @@ export function canonicalAddedDirs(setting: SessionSandboxSetting, before?: Sess
     if (record) ids[d] = record;
     else delete ids[d];
   }
-  const { pins: _p, ...rest } = setting;
+  const agent = new Set(setting.agentDirs ?? []);
+  const agentDirs = dirs.filter((d) => agent.has(d));
+  const { agentDirs: _a, pins: _p, ...rest } = setting;
   const pins = setting.pins ?? before?.pins;
   return {
     ...rest,
     addedDirs: dirs,
+    ...(agentDirs.length > 0 ? { agentDirs } : {}),
     ...(Object.keys(ids).length > 0 || pins ? { pins: { ...(pins ?? {}), ids } } : {}),
   };
 }
 
 /** The setting's fields that only say which directories are readable or writable: a change to them alone is applied between turns, never restarting work (SessionSandbox.set). */
-const DIR_FIELDS = ["projectRoots", "addedDirs"] as const;
+const DIR_FIELDS = ["projectRoots", "addedDirs", "agentDirs"] as const;
 
 function withoutDirs(setting: SessionSandboxSetting | undefined): string {
   // `pins` is what the daemon keeps of the directories, not a choice: no change of it is one of the setting.
-  const { projectRoots: _r, addedDirs: _a, pins: _p, ...rest } = setting ?? {};
+  const { projectRoots: _r, addedDirs: _a, agentDirs: _g, pins: _p, ...rest } = setting ?? {};
   return JSON.stringify(Object.entries(rest).sort(([a], [b]) => a.localeCompare(b)));
 }
 
@@ -331,7 +349,7 @@ export function sandboxDirsOf(
   rootEntries: readonly string[],
   addedDirs: readonly string[],
   config?: CodeoidConfig,
-  opts: { pins?: Readonly<Record<string, string>> } = {},
+  opts: { pins?: Readonly<Record<string, string>>; agentDirs?: readonly string[] } = {},
 ): SandboxDirs {
   const home = resolve(process.env.HOME ?? homedir());
   const configDir = getConfigDir();
@@ -377,9 +395,18 @@ export function sandboxDirsOf(
       if (record) pinned[root] = record;
     }
   }
-  if (roots.length > 0) {
-    const secrets = projectRootSecrets(roots, [top, ...added]);
+  const agent = new Set((opts.agentDirs ?? []).map((d) => resolve(d)));
+  const agentAdded = added.filter((d) => agent.has(d));
+  if (roots.length > 0 || agentAdded.length > 0) {
+    // The session's own: its workspace and what its owner added; the agent's own added dirs are looked through as a root is.
+    const secrets = projectRootSecrets([...roots, ...agentAdded], [top, ...added.filter((d) => !agent.has(d))]);
     for (const over of secrets.over) {
+      if (agent.has(over)) {
+        const why = `more than ${PROJECT_ROOT_SCAN_LIMIT} directories to look through for credential files (${[...SCAN_SKIPPED_DIRS].slice(0, 2).join(", ")} and the like aside), which stay hidden in a directory the agent added itself`;
+        notes.push(`added directory ${over}: ${why}: not writable — the owner can add it (\`/sandbox add\`), or a narrower one`);
+        dropped.push({ dir: over, why });
+        continue;
+      }
       notes.push(
         `project root ${over}: more than ${PROJECT_ROOT_SCAN_LIMIT} directories to look through for credential files (${[...SCAN_SKIPPED_DIRS].slice(0, 2).join(", ")} and the like aside): not used — name narrower roots in sandbox.projectRoots (or the session's own), the repositories you need`,
       );
@@ -389,6 +416,10 @@ export function sandboxDirsOf(
       notes.push(`${c} holds a credential (a remote URL with a user or password in it, or an http extraheader): hidden, so git in ${repositoryOfConfig(c)} can't read its config from this session`);
     }
     if (secrets.gitConfigs.length > 5) notes.push(`and ${secrets.gitConfigs.length - 5} more repositories' git configs holding a credential: hidden`);
+    for (const d of dropped) {
+      const i = added.indexOf(d.dir);
+      if (i >= 0) added.splice(i, 1);
+    }
   }
   return { roots, added, notes, homeWorkspace, dropped, pinned };
 }
@@ -419,7 +450,7 @@ export async function resolveSandbox(opts: {
   /** Roots and added dirs pinned by this resolution (sandboxDirsOf). */
   pinned?: Record<string, string>;
 }> {
-  const { choice, network, dockerSocket, projectRoots, addedDirs } = effectiveSetting(opts.config, opts.setting);
+  const { choice, network, dockerSocket, projectRoots, addedDirs, agentDirs } = effectiveSetting(opts.config, opts.setting);
   const base = {
     choice,
     network: network.mode,
@@ -469,7 +500,7 @@ export async function resolveSandbox(opts: {
   // Working across repositories: the project roots it reads, the directories it writes besides its workspace.
   const dirs: SandboxDirs =
     top !== null
-      ? sandboxDirsOf(top, projectRoots, addedDirs, opts.codeoidConfig, { ...(opts.setting?.pins ? { pins: opts.setting.pins.ids } : {}) })
+      ? sandboxDirsOf(top, projectRoots, addedDirs, opts.codeoidConfig, { ...(opts.setting?.pins ? { pins: opts.setting.pins.ids } : {}), agentDirs })
       : { roots: [], added: [], notes: [], homeWorkspace: false, dropped: [], pinned: {} };
   const limits = [...c.plan.limits, ...(net.note ? [net.note] : []), ...(gitNote ? [gitNote] : []), ...(topNote ? [topNote] : []), ...(dockerNote ? [dockerNote] : []), ...rootNotes, ...dirs.notes];
   const applied: NetworkPolicy = net.mode === "allowlist" ? network : { mode: net.mode };
@@ -743,9 +774,10 @@ export class SessionSandbox {
     const gone = new Set(dirs.map((d) => resolve(d)));
     const kept = this.#setting.addedDirs.filter((d) => !gone.has(resolve(normalizeSandboxDir(d) ?? d)));
     if (kept.length === this.#setting.addedDirs.length) return;
-    const { addedDirs: _old, pins, ...rest } = this.#setting;
+    const { addedDirs: _old, agentDirs, pins, ...rest } = this.#setting;
+    const agent = (agentDirs ?? []).filter((d) => kept.includes(d));
     const ids = Object.fromEntries(Object.entries(pins?.ids ?? {}).filter(([k]) => !gone.has(k)));
-    const base: SessionSandboxSetting = { ...rest, ...(pins ? { pins: { ...pins, ids } } : {}) };
+    const base: SessionSandboxSetting = { ...rest, ...(agent.length > 0 ? { agentDirs: agent } : {}), ...(pins ? { pins: { ...pins, ids } } : {}) };
     this.#setting = kept.length > 0 ? { ...base, addedDirs: kept } : Object.keys(base).length > 0 ? base : undefined;
     this.#droppedDirs = this.#droppedDirs.filter((d) => !gone.has(resolve(d.dir)));
   }
@@ -980,6 +1012,7 @@ export class SessionSandbox {
       this.#checkEntries();
       for (const d of dirs.added) this.#checkEntriesOf(d);
     }
+    const agent = new Set(this.effective().agentDirs);
     const build = () => buildSandboxSpec({
       backendReadable: readable,
       sessionId: this.#sessionId,
@@ -995,7 +1028,7 @@ export class SessionSandbox {
       projectRoots: dirs.roots,
       addedDirs: dirs.added.map((dir) => {
         const guard = this.#guardFor(dir);
-        return { dir, ...(folder && guard ? { ownWorktreeEntries: guard.ownEntries() } : {}) };
+        return { dir, ...(agent.has(dir) ? { agent: true } : {}), ...(folder && guard ? { ownWorktreeEntries: guard.ownEntries() } : {}) };
       }),
       ...(this.#setting?.pins ? { pins: this.#setting.pins.ids } : {}),
     });
