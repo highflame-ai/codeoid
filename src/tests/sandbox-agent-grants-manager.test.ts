@@ -113,3 +113,26 @@ describe("an autonomous grant never touches another session's or codeoid's check
     expect(main).toMatch(/another checkout of this session's own repository|session ".*"'s workspace/);
   });
 });
+
+describe("an agent's own grant never shares a directory with another session made there later (#448 round 14)", () => {
+  it("a session created in the agent's dir afterwards: the dir is let go at the next turn (said, audited), its spec no longer writes it", async () => {
+    const m = t.newManager();
+    const { info, session } = await t.autonomous(m);
+    expect(await session.requestDirectory({ path: t.sibling, reason: "fix the client too" })).toContain(`Added: ${t.sibling}`);
+    await session.send("go", AUTH);
+    await until(() => session.toInfo().status === "idle");
+    expect(t.runtimeSpec()?.writable).toContain(t.sibling);
+    const lines = t.infoLines(m, info?.name as string);
+    // The owner starts another session there: its commands write the sibling too.
+    const other = infoOf(await m.handle({ type: "session.create", id: "o", name: "infra", workdir: t.sibling } as never, AUTH, CLIENT));
+    expect(other?.id).toBeTruthy();
+    await t.sendWhenReady(session, "again");
+    await until(() => session.toInfo().status === "idle");
+    expect(session.sandboxSetting?.addedDirs).toBeUndefined();
+    expect(session.sandboxSetting?.agentDirs).toBeUndefined();
+    expect(session.toInfo().sandbox?.addedDirs).toBeUndefined();
+    expect(t.runtimeSpec()?.writable).not.toContain(t.sibling);
+    expect(lines.some((l) => l.includes(`${t.sibling}, which the agent added, is no longer writable: ${t.sibling} is session "infra"'s workspace`))).toBe(true);
+    expect(t.audits.some((a) => a.action === "session.sandbox_dir_dropped" && a.detail.includes(`session "infra"'s workspace`))).toBe(true);
+  });
+});

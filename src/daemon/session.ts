@@ -3172,6 +3172,8 @@ export class Session {
   async ensureSandbox(): Promise<SessionSandboxInfo | null> {
     const sbx = this.#sandbox;
     if (!sbx) return null;
+    // An agent's own grant another session works in now is let go first (applied as any change of directories).
+    await this.#dropSharedAgentDirs();
     // Directories added or removed are applied only between turns, with no background work running: a
     // Claude query rebuilt, or a process backend restarted, mid-work would end that work.
     const applyDirs = sbx.dirsPending && this.#mayApplySandboxDirs();
@@ -3432,6 +3434,38 @@ export class Session {
     const held = `its git structure and project settings stay read-only, as in the workspace${repos > 0 ? `, and so do those of the ${repos} ${repos === 1 ? "repository" : "repositories"} inside it` : ""}`;
     const warning = overlap ? `. Warning: ${overlap} — a change either session makes there (a directory swapped for a link included) the other one runs against` : "";
     return `${held}; its credential files (.env files, keys, a token in a git config) become readable to its commands, as the workspace's are${warning}`;
+  }
+
+  /**
+   * The directories the agent added itself (an autonomous
+   * `request_directory`) that another session's checkout, or one of
+   * codeoid's, touches now (a session made there since, a directory
+   * another session added): taken out of the setting, said and audited
+   * (#448 round 14), so an agent's own grant never shares a directory with
+   * another writer, as at the grant (`checkoutOverlap`). Looked at every
+   * resolution; applied as any change of directories, between turns.
+   */
+  async #dropSharedAgentDirs(): Promise<void> {
+    const sbx = this.#sandbox;
+    const setting = sbx?.setting;
+    if (!sbx || !setting?.agentDirs || setting.agentDirs.length === 0) return;
+    const shared = setting.agentDirs.map((dir) => ({ dir, why: this.#checkoutOverlapOf(dir) })).filter((d): d is { dir: string; why: string } => d.why !== null);
+    if (shared.length === 0) return;
+    const gone = new Set(shared.map((d) => d.dir));
+    const addedDirs = (setting.addedDirs ?? []).filter((d) => !gone.has(d) && !gone.has(normalizeSandboxDir(d) ?? d));
+    const agentDirs = setting.agentDirs.filter((d) => !gone.has(d));
+    const { addedDirs: _a, agentDirs: _g, ...rest } = setting;
+    await sbx.set({ ...rest, ...(addedDirs.length > 0 ? { addedDirs } : {}), ...(agentDirs.length > 0 ? { agentDirs } : {}) });
+    for (const d of shared) {
+      this.#store.audit(SYSTEM_IDENTITY.sub, "session.sandbox_dir_dropped", this.id, `${d.dir}: ${d.why}`.slice(0, 2000));
+      const note = this.#makeMessage("info", `🛡 Sandbox: ${d.dir}, which the agent added, is no longer writable: ${d.why}. The owner can add it (\`/sandbox add\`) if both should write it.`, SYSTEM_IDENTITY, undefined, undefined, {
+        event: "sandbox.dir_dropped",
+        path: d.dir,
+      });
+      this.#persistAndBuffer(note);
+      this.#broadcastRaw(note);
+    }
+    this.#saveMetaNow();
   }
 
   /** Why `dir` touches another session's or codeoid's checkout (project-roots.ts `checkoutOverlap`), or null. */
