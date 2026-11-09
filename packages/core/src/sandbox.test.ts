@@ -89,7 +89,7 @@ describe("project roots and added directories (working across repositories)", ()
     expect(sandboxDirsText(info)).toBe("reads /home/u/Workspace (read-only); also writes /home/u/Workspace/b; from the next turn: +/srv/c");
     expect(sandboxBadge(info)?.title).toContain("It reads /home/u/Workspace (read-only); also writes /home/u/Workspace/b");
     expect(sandboxSummary(info)).toBe("sandbox: bubblewrap, network on; reads /home/u/Workspace (read-only); also writes /home/u/Workspace/b; from the next turn: +/srv/c");
-    expect(sandboxDirsText(on)).toBeNull();
+    expect(sandboxDirsText({ ...on, projectRoots: [] })).toBeNull();
   });
 
   it("a workspace that is the home: the chip says so", () => {
