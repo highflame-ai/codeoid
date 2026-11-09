@@ -29,6 +29,7 @@
 
 import { realpathSync, statSync } from "node:fs";
 import { LocalSandboxHandle } from "./local-handle.js";
+import { boundPath } from "./pinned.js";
 import type { NetworkMode, SandboxCapabilities, SandboxHandle, SandboxProbe, SandboxProvider, SandboxSpawnOptions, SandboxSpec } from "./types.js";
 
 export const SEATBELT_PROVIDER_ID = "seatbelt";
@@ -63,13 +64,16 @@ export function seatbeltProfile(
   spec: SandboxSpec,
   fs: { real?: (p: string) => string; isDir?: (p: string) => boolean | null } = {},
 ): SeatbeltProfile {
-  const real = fs.real ?? ((p: string) => {
+  // Everything a rule names by path is pinned: named as it was pinned (the handle checked it is still that, and
+  // the launched argv checks again; #448 round 14), never resolved again here. Only what isn't is resolved.
+  // paths: resolves only what isn't pinned (boundPath): a hidden path, the home's allowlist
+  const real = boundPath(spec.pins, fs.real ?? ((p: string) => {
     try {
       return realpathSync(p);
     } catch {
       return p;
     }
-  });
+  }));
   const isDir = fs.isDir ?? (() => null);
   const params: Record<string, string> = {};
   const names = new Map<string, string>();
@@ -114,7 +118,7 @@ export function seatbeltProfile(
   // A repository's hooks and config: not writable, with everything in them.
   for (const p of (spec.readOnly ?? []).map(real)) rules.push({ path: p, kind: "read-only" });
   // Every dir between a writable root and a hidden path in it: the directory itself not writable (so no rename), its contents still.
-  for (const p of (spec.pinned ?? []).map(real)) rules.push({ path: p, kind: "pinned" });
+  for (const p of [...(spec.pinned ?? []), ...(spec.heldInPlace ?? [])].map(real)) rules.push({ path: p, kind: "pinned" });
   const rank = (r: Rule) => (r.kind === "hide" ? 0 : 1);
   rules.sort((a, b) => depth(a.path) - depth(b.path) || rank(a) - rank(b));
 
@@ -227,6 +231,7 @@ export class SeatbeltSandboxProvider implements SandboxProvider {
   async probe(): Promise<SandboxProbe> {
     if (process.platform !== "darwin") return { available: false, reason: "Seatbelt runs on macOS only" };
     try {
+      // paths: the probe: a fixed argv, in no session's directory
       const proc = Bun.spawn([this.#bin, "-p", "(version 1)(allow default)", "/usr/bin/true"], { stdin: "ignore", stdout: "ignore", stderr: "pipe", timeout: 10_000 });
       const [code, err] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
       if (code === 0) return { available: true, detail: this.#bin };
@@ -242,6 +247,7 @@ export class SeatbeltSandboxProvider implements SandboxProvider {
 
   openSync(spec: SandboxSpec): SandboxHandle {
     const bin = this.#bin;
+    // paths: a look (directory or file) for a rule's form, once the handle checked the pins
     const isDir = (p: string): boolean | null => {
       try {
         return statSync(p).isDirectory();
@@ -253,6 +259,7 @@ export class SeatbeltSandboxProvider implements SandboxProvider {
     if (spec.privateTemp) {
       // The temp dir is made per program, in the spec's (a real path: Seatbelt sees `/private/…`).
       let parent = spec.tempDir;
+      // paths: the session's temp dir: made by the daemon in its private dir, which no sandbox sees
       try {
         parent = realpathSync(parent);
       } catch {

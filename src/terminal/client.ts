@@ -465,6 +465,22 @@ export class TerminalClient {
     if (line) console.log(data.pending ? `  now: ${line}` : line);
   }
 
+  /** Add a directory to what a session's commands write, or remove one (docs/sandbox.md, Working across repositories). */
+  async sandboxDir(sessionIdOrName: string, action: "add" | "remove", path: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const resp = await this.#request({ type: "session.sandbox_dir", id: randomUUID(), sessionId, action, path });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const data = resp.data as { pending?: boolean; message?: string; sandbox?: SessionSandboxInfo | null };
+    if (data.pending) console.log(`Asked on the session: ${path} is writable once its owner says yes (codeoid approve ${sessionIdOrName}, or the web UI), from its next turn.`);
+    else if (data.message) console.log(data.message);
+    const line = sandboxSummary(data.sandbox ?? undefined);
+    if (line) console.log(`  now: ${line}`);
+  }
+
   /** The daemon's sandbox providers and whether each runs here (#448). */
   async sandboxProviders(): Promise<void> {
     const resp = await this.#request({ type: "sandbox.providers", id: randomUUID() });

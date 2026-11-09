@@ -93,6 +93,8 @@ export const sessionSandboxSettingSchema = z
     network: z.enum(["on", "off", "allowlist"]).optional(),
     allowedHosts: z.array(z.string().min(1).max(253)).max(256).optional(),
     dockerSocket: z.boolean().optional(),
+    projectRoots: z.array(z.string().min(1).max(4096)).max(64).optional(),
+    addedDirs: z.array(z.string().min(1).max(4096)).max(64).optional(),
   })
   .strict();
 
@@ -275,6 +277,14 @@ export const sessionSetSandboxSchema = z.object({
   type: z.literal("session.set_sandbox"),
   sessionId: sessionIdField,
   sandbox: sessionSandboxSettingSchema,
+});
+
+export const sessionSandboxDirSchema = z.object({
+  ...base,
+  type: z.literal("session.sandbox_dir"),
+  sessionId: sessionIdField,
+  action: z.enum(["add", "remove"]),
+  path: z.string().min(1).max(4096),
 });
 
 export const sandboxProvidersSchema = z.object({ ...base, type: z.literal("sandbox.providers") });
@@ -1271,6 +1281,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   sessionDestroySchema,
   sessionSetModeSchema,
   sessionSetSandboxSchema,
+  sessionSandboxDirSchema,
   sandboxProvidersSchema,
   sessionPinSchema,
   sessionUnpinSchema,

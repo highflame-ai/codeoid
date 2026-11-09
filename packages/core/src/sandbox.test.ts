@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { SessionSandboxInfo } from "@highflame/codeoid-protocol";
-import { approvalSandboxLine, approvalSandboxWarns, DOCKER_ACCESS_WHY, modeSummary, sandboxBadge, sandboxSummary } from "./sandbox.js";
+import { approvalSandboxLine, approvalSandboxWarns, DOCKER_ACCESS_WHY, HOME_WORKSPACE_LINE, modeSummary, sandboxBadge, sandboxDirsText, sandboxSummary } from "./sandbox.js";
 import { dispatchSlash, parseSlash } from "./slash.js";
 
 const on: SessionSandboxInfo = { choice: "auto", state: "on", provider: "bwrap", providerName: "bubblewrap", network: "off", confinement: "native", via: "Claude Code's sandbox (bubblewrap) with codeoid's policy", enforced: true };
@@ -78,5 +78,24 @@ describe("the mode line in a list (#448)", () => {
     expect(modeSummary({ mode: "guarded" })).toBeNull();
     expect(modeSummary({ mode: "interactive" })).toBeNull();
     expect(modeSummary({})).toBeNull();
+  });
+});
+
+describe("project roots and added directories (working across repositories)", () => {
+  const on = { choice: "auto", state: "on" as const, provider: "bwrap", providerName: "bubblewrap", network: "on" as const, enforced: true };
+
+  it("the tooltip and the list line say what it reads and writes besides the workspace, and what lands next turn", () => {
+    const info = { ...on, projectRoots: ["/home/u/Workspace"], addedDirs: ["/home/u/Workspace/b"], pendingDirs: { add: ["/srv/c"], remove: [] } };
+    expect(sandboxDirsText(info)).toBe("reads /home/u/Workspace (read-only); also writes /home/u/Workspace/b; from the next turn: +/srv/c");
+    expect(sandboxBadge(info)?.title).toContain("It reads /home/u/Workspace (read-only); also writes /home/u/Workspace/b");
+    expect(sandboxSummary(info)).toBe("sandbox: bubblewrap, network on; reads /home/u/Workspace (read-only); also writes /home/u/Workspace/b; from the next turn: +/srv/c");
+    expect(sandboxDirsText({ ...on, projectRoots: [] })).toBeNull();
+  });
+
+  it("a workspace that is the home: the chip says so", () => {
+    const b = sandboxBadge({ ...on, homeWorkspace: true });
+    expect(b).toMatchObject({ text: HOME_WORKSPACE_LINE, tone: "warn" });
+    expect(HOME_WORKSPACE_LINE).toBe("sandboxed: workspace is your home — only credentials are protected");
+    expect(sandboxSummary({ ...on, homeWorkspace: true })).toContain("workspace is your home (only credentials are protected)");
   });
 });

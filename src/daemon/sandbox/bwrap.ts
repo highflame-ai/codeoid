@@ -13,7 +13,8 @@
  *   --ro-bind /dev/null <f>  a hidden file or socket: empty, and nothing to connect to
  *   --ro-bind <p> <p>        read-only inside something writable (what of a repository decides its config,
  *                            hooks and git dir; the project settings agent CLIs run code from)
- *   --bind <d> <d>           a pinned directory: a mount point, so it can't be renamed, still writable inside
+ *   --bind <d> <d>           a pinned directory, or one held in place: a mount point, so it can't be renamed,
+ *                            still writable inside
  *   --ro-bind <s> <s>        a container runtime socket the owner let in (spec.dockerSockets; off by default):
  *                            connecting needs no write to the mount, and it can't be removed or replaced
  *   --setenv                 the toolchains' caches in the sandbox's cache dir (spec.env)
@@ -29,6 +30,7 @@
 import { lstatSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { LocalSandboxHandle } from "./local-handle.js";
+import { boundPath } from "./pinned.js";
 import type { NetworkMode, SandboxCapabilities, SandboxHandle, SandboxProbe, SandboxProvider, SandboxSpawnOptions, SandboxSpec } from "./types.js";
 
 export const BWRAP_PROVIDER_ID = "bwrap";
@@ -36,6 +38,7 @@ export const BWRAP_PROVIDER_ID = "bwrap";
 /** What is at a path: a directory, anything else that exists, or nothing. */
 export type PathKind = "dir" | "other" | null;
 
+// paths: a look at what is there, no write: a pinned path the handle checked first, and bwrap binds as pinned
 export function pathKind(p: string): PathKind {
   try {
     const st = lstatSync(p);
@@ -51,7 +54,8 @@ export function pathKind(p: string): PathKind {
 }
 
 /** The real path when it exists, else the path. */
-function realOr(p: string): string {
+// paths: only for what isn't pinned (boundPath): a hidden path (a link there hides more), the home's allowlist (shown where it leads, by design)
+function realOrPath(p: string): string {
   try {
     return realpathSync(p);
   } catch {
@@ -90,15 +94,22 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
 
   const mounts: Mount[] = [];
   const seen = new Set<string>();
+  // Everything bound by name is pinned, and bound by the path it was pinned at, never by where a link there leads
+  // (pinned.ts: the handle checked it is still that, and the launched argv checks again; #448 round 14: never
+  // resolved again here). Only what isn't pinned is resolved: a hidden path (a link there hides more), the home's
+  // allowlist (shown where a link leads, by design).
+  const realOr = boundPath(spec.pins, realOrPath);
   const writable = [spec.workspace, ...spec.writable].map(realOr);
+  const shownInTmp = [...writable, ...spec.reexposed.flatMap((r) => [resolve(r), realOr(r)]).filter((r) => r !== "/tmp")];
   const hide = (p: string) => {
     const at = realOr(p);
     const k = kind(at);
     if (!k || seen.has(`h:${at}`)) return;
     // The sandbox's own /dev and /proc are new, and so is its /tmp: the
-    // host's is reachable only where a writable location is bound into it.
+    // host's is reachable only where a writable location, or one shown
+    // again (a worktree location of a repository in /tmp), is bound into it.
     if (at === "/" || within(at, "/proc") || within(at, "/dev")) return;
-    if (within(at, "/tmp") && !writable.some((w) => within(at, w))) return;
+    if (within(at, "/tmp") && !shownInTmp.some((w) => within(at, w))) return;
     seen.add(`h:${at}`);
     mounts.push(k === "dir" ? { kind: "hide-dir", path: at } : { kind: "hide-file", path: at });
   };
@@ -122,15 +133,21 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   // Read-only inside something writable (a repository's hooks and config), with everything in it.
   for (const p of spec.readOnly ?? []) {
     const at = realOr(p);
-    if (!kind(at) || seen.has(`o:${at}`)) continue;
+    // Never one that is hidden (a repository's git config holding a credential, in a dir the agent added), or in a
+    // hidden dir its writable root shows: its bind would show it again over the hiding.
+    const holder = writable.filter((w) => within(at, w)).sort((x, y) => depth(y) - depth(x))[0];
+    if (!kind(at) || seen.has(`o:${at}`) || seen.has(`h:${at}`) || (holder && hiddenDirs.some((d) => within(at, d) && within(d, holder) && d !== holder))) continue;
     seen.add(`o:${at}`);
     mounts.push({ kind: "ro-bind", src: at, path: at });
   }
-  // Every dir between a writable root and a hidden path in it: a mount point nothing can rename, still writable inside.
-  for (const p of spec.pinned ?? []) {
+  // Every dir between a writable root and a hidden path in it, and every dir held in place (the working directory
+  // and its way up to the workspace, a held path's parents): a mount point nothing can rename, still writable inside.
+  for (const p of [...(spec.pinned ?? []), ...(spec.heldInPlace ?? [])]) {
     const at = realOr(p);
-    // Never one a hidden dir covers (or is): its bind would show the real dir again.
-    if (kind(at) !== "dir" || seen.has(`o:${at}`) || hiddenDirs.some((d) => within(at, d))) continue;
+    // Never one a hidden dir in its writable root covers (or is): its bind would show the real dir again. One in
+    // a hidden dir the root is shown again in (the hidden home) is shown already.
+    const holder = writable.filter((w) => within(at, w)).sort((x, y) => depth(y) - depth(x))[0];
+    if (kind(at) !== "dir" || seen.has(`o:${at}`) || hiddenDirs.some((d) => within(at, d) && (!holder || (within(d, holder) && d !== holder)))) continue;
     seen.add(`o:${at}`);
     mounts.push({ kind: "bind", src: at, path: at });
   }
@@ -223,6 +240,7 @@ export class BwrapSandboxProvider implements SandboxProvider {
     // (an AppArmor restriction, a container) fail here.
     const argv = [bin, "--die-with-parent", "--unshare-pid", "--unshare-net", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--", "/bin/sh", "-c", "exit 0"];
     try {
+      // paths: the probe: a fixed argv, in no session's directory
       const proc = Bun.spawn(argv, { stdin: "ignore", stdout: "ignore", stderr: "pipe", timeout: 10_000 });
       const [code, err] = await Promise.all([proc.exited, new Response(proc.stderr).text()]);
       if (code === 0) return { available: true, detail: bin };

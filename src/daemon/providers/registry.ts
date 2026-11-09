@@ -46,6 +46,7 @@ import type { EndpointStore } from "../openai-endpoints.js";
 import { AccountError, type AccountStore, type ResolvedAccount } from "../accounts.js";
 import { type EndpointCatalog, syncEndpointProviders } from "./endpoint/index.js";
 import { registerSecretPaths } from "../secret-paths.js";
+import type { RequestDirectoryInput, SandboxMcpMount } from "../sandbox/request-directory.js";
 import type { SandboxRuntime } from "../sandbox/session-sandbox.js";
 
 /**
@@ -72,6 +73,14 @@ export interface ProviderSessionInit {
   /** Role-scoped goal-blackboard mount, resolved lazily — see the provider
    *  inits for why it is a getter and not a value. */
   blackboardMcp?: () => { url: string; token: string } | undefined;
+  /**
+   * The sandbox's `request_directory` (sandbox/request-directory.ts): decided
+   * by the session. Backends that run an in-process MCP server (Claude, Qwen)
+   * or a bridge (pi) serve it from this; present when the daemon sandboxes.
+   */
+  requestDirectory?: (input: RequestDirectoryInput) => Promise<string>;
+  /** The same tool over the daemon's `/mcp/sandbox`, for the backends that mount a URL (Codex, the Gemini CLI, opencode). */
+  sandboxMcp?: () => SandboxMcpMount | undefined;
   /** Cross-backend MCP registry — the servers to mount on this session's backend. */
   mcpRegistry?: McpServerView;
   /** Daemon-owned MCP client pool backing the registry (Model-B backends execute
@@ -450,6 +459,7 @@ export function createDefaultProviderRegistry(
         fleet: init.fleet,
         loop: init.loop,
         blackboardMcp: init.blackboardMcp,
+        requestDirectory: init.requestDirectory,
         mcpRegistry: init.mcpRegistry,
         mcpHub: init.mcpHub,
         config: init.config,
@@ -530,6 +540,7 @@ export function createDefaultProviderRegistry(
             resolveAccount: init.resolveAccount,
             extraEnv: init.extraEnv,
             sandbox: init.sandbox,
+            requestDirectory: init.requestDirectory,
           }),
       });
     } else {
@@ -560,6 +571,7 @@ export function createDefaultProviderRegistry(
             memoryMcp: init.memoryMcp,
             mcpProxy: init.mcpHub?.proxy ?? undefined,
             blackboardMcp: init.blackboardMcp,
+            sandboxMcp: init.sandboxMcp,
             mcpRegistry: init.mcpRegistry,
             onModels: init.onModels,
             resolveAccount: init.resolveAccount,
@@ -595,6 +607,7 @@ export function createDefaultProviderRegistry(
             memoryMcp: init.memoryMcp,
             mcpProxy: init.mcpHub?.proxy ?? undefined,
             blackboardMcp: init.blackboardMcp,
+            sandboxMcp: init.sandboxMcp,
             mcpRegistry: init.mcpRegistry,
             onModels: init.onModels,
             resolveAccount: init.resolveAccount,
@@ -636,6 +649,7 @@ export function createDefaultProviderRegistry(
           resolveAccount: init.resolveAccount,
           extraEnv: init.extraEnv,
           sandbox: init.sandbox,
+          requestDirectory: init.requestDirectory,
         }),
     });
   }
@@ -699,6 +713,7 @@ export function createDefaultProviderRegistry(
             memoryMcp: init.memoryMcp,
             mcpProxy: init.mcpHub?.proxy ?? undefined,
             blackboardMcp: init.blackboardMcp,
+            sandboxMcp: init.sandboxMcp,
             mcpRegistry: init.mcpRegistry,
             onModels: init.onModels,
             agent: config?.providers?.opencode?.agent,

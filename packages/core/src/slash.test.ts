@@ -406,3 +406,24 @@ describe("/account", () => {
     expect(c.sent[0]).toMatchObject({ type: "session.set_claude_account", sessionId: c.sessionId, account: null });
   });
 });
+
+describe("/sandbox add|remove (working across repositories)", () => {
+  it("parses a directory to add or remove, spaces and all; the provider form is unchanged", () => {
+    expect(parseSlash("/sandbox add ~/Workspace/b")).toEqual({ kind: "sandbox-dir", action: "add", path: "~/Workspace/b" });
+    expect(parseSlash("/sandbox remove /srv/my repo")).toEqual({ kind: "sandbox-dir", action: "remove", path: "/srv/my repo" });
+    expect(parseSlash("/sandbox rm /srv/x")).toEqual({ kind: "sandbox-dir", action: "remove", path: "/srv/x" });
+    expect(() => parseSlash("/sandbox add")).toThrow("/sandbox add <dir>");
+    expect(parseSlash("/sandbox bwrap off")).toEqual({ kind: "sandbox", sandbox: { provider: "bwrap", network: "off" } });
+  });
+
+  it("sends session.sandbox_dir, and says what was done unless it was asked of the owner", async () => {
+    const c = ctx();
+    dispatchSlash({ kind: "sandbox-dir", action: "add", path: "/srv/b" }, c);
+    expect(c.sent).toEqual([{ type: "session.sandbox_dir", id: "req-1", sessionId: "s1", action: "add", path: "/srv/b" }]);
+    const reports: string[] = [];
+    const withRequest = { ...ctx(), request: async () => ({ data: { message: "/srv/b removed: not writable from the session's next turn" } }), report: (t: string) => void reports.push(t) };
+    dispatchSlash({ kind: "sandbox-dir", action: "remove", path: "/srv/b" }, withRequest as never);
+    await Bun.sleep(1);
+    expect(reports).toEqual(["/srv/b removed: not writable from the session's next turn"]);
+  });
+});

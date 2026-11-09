@@ -40,6 +40,7 @@ const DIR_LIMIT = 200;
 /** Label → fingerprint of each watched file (absent: not in the map). */
 export type GitControlSnapshot = ReadonlyMap<string, string>;
 
+// paths: a look (a file's fingerprint), no write
 function fingerprint(p: string): string | null {
   try {
     const st = lstatSync(p);
@@ -52,6 +53,7 @@ function fingerprint(p: string): string | null {
   }
 }
 
+// paths: a look, no write
 function readlinkOr(p: string): string {
   try {
     return readlinkSync(p);
@@ -61,6 +63,7 @@ function readlinkOr(p: string): string {
 }
 
 /** codeoid's own placeholders read as absent: an empty `config.worktree`, a `commondir` of `.`. */
+// paths: a look, no write
 function placeholder(p: string, name: string): boolean {
   try {
     const text = readFileSync(p, "utf8");
@@ -75,6 +78,7 @@ function placeholder(p: string, name: string): boolean {
  * anywhere isn't, #448 round 11), `commondir` naming its repository
  * (`common`, as `../..` from there), no `config.worktree` but codeoid's empty one.
  */
+// paths: a look, no write
 function plainWorktree(dir: string, common: string): boolean {
   try {
     if (!lstatSync(dir).isDirectory() || lstatSync(join(dir, "commondir")).isSymbolicLink()) return false;
@@ -90,6 +94,7 @@ function plainWorktree(dir: string, common: string): boolean {
   }
 }
 
+// paths: a look, no write
 function entries(dir: string): string[] {
   try {
     return readdirSync(dir).sort().slice(0, DIR_LIMIT);
@@ -99,8 +104,9 @@ function entries(dir: string): string[] {
 }
 
 /** `core.hooksPath` as the repository's own config files set it (the last one wins), or null. */
-function hooksPathOf(configs: readonly string[]): string | null {
+export function hooksPathOf(configs: readonly string[]): string | null {
   let found: string | null = null;
+  // paths: a look (a config's text), no write
   for (const file of configs) {
     let text = "";
     try {
@@ -150,6 +156,7 @@ function strayGitEntries(folders: readonly string[], common: string): string[] {
   if (folders.length === 0) return [];
   const commonReal = realOr(common);
   const real = folders.map(realOr);
+  // paths: a look, no write
   const check = (dotgit: string): boolean => {
     let st: ReturnType<typeof lstatSync>;
     try {
@@ -161,6 +168,7 @@ function strayGitEntries(folders: readonly string[], common: string): string[] {
     return true;
   };
   // The worktrees git knows of there: each one's `.git`, as its admin dir's `gitdir` names it.
+  // paths: a look at git's records of worktrees, no write
   for (const w of entries(join(common, "worktrees"))) {
     try {
       const dotgit = resolve(join(common, "worktrees", w), readFileSync(join(common, "worktrees", w, "gitdir"), "utf8").trim());
@@ -170,6 +178,7 @@ function strayGitEntries(folders: readonly string[], common: string): string[] {
       /* no gitdir */
     }
   }
+  // paths: a look through the session's worktree folders, no write
   let budget = FOLDER_DIR_LIMIT;
   let level = [...real];
   for (let depth = 0; depth <= 3 && level.length > 0; depth++) {
@@ -191,6 +200,7 @@ function strayGitEntries(folders: readonly string[], common: string): string[] {
   return [...out];
 }
 
+// paths: for comparing paths in a look, no write
 function realOr(p: string): string {
   try {
     return realpathSync(p);
@@ -200,6 +210,7 @@ function realOr(p: string): string {
 }
 
 /** A worktree's `.git` file as git makes it: naming `<common>/worktrees/<n>`, whose `gitdir` names this file back. */
+// paths: a look, no write
 function namesOwnAdmin(dotgit: string, commonReal: string): boolean {
   try {
     const m = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotgit, "utf8"));
@@ -247,6 +258,7 @@ export function gitControlSnapshot(workspace: string, home: string = process.env
     // Every worktree's admin dir, as a group ({@link gitControlChanges}): what names its repository and its checkout,
     // and its own config. One that appears as `git worktree add` makes one (its repository's `commondir`, no config
     // of its own) isn't news, nor one that goes; one changed meanwhile is, or one that appears naming anything else.
+    // paths: a look at git's records of worktrees, no write
     const own = (opts.ownFolders ?? []).map(realOr);
     for (const w of entries(join(common, "worktrees"))) {
       const dir = join(common, "worktrees", w);
@@ -262,6 +274,7 @@ export function gitControlSnapshot(workspace: string, home: string = process.env
       for (const n of mine ? ["commondir", "config.worktree"] : ["commondir", "gitdir", "config.worktree"]) watch(join(dir, n));
     }
     // A checkout in the session's own worktree folders whose `.git` git would follow elsewhere (#448 round 10).
+    // paths: a look, no write
     for (const g of strayGitEntries(opts.ownFolders ?? [], common)) {
       let f: string | null = null;
       try {

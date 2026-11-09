@@ -19,6 +19,7 @@
  *   - `get_commands` → codeoid `session.commands` (slash passthrough)
  */
 
+import { REQUEST_DIRECTORY_DESCRIPTION, REQUEST_DIRECTORY_SCHEMA, REQUEST_DIRECTORY_TOOL_FQ, type RequestDirectoryInput } from "../../sandbox/request-directory.js";
 import type { McpTenant } from "../../mcp/oauth.js";
 import { randomUUID } from "node:crypto";
 import { AsyncQueue } from "../../async-queue.js";
@@ -93,6 +94,11 @@ export interface PiProviderInit {
   mcpRegistry?: McpServerView;
   mcpHub?: McpHub;
   /**
+   * The sandbox's `request_directory`, decided by the session
+   * (sandbox/request-directory.ts): a bridge tool, as registry servers' are.
+   */
+  requestDirectory?: (input: RequestDirectoryInput) => Promise<string>;
+  /**
    * This session's account for the backend, resolved when the process is
    * spawned (accounts.ts); null = the daemon's own login. Throws when the
    * chosen account can't be used — the turn fails, never another credential.
@@ -139,6 +145,7 @@ export class PiProvider implements SessionProvider {
   #memory: MemoryEngine | null;
   #mcpRegistry: McpServerView | null;
   #mcpHub: McpHub | null;
+  readonly #requestDirectory: ((input: RequestDirectoryInput) => Promise<string>) | null;
 
   #proc: PiRpcProcess | null = null;
   #bridgeReady = false;
@@ -175,6 +182,7 @@ export class PiProvider implements SessionProvider {
     this.#memory = init.memory ?? null;
     this.#mcpRegistry = init.mcpRegistry ?? null;
     this.#mcpHub = init.mcpHub ?? null;
+    this.#requestDirectory = init.requestDirectory ?? null;
   }
 
   /**
@@ -766,16 +774,35 @@ export class PiProvider implements SessionProvider {
 
   /** Discover external MCP tools to register in the bridge at spawn time. */
   async #discoverMcpTools(): Promise<BridgeMcpTool[]> {
+    // The sandbox's ask for a directory to write: served here, not by the hub.
+    const own: BridgeMcpTool[] = this.#requestDirectory
+      ? [{ name: REQUEST_DIRECTORY_TOOL_FQ, description: REQUEST_DIRECTORY_DESCRIPTION, parameters: REQUEST_DIRECTORY_SCHEMA }]
+      : [];
     const view = this.#mcpToolsView();
-    if (!view || !view.hasServers()) return [];
+    if (!view || !view.hasServers()) return own;
     const handles = await view.handles();
-    return handles.map((h) => ({ name: h.canonicalName, description: h.description, parameters: h.inputSchema }));
+    return [...own, ...handles.map((h) => ({ name: h.canonicalName, description: h.description, parameters: h.inputSchema }))];
   }
 
   /** Bridge external-MCP call: the pi-registered tool proxies here (pi has no
    *  MCP). Already gated by the tool_call hook; run it through the daemon hub. */
   async #onMcpToolRequest(id: string, frame: PiFrame): Promise<void> {
     const reply = (value: string) => this.#proc?.send({ type: "extension_ui_response", id, value });
+    const ask = this.#requestDirectory;
+    if (ask) {
+      let p: { name?: string; args?: Record<string, unknown> } = {};
+      try {
+        p = JSON.parse(String(frame.placeholder ?? "{}")) as typeof p;
+      } catch {
+        /* judged below */
+      }
+      if (p.name === REQUEST_DIRECTORY_TOOL_FQ) {
+        const path = typeof p.args?.path === "string" ? p.args.path : "";
+        const reason = typeof p.args?.reason === "string" ? p.args.reason : "";
+        reply(!path || !reason ? "Refused: give the directory's absolute path and why you need it." : await ask({ path, reason }).catch((e) => `Refused: ${e instanceof Error ? e.message : String(e)}`));
+        return;
+      }
+    }
     const view = this.#mcpToolsView();
     if (!view) {
       reply("codeoid MCP is not enabled for this session.");

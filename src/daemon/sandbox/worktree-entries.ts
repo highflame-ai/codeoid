@@ -100,6 +100,7 @@ interface EntryRecord {
   config: string;
 }
 
+// paths: for comparing git's records with paths, in a look; no write
 function realOr(p: string): string {
   try {
     return realpathSync(p);
@@ -112,6 +113,7 @@ function within(child: string, parent: string): boolean {
   return child === parent || child.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
 }
 
+// paths: a look, no write
 function lexists(p: string): boolean {
   try {
     lstatSync(p);
@@ -122,6 +124,7 @@ function lexists(p: string): boolean {
 }
 
 /** A small regular file's text (never through a link): `missing`, `file` with its text, or `other` (a link, a dir, too big). */
+// paths: a look, no write
 function readSmall(p: string): { kind: "missing" } | { kind: "file"; text: string } | { kind: "other"; what: string } {
   let st: ReturnType<typeof lstatSync>;
   try {
@@ -174,6 +177,7 @@ function samePath(a: string, b: string): boolean {
 }
 
 /** `info/` holding only `sparse-checkout`: what git makes for a sparse worktree. */
+// paths: a look, no write
 function onlySparse(info: string): boolean {
   try {
     if (!lstatSync(info).isDirectory()) return false;
@@ -224,6 +228,7 @@ function copiesMain(text: string, common: string): boolean {
   return true;
 }
 
+// paths: a look, no write
 function readlinkOr(p: string): string {
   try {
     return readlinkSync(p);
@@ -235,6 +240,7 @@ function readlinkOr(p: string): string {
 let replaceSeq = 0;
 
 /** Replace `p` with a regular file holding `content` (atomically: never written through a link). Whether it was. */
+// paths: inside the repository's git dir, which the caller pins and checks before and after (SessionSandbox#checkEntriesOf); written beside the file (O_EXCL) and renamed over it, never through a link
 function replaceFile(p: string, content: string): boolean {
   const part = `${p}.codeoid-${process.pid}-${++replaceSeq}`;
   try {
@@ -269,6 +275,7 @@ function writableBy(ctx: WorktreeEntryContext): (p: string) => boolean {
 function scanClaims(worktreesReal: string, seeds: readonly string[], roots: ReadonlyArray<{ dir: string; depth: number }>): Map<string, string[]> {
   const out = new Map<string, string[]>();
   const seen = new Set<string>();
+  // paths: a look, no write
   const visit = (dotgit: string): boolean => {
     let st: ReturnType<typeof lstatSync>;
     try {
@@ -295,6 +302,7 @@ function scanClaims(worktreesReal: string, seeds: readonly string[], roots: Read
         // A checkout: its own `.git` is what counts, nothing deeper.
         if (visit(join(dir, ".git")) && depth > 0) continue;
         if (depth === r.depth) continue;
+        // paths: a look, no write
         let names: string[] = [];
         try {
           names = readdirSync(dir).sort();
@@ -362,6 +370,7 @@ export class WorktreeEntryGuard {
     const firstLook = !this.#looked;
     this.#looked = true;
     const dir = join(common, "worktrees");
+    // paths: a look at the repository's worktrees dir, no write
     let names: string[] = [];
     try {
       // A linked `worktrees/` makes the git dir read-only whole (policy.ts): nothing of it is the session's to make.
@@ -405,6 +414,7 @@ export class WorktreeEntryGuard {
       const other = namedEntry(rec.dotgit, worktreesReal);
       if (!other || other === name || this.#records.has(other) || !names.includes(other)) continue;
       const otherNamed = entryGitdir(join(dir, other));
+      // paths: a look, no write
       let otherKey = "";
       try {
         const o = lstatSync(join(dir, other));
@@ -422,6 +432,7 @@ export class WorktreeEntryGuard {
       seen.add(name);
       const at = join(dir, name);
       const atReal = join(worktreesReal, name);
+      // paths: a look, no write
       let st: ReturnType<typeof lstatSync>;
       try {
         st = lstatSync(at);
@@ -433,6 +444,7 @@ export class WorktreeEntryGuard {
         this.#records.delete(name);
         const target = readlinkOr(at);
         let removed = false;
+        // paths: a link in the repository's worktrees dir (the git dir pinned by the caller): unlink removes the link itself, never what it leads to
         try {
           unlinkSync(at);
           removed = true;
@@ -599,6 +611,7 @@ export class WorktreeEntryGuard {
 }
 
 /** The repository's dir for what is taken out of its worktree entries: made 0700, never through a link; null when it can't be. */
+// paths: in the repository's git dir (pinned by the caller): made 0700, used only when a directory and not a link
 function quarantineDir(common: string): string | null {
   const dir = join(common, QUARANTINE_DIR);
   try {
@@ -615,6 +628,7 @@ function quarantineDir(common: string): string | null {
 }
 
 /** Move `src` (a file, a dir, a link) into the quarantine dir; where it went, or null. */
+// paths: an entry moved aside within the repository's git dir (pinned by the caller): a rename never follows a link
 function quarantine(common: string, src: string, label: string): string | null {
   const dir = quarantineDir(common);
   if (!dir) return null;
@@ -633,6 +647,7 @@ function quarantine(common: string, src: string, label: string): string | null {
 }
 
 /** Keep `content` in the quarantine dir; where, or null. */
+// paths: in the quarantine dir (O_EXCL), in the git dir pinned by the caller
 function keepAside(common: string, label: string, content: string): string | null {
   const dir = quarantineDir(common);
   if (!dir) return null;

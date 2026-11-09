@@ -33,6 +33,7 @@
  *     authoritative for files.
  */
 
+import { SANDBOX_MCP_SERVER_NAME, type SandboxMcpMount } from "../../sandbox/request-directory.js";
 import { join } from "node:path";
 import type { BackendHostFiles } from "../../sandbox/host-file-tools.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
@@ -162,6 +163,8 @@ export interface OpencodeProviderInit {
   memoryMcp?: MemoryMcpMount;
   mcpProxy?: McpProxyMount;
   blackboardMcp?: () => { url: string; token: string } | undefined;
+  /** The sandbox's `request_directory` over the daemon's `/mcp/sandbox` (sandbox/request-directory.ts). */
+  sandboxMcp?: () => SandboxMcpMount | undefined;
   mcpRegistry?: McpServerView;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
   /** opencode agent the session runs (`providers.opencode.agent`); absent = opencode's default. */
@@ -352,6 +355,7 @@ export class OpencodeProvider implements SessionProvider {
   readonly #workspaceId: string;
   readonly #memoryMcp: MemoryMcpMount | null;
   readonly #blackboardMcp: (() => { url: string; token: string } | undefined) | null;
+  readonly #sandboxMcp: (() => SandboxMcpMount | undefined) | null;
   readonly #mcpRegistry: McpServerView | null;
   readonly #proxy: McpProxyLease;
   readonly #onModels: OpencodeProviderInit["onModels"];
@@ -538,6 +542,7 @@ export class OpencodeProvider implements SessionProvider {
     this.#workspaceId = init.workspaceId ?? init.sessionId;
     this.#memoryMcp = init.memoryMcp ?? null;
     this.#blackboardMcp = init.blackboardMcp ?? null;
+    this.#sandboxMcp = init.sandboxMcp ?? null;
     this.#mcpRegistry = init.mcpRegistry ?? null;
     this.#onModels = init.onModels;
     this.#agent = init.agent;
@@ -1641,6 +1646,10 @@ export class OpencodeProvider implements SessionProvider {
     }
     const bb = this.#blackboardMcp?.();
     if (bb) configs.push({ name: BLACKBOARD_MCP_SERVER_NAME, config: remote(bb.url, bb.token) });
+    // The sandbox's ask for a directory to write (sandbox/request-directory.ts): its call returns within opencode's
+    // MCP call timeout, the owner's question left open (REQUEST_DIRECTORY_SHORT_WAIT_MS).
+    const sbx = this.#sandboxMcp?.();
+    if (sbx) configs.push({ name: SANDBOX_MCP_SERVER_NAME, config: remote(sbx.url, sbx.token) });
     for (const spec of this.#mcpRegistry?.forNativeMount(this.id) ?? []) {
       const t = spec.transport;
       if (t.kind === "stdio") {

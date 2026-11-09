@@ -19,6 +19,7 @@
  */
 
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import type { PathPin } from "./pinned.js";
 
 /** How strong the boundary is: OS namespaces/profiles, a separate kernel (gVisor), a VM. */
 export type IsolationTier = "os" | "kernel" | "hardware";
@@ -117,6 +118,17 @@ export interface SandboxSpec {
    */
   pinned?: readonly string[];
   /**
+   * Directories held in place as {@link pinned} ones are (a mount point, a
+   * denied rename), what is in them writable, but never read-only on
+   * Claude's own sandbox (whose denial takes a subtree; its CLI binds the
+   * working directory's ancestors itself): the working directory and each
+   * dir between it and the workspace, and each dir between a writable root
+   * and a path held read-only in it (#448 round 14). Moved aside, each
+   * would take what is held in it along and leave its place to a planted
+   * copy (a package's `.claude/settings.json`).
+   */
+  heldInPlace?: readonly string[];
+  /**
    * The session's own folder in each of the repository's worktree locations
    * (in {@link writable} too): where a command checks a new worktree out
    * (`<repo>-worktrees/<folder>`, `.worktrees/<folder>`,
@@ -125,6 +137,32 @@ export interface SandboxSpec {
    * writable roots).
    */
   worktreeFolders?: readonly string[];
+  /**
+   * The session's project roots (`sandbox.projectRoots`, policy.ts
+   * `resolveProjectRoots`): readable whole, read-only, with what the hidden
+   * list hides in them hidden again (in {@link reexposed} too). Other
+   * repositories, other sessions' checkouts.
+   */
+  projectRoots?: readonly string[];
+  /**
+   * Directories the session was given to write besides its workspace
+   * (`SessionSandboxSetting.addedDirs`): each treated as a workspace (in
+   * {@link writable}, its git structure and project settings in
+   * {@link readOnly}, its repository's worktree folder in
+   * {@link worktreeFolders}). What a backend's own sandbox must also let it
+   * write (Codex's writable roots).
+   */
+  addedDirs?: readonly string[];
+  /**
+   * Every path bound by name (the workspace, the working directory, added
+   * directories, project roots, worktree folders and locations, the
+   * session's writable and temp dirs, the paths held read-only, the dirs
+   * held in place), each with what it was when the spec was built
+   * (pinned.ts, #448 rounds 13 and 14): checked again at every launch, which
+   * is refused when one is reached through a link or is another directory
+   * now. A provider binds each by this path, never resolves it again.
+   */
+  pins?: readonly PathPin[];
   /** Container runtime sockets (and their dirs): never reachable, they are root-equivalent. */
   containerSockets: readonly string[];
   /**

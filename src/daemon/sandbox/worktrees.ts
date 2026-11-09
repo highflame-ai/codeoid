@@ -30,15 +30,17 @@
  * its own output, like the workspace.
  */
 
-import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
+import { makeAt } from "./pinned.js";
 import type { GitLayout } from "./policy.js";
 
 function within(child: string, parent: string): boolean {
   return child === parent || child.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
 }
 
+// paths: a repository's layout, found once at a spec build (a link from the main checkout's parent down is refused: `linked`); what it gives is pinned by the spec, and made only through makeAt
 function realOr(p: string): string {
   try {
     return realpathSync(p);
@@ -47,6 +49,7 @@ function realOr(p: string): string {
   }
 }
 
+// paths: a look (is it a link: then refused), no write
 function isLink(p: string): boolean {
   try {
     return lstatSync(p).isSymbolicLink();
@@ -56,6 +59,7 @@ function isLink(p: string): boolean {
 }
 
 /** A dir of the daemon user's own, not a link. */
+// paths: a look, no write
 function ownDir(p: string): boolean {
   try {
     const st = lstatSync(p);
@@ -289,7 +293,8 @@ export function worktreeFoldersOf(
   const mk = (p: string): void => {
     if (!make) return;
     try {
-      mkdirSync(p, { mode: 0o755 });
+      // Never through a link (pinned.ts: its parent pinned for the make, checked again after; #448 round 14).
+      makeAt(p, "dir", "making a worktree folder");
     } catch {
       /* there already, or can't be made: then only an existing one is used */
     }
@@ -343,6 +348,7 @@ export function existingFolderName(locations: readonly WorktreeLocation[], sessi
   const suffix = `-${sessionShortId(sessionId)}`;
   for (const loc of locations) {
     let names: string[] = [];
+    // paths: a look (which folder names a location holds), no write
     try {
       names = readdirSync(loc.dir).filter((n) => n.endsWith(suffix) && n.length > suffix.length);
     } catch {
@@ -375,6 +381,7 @@ export interface WorktreeAdmin {
 export function worktreeAdminsOf(common: string, limit = 500): WorktreeAdmin[] {
   const dir = join(common, "worktrees");
   let names: string[] = [];
+  // paths: a look at the repository's worktree admin dirs, no write
   try {
     names = readdirSync(dir, { withFileTypes: true })
       .filter((e) => e.isDirectory())

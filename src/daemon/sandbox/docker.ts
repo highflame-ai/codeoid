@@ -37,6 +37,7 @@ import { lstatSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve as resolvePath } from "node:path";
 import { LocalSandboxHandle } from "./local-handle.js";
+import { boundPath } from "./pinned.js";
 import type { NetworkMode, SandboxCapabilities, SandboxHandle, SandboxProbe, SandboxProvider, SandboxSpawnOptions, SandboxSpec } from "./types.js";
 
 export const DOCKER_PROVIDER_ID = "docker";
@@ -54,7 +55,8 @@ function within(child: string, parent: string): boolean {
   return child === parent || child.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
 }
 
-function realOr(p: string): string {
+// paths: only for what isn't pinned (boundPath): a hidden path (a link there hides more), the home's allowlist, the owner's socket
+function realOrPath(p: string): string {
   try {
     return realpathSync(p);
   } catch {
@@ -65,9 +67,10 @@ function realOr(p: string): string {
 /** What exists at a path: a directory, something else, nothing. */
 export type DockerPathKind = "dir" | "other" | null;
 
+// paths: a look at what is there, no write: a pinned path the handle checked first
 function pathKind(p: string): DockerPathKind {
   try {
-    const st = lstatSync(realOr(p));
+    const st = lstatSync(realOrPath(p));
     return st.isDirectory() ? "dir" : "other";
   } catch {
     return null;
@@ -98,6 +101,7 @@ export interface DockerRunOptions {
 /** Where a container runtime socket the owner let in is mounted inside the container (`DOCKER_HOST` names it). */
 export const CONTAINER_DOCKER_SOCKET = "/var/run/docker.sock";
 
+// paths: the owner's container socket (opted in), outside every sandbox's writes: a look at its group
 function socketGroup(p: string): number | null {
   try {
     return statSync(p).gid;
@@ -109,6 +113,9 @@ function socketGroup(p: string): number | null {
 /** `docker run`'s arguments for `argv` under `spec`. Pure but for `kind` (tests replace it). */
 export function dockerRunArgs(spec: SandboxSpec, argv: readonly string[], o: DockerRunOptions): string[] {
   const kind = o.kind ?? pathKind;
+  // Everything bound by name is pinned: mounted by the path it was pinned at (the handle checked it is still that,
+  // and the launched argv checks again; #448 round 14), never resolved again here. Only what isn't is resolved.
+  const realOr = boundPath(spec.pins, realOrPath);
   const args = [
     "run",
     "--rm",
@@ -159,10 +166,14 @@ export function dockerRunArgs(spec: SandboxSpec, argv: readonly string[], o: Doc
   }
   // Every dir between a mounted writable root and a hidden path in it: a mount point (no rename), still writable (Docker mounts parents first).
   const hiddenAt = spec.hidden.map(realOr);
-  for (const p of spec.pinned ?? []) {
+  const writableAt = [workspace, ...spec.writable.map(realOr)];
+  for (const p of [...(spec.pinned ?? []), ...(spec.heldInPlace ?? [])]) {
     const at = realOr(p);
-    // Never one a hidden path covers (or is): its mount would show the real dir again.
-    if (kind(at) === "dir" && inMounted(at) && !hiddenAt.some((h) => within(at, h))) bind(at, at, false);
+    // Never one a hidden path in its writable root covers (or is): its mount would show the real dir again. One in a
+    // hidden dir the root is mounted from (the hidden home holding the workspace) is the root's: mounted (#448
+    // round 14, as bubblewrap's since round 13).
+    const holder = writableAt.filter((w) => within(at, w)).sort((x, y) => y.length - x.length)[0];
+    if (kind(at) === "dir" && inMounted(at) && !hiddenAt.some((h) => within(at, h) && (!holder || (within(h, holder) && h !== holder)))) bind(at, at, false);
   }
   // A hidden path inside something mounted is covered again.
   for (const h of [...spec.hidden, ...spec.containerSockets, ...(spec.serviceSockets ?? [])]) {
@@ -237,6 +248,7 @@ export class DockerSandboxProvider implements SandboxProvider {
     const docker = this.#client();
     if (!docker) return { available: false, reason: "the docker client isn't installed" };
     try {
+      // paths: the probe: a fixed argv, in no session's directory
       const proc = Bun.spawn([docker, "version", "--format", "{{.Server.Version}}"], { stdin: "ignore", stdout: "pipe", stderr: "pipe", timeout: 10_000 });
       const [code, out, err] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
       if (code === 0 && out.trim()) return { available: true, detail: `Docker ${out.trim()}` };
@@ -272,6 +284,7 @@ export class DockerSandboxProvider implements SandboxProvider {
           // A launcher (no cwd: it runs from wherever it is started, maybe many at once) names none.
           ...(opts.cwd ? { name: `codeoid-${safe}-${randomBytes(4).toString("hex")}` } : {}),
           handle: handleId,
+          // paths: the container's own working directory (-w), inside it
           cwd: opts.cwd,
           envNames: Object.keys(opts.env),
           uid,
@@ -282,6 +295,7 @@ export class DockerSandboxProvider implements SandboxProvider {
       env: { ...opts.env, ...clientEnv },
     });
     // Containers outlive a killed client: remove every one this handle started.
+    // paths: docker ps / rm by this handle's label: no path
     const onClose = () =>
       new Promise<void>((resolve) => {
         execFile(docker, ["ps", "-aq", "--filter", `label=codeoid.handle=${handleId}`], { env: { ...clientEnv } }, (err, out) => {

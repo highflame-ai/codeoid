@@ -24,6 +24,7 @@
  * agent can become a backend by reusing this shape with a different binary.
  */
 
+import { SANDBOX_MCP_SERVER_NAME, type SandboxMcpMount } from "../../sandbox/request-directory.js";
 import type { McpTenant } from "../../mcp/oauth.js";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
@@ -86,6 +87,8 @@ export interface GeminiAcpProviderInit {
    * server list (per turn for claude), by which time it is set.
    */
   blackboardMcp?: () => { url: string; token: string } | undefined;
+  /** The sandbox's `request_directory` over the daemon's `/mcp/sandbox` (sandbox/request-directory.ts). */
+  sandboxMcp?: () => SandboxMcpMount | undefined;
 
   /** Cross-backend MCP registry — external servers mount on session/new
    *  (gemini-cli owns its client); approval flows through canUseTool. */
@@ -126,6 +129,7 @@ export class GeminiAcpProvider implements SessionProvider {
   #memoryMcp: MemoryMcpMount | null;
   /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
   readonly #blackboardMcp: (() => { url: string; token: string } | undefined) | null;
+  readonly #sandboxMcp: (() => SandboxMcpMount | undefined) | null;
   #mcpRegistry: McpServerView | null;
   /** Live scoped token for the mounted memory endpoint; revoked on teardown. */
   #memoryToken: string | null = null;
@@ -163,6 +167,7 @@ export class GeminiAcpProvider implements SessionProvider {
     this.#workspaceId = init.workspaceId ?? init.sessionId;
     this.#memoryMcp = init.memoryMcp ?? null;
     this.#blackboardMcp = init.blackboardMcp ?? null;
+    this.#sandboxMcp = init.sandboxMcp ?? null;
     this.#mcpRegistry = init.mcpRegistry ?? null;
     this.#proxy = new McpProxyLease(
       init.mcpProxy,
@@ -456,6 +461,16 @@ export class GeminiAcpProvider implements SessionProvider {
         name: BLACKBOARD_MCP_SERVER_NAME,
         url: bb.url,
         headers: [{ name: "Authorization", value: `Bearer ${bb.token}` }],
+      });
+    }
+    // The sandbox's ask for a directory to write (sandbox/request-directory.ts): the session's token.
+    const sbx = this.#sandboxMcp?.();
+    if (sbx) {
+      servers.push({
+        type: "http",
+        name: SANDBOX_MCP_SERVER_NAME,
+        url: sbx.url,
+        headers: [{ name: "Authorization", value: `Bearer ${sbx.token}` }],
       });
     }
     // Registry servers — native mount (gemini-cli owns its MCP client). ACP's

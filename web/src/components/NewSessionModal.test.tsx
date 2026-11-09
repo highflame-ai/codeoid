@@ -882,6 +882,23 @@ describe("NewSessionModal sandbox choice (#448)", () => {
     await waitFor(() => expect(requestMock).toHaveBeenCalledWith(expect.objectContaining({ type: "session.create", sandbox: { dockerSocket: true } })));
   });
 
+  it("project roots and added directories (working across repositories): the default shown, sent as projectRoots and addedDirs; none is []", async () => {
+    authMock.mockReturnValue(authOk(["claude"]));
+    requestMock.mockImplementation(async (m: { type: string }) => (m.type === "sandbox.providers" ? providersReply : { id: "s-new", name: "n", workdir: "/w" }));
+    const { getByText, getByLabelText, getByPlaceholderText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.click(getByText("change"));
+    await waitFor(() => expect(getByLabelText("Project roots")).toBeTruthy());
+    expect((getByLabelText("Project roots") as HTMLInputElement).placeholder).toContain("default: the repository's parent");
+    fireEvent.input(getByLabelText("Project roots"), { target: { value: "@parent, ~/src" } });
+    fireEvent.input(getByLabelText("Added directories"), { target: { value: "~/Workspace/b,\n/srv/c" } });
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "demo" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() =>
+      expect(requestMock).toHaveBeenCalledWith(expect.objectContaining({ type: "session.create", sandbox: { projectRoots: ["@parent", "~/src"], addedDirs: ["~/Workspace/b", "/srv/c"] } })),
+    );
+  });
+
   it("off says what it means", async () => {
     authMock.mockReturnValue(authOk(["claude"]));
     requestMock.mockResolvedValue(providersReply);

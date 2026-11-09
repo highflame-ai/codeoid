@@ -32,6 +32,13 @@ import { TranscriptStore } from "../daemon/transcript.js";
 import { type AuthContext, CAPABILITIES, type SessionMessage, type SessionMode, type SessionSandboxSetting, type SessionUiRequestMsg } from "../protocol/types.js";
 
 const AUTH: AuthContext = { sub: "u", scopes: [], delegationDepth: 0, accountId: "a", projectId: "p" };
+
+/** A setting without what the daemon keeps of its directories (their pins, #448 round 13): undefined when that was all. */
+function withoutPins(setting: SessionSandboxSetting | undefined): SessionSandboxSetting | undefined {
+  if (!setting) return setting;
+  const { pins: _p, ...rest } = setting;
+  return Object.keys(rest).length > 0 ? rest : undefined;
+}
 const BASE_CONFIG = {
   workspaceIndex: { enabled: false, episodeThreshold: 5, timeThresholdMs: 60_000, debounceMs: 15_000 },
   compress: { enabled: false, excludeCommands: [], excludePatterns: [], compressPipes: false, minBytes: 1024 },
@@ -368,6 +375,7 @@ describe("fallback: unattended work refuses, interactive work says so", () => {
 describe("the approval card and the gate", () => {
   test("a shell call on a sandboxed session: sandboxed, with the provider and network", async () => {
     const r = await gateCall("Bash", { command: "ls" });
+    // No project root: the workdir is in no repository, and in the host's temp dir (#448 round 12).
     expect(r.card).toMatchObject({ sandboxed: true, sandboxNote: "sandboxed: fake-bwrap, network on" });
   });
 
@@ -424,7 +432,8 @@ describe("changing a session's sandbox", () => {
     const r = await session.setSandbox({ network: "off" }, AUTH);
     expect(r).toEqual({ ok: true });
     expect(session.sandboxInfo).toMatchObject({ network: "off", state: "on" });
-    expect(session.sandboxSetting).toEqual({ network: "off" });
+    // What the daemon keeps of the directories (their pins, #448 round 13) aside.
+    expect(withoutPins(session.sandboxSetting)).toEqual({ network: "off" });
   });
 
   test("widening (off) is asked on the session; a yes applies it, a no doesn't", async () => {
@@ -808,7 +817,7 @@ describe("round 1 of the #448 audit", () => {
     const second = sbx.refresh("opencode");
     release();
     await Promise.all([first, second]);
-    expect(sbx.setting).toEqual({ network: "off" });
+    expect(withoutPins(sbx.setting)).toEqual({ network: "off" });
     expect(sbx.resolvedFor("opencode")).toBe(true);
     expect(sbx.info?.network).toBe("off");
     expect(sbx.runtime?.spec.network).toEqual({ mode: "off" });
@@ -923,7 +932,7 @@ describe("round 1 of the #448 audit", () => {
     const busy = await session.setSandbox({ network: "off" }, AUTH);
     expect(busy).toMatchObject({ ok: false });
     expect((busy as { error: string }).error).toContain("busy");
-    expect(session.sandboxSetting).toBeUndefined();
+    expect(withoutPins(session.sandboxSetting)).toBeUndefined();
     await session.interrupt(AUTH);
     await until(() => !session.pendingToolApprovals().length);
     provider.onSessionEvent?.({ type: "background_tasks", tasks: [{ id: "bg1", kind: "local_bash", description: "dev server", status: "running" }] });
@@ -1012,9 +1021,18 @@ describe("round 8 of the #448 audit: host-side file tools are held to the sandbo
 
   test("the sandbox decides what a read reaches: the home's allowlist is readable; the host's /tmp is to Claude's own sandbox, not to opencode's under bubblewrap (its /tmp is the session's)", async () => {
     expect((await gateCall("Read", { file_path: join(homedir(), ".gitconfig") }, { mode: "autonomous" })).behavior).toBe("allow");
-    const outside = join(root, "elsewhere", "notes.txt");
-    expect((await gateCall("Read", { file_path: outside }, { mode: "autonomous" })).behavior).toBe("allow");
-    expectOutside(await gateCall("Read", { file_path: outside }, { mode: "autonomous", backend: "opencode" }), "read", outside);
+    // Outside every project root (there is none: the workdir is in no repository, in the host's temp dir): another dir of the host's /tmp.
+    const other = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-sbx-elsewhere-")));
+    try {
+      const outside = join(other, "notes.txt");
+      expect((await gateCall("Read", { file_path: outside }, { mode: "autonomous" })).behavior).toBe("allow");
+      expectOutside(await gateCall("Read", { file_path: outside }, { mode: "autonomous", backend: "opencode" }), "read", outside);
+    } finally {
+      rmSync(other, { recursive: true, force: true });
+    }
+    // Beside the workdir: no root shows it (#448 round 12: none outside a repository, none in a temp dir), so neither do its file tools.
+    const sibling = join(root, "elsewhere", "notes.txt");
+    expectOutside(await gateCall("Read", { file_path: sibling }, { mode: "autonomous", backend: "opencode" }), "read", sibling);
   });
 
   test("a write through a link out of the workspace is judged where it lands", async () => {

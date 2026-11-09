@@ -280,7 +280,7 @@ describe("hidden paths", () => {
 describe("config", () => {
   test("on by default: auto, network on", () => {
     const c = loadConfig({ raw: {}, env: {}, quiet: true });
-    expect(c.sandbox).toEqual({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], docker: { image: "node:22-bookworm-slim", socket: false } });
+    expect(c.sandbox).toEqual({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], projectRoots: ["@parent"], docker: { image: "node:22-bookworm-slim", socket: false } });
   });
 
   test("env vars override the file", () => {

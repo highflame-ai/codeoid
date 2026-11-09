@@ -99,6 +99,7 @@ import {
   numstatTrees,
   restoreTree,
 } from "./checkpoints.js";
+import { type PinnedDir, PinnedPathError, pinDir, pinRecord } from "./sandbox/pinned.js";
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
 import type { EffortChangeResult, EffortLevel, RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
 import { LIMITS } from "../protocol/types.js";
@@ -168,7 +169,7 @@ import {
   type MemoryEngine,
   type MemoryMcpMount,
 } from "./memory/index.js";
-import { isElicitationTool, isSafeTool, isUnresolvedPathTool, roleDeniesTool } from "./providers/tool-safety.js";
+import { isElicitationTool, isRequestDirectoryTool, isSafeTool, isUnresolvedPathTool, roleDeniesTool } from "./providers/tool-safety.js";
 import type { PackActivation } from "./pipeline/index.js";
 import { McpRegistry } from "./mcp/registry.js";
 import { mcpSpecKey, SessionMcpView, type WorkdirReach } from "./mcp/session-view.js";
@@ -183,6 +184,23 @@ const RESEED_AFTER_TEARDOWN = new Set(["gemini-cli"]);
  * releases it when idle, so the next turn starts one on the new credential.
  * The rest re-read their account every turn (accounts.ts).
  */
+/** What an approval card adds of the sandbox's directories (docs/sandbox.md, "Working across repositories"): "; reads R (read-only); also writes D". */
+function cardDirsNote(info: SessionSandboxInfo): string {
+  const parts = [
+    ...(info.homeWorkspace ? ["workspace is your home: only credentials are protected"] : []),
+    ...(info.projectRoots?.length ? [`reads ${info.projectRoots.join(", ")} (read-only)`] : []),
+    ...(info.addedDirs?.length ? [`also writes ${info.addedDirs.join(", ")}`] : []),
+  ];
+  return parts.length > 0 ? `; ${parts.join("; ")}` : "";
+}
+
+/** The directories a resolved sandbox reads and writes besides its workspace, in words. */
+function sandboxDirsLine(info: SessionSandboxInfo | null): string {
+  const added = info?.addedDirs ?? [];
+  const roots = info?.projectRoots ?? [];
+  return `writes ${added.length > 0 ? `the workspace and ${added.join(", ")}` : "the workspace"}; reads ${roots.length > 0 ? roots.join(", ") : "no project root"}`;
+}
+
 const PROCESS_BACKENDS: ReadonlySet<string> = new Set(["claude", "codex", "gemini-cli", "qwen", "pi"]);
 
 /** Statuses the idle countdown (#451) runs in: nothing in flight until the next message. */
@@ -213,7 +231,10 @@ import { CLAUDE_ALL_SOCKETS_NOTE, describeSandbox, resolveSandbox, SandboxRequir
 import { type WorktreeEntryFinding, worktreeEntryLine, worktreeEntryWarning } from "./sandbox/worktree-entries.js";
 import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
 import { worktreeFolderNote } from "./sandbox/worktrees.js";
-import { protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
+import { hiddenPathsFor, protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
+import { addedDirProblem, addedDirReal, autonomousGrantProblem, checkoutOverlap, inAnyDir, nestedControl, normalizeSandboxDir, type OtherCheckout } from "./sandbox/project-roots.js";
+import { sandboxRootIfMade } from "./sandbox/root.js";
+import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -450,6 +471,8 @@ export interface SessionCreateOptions {
   backgroundWakeFallbackMs?: number;
   /** Override for FOREIGN_STOP_GRACE_MS (tests). */
   foreignStopGraceMs?: number;
+  /** Override for how long `request_directory` waits for its owner's answer before it returns (tests). */
+  requestDirectoryWaitMs?: number;
   /** Optional memory engine — when provided, episodes are chunked and stored for recall. */
   memory?: MemoryEngine;
   /** Shared in-daemon memory MCP endpoint + URL, for URL-mounting backends. */
@@ -521,6 +544,14 @@ export interface SessionCreateOptions {
    * rather than an in-process Claude-SDK server (#245).
    */
   blackboardMcp?: { url: string; token: string };
+  /**
+   * The sandbox's `request_directory` over the daemon's `/mcp/sandbox`
+   * (sandbox/request-directory.ts), minted by the manager for this session:
+   * what the URL-mounting backends (Codex, the Gemini CLI, opencode) mount.
+   */
+  sandboxMcp?: (sessionId: string) => SandboxMcpMount | undefined;
+  /** The checkouts other sessions work in (SessionManager): what an autonomous `request_directory` never touches (#448 round 13). */
+  sandboxCheckouts?: (sessionId: string) => OtherCheckout[];
   /**
    * Pre-built codeoid_fleet MCP server (conductor sessions only). Built by
    * the SessionManager because its tools close over the manager's tenant-
@@ -680,6 +711,7 @@ function planHash(parts: readonly string[]): string {
 }
 
 /** Whether `rel` exists in `workdir` as something other than a directory (links not followed). */
+// paths: a look (no write) in the working directory as pinned, just checked by #planRewind; the restore checks it again
 async function isNonDirectory(workdir: string, rel: string): Promise<boolean> {
   try {
     return !(await lstat(join(workdir, rel))).isDirectory();
@@ -693,6 +725,7 @@ async function isNonDirectory(workdir: string, rel: string): Promise<boolean> {
  * not followed). Exact: on a case-insensitive filesystem `lstat("readme.md")`
  * also finds `README.md`, which would make a case-only rename look occupied.
  */
+// paths: a look (no write) in the working directory as pinned, just checked by #planRewind; the restore checks it again
 async function existsOnDisk(workdir: string, rel: string): Promise<boolean> {
   try {
     await lstat(join(workdir, rel));
@@ -710,6 +743,7 @@ async function existsOnDisk(workdir: string, rel: string): Promise<boolean> {
 }
 
 /** Whether any parent directory of `rel` inside `workdir` is a symlink. */
+// paths: a look (no write) in the working directory as pinned, just checked by #planRewind; the restore checks it again
 async function hasSymlinkedParent(workdir: string, rel: string): Promise<boolean> {
   const parts = rel.split("/");
   for (let k = 1; k < parts.length; k++) {
@@ -777,6 +811,7 @@ export function irreversibleEffects(turns: readonly CanonicalTurn[], ctx: { work
         const call = tc.input.call && typeof tc.input.call === "object" ? shellCallOf(inner, tc.input.call as Record<string, unknown>) : null;
         if (!call) continue;
         const places = Array.isArray(tc.input.paths) ? tc.input.paths.filter((p): p is string => typeof p === "string" && p.length > 0) : [];
+        // paths: judging what a recorded command would reach (outsideEffects): no use of the path
         if ((places.length > 0 ? places : [ctx.workdir]).some((cwd) => outsideEffects(call.command, { ...ctx, cwd: resolvePath(ctx.workdir, cwd) }))) {
           out.push({ tool: inner, detail: shorten(call.command) });
         }
@@ -930,6 +965,8 @@ export class Session {
    *  is scoped to a goal id that IS this session's id, so it can only be
    *  attached after construction (see attachBlackboard). */
   #blackboardMcp?: { url: string; token: string };
+  #sandboxMcp?: (sessionId: string) => SandboxMcpMount | undefined;
+  #sandboxCheckouts?: (sessionId: string) => OtherCheckout[];
   readonly createdBy: string;
   readonly createdAt: string;
   /**
@@ -1234,10 +1271,23 @@ export class Session {
   #refBaseline: Promise<string[] | null> | null = null;
   /** The commit look in flight: one at a time, each from where the last one left the baseline. */
   #settingsCheck: Promise<void> = Promise.resolve();
+  /** The same two looks for each directory the session was given to write (its repository's), from when it applied. */
+  readonly #addedGitBaselines = new Map<string, { git: GitControlSnapshot; refs: Promise<string[] | null> }>();
+  /** The agent's `request_directory` questions still open, by directory: a repeat request joins its answer. */
+  readonly #dirRequests = new Map<string, Promise<string>>();
+  /** The pin change last said on the session (#sandboxPinRefusal): said once per change. */
+  #pinSaid: string | null = null;
+  /** The working directory's identity when there is no sandbox to keep it (an embedder): taken at its first use. */
+  #ownWorkdirRecord: string | null = null;
+  /** The change of the working directory last said (#workdirChanged): said once per change. */
+  #workdirChangeSaid: string | null = null;
+  #requestDirectoryWaitMs: number | undefined;
   /** Started for unattended work: turns need an enforced sandbox (SessionCreateOptions.requireSandbox). */
   #requireSandbox = false;
   /** The sandbox changed while the backend process ran: it runs in the old one until it is restarted. */
   #sandboxRestartPending = false;
+  /** The sandbox's directories changed and were applied while the backend ran: restarted before the next turn. */
+  #sandboxDirsRestart = false;
   /** Why the last finished turn failed, when a usage or rate limit was the cause; null after a success. */
   #lastTurnInfraError: TurnInfraError | null = null;
   /**
@@ -1552,6 +1602,9 @@ export class Session {
     this.collaboration = opts.collaboration;
     this.collaborationRole = opts.collaborationRole;
     this.#blackboardMcp = opts.blackboardMcp;
+    this.#sandboxMcp = opts.sandboxMcp;
+    this.#sandboxCheckouts = opts.sandboxCheckouts;
+    this.#requestDirectoryWaitMs = opts.requestDirectoryWaitMs;
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
     this.#collaborationCost = opts.collaborationCost;
@@ -1856,6 +1909,8 @@ export class Session {
       // A getter, so a mount attached after construction still reaches the
       // provider when it next builds its server list.
       blackboardMcp: () => this.#blackboardMcp,
+      // The sandbox's ask for a directory to write (sandbox/request-directory.ts): decided here, every backend.
+      ...(this.#sandbox ? { requestDirectory: (input: RequestDirectoryInput) => this.requestDirectory(input), sandboxMcp: () => this.#sandboxMcp?.(this.id) } : {}),
       mcpRegistry: this.#mcpView ?? this.#mcpRegistry,
       mcpHub: this.#mcpHub,
       fleet: this.#fleet,
@@ -2031,36 +2086,47 @@ export class Session {
         }
         this.#releaseProviderWhenIdle = false;
         this.#sandboxRestartPending = false;
-        // Before the teardown, as terminateBackend does: codex and the Gemini
-        // CLI are stopped with a bare SIGKILL, and what they started (MCP
-        // servers, commands) would otherwise be left running, out of reach.
-        let tree: ProcessEntry[] = [];
-        try {
-          const roots = (await withTimeout(this.#provider.backendProcessIds?.() ?? Promise.resolve([]), 3_000)) ?? [];
-          tree = await withTimeout(snapshotTree(roots), 3_000);
-        } catch (e) {
-          console.error(`[codeoid/session ${this.id}] could not snapshot the ${backend} backend's processes: ${e instanceof Error ? e.message : String(e)}`);
-        }
-        await this.#teardownProvider();
-        try {
-          const killed = await killSurvivors(tree);
-          if (killed.length > 0) {
-            this.#store.audit(opts.idle ? "system:idle-release" : "system:account-release", "session.release_backend.reaped", this.id, `pids=${killed.join(",")}`);
-            console.warn(`[codeoid/session ${this.id}] killed ${killed.length} process(es) the released ${backend} backend left running: ${killed.join(", ")}`);
-          }
-        } catch (e) {
-          console.error(`[codeoid/session ${this.id}] killing the released backend's leftover processes failed: ${e instanceof Error ? e.message : String(e)}`);
-        }
-        // A backend that can't resume its own conversation (the Gemini CLI
-        // starts a new ACP session) is handed the history, as after an MCP
-        // rebuild — an account switch must never start the conversation over.
-        if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
-          await this.#seedProviderFromHistory();
-        }
+        this.#sandboxDirsRestart = false;
+        await this.#releaseBackendNow(opts.idle ? "system:idle-release" : "system:account-release");
       })
       .catch((e) => {
         console.error(`[codeoid/session ${this.id}] releasing the idle ${backend} backend failed: ${e instanceof Error ? e.message : String(e)}`);
       });
+  }
+
+  /**
+   * Stop the backend's process now (idle: in the send chain) so its next turn
+   * starts a fresh one that resumes the conversation: what it started is
+   * reaped, and a backend that can't resume is handed the history.
+   */
+  async #releaseBackendNow(who: string): Promise<void> {
+    const backend = this.#provider.id;
+    // Before the teardown, as terminateBackend does: codex and the Gemini
+    // CLI are stopped with a bare SIGKILL, and what they started (MCP
+    // servers, commands) would otherwise be left running, out of reach.
+    let tree: ProcessEntry[] = [];
+    try {
+      const roots = (await withTimeout(this.#provider.backendProcessIds?.() ?? Promise.resolve([]), 3_000)) ?? [];
+      tree = await withTimeout(snapshotTree(roots), 3_000);
+    } catch (e) {
+      console.error(`[codeoid/session ${this.id}] could not snapshot the ${backend} backend's processes: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    await this.#teardownProvider();
+    try {
+      const killed = await killSurvivors(tree);
+      if (killed.length > 0) {
+        this.#store.audit(who, "session.release_backend.reaped", this.id, `pids=${killed.join(",")}`);
+        console.warn(`[codeoid/session ${this.id}] killed ${killed.length} process(es) the released ${backend} backend left running: ${killed.join(", ")}`);
+      }
+    } catch (e) {
+      console.error(`[codeoid/session ${this.id}] killing the released backend's leftover processes failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    // A backend that can't resume its own conversation (the Gemini CLI
+    // starts a new ACP session) is handed the history, as after an MCP
+    // rebuild — an account switch must never start the conversation over.
+    if (RESEED_AFTER_TEARDOWN.has(this.#provider.id) && this.#accumulator.history.length > 0) {
+      await this.#seedProviderFromHistory();
+    }
   }
 
   /**
@@ -2162,7 +2228,7 @@ export class Session {
   #heldWrite(toolName: string, input: unknown): { path: string; what: HeldPath["what"] | "unresolved" } | null {
     if (!this.#hostSideFileTools() || !input || typeof input !== "object") return null;
     try {
-      return heldWriteOf(toolName, input as Record<string, unknown>, this.workdir, protectedWriteTargets(this.workdir));
+      return heldWriteOf(toolName, input as Record<string, unknown>, this.workdir, protectedWriteTargets(this.workdir, undefined, this.#sandbox?.appliedAddedDirs() ?? []));
     } catch {
       return writeTargets(toolName, input as Record<string, unknown>) ? { path: "(couldn't be judged)", what: "unresolved" } : null;
     }
@@ -2197,6 +2263,7 @@ export class Session {
       if (!rt) throw new Error("no runtime");
       const own = this.#provider.hostFiles?.() ?? {};
       const bounds = hostToolBoundsFor(rt, this.#provider.id, this.#provider.hostReadable?.() ?? [], own, userHiddenPaths(this.#config));
+      // paths: judging a tool call's input against the sandbox's bounds: no use of the path
       return hostFileToolBreach(toolName, input, { bounds, workdir: this.workdir, ...(shellCwd !== undefined ? { cwd: shellCwd } : {}) });
     } catch {
       return { path: "(couldn't be judged)", access: "read", why: "unresolved" };
@@ -3110,11 +3177,82 @@ export class Session {
   async ensureSandbox(): Promise<SessionSandboxInfo | null> {
     const sbx = this.#sandbox;
     if (!sbx) return null;
-    if (sbx.resolvedFor(this.#provider.id) && sbx.info) return sbx.info;
+    // An agent's own grant another session works in now is let go first (applied as any change of directories).
+    await this.#dropSharedAgentDirs();
+    // Directories added or removed are applied only between turns, with no background work running: a
+    // Claude query rebuilt, or a process backend restarted, mid-work would end that work.
+    const applyDirs = sbx.dirsPending && this.#mayApplySandboxDirs();
+    if (sbx.resolvedFor(this.#provider.id) && sbx.info && !applyDirs) return sbx.info;
     const before = JSON.stringify(sbx.info);
     const info = await sbx.refresh(this.#provider.id);
-    if (JSON.stringify(info) !== before) this.#broadcastInfoUpdate();
+    // Pins taken by this resolution (the workspace, a root seen first: #448 round 13) are kept with the setting.
+    if (sbx.takePinsChanged()) this.#saveMetaNow();
+    this.#sayDroppedDirs();
+    if (applyDirs) {
+      // A backend running now runs in the old sandbox: restarted before its next turn (#restartForSandboxDirs).
+      if (PROCESS_BACKENDS.has(this.#provider.id) && this.#provider.hasQueried) this.#sandboxDirsRestart = true;
+      const note = this.#makeMessage("info", `🛡 Sandbox directories applied: ${sandboxDirsLine(info)}`, SYSTEM_IDENTITY, undefined, undefined, { event: "sandbox.dirs_applied" });
+      this.#persistAndBuffer(note);
+      this.#broadcastRaw(note);
+    }
+    if (JSON.stringify(info) !== before || applyDirs) this.#broadcastInfoUpdate();
     return info;
+  }
+
+  /**
+   * Why no tool call may run now because a directory the sandbox binds by
+   * name isn't what was pinned (SessionSandbox.pinProblem, #448 round 13),
+   * or null. Said on the session once per change (event
+   * `sandbox.pin_changed`, audit `session.sandbox_pin_changed`).
+   */
+  #sandboxPinRefusal(): string | null {
+    const sbx = this.#sandbox;
+    if (!sbx || sbx.info?.state !== "on") return null;
+    const problem = sbx.pinProblem();
+    if (!problem) {
+      this.#pinSaid = null;
+      return null;
+    }
+    if (this.#pinSaid !== problem) {
+      this.#pinSaid = problem;
+      this.#store.audit(SYSTEM_IDENTITY.sub, "session.sandbox_pin_changed", this.id, problem.slice(0, 2000));
+      const note = this.#makeMessage("info", `🛡 Sandbox: ${problem}.`, SYSTEM_IDENTITY, undefined, undefined, { event: "sandbox.pin_changed" });
+      this.#persistAndBuffer(note);
+      this.#broadcastRaw(note);
+    }
+    return problem;
+  }
+
+  /** Whether a change of the sandbox's directories may be applied now: no turn, approval or background work. */
+  #mayApplySandboxDirs(): boolean {
+    return !this.#turnActive() && !this.#hasAgentBackgroundWork() && this.#pendingApprovals.size === 0 && this.#pendingUiRequests.size === 0;
+  }
+
+  /**
+   * A directory change applied while the backend's process runs in the old
+   * sandbox: restarted (idle, in the send chain) before the turn that
+   * follows, which resumes its conversation.
+   */
+  async #restartForSandboxDirs(): Promise<void> {
+    if (!this.#sandboxDirsRestart) return;
+    this.#sandboxDirsRestart = false;
+    if (!PROCESS_BACKENDS.has(this.#provider.id) || !this.#provider.hasQueried) return;
+    await this.#releaseBackendNow("system:sandbox-dirs");
+  }
+
+  /** The sandbox's workspace (a monorepo's repository top, as pinned), or the workdir without a sandbox. */
+  get sandboxWorkspace(): string {
+    return this.#sandbox?.workspace ?? this.workdir;
+  }
+
+  /** The session's own worktree folders (its commands write them): none without a sandbox. */
+  sandboxWorktreeFolders(): string[] {
+    return this.#sandbox?.worktreeFolders() ?? [];
+  }
+
+  /** The directories the session's commands write besides its workspace, as set. */
+  sandboxAddedDirs(): string[] {
+    return this.#sandbox?.effective().addedDirs ?? [];
   }
 
   /** The session's own sandbox setting (persisted; a fork and a collaboration's children inherit it). */
@@ -3124,7 +3262,19 @@ export class Session {
 
   /** The resolved sandbox, if any (SessionInfo.sandbox). */
   get sandboxInfo(): SessionSandboxInfo | null {
-    return this.#sandbox?.info ?? null;
+    const info = this.#sandbox?.info;
+    return info ? this.#sandboxInfoWire(info) : null;
+  }
+
+  /** The resolution with the directories set but not applied yet (they take effect between turns). */
+  #sandboxInfoWire(info: SessionSandboxInfo): SessionSandboxInfo {
+    const sbx = this.#sandbox;
+    if (!sbx?.dirsPending) return info;
+    const applied = sbx.appliedAddedDirs();
+    const wanted = sbx.effective().addedDirs;
+    const add = wanted.filter((d) => !applied.includes(d));
+    const remove = applied.filter((d) => !wanted.includes(d));
+    return add.length > 0 || remove.length > 0 ? { ...info, pendingDirs: { add, remove } } : info;
   }
 
   /** Whether the session was started for unattended work (SessionCreateOptions.requireSandbox). */
@@ -3193,7 +3343,8 @@ export class Session {
         this.#broadcastRaw(note);
         return false;
       }
-      await sbx.set(next);
+      // Project roots set again: each pinned anew, as it is now (#448 round 13).
+      await sbx.set(next, { repinRoots: setting.projectRoots !== undefined });
       this.#store.audit(sender.sub, "session.set_sandbox", this.id, answeredBy && answeredBy !== sender.sub ? `${change} (confirmed by ${answeredBy})` : change);
       this.#saveMetaNow();
       // A backend running now runs in the old sandbox: restarted before its next turn.
@@ -3245,6 +3396,337 @@ export class Session {
   }
 
   /**
+   * Why `raw` can't be added to what the session's commands write, or the
+   * directory it names: where it really is now (what is kept and bound:
+   * project-roots.ts `addedDirReal`), with `written` (absolute; a relative
+   * one is the workdir's) and `already` when it is writable now (the
+   * workspace, the session's worktree folders or temp dir, an added dir).
+   */
+  #sandboxDirCheck(raw: string): { dir: string; written: string; already?: string; agentHeld?: true } | { error: string } {
+    const sbx = this.#sandbox;
+    if (!sbx) return { error: "this daemon has no OS sandbox" };
+    const home = process.env.HOME ?? homedir();
+    const written = normalizeSandboxDir(raw, home) ?? resolvePath(this.workdir, raw.trim());
+    const dir = addedDirReal(written, home) ?? written;
+    const workspace = sbx.workspace;
+    if (inAnyDir(dir, [workspace])) return { dir, written, already: `${dir} is in the session's workspace (${workspace}), which its commands write already` };
+    const folder = sbx.worktreeFolders().find((f) => inAnyDir(dir, [f]));
+    if (folder) return { dir, written, already: `${dir} is in the session's own worktree folder (${folder}), which its commands write already` };
+    const temp = sbx.tempDirPath;
+    if (temp && inAnyDir(dir, [temp])) return { dir, written, already: `${dir} is in the session's temp dir, which its commands write already` };
+    const { addedDirs: added, agentDirs } = sbx.effective();
+    const holder = added.find((d) => inAnyDir(dir, [d]));
+    // The agent's own: added already, but its credentials stay hidden there — the owner may add it as theirs.
+    const agentHeld = holder !== undefined && agentDirs.includes(holder) ? ({ agentHeld: true } as const) : {};
+    if (holder) return { dir, written, already: holder === dir ? `${dir} is added already` : `${dir} is in ${holder}, which is added already`, ...agentHeld };
+    const root = sandboxRootIfMade();
+    const hidden = [...hiddenPathsFor(this.#config), ...(root ? [root] : [])];
+    const problem = addedDirProblem(written, { home, configDir: getConfigDir(), hidden });
+    return problem ? { error: problem } : { dir, written };
+  }
+
+  /**
+   * What stays read-only in `dir` once the owner adds it, in words, for the
+   * owner's confirm: true for what is there. Its credential files become
+   * readable to the session's commands, as the workspace's are (only a
+   * directory the agent added itself keeps a project root's hiding); and a
+   * checkout another session works in is said (#448 round 13).
+   */
+  #addedDirProtection(dir: string): string {
+    const nested = nestedControl(dir);
+    const repos = nested.repos.filter((r) => r !== dir).length;
+    const overlap = this.#checkoutOverlapOf(dir);
+    const held = `its git structure and project settings stay read-only, as in the workspace${repos > 0 ? `, and so do those of the ${repos} ${repos === 1 ? "repository" : "repositories"} inside it` : ""}`;
+    const warning = overlap ? `. Warning: ${overlap} — a change either session makes there (a directory swapped for a link included) the other one runs against` : "";
+    return `${held}; its credential files (.env files, keys, a token in a git config) become readable to its commands, as the workspace's are${warning}`;
+  }
+
+  /**
+   * The directories the agent added itself (an autonomous
+   * `request_directory`) that another session's checkout, or one of
+   * codeoid's, touches now (a session made there since, a directory
+   * another session added): taken out of the setting, said and audited
+   * (#448 round 14), so an agent's own grant never shares a directory with
+   * another writer, as at the grant (`checkoutOverlap`). Looked at every
+   * resolution; applied as any change of directories, between turns.
+   */
+  async #dropSharedAgentDirs(): Promise<void> {
+    const sbx = this.#sandbox;
+    const setting = sbx?.setting;
+    if (!sbx || !setting?.agentDirs || setting.agentDirs.length === 0) return;
+    const shared = setting.agentDirs.map((dir) => ({ dir, why: this.#checkoutOverlapOf(dir) })).filter((d): d is { dir: string; why: string } => d.why !== null);
+    if (shared.length === 0) return;
+    const gone = new Set(shared.map((d) => d.dir));
+    const addedDirs = (setting.addedDirs ?? []).filter((d) => !gone.has(d) && !gone.has(normalizeSandboxDir(d) ?? d));
+    const agentDirs = setting.agentDirs.filter((d) => !gone.has(d));
+    const { addedDirs: _a, agentDirs: _g, ...rest } = setting;
+    await sbx.set({ ...rest, ...(addedDirs.length > 0 ? { addedDirs } : {}), ...(agentDirs.length > 0 ? { agentDirs } : {}) });
+    for (const d of shared) {
+      this.#store.audit(SYSTEM_IDENTITY.sub, "session.sandbox_dir_dropped", this.id, `${d.dir}: ${d.why}`.slice(0, 2000));
+      const note = this.#makeMessage("info", `🛡 Sandbox: ${d.dir}, which the agent added, is no longer writable: ${d.why}. The owner can add it (\`/sandbox add\`) if both should write it.`, SYSTEM_IDENTITY, undefined, undefined, {
+        event: "sandbox.dir_dropped",
+        path: d.dir,
+      });
+      this.#persistAndBuffer(note);
+      this.#broadcastRaw(note);
+    }
+    this.#saveMetaNow();
+  }
+
+  /** Why `dir` touches another session's or codeoid's checkout (project-roots.ts `checkoutOverlap`), or null. */
+  #checkoutOverlapOf(dir: string): string | null {
+    const sbx = this.#sandbox;
+    if (!sbx) return null;
+    try {
+      return checkoutOverlap(dir, this.#sandboxCheckouts?.(this.id) ?? [], {
+        workspace: sbx.workspace,
+        ownFolders: sbx.worktreeFolders(),
+        worktreeRoots: sbx.config.worktreeRoots,
+        configDir: getConfigDir(),
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  /** The added dirs once `dir` is added: any of them inside it go (it holds them now). */
+  #withAddedDir(dir: string): string[] {
+    return [...this.#sandbox!.effective().addedDirs.filter((d) => !inAnyDir(d, [dir])), dir];
+  }
+
+  /**
+   * Say on the session (and audit) each added directory the last resolution
+   * left out because it no longer is what was granted, or can't be one now
+   * (SessionSandbox.droppedDirs), and take it out of the setting: never
+   * followed to where a link put there leads, never added back unasked.
+   */
+  #sayDroppedDirs(): void {
+    const sbx = this.#sandbox;
+    const dropped = sbx?.droppedDirs() ?? [];
+    if (!sbx || dropped.length === 0) return;
+    sbx.forget(dropped.map((d) => d.dir));
+    for (const d of dropped) {
+      this.#store.audit(SYSTEM_IDENTITY.sub, "session.sandbox_dir_dropped", this.id, `${d.dir}: ${d.why}`.slice(0, 2000));
+      const note = this.#makeMessage("info", `🛡 Sandbox: ${d.dir} is no longer writable: ${d.why}. Add it again (\`/sandbox add\`) if it should be.`, SYSTEM_IDENTITY, undefined, undefined, {
+        event: "sandbox.dir_dropped",
+        path: d.dir,
+      });
+      this.#persistAndBuffer(note);
+      this.#broadcastRaw(note);
+    }
+    this.#saveMetaNow();
+  }
+
+  /** When an added or removed directory takes effect, in words. */
+  #dirsWhen(): string {
+    if (this.#mayApplySandboxDirs()) return "from the session's next turn";
+    if (this.#hasAgentBackgroundWork()) return "from the session's next turn after the background work running now has ended";
+    return "from the session's next turn";
+  }
+
+  /**
+   * Record a change of the session's added directories (persisted, audited,
+   * said on the session) and apply it now when nothing runs, else at the next
+   * turn that starts with nothing running (#ensureSandbox). Never restarts
+   * work: the backend picks it up between turns.
+   */
+  async #changeSandboxDirs(next: readonly string[], audit: { who: string; action: string; detail: string }, line: string, grant?: { dir: string; by: "owner" | "agent" }): Promise<void> {
+    const sbx = this.#sandbox;
+    if (!sbx) return;
+    // Who added each: the agent's own keep a project root's credential hiding (#448 round 13).
+    const agent = new Set(sbx.effective().agentDirs.filter((d) => next.includes(d)));
+    if (grant?.by === "agent") agent.add(grant.dir);
+    else if (grant) agent.delete(grant.dir);
+    const { agentDirs: _old, ...rest } = sbx.setting ?? {};
+    await sbx.set({ ...rest, addedDirs: [...next], ...(agent.size > 0 ? { agentDirs: [...agent] } : {}) });
+    this.#store.audit(audit.who, audit.action, this.id, audit.detail.slice(0, 2000));
+    this.#saveMetaNow();
+    const note = this.#makeMessage("info", `🛡 ${line}`, SYSTEM_IDENTITY, undefined, undefined, { event: "sandbox.dirs_changed", addedDirs: [...next] });
+    this.#persistAndBuffer(note);
+    this.#broadcastRaw(note);
+    if (this.#mayApplySandboxDirs() && sbx.resolvedFor(this.#provider.id)) {
+      await this.ensureSandbox();
+      // A process backend picks it up when it next starts: stopped now (idle), as a sandbox change is.
+      if (this.#sandboxDirsRestart) {
+        this.#sandboxDirsRestart = false;
+        this.#sandboxRestartPending = true;
+        this.releaseIdleProvider({ idle: true });
+      }
+    }
+    this.#broadcastInfoUpdate();
+  }
+
+  /**
+   * Add a directory to what the session's commands write, or remove one
+   * (`session.sandbox_dir`; owner only, undelegated: SessionManager checks).
+   * Removing applies (between turns); adding is a widening, asked of the
+   * owner on the session with an owner-only confirm, as `setSandbox`'s
+   * widening is, and lands on a yes. `confirmed`: the owner's own request
+   * where nothing else could have sent it (none today).
+   */
+  async changeSandboxDir(
+    action: "add" | "remove",
+    raw: string,
+    sender: AuthContext,
+    opts: { onDecided?: (applied: boolean, reason?: string) => void } = {},
+  ): Promise<{ ok: true; pending?: true; message: string } | { ok: false; error: string }> {
+    const sbx = this.#sandbox;
+    if (!sbx) return { ok: false, error: "this daemon has no OS sandbox" };
+    const current = sbx.effective().addedDirs;
+    if (action === "remove") {
+      const written = normalizeSandboxDir(raw) ?? resolvePath(this.workdir, raw.trim());
+      // Kept by where it really was when added: named either way.
+      const dir = current.includes(written) ? written : (addedDirReal(written) ?? written);
+      if (!current.includes(dir)) return { ok: false, error: `${dir} isn't one of the session's added directories${current.length > 0 ? ` (${current.join(", ")})` : ""}` };
+      const when = this.#dirsWhen();
+      await this.#changeSandboxDirs(current.filter((d) => d !== dir), { who: sender.sub, action: "session.sandbox_dir_removed", detail: dir }, `Sandbox: ${dir} is no longer writable (${when})`);
+      return { ok: true, message: `${dir} removed: not writable ${when}` };
+    }
+    const check = this.#sandboxDirCheck(raw);
+    if ("error" in check) return { ok: false, error: check.error };
+    // One the agent added itself is the owner's to add as theirs (its credentials readable then); anything else
+    // writable already has nothing to add.
+    const upgrade = check.already !== undefined && check.agentHeld === true && current.includes(check.dir);
+    if (check.already && !upgrade) return { ok: true, message: check.already };
+    const dir = check.dir;
+    const via = check.written !== dir ? ` (${check.written} leads there)` : "";
+    this.#store.audit(sender.sub, "session.sandbox_dir_ask", this.id, `${dir}${via}`);
+    let answeredBy: string | undefined;
+    void this.requestUserInput(
+      {
+        method: "confirm",
+        title: `Let "${this.name}" write ${dir}?`,
+        message: `Its sandboxed commands could change and commit files in ${dir}${via} (${this.#addedDirProtection(dir)}). It takes effect ${this.#dirsWhen()}.`,
+      },
+      { ownerOnly: true, onAnswer: (sub) => {
+          answeredBy = sub;
+        },
+      },
+    ).then(
+      async (answer) => {
+        if (answer.cancelled || answer.confirmed !== true) {
+          this.#store.audit(answeredBy ?? sender.sub, "session.sandbox_dir_denied", this.id, `${dir} ${answer.reason ?? "declined"}`);
+          opts.onDecided?.(false, answer.reason ?? "declined");
+          return;
+        }
+        const again = this.#sandboxDirCheck(dir);
+        const stillUpgrade = upgrade && !("error" in again) && again.agentHeld === true && again.dir === dir;
+        if ("error" in again || (again.already && !stillUpgrade) || again.dir !== dir) {
+          opts.onDecided?.(false, "error" in again ? again.error : (again.already ?? `${dir} isn't the directory it was when asked (it leads to ${again.dir} now)`));
+          return;
+        }
+        const when = this.#dirsWhen();
+        await this.#changeSandboxDirs(
+          this.#withAddedDir(dir),
+          { who: answeredBy ?? sender.sub, action: "session.sandbox_dir_added", detail: `${dir} by=owner` },
+          `Sandbox: ${dir} is writable (${when})`,
+          { dir, by: "owner" },
+        );
+        opts.onDecided?.(true);
+      },
+      () => opts.onDecided?.(false, "failed"),
+    );
+    return { ok: true, pending: true, message: `asked on the session: let it write ${dir}?` };
+  }
+
+  /**
+   * The agent's `request_directory` (sandbox/request-directory.ts): the text
+   * it reads. Interactive and guarded: its owner answers a confirm card
+   * naming the directory and the reason (owner-only; an unattended run
+   * isn't asked, so never parks). Autonomous: a directory under the
+   * session's project roots is added unasked, anything else refused at once.
+   * Audited either way; what is added is writable from the next turn.
+   */
+  async requestDirectory(input: RequestDirectoryInput): Promise<string> {
+    const sbx = this.#sandbox;
+    const info = sbx?.info;
+    if (!sbx || !info || info.state !== "on") {
+      return `Nothing to add: this session's commands aren't sandboxed (${info?.reason ?? info?.state ?? "no sandbox"}), so they write wherever you can.`;
+    }
+    const check = this.#sandboxDirCheck(input.path);
+    const asked = "dir" in check ? check.dir : input.path;
+    this.#store.audit(SYSTEM_IDENTITY.sub, "session.sandbox_dir_request", this.id, `${asked} reason=${input.reason}`.slice(0, 2000));
+    const refuse = (why: string): string => {
+      this.#store.audit(SYSTEM_IDENTITY.sub, "session.sandbox_dir_refused", this.id, `${asked}: ${why}`.slice(0, 2000));
+      const note = this.#makeMessage("info", `🛡 The agent asked to write ${asked}: refused (${why})`, SYSTEM_IDENTITY, undefined, undefined, { event: "sandbox.dir_refused", path: asked });
+      this.#persistAndBuffer(note);
+      this.#broadcastRaw(note);
+      return `Refused: ${why}.`;
+    };
+    if ("error" in check) return refuse(check.error);
+    if (check.already) return `Nothing to add: ${check.already}.`;
+    const dir = check.dir;
+    const via = check.written !== dir ? ` (${check.written} leads there)` : "";
+    const grant = async (by: string, how: string, granted: "owner" | "agent"): Promise<string> => {
+      const when = this.#dirsWhen();
+      await this.#changeSandboxDirs(
+        this.#withAddedDir(dir),
+        { who: by, action: "session.sandbox_dir_added", detail: `${dir} by=agent ${how} reason=${input.reason}` },
+        `Sandbox: ${dir} is writable, as the agent asked (${how}; ${when})`,
+        { dir, by: granted },
+      );
+      const hidden = granted === "agent" ? " Its credential files (.env files, keys, a token in a git config) stay hidden to you, as in a project root." : "";
+      return `Added: ${dir} is writable to your commands ${when.replace("the session's", "your")}.${hidden} Finish this turn; it isn't writable yet in this one.`;
+    };
+    // Autonomous (an unattended run's too: a routine's, a loop worker's, a dispatched worker's): only a repository
+    // (or a dir in one) strictly under a project root, named by its real path, never another session's or codeoid's
+    // checkout; its credential files stay hidden. Anything else is the owner's to add.
+    if (this.#mode === "autonomous") {
+      const why = autonomousGrantProblem(check.written, dir, sbx.appliedProjectRoots()) ?? this.#checkoutOverlapOf(dir);
+      if (!why) return grant(SYSTEM_IDENTITY.sub, "a repository under a project root, autonomous", "agent");
+      return refuse(`${why}. The owner can add it (\`/sandbox add ${dir}\`)`);
+    }
+    // One card per directory: a repeat request while it is open waits on the same answer.
+    let pending = this.#dirRequests.get(dir);
+    if (!pending) {
+      let answeredBy: string | undefined;
+      const asked = this.requestUserInput(
+        {
+          method: "confirm",
+          title: `The agent asks to write ${dir}`,
+          message: `"${this.name}" asks for its sandboxed commands to write ${dir}${via} (${this.#addedDirProtection(dir)}).\n\nIts reason: ${input.reason}`,
+        },
+        {
+          ownerOnly: true,
+          onAnswer: (sub) => {
+            answeredBy = sub;
+          },
+        },
+      );
+      pending = asked.then(async (answer): Promise<string> => {
+        this.#dirRequests.delete(dir);
+        if (answer.cancelled || answer.confirmed !== true) {
+          const why =
+            answer.reason === "unattended"
+              ? "nobody is there to approve it in this unattended run; the owner can add it (`/sandbox add`)"
+              : answer.cancelled
+                ? `the question was withdrawn (${answer.reason ?? "cancelled"})`
+                : "the owner declined";
+          this.#store.audit(answeredBy ?? SYSTEM_IDENTITY.sub, "session.sandbox_dir_denied", this.id, `${dir} ${answer.reason ?? "declined"}`);
+          return refuse(why);
+        }
+        const again = this.#sandboxDirCheck(dir);
+        if ("error" in again) return refuse(again.error);
+        if (again.already) return `Nothing to add: ${again.already}.`;
+        if (again.dir !== dir) return refuse(`${dir} isn't the directory it was when asked (it leads to ${again.dir} now)`);
+        return grant(answeredBy ?? this.createdBy, "the owner approved", "owner");
+      });
+      this.#dirRequests.set(dir, pending);
+    }
+    // The call returns before its backend's MCP client gives up on it (opencode's: about a minute); the card stays
+    // open, and a later yes still adds the directory.
+    const waitMs = this.#requestDirectoryWaitMs ?? (this.#provider.id === "opencode" ? REQUEST_DIRECTORY_SHORT_WAIT_MS : REQUEST_DIRECTORY_WAIT_MS);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), waitMs);
+    });
+    const first = await Promise.race([pending, late]);
+    clearTimeout(timer);
+    if (first !== null) return first;
+    return `No answer yet: the owner has been asked to let you write ${dir}, and the question stays open. If they say yes, it is writable from a later turn (call request_directory again to see). Carry on without it, or end this turn.`;
+  }
+
+  /**
    * A call that asks to run outside the backend's own sandbox or widen it
    * (asksOutsideSandbox), on a session whose sandbox is the backend's own
    * (native). Where codeoid's sandbox is around the whole process (Docker,
@@ -3272,12 +3754,16 @@ export class Session {
    */
   #checkGitControl(sub: string): Promise<void> {
     const commits = this.#checkSettingsCommits(sub);
+    const added = this.#checkAddedGitControl(sub);
     // The repository's worktree entries first (#448 round 11): what is restored there isn't news below.
     this.#sandbox?.checkWorktreeEntries();
     const before = this.#gitBaseline;
-    if (!before) return commits;
+    if (!before) return Promise.all([commits, added]).then(() => {});
+    // In the working directory as pinned (#448 round 14): one swapped for a link is said, never looked into.
+    const workdir = this.#pinnedWorkdirOrSay("the look at the repository's git settings");
+    if (!workdir) return Promise.all([commits, added]).then(() => {});
     try {
-      const now = gitControlSnapshot(this.workdir, undefined, { ownFolders: this.#sandbox?.worktreeFolders() ?? [] });
+      const now = gitControlSnapshot(workdir.path, undefined, { ownFolders: this.#sandbox?.worktreeFolders() ?? [] });
       const changed = gitControlChanges(before, now);
       this.#gitBaseline = now;
       if (changed.length > 0) {
@@ -3287,7 +3773,46 @@ export class Session {
     } catch (err) {
       console.error(`[codeoid/session ${this.id}] checking the repository's git settings failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-    return commits;
+    return Promise.all([commits, added]).then(() => {});
+  }
+
+  /**
+   * The end-of-turn look ({@link #checkGitControl}) in each added
+   * directory's repository: what of its git settings changed, and the
+   * commits that changed its project settings, each said naming the
+   * directory. Serialized with the workspace's; best effort.
+   */
+  #checkAddedGitControl(sub: string): Promise<void> {
+    const dirs = [...this.#addedGitBaselines.keys()];
+    if (dirs.length === 0) return Promise.resolve();
+    const look = async (): Promise<void> => {
+      for (const dir of dirs) {
+        const base = this.#addedGitBaselines.get(dir);
+        if (!base) continue;
+        try {
+          const now = gitControlSnapshot(dir, undefined, { ownFolders: this.#sandbox?.worktreeFolders() ?? [] });
+          const changed = gitControlChanges(base.git, now);
+          base.git = now;
+          if (changed.length > 0) {
+            this.#store.audit(sub, "session.git_control_changed", this.id, `${dir}: ${changed.slice(0, 20).join(",")}`);
+            this.#sandboxWarning(`In ${dir} (added to this session's sandbox): ${gitControlWarning(changed)}`, "sandbox.git_changed");
+          }
+          const before = await base.refs;
+          const tips = await refTips(dir);
+          if (tips === null) continue;
+          const found = before === null ? { commits: [], more: false } : await settingsCommits(dir, before, tips);
+          if (found === null) continue;
+          base.refs = Promise.resolve(tips);
+          if (found.commits.length === 0) continue;
+          this.#store.audit(sub, "session.settings_committed", this.id, `${dir}: ${found.commits.slice(0, 20).map((c) => `${c.commit.slice(0, 12)}:${c.files.slice(0, 5).join("|")}`).join(",")}`.slice(0, 2000));
+          this.#sandboxWarning(`In ${dir} (added to this session's sandbox): ${settingsCommitWarning(found.commits, found.more)}`, "sandbox.settings_committed");
+        } catch (err) {
+          console.error(`[codeoid/session ${this.id}] checking ${dir}'s git settings failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    };
+    this.#settingsCheck = this.#settingsCheck.then(look).catch(() => {});
+    return this.#settingsCheck;
   }
 
   /**
@@ -3305,9 +3830,12 @@ export class Session {
       const baseline = this.#refBaseline;
       if (!baseline) return;
       const before = await baseline;
-      const now = await refTips(this.workdir);
+      // In the working directory as pinned (#448 round 14): git never runs where a link put in its place leads.
+      const workdir = this.#pinnedWorkdirOrSay("the look at the session's commits");
+      if (!workdir) return;
+      const now = await refTips(workdir.path);
       if (now === null) return;
-      const found = before === null ? { commits: [], more: false } : await settingsCommits(this.workdir, before, now);
+      const found = before === null ? { commits: [], more: false } : await settingsCommits(workdir.path, before, now);
       if (found === null) return;
       this.#refBaseline = Promise.resolve(now);
       if (found.commits.length === 0) return;
@@ -3366,7 +3894,7 @@ export class Session {
         const inside = shell || runner?.fileTools === true;
         // Commands can reach the container runtime (the owner's opt-in): every card says so, as a warning.
         const docker = info.dockerSocket === true ? { sandboxDocker: true } : {};
-        if (inside) return { sandboxed: true, sandboxNote: `sandboxed${info.dockerSocket ? ", Docker access" : ""}: ${info.providerName ?? info.provider}, network ${info.network}`, ...docker };
+        if (inside) return { sandboxed: true, sandboxNote: `sandboxed${info.dockerSocket ? ", Docker access" : ""}: ${info.providerName ?? info.provider}, network ${info.network}${cardDirsNote(info)}`, ...docker };
         // Beyond what the sandbox lets its commands do: the owner decides, told so (#448 round 9).
         const beyond = this.#hostBoundsNote(toolName, input, shellCwd);
         return { sandboxed: false, sandboxNote: beyond ?? "runs in the backend's own process, outside the sandbox", ...docker };
@@ -4060,9 +4588,17 @@ export class Session {
     // The OS sandbox (#448), resolved for this backend before it starts. An
     // autonomous or unattended turn doesn't start without one that holds.
     await this.ensureSandbox();
-    // Its worktree folders, removed while empty at the last turn's end, are there again for this one's commands.
-    this.#sandbox?.prepareFolders();
+    // Directories added or removed since the backend started: it starts again in the sandbox that has them.
+    await this.#restartForSandboxDirs();
+    // A pinned directory changed since the last resolution (#448 round 13): looked at again now, so an added dir or a
+    // root that changed is left out (said) before the turn; one that still is (the workspace) refuses it below.
+    if (this.#sandbox?.info?.state === "on" && this.#sandbox.pinProblem() && this.#mayApplySandboxDirs()) {
+      await this.ensureSandbox();
+      await this.#restartForSandboxDirs();
+    }
     const sandboxRefused =
+      // A directory the sandbox binds by name isn't what was pinned: no command of this turn could run (#sandboxPinRefusal).
+      this.#sandboxPinRefusal() ??
       this.sandboxRefusal() ??
       // Its backend still runs in the sandbox it had before a change: not what the session reports.
       (this.#sandboxRestartPending && this.#sandboxRequired() ? "its backend still runs in its previous sandbox (it restarts once the session is idle)" : null);
@@ -4071,11 +4607,24 @@ export class Session {
       throw new SandboxRequiredError(`Not started: ${sandboxRefused}`);
     }
     this.#store.audit(sender.sub, "session.send", this.id);
-    // What of the repository git runs at the user's next command, as it is before the agent works (#448).
-    if (this.#sandbox && !this.#gitBaseline) this.#gitBaseline = gitControlSnapshot(this.workdir, undefined, { ownFolders: this.#sandbox.worktreeFolders() });
+    // Its worktree folders, removed while empty at the last turn's end, are there again for this one's commands: only
+    // once its directories are what was pinned (#448 round 14), and never made through a link (worktrees.ts).
+    this.#sandbox?.prepareFolders();
+    // What of the repository git runs at the user's next command, as it is before the agent works (#448), in the
+    // working directory as pinned (checked just above with the sandbox's pins).
+    const baselineDir = this.#sandbox && (!this.#gitBaseline || !this.#refBaseline) ? this.#pinnedWorkdirOrSay("the look at the repository's git settings") : null;
+    if (baselineDir && !this.#gitBaseline) this.#gitBaseline = gitControlSnapshot(baselineDir.path, undefined, { ownFolders: this.#sandbox?.worktreeFolders() ?? [] });
     // And the commits its refs name, so a commit made from here on can be told (#448 round 6).
-    if (this.#sandbox && !this.#refBaseline) this.#refBaseline = refTips(this.workdir);
+    if (baselineDir && !this.#refBaseline) this.#refBaseline = refTips(baselineDir.path);
     await this.#refBaseline;
+    // The same for each added directory's repository, from the first turn it is writable in.
+    // Every repository inside one too (a folder of them).
+    for (const dir of this.#sandbox?.appliedRepositories() ?? []) {
+      if (this.#addedGitBaselines.has(dir)) continue;
+      const base = { git: gitControlSnapshot(dir, undefined, { ownFolders: this.#sandbox?.worktreeFolders() ?? [] }), refs: refTips(dir) };
+      this.#addedGitBaselines.set(dir, base);
+      await base.refs;
+    }
     // A new turn is starting — clear any interrupt from the previous one.
     this.#turnInterrupted = false;
     this.#lastTurnError = null;
@@ -6006,7 +6555,9 @@ export class Session {
       const t0 = Date.now();
       try {
         await execFileP("sh", ["-c", command], {
-          cwd: this.workdir,
+          // In the fork's working directory as pinned (#448 round 14): changed meanwhile, the setup is refused (said).
+          // paths: the pinned workdir, checked here
+          cwd: this.pinnedWorkdir("running the fork's setup command").path,
           timeout: FORK_SETUP_TIMEOUT_MS,
           maxBuffer: 8 * 1024 * 1024,
         });
@@ -6583,7 +7134,7 @@ export class Session {
       providerId: this.#provider.id,
       ...this.#accountInfo(),
       mode: this.#mode,
-      ...(this.#sandbox?.info ? { sandbox: this.#sandbox.info } : {}),
+      ...(this.#sandbox?.info ? { sandbox: this.#sandboxInfoWire(this.#sandbox.info) } : {}),
       turnsRemaining: this.#turnsRemaining,
       ...(this.#budgetExhausted ? { budgetExhausted: true as const } : {}),
       ...(this.#autonomousBudgetSpent ? { autonomousBudgetSpent: true as const } : {}),
@@ -7656,7 +8207,41 @@ export class Session {
     if (this.#memory) parts.push(this.#buildMemoryPromptAppend());
     const worktrees = this.#worktreePromptAppend();
     if (worktrees) parts.push(worktrees);
+    const dirs = this.#sandboxDirsPromptAppend();
+    if (dirs) parts.push(dirs);
     return parts.length > 0 ? parts.join("\n\n") : undefined;
+  }
+
+  /**
+   * What the session's sandboxed commands read and write besides the
+   * workspace (docs/sandbox.md, "Working across repositories"), as the
+   * running sandbox has it, and how to ask for more: a write outside fails
+   * with the OS's bare "Read-only file system". Changes only when a change
+   * of directories is applied (between turns), so the prefix stays stable.
+   */
+  #sandboxDirsPromptAppend(): string | null {
+    const sbx = this.#sandbox;
+    if (!sbx?.runtime || sbx.info?.state !== "on") return null;
+    const roots = sbx.appliedProjectRoots();
+    const added = sbx.appliedAddedDirs();
+    const lines = ["# Other directories in this sandbox"];
+    lines.push(
+      roots.length > 0
+        ? `Your commands can read (read-only) everything under ${roots.map((r) => `${r}/`).join(", ")}: other repositories, and other sessions' checkouts there. Credentials and secret files stay hidden.`
+        : "Your commands can read only the workspace and the toolchains the sandbox shows.",
+    );
+    if (added.length > 0) lines.push(`Besides the workspace, they can write ${added.map((d) => `${d}/`).join(", ")} (git structure and project settings there read-only, as in the workspace).`);
+    if (this.#requestDirectoryMounted()) lines.push("To write in another directory, call the `request_directory` tool (path, reason). What it grants is writable from your next turn.");
+    else lines.push("To write in another directory, ask the owner to add it (`/sandbox add <dir>`).");
+    return lines.join("\n");
+  }
+
+  /** Whether this session's backend has the sandbox's `request_directory` (sandbox/request-directory.ts). */
+  #requestDirectoryMounted(): boolean {
+    const id = this.#provider.id;
+    if (id === "claude" || id === "qwen" || id === "pi") return true;
+    if (id === "codex" || id === "gemini-cli" || id === "opencode") return this.#sandboxMcp?.(this.id) !== undefined;
+    return false;
   }
 
   /**
@@ -7770,6 +8355,9 @@ export class Session {
     // resolve for certain is never run unasked (tool-safety.ts).
     if (isUnresolvedPathTool(toolName)) return false;
 
+    // An ask itself (sandbox/request-directory.ts): the session decides it, so it never waits on a card first.
+    if (isRequestDirectoryTool(toolName)) return true;
+
     if (this.#mode === "interactive") return false;
 
     // Read-only / retrieval tools — safe in both guarded and autonomous.
@@ -7841,6 +8429,7 @@ export class Session {
     if (isFleetSendTool(toolName)) return false;
     if (isElicitationTool(toolName)) return false;
     if (isUnresolvedPathTool(toolName)) return false;
+    if (isRequestDirectoryTool(toolName)) return true;
     if (this.#mode === "interactive") return false;
     if (isSafeTool(toolName)) return true;
     if (this.#isReadonlyMcpTool(toolName)) return true;
@@ -8191,6 +8780,17 @@ export class Session {
       // runs — not even a read — until a new budget re-arms the session.
       if (this.#budgetExhausted) return this.#endAttemptOnBudget(approvalId, toolName, sender);
 
+      // A directory the sandbox binds by name isn't what was pinned (#448
+      // round 13: the workspace, an added dir, a root swapped for a link):
+      // no call runs against it, in any mode, approved or not.
+      const pinRefusal = this.#sandboxPinRefusal();
+      if (pinRefusal) {
+        this.#approvalPatchKeys.delete(approvalId);
+        this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: pinRefusal });
+        this.#store.audit(sender.sub, "session.sandbox_pin_refuse", this.id, `tool=${toolName}`);
+        return { behavior: "deny" as const, message: pinRefusal };
+      }
+
       // Hook gate — the policy layer, run BEFORE the approval gate. A hook
       // block is a policy deny that never prompts the user (and never burns
       // the autonomous budget — #shouldAutoApprove runs after this); an
@@ -8334,6 +8934,7 @@ export class Session {
       // daemon's credential files or a process environment is refused; one
       // searching a directory that holds them is asked about (refused in
       // autonomous mode), never auto-run.
+      // paths: judging a tool call's input (secretPathVerdict): no use of the path
       const secret = secretPathVerdict(toolName, effectiveInput, { workdir: this.workdir, configDir: getConfigDir(), cwd: shellCwd });
       // A shell command is judged by what it runs (#431): one naming a
       // credential file is refused like the file tools; a risky one asks.
@@ -9038,6 +9639,7 @@ export class Session {
         // as canUseTool's synchronous section, always after it).
         const risk = this.#shellRisk(event.name, event.input, event.shellCwd);
         const held = this.#heldWrite(event.name, event.input);
+        // paths: judging a tool call's input (secretPathVerdict): no use of the path
         const secret = secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir(), cwd: event.shellCwd });
         // Claude's sandbox asking for a host: decided by the session's network alone (#448).
         const networkAsk = event.name === SANDBOX_NETWORK_TOOL && this.#sandbox?.info?.state === "on";
@@ -9054,9 +9656,11 @@ export class Session {
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
         // Autonomous mode refuses it outright (#autonomousRefusal): no approval card either.
         const deniedFirst = networkAsk || budgetDenied || secret?.action === "deny" || risk?.secret?.action === "deny";
+        // A pinned directory changed (#448 round 13): the gate refuses every call (#sandboxPinRefusal).
+        const pinned = budgetDenied ? null : this.#sandboxPinRefusal();
         // Beyond the sandbox, a host-side file tool is refused in autonomous mode (#outsideSandbox).
-        const outside = deniedFirst ? null : this.#outsideSandboxRefusal(event.name, event.input, event.shellCwd);
-        const refused = deniedFirst ? null : outside ? { reason: hostFileBreachReason(outside) } : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
+        const outside = deniedFirst || pinned ? null : this.#outsideSandboxRefusal(event.name, event.input, event.shellCwd);
+        const refused = pinned ? { reason: pinned } : deniedFirst ? null : outside ? { reason: hostFileBreachReason(outside) } : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
         const toolMsg = this.#makeMessage(
           "tool_call",
           `${event.name}(${Object.keys(event.input).join(", ")})`,
@@ -9783,6 +10387,68 @@ export class Session {
   }
 
   /**
+   * The working directory as the daemon uses it on the host (#448 round 14,
+   * sandbox/pinned.ts): its real path and identity, taken when the session
+   * first resolved its sandbox (kept with the setting) or, without one, at
+   * the first use. Checkpoints, going back a turn, a fork's files and the
+   * end-of-turn git looks take it from here, never by the path alone: one
+   * moved aside and replaced (by a link to the home, or another directory)
+   * is refused, said and audited ({@link #workdirChanged}), never followed.
+   */
+  #pinnedWorkdir(op: string): PinnedDir {
+    if (this.#sandbox) {
+      const pin = this.#sandbox.workdirPin(op);
+      if (this.#sandbox.takePinsChanged()) this.#saveMetaNow();
+      return pin;
+    }
+    this.#ownWorkdirRecord ??= pinRecord(this.workdir);
+    return pinDir(this.workdir, "the working directory", this.#ownWorkdirRecord, op);
+  }
+
+  /**
+   * The working directory as pinned, for a host-side use of it from outside
+   * the session (a client's file read, a fork's worktree and the files it
+   * carries, the project's MCP config): throws {@link PinnedPathError}, said
+   * on the session and audited, when it changed under the session.
+   */
+  pinnedWorkdir(op: string): PinnedDir {
+    try {
+      return this.#pinnedWorkdir(op);
+    } catch (err) {
+      if (err instanceof PinnedPathError) this.#workdirChanged(err);
+      throw err;
+    }
+  }
+
+  /**
+   * {@link #pinnedWorkdir}, or null when it changed: said on the session
+   * once per change (event `workdir.changed`) and audited
+   * (`session.workdir_changed`).
+   */
+  #pinnedWorkdirOrSay(op: string): PinnedDir | null {
+    try {
+      const pin = this.#pinnedWorkdir(op);
+      this.#workdirChangeSaid = null;
+      return pin;
+    } catch (err) {
+      if (!(err instanceof PinnedPathError)) throw err;
+      this.#workdirChanged(err);
+      return null;
+    }
+  }
+
+  /** A use of the working directory refused because it changed under the session: said once per change, audited every time. */
+  #workdirChanged(err: PinnedPathError): void {
+    this.#store.audit(SYSTEM_IDENTITY.sub, "session.workdir_changed", this.id, err.message.slice(0, 2000));
+    const said = `${err.path}: ${err.reason}`;
+    if (this.#workdirChangeSaid === said || this.#destroyed) return;
+    this.#workdirChangeSaid = said;
+    const note = this.#makeMessage("info", `⚠ ${err.message}.`, SYSTEM_IDENTITY, undefined, undefined, { event: "workdir.changed" });
+    this.#persistAndBuffer(note);
+    this.#broadcastRaw(note);
+  }
+
+  /**
    * Snapshot the workspace for `turnId` (see checkpoints.ts). Waits at most
    * `waitMs` (0 = don't wait) so a slow snapshot on a huge tree delays the
    * turn by a bounded amount; if the turn starts first, the snapshot is
@@ -9795,13 +10461,16 @@ export class Session {
   ): Promise<void> {
     if (!this.#checkpointsEnabled() || this.#destroyed) return;
     const cfg = this.#config?.session.checkpoints;
+    // Only of the working directory as pinned (#448 round 14): one an agent swapped for a link is never read.
+    const workdir = this.#pinnedWorkdirOrSay("a snapshot of the files");
+    if (!workdir) return;
     let started = false;
     // Serialized: a turn's start snapshot waits for the previous turn's end
     // snapshot (within its wait budget) instead of being skipped.
     const job = this.#checkpointChain.then(() =>
       createCheckpoint({
         root: this.#checkpointRoot,
-        workdir: this.workdir,
+        workdir,
         sessionId: this.id,
         turnId,
         // Late = the agent may have been editing while it was taken: for a
@@ -9815,6 +10484,8 @@ export class Session {
     ).then((r) => {
       if (!r.ok) {
         console.error(`[codeoid/session ${this.id.slice(0, 8)}] checkpoint skipped for turn ${turnId.slice(0, 8)}: ${r.reason}`);
+        // It changed while being read: said, as before it.
+        if (r.pinned) this.#pinnedWorkdirOrSay("a snapshot of the files");
       }
       return r;
     });
@@ -10003,19 +10674,27 @@ export class Session {
     checkpointId: string,
     opts: { asEndOf?: string; within?: string } = {},
   ): Promise<{ restored: number; removed: number }> {
-    // Only ever write inside the fork's own worktree, resolved — a symlinked
-    // folder must not carry the roll somewhere else.
+    // Only ever into the working directory as pinned (#448 round 14), never a
+    // link or another directory put in its place.
+    let workdir: PinnedDir;
+    try {
+      workdir = this.#pinnedWorkdir("putting a fork's files in place");
+    } catch (err) {
+      if (err instanceof PinnedPathError) this.#workdirChanged(err);
+      throw err;
+    }
+    // And only inside the fork's own worktree: the pinned path is real; the
+    // worktree is codeoid's own, just made, resolved once to compare.
     if (opts.within) {
-      const real = (p: string) => {
-        try {
-          return realpathSync(p);
-        } catch {
-          return null;
-        }
-      };
-      const root = real(opts.within);
-      const here = real(this.workdir);
-      if (!root || !here || (here !== root && !here.startsWith(`${root}/`))) {
+      let root: string | null = null;
+      try {
+        // paths: the fork's own worktree, just made by codeoid, resolved once to compare with the pinned workdir
+        root = realpathSync(opts.within);
+      } catch {
+        root = null;
+      }
+      const here = workdir.path;
+      if (!root || (here !== root && !here.startsWith(`${root}/`))) {
         throw new Error("this fork's folder isn't inside its own worktree");
       }
     }
@@ -10024,13 +10703,16 @@ export class Session {
       if (!rec) throw new Error("that snapshot isn't available to this session");
       const now = await currentTree({
         root: this.#checkpointRoot,
-        workdir: this.workdir,
+        workdir,
         sessionId: this.id,
         excludeDirs: this.#protectedDirs(),
         excludePaths: this.#setupPaths(),
         limits: this.#checkpointLimits(),
       });
-      if (!now.ok) throw new Error(now.reason);
+      if (!now.ok) {
+        if (now.pinned) this.#pinnedWorkdirOrSay("putting a fork's files in place");
+        throw new Error(now.reason);
+      }
       const changes = await diffTrees(this.#checkpointRoot, this.id, rec.sha, now.tree);
       if (changes.length === 0) return { restored: 0, removed: 0 };
       const protectedHit = changes.find((c) => this.#isProtectedPath(c.path));
@@ -10040,11 +10722,14 @@ export class Session {
       const kept = new Set(keep);
       await restoreTree({
         root: this.#checkpointRoot,
-        workdir: this.workdir,
+        workdir,
         sessionId: this.id,
         from: now.tree,
         to: rec.sha,
         ...(keep.length > 0 ? { keep } : {}),
+      }).catch((err) => {
+        if (err instanceof PinnedPathError) this.#workdirChanged(err);
+        throw err;
       });
       return {
         restored: changes.filter((c) => c.status !== "A" && !kept.has(c.path)).length,
@@ -10171,15 +10856,30 @@ export class Session {
     if (!start) {
       return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: "there is no snapshot of the files from when that turn started" };
     }
+    // The working directory as pinned (#448 round 14): one moved aside and replaced is never read or written.
+    let workdir: PinnedDir;
+    try {
+      workdir = this.#pinnedWorkdir("going back a turn");
+    } catch (err) {
+      if (!(err instanceof PinnedPathError)) throw err;
+      this.#workdirChanged(err);
+      throw new RewindError("restore_failed", `${err.message}. Nothing was changed.`);
+    }
     const now = await currentTree({
       root: this.#checkpointRoot,
-      workdir: this.workdir,
+      workdir,
       sessionId: this.id,
       excludeDirs: this.#protectedDirs(),
       excludePaths: this.#setupPaths(),
       limits: this.#checkpointLimits(),
     });
-    if (!now.ok) return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: `the current files couldn't be read: ${now.reason}` };
+    if (!now.ok) {
+      if (now.pinned) {
+        this.#pinnedWorkdirOrSay("going back a turn");
+        throw new RewindError("restore_failed", `${now.reason}. Nothing was changed.`);
+      }
+      return { ...plan, planId: planHash([turnId, ...removedIds]), filesUnavailable: `the current files couldn't be read: ${now.reason}` };
+    }
     const changes = await diffTrees(this.#checkpointRoot, this.id, start.sha, now.tree);
 
     // Never delete a file the snapshot didn't hold because it was IGNORED
@@ -10197,14 +10897,15 @@ export class Session {
     // Paths left alone because something else occupies them now (reported).
     const skipped: string[] = [];
     for (const c of changes) {
-      // Never through a symlinked parent (git wouldn't either; say so).
-      if (await hasSymlinkedParent(this.workdir, c.path)) {
+      // Never through a symlinked parent (git wouldn't either; say so). Looks in the pinned directory just
+      // checked (read only); the restore checks it again.
+      if (await hasSymlinkedParent(workdir.path, c.path)) {
         keep.add(c.path);
         skipped.push(c.path);
         continue;
       }
       if (c.status === "A") continue;
-      if (c.status === "D" && (await existsOnDisk(this.workdir, c.path))) {
+      if (c.status === "D" && (await existsOnDisk(workdir.path, c.path))) {
         keep.add(c.path);
         skipped.push(c.path);
         continue;
@@ -10213,7 +10914,7 @@ export class Session {
       for (let k = 1; k < parts.length; k++) {
         const parent = parts.slice(0, k).join("/");
         if (createdSet.has(parent)) break;
-        if (await isNonDirectory(this.workdir, parent)) {
+        if (await isNonDirectory(workdir.path, parent)) {
           keep.add(c.path);
           skipped.push(c.path);
           break;
@@ -10346,10 +11047,12 @@ export class Session {
       const protectedHit = plan_.fileChanges.find((c) => this.#isProtectedPath(c.path));
       if (protectedHit) throw new RewindError("restore_failed", `refusing to restore a path in codeoid's own data: ${protectedHit.path}`);
       try {
+        // Into the working directory as pinned (#448 round 14), checked again before and after the write.
+        const workdir = this.#pinnedWorkdir("going back a turn");
         await this.#serializedCheckpointOp(() =>
           restoreTree({
             root: this.#checkpointRoot,
-            workdir: this.workdir,
+            workdir,
             sessionId: this.id,
             from: plan_.currentTreeSha!,
             to: plan_.checkpointSha!,
@@ -10357,6 +11060,7 @@ export class Session {
           }),
         );
       } catch (err) {
+        if (err instanceof PinnedPathError) this.#workdirChanged(err);
         this.#auditRewind(sender, turnId, plan_, `failed: ${err instanceof Error ? err.message : String(err)}`, opts.force);
         throw new RewindError("restore_failed", `The files couldn't be restored: ${err instanceof Error ? err.message : String(err)}. ${wasBusy ? "The running turn was stopped; the conversation was not changed." : "Nothing was changed."}`);
       }

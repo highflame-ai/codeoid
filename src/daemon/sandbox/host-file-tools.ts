@@ -107,6 +107,7 @@ function bothForms(paths: readonly string[]): string[] {
   return [...out];
 }
 
+// paths: a look (does a hidden path exist), no write
 function lexists(p: string): boolean {
   try {
     lstatSync(p);

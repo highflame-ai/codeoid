@@ -8,6 +8,7 @@
 import { BLACKBOARD_MCP_SERVER_NAME } from "../blackboard/mcp-http.js";
 import { MEMORY_MCP_SERVER_NAME } from "../memory/mcp-http.js";
 import { MEMORY_TOOL_NAMES } from "../memory/tools.js";
+import { REQUEST_DIRECTORY_TOOL, SANDBOX_MCP_SERVER_NAME } from "../sandbox/request-directory.js";
 import { FLEET_READ_TOOLS, FLEET_TOOL_PREFIX } from "../../protocol/types.js";
 
 /** Built-in read-only tools that never require confirmation. */
@@ -24,6 +25,15 @@ const BLACKBOARD_TOOL_PREFIXES = [
   `mcp__${BLACKBOARD_MCP_SERVER_NAME}__`,
   `${BLACKBOARD_MCP_SERVER_NAME}__`,
 ] as const;
+
+/**
+ * Same two namespacing conventions, for the sandbox's `request_directory`
+ * (sandbox/request-directory.ts). It runs unprompted because it is itself an
+ * ask: the session decides it (the owner's confirm in guarded and
+ * interactive mode, the project roots in autonomous mode), so a gate card in
+ * front of it would ask twice.
+ */
+const SANDBOX_TOOL_PREFIXES = [`mcp__${SANDBOX_MCP_SERVER_NAME}__`, `${SANDBOX_MCP_SERVER_NAME}__`] as const;
 
 /**
  * Same two namespacing conventions, for the conductor's fleet mount.
@@ -61,12 +71,20 @@ const BLACKBOARD_SAFE_TOOLS = [
  * write-capable memory tool bypass confirmation. A different separator simply
  * prompts (fail-safe), never auto-approves by accident.
  */
+/** The sandbox's `request_directory`, as any backend names it: the session decides it, so no gate card asks first (every mode). */
+export function isRequestDirectoryTool(name: string): boolean {
+  return SANDBOX_TOOL_PREFIXES.some((p) => name === `${p}${REQUEST_DIRECTORY_TOOL}`);
+}
+
 export function isSafeTool(name: string): boolean {
   if (SAFE_TOOLS.has(name)) return true;
   for (const prefix of MEMORY_TOOL_PREFIXES) {
     if (name.startsWith(prefix)) {
       return (MEMORY_TOOL_NAMES as readonly string[]).includes(name.slice(prefix.length));
     }
+  }
+  for (const prefix of SANDBOX_TOOL_PREFIXES) {
+    if (name.startsWith(prefix)) return name.slice(prefix.length) === REQUEST_DIRECTORY_TOOL;
   }
   for (const prefix of BLACKBOARD_TOOL_PREFIXES) {
     if (name.startsWith(prefix)) {
