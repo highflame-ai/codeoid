@@ -91,14 +91,16 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
   const mounts: Mount[] = [];
   const seen = new Set<string>();
   const writable = [spec.workspace, ...spec.writable].map(realOr);
+  const shownInTmp = [...writable, ...spec.reexposed.flatMap((r) => [resolve(r), realOr(r)]).filter((r) => r !== "/tmp")];
   const hide = (p: string) => {
     const at = realOr(p);
     const k = kind(at);
     if (!k || seen.has(`h:${at}`)) return;
     // The sandbox's own /dev and /proc are new, and so is its /tmp: the
-    // host's is reachable only where a writable location is bound into it.
+    // host's is reachable only where a writable location, or one shown
+    // again (a worktree location of a repository in /tmp), is bound into it.
     if (at === "/" || within(at, "/proc") || within(at, "/dev")) return;
-    if (within(at, "/tmp") && !writable.some((w) => within(at, w))) return;
+    if (within(at, "/tmp") && !shownInTmp.some((w) => within(at, w))) return;
     seen.add(`h:${at}`);
     mounts.push(k === "dir" ? { kind: "hide-dir", path: at } : { kind: "hide-file", path: at });
   };

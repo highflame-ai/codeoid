@@ -31,7 +31,7 @@
  *     its commands.
  */
 
-import { readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import type { SandboxSettings } from "@anthropic-ai/claude-agent-sdk";
@@ -174,7 +174,7 @@ export function claudeSandboxSettings(
         tempDir,
         ...spec.writable,
         ...spec.reexposed.filter((r) => !roots.has(r) && !holdsFolder(r, spec.worktreeFolders ?? [])),
-        ...readAround([...roots], [spec.workspace, tempDir, ...spec.writable]),
+        ...readAround([...roots], [spec.workspace, tempDir, ...spec.writable], undefined, [...spec.hidden, ...spec.containerSockets, ...(spec.serviceSockets ?? [])]),
         ...sockets,
       ]),
     },
@@ -198,11 +198,29 @@ function holdsFolder(dir: string, folders: readonly string[]): boolean {
  * entry instead, all but the way down to the writable ones (which
  * `allowWrite` shows). An entry made in it after the query started isn't
  * shown (docs/sandbox.md, Limits). Bounded.
+ *
+ * Never an entry that is a link (it would be shown by where it leads: the
+ * CLI binds physical paths; left out, it isn't there), nor one that is, or
+ * is in, a `hidden` path: an `allowRead` equal to a `denyRead` path wins in
+ * the CLI. A hidden path strictly inside a shown entry stays hidden: the CLI
+ * lays `denyRead` paths inside an `allowRead` one after it (checked on the
+ * real CLI, #448 round 12).
  */
-export function readAround(readable: readonly string[], writable: readonly string[], limit = 4000): string[] {
+export function readAround(readable: readonly string[], writable: readonly string[], limit = 4000, hidden: readonly string[] = []): string[] {
   const out: string[] = [];
   const inside = (child: string, parent: string) => child !== parent && child.startsWith(`${parent}/`);
   const writes = writable.flatMap((w) => [resolve(w), physicalOf(w)]);
+  const hides = [...new Set(hidden.flatMap((h) => [resolve(h), physicalOf(h)]))];
+  // Only what is hidden in (or is) the readable dir: one holding it (the denied home) is what it is shown in.
+  let inBase: string[] = [];
+  const isHidden = (p: string) => [resolve(p), physicalOf(p)].some((at) => inBase.some((h) => at === h || inside(at, h)));
+  const isLink = (p: string) => {
+    try {
+      return lstatSync(p).isSymbolicLink();
+    } catch {
+      return true;
+    }
+  };
   let budget = limit;
   const split = (dir: string, keep: string[]): void => {
     let names: string[] = [];
@@ -214,6 +232,7 @@ export function readAround(readable: readonly string[], writable: readonly strin
     for (const name of names) {
       if (--budget < 0) return;
       const at = join(dir, name);
+      if (isLink(at) || isHidden(at)) continue;
       const held = keep.filter((w) => w === at || inside(w, at));
       if (held.length === 0) out.push(at);
       else if (!held.includes(at)) split(at, held);
@@ -221,6 +240,8 @@ export function readAround(readable: readonly string[], writable: readonly strin
   };
   for (const r of readable) {
     for (const base of new Set([resolve(r), physicalOf(r)])) {
+      inBase = hides.filter((h) => h === base || inside(h, base));
+      if (isHidden(base)) continue;
       const keep = writes.filter((w) => w === base || inside(w, base));
       if (keep.includes(base)) continue;
       if (keep.length === 0) out.push(base);
