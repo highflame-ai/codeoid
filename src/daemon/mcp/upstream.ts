@@ -33,6 +33,8 @@ export interface UpstreamOptions {
   env: Record<string, string | undefined>;
   /** Set for an OAuth server: the tenant's bearer. */
   oauth?: UpstreamBearer;
+  /** Reads a named credential's value (transport.credential), when the request is made. */
+  secrets?: (id: string) => string | undefined;
   /** Who the upstream server sees connecting (default: codeoid). */
   clientInfo?: Implementation;
   /** What the client declares it can do — the relay passes its backend's. */
@@ -44,6 +46,14 @@ export interface UpstreamOptions {
 }
 
 export const UPSTREAM_CLIENT_INFO: Implementation = { name: "codeoid", version: "1.0" };
+
+/** A server's named credential has no value in the secret store. */
+export class McpCredentialMissing extends Error {
+  constructor(readonly server: string, readonly credential: string) {
+    super(`${server}: credential "${credential}" has no value — set it in the credential store`);
+    this.name = "McpCredentialMissing";
+  }
+}
 
 /**
  * A server configured without OAuth answered with the MCP authorization
@@ -154,13 +164,20 @@ export async function closeUpstream(client: Client, timeoutMs = 3_000): Promise<
  */
 export function upstreamFetch(opts: UpstreamOptions): typeof fetch {
   const base = opts.fetchFn ?? fetch;
-  const { name, transport, env, oauth } = opts;
+  const { name, transport, env, oauth, secrets } = opts;
   const send = (url: string | URL | Request, init: RequestInit | undefined, token: string | undefined): Promise<Response> => {
     const headers = new Headers(init?.headers);
     // What the SDK sets (session id, protocol version, accept) wins over config.
     for (const [k, v] of Object.entries(transport.headers ?? {})) if (!headers.has(k)) headers.set(k, v);
     if (token) headers.set("Authorization", `Bearer ${token}`);
-    else if (transport.bearerTokenEnv && env[transport.bearerTokenEnv]) {
+    else if (transport.credential) {
+      // A workstream's named credential, read now: a rotated value applies at
+      // the next request. Missing = refused here, never sent without it.
+      const value = secrets?.(transport.credential.id);
+      if (value === undefined) throw new McpCredentialMissing(name, transport.credential.id);
+      if (transport.credential.header) headers.set(transport.credential.header, value);
+      else headers.set("Authorization", `Bearer ${value}`);
+    } else if (transport.bearerTokenEnv && env[transport.bearerTokenEnv]) {
       headers.set("Authorization", `Bearer ${env[transport.bearerTokenEnv]}`);
     }
     return base(url, { ...init, headers, ...(oauth ? { redirect: "error" as const } : {}) });
@@ -177,7 +194,10 @@ export function upstreamFetch(opts: UpstreamOptions): typeof fetch {
       // given no credentials of its own: a 401 for a static token that expired
       // is that token's problem, not a sign-in to adopt.
       const challenge = resp.headers.get("www-authenticate") ?? "";
-      const credentialed = transport.bearerTokenEnv !== undefined || Object.keys(transport.headers ?? {}).some((k) => k.toLowerCase() === "authorization");
+      const credentialed =
+        transport.bearerTokenEnv !== undefined ||
+        transport.credential !== undefined ||
+        Object.keys(transport.headers ?? {}).some((k) => k.toLowerCase() === "authorization");
       if (resp.status === 401 && !credentialed && /^\s*Bearer\b/i.test(challenge) && /resource_metadata\s*=/i.test(challenge)) {
         await resp.body?.cancel().catch(() => {});
         throw new McpServerWantsSignIn(name);

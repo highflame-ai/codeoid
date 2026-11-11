@@ -38,6 +38,13 @@ export interface McpHttpTransport {
   bearerTokenEnv?: string;
   /** OAuth per the MCP authorization spec; the daemon holds the token. */
   oauth?: McpOAuthConfig;
+  /**
+   * A named credential this server is called with (workstreams §6.5 case 2):
+   * a REFERENCE, never the value — the daemon reads the value from its secret
+   * store when it connects (mcp/upstream.ts), so no spec, config view or
+   * backend argv ever carries it. `header` absent = `Authorization: Bearer`.
+   */
+  credential?: { id: string; header?: string };
 }
 
 /** A remote server's OAuth settings. Everything is optional: with none, the

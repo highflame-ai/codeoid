@@ -3391,6 +3391,8 @@ export type ResponseErrorDetail =
    * §5.2). `resolution` says what the folder resolves to and why.
    */
   | { kind: "workstream_conflict"; resolution: WorkstreamResolution }
+  /** `workstream_required`: isolation is on and the folder has no workstream; choose one. */
+  | { kind: "workstream_required"; resolution: WorkstreamResolution }
   /** `workstream_unknown`: the chosen workstream isn't configured (or is a base). */
   | { kind: "workstream_unknown"; workstream: string };
 

@@ -10,6 +10,7 @@
 
 import { addedDirProblem, type OtherCheckout, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
 import { WorkstreamService, type WorkstreamBinding } from "./workstreams/service.js";
+import { grantRefusal, type McpGrant } from "./workstreams/grant.js";
 import type { FolderReader } from "./workstreams/folder.js";
 import { createSecretStore, type SecretStore } from "./credentials/store.js";
 import { registerSecretPaths } from "./secret-paths.js";
@@ -739,7 +740,7 @@ export class SessionManager {
     this.#rateLimiter = rateLimiter ?? new RateLimiter();
     this.#memory = memory;
     this.#config = opts?.config;
-    this.#workstreams = new WorkstreamService(opts?.config?.workstreams, opts?._testFolderReader);
+    this.#workstreams = new WorkstreamService(opts?.config?.workstreams, opts?._testFolderReader, opts?.config?.credentials);
     this.#secrets = opts?._testSecrets ?? createSecretStore(opts?.config?.credentialStore);
     // A `dir` store holds every credential's value in plain files: refused to
     // every agent's file tools and hidden from every sandbox, as codeoid's own
@@ -2311,6 +2312,7 @@ mcpHub: this.#mcpHub,
     workstream?: WorkstreamBinding;
     describeWorkstream: (b: WorkstreamBinding | undefined) => ReturnType<WorkstreamService["info"]>;
     workstreamEnv?: Readonly<Record<string, string>>;
+    mcpGrant: () => McpGrant | undefined;
   } {
     const { env, missing } = this.#workstreams.envFor(binding, this.#secrets);
     if (missing.length > 0) {
@@ -2320,6 +2322,8 @@ mcpHub: this.#mcpHub,
       ...(binding ? { workstream: binding } : {}),
       describeWorkstream: this.#describeWorkstream,
       ...(Object.keys(env).length > 0 ? { workstreamEnv: env } : {}),
+      // Read live: the grant follows the config as it is at each listing.
+      mcpGrant: () => this.#workstreams.grantFor(binding),
     };
   }
 
@@ -4242,6 +4246,12 @@ mcpHub: this.#mcpHub,
   setMcp(registry: McpRegistry, hub: McpHub, oauth?: McpOAuth): void {
     this.#mcpRegistry = registry;
     this.#mcpHub = hub;
+    // Every call a session makes through the hub is checked against its
+    // workstream's grant as it is NOW (G4): a revoked server fails mid-turn.
+    hub.setPermit((sessionId, spec) => {
+      const session = this.#sessions.get(sessionId);
+      return session ? grantRefusal(this.#workstreams.grantFor(session.workstream), spec) : undefined;
+    });
     this.#mcpOAuth = oauth;
   }
 
@@ -4535,7 +4545,7 @@ mcpHub: this.#mcpHub,
     // Home workstream (docs/workstreams-design.md §5): an explicit choice, else
     // the folder's, else the default. Refused before anything is built.
     const givenWorkdir = givenPath(msg.workdir);
-    const homing = this.#workstreams.forCreate(workdir, msg.workstream, givenWorkdir);
+    const homing = this.#workstreams.forCreate(workdir, msg.workstream, givenWorkdir, true);
     if (homing.ok && msg.workstream !== undefined && auth.delegationDepth > 0) {
       // A delegated token may confirm the folder's own home, never pick
       // another: the home will decide credentials (W1), as an account choice
@@ -4561,6 +4571,7 @@ mcpHub: this.#mcpHub,
           homing.kind === "workstream_unknown"
             ? { kind: "workstream_unknown", workstream: homing.workstream }
             : { kind: homing.kind, resolution: homing.resolution },
+
       };
     }
     for (const w of homing.warnings) warn(w);

@@ -103,6 +103,7 @@ import { type PinnedDir, PinnedPathError, pinDir, pinRecord } from "./sandbox/pi
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
 import type { EffortChangeResult, EffortLevel, RewindFiles, RewindIrreversible, SessionWorkstreamInfo, TurnSummary } from "../protocol/types.js";
 import type { WorkstreamBinding } from "./workstreams/binding.js";
+import type { McpGrant } from "./workstreams/grant.js";
 import { LIMITS } from "../protocol/types.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import type { PendingToolApproval, SessionApproveOutcome, SessionSandboxInfo, SessionSandboxSetting } from "../protocol/types.js";
@@ -565,6 +566,12 @@ export interface SessionCreateOptions {
    * would). Never persisted: recomputed from the config on every resume.
    */
   workstreamEnv?: Readonly<Record<string, string>>;
+  /**
+   * The home's MCP grant under isolation (workstreams/grant.ts), read live;
+   * undefined result = no isolation. Applied by the session's MCP view, so
+   * every backend sees only what the home selects.
+   */
+  mcpGrant?: () => McpGrant | undefined;
   /**
    * Role-scoped goal-blackboard mount for a collaboration child: the endpoint
    * URL plus a bearer token that IS the scope (one goal, this role's read/write
@@ -1818,6 +1825,7 @@ export class Session {
         workdir: this.workdir,
         tenant: { accountId: this.accountId, projectId: this.projectId },
         approvals: () => this.#store.workdirMcpApprovals(scope),
+        ...(opts.mcpGrant ? { grant: opts.mcpGrant } : {}),
       });
     }
     this.#config = opts.config;

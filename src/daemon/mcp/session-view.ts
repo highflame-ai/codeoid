@@ -31,6 +31,7 @@
 
 import type { RawMcpServerConfig } from "../../config.js";
 import type { McpHub } from "./hub.js";
+import type { McpGrant } from "../workstreams/grant.js";
 import type { McpTenant } from "./oauth.js";
 import { isReservedMcpName, normalizeSpec, type McpRegistry, type McpServerView } from "./registry.js";
 import { isOAuthServer, type McpServerSpec } from "./types.js";
@@ -53,6 +54,12 @@ export interface SessionMcpViewOptions {
   read?: (workdir: string) => Promise<WorkdirRead | WorkdirServer[] | null>;
   /** Injected for tests: the user's global Claude servers (null: can't be read just now). */
   readGlobal?: () => Promise<Record<string, RawMcpServerConfig> | null>;
+  /**
+   * The session's workstream grant (workstreams/grant.ts), read on every
+   * listing — undefined = no isolation, today's servers. Live: a server the
+   * workstream drops is gone from the next listing.
+   */
+  grant?: () => McpGrant | undefined;
 }
 
 /** What changed when a view was applied. */
@@ -235,6 +242,8 @@ export class SessionMcpView implements McpServerView {
 
   /** A name the project's .mcp.json declared, on a backend that loads that file itself: its tools may be the repo's. */
   leftToBackend(name: string, backendId: string): boolean {
+    // Isolated, Claude runs strict: it loads no .mcp.json, so nothing is its own.
+    if (backendId === "claude" && this.isolated) return false;
     return READS_MCP_JSON.has(backendId) && (this.#repoUnreadable || this.#mcpJsonNames.has(name));
   }
 
@@ -259,7 +268,30 @@ export class SessionMcpView implements McpServerView {
   }
 
   forNativeMount(backendId: string): McpServerSpec[] {
-    return this.forBackend(backendId).filter((s) => !s.builtin && !isOAuthServer(s));
+    const native = this.forBackend(backendId).filter((s) => !s.builtin && !isOAuthServer(s));
+    // Isolated: a backend that mounts a server itself gets only those it can
+    // mount holding no secret (G1). One called with a credential goes through
+    // the relay (relayFor); a stdio server needing env values isn't given at
+    // all — its env would ride the backend's own config.
+    return this.isolated ? native.filter((s) => secretFree(s)) : native;
+  }
+
+  relayFor(backendId: string): McpServerSpec[] {
+    const http = (s: McpServerSpec) => s.transport.kind === "http";
+    const oauth = this.oauthFor(backendId).filter(http);
+    if (!this.isolated) return oauth;
+    const credentialed = this.forBackend(backendId).filter((s) => !s.builtin && !isOAuthServer(s) && http(s) && !secretFree(s));
+    return [...oauth, ...credentialed];
+  }
+
+  /** Servers a stdio server's env would need values for, withheld from a native mount under isolation. */
+  withheldFromNative(backendId: string): McpServerSpec[] {
+    if (!this.isolated) return [];
+    return this.forBackend(backendId).filter((s) => !s.builtin && !isOAuthServer(s) && s.transport.kind === "stdio" && !secretFree(s));
+  }
+
+  get isolated(): boolean {
+    return this.#opts.grant?.() !== undefined;
   }
 
   // ── internals ──
@@ -311,11 +343,15 @@ export class SessionMcpView implements McpServerView {
     globals: readonly McpServerSpec[] | null,
     declared: ReadonlySet<string>,
   ): McpServerSpec[] {
+    const grant = this.#opts.grant?.();
     const byName = new Map<string, McpServerSpec>();
     for (const s of this.#base.list()) if (!(globals && s.origin === "claude-global")) byName.set(s.name, s);
     for (const g of globals ?? []) if (!byName.has(g.name)) byName.set(g.name, g);
-    if (backendId !== "claude") {
-      const mcpJsonNames = backendId && READS_MCP_JSON.has(backendId) ? declared : null;
+    // Isolated, Claude runs with a strict MCP config and loads none of its
+    // own: the workdir layer is codeoid's to give it, as to every backend.
+    if (backendId !== "claude" || grant) {
+      // Strict (isolated) Claude reads no .mcp.json of its own: those are codeoid's to give.
+      const mcpJsonNames = backendId && READS_MCP_JSON.has(backendId) && !(grant && backendId === "claude") ? declared : null;
       for (const spec of layer) {
         if (mcpJsonNames?.has(spec.name)) continue;
         const existing = byName.get(spec.name);
@@ -325,7 +361,7 @@ export class SessionMcpView implements McpServerView {
         byName.set(spec.name, spec);
       }
     }
-    return [...byName.values()];
+    return grant ? applyGrant([...byName.values()], grant) : [...byName.values()];
   }
 
   /** The workdir servers that apply, by consent and precedence. */
@@ -388,4 +424,47 @@ function fingerprintOfApplied(layer: readonly McpServerSpec[], globals: readonly
 
 function mcpJsonNamesOf(read: readonly WorkdirServer[]): ReadonlySet<string> {
   return new Set(read.filter((w) => isMcpJson(w.path)).map((w) => w.name));
+}
+
+/** A server a backend can mount itself without holding any secret. */
+export function secretFree(spec: McpServerSpec): boolean {
+  const t = spec.transport;
+  if (t.kind === "http") return !t.credential && !t.bearerTokenEnv && Object.keys(t.headers ?? {}).length === 0;
+  if (t.kind === "stdio") return Object.keys(t.env ?? {}).length === 0;
+  return true;
+}
+
+/**
+ * The specs a grant lets through (grant.ts): built-ins; the folder's own
+ * servers when the folder is the home's; any other only by name. A selected
+ * server called with a named credential gets it as a REFERENCE on its
+ * transport, and a variant of its own, so the hub keeps one client per
+ * credential. An OAuth slot (a second sign-in) is not supported yet: such a
+ * server is withheld, never called with the default sign-in instead.
+ */
+function applyGrant(specs: readonly McpServerSpec[], grant: McpGrant): McpServerSpec[] {
+  const out: McpServerSpec[] = [];
+  for (const spec of specs) {
+    if (spec.builtin) {
+      out.push(spec);
+      continue;
+    }
+    if (spec.origin === "claude-local" || spec.origin === "claude-repo") {
+      if (grant.workdirServers) out.push(spec);
+      continue;
+    }
+    const sel = grant.servers.get(spec.name);
+    if (!sel || sel.oauthSlot) continue;
+    if (sel.credential && spec.transport.kind === "http" && !isOAuthServer(spec)) {
+      out.push({
+        ...spec,
+        transport: { ...spec.transport, credential: { ...sel.credential } },
+        variant: `${spec.variant ?? ""}#cred:${sel.credential.id}`,
+      });
+      continue;
+    }
+    if (sel.credential) continue; // a credential this server can't take (stdio, OAuth): withheld, never sent without it
+    out.push(spec);
+  }
+  return out;
 }

@@ -501,7 +501,7 @@ export class CodexProvider implements SessionProvider {
     this.#mcpRegistry = init.mcpRegistry ?? null;
     this.#proxy = new McpProxyLease(
       init.mcpProxy,
-      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
+      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id, ...(init.mcpRegistry ? { view: init.mcpRegistry } : {}) } : null,
     );
   }
 

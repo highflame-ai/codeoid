@@ -169,7 +169,7 @@ export class QwenProvider implements SessionProvider {
     this.#init = init;
     this.#proxy = new McpProxyLease(
       init.mcpProxy,
-      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
+      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id, ...(init.mcpRegistry ? { view: init.mcpRegistry } : {}) } : null,
     );
   }
 

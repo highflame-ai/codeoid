@@ -19,6 +19,8 @@ import { FolderReader } from "./folder.js";
 import { expandHome, type MatchableWorkstream, matchFolder, normalizePathRule } from "./match.js";
 import type { WorkstreamsConfig } from "./schema.js";
 import type { SecretStore } from "../credentials/store.js";
+import type { CredentialDecl } from "../credentials/schema.js";
+import type { GrantCredential, McpGrant } from "./grant.js";
 
 export { readWorkstreamBinding, type WorkstreamBinding } from "./binding.js";
 
@@ -27,7 +29,7 @@ export const CONDUCTOR_WORKSTREAM = "conductor";
 
 export type CreateBinding =
   | { ok: true; binding: WorkstreamBinding | undefined; resolution?: WorkstreamResolution; warnings: string[] }
-  | { ok: false; kind: "workstream_conflict"; resolution: WorkstreamResolution; error: string }
+  | { ok: false; kind: "workstream_conflict" | "workstream_required"; resolution: WorkstreamResolution; error: string }
   | { ok: false; kind: "workstream_unknown"; workstream: string; error: string };
 
 /** What a meta on disk says about its session, for the resume pre-pass. */
@@ -49,9 +51,11 @@ export class WorkstreamService {
   #written = new Map<string, string>();
   #revision: string;
   #reader: FolderReader;
+  #credentials = new Map<string, CredentialDecl>();
 
-  constructor(cfg: WorkstreamsConfig | undefined, reader: FolderReader = new FolderReader()) {
+  constructor(cfg: WorkstreamsConfig | undefined, reader: FolderReader = new FolderReader(), credentials: readonly CredentialDecl[] = []) {
     this.#reader = reader;
+    for (const c of credentials) this.#credentials.set(c.id, c);
     this.#cfg = cfg ?? { isolateGlobalServers: false, items: [] };
     this.#effective = new Map();
     this.#matchables = [];
@@ -104,8 +108,31 @@ export class WorkstreamService {
   }
 
   /** Replace the config (a settings write, W2). Live sessions keep their bindings. */
-  update(cfg: WorkstreamsConfig): void {
+  update(cfg: WorkstreamsConfig, credentials?: readonly CredentialDecl[]): void {
+    if (credentials) this.#credentials = new Map(credentials.map((c) => [c.id, c]));
     this.#load(cfg);
+  }
+
+  /**
+   * What a session homed by `binding` may reach over MCP (grant.ts), or
+   * undefined when isolation is off — every session then keeps today's
+   * servers. Read live by the session's view and the hub, so a server
+   * removed from a workstream stops on the next call (G4).
+   */
+  grantFor(binding: WorkstreamBinding | undefined): McpGrant | undefined {
+    if (!this.configured || !this.#cfg.isolateGlobalServers) return undefined;
+    const ws = binding?.id && binding.source !== "reserved" ? this.#effective.get(binding.id) : undefined;
+    if (!ws) return { ...(binding?.id ? { workstream: binding.id } : {}), servers: new Map(), workdirServers: false };
+    const servers = new Map<string, { credential?: GrantCredential; oauthSlot?: string }>();
+    for (const s of ws.servers) {
+      const decl = s.credential ? this.#credentials.get(s.credential) : undefined;
+      if (s.credential && !decl) continue; // validated at load; a config edit that drops one fails closed
+      if (!decl) servers.set(s.server, {});
+      else if (decl.kind === "bearer") servers.set(s.server, { credential: { id: decl.id } });
+      else if (decl.kind === "header") servers.set(s.server, { credential: { id: decl.id, header: decl.header } });
+      else if (decl.kind === "oauth") servers.set(s.server, { oauthSlot: decl.id });
+    }
+    return { workstream: ws.id, servers, workdirServers: binding?.source !== "override" };
   }
 
   /** Any workstream configured at all. With none, the daemon behaves as before workstreams. */
@@ -232,7 +259,7 @@ export class WorkstreamService {
    * with no choice, gets no home and a warning: W1 requires the choice once
    * isolation is on.
    */
-  forCreate(workdir: string, explicit?: string, given?: string): CreateBinding {
+  forCreate(workdir: string, explicit?: string, given?: string, required = false): CreateBinding {
     if (explicit !== undefined) {
       const problem = this.choiceProblem(explicit);
       if (problem) return { ok: false, kind: "workstream_unknown", workstream: explicit, error: problem };
@@ -246,6 +273,18 @@ export class WorkstreamService {
         kind: "workstream_conflict",
         resolution,
         error: `This folder belongs to workstream "${c.folder}" (exclusive). Start the session in "${c.folder}", or choose a folder outside it for "${c.chosen}".`,
+      };
+    }
+    // Isolated, a home decides everything a session reaches: a folder with
+    // none must be given one (§5.1). Sessions the daemon starts itself use
+    // forFolder (the manager's), which keeps "no home": built-ins only.
+    if (this.#cfg.isolateGlobalServers && resolution.home === undefined && explicit === undefined && required) {
+      const ids = [...this.#effective.values()].filter((w) => !w.abstract).map((w) => w.id);
+      return {
+        ok: false,
+        kind: "workstream_required",
+        resolution,
+        error: `This folder belongs to no workstream${resolution.ambiguous ? ` (${resolution.ambiguous.join(" and ")} both match)` : ""}: choose one (${ids.join(", ")}).`,
       };
     }
     const warnings: string[] = [];

@@ -1044,7 +1044,9 @@ export class ClaudeProvider implements SessionProvider {
     // stall watchdog so the SDK signals first.
     const mcpToolTimeoutMs = init.config?.session.mcpToolTimeoutMs ?? 120_000;
     // A server codeoid now signs in to is codeoid's (mounted below), not the CLI's.
-    const userServers = withoutServers((init.userMcpServers ?? loadUserMcpServers)(opts.workdir), oauthMcp.deniedUrls);
+    // Under workstream isolation none of the user's own: the CLI runs strict,
+    // and every server it may reach is one of codeoid's bridges (G1).
+    const userServers = oauthMcp.strict ? {} : withoutServers((init.userMcpServers ?? loadUserMcpServers)(opts.workdir), oauthMcp.deniedUrls);
     // ...but never in place of the user's own server of that name at another
     // address — in this workdir's config, which adopting (from another
     // workdir, perhaps) couldn't see. Theirs stays; codeoid's isn't mounted here.
@@ -1063,7 +1065,7 @@ export class ClaudeProvider implements SessionProvider {
       ...withMcpToolTimeout(userServers, mcpToolTimeoutMs),
       // Registry servers — mounted natively on the SDK (claude owns its client);
       // tool calls surface as `mcp__<server>__<tool>` and gate via canUseTool.
-      ...withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs),
+      ...(oauthMcp.strict ? {} : withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs)),
       // Registry OAuth servers the tenant has signed in to — in-process, in
       // front of the daemon-owned client, which holds the token (#390). The
       // hub applies its own per-call timeout.
@@ -1340,6 +1342,9 @@ export class ClaudeProvider implements SessionProvider {
         // mode this also surfaces the user's own skills, which is the intended
         // behaviour.
         settingSources: ["project", "user"],
+        // Workstream isolation (G1): only the servers codeoid passes — no
+        // `~/.claude.json`, no `.mcp.json`, no plugin's, no agent's own.
+        ...(oauthMcp.strict ? { strictMcpConfig: true } : {}),
         // The CLI must not connect its own copy of a server codeoid signs in
         // to (from ~/.claude.json, a .mcp.json): the flag-settings denylist,
         // by URL, keeps it from dialing it at all (#390).

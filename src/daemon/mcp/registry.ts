@@ -46,6 +46,19 @@ export interface McpServerView {
   oauthFor(backendId: string): McpServerSpec[];
   /** External servers a native-mount backend mounts itself (no OAuth ones). */
   forNativeMount(backendId: string): McpServerSpec[];
+  /**
+   * HTTP servers a CLI backend reaches through the daemon's relay
+   * (mcp/proxy.ts), the daemon holding the credential: OAuth servers, and
+   * under workstream isolation every server called with a credential.
+   */
+  relayFor(backendId: string): McpServerSpec[];
+  /**
+   * Workstream isolation applies (docs/workstreams-design.md §6.1): what is
+   * listed is all the session may reach, and no backend may hold a secret —
+   * Claude runs with a strict MCP config, other CLIs mount only secret-free
+   * servers natively.
+   */
+  readonly isolated: boolean;
 }
 
 export class McpRegistry implements McpServerView {
@@ -121,6 +134,12 @@ export class McpRegistry implements McpServerView {
   forNativeMount(backendId: string): McpServerSpec[] {
     return this.forBackend(backendId).filter((s) => !s.builtin && !isOAuthServer(s));
   }
+
+  relayFor(backendId: string): McpServerSpec[] {
+    return this.oauthFor(backendId).filter((s) => s.transport.kind === "http");
+  }
+
+  readonly isolated = false;
 }
 
 /** Raw (zod-validated) config → normalized spec. Transport is inferred from

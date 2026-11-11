@@ -9,6 +9,7 @@
  */
 
 import { SANDBOX_MCP_PATH } from "./sandbox/request-directory.js";
+import { createSecretStore } from "./credentials/store.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -610,6 +611,9 @@ export class DaemonServer {
       toolTimeoutMs: this.#config.fullConfig?.session.mcpToolTimeoutMs,
       daemonEnv: process.env,
       credentials: mcpOAuth,
+      // Named credentials' values (workstreams G2): the hub and the relay
+      // read them per request, so no backend ever holds one.
+      secrets: createSecretStore(this.#config.fullConfig?.credentialStore),
     });
     // The relay for backends that own their MCP clients (#396). Its URL is the
     // loopback, whatever the daemon binds: the agent subprocess is local.
