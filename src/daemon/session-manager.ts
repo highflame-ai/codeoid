@@ -10123,7 +10123,12 @@ mcpHub: this.#mcpHub,
               ? `"${msg.workstream}" shares only with approval. The session could read its folders and recall its memory; it gets none of its servers or credentials, and writes nothing there.`
               : `${decide.ask.map((w) => `"${w}"`).join(" and ")} share${decide.ask.length === 1 ? "s" : ""} only with approval, and the session's whole conversation would go with it.`,
         },
-        { ownerOnly: true, onAnswer: (sub) => void (answeredBy = sub) },
+        {
+          ownerOnly: true,
+          onAnswer: (sub) => {
+            answeredBy = sub;
+          },
+        },
       )
       .then(
         (answer) => {
