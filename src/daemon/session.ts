@@ -105,6 +105,7 @@ import type { EffortChangeResult, EffortLevel, RewindFiles, RewindIrreversible, 
 import type { WorkstreamBinding } from "./workstreams/binding.js";
 import type { WorkstreamFence } from "./workstreams/service.js";
 import { type FenceRefusal, fenceRefusal, fenceRefusalText } from "./workstreams/gate.js";
+import { repositoryTopOf } from "./workstreams/folders.js";
 import type { McpGrant } from "./workstreams/grant.js";
 import { LIMITS } from "../protocol/types.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
@@ -580,7 +581,7 @@ export interface SessionCreateOptions {
    * for its binding: its home's and references' folders, and every other
    * workstream's. Undefined result = no fence.
    */
-  workstreamFence?: (binding: WorkstreamBinding | undefined) => WorkstreamFence | undefined;
+  workstreamFence?: (binding: WorkstreamBinding | undefined, own: readonly string[]) => WorkstreamFence | undefined;
   /**
    * Role-scoped goal-blackboard mount for a collaboration child: the endpoint
    * URL plus a bearer token that IS the scope (one goal, this role's read/write
@@ -1457,7 +1458,7 @@ export class Session {
     if (!fence) return undefined;
     return {
       roots: [...new Set([...fence.home, ...fence.references.flatMap((r) => r.folders)])],
-      hidden: [...new Set(fence.foreign.flatMap((f) => f.folders))],
+      hidden: fence.hidden,
     };
   }
 
@@ -1850,7 +1851,10 @@ export class Session {
     const envOf = opts.workstreamEnv;
     this.#workstreamEnv = envOf ? () => envOf(this.#workstream) : undefined;
     const fenceOf = opts.workstreamFence;
-    this.#workstreamFence = fenceOf ? () => fenceOf(this.#workstream) : undefined;
+    // The session's own folder stays readable whatever its home (one moved, or homed past a claim): its
+    // workdir and the repository holding it (the sandbox's workspace in a monorepo).
+    const own = [...new Set([opts.workdir, repositoryTopOf(opts.workdir, homedir())])];
+    this.#workstreamFence = fenceOf ? () => fenceOf(this.#workstream, own) : undefined;
     const extra = opts.extraEnv;
     if (extra) {
       // Before any side effect: a refused key must fail the create, not run a
@@ -2557,7 +2561,8 @@ export class Session {
     this.#approvalPatchKeys.delete(approvalId);
     this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: reason });
     this.#store.audit(sender.sub, "session.workstream_fence_refuse", this.id, `tool=${toolName} kind=${r.kind} workstream=${r.workstream}`);
-    const infoMsg = this.#makeMessage("info", `⛔ Refused ${toolName}: ${r.path} is workstream "${r.workstream}"'s`, SYSTEM_IDENTITY, undefined, undefined, {
+    const said = r.kind === "unresolved" ? `couldn't tell where ${r.path} is` : `${r.path} is workstream "${r.workstream}"'s`;
+    const infoMsg = this.#makeMessage("info", `⛔ Refused ${toolName}: ${said}`, SYSTEM_IDENTITY, undefined, undefined, {
       event: "workstream.fenced",
       tool: toolName,
       workstream: r.workstream,
@@ -3754,7 +3759,11 @@ export class Session {
     const root = sandboxRootIfMade();
     const hidden = [...hiddenPathsFor(this.#config), ...(root ? [root] : [])];
     const problem = addedDirProblem(written, { home, configDir: getConfigDir(), hidden });
-    return problem ? { error: problem } : { dir, written };
+    if (problem) return { error: problem };
+    // Another workstream's folder (workstreams §7.3): writable would open the fence; reading it is a reference.
+    const fenced = this.#fenceRefusal("Write", { file_path: join(dir, ".codeoid-probe") }, null);
+    if (fenced) return { error: `${dir} is in workstream "${fenced.workstream}"'s folders: add a reference to read it (codeoid workstream ref add), never a writable directory` };
+    return { dir, written };
   }
 
   /**
@@ -8973,7 +8982,7 @@ export class Session {
     let timelineEpisodes: ReturnType<MemoryEngine["timeline"]> = [];
     if (this.#memory) {
       try {
-        timelineEpisodes = this.#memory.timeline(this.#workspaceId, 30);
+        timelineEpisodes = this.#memory.timeline(this.#workspaceId, 30, 0, this.#memoryWorkstreams());
       } catch {
         /* graceful — the map still works without the page table */
       }
@@ -9112,7 +9121,11 @@ export class Session {
     // live scheduler every turn churns the append by a few bytes (relative times,
     // counts) and forces a per-turn query-loop rebuild that aborts the turn.
     if (this.#frozenMemoryIndex === null) {
-      this.#frozenMemoryIndex = this.#indexScheduler?.get() ?? "";
+      // The index is the repository's whole memory: left out where another workstream wrote some of it
+      // (a repository two workstreams share); recall, filtered, still reaches the session's own.
+      const scope = this.#memoryWorkstreams();
+      const mixed = scope !== undefined && (this.#memory?.store.hasOtherWorkstreams(this.#workspaceId, scope) ?? false);
+      this.#frozenMemoryIndex = mixed ? "" : (this.#indexScheduler?.get() ?? "");
     }
     const index = this.#frozenMemoryIndex;
     if (!index) return MEMORY_SYSTEM_PROMPT_APPEND;

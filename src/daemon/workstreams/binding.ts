@@ -35,6 +35,12 @@ export interface WorkstreamBinding {
    * as it is then, even after the reference is gone.
    */
   readFrom?: string[];
+  /**
+   * The stored binding couldn't be read back, so what the session read from
+   * is unknown: it gets no home, and is never moved to another workstream
+   * (that would carry its conversation past a policy nobody can check).
+   */
+  sealed?: true;
 }
 
 const ID = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
@@ -58,6 +64,18 @@ function readReference(raw: unknown): WorkstreamReference | undefined {
     grantedAt: r.grantedAt,
   };
 }
+
+/** Why a reference's folders can't be stored (the same bounds a binding is read back with), or undefined. */
+export function referencePathsProblem(paths: readonly string[] | undefined): string | undefined {
+  if (paths === undefined) return undefined;
+  if (paths.length === 0) return "A reference names its folders, or none for all of them";
+  if (paths.length > MAX_REFERENCE_PATHS) return `A reference names at most ${MAX_REFERENCE_PATHS} folders`;
+  const bad = paths.find((p) => !p.startsWith("/") || p.length > 4096 || p.includes("\0"));
+  return bad === undefined ? undefined : `Not an absolute folder: ${JSON.stringify(bad)}`;
+}
+
+/** Most references one session holds. */
+export const REFERENCE_LIMIT = MAX_REFERENCES;
 
 const SOURCES: ReadonlySet<string> = new Set(["explicit", "matched", "default", "override", "migrated", "reserved", "none"]);
 
@@ -100,5 +118,6 @@ export function readWorkstreamBinding(raw: unknown): WorkstreamBinding | undefin
     revision: r.revision,
     ...(references && references.length > 0 ? { references } : {}),
     ...(readFrom && readFrom.length > 0 ? { readFrom } : {}),
+    ...(r.sealed === true ? { sealed: true as const } : {}),
   };
 }

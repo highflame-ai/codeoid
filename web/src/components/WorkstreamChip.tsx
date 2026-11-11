@@ -10,7 +10,7 @@
  * `ask` one may be asked of the owner on the session.
  */
 
-import { type Component, For, Show, createSignal, onCleanup } from "solid-js";
+import { type Component, For, Show, createSignal, onCleanup, onMount } from "solid-js";
 
 import type { SessionInfo } from "../protocol/types";
 import { changeSessionWorkstream, fetchWorkstreams, homeChoices, workstreamsState } from "../state/workstreams";
@@ -121,24 +121,36 @@ const WorkstreamPanel: Component<{ session: SessionInfo; anchor: HTMLElement | u
       setBusy(false);
     }
   };
-  // Below the chip, kept inside the window.
-  const rect = props.anchor?.getBoundingClientRect();
-  const width = Math.min(320, window.innerWidth - 16);
-  const left = Math.max(8, Math.min((rect?.left ?? 8), window.innerWidth - width - 8));
-  const top = (rect?.bottom ?? 40) + 4;
+  // Below the chip, kept inside the window; placed again when the window changes.
+  const place = () => {
+    const rect = props.anchor?.getBoundingClientRect();
+    const width = Math.min(320, window.innerWidth - 16);
+    const left = Math.max(8, Math.min(rect?.left ?? 8, window.innerWidth - width - 8));
+    return { width, left, top: (rect?.bottom ?? 40) + 4 };
+  };
+  const [pos, setPos] = createSignal(place());
+  const onResize = () => setPos(place());
   const onKey = (e: KeyboardEvent) => {
     if (e.key === "Escape") props.onClose();
   };
   window.addEventListener("keydown", onKey);
-  onCleanup(() => window.removeEventListener("keydown", onKey));
+  window.addEventListener("resize", onResize);
+  onCleanup(() => {
+    window.removeEventListener("keydown", onKey);
+    window.removeEventListener("resize", onResize);
+  });
+  let dialog: HTMLDivElement | undefined;
+  onMount(() => dialog?.focus());
   return (
     <>
       <div class="fixed inset-0 z-30" onClick={() => props.onClose()} aria-hidden="true" />
       <div
+        ref={dialog}
         role="dialog"
         aria-label="Workstream"
-        class="fixed z-40 space-y-3 overflow-y-auto rounded-lg border border-border bg-bg-elev p-3 text-[12px] shadow-2xl"
-        style={{ left: `${left}px`, top: `${top}px`, width: `${width}px`, "max-height": `calc(100vh - ${top + 8}px)` }}
+        tabIndex={-1}
+        class="fixed z-40 space-y-3 overflow-y-auto rounded-lg border border-border bg-bg-elev p-3 text-[12px] shadow-2xl focus:outline-none"
+        style={{ left: `${pos().left}px`, top: `${pos().top}px`, width: `${pos().width}px`, "max-height": `calc(100vh - ${pos().top + 8}px)` }}
       >
         <div>
           <div class="text-[10px] font-medium uppercase tracking-wider text-fg-faint">Home</div>

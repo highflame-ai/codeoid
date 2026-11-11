@@ -465,12 +465,16 @@ A folder's workstream is remembered: if its repository later matches a different
 
 ### Reading another workstream, and moving a session
 
-With `isolateGlobalServers: true` a session reads only its own workstream's folders and memory:
-- its sandbox shows its home's folders read-only as its project roots (never the whole `@parent`), and hides every other workstream's folder under a root it shows;
+With `isolateGlobalServers: true` a session is fenced off from every other workstream's folders and memory:
+- its sandbox shows its home's folders read-only as its project roots (never the whole `@parent`), and hides other workstreams' folders;
 - a file tool (Read, Grep, Glob, Write, Edit, on every backend, in every mode) in another workstream's folder is refused, naming that workstream;
 - `recall`, `timeline` and `get_episode` leave out episodes another workstream wrote (episodes from before workstreams stay visible in their repository).
 
-A workstream's folders are the directories its path rules name on this machine (a glob such as `~/Workspace/acme-*` expands to the folders it matches, never to `~/Workspace`), plus the folders recorded as its home (a remote rule names no path).
+A workstream's folders are the directories its path rules name on this machine (a glob such as `~/Workspace/acme-*` expands to the folders it matches, never to `~/Workspace`), plus the folders where its sessions were started by their folder's own match.
+The more specific rule decides: a catch-all workstream over `~/Workspace` is fenced off from `~/Workspace/acme-api` when that is another's, and inside a folder of another workstream's, only what the session may read (its own workdir, its home's folders, what a reference grants) stays readable.
+The home itself is never a workstream's folder.
+
+Limits: a repository matched only by a remote rule is fenced once a session has been started there (its folder is recorded then); one never opened is not. A session's commands in an unsandboxed session (`--sandbox off`) can still read other workstreams' folders; only its file tools are fenced.
 
 A **reference** lets a session read another workstream: its folders read-only (or only some), and its memory. Never its servers, credentials or accounts, and never a write.
 The workstream being read decides, by its `share`:
@@ -491,7 +495,6 @@ codeoid workstream move <session> <workstream>                         # another
 Moving a session takes its whole conversation with it, so it follows the `share` of its old home and of every workstream it has read from (for its lifetime, even after the reference is gone). Moving from the default workstream, or from no home, is always allowed; past another workstream's exclusive folder it is an override (needs `session:approve`).
 Each change applies at the session's next turn: its backend is rebuilt with the new servers, credentials and sandbox.
 
-Commands in an unsandboxed session (`--sandbox off`) can still read other workstreams' folders; only its file tools are fenced.
 
 ### Moving an existing setup
 

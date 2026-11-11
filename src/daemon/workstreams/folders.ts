@@ -91,17 +91,20 @@ export function expandPathRule(rule: string, limit = FOLDER_LIMIT): ExpandedFold
  * The repository top of `dir`: the nearest ancestor holding `.git` (a dir or
  * a file), or `dir` itself when there is none. A recorded home folder is a
  * session's workdir, which may be a package inside a repository: the fence is
- * the whole repository.
+ * the whole repository. Never `stopAt` (the home) or anything holding it: a
+ * home that is itself a repository (dotfiles) must not make every folder in
+ * it one workstream's.
  */
 export function repositoryTopOf(dir: string, stopAt?: string): string {
   let at = dir;
   for (;;) {
+    if (at === "/" || (stopAt !== undefined && within(stopAt, at))) return dir;
     try {
       lstatSync(join(at, ".git"));
       return at;
     } catch {}
     const up = dirname(at);
-    if (up === at || at === stopAt) return dir;
+    if (up === at) return dir;
     at = up;
   }
 }
@@ -117,4 +120,43 @@ export function outermost(folders: Iterable<string>): string[] {
   const out: string[] = [];
   for (const f of sorted) if (!out.some((o) => within(f, o))) out.push(f);
   return out;
+}
+
+/** Most entries {@link carveOut} hides before it gives up (and the folder is hidden whole). */
+export const CARVE_LIMIT = 2000;
+
+/**
+ * What to hide of `folder` so that only `keep` (paths inside it) stays
+ * visible: every entry on the way to a kept path that doesn't lead to one,
+ * at each level. Null when that takes more than `limit` entries or a level
+ * can't be listed: then the folder is hidden whole (the kept paths with it —
+ * failing closed).
+ */
+export function carveOut(folder: string, keep: readonly string[], limit = CARVE_LIMIT): string[] | null {
+  const out: string[] = [];
+  const walk = (dir: string): boolean => {
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return false;
+    }
+    for (const name of names) {
+      const path = join(dir, name);
+      if (keep.some((k) => within(path, k))) continue; // kept (or inside one)
+      if (keep.some((k) => within(k, path))) {
+        // Leads to a kept path: hide its other entries, never follow a link.
+        let real = false;
+        try {
+          real = lstatSync(path).isDirectory();
+        } catch {}
+        if (!real || !walk(path)) return false;
+        continue;
+      }
+      out.push(path);
+      if (out.length > limit) return false;
+    }
+    return true;
+  };
+  return walk(folder) ? out : null;
 }

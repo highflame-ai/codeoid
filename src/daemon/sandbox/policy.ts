@@ -1210,7 +1210,11 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const baseHidden = hiddenPathsFor(inputs.config, inputs.hidden);
   // What the hidden list hides, the home aside: no root or added dir is inside it (validated; again here).
   const inHidden = (p: string) => [...baseHidden, ...(root ? [root] : [])].some((h) => within(p, h) || within(realOr(p), realOr(h)));
-  const addedKept = added.filter((a) => !inHidden(a.dir) && !userHidden.some((u) => within(a.dir, u)));
+  // An added dir inside another workstream's folder isn't kept either: adding it can't open the fence.
+  const extraHidden = (inputs.extraHidden ?? []).map((h) => resolve(h));
+  const addedKept = added.filter(
+    (a) => !inHidden(a.dir) && !userHidden.some((u) => within(a.dir, u)) && !extraHidden.some((h) => within(a.dir, h) || within(realOr(a.dir), realOr(h))),
+  );
   // The session's own: its workspace and the dirs its owner added (their credentials are its to use, as the
   // workspace's are). A dir the agent added itself (autonomous `request_directory`) keeps the hiding a root has.
   // Its repository's git dir too (a fork's worktree uses its main checkout's): git there reads its config.

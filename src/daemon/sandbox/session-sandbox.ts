@@ -611,9 +611,9 @@ export class SessionSandbox {
     const wd = this.#workstreamDirs?.();
     if (!wd) return undefined;
     const workspace = this.#workspace();
-    const added = this.#setting?.addedDirs ?? [];
     const holds = (h: string, p: string) => h === "/" || p === h || p.startsWith(`${h}/`);
-    const hidden = wd.hidden.filter((h) => !holds(h, workspace) && !holds(h, this.#workdir) && !added.some((a) => holds(h, a) || holds(a, h)));
+    // An added dir doesn't un-hide one: one inside a hidden folder is dropped (policy.ts), one holding it keeps it hidden.
+    const hidden = wd.hidden.filter((h) => !holds(h, workspace) && !holds(h, this.#workdir));
     return { roots: wd.roots, hidden };
   }
 

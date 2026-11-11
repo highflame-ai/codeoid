@@ -11,6 +11,7 @@
 import { addedDirProblem, type OtherCheckout, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
 import { WorkstreamService, type WorkstreamBinding, type WorkstreamFence, type WorkstreamReference } from "./workstreams/service.js";
 import { repositoryTopOf } from "./workstreams/folders.js";
+import { REFERENCE_LIMIT, referencePathsProblem } from "./workstreams/binding.js";
 import { grantRefusal, type McpGrant } from "./workstreams/grant.js";
 import { OverrideTokens } from "./workstreams/override.js";
 import { withSlot } from "./mcp/oauth.js";
@@ -2338,7 +2339,7 @@ mcpHub: this.#mcpHub,
     describeWorkstream: (b: WorkstreamBinding | undefined) => ReturnType<WorkstreamService["info"]>;
     workstreamEnv?: (b: WorkstreamBinding | undefined) => Readonly<Record<string, string>>;
     mcpGrant: (b: WorkstreamBinding | undefined) => McpGrant | undefined;
-    workstreamFence: (b: WorkstreamBinding | undefined) => WorkstreamFence | undefined;
+    workstreamFence: (b: WorkstreamBinding | undefined, own: readonly string[]) => WorkstreamFence | undefined;
   } {
     const { missing } = this.#workstreams.envFor(binding, this.#secrets);
     if (missing.length > 0) {
@@ -2353,7 +2354,7 @@ mcpHub: this.#mcpHub,
       ...(this.#workstreams.configured || binding ? { workstreamEnv: (b: WorkstreamBinding | undefined) => (b?.id ? this.#workstreams.envFor(b, this.#secrets).env : {}) } : {}),
       // The grant follows the config as it is at each listing.
       mcpGrant: (b) => this.#workstreams.grantFor(b),
-      workstreamFence: (b) => this.#workstreamFence(b),
+      workstreamFence: (b, own) => this.#workstreamFence(b, own),
     };
   }
 
@@ -2366,15 +2367,15 @@ mcpHub: this.#mcpHub,
    * names no path), as repository tops. Cached 5s: folders made meanwhile
    * (a new clone) are fenced within that.
    */
-  #workstreamFence(binding: WorkstreamBinding | undefined): WorkstreamFence | undefined {
+  #workstreamFence(binding: WorkstreamBinding | undefined, own: readonly string[] = []): WorkstreamFence | undefined {
     if (!this.#workstreams.configured || !this.#workstreams.isolateGlobalServers) return undefined;
-    const key = `${this.#workstreams.revision}\u0000${JSON.stringify(binding ?? null)}`;
+    const key = `${this.#workstreams.revision}\u0000${JSON.stringify(binding ?? null)}\u0000${own.join("\u0000")}`;
     const now = Date.now();
     const hit = this.#fenceCache.get(key);
     if (hit && now - hit.at < 5_000) return hit.fence;
     const recorded = this.#store.workstreamFoldersByWorkstream();
     const home = homedir();
-    const fence = this.#workstreams.fenceFor(binding, (id) => (recorded.get(id) ?? []).map((w) => repositoryTopOf(w, home)));
+    const fence = this.#workstreams.fenceFor(binding, (id) => (recorded.get(id) ?? []).map((w) => repositoryTopOf(w, home)), own);
     if (this.#fenceCache.size > 256) this.#fenceCache.clear();
     this.#fenceCache.set(key, { at: now, fence });
     return fence;
@@ -4859,9 +4860,8 @@ mcpHub: this.#mcpHub,
       const refs: WorkstreamReference[] = [];
       for (const asked of msg.references) {
         const paths = asked.paths?.map((p) => normalizeWorkdir(p) ?? p);
-        if (paths?.some((p) => !p.startsWith("/"))) {
-          return { type: "response.error", requestId: msg.id, error: "A reference's folders are absolute paths", code: "invalid_request" };
-        }
+        const pathProblem = referencePathsProblem(paths);
+        if (pathProblem) return { type: "response.error", requestId: msg.id, error: pathProblem, code: "invalid_request" };
         const v = this.#workstreams.referenceVerdict(createWorkstream.id, { workstream: asked.workstream, ...(paths ? { paths } : {}) }, (recorded.get(asked.workstream) ?? []).map((w) => repositoryTopOf(w, homedir())));
         if (!v.ok) return { type: "response.error", requestId: msg.id, error: v.error, code: "forbidden" };
         if (v.ask.length > 0 && !approves) {
@@ -10044,7 +10044,11 @@ mcpHub: this.#mcpHub,
       | { error: string };
     if (msg.type === "session.add_reference") {
       const paths = msg.paths?.map((p) => normalizeWorkdir(p) ?? p);
-      if (paths?.some((p) => !p.startsWith("/"))) return err("A reference's folders are absolute paths");
+      // Held to what a binding is read back with: one stored that can't be read would seal the session.
+      const pathProblem = referencePathsProblem(paths);
+      if (pathProblem) return err(pathProblem);
+      const others = (binding.references ?? []).filter((r) => r.workstream !== msg.workstream);
+      if (others.length >= REFERENCE_LIMIT) return err(`A session reads at most ${REFERENCE_LIMIT} other workstreams`);
       const recorded = this.#store.workstreamFoldersByWorkstream().get(msg.workstream) ?? [];
       const v = this.#workstreams.referenceVerdict(binding.id, { workstream: msg.workstream, ...(paths ? { paths } : {}) }, recorded.map((w) => repositoryTopOf(w, homedir())));
       const again = () => {
