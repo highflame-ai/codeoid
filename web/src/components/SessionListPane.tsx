@@ -6,6 +6,7 @@
  */
 
 import { Component, createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import { WorkstreamChip } from "./WorkstreamChip";
 
 import { formatSessionCost, formatTokens, relativeTime } from "../lib/format";
 import {
@@ -456,6 +457,9 @@ const SessionRow: Component<{
           </span>
           <Show when={props.session.role === "conductor"}>
             <ConductorBadge />
+          </Show>
+          <Show when={props.session.workstream?.id && props.session.role !== "conductor"}>
+            <WorkstreamChip session={props.session} />
           </Show>
           <Show when={workerShape(props.session)}>
             {(shape) => <WorkerShapeBadge shape={shape()} />}

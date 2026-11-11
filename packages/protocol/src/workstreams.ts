@@ -63,6 +63,8 @@ export interface WorkstreamSummary {
   env: string[];
   git?: { name?: string; email?: string };
   skillDirs: string[];
+  /** The item as configured (bases NOT merged): what an editor edits and sends back to `workstream.upsert`. */
+  config: Record<string, unknown>;
 }
 
 export interface WorkstreamMatchInfo {

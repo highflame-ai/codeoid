@@ -170,10 +170,12 @@ export function filterFleet(
   return out;
 }
 
-/** Name, workdir, role name, or the session role ("conductor" / a worker's shape). */
+/** Name, workdir, workstream, role name, or the session role ("conductor" / a worker's shape). */
 function matchesSession(s: SessionInfo, lowercaseQuery: string): boolean {
   if (s.name.toLowerCase().includes(lowercaseQuery)) return true;
   if (s.workdir.toLowerCase().includes(lowercaseQuery)) return true;
+  // "acme" finds every session of the Acme workstream.
+  if (s.workstream?.id?.includes(lowercaseQuery) || s.workstream?.name?.toLowerCase().includes(lowercaseQuery)) return true;
   const role = s.collaborationRole?.roleName;
   if (role !== undefined && role.includes(lowercaseQuery)) return true;
   // "conductor" / "worker" / "scout" / "ship" are how you'd actually search

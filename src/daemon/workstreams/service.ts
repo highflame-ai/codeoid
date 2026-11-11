@@ -181,6 +181,7 @@ export class WorkstreamService {
       env: Object.keys(w.env),
       ...(w.git ? { git: { ...w.git } } : {}),
       skillDirs: [...w.skillDirs],
+      config: structuredClone((this.#cfg.items.find((i) => i.id === w.id) ?? {}) as Record<string, unknown>),
     }));
   }
 

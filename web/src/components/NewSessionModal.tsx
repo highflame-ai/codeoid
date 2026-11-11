@@ -59,6 +59,8 @@ function sandboxDefaultLabel(d: SandboxProvidersData | null): string {
 import DirectoryPicker from "./files/DirectoryPicker";
 import { providerIds, providerLabel } from "../state/providers";
 import { accountDetail, backendAccounts, DEFAULT_ACCOUNT, fetchAccounts } from "../state/accounts";
+import { fetchWorkstreams, homeChoices, resolveWorkstream } from "../state/workstreams";
+import type { WorkstreamResolution } from "../protocol/types";
 
 /** The modal serves three flows from one dialog: a plain session, a governed
  *  pipeline run (docs/pipeline-run.md — adds a goal box + requires a pack), or
@@ -162,6 +164,31 @@ const NewSessionModal: Component = () => {
   // daemon default, "default" = pin the daemon's own login, else a named
   // account (accounts.ts). Names are per backend, so a provider change resets it.
   const [account, setAccount] = createSignal("");
+  // Home workstream (docs/workstreams-design.md): "" = the folder's (what
+  // `workstream.resolve` says), else an explicit choice.
+  const [workstream, setWorkstream] = createSignal("");
+  const [resolution, setResolution] = createSignal<WorkstreamResolution | null>(null);
+  // A choice refused past another workstream's exclusive claim, with the token
+  // that confirms it (G3): shown with what would change, never sent unasked.
+  const [overrideOffer, setOverrideOffer] = createSignal<NonNullable<WorkstreamResolution["conflict"]> | null>(null);
+  // What the folder resolves to, as it is typed or picked (debounced).
+  createEffect(
+    on([workdir, openSignal, () => homeChoices().length], ([dir, open, homes]) => {
+      setOverrideOffer(null);
+      if (!open || homes === 0 || !dir.trim()) {
+        setResolution(null);
+        return;
+      }
+      const timer = setTimeout(() => {
+        resolveWorkstream(dir.trim())
+          .then((r) => {
+            if (workdir() === dir) setResolution(r);
+          })
+          .catch(() => setResolution(null));
+      }, 300);
+      onCleanup(() => clearTimeout(timer));
+    }),
+  );
   // OS sandbox (#448): "" = the daemon's default; else auto | off | a provider id.
   const [sandboxChoice, setSandboxChoice] = createSignal("");
   // "" = the daemon's default network; else on | off.
@@ -421,6 +448,8 @@ const NewSessionModal: Component = () => {
         void fetchPacks().catch(() => {});
         // Named accounts, for the account picker (hidden without any).
         void fetchAccounts(true).catch(() => {});
+        // Workstreams, for the workstream picker (hidden without any).
+        void fetchWorkstreams(true).catch(() => {});
         requestAnimationFrame(() => nameRef?.focus());
       }
     }),
@@ -454,6 +483,9 @@ const NewSessionModal: Component = () => {
     setGoal("");
     setProviderId("");
     setAccount("");
+    setWorkstream("");
+    setResolution(null);
+    setOverrideOffer(null);
     setPackId("");
     setPackRole("");
     setSandboxChoice("");
@@ -464,7 +496,7 @@ const NewSessionModal: Component = () => {
     setWarnings([]);
   }
 
-  async function submit(ev: Event): Promise<void> {
+  async function submit(ev: Event, overrideToken?: string): Promise<void> {
     ev.preventDefault();
     if (busy()) return;
     const n = name().trim();
@@ -597,6 +629,8 @@ const NewSessionModal: Component = () => {
             : {}),
         ...(packId() ? { pack: packId() } : {}),
         ...(packRole() ? { packRole: packRole() } : {}),
+        ...(workstream() ? { workstream: workstream() } : {}),
+        ...(overrideToken && workstream() ? { override: { token: overrideToken } } : {}),
         ...(sandboxChoice() || sandboxNetwork() || sandboxDocker() || sandboxRoots().trim() || sandboxAdded().trim()
           ? {
               sandbox: {
@@ -628,7 +662,17 @@ const NewSessionModal: Component = () => {
         closeAndReset();
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      // Past another workstream's exclusive claim, with a way to confirm it:
+      // offered, never sent unasked.
+      const detail = err && typeof err === "object" && "detail" in err ? (err as { detail?: { kind?: string; resolution?: WorkstreamResolution } }).detail : undefined;
+      const conflict = detail?.kind === "workstream_conflict" ? detail.resolution?.conflict : undefined;
+      if (conflict?.overrideToken && !overrideToken) {
+        setOverrideOffer(conflict);
+        setError(null);
+      } else {
+        setOverrideOffer(null);
+        setError(err instanceof Error ? err.message : String(err));
+      }
       setBusy(false);
     }
   }
@@ -1165,6 +1209,66 @@ const NewSessionModal: Component = () => {
               </Show>
             </Show>
           </div>
+
+          <Show when={mode() === "session" && homeChoices().length > 0}>
+            <label class="block space-y-1.5">
+              <span class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">Workstream</span>
+              <select
+                value={workstream()}
+                onChange={(e) => {
+                  setWorkstream(e.currentTarget.value);
+                  setOverrideOffer(null);
+                }}
+                disabled={busy()}
+                aria-label="Workstream"
+                class="w-full rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
+              >
+                <option value="">
+                  {resolution()?.home
+                    ? `The folder's: ${resolution()?.home}${resolution()?.source === "matched" ? ` (matched by ${resolution()?.matchedBy})` : resolution()?.source === "default" ? " (the default)" : ""}`
+                    : resolution()?.ambiguous
+                      ? `The folder's: none — ${resolution()?.ambiguous?.join(" and ")} both match`
+                      : "The folder's (none matches)"}
+                </option>
+                <For each={homeChoices()}>{(w) => <option value={w.id}>{w.name === w.id ? w.id : `${w.name} (${w.id})`}</option>}</For>
+              </select>
+            </label>
+          </Show>
+
+          <Show when={overrideOffer()}>
+            {(c) => (
+              <div class="space-y-2 rounded border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-relaxed text-warn" role="alert">
+                <div class="font-semibold">This folder belongs to workstream “{c().folder}” (exclusive).</div>
+                <div>
+                  A session here in “{c().chosen}” gets{" "}
+                  {c().changes && c().changes!.gains.length > 0 ? `its servers (${c().changes!.gains.join(", ")})` : "none of the folder's servers"}
+                  {c().changes && c().changes!.env.length > 0 ? ` and env ${c().changes!.env.join(", ")}` : ""}
+                  {c().changes?.git ? `, commits as ${c().changes!.git}` : ""}, and writes into “{c().folder}”'s code
+                  {c().changes && c().changes!.withholds.length > 0 ? `; it is not given ${c().changes!.withholds.join(", ")}` : ""}.
+                </div>
+                <div class="flex gap-2">
+                  <button
+                    type="button"
+                    class="rounded border border-border bg-bg px-2.5 py-1 text-fg"
+                    onClick={() => {
+                      setWorkstream(c().folder);
+                      setOverrideOffer(null);
+                    }}
+                  >
+                    Use “{c().folder}”
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded border border-warn/60 bg-bg px-2.5 py-1 text-warn"
+                    disabled={busy()}
+                    onClick={(e) => void submit(e, c().overrideToken)}
+                  >
+                    Start anyway
+                  </button>
+                </div>
+              </div>
+            )}
+          </Show>
 
           <Show when={error()}>
             <div class="rounded border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
