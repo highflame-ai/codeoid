@@ -463,6 +463,36 @@ A workstream with `allowOverride: false` can't be overridden at all.
 
 A folder's workstream is remembered: if its repository later matches a different one (its `origin` was changed), the next session there must choose.
 
+### Reading another workstream, and moving a session
+
+With `isolateGlobalServers: true` a session reads only its own workstream's folders and memory:
+- its sandbox shows its home's folders read-only as its project roots (never the whole `@parent`), and hides every other workstream's folder under a root it shows;
+- a file tool (Read, Grep, Glob, Write, Edit, on every backend, in every mode) in another workstream's folder is refused, naming that workstream;
+- `recall`, `timeline` and `get_episode` leave out episodes another workstream wrote (episodes from before workstreams stay visible in their repository).
+
+A workstream's folders are the directories its path rules name on this machine (a glob such as `~/Workspace/acme-*` expands to the folders it matches, never to `~/Workspace`), plus the folders recorded as its home (a remote rule names no path).
+
+A **reference** lets a session read another workstream: its folders read-only (or only some), and its memory. Never its servers, credentials or accounts, and never a write.
+The workstream being read decides, by its `share`:
+
+| `share` | A reference to it is… |
+| --- | --- |
+| `open` | granted. |
+| `ask` | granted when its owner asks with `session:approve` on an undelegated token; asked of the owner on the session otherwise. |
+| `closed` | refused. A reference granted before it was closed gives nothing. |
+
+```bash
+codeoid new <name> <dir> --ref pub --ref acme:~/Workspace/acme-api   # at create
+codeoid workstream ref add <session> pub                               # later (the session header's chip too)
+codeoid workstream ref rm <session> pub
+codeoid workstream move <session> <workstream>                         # another home
+```
+
+Moving a session takes its whole conversation with it, so it follows the `share` of its old home and of every workstream it has read from (for its lifetime, even after the reference is gone). Moving from the default workstream, or from no home, is always allowed; past another workstream's exclusive folder it is an override (needs `session:approve`).
+Each change applies at the session's next turn: its backend is rebuilt with the new servers, credentials and sandbox.
+
+Commands in an unsandboxed session (`--sandbox off`) can still read other workstreams' folders; only its file tools are fenced.
+
 ### Moving an existing setup
 
 `codeoid workstream import [--root <dir>]` proposes workstreams from your repositories' remotes and lists Claude's global MCP servers to assign. It writes nothing; isolation stays off until you turn it on.

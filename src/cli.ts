@@ -1091,6 +1091,12 @@ program
   )
   .option("--override", "with --workstream: confirm it past the folder's own exclusive workstream without asking (needs session:approve)")
   .option(
+    "--ref <workstream[:dir]>",
+    "Another workstream the session may read: its folders read-only (or only <dir>) and its memory, repeatable. By its share policy: open, ask (needs session:approve), closed (refused).",
+    (v: string, p: string[] = []) => [...p, v],
+    [] as string[],
+  )
+  .option(
     "--pack <id>",
     "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents). With --collaborate, the collaboration ADOPTS the pack: role names bind strictly to the pack's declared roles.",
   )
@@ -1133,9 +1139,17 @@ program
         projectRoots?: boolean;
         workstream?: string;
         override?: boolean;
+        ref: string[];
       },
     ) => {
       const config = loadConfig();
+      let references: Array<{ workstream: string; paths?: string[] }>;
+      try {
+        references = referenceFlags(opts.ref);
+      } catch (e) {
+        console.error(e instanceof Error ? e.message : String(e));
+        process.exit(1);
+      }
       if (opts.override && !opts.workstream) {
         console.error("--override confirms a --workstream choice; give one (codeoid workstream match <dir> shows the folder's).");
         process.exit(1);
@@ -1210,6 +1224,7 @@ program
         collaboration,
         ...(sandbox ? { sandbox } : {}),
         ...(opts.workstream ? { workstream: opts.workstream } : {}),
+        ...(references.length > 0 ? { references } : {}),
         confirmOverride: async (warning: string) => {
           console.error(warning);
           return confirmOnTerminal("Start it anyway? [y/N] ", opts.override, "Not started: pass --override to confirm without a terminal.");
@@ -1218,6 +1233,22 @@ program
       client.disconnect();
     },
   );
+
+/** `--ref acme`, `--ref acme:~/Workspace/acme-api` → references, one per workstream (folders gathered). */
+export function referenceFlags(flags: readonly string[]): Array<{ workstream: string; paths?: string[] }> {
+  const out = new Map<string, { workstream: string; paths?: string[]; whole: boolean }>();
+  for (const f of flags) {
+    const at = f.indexOf(":");
+    const workstream = (at < 0 ? f : f.slice(0, at)).trim();
+    const dir = at < 0 ? "" : f.slice(at + 1).trim();
+    if (!workstream) throw new Error(`--ref ${f}: name a workstream (--ref <workstream>[:<dir>])`);
+    const cur = out.get(workstream) ?? { workstream, whole: false };
+    if (!dir) cur.whole = true;
+    else cur.paths = [...(cur.paths ?? []), dirFlag(dir)];
+    out.set(workstream, cur);
+  }
+  return [...out.values()].map((r) => (r.whole || !r.paths ? { workstream: r.workstream } : { workstream: r.workstream, paths: r.paths }));
+}
 
 /** A directory as the daemon keeps it: `~` left to it (its home), a relative one this shell's. */
 function dirFlag(d: string): string {
@@ -1706,6 +1737,43 @@ workstreamCmd
       if (w.git?.name || w.git?.email) line("git", [w.git.name, w.git.email && `<${w.git.email}>`].filter(Boolean).join(" "));
       for (const d of w.skillDirs) line("skills", d);
     });
+  });
+
+workstreamCmd
+  .command("move <session> <workstream>")
+  .description("Move a session to another home workstream: its whole conversation goes with it, so the share policy of its old home (and of each workstream it read) decides; applied at its next turn")
+  .action(async (session: string, workstream: string) => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    try {
+      await client.sessionWorkstream(session, { kind: "set_workstream", workstream });
+    } finally {
+      client.disconnect();
+    }
+  });
+
+workstreamCmd
+  .command("ref <action> <session> <workstream[:dir]>")
+  .description("add | rm: let a session read another workstream (its folders read-only, or only <dir>, and its memory), or stop")
+  .action(async (action: string, session: string, target: string) => {
+    if (action !== "add" && action !== "rm") {
+      console.error("codeoid workstream ref add|rm <session> <workstream>[:<dir>]");
+      process.exit(1);
+    }
+    let ref: { workstream: string; paths?: string[] };
+    try {
+      [ref] = referenceFlags([target]) as [{ workstream: string; paths?: string[] }];
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    try {
+      await client.sessionWorkstream(session, action === "add" ? { kind: "add_reference", ...ref } : { kind: "remove_reference", workstream: ref.workstream });
+    } finally {
+      client.disconnect();
+    }
   });
 
 workstreamCmd

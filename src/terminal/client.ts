@@ -483,6 +483,38 @@ export class TerminalClient {
     if (line) console.log(`  now: ${line}`);
   }
 
+  /**
+   * Change what workstreams a session reads, or move it to another
+   * (workstreams §5.3, §7): `session.add_reference` / `remove_reference` /
+   * `set_workstream`. An `ask` workstream may be asked of the owner on the session.
+   */
+  async sessionWorkstream(
+    sessionIdOrName: string,
+    change: { kind: "add_reference"; workstream: string; paths?: string[] } | { kind: "remove_reference"; workstream: string } | { kind: "set_workstream"; workstream: string },
+  ): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const base = { id: randomUUID(), sessionId, workstream: change.workstream };
+    const resp = await this.#request(
+      change.kind === "add_reference"
+        ? { type: "session.add_reference", ...base, ...(change.paths?.length ? { paths: change.paths } : {}) }
+        : change.kind === "remove_reference"
+          ? { type: "session.remove_reference", ...base }
+          : { type: "session.set_workstream", ...base },
+    );
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const data = resp.data as { pending?: boolean; message?: string; workstream?: SessionInfo["workstream"] };
+    if (data.pending) console.log(`Asked on the session: it applies once its owner says yes (codeoid approve ${S(sessionIdOrName)}, or the web UI), from its next turn.`);
+    else console.log(change.kind === "set_workstream" ? `Moved: its servers, credentials and sandbox follow from its next turn.` : `Done, from its next turn.`);
+    const ws = workstreamSummary(data.workstream);
+    if (ws) console.log(`  ${sanitizeTerminalOutput(ws)}`);
+    const refs = data.workstream?.references ?? [];
+    if (refs.length > 0) console.log(`  reads: ${sanitizeTerminalOutput(refs.map((r) => `${r.workstream}${r.paths ? ` (${r.paths.join(", ")})` : ""}`).join("; "))}`);
+  }
+
   /** The daemon's sandbox providers and whether each runs here (#448). */
   async sandboxProviders(): Promise<void> {
     const resp = await this.#request({ type: "sandbox.providers", id: randomUUID() });
@@ -521,6 +553,8 @@ export class TerminalClient {
       sandbox?: SessionSandboxSetting;
       /** Home workstream (docs/workstreams-design.md); absent = the folder's. */
       workstream?: string;
+      /** Other workstreams it may read (§7.2). */
+      references?: Array<{ workstream: string; paths?: string[] }>;
       /**
        * Asked when the choice conflicts with the folder's exclusive workstream
        * and may be overridden (G3): shown what would change; true = confirm.
@@ -549,6 +583,7 @@ export class TerminalClient {
       ...(opts.sandbox ? { sandbox: opts.sandbox } : {}),
       ...(opts.workstream ? { workstream: opts.workstream } : {}),
       ...(opts.overrideToken ? { override: { token: opts.overrideToken } } : {}),
+      ...(opts.references?.length ? { references: opts.references } : {}),
     });
 
     const conflict = resp.type === "response.error" && resp.detail?.kind === "workstream_conflict" ? resp.detail.resolution.conflict : undefined;
