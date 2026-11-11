@@ -9,6 +9,7 @@ import { ancestry, expandHome, matchFolder, normalizePathRule, normalizeRemote, 
 import { workstreamsSchema } from "./schema.js";
 import { WorkstreamService } from "./service.js";
 import { proposeWorkstreams } from "./import.js";
+import { expandPathRule } from "./folders.js";
 import { EnvFileSecretStore } from "../credentials/store.js";
 
 const ws = (id: string, over: Partial<MatchableWorkstream> = {}): MatchableWorkstream => ({
@@ -552,3 +553,82 @@ describe("proposeWorkstreams (codeoid workstream import)", () => {
   });
 });
 
+
+describe("W3: folders, the fence, share verdicts", () => {
+  const service = (items: unknown[], extra: Record<string, unknown> = {}) =>
+    new WorkstreamService(workstreamsSchema.parse({ isolateGlobalServers: true, items, ...extra }), new FolderReader({ home: tmp, sshConfig: "" }));
+
+  test("a glob rule expands to the folders it names, never its literal head; a link is never followed", () => {
+    for (const d of ["W/acme-api", "W/acme-web", "W/other", "elsewhere"]) mkdirSync(join(tmp, d), { recursive: true });
+    writeFileSync(join(tmp, "W", "acme-file"), "");
+    symlinkSync(join(tmp, "elsewhere"), join(tmp, "W", "acme-link"));
+    expect(expandPathRule(join(tmp, "W", "acme-*")).folders.sort()).toEqual([join(tmp, "W", "acme-api"), join(tmp, "W", "acme-web")]);
+    expect(expandPathRule(join(tmp, "W", "missing")).folders).toEqual([]);
+    expect(expandPathRule(join(tmp, "W", "**", "x")).limits[0]).toContain("**");
+    expect(expandPathRule(join(tmp, "W", "*"), 1).limits[0]).toContain("more than 1");
+  });
+
+  test("the fence: home's folders, a reference's (narrowed by paths), and every other workstream's as foreign", () => {
+    for (const d of ["W/acme-api", "W/acme-web", "W/hf", "W/mine/inner"]) mkdirSync(join(tmp, d), { recursive: true });
+    const s = service([
+      { id: "acme", share: "ask", match: { paths: ["~/W/acme-*"] } },
+      { id: "hf", share: "closed", match: { paths: ["~/W/hf"] } },
+      { id: "mine", share: "open", match: { paths: ["~/W/mine"] } },
+      { id: "broad", match: { paths: ["~/W"] } },
+    ]);
+    const fence = s.fenceFor({ id: "mine", source: "matched", revision: "r", references: [{ workstream: "acme", paths: [join(tmp, "W", "acme-api")], grantedBy: "u", grantedAt: "t" }] })!;
+    expect(fence.home).toEqual([join(tmp, "W", "mine")]);
+    expect(fence.references).toEqual([{ workstream: "acme", folders: [join(tmp, "W", "acme-api")] }]);
+    // acme-web isn't referenced: foreign, as is hf; `broad` holds the home, so it can't be fenced off.
+    expect(fence.foreign).toEqual([
+      { workstream: "acme", folders: [join(tmp, "W", "acme-web")] },
+      { workstream: "hf", folders: [join(tmp, "W", "hf")] },
+    ]);
+    // A closed workstream's reference gives nothing, even one granted before.
+    const closed = s.fenceFor({ id: "mine", source: "matched", revision: "r", references: [{ workstream: "hf", grantedBy: "u", grantedAt: "t" }] })!;
+    expect(closed.references).toEqual([]);
+    // Recorded homes (a remote-rule workstream) count as its folders.
+    expect(s.fenceFor(undefined, (id) => (id === "hf" ? [join(tmp, "W", "hf"), "/srv/hf-clone"] : []))!.foreign.find((f) => f.workstream === "hf")?.folders.sort()).toEqual(["/srv/hf-clone", join(tmp, "W", "hf")].sort());
+    // Isolation off: no fence.
+    expect(new WorkstreamService(workstreamsSchema.parse({ items: [{ id: "a" }] }), new FolderReader({ home: tmp, sshConfig: "" })).fenceFor(undefined)).toBeUndefined();
+  });
+
+  test("reference verdicts follow the share policy of the workstream read", () => {
+    mkdirSync(join(tmp, "W", "acme-api"), { recursive: true });
+    const s = service([
+      { id: "acme", share: "ask", match: { paths: ["~/W/acme-*"] } },
+      { id: "hf", share: "closed" },
+      { id: "pub", share: "open" },
+      { id: "base", abstract: true },
+    ]);
+    expect(s.referenceVerdict("pub", { workstream: "acme" })).toEqual({ ok: true, ask: ["acme"] });
+    expect(s.referenceVerdict("acme", { workstream: "pub" })).toEqual({ ok: true, ask: [] });
+    expect(s.referenceVerdict("pub", { workstream: "hf" })).toMatchObject({ ok: false });
+    expect(s.referenceVerdict("pub", { workstream: "base" })).toMatchObject({ ok: false });
+    expect(s.referenceVerdict("pub", { workstream: "pub" })).toMatchObject({ ok: false });
+    expect(s.referenceVerdict("pub", { workstream: "nope" })).toMatchObject({ ok: false });
+    expect(s.referenceVerdict("pub", { workstream: "acme", paths: [join(tmp, "W", "acme-api", "src")] })).toEqual({ ok: true, ask: ["acme"] });
+    expect(s.referenceVerdict("pub", { workstream: "acme", paths: ["/etc"] })).toMatchObject({ ok: false });
+  });
+
+  test("move verdicts: the old home's policy and every workstream read from; from the default, always", () => {
+    const s = service([{ id: "acme", share: "ask" }, { id: "hf", share: "closed" }, { id: "pub", share: "open" }, { id: "scratch", share: "closed" }], { default: "scratch" });
+    const b = (id: string, readFrom?: string[]) => ({ id, source: "matched" as const, revision: "r", ...(readFrom ? { readFrom } : {}) });
+    expect(s.moveVerdict(b("pub"), "acme")).toEqual({ ok: true, ask: [] });
+    expect(s.moveVerdict(b("acme"), "pub")).toEqual({ ok: true, ask: ["acme"] });
+    expect(s.moveVerdict(b("hf"), "pub")).toMatchObject({ ok: false });
+    expect(s.moveVerdict(b("pub", ["hf"]), "acme")).toMatchObject({ ok: false });
+    expect(s.moveVerdict(b("pub", ["hf"]), "hf")).toEqual({ ok: true, ask: [] });
+    expect(s.moveVerdict(b("scratch"), "acme")).toEqual({ ok: true, ask: [] });
+    expect(s.moveVerdict(undefined, "acme")).toEqual({ ok: true, ask: [] });
+    expect(s.moveVerdict({ id: "conductor", source: "reserved", revision: "r" }, "pub")).toMatchObject({ ok: false });
+  });
+
+  test("a binding's references and read-from record round-trip; a malformed one fails the binding", () => {
+    const good = { id: "a", source: "matched", revision: "r", references: [{ workstream: "b", paths: ["/x"], grantedBy: "u", grantedAt: "t" }], readFrom: ["b", "b"] };
+    expect(readWorkstreamBinding(good)).toEqual({ ...good, readFrom: ["b"] });
+    expect(readWorkstreamBinding({ ...good, references: [{ workstream: "B!", grantedBy: "u", grantedAt: "t" }] })).toBeUndefined();
+    expect(readWorkstreamBinding({ ...good, references: [{ workstream: "b", paths: ["rel"], grantedBy: "u", grantedAt: "t" }] })).toBeUndefined();
+    expect(readWorkstreamBinding({ ...good, readFrom: ["ok", 3] })).toBeUndefined();
+  });
+});

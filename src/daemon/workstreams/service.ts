@@ -14,6 +14,7 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import type { SessionWorkstreamInfo, WorkstreamResolution, WorkstreamSummary } from "../../protocol/types.js";
 import { readWorkstreamBinding, type WorkstreamBinding } from "./binding.js";
+import { expandPathRule, outermost, within } from "./folders.js";
 import { effectiveWorkstreams, type EffectiveWorkstream } from "./effective.js";
 import { FolderReader } from "./folder.js";
 import { expandHome, type MatchableWorkstream, matchFolder, normalizePathRule } from "./match.js";
@@ -22,7 +23,26 @@ import type { SecretStore } from "../credentials/store.js";
 import type { CredentialDecl } from "../credentials/schema.js";
 import type { GrantCredential, McpGrant } from "./grant.js";
 
-export { readWorkstreamBinding, type WorkstreamBinding } from "./binding.js";
+export { readWorkstreamBinding, type WorkstreamBinding, type WorkstreamReference } from "./binding.js";
+
+/**
+ * A session's read fence (§7.3): the folders it may read (its home's, and
+ * its references'), and every other workstream's, which it may not. Built
+ * from the folders on this machine; `limits` says what couldn't be expanded.
+ */
+export interface WorkstreamFence {
+  workstream?: string;
+  /** The home's folders: readable and, as the sandbox allows, writable. */
+  home: string[];
+  /** Readable only, never written. */
+  references: Array<{ workstream: string; folders: string[] }>;
+  /** Neither read nor written: every other workstream's folders that hold none of the above. */
+  foreign: Array<{ workstream: string; folders: string[] }>;
+  limits: string[];
+}
+
+/** What a share policy says to a read or a move: allowed, the owner asked, or refused (with why). */
+export type ShareVerdict = { ok: true; ask: string[] } | { ok: false; error: string };
 
 /** The reserved home of the conductor (§10). */
 export const CONDUCTOR_WORKSTREAM = "conductor";
@@ -155,6 +175,104 @@ export class WorkstreamService {
 
   get(id: string): EffectiveWorkstream | undefined {
     return this.#effective.get(id);
+  }
+
+  /**
+   * A workstream's folders on this machine: the directories its path rules
+   * name (each spelling: as written and, for `~`, the home's real path), plus
+   * `recorded` (folders recorded as its home, repository tops).
+   */
+  foldersOf(id: string, recorded: readonly string[] = []): { folders: string[]; limits: string[] } {
+    const m = this.#matchables.find((x) => x.id === id);
+    if (!m || m.abstract) return { folders: [], limits: [] };
+    const limits: string[] = [];
+    const found: string[] = [...recorded];
+    for (const rule of m.paths) {
+      const e = expandPathRule(rule);
+      found.push(...e.folders);
+      limits.push(...e.limits);
+    }
+    return { folders: outermost(found), limits };
+  }
+
+  /**
+   * The read fence of a session homed by `binding`, or undefined when
+   * isolation is off (nothing is fenced then, as before W3). `recorded(id)`
+   * gives a workstream's recorded home folders.
+   */
+  fenceFor(binding: WorkstreamBinding | undefined, recorded: (id: string) => readonly string[] = () => []): WorkstreamFence | undefined {
+    if (!this.configured || !this.#cfg.isolateGlobalServers) return undefined;
+    const limits: string[] = [];
+    const homeId = binding?.id && binding.source !== "reserved" && this.#effective.has(binding.id) ? binding.id : undefined;
+    const of = (id: string) => {
+      const r = this.foldersOf(id, recorded(id));
+      limits.push(...r.limits);
+      return r.folders;
+    };
+    const home = homeId ? of(homeId) : [];
+    const references: WorkstreamFence["references"] = [];
+    for (const ref of binding?.references ?? []) {
+      const ws = this.#effective.get(ref.workstream);
+      // A reference whose workstream is gone or closed now gives nothing (§8).
+      if (!ws || ws.abstract || ws.share === "closed" || ref.workstream === homeId) continue;
+      const all = of(ref.workstream);
+      const folders = ref.paths ? ref.paths.filter((p) => all.some((f) => within(p, f))) : all;
+      if (folders.length > 0) references.push({ workstream: ref.workstream, folders });
+    }
+    const readable = [...home, ...references.flatMap((r) => r.folders)];
+    const foreign: WorkstreamFence["foreign"] = [];
+    for (const ws of this.#effective.values()) {
+      if (ws.abstract || ws.id === homeId) continue;
+      // A folder holding a readable one can't be fenced off without fencing
+      // that too: the more specific rule made it the home's or a reference's.
+      const folders = of(ws.id).filter((f) => !readable.some((r) => within(r, f) || within(f, r)));
+      if (folders.length > 0) foreign.push({ workstream: ws.id, folders });
+    }
+    return { ...(homeId ? { workstream: homeId } : {}), home, references, foreign, limits: [...new Set(limits)] };
+  }
+
+  /**
+   * Whether a session homed in `home` may read `target` (a reference,
+   * §7.1): `open` yes, `ask` with its owner's confirm, `closed` never.
+   */
+  referenceVerdict(home: string | undefined, ref: { workstream: string; paths?: readonly string[] }, recorded: readonly string[] = []): ShareVerdict {
+    const ws = this.#effective.get(ref.workstream);
+    if (!ws) return { ok: false, error: `Unknown workstream "${ref.workstream}"` };
+    if (ws.abstract) return { ok: false, error: `"${ws.id}" is a base workstream: it has no folders of its own` };
+    if (ws.id === home) return { ok: false, error: `"${ws.id}" is this session's own workstream` };
+    if (ws.share === "closed") return { ok: false, error: `Workstream "${ws.id}" is closed: other workstreams can't read it` };
+    if (ref.paths) {
+      const { folders } = this.foldersOf(ws.id, recorded);
+      const outside = ref.paths.filter((p) => !folders.some((f) => within(p, f)));
+      if (outside.length > 0) return { ok: false, error: `Not ${ws.id}'s folders: ${outside.join(", ")}` };
+    }
+    return { ok: true, ask: ws.share === "ask" ? [ws.id] : [] };
+  }
+
+  /**
+   * Whether a session may move to `target` (§5.3): a move carries its whole
+   * transcript, so it is a share from the old home and from every workstream
+   * it has read from. From no home or the default workstream it is always
+   * allowed.
+   */
+  moveVerdict(binding: WorkstreamBinding | undefined, target: string): ShareVerdict {
+    const problem = this.choiceProblem(target);
+    if (problem) return { ok: false, error: problem };
+    if (binding?.source === "reserved") return { ok: false, error: "The conductor's home can't be changed" };
+    const from = new Set<string>(binding?.readFrom ?? []);
+    if (binding?.id && binding.id !== this.#cfg.default) from.add(binding.id);
+    from.delete(target);
+    const ask: string[] = [];
+    for (const id of [...from].sort()) {
+      const ws = this.#effective.get(id);
+      // A workstream since deleted has no policy left to keep.
+      if (!ws) continue;
+      if (ws.share === "closed") {
+        return { ok: false, error: id === binding?.id ? `Workstream "${id}" is closed: its sessions can't move to another` : `This session read from "${id}", which is closed: it can't move to another workstream` };
+      }
+      if (ws.share === "ask") ask.push(id);
+    }
+    return { ok: true, ask };
   }
 
   /** Why `id` can't be chosen as a home, or undefined when it can. */
