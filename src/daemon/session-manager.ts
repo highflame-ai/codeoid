@@ -1058,11 +1058,12 @@ export class SessionManager {
       if (m.collaboration) goalConfigs.set(m.sessionId, m.collaboration);
     }
     // Every session's home workstream, from EVERY meta (a fork's parent may be
-    // outside the resume window): validated, failing closed (G5).
+    // outside the resume window), decided on demand for the sessions resumed:
+    // validated, failing closed (G5). No folder is read here.
     const resumeHomes = this.#workstreams.forResume(
       allMetas.map((m) => ({
         sessionId: m.sessionId,
-        workdir: normalizeWorkdir(m.workdir) ?? m.workdir,
+        workdir: m.workdir,
         ...(m.role ? { role: m.role } : {}),
         stored: (m as { workstream?: unknown }).workstream,
         ...((m.forkedFrom?.sessionId ?? m.collaborationRole?.parentSessionId)
@@ -1099,7 +1100,7 @@ export class SessionManager {
         }
         // Home workstream (G5), decided for every meta up front (forks and
         // children inherit their parent's); persisted once resume succeeded.
-        const resumedWorkstream = resumeHomes.get(meta.sessionId) ?? { binding: undefined, persist: false };
+        const resumedWorkstream = resumeHomes(meta.sessionId);
         const session = new Session({
           ...this.#workstreamOpts(resumedWorkstream.binding),
           name: meta.sessionName,
@@ -4847,10 +4848,6 @@ mcpHub: this.#mcpHub,
     goalSessionId = session.id;
     this.#sessions.set(session.id, session);
     this.#rateLimiter.recordCreation(auth.sub);
-    // Which line of work it belongs to, and how that was decided — the home will decide its credentials (W1).
-    if (createWorkstream) {
-      this.#store.audit(auth.sub, "session.workstream", session.id, `id=${createWorkstream.id ?? "none"} source=${createWorkstream.source}${createWorkstream.matchedBy ? ` rule=${createWorkstream.matchedBy}` : ""}`);
-    }
     // What the sandbox resolves to here, said at once (#448).
     const sandboxInfo = await session.ensureSandbox();
     if (msg.sandbox?.provider === "off") this.#store.audit(auth.sub, "session.sandbox_off", session.id, "at create");
@@ -5530,6 +5527,19 @@ mcpHub: this.#mcpHub,
       // folder must not be another workstream's exclusive one, exactly as
       // for a create choosing that home there (W0 audit).
       if (parent.workstream?.id && this.#workstreams.configured) {
+        // A delegated token may not carry a home into a folder that isn't
+        // that home's — the same rule as choosing one at create.
+        if (auth.delegationDepth > 0) {
+          const folderHome = this.#workstreams.resolve(bound, undefined, givenPath(msg.workdir)).home;
+          if (folderHome !== parent.workstream.id) {
+            return {
+              type: "response.error",
+              requestId: msg.id,
+              error: `A delegated token can't fork a "${parent.workstream.id}" session into a folder whose workstream is ${folderHome ? `"${folderHome}"` : "none"}.`,
+              code: "forbidden",
+            };
+          }
+        }
         const homing = this.#workstreams.forCreate(bound, parent.workstream.id, givenPath(msg.workdir));
         if (!homing.ok && homing.kind === "workstream_conflict") {
           return {
@@ -7233,7 +7243,8 @@ mcpHub: this.#mcpHub,
         // worktree like any codeoid-made fork; the branch stays, holding only
         // what the run delivered.
         const session = new Session({
-          ...this.#workstreamOpts(this.#workstreamForFolder(workdir)),
+          // The checkout the loop works on, not its worktree (`<repo>-worktrees/…` matches no rule written for the repo).
+          ...this.#workstreamOpts(this.#workstreamForFolder(run.contract.workdir)),
           name: `loop-${run.id.slice(5, 13)}`,
           workdir,
           ...(run.worktreeRoot && run.branch
@@ -7338,7 +7349,8 @@ mcpHub: this.#mcpHub,
           }
         }
         const session = new Session({
-          ...this.#workstreamOpts(this.#workstreamForFolder(workdir)),
+          // The routine's own folder, not the worktree it may run in.
+          ...this.#workstreamOpts(this.#workstreamForFolder(o.workdir)),
           // The conductor's name is reserved for the singleton.
           name: o.name === this.#conductorName() ? `${o.name}-routine` : o.name,
           workdir,

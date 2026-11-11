@@ -16,7 +16,7 @@ import type { SessionWorkstreamInfo, WorkstreamResolution, WorkstreamSummary } f
 import { readWorkstreamBinding, type WorkstreamBinding } from "./binding.js";
 import { effectiveWorkstreams, type EffectiveWorkstream } from "./effective.js";
 import { FolderReader } from "./folder.js";
-import { expandHome, literalHead, type MatchableWorkstream, matchFolder, normalizePathRule } from "./match.js";
+import { expandHome, type MatchableWorkstream, matchFolder, normalizePathRule } from "./match.js";
 import type { WorkstreamsConfig } from "./schema.js";
 
 export { readWorkstreamBinding, type WorkstreamBinding } from "./binding.js";
@@ -73,25 +73,33 @@ export class WorkstreamService {
   }
 
   /**
-   * The forms a path rule matches in: as written (`~` expanded, trailing
-   * `/` and `/**` dropped — they mean the same folder), and with its literal
-   * head resolved to its real path when that differs, so `~/Workspace/x`
-   * still matches when `~` (or `~/Workspace`) is a symlink and the workdir
-   * arrives canonical. The head is the owner's own config, resolved once at
-   * load — never a link found by scanning (folder.ts).
+   * The forms a path rule matches in: as written (`~` expanded, trailing `/`
+   * and `/**` dropped — they mean the same folder) and, for a `~` rule, with
+   * the home's real path when the home is a symlink, so `~/Workspace/x`
+   * matches a canonical workdir.
+   *
+   * Only `~` is resolved, never the rest of a rule's fixed part: a folder a
+   * rule names that doesn't exist yet (or that an agent can replace) would
+   * otherwise become a link someone else points, re-homing another
+   * workstream's folder at the next start (W0 audit round 2). The home is the
+   * daemon's own; anyone who can replace it has every credential anyway.
    */
   #pathRuleForms(written: string): string[] {
-    const rule = normalizePathRule(expandHome(written, this.#reader.home));
-    const forms = [rule];
-    const head = literalHead(rule);
-    try {
-      const real = realpathSync(head);
-      if (real !== head) forms.push(normalizePathRule(real + rule.slice(head.length)));
-    } catch {
-      // A head that doesn't exist yet: the rule as written is all there is.
+    const forms = [normalizePathRule(expandHome(written, this.#reader.home))];
+    if (written === "~" || written.startsWith("~/")) {
+      const realHome = this.#realHome();
+      if (realHome !== this.#reader.home) forms.push(normalizePathRule(expandHome(written, realHome)));
     }
     for (const f of forms) this.#written.set(f, written);
     return forms;
+  }
+
+  #realHome(): string {
+    try {
+      return realpathSync(this.#reader.home);
+    } catch {
+      return this.#reader.home;
+    }
   }
 
   /** Replace the config (a settings write, W2). Live sessions keep their bindings. */
@@ -184,14 +192,16 @@ export class WorkstreamService {
     };
 
     if (explicit !== undefined) {
-      // The folder's claimant: the best match when it is exclusive (an
-      // exclusive claim outranks any suggestion, match.ts); else any OTHER
-      // exclusive workstream among those tied or disagreeing — choosing one
-      // of them never waives another's exclusive claim on the same folder.
+      // The folder's claimant: the best match when it is exclusive; else, among
+      // those tied or disagreeing, an exclusive one other than the choice —
+      // unless the choice is itself one of the tied exclusives: a tie means
+      // neither outranks the other, so choosing one settles it. A
+      // suggestion chosen against an exclusive it ties with waives nothing.
+      const tiedExclusive = (id: string) => ambiguous?.includes(id) && candidates.some((c) => c.workstream === id && c.claim === "exclusive");
       const claimant =
         best?.claim === "exclusive"
           ? best.workstream
-          : ambiguous
+          : ambiguous && !tiedExclusive(explicit)
             ? candidates.find((c) => ambiguous.includes(c.workstream) && c.workstream !== explicit && c.claim === "exclusive")?.workstream
             : undefined;
       const base = { candidates, ...(ambiguous ? { ambiguous } : {}) };
@@ -275,7 +285,7 @@ export class WorkstreamService {
    * With no workstreams configured, a stored binding is kept (it applies
    * again if workstreams come back) and nothing is resolved.
    */
-  forResume(metas: readonly ResumeMetaFacts[]): Map<string, { binding: WorkstreamBinding | undefined; persist: boolean }> {
+  forResume(metas: readonly ResumeMetaFacts[]): (sessionId: string) => { binding: WorkstreamBinding | undefined; persist: boolean } {
     const out = new Map<string, { binding: WorkstreamBinding | undefined; persist: boolean }>();
     const byId = new Map(metas.map((m) => [m.sessionId, m] as const));
     const none = (): WorkstreamBinding => ({ source: "none", revision: this.#revision });
@@ -306,7 +316,7 @@ export class WorkstreamService {
         } else {
           let resolution: WorkstreamResolution;
           try {
-            resolution = this.resolve(m.workdir);
+            resolution = this.resolve(expandHome(m.workdir, this.#reader.home));
           } catch {
             resolution = { source: "none", candidates: [] };
           }
@@ -318,8 +328,12 @@ export class WorkstreamService {
       return result;
     };
 
-    for (const m of metas) decide(m, 0);
-    return out;
+    // Decided on demand, so only the sessions actually resumed (and their
+    // ancestors) cost a folder read — none at all with nothing configured.
+    return (sessionId) => {
+      const m = byId.get(sessionId);
+      return m ? decide(m, 0) : { binding: undefined, persist: false };
+    };
   }
 
   #bind(r: WorkstreamResolution): WorkstreamBinding {

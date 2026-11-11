@@ -140,9 +140,9 @@ describe("who may choose (W0 audit)", () => {
   it("every create with a home is audited with how it was decided", async () => {
     const resp = await create(manager(WS), "aud", "client");
     const id = (resp as { data: SessionInfo }).data.id;
-    const rows = store.database.prepare("SELECT action, detail FROM audit_log WHERE session_id = ? AND action = 'session.workstream'").all(id) as Array<{ detail: string }>;
+    const rows = store.database.prepare("SELECT action, detail FROM audit_log WHERE session_id = ? AND action = 'session.create'").all(id) as Array<{ detail: string }>;
     expect(rows).toHaveLength(1);
-    expect(rows[0]!.detail).toContain("id=client source=matched");
+    expect(rows[0]!.detail).toContain("workstream=client source=matched");
   });
 
   it("an unknown id, even malformed, gets the specific error rather than a schema rejection", async () => {
@@ -159,7 +159,20 @@ describe("forks keep their parent's home (W0 audit)", () => {
     const fork = await m.handle({ type: "session.fork", id: "f1", sessionId: id, providerId: "claude", workdir: join(tmp, "home", "client") } as never, OWNER, client);
     expect(fork).toMatchObject({ type: "response.error", detail: { kind: "workstream_conflict" } });
     const ok = await m.handle({ type: "session.fork", id: "f2", sessionId: id, providerId: "claude", workdir: join(tmp, "home", "loose") } as never, OWNER, client);
-    if (ok.type === "response.error") expect(ok.detail?.kind).not.toBe("workstream_conflict");
+    expect(ok.type).toBe("response.ok");
+    expect((ok as { data: SessionInfo }).data.workstream).toMatchObject({ id: "mine" });
+  });
+
+  it("a delegated token can't fork a session into a folder of another home", async () => {
+    const m = manager(WS);
+    const parent = await create(m, "p2", "mine");
+    const id = (parent as { data: SessionInfo }).data.id;
+    const fork = await m.handle(
+      { type: "session.fork", id: "f3", sessionId: id, providerId: "claude", workdir: join(tmp, "home", "loose") } as never,
+      { ...OWNER, delegationDepth: 1 },
+      client,
+    );
+    expect(fork).toMatchObject({ type: "response.error", code: "forbidden" });
   });
 });
 

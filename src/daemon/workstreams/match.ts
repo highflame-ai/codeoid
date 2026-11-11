@@ -12,14 +12,17 @@
  *  - A remote rule matches the `origin` remote, or `upstream`. A match through
  *    `upstream` alone is only ever a suggestion: you see where the code came
  *    from, you are not held to it.
- *  - An exclusive claim outranks a suggestion, whatever their specificity: a
- *    more specific `suggest` rule must not take a folder away from the
- *    workstream that holds it exclusively (W0 audit). Carving a folder out of
- *    an exclusive one takes a more specific exclusive rule.
+ *  - Any path match beats any remote match. A remote is text an agent can
+ *    edit in `.git/config`, so it must never outrank a rule on the folder
+ *    itself (W0 audit round 2) — exclusive or not.
+ *  - Within a kind, an exclusive claim outranks a suggestion, whatever their
+ *    specificity: a more specific `suggest` path must not take a folder from
+ *    the workstream holding it exclusively (W0 audit). Carving a folder out
+ *    of an exclusive one takes a more specific exclusive rule.
  *  - Then the most specific RULE wins (never where it matched: `/w/**`
  *    matching the folder itself must not beat `/w/acme` matching its parent):
- *    any path match beats any remote match; then the rule with more literal
- *    segments; then more literal characters; `origin` beats `upstream`.
+ *    more literal segments, then more literal characters; `origin` beats
+ *    `upstream`.
  *  - Two workstreams tied at the top are ambiguous: no home is picked, and the
  *    tie is reported so an explicit choice can settle it.
  */
@@ -123,7 +126,7 @@ function bestPathMatch(ws: MatchableWorkstream, folder: FolderFacts): MatchCandi
           rule,
           kind: "path",
           claim: ws.claim,
-          score: [ws.claim === "exclusive" ? 1 : 0, 2, literalSegments(rule), literalLength(rule), 1],
+          score: [2, ws.claim === "exclusive" ? 1 : 0, literalSegments(rule), literalLength(rule), 1],
         };
         if (!best || compareScore(cand.score, best.score) > 0) best = cand;
       }
@@ -148,7 +151,7 @@ function bestRemoteMatch(ws: MatchableWorkstream, folder: FolderFacts): MatchCan
         kind: "remote",
         via,
         claim: via === "upstream" ? "suggest" : ws.claim,
-        score: [via === "origin" && ws.claim === "exclusive" ? 1 : 0, 1, literalSegments(rule), literalLength(rule), via === "origin" ? 1 : 0],
+        score: [1, via === "origin" && ws.claim === "exclusive" ? 1 : 0, literalSegments(rule), literalLength(rule), via === "origin" ? 1 : 0],
       };
       if (!best || compareScore(cand.score, best.score) > 0) best = cand;
     }

@@ -690,8 +690,15 @@ export class TranscriptStore {
    */
   async patchMeta(sessionId: string, patch: Partial<Omit<TranscriptMeta, "sessionId">>): Promise<void> {
     return this.#enqueueMeta(sessionId, async () => {
-      const current = JSON.parse(await readFile(this.metaPath(sessionId), "utf-8")) as TranscriptMeta;
-      await this.#writeMetaAtomic({ ...current, ...patch, sessionId });
+      let text: string;
+      try {
+        text = await readFile(this.metaPath(sessionId), "utf-8");
+      } catch (err) {
+        // Gone (the session was destroyed meanwhile): a patch never recreates a meta.
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw err;
+      }
+      await this.#writeMetaAtomic({ ...(JSON.parse(text) as TranscriptMeta), ...patch, sessionId });
     });
   }
 

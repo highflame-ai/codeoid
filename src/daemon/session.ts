@@ -1961,7 +1961,11 @@ export class Session {
         accountId: opts.auth.accountId,
         projectId: opts.auth.projectId,
       });
-      this.#store.audit(opts.auth.sub, "session.create", this.id, `name=${this.name}${this.#effort ? ` effort=${this.#effort}` : ""}`);
+      // The home is in the one row every creation path writes (import, loops,
+      // routines, dispatch, forks, children): it will decide credentials (W1).
+      const ws = this.#workstream;
+      const wsDetail = ws ? ` workstream=${ws.id ?? "none"} source=${ws.source}${ws.matchedBy ? ` rule=${JSON.stringify(ws.matchedBy)}` : ""}` : "";
+      this.#store.audit(opts.auth.sub, "session.create", this.id, `name=${this.name}${this.#effort ? ` effort=${this.#effort}` : ""}${wsDetail}`);
       if (this.#effort) this.#store.setSessionEffort(this.id, this.#effort);
 
       this.#transcriptStore.saveMeta({

@@ -1577,7 +1577,7 @@ export class TerminalClient {
 /** One line saying a session's home workstream and how it got it; undefined when it has none to say. */
 export function workstreamSummary(ws: SessionInfo["workstream"]): string | undefined {
   if (!ws) return undefined;
-  if (!ws.id) return "workstream: none (no rule matched and no default is set)";
+  if (!ws.id) return "workstream: none — choose one (`codeoid workstream match <dir>` says why)";
   const label = ws.name && ws.name !== ws.id ? `${ws.name} (${ws.id})` : ws.id;
   const how =
     ws.source === "matched" ? `matched by ${ws.matchedBy ?? "a rule"}`
