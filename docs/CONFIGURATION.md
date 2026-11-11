@@ -447,6 +447,12 @@ Every reference to a credential is checked when the config loads: declared once,
 
 Under isolation a session you create in a folder with no workstream is refused until you choose one; sessions the daemon starts there (loops, routines, dispatch) get built-ins only.
 
+### Editing them live
+
+Settings → Workstreams and Settings → Credentials in the web UI (or the `workstream.*` / `credential.*` messages) edit `config.json` and `.env` directly; the whole config is validated before anything is written.
+A change applies at once to new sessions and to every call a session makes through codeoid; a running session's backend is rebuilt with its workstream's servers, env and credentials as they are now at its next turn.
+A session keeps its workstream: editing rules never moves a session to another.
+
 ### Overrides
 
 Choosing a workstream for a folder another workstream holds exclusively is refused with what it would change.

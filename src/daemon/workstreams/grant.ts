@@ -40,8 +40,9 @@ export function grantRefusal(grant: McpGrant | undefined, spec: { name: string; 
     return grant.workdirServers ? undefined : `MCP server "${name}" is this folder's own, and the folder isn't workstream "${grant.workstream ?? "none"}"'s`;
   }
   const sel = grant.servers.get(name);
-  const credential = "credential" in spec.transport ? spec.transport.credential?.id : undefined;
-  if (sel && (sel.oauthSlot ?? sel.credential?.id) === credential) return undefined;
+  const cred = "credential" in spec.transport ? spec.transport.credential : undefined;
+  const same = sel?.oauthSlot ? cred?.id === sel.oauthSlot : (sel?.credential?.id === cred?.id && (sel?.credential?.header ?? "") === (cred && "header" in cred ? (cred.header ?? "") : ""));
+  if (sel && same) return undefined;
   if (sel) return `MCP server "${name}" is now called with another credential in workstream "${grant.workstream}" — it applies from the next turn`;
   return grant.workstream
     ? `MCP server "${name}" is not in workstream "${grant.workstream}"`

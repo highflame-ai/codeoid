@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "../config.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
+import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
@@ -126,3 +127,63 @@ describe("editing credentials", () => {
     if (o.type === "response.error") expect(o.error).toContain("codeoid mcp signin slack --credential o");
   });
 });
+
+describe("live edits after the W2 audit", () => {
+  it("a hand edit to the other block since boot is applied too, never shadowed", async () => {
+    const path = join(tmp, "config", "codeoid", "config.json");
+    writeFileSync(path, JSON.stringify({ ...configJson(), credentials: [{ id: "hand", kind: "env" }] }));
+    await h({ type: "workstream.upsert", id: "a1", item: { id: "acme", env: { GH_TOKEN: { secret: "hand" } } } });
+    expect(await h({ type: "credential.list", id: "a2" })).toMatchObject({ credentials: [{ id: "hand", usedBy: ["acme"] }] });
+    expect(await h({ type: "credential.set_value", id: "a3", credential: "hand", value: "v" })).toMatchObject({ type: "credential.list.result" });
+  });
+
+  it("deleting an undeclared or malformed credential is refused, touching nothing", async () => {
+    writeFileSync(join(tmp, "config", "codeoid", ".env"), "CODEOID_CRED_GHOST=keep\n");
+    expect(await h({ type: "credential.delete", id: "d1", credential: "ghost" })).toMatchObject({ type: "response.error" });
+    expect(readFileSync(join(tmp, "config", "codeoid", ".env"), "utf8")).toContain("CODEOID_CRED_GHOST=keep");
+  });
+
+  it("a write-only token gets its edit's reply", async () => {
+    const r = await h({ type: "workstream.upsert", id: "w1", item: { id: "acme" } }, { ...OWNER, scopes: [SCOPES.SETTINGS_WRITE] as AuthContext["scopes"] });
+    expect(r).toMatchObject({ type: "workstream.list.result" });
+  });
+
+  it("a value from the daemon's real environment is refused: it would win at the next start", async () => {
+    await h({ type: "credential.upsert", id: "e1", item: { id: "real", kind: "env" } });
+    process.env.CODEOID_CRED_REAL = "from-env";
+    const r = await h({ type: "credential.set_value", id: "e2", credential: "real", value: "x" });
+    expect(r).toMatchObject({ type: "response.error" });
+    if (r.type === "response.error") expect(r.error).toContain("daemon's own environment");
+  });
+
+  it("a live session's backend env follows the workstream: a cleared credential is gone at its next start", async () => {
+    const seen: Array<Record<string, string>> = [];
+    const registry = new ProviderRegistry("rec");
+    registry.register({
+      id: "rec",
+      displayName: "rec",
+      create: (init) => {
+        seen.push(init.extraEnv as Record<string, string>);
+        return new MockSessionProvider("rec", []);
+      },
+    });
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: loadConfig({ env: {}, quiet: true }),
+      providers: registry,
+      _testFolderReader: new FolderReader({ home: join(tmp, "home"), sshConfig: "" }),
+    });
+    const hm = (msg: Record<string, unknown>) => m.handle(msg as never, OWNER, client);
+    await hm({ type: "credential.upsert", id: "l1", item: { id: "gh", kind: "env" } });
+    await hm({ type: "credential.set_value", id: "l2", credential: "gh", value: "tok-1" });
+    await hm({ type: "workstream.upsert", id: "l3", item: { id: "acme", match: { paths: ["~/acme"] }, env: { GH_TOKEN: { secret: "gh" } } } });
+    expect((await hm({ type: "session.create", id: "l4", name: "s", workdir: join(tmp, "home", "acme") })).type).toBe("response.ok");
+    const env = seen.at(-1)!;
+    expect({ ...env }.GH_TOKEN).toBe("tok-1");
+    await hm({ type: "credential.set_value", id: "l5", credential: "gh", value: "tok-2" });
+    expect({ ...env }.GH_TOKEN).toBe("tok-2");
+    await hm({ type: "credential.set_value", id: "l6", credential: "gh", value: null });
+    expect({ ...env }.GH_TOKEN).toBeUndefined();
+    await m.drain(2_000);
+  });
+});
+

@@ -64,7 +64,7 @@ test("workstreams in the web UI: settings, the new-session picker, a confirmed o
   await page.getByLabel("Workstream").selectOption("mine");
   await page.getByRole("button", { name: "create", exact: true }).click();
   const offer = page.getByRole("alert").filter({ hasText: "belongs to workstream" });
-  await expect(offer).toContainText("“acme” (exclusive)");
+  await expect(offer).toContainText("“Acme Corp” (exclusive)");
   for (const [w, h] of VIEWPORTS) {
     await page.setViewportSize({ width: w, height: h });
     await offer.scrollIntoViewIfNeeded();
@@ -76,8 +76,9 @@ test("workstreams in the web UI: settings, the new-session picker, a confirmed o
   await page.setViewportSize({ width: 1280, height: 800 });
   await page.getByRole("button", { name: "Start anyway" }).click();
   await expect(page.getByRole("heading", { name: "past-claim", level: 2 })).toBeVisible();
-  const chip = page.getByRole("main").getByTestId("workstream-chip").or(page.getByTestId("workstream-chip").first());
-  await expect(chip.first()).toContainText("Mine");
+  // The session header's chip (not the list row's): beside the session's own heading.
+  const header = page.getByRole("heading", { name: "past-claim", level: 2 }).locator("xpath=..");
+  await expect(header.getByTestId("workstream-chip")).toContainText("Mine");
   for (const [w, h] of VIEWPORTS) {
     await page.setViewportSize({ width: w, height: h });
     await page.screenshot({ path: join(SHOTS, `session-${w}x${h}.png`), fullPage: false });

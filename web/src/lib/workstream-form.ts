@@ -80,6 +80,26 @@ export function toForm(config: Record<string, unknown>): WorkstreamForm {
 }
 
 /**
+ * What's wrong with the editor's text before it goes to the daemon (which
+ * judges the rest): an env line without `NAME = credential`, a name twice, a
+ * server line with more than one `=`. Undefined when fine.
+ */
+export function formProblem(form: WorkstreamForm): string | undefined {
+  const seen = new Set<string>();
+  for (const l of lines(form.env)) {
+    const parts = l.split("=").map((s) => s.trim());
+    if (parts.length !== 2 || !parts[0] || !parts[1]) return `Env "${l}": write it as NAME = credential`;
+    if (seen.has(parts[0])) return `Env ${parts[0]} is set twice`;
+    seen.add(parts[0]);
+  }
+  for (const l of lines(form.servers)) {
+    const parts = l.split("=").map((s) => s.trim());
+    if (parts.length > 2 || !parts[0] || (parts.length === 2 && !parts[1])) return `Server "${l}": write it as server, or server = credential`;
+  }
+  return undefined;
+}
+
+/**
  * The item to save: the edited fields over `base` (the item as configured),
  * so fields the editor doesn't show (exclude, accounts, defaults, skillDirs)
  * are kept as they were. Empty optional fields are left out.

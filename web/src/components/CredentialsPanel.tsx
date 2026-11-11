@@ -89,6 +89,7 @@ const CredentialRow: Component<{
 }> = (props) => {
   const [value, setValue] = createSignal("");
   const [confirm, setConfirm] = createSignal(false);
+  const [confirmClear, setConfirmClear] = createSignal(false);
   const c = () => props.c;
   return (
     <div class="space-y-2 px-3 py-2" data-testid={`credential-${props.c.id}`}>
@@ -114,8 +115,16 @@ const CredentialRow: Component<{
               </button>
             }
           >
-            <button type="button" class={`${button} border-danger/50 text-danger`} onClick={() => void props.run(`rm:${c().id}`, () => deleteCredential(c().id))}>
+            <button
+              type="button"
+              class={`${button} border-danger/50 text-danger`}
+              disabled={props.busy !== null}
+              onClick={() => void props.run(`rm:${c().id}`, () => deleteCredential(c().id)).then(() => setConfirm(false))}
+            >
               Remove {c().id} and its value?
+            </button>
+            <button type="button" class={`${button} ml-1.5`} onClick={() => setConfirm(false)}>
+              Cancel
             </button>
           </Show>
         </span>
@@ -139,7 +148,7 @@ const CredentialRow: Component<{
             <input
               type="password"
               class={input}
-              autocomplete="off"
+              autocomplete="new-password"
               aria-label={`Value of ${c().id}`}
               placeholder={c().status.set ? "replace the value" : "the value"}
               value={value()}
@@ -149,9 +158,23 @@ const CredentialRow: Component<{
               Set
             </button>
             <Show when={c().status.set}>
-              <button type="button" class={button} onClick={() => void props.run(`clr:${c().id}`, () => setCredentialValue(c().id, null))}>
-                Clear
-              </button>
+              <Show
+                when={confirmClear()}
+                fallback={
+                  <button type="button" class={button} disabled={props.busy !== null} onClick={() => setConfirmClear(true)}>
+                    Clear
+                  </button>
+                }
+              >
+                <button
+                  type="button"
+                  class={`${button} border-danger/50 text-danger`}
+                  disabled={props.busy !== null}
+                  onClick={() => void props.run(`clr:${c().id}`, () => setCredentialValue(c().id, null)).then(() => setConfirmClear(false))}
+                >
+                  Clear its value?
+                </button>
+              </Show>
             </Show>
           </form>
         </Show>

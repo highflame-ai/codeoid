@@ -50,6 +50,7 @@ export function _resetWorkstreamsForTest(): void {
   setState(EMPTY);
   setCreds(EMPTY_CREDS);
   inflight = null;
+  refetch = null;
 }
 
 export function _setWorkstreamsForTest(s: Partial<WorkstreamsState>): void {
@@ -89,10 +90,23 @@ async function credsCall(build: (id: string) => ClientMessage): Promise<void> {
 }
 
 let inflight: Promise<void> | null = null;
+let refetch: Promise<void> | null = null;
 
-/** The configured workstreams (settings:read). A failure leaves them unloaded, so the next caller tries again. */
+/**
+ * The configured workstreams (settings:read). A failure leaves them unloaded,
+ * so the next caller tries again. A forced fetch while one is in flight wants
+ * a list newer than that one (a `workstreams.changed` after it was sent): it
+ * runs once the current one settles, and several share that refetch.
+ */
 export function fetchWorkstreams(force = false): Promise<void> {
-  if (inflight) return inflight;
+  if (inflight) {
+    if (!force) return inflight;
+    refetch ??= inflight.then(() => {
+      refetch = null;
+      return fetchWorkstreams(true);
+    });
+    return refetch;
+  }
   if (state().loaded && !force) return Promise.resolve();
   setState((s) => ({ ...s, loading: true }));
   inflight = (async () => {

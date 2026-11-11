@@ -1115,11 +1115,13 @@ export const workstreamSettingsSchema = z.object({
 });
 export const credentialListSchema = z.object({ ...base, type: z.literal("credential.list") });
 export const credentialUpsertSchema = z.object({ ...base, type: z.literal("credential.upsert"), item: configItemField });
-export const credentialDeleteSchema = z.object({ ...base, type: z.literal("credential.delete"), credential: z.string().min(1).max(64) });
+// A credential's id shape (the daemon's config rule): no line breaks or spaces reach an audit row.
+const credentialIdField = z.string().regex(/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/);
+export const credentialDeleteSchema = z.object({ ...base, type: z.literal("credential.delete"), credential: credentialIdField });
 export const credentialSetValueSchema = z.object({
   ...base,
   type: z.literal("credential.set_value"),
-  credential: z.string().min(1).max(64),
+  credential: credentialIdField,
   value: z.string().max(LIMITS.SETTING_VALUE_MAX).nullable(),
 });
 

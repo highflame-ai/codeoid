@@ -168,23 +168,29 @@ const NewSessionModal: Component = () => {
   // `workstream.resolve` says), else an explicit choice.
   const [workstream, setWorkstream] = createSignal("");
   const [resolution, setResolution] = createSignal<WorkstreamResolution | null>(null);
+  // The folder couldn't be checked (a scope, an unreadable folder): said as such, never as "none matches".
+  const [resolveFailed, setResolveFailed] = createSignal(false);
+  let workstreamSelect: HTMLSelectElement | undefined;
+  let createButton: HTMLButtonElement | undefined;
   // A choice refused past another workstream's exclusive claim, with the token
   // that confirms it (G3): shown with what would change, never sent unasked.
   const [overrideOffer, setOverrideOffer] = createSignal<NonNullable<WorkstreamResolution["conflict"]> | null>(null);
   // What the folder resolves to, as it is typed or picked (debounced).
   createEffect(
-    on([workdir, openSignal, () => homeChoices().length], ([dir, open, homes]) => {
+    on([workdir, openSignal, () => homeChoices().length, mode], ([dir, open, homes]) => {
       setOverrideOffer(null);
-      if (!open || homes === 0 || !dir.trim()) {
-        setResolution(null);
-        return;
-      }
+      // The last folder's answer never stands for this one, even for the debounce.
+      setResolution(null);
+      setResolveFailed(false);
+      if (!open || homes === 0 || !dir.trim()) return;
       const timer = setTimeout(() => {
         resolveWorkstream(dir.trim())
           .then((r) => {
             if (workdir() === dir) setResolution(r);
           })
-          .catch(() => setResolution(null));
+          .catch(() => {
+            if (workdir() === dir) setResolveFailed(true);
+          });
       }, 300);
       onCleanup(() => clearTimeout(timer));
     }),
@@ -496,6 +502,12 @@ const NewSessionModal: Component = () => {
     setWarnings([]);
   }
 
+  /** A workstream as the picker names it. */
+  function nameOf(id: string): string {
+    const w = homeChoices().find((x) => x.id === id);
+    return w && w.name !== id ? w.name : id;
+  }
+
   async function submit(ev: Event, overrideToken?: string): Promise<void> {
     ev.preventDefault();
     if (busy()) return;
@@ -669,6 +681,16 @@ const NewSessionModal: Component = () => {
       if (conflict?.overrideToken && !overrideToken) {
         setOverrideOffer(conflict);
         setError(null);
+      } else if (detail?.kind === "workstream_required") {
+        // The daemon's text names a CLI flag; here the picker is the way.
+        setOverrideOffer(null);
+        const ambiguous = detail.resolution?.ambiguous;
+        setError(
+          ambiguous && ambiguous.length > 0
+            ? `Choose a workstream for this folder: ${ambiguous.map(nameOf).join(" and ")} both match${/remote/.test(err instanceof Error ? err.message : "") ? " (its repository's remote changed)" : ""}.`
+            : "This folder belongs to no workstream: choose one.",
+        );
+        workstreamSelect?.focus();
       } else {
         setOverrideOffer(null);
         setError(err instanceof Error ? err.message : String(err));
@@ -1214,6 +1236,7 @@ const NewSessionModal: Component = () => {
             <label class="block space-y-1.5">
               <span class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">Workstream</span>
               <select
+                ref={workstreamSelect}
                 value={workstream()}
                 onChange={(e) => {
                   setWorkstream(e.currentTarget.value);
@@ -1224,7 +1247,13 @@ const NewSessionModal: Component = () => {
                 class="w-full rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
               >
                 <option value="">
-                  {resolution()?.home
+                  {resolveFailed()
+                    ? "The folder's (couldn't check it)"
+                    : !workdir().trim()
+                      ? "The folder's"
+                      : !resolution()
+                        ? "The folder's (checking…)"
+                        : resolution()?.home
                     ? `The folder's: ${resolution()?.home}${resolution()?.source === "matched" ? ` (matched by ${resolution()?.matchedBy})` : resolution()?.source === "default" ? " (the default)" : ""}`
                     : resolution()?.ambiguous
                       ? `The folder's: none — ${resolution()?.ambiguous?.join(" and ")} both match`
@@ -1243,9 +1272,9 @@ const NewSessionModal: Component = () => {
                 // Shown below the fold on a phone: brought into view as it appears.
                 ref={(el) => requestAnimationFrame(() => el.scrollIntoView?.({ block: "nearest", behavior: "smooth" }))}
               >
-                <div class="font-semibold">This folder belongs to workstream “{c().folder}” (exclusive).</div>
+                <div class="font-semibold">This folder belongs to workstream “{nameOf(c().folder)}” (exclusive).</div>
                 <div>
-                  A session here in “{c().chosen}” gets{" "}
+                  A session here in “{nameOf(c().chosen)}” gets{" "}
                   {c().changes && c().changes!.gains.length > 0 ? `“${c().chosen}”'s servers (${c().changes!.gains.join(", ")})` : `no MCP servers from “${c().chosen}”`}
                   {c().changes && c().changes!.env.length > 0 ? ` and env ${c().changes!.env.join(", ")}` : ""}
                   {c().changes?.git ? `, commits as ${c().changes!.git}` : ""}, and writes into “{c().folder}”'s code
@@ -1258,9 +1287,11 @@ const NewSessionModal: Component = () => {
                     onClick={() => {
                       setWorkstream(c().folder);
                       setOverrideOffer(null);
+                      // The offer unmounts with its buttons: focus goes on to create.
+                      queueMicrotask(() => createButton?.focus());
                     }}
                   >
-                    Use “{c().folder}”
+                    Use “{nameOf(c().folder)}”
                   </button>
                   <button
                     type="button"
@@ -1321,6 +1352,7 @@ const NewSessionModal: Component = () => {
                 cancel
               </button>
               <button
+                ref={createButton}
                 type="submit"
                 class="ml-auto rounded bg-accent px-3 py-1.5 text-sm font-semibold text-bg transition hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
                 disabled={

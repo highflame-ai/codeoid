@@ -485,7 +485,8 @@ function applyGrant(specs: readonly McpServerSpec[], grant: McpGrant): McpServer
       out.push({
         ...spec,
         transport: { ...spec.transport, credential: { ...sel.credential } },
-        variant: `${spec.variant ?? ""}#cred:${sel.credential.id}`,
+        // The header too: a credential redeclared with another header is another client.
+        variant: `${spec.variant ?? ""}#cred:${sel.credential.id}:${sel.credential.header ?? ""}`,
       });
       continue;
     }

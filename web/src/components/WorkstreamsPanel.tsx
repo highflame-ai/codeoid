@@ -7,7 +7,7 @@
 
 import { type Component, For, Show, createSignal, onMount } from "solid-js";
 
-import { EMPTY_FORM, fromForm, toForm, type WorkstreamForm } from "../lib/workstream-form";
+import { EMPTY_FORM, formProblem, fromForm, toForm, type WorkstreamForm } from "../lib/workstream-form";
 import type { WorkstreamResolution, WorkstreamSummary } from "../protocol/types";
 import {
   deleteWorkstream,
@@ -76,7 +76,13 @@ export const WorkstreamsPanel: Component = () => {
             class="mt-0.5"
             checked={workstreamsState().isolateGlobalServers}
             disabled={busy() !== null}
-            onChange={(e) => void run("isolate", () => saveWorkstreamSettings({ isolateGlobalServers: e.currentTarget.checked }))}
+            onChange={(e) => {
+              const el = e.currentTarget;
+              // Failed: the box shows the config again, not the click.
+              void run("isolate", () => saveWorkstreamSettings({ isolateGlobalServers: el.checked })).then((ok) => {
+                if (!ok) el.checked = workstreamsState().isolateGlobalServers;
+              });
+            }}
           />
           <span>
             Isolate MCP servers
@@ -93,7 +99,12 @@ export const WorkstreamsPanel: Component = () => {
             class="min-w-0 max-w-full rounded border border-border bg-bg px-2 py-1 text-[12px] text-fg"
             value={workstreamsState().default ?? ""}
             disabled={busy() !== null}
-            onChange={(e) => void run("default", () => saveWorkstreamSettings({ default: e.currentTarget.value || null }))}
+            onChange={(e) => {
+              const el = e.currentTarget;
+              void run("default", () => saveWorkstreamSettings({ default: el.value || null })).then((ok) => {
+                if (!ok) el.value = workstreamsState().default ?? "";
+              });
+            }}
           >
             <option value="">none</option>
             <For each={homes()}>{(w) => <option value={w.id}>{w.name}</option>}</For>
@@ -107,28 +118,33 @@ export const WorkstreamsPanel: Component = () => {
             None yet. Add one below, or run <code class="font-mono">codeoid workstream import</code> for a proposal from your repositories.
           </div>
         </Show>
-        <For each={list()}>
-          {(w) => (
+        {/* Keyed by id, not by object: every list refresh (an isolation toggle, another
+            client's edit) hands new objects, and a row remounting would drop an
+            open editor's typed changes. */}
+        <For each={list().map((x) => x.id)}>
+          {(id) => (
+            <Show when={list().find((x) => x.id === id)}>
+              {(w) => (
             <div class="px-3 py-2">
               <div class="flex flex-wrap items-center gap-2">
-                <Show when={chipColor(w.color)}>
+                <Show when={chipColor(w().color)}>
                   {(c) => <span class="inline-block h-2 w-2 rounded-full" style={{ "background-color": c() }} aria-hidden="true" />}
                 </Show>
-                <span class="text-[13px] font-medium text-fg">{w.name}</span>
-                <span class="font-mono text-[11px] text-fg-faint">{w.id}</span>
-                <Badge>{w.abstract ? "base" : w.claim}</Badge>
-                <Badge>share: {w.share}</Badge>
-                <Show when={workstreamsState().default === w.id}>
+                <span class="text-[13px] font-medium text-fg">{w().name}</span>
+                <span class="font-mono text-[11px] text-fg-faint">{w().id}</span>
+                <Badge>{w().abstract ? "base" : w().claim}</Badge>
+                <Badge>share: {w().share}</Badge>
+                <Show when={workstreamsState().default === w().id}>
                   <Badge accent>default</Badge>
                 </Show>
                 <span class="ml-auto flex gap-1.5">
-                  <button type="button" class={button} onClick={() => setEditing(w.id)} disabled={busy() !== null}>
+                  <button type="button" class={button} onClick={() => setEditing(w().id)} disabled={busy() !== null}>
                     Edit
                   </button>
                   <Show
-                    when={confirmRemove() === w.id}
+                    when={confirmRemove() === w().id}
                     fallback={
-                      <button type="button" class={button} onClick={() => setConfirmRemove(w.id)} disabled={busy() !== null}>
+                      <button type="button" class={button} onClick={() => setConfirmRemove(w().id)} disabled={busy() !== null}>
                         Remove
                       </button>
                     }
@@ -136,22 +152,28 @@ export const WorkstreamsPanel: Component = () => {
                     <button
                       type="button"
                       class={`${button} border-danger/50 text-danger`}
-                      onClick={() => void run(`rm:${w.id}`, () => deleteWorkstream(w.id)).then(() => setConfirmRemove(null))}
+                      disabled={busy() !== null}
+                      onClick={() => void run(`rm:${w().id}`, () => deleteWorkstream(w().id)).then(() => setConfirmRemove(null))}
                     >
-                      Remove {w.id}? Its sessions keep it, shown orphaned
+                      Remove {w().id}? Its sessions keep it, shown orphaned
+                    </button>
+                    <button type="button" class={button} onClick={() => setConfirmRemove(null)}>
+                      Cancel
                     </button>
                   </Show>
                 </span>
               </div>
               <div class="mt-1 text-[12px] text-fg-muted">
-                {[...w.match.paths, ...w.match.remotes.map((r) => `remote ${r}`)].join(" · ") || (w.abstract ? "a base for others to extend" : "no rules — chosen only")}
-                <Show when={w.servers.length > 0}> · servers: {w.servers.map((s) => s.server).join(", ")}</Show>
-                <Show when={w.env.length > 0}> · env: {w.env.join(", ")}</Show>
+                {[...w().match.paths, ...w().match.remotes.map((r) => `remote ${r}`)].join(" · ") || (w().abstract ? "a base for others to extend" : "no rules — chosen only")}
+                <Show when={w().servers.length > 0}> · servers: {w().servers.map((s) => s.server).join(", ")}</Show>
+                <Show when={w().env.length > 0}> · env: {w().env.join(", ")}</Show>
               </div>
-              <Show when={editing() === w.id}>
-                <Editor existing={w} onDone={() => setEditing(null)} run={run} busy={busy()} />
+              <Show when={editing() === w().id}>
+                <Editor existing={w()} onDone={() => setEditing(null)} run={run} busy={busy()} />
               </Show>
             </div>
+              )}
+            </Show>
           )}
         </For>
       </div>
@@ -198,7 +220,8 @@ const Editor: Component<{
     onInput: (e: InputEvent & { currentTarget: HTMLInputElement | HTMLTextAreaElement }) => setForm({ ...form(), [k]: e.currentTarget.value }),
   });
   const save = async () => {
-    const ok = await props.run("save", () => saveWorkstream(fromForm(form(), props.existing?.config)));
+    const problem = formProblem(form());
+    const ok = await props.run("save", () => (problem ? Promise.reject(new Error(problem)) : saveWorkstream(fromForm(form(), props.existing?.config))));
     if (ok) props.onDone();
   };
   const row = "grid gap-1";
@@ -272,7 +295,7 @@ const Editor: Component<{
       </label>
       <label class={row}>
         <span class={label}>Color</span>
-        <input class={input} {...field("color")} placeholder="orange or #f97316" />
+        <input class={input} {...field("color")} placeholder="orange or #f97316 (a name or #hex)" />
       </label>
       <label class="flex items-center gap-2 text-[12px] text-fg sm:col-span-2">
         <input type="checkbox" checked={form().abstract} onChange={(e) => setForm({ ...form(), abstract: e.currentTarget.checked })} />

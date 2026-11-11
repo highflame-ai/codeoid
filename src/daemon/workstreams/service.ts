@@ -74,7 +74,8 @@ export class WorkstreamService {
       paths: w.match.paths.flatMap((p) => this.#pathRuleForms(p)),
       remotes: w.match.remotes.map((r) => r.toLowerCase()),
     }));
-    this.#revision = createHash("sha256").update(JSON.stringify(cfg)).digest("hex").slice(0, 16);
+    // The credentials too: a credential edit changes what sessions get, and clients skip a repeated revision.
+    this.#revision = createHash("sha256").update(JSON.stringify([cfg, [...this.#credentials.values()]])).digest("hex").slice(0, 16);
   }
 
   /**

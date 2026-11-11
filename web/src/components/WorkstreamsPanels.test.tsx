@@ -9,48 +9,51 @@ const calls = vi.hoisted(() => ({
   del: vi.fn((_id: string) => Promise.resolve()),
 }));
 vi.mock("../state/connection", () => ({ getClient: () => ({ request: vi.fn() }), newRequestId: () => "r" }));
-vi.mock("../state/workstreams", () => ({
-  fetchWorkstreams: vi.fn(() => Promise.resolve()),
-  fetchCredentials: vi.fn(() => Promise.resolve()),
-  resolveWorkstream: vi.fn(() => Promise.resolve({ home: "acme", source: "matched", matchedBy: "~/acme", candidates: [] })),
-  saveWorkstream: calls.save,
-  deleteWorkstream: calls.del,
-  saveWorkstreamSettings: calls.settings,
-  saveCredential: vi.fn(() => Promise.resolve()),
-  deleteCredential: vi.fn(() => Promise.resolve()),
-  setCredentialValue: calls.setValue,
-  workstreamsState: () => ({
-    loaded: true,
-    loading: false,
-    revision: "r1",
-    isolateGlobalServers: false,
-    workstreams: [
-      {
-        id: "acme",
-        name: "Acme",
-        abstract: false,
-        extends: [],
-        claim: "exclusive",
-        allowOverride: true,
-        share: "ask",
-        match: { paths: ["~/acme"], remotes: [] },
-        servers: [{ server: "github", credential: "gh", from: "acme" }],
-        accounts: {},
-        defaults: {},
-        env: ["GH_TOKEN"],
-        skillDirs: [],
-        config: { id: "acme", name: "Acme", claim: "exclusive", match: { paths: ["~/acme"], remotes: [] }, mcpServers: [{ server: "github", credential: "gh" }], env: { GH_TOKEN: { secret: "gh-env" } }, accounts: { claude: "work" } },
-      },
-    ],
-    error: null,
-  }),
-  credentialsState: () => ({
-    loaded: true,
-    store: { kind: "env-file", writable: true },
-    credentials: [{ id: "gh-env", kind: "env", status: { set: false }, usedBy: ["acme"] }],
-    error: null,
-  }),
-}));
+const holder = vi.hoisted(() => ({ set: (_v: unknown) => {} }));
+const { listState } = vi.hoisted(() => {
+  const ACME = {
+    id: "acme",
+    name: "Acme",
+    abstract: false,
+    extends: [],
+    claim: "exclusive",
+    allowOverride: true,
+    share: "ask",
+    match: { paths: ["~/acme"], remotes: [] },
+    servers: [{ server: "github", credential: "gh", from: "acme" }],
+    accounts: {},
+    defaults: {},
+    env: ["GH_TOKEN"],
+    skillDirs: [],
+    config: { id: "acme", name: "Acme", claim: "exclusive", match: { paths: ["~/acme"], remotes: [] }, mcpServers: [{ server: "github", credential: "gh" }], env: { GH_TOKEN: { secret: "gh-env" } }, accounts: { claude: "work" } },
+  };
+  const listState = (revision: string) => ({ loaded: true, loading: false, revision, isolateGlobalServers: false, workstreams: [{ ...ACME }], error: null });
+  return { ACME, listState };
+});
+
+vi.mock("../state/workstreams", async () => {
+  const { createSignal } = await import("solid-js");
+  const [state, setState] = createSignal<unknown>(listState("r1"));
+  holder.set = setState;
+  return {
+    fetchWorkstreams: vi.fn(() => Promise.resolve()),
+    fetchCredentials: vi.fn(() => Promise.resolve()),
+    resolveWorkstream: vi.fn(() => Promise.resolve({ home: "acme", source: "matched", matchedBy: "~/acme", candidates: [] })),
+    saveWorkstream: calls.save,
+    deleteWorkstream: calls.del,
+    saveWorkstreamSettings: calls.settings,
+    saveCredential: vi.fn(() => Promise.resolve()),
+    deleteCredential: vi.fn(() => Promise.resolve()),
+    setCredentialValue: calls.setValue,
+    workstreamsState: state,
+    credentialsState: () => ({
+      loaded: true,
+      store: { kind: "env-file", writable: true },
+      credentials: [{ id: "gh-env", kind: "env", status: { set: false }, usedBy: ["acme"] }],
+      error: null,
+    }),
+  };
+});
 
 import { CredentialsPanel } from "./CredentialsPanel";
 import { WorkstreamsPanel } from "./WorkstreamsPanel";
@@ -71,6 +74,16 @@ describe("WorkstreamsPanel", () => {
     expect(calls.save.mock.calls[0]![0]).toMatchObject({ id: "acme", match: { paths: ["~/acme", "~/acme-*"] }, accounts: { claude: "work" }, mcpServers: [{ server: "github", credential: "gh" }] });
     fireEvent.click(r.getByRole("checkbox", { name: /Isolate MCP servers/ }));
     await waitFor(() => expect(calls.settings).toHaveBeenCalledWith({ isolateGlobalServers: true }));
+  });
+
+  it("an open editor keeps what was typed when the list refreshes (another client's edit, a toggle)", async () => {
+    const r = render(() => <WorkstreamsPanel />);
+    fireEvent.click(r.getByRole("button", { name: "Edit" }));
+    const area = r.getByRole("form", { name: "Edit acme" }).querySelector("textarea") as HTMLTextAreaElement;
+    fireEvent.input(area, { target: { value: "~/typed" } });
+    holder.set(listState("r2")); // a new list: new objects, same ids
+    await Promise.resolve();
+    expect((r.getByRole("form", { name: "Edit acme" }).querySelector("textarea") as HTMLTextAreaElement).value).toBe("~/typed");
   });
 
   it("checks a folder", async () => {

@@ -286,7 +286,7 @@ export function writeWorktreeTrust(
 export function writeConfigBlock(
   key: "workstreams" | "credentials",
   update: (current: unknown) => unknown,
-): { ok: true; value: unknown } | { ok: false; error: string } {
+): { ok: true; value: unknown; config: Record<string, unknown> } | { ok: false; error: string } {
   let raw: Record<string, unknown>;
   try {
     raw = readRawConfig();
@@ -299,7 +299,14 @@ export function writeConfigBlock(
   const validation = validateConfigObject(raw);
   if (!validation.ok) return { ok: false, error: validation.issues.map((i) => `${i.path ? `${i.path}: ` : ""}${i.message}`).join("; ") };
   writeConfigJson(raw);
-  return { ok: true, value };
+  // The whole file as written: a caller applies every block it depends on from
+  // it, never one block from here and another from what it loaded at boot.
+  return { ok: true, value, config: raw };
+}
+
+/** Whether `.env` itself defines `key` (not merely the daemon's environment). */
+export function readDotEnvValueSet(key: string): boolean {
+  return readDotEnvKeys(configFilePaths().envPath).has(key);
 }
 
 /**
