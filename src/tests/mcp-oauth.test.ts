@@ -9,7 +9,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../daemon/store.js";
-import { McpOAuth, type McpTenant } from "../daemon/mcp/oauth.js";
+import { McpOAuth, type McpTenant, withSlot } from "../daemon/mcp/oauth.js";
 import type { McpServerSpec } from "../daemon/mcp/types.js";
 import { McpHub } from "../daemon/mcp/hub.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
@@ -628,3 +628,48 @@ describe("credential binding and limits", () => {
     hub.closeAll();
   });
 });
+
+describe("credential slots: a second sign-in to one server (workstreams §6.5 case 2)", () => {
+  it("each slot signs in, stays signed in and signs out on its own; a completion lands in the slot it began for", async () => {
+    fake = new FakeOAuthMcp();
+    const oauth = engine();
+    const base = spec();
+    const work = withSlot(base, "work");
+    await connect(oauth, base);
+    expect(oauth.status(base, TENANT)).toBe("connected");
+    expect(oauth.status(work, TENANT)).toBe("disconnected");
+    // complete() resolves the BASE spec by name; the pending sign-in carries the slot.
+    const begun = await oauth.begin(work, TENANT);
+    if (begun.status !== "redirect") throw new Error("expected a redirect");
+    const done = await oauth.complete({ callbackUrl: await signIn(begun.url) }, { tenant: TENANT }, () => base);
+    expect(done.slot).toBe("work");
+    expect(oauth.status(work, TENANT)).toBe("connected");
+    expect(await oauth.accessToken(work, TENANT)).not.toBe(await oauth.accessToken(base, TENANT));
+    oauth.disconnect(work, TENANT);
+    expect(oauth.status(work, TENANT)).toBe("disconnected");
+    expect(oauth.status(base, TENANT)).toBe("connected");
+  });
+});
+
+describe("the slot migration", () => {
+  it("rebuilds an old table once, every row becoming the default slot", () => {
+    const { Database } = require("bun:sqlite") as typeof import("bun:sqlite");
+    const path = join(tmp, "old.db");
+    const db = new Database(path);
+    db.exec(`CREATE TABLE mcp_oauth_credentials (
+      account_id TEXT NOT NULL, project_id TEXT NOT NULL, server TEXT NOT NULL, server_url TEXT NOT NULL,
+      client_json TEXT, tokens_json TEXT, tokens_saved_at INTEGER, updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (account_id, project_id, server, server_url));
+      INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, tokens_json) VALUES ('acc-1', 'proj-1', 'notes', 'https://n/mcp', '{"access_token":"t"}');`);
+    db.close();
+    const migrated = new Store(path);
+    expect(migrated.getMcpOAuthCredential(TENANT, { name: "notes", url: "https://n/mcp" })?.tokens).toEqual({ access_token: "t" });
+    expect(migrated.getMcpOAuthCredential(TENANT, { name: "notes", url: "https://n/mcp", slot: "work" })).toBeUndefined();
+    migrated.saveMcpOAuthTokens(TENANT, { name: "notes", url: "https://n/mcp", slot: "work" }, { access_token: "w" }, 1);
+    expect(migrated.getMcpOAuthCredential(TENANT, { name: "notes", url: "https://n/mcp" })?.tokens).toEqual({ access_token: "t" });
+    migrated.close();
+    // A second open is a no-op.
+    new Store(path).close();
+  });
+});
+

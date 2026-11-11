@@ -1808,7 +1808,8 @@ mcp
   .command("signin <server>")
   .description("Sign in to an OAuth MCP server in codeoid's registry (one you adopted, or configured with oauth)")
   .option("--callback-url <url>", "finish a sign-in from the address the browser landed on")
-  .action((server: string, opts: { callbackUrl?: string }) => withClient((c) => c.mcpSignin(server, opts.callbackUrl)));
+  .option("--credential <id>", "sign in to one of the server's named OAuth credentials (a workstream's own sign-in) instead of its default")
+  .action((server: string, opts: { callbackUrl?: string; credential?: string }) => withClient((c) => c.mcpSignin(server, opts.callbackUrl, opts.credential)));
 
 mcp
   .command("reconnect <session> <server>")

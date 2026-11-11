@@ -17,6 +17,9 @@ import { TranscriptStore } from "../daemon/transcript.js";
 import { FolderReader } from "../daemon/workstreams/folder.js";
 import { EnvFileSecretStore } from "../daemon/credentials/store.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
+import { McpRegistry } from "../daemon/mcp/registry.js";
+import { McpHub } from "../daemon/mcp/hub.js";
+import { McpOAuth } from "../daemon/mcp/oauth.js";
 import { ALL_SCOPES, SCOPES } from "../protocol/scopes.js";
 import type { AuthContext, DaemonMessage, SessionInfo } from "../protocol/types.js";
 
@@ -389,3 +392,15 @@ describe("under isolation a user's create must have a home", () => {
   });
 });
 
+describe("signing in to a credential slot", () => {
+  it("is refused unless the slot is declared as an OAuth credential for that server", async () => {
+    const m = manager(WS, [{ id: "slack-hf", kind: "oauth", server: "slack" }, { id: "plain", kind: "env" }, { id: "other-oauth", kind: "oauth", server: "notion" }]);
+    const registry = new McpRegistry({ slack: { url: "https://slack.invalid/mcp", oauth: true, args: [], env: {}, headers: {}, trust: "prompt", scope: "workspace", enabled: true, native: false } as never }, { memoryEnabled: false });
+    m.setMcp(registry, new McpHub({}), new McpOAuth({ store, redirectBaseUrl: () => "http://127.0.0.1:1", env: {} }));
+    for (const credential of ["undeclared", "plain", "other-oauth"]) {
+      const r = await m.handle({ type: "mcp.oauth.begin", id: `s-${credential}`, server: "slack", credential } as never, OWNER, client);
+      expect(r).toMatchObject({ type: "response.error", code: "invalid_request" });
+      if (r.type === "response.error") expect(r.error).toContain("is not an OAuth credential declared for \"slack\"");
+    }
+  });
+});

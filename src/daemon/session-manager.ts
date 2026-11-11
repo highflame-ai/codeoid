@@ -12,6 +12,7 @@ import { addedDirProblem, type OtherCheckout, PROJECT_ROOT_PARENT, projectRootPr
 import { WorkstreamService, type WorkstreamBinding } from "./workstreams/service.js";
 import { grantRefusal, type McpGrant } from "./workstreams/grant.js";
 import { OverrideTokens } from "./workstreams/override.js";
+import { withSlot } from "./mcp/oauth.js";
 import type { FolderReader } from "./workstreams/folder.js";
 import { createSecretStore, type SecretStore } from "./credentials/store.js";
 import { registerSecretPaths } from "./secret-paths.js";
@@ -3570,6 +3571,7 @@ mcpHub: this.#mcpHub,
     requestId: string,
     server: string,
     auth: AuthContext,
+    credential?: string,
   ): { spec: McpServerSpec; oauth: McpOAuth } | DaemonMessage {
     if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return this.#loginForbidden(requestId);
     const spec = this.#mcpRegistry?.get(server);
@@ -3581,18 +3583,25 @@ mcpHub: this.#mcpHub,
         code: "invalid_request",
       };
     }
-    return { spec, oauth: this.#mcpOAuth };
+    if (credential === undefined) return { spec, oauth: this.#mcpOAuth };
+    // A slot (workstreams §6.5 case 2) must be declared, as an OAuth
+    // credential, for exactly this server.
+    const decl = this.#config?.credentials?.find((c) => c.id === credential);
+    if (!decl || decl.kind !== "oauth" || decl.server !== server) {
+      return { type: "response.error", requestId, error: `"${credential}" is not an OAuth credential declared for "${server}" (config.json → credentials)`, code: "invalid_request" };
+    }
+    return { spec: withSlot(spec, credential), oauth: this.#mcpOAuth };
   }
 
   async #mcpOAuthBegin(
     msg: Extract<ClientMessage, { type: "mcp.oauth.begin" }>,
     auth: AuthContext,
   ): Promise<DaemonMessage> {
-    const target = this.#oauthTarget(msg.id, msg.server, auth);
+    const target = this.#oauthTarget(msg.id, msg.server, auth, msg.credential);
     if ("type" in target) return target;
     try {
       const begun = await target.oauth.begin(target.spec, tenantOf(auth));
-      this.#store.audit(auth.sub, "mcp.oauth.begin", "", `server=${msg.server} status=${begun.status}`);
+      this.#store.audit(auth.sub, "mcp.oauth.begin", "", `server=${msg.server}${msg.credential ? ` credential=${msg.credential}` : ""} status=${begun.status}`);
       if (begun.status === "connected") return { type: "mcp.oauth.begin.result", requestId: msg.id, status: "connected" };
       return {
         type: "mcp.oauth.begin.result",
@@ -3642,7 +3651,7 @@ mcpHub: this.#mcpHub,
     msg: Extract<ClientMessage, { type: "mcp.oauth.disconnect" }>,
     auth: AuthContext,
   ): DaemonMessage {
-    const target = this.#oauthTarget(msg.id, msg.server, auth);
+    const target = this.#oauthTarget(msg.id, msg.server, auth, msg.credential);
     if ("type" in target) return target;
     const tenant = tenantOf(auth);
     target.oauth.disconnect(target.spec, tenant);

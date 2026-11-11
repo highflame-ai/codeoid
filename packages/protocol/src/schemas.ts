@@ -738,6 +738,7 @@ export const mcpOAuthBeginSchema = z.object({
   ...base,
   type: z.literal("mcp.oauth.begin"),
   server: mcpServerNameField,
+  credential: z.string().min(1).max(64).optional(),
 });
 
 export const mcpOAuthCompleteSchema = z.object({
@@ -751,6 +752,7 @@ export const mcpOAuthDisconnectSchema = z.object({
   ...base,
   type: z.literal("mcp.oauth.disconnect"),
   server: mcpServerNameField,
+  credential: z.string().min(1).max(64).optional(),
 });
 
 export const mcpAdoptSchema = z.object({

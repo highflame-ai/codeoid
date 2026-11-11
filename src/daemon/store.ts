@@ -231,6 +231,13 @@ function enableWalWithRetry(db: Database, dbPath: string): void {
   );
 }
 
+/** Which stored OAuth credential: a server at a URL, and a slot ('' / absent = its default sign-in). */
+export interface McpOAuthServerKey {
+  name: string;
+  url: string;
+  slot?: string;
+}
+
 export class Store {
   #db: Database;
 
@@ -454,11 +461,14 @@ export class Store {
         project_id      TEXT NOT NULL,
         server          TEXT NOT NULL,
         server_url      TEXT NOT NULL,
+        -- A named credential's slot (workstreams §6.5 case 2: a second
+        -- sign-in to one server). '' = the server's default sign-in.
+        credential      TEXT NOT NULL DEFAULT '',
         client_json     TEXT,
         tokens_json     TEXT,
         tokens_saved_at INTEGER,
         updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
-        PRIMARY KEY (account_id, project_id, server, server_url)
+        PRIMARY KEY (account_id, project_id, server, server_url, credential)
       );
 
       -- Durable conductor identity (design R2): one row per tenant, reloaded
@@ -615,6 +625,37 @@ export class Store {
           ALTER TABLE audit_log_rebuild RENAME TO audit_log;
           CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
         `);
+      }
+    }
+
+    // ── mcp_oauth_credentials: a credential slot in the key (rebuild) ─────
+    // Workstreams give one server several sign-ins (§6.5 case 2). The slot is
+    // part of the primary key, which SQLite can't change by ALTER, so the
+    // table is rebuilt once, in one transaction: every existing row becomes
+    // the default slot (''), exactly what it was.
+    {
+      const cols = this.#db.prepare("PRAGMA table_info(mcp_oauth_credentials)").all() as Array<{ name: string }>;
+      if (cols.length > 0 && !cols.some((c) => c.name === "credential")) {
+        this.#db.transaction(() => {
+          this.#db.exec(`
+            CREATE TABLE mcp_oauth_credentials_rebuild (
+              account_id      TEXT NOT NULL,
+              project_id      TEXT NOT NULL,
+              server          TEXT NOT NULL,
+              server_url      TEXT NOT NULL,
+              credential      TEXT NOT NULL DEFAULT '',
+              client_json     TEXT,
+              tokens_json     TEXT,
+              tokens_saved_at INTEGER,
+              updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+              PRIMARY KEY (account_id, project_id, server, server_url, credential)
+            );
+            INSERT INTO mcp_oauth_credentials_rebuild (account_id, project_id, server, server_url, credential, client_json, tokens_json, tokens_saved_at, updated_at)
+              SELECT account_id, project_id, server, server_url, '', client_json, tokens_json, tokens_saved_at, updated_at FROM mcp_oauth_credentials;
+            DROP TABLE mcp_oauth_credentials;
+            ALTER TABLE mcp_oauth_credentials_rebuild RENAME TO mcp_oauth_credentials;
+          `);
+        })();
       }
     }
 
@@ -1814,14 +1855,14 @@ export class Store {
   /** A tenant's stored OAuth state for one MCP server, or undefined. */
   getMcpOAuthCredential(
     tenant: { accountId: string; projectId: string },
-    server: { name: string; url: string },
+    server: McpOAuthServerKey,
   ): { client?: Record<string, unknown>; tokens?: Record<string, unknown>; tokensSavedAt?: number } | undefined {
     const row = this.#db
       .prepare(
         `SELECT client_json, tokens_json, tokens_saved_at FROM mcp_oauth_credentials
-         WHERE account_id = ? AND project_id = ? AND server = ? AND server_url = ?`,
+         WHERE account_id = ? AND project_id = ? AND server = ? AND server_url = ? AND credential = ?`,
       )
-      .get(tenant.accountId, tenant.projectId, server.name, server.url) as
+      .get(tenant.accountId, tenant.projectId, server.name, server.url, server.slot ?? "") as
       | { client_json: string | null; tokens_json: string | null; tokens_saved_at: number | null }
       | null;
     if (!row) return undefined;
@@ -1835,36 +1876,36 @@ export class Store {
   /** Save the client a server registered for this tenant (dynamic registration). */
   saveMcpOAuthClient(
     tenant: { accountId: string; projectId: string },
-    server: { name: string; url: string },
+    server: McpOAuthServerKey,
     client: object,
   ): void {
     this.#db
       .prepare(
-        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, client_json, updated_at)
-         VALUES (?, ?, ?, ?, ?, datetime('now'))
-         ON CONFLICT(account_id, project_id, server, server_url) DO UPDATE SET
+        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, credential, client_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(account_id, project_id, server, server_url, credential) DO UPDATE SET
            client_json = excluded.client_json, updated_at = excluded.updated_at`,
       )
-      .run(tenant.accountId, tenant.projectId, server.name, server.url, JSON.stringify(client));
+      .run(tenant.accountId, tenant.projectId, server.name, server.url, server.slot ?? "", JSON.stringify(client));
   }
 
   /** Save a tenant's tokens for a server, stamped with when they were issued. */
   saveMcpOAuthTokens(
     tenant: { accountId: string; projectId: string },
-    server: { name: string; url: string },
+    server: McpOAuthServerKey,
     tokens: object,
     savedAtMs: number,
   ): void {
     this.#db
       .prepare(
-        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, tokens_json, tokens_saved_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-         ON CONFLICT(account_id, project_id, server, server_url) DO UPDATE SET
+        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, credential, tokens_json, tokens_saved_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(account_id, project_id, server, server_url, credential) DO UPDATE SET
            tokens_json = excluded.tokens_json,
            tokens_saved_at = excluded.tokens_saved_at,
            updated_at = excluded.updated_at`,
       )
-      .run(tenant.accountId, tenant.projectId, server.name, server.url, JSON.stringify(tokens), savedAtMs);
+      .run(tenant.accountId, tenant.projectId, server.name, server.url, server.slot ?? "", JSON.stringify(tokens), savedAtMs);
   }
 
   /**
@@ -1874,11 +1915,11 @@ export class Store {
    */
   clearMcpOAuth(
     tenant: { accountId: string; projectId: string },
-    server: { name: string; url: string },
+    server: McpOAuthServerKey,
     what: "tokens" | "client" | "all",
   ): void {
-    const where = "account_id = ? AND project_id = ? AND server = ? AND server_url = ?";
-    const args = [tenant.accountId, tenant.projectId, server.name, server.url] as const;
+    const where = "account_id = ? AND project_id = ? AND server = ? AND server_url = ? AND credential = ?";
+    const args = [tenant.accountId, tenant.projectId, server.name, server.url, server.slot ?? ""] as const;
     if (what === "all") {
       this.#db.prepare(`DELETE FROM mcp_oauth_credentials WHERE ${where}`).run(...args);
       return;

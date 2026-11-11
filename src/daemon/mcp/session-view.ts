@@ -32,6 +32,7 @@
 import type { RawMcpServerConfig } from "../../config.js";
 import type { McpHub } from "./hub.js";
 import type { McpGrant } from "../workstreams/grant.js";
+import { withSlot } from "./oauth.js";
 import type { McpTenant } from "./oauth.js";
 import { isReservedMcpName, normalizeSpec, type McpRegistry, type McpServerView } from "./registry.js";
 import { isOAuthServer, type McpServerSpec } from "./types.js";
@@ -439,8 +440,8 @@ export function secretFree(spec: McpServerSpec): boolean {
  * servers when the folder is the home's; any other only by name. A selected
  * server called with a named credential gets it as a REFERENCE on its
  * transport, and a variant of its own, so the hub keeps one client per
- * credential. An OAuth slot (a second sign-in) is not supported yet: such a
- * server is withheld, never called with the default sign-in instead.
+ * credential. An OAuth server with a slot is called with that slot's own
+ * sign-in (withSlot) — never with the default one instead.
  */
 function applyGrant(specs: readonly McpServerSpec[], grant: McpGrant): McpServerSpec[] {
   const out: McpServerSpec[] = [];
@@ -454,7 +455,11 @@ function applyGrant(specs: readonly McpServerSpec[], grant: McpGrant): McpServer
       continue;
     }
     const sel = grant.servers.get(spec.name);
-    if (!sel || sel.oauthSlot) continue;
+    if (!sel) continue;
+    if (sel.oauthSlot) {
+      if (isOAuthServer(spec)) out.push(withSlot(spec, sel.oauthSlot));
+      continue; // a slot names a sign-in; a server without OAuth has none to take
+    }
     if (sel.credential && spec.transport.kind === "http" && !isOAuthServer(spec)) {
       out.push({
         ...spec,

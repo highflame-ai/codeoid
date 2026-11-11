@@ -87,9 +87,27 @@ describe("the session's view under a grant", () => {
     expect(JSON.stringify(v.list())).not.toContain("ghp_");
   });
 
-  it("an OAuth slot (not supported yet) or a credential a stdio server can't take: withheld, never called without it", async () => {
+  it("a slot or credential a server can't take is withheld, never called without it", async () => {
+    // github has no OAuth (a slot names a sign-in), notes is stdio (a credential is an HTTP header).
     const v = await view({ workstream: "acme", servers: new Map([["github", { oauthSlot: "gh-2" }], ["notes", { credential: { id: "x" } }]]), workdirServers: false });
     expect(names(v.list())).toEqual(["codeoid_memory"]);
+  });
+
+  it("an OAuth server with a slot is called with that slot's own sign-in", async () => {
+    const registry = new McpRegistry({ slack: raw({ url: "https://slack.example/mcp", oauth: true }) }, { memoryEnabled: false });
+    const v = new SessionMcpView(registry, null, {
+      workdir: "/w",
+      tenant: TENANT,
+      approvals: () => new Set(),
+      read: async () => [],
+      readGlobal: async () => null,
+      grant: () => ({ workstream: "hf", servers: new Map([["slack", { oauthSlot: "slack-hf" }]]), workdirServers: false }),
+    });
+    await v.load();
+    const slack = v.get("slack");
+    expect(slack?.transport).toMatchObject({ kind: "http", credential: { id: "slack-hf" } });
+    expect(slack?.variant).toContain("#oauth:slack-hf");
+    expect(names(v.relayFor("codex"))).toEqual(["slack"]);
   });
 
   it("CLI backends: native mounts only secret-free; credentialed HTTP through the relay; stdio needing env values withheld", async () => {

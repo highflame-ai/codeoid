@@ -981,20 +981,21 @@ export class TerminalClient {
    * finishes a sign-in on its own only for the browser the web UI started it
    * from. `callbackUrl` finishes one started earlier, without a terminal.
    */
-  async mcpSignin(server: string, callbackUrl?: string): Promise<void> {
+  async mcpSignin(server: string, callbackUrl?: string, credential?: string): Promise<void> {
     if (callbackUrl) {
       await this.#finishMcpSignin(callbackUrl);
       return;
     }
     // Discovery and client registration are a few round trips to the provider.
-    const begun = await this.#request({ type: "mcp.oauth.begin", id: randomUUID(), server }, 45_000);
+    const begun = await this.#request({ type: "mcp.oauth.begin", id: randomUUID(), server, ...(credential ? { credential } : {}) }, 45_000);
     if (begun.type !== "mcp.oauth.begin.result") {
       this.#printError(begun);
       process.exitCode = 1;
       return;
     }
+    const as = credential ? ` (credential ${S(credential)})` : "";
     if (begun.status === "connected" || !begun.url) {
-      console.log(`${S(server)} is signed in.`);
+      console.log(`${S(server)}${as} is signed in.`);
       return;
     }
     console.log(`Open this address to sign in to ${S(server)}:\n\n  ${begun.url}\n`);
