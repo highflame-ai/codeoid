@@ -1095,6 +1095,22 @@ export class Session {
   }
 
   /**
+   * Change the session's binding (workstreams W3: a reference granted or
+   * taken away, a move to another home, §5.3, §7). Authorized and judged by
+   * the manager. Saved at once; what it gives is read live, so the backend
+   * is rebuilt with it at the next turn (its servers, env, sandbox roots and
+   * recall), never mid-turn. Said on the session.
+   */
+  setWorkstream(next: WorkstreamBinding, said: string): void {
+    this.#workstream = next;
+    this.#saveMetaNow();
+    const info = this.#makeMessage("info", `🧭 ${said}`, SYSTEM_IDENTITY, undefined, undefined, { event: "workstream.changed", workstream: next.id ?? null });
+    this.#persistAndBuffer(info);
+    this.#broadcastRaw(info);
+    this.#broadcastInfoUpdate();
+  }
+
+  /**
    * Goal + role→backend bindings when this session was created with the
    * Collaborative toggle (set from opts / restored from meta). Readonly: the
    * bindings are fixed for the life of the goal (§2, per-goal child

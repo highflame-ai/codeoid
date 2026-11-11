@@ -9,7 +9,7 @@
  */
 
 import { addedDirProblem, type OtherCheckout, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
-import { WorkstreamService, type WorkstreamBinding, type WorkstreamFence } from "./workstreams/service.js";
+import { WorkstreamService, type WorkstreamBinding, type WorkstreamFence, type WorkstreamReference } from "./workstreams/service.js";
 import { repositoryTopOf } from "./workstreams/folders.js";
 import { grantRefusal, type McpGrant } from "./workstreams/grant.js";
 import { OverrideTokens } from "./workstreams/override.js";
@@ -1548,6 +1548,10 @@ mcpHub: this.#mcpHub,
         return this.#loopWorkerGuard(msg, "change the sandbox of") ?? this.#setSandbox(msg, auth);
       case "session.sandbox_dir":
         return this.#loopWorkerGuard(msg, "change the sandbox of") ?? this.#sandboxDir(msg, auth);
+      case "session.add_reference":
+      case "session.remove_reference":
+      case "session.set_workstream":
+        return this.#loopWorkerGuard(msg, "change the workstream of") ?? this.#sessionWorkstreamEdit(msg, auth);
       case "sandbox.providers":
         return this.#sandboxProviders(msg, auth);
       case "session.pin":
@@ -4842,7 +4846,33 @@ mcpHub: this.#mcpHub,
       }
     }
     for (const w of homing.warnings) warn(w);
-    const createWorkstream = homing.binding;
+    let createWorkstream = homing.binding;
+    // References asked at create (§7.2): each by the share policy of the
+    // workstream read. The creator asking with session:approve, undelegated,
+    // is the confirm an `ask` workstream wants; anyone else gets `open` only.
+    if (msg.references && msg.references.length > 0) {
+      if (!this.#workstreams.configured || !createWorkstream) {
+        return { type: "response.error", requestId: msg.id, error: "No workstreams are configured: a session can't reference one", code: "invalid_request" };
+      }
+      const approves = hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE) && auth.delegationDepth === 0;
+      const recorded = this.#store.workstreamFoldersByWorkstream();
+      const refs: WorkstreamReference[] = [];
+      for (const asked of msg.references) {
+        const paths = asked.paths?.map((p) => normalizeWorkdir(p) ?? p);
+        if (paths?.some((p) => !p.startsWith("/"))) {
+          return { type: "response.error", requestId: msg.id, error: "A reference's folders are absolute paths", code: "invalid_request" };
+        }
+        const v = this.#workstreams.referenceVerdict(createWorkstream.id, { workstream: asked.workstream, ...(paths ? { paths } : {}) }, (recorded.get(asked.workstream) ?? []).map((w) => repositoryTopOf(w, homedir())));
+        if (!v.ok) return { type: "response.error", requestId: msg.id, error: v.error, code: "forbidden" };
+        if (v.ask.length > 0 && !approves) {
+          return { type: "response.error", requestId: msg.id, error: `Workstream "${asked.workstream}" shares only with approval: referencing it needs session:approve on an undelegated token`, code: "forbidden" };
+        }
+        refs.push({ workstream: asked.workstream, ...(paths ? { paths } : {}), grantedBy: auth.sub, grantedAt: new Date().toISOString() });
+      }
+      const unique = [...new Map(refs.map((r) => [r.workstream, r])).values()];
+      createWorkstream = { ...createWorkstream, references: unique, readFrom: [...new Set([...(createWorkstream.readFrom ?? []), ...unique.map((r) => r.workstream)])] };
+      this.#store.audit(auth.sub, "workstream.reference_added", "", `workdir=${workdir} references=${unique.map((r) => r.workstream).join(",")} at=create`);
+    }
     if (createWorkstream?.source === "override") {
       const c = homing.resolution?.conflict;
       this.#store.audit(auth.sub, "workstream.override", "", `workdir=${workdir} folder=${c?.folder ?? "?"} chosen=${createWorkstream.id} revision=${createWorkstream.revision}`);
@@ -9975,6 +10005,145 @@ mcpHub: this.#mcpHub,
     return { type: "response.ok", requestId: msg.id, data: { ...(result.pending ? { pending: true } : {}), message: result.message, sandbox: session.sandboxInfo } };
   }
 
+  /**
+   * `session.add_reference` / `remove_reference` / `set_workstream`
+   * (workstreams §5.3, §7): owner-only. A grant or a move follows the share
+   * policy of each workstream it reads from (WorkstreamService
+   * `referenceVerdict` / `moveVerdict`): `closed` refuses; `ask` is granted
+   * at once to the owner asking with session:approve on an undelegated token,
+   * else asked of the owner on the session. Applied at the next turn.
+   */
+  async #sessionWorkstreamEdit(
+    msg: Extract<ClientMessage, { type: "session.add_reference" | "session.remove_reference" | "session.set_workstream" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const err = (error: string, code: "forbidden" | "invalid_request" | "not_found" = "invalid_request"): DaemonMessage => ({ type: "response.error", requestId: msg.id, error, code });
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) return err("Missing scope: session:send", "forbidden");
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return err("Session not found", "not_found");
+    if (session.createdBy !== auth.sub) return err("Only the session's owner can change what workstreams it reads", "forbidden");
+    const binding = session.workstream;
+    if (!this.#workstreams.configured || !binding) return err("No workstreams are configured");
+    if (binding.source === "reserved") return err("The conductor's workstream can't be changed");
+    // The owner asking with approval rights, undelegated, is the confirm an `ask` policy wants.
+    const approves = hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE) && auth.delegationDepth === 0;
+    const reply = (data: Record<string, unknown>): DaemonMessage => ({ type: "response.ok", requestId: msg.id, data: { ...data, workstream: this.#describeWorkstream(session.workstream) } });
+
+    if (msg.type === "session.remove_reference") {
+      const refs = binding.references ?? [];
+      if (!refs.some((r) => r.workstream === msg.workstream)) return err(`This session has no reference to "${msg.workstream}"`);
+      const rest = refs.filter((r) => r.workstream !== msg.workstream);
+      session.setWorkstream({ ...withoutKey(binding, "references"), ...(rest.length > 0 ? { references: rest } : {}) }, `No longer reads workstream "${msg.workstream}" (from the next turn)`);
+      this.#store.audit(auth.sub, "workstream.reference_removed", session.id, `workstream=${msg.workstream}`);
+      return reply({ message: `removed the reference to ${msg.workstream}` });
+    }
+
+    // What is asked, as it will be granted; null = refused (with why).
+    let decide:
+      | { ask: string[]; recheck: () => string | undefined; apply: (by: string) => { next: WorkstreamBinding; said: string; audit: [string, string] } }
+      | { error: string };
+    if (msg.type === "session.add_reference") {
+      const paths = msg.paths?.map((p) => normalizeWorkdir(p) ?? p);
+      if (paths?.some((p) => !p.startsWith("/"))) return err("A reference's folders are absolute paths");
+      const recorded = this.#store.workstreamFoldersByWorkstream().get(msg.workstream) ?? [];
+      const v = this.#workstreams.referenceVerdict(binding.id, { workstream: msg.workstream, ...(paths ? { paths } : {}) }, recorded.map((w) => repositoryTopOf(w, homedir())));
+      const again = () => {
+        const w = this.#workstreams.referenceVerdict(session.workstream?.id, { workstream: msg.workstream, ...(paths ? { paths } : {}) }, recorded.map((r) => repositoryTopOf(r, homedir())));
+        return w.ok ? undefined : w.error;
+      };
+      decide = !v.ok
+        ? { error: v.error }
+        : {
+            ask: v.ask,
+            recheck: again,
+            apply: (by) => {
+              const cur = session.workstream ?? binding;
+              const ref = { workstream: msg.workstream, ...(paths ? { paths } : {}), grantedBy: by, grantedAt: new Date().toISOString() };
+              const next: WorkstreamBinding = {
+                ...cur,
+                references: [...(cur.references ?? []).filter((r) => r.workstream !== msg.workstream), ref],
+                readFrom: [...new Set([...(cur.readFrom ?? []), msg.workstream])],
+              };
+              return { next, said: `Reads workstream "${msg.workstream}"${paths ? ` (${paths.join(", ")})` : ""} from the next turn: its folders read-only, and its memory`, audit: ["workstream.reference_added", `workstream=${msg.workstream}${paths ? ` paths=${paths.join(",")}` : ""} by=${by}`] };
+            },
+          };
+    } else {
+      if (msg.workstream === binding.id) return err(`The session is already in "${msg.workstream}"`);
+      const v = this.#workstreams.moveVerdict(binding, msg.workstream);
+      // Past another workstream's exclusive claim on the folder: an override (§5.2), never asked on the session.
+      const resolution = this.#workstreams.resolve(session.workdir, msg.workstream);
+      const conflict = resolution.conflict;
+      if (v.ok && conflict) {
+        if (!conflict.overridable) return err(`This folder belongs to workstream "${conflict.folder}", which allows no override`, "forbidden");
+        if (!approves) return err(`This folder belongs to workstream "${conflict.folder}" (exclusive): moving the session past it needs session:approve on an undelegated token`, "forbidden");
+      }
+      decide = !v.ok
+        ? { error: v.error }
+        : {
+            ask: v.ask,
+            recheck: () => {
+              const w = this.#workstreams.moveVerdict(session.workstream, msg.workstream);
+              return w.ok ? undefined : w.error;
+            },
+            apply: (by) => {
+              const cur = session.workstream ?? binding;
+              const refs = (cur.references ?? []).filter((r) => r.workstream !== msg.workstream);
+              const next: WorkstreamBinding = {
+                id: msg.workstream,
+                source: conflict ? "override" : "explicit",
+                revision: this.#workstreams.revision,
+                ...(refs.length > 0 ? { references: refs } : {}),
+                ...(cur.readFrom?.length ? { readFrom: cur.readFrom } : {}),
+              };
+              return { next, said: `Moved to workstream "${msg.workstream}"${cur.id ? ` from "${cur.id}"` : ""}: its servers, credentials and sandbox from the next turn`, audit: [conflict ? "workstream.override" : "workstream.moved", `from=${cur.id ?? "none"} to=${msg.workstream} by=${by}`] };
+            },
+          };
+    }
+    if ("error" in decide) return err(decide.error, "forbidden");
+    const applyNow = (by: string) => {
+      const { next, said, audit } = decide.apply(by);
+      session.setWorkstream(next, said);
+      this.#store.audit(by, audit[0], session.id, audit[1]);
+    };
+    if (decide.ask.length === 0 || approves) {
+      applyNow(auth.sub);
+      return reply({ message: "done" });
+    }
+    // An `ask` workstream, and the asker can't approve it: the owner confirms on the session.
+    const what = msg.type === "session.add_reference" ? `read workstream "${msg.workstream}"` : `move to workstream "${msg.workstream}"`;
+    this.#store.audit(auth.sub, "workstream.share_ask", session.id, `${msg.type} ${msg.workstream} ask=${decide.ask.join(",")}`);
+    let answeredBy: string | undefined;
+    void session
+      .requestUserInput(
+        {
+          method: "confirm",
+          title: `Let "${session.name}" ${what}?`,
+          message:
+            msg.type === "session.add_reference"
+              ? `"${msg.workstream}" shares only with approval. The session could read its folders and recall its memory; it gets none of its servers or credentials, and writes nothing there.`
+              : `${decide.ask.map((w) => `"${w}"`).join(" and ")} share${decide.ask.length === 1 ? "s" : ""} only with approval, and the session's whole conversation would go with it.`,
+        },
+        { ownerOnly: true, onAnswer: (sub) => void (answeredBy = sub) },
+      )
+      .then(
+        (answer) => {
+          if (answer.cancelled || answer.confirmed !== true) {
+            this.#store.audit(answeredBy ?? auth.sub, "workstream.share_denied", session.id, `${msg.type} ${msg.workstream} ${answer.reason ?? "declined"}`);
+            return;
+          }
+          // Judged again as it is now: a policy tightened while the owner was asked wins.
+          const now = decide.recheck();
+          if (now) {
+            this.#store.audit(answeredBy ?? auth.sub, "workstream.share_denied", session.id, `${msg.type} ${msg.workstream} ${now}`);
+            return;
+          }
+          applyNow(answeredBy ?? auth.sub);
+        },
+        () => {},
+      );
+    return reply({ pending: true, message: `asked on the session: ${what}?` });
+  }
+
   /** `sandbox.providers` (#448): what the daemon has and whether each runs here. */
   async #sandboxProviders(msg: Extract<ClientMessage, { type: "sandbox.providers" }>, auth: AuthContext): Promise<DaemonMessage> {
     if (!hasScope(auth.scopes as string[], SCOPES.SESSION_CREATE)) {
@@ -10432,4 +10601,10 @@ function tenantOf(auth: AuthContext): McpTenant {
 function daemonSandboxRoot(): string[] {
   const root = sandboxRootIfMade();
   return root ? [root] : [];
+}
+
+/** `obj` without `key` (an optional field taken away). */
+function withoutKey<T extends object, K extends keyof T>(obj: T, key: K): Omit<T, K> {
+  const { [key]: _, ...rest } = obj;
+  return rest;
 }
