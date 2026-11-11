@@ -87,7 +87,7 @@ export interface FleetDispatchDeps {
    * exclusive claim, which the spawn's approval card said (G3). Absent = no
    * workstreams on this daemon.
    */
-  checkWorkstream?(workdir: string, workstream?: string): { ok: true; workstream?: string; override?: boolean; revision?: string } | { ok: false; error: string };
+  checkWorkstream?(workdir: string, workstream?: string, confirmation?: string): { ok: true; workstream?: string; override?: boolean; revision?: string } | { ok: false; error: string };
   /** Interrupt a running session immediately (post-approval). */
   interrupt(sessionId: string): Promise<void>;
   /** Normalize + validate a spawn workdir; null when unusable. */
@@ -449,6 +449,8 @@ export function createFleetHandlers(deps: FleetDeps) {
       provider?: string;
       model?: string;
       workstream?: string;
+      /** Set by codeoid on an approved call whose card confirmed something (workstreams §10); never the model's. */
+      confirmation?: string;
     }): Promise<string> {
       if (!deps.dispatch) return "Dispatch is disabled on this daemon.";
       const shape = args.shape ?? "scout";
@@ -467,7 +469,7 @@ export function createFleetHandlers(deps: FleetDeps) {
       if (!backend.ok) return backend.error;
       // Its home (§10): the workstream named, else the folder's — a conflict is the conductor's to resolve now.
       const home: { ok: true; workstream?: string; override?: boolean; revision?: string } | { ok: false; error: string } = deps.dispatch.checkWorkstream
-        ? deps.dispatch.checkWorkstream(workdir, args.workstream)
+        ? deps.dispatch.checkWorkstream(workdir, args.workstream, args.confirmation)
         : { ok: true };
       if (!home.ok) return home.error;
       const taskId = deps.dispatch.enqueue({
@@ -711,9 +713,10 @@ export function buildFleetMcpServer(
             .max(64)
             .optional()
             .describe("The workstream the worker is homed in: it gets that workstream's servers, credentials and memory only. Omit for the folder's own; required where the folder has none. A conflict with the folder's exclusive workstream is shown on the approval card."),
+          confirmation: z.string().max(64).optional().describe("Set by codeoid when the owner approves; never set it yourself."),
         },
-        async ({ workdir, task, shape, provider, model, workstream }) =>
-          text(await handlers.fleet_spawn({ workdir, task, shape, provider, model, ...(workstream ? { workstream } : {}) })),
+        async ({ workdir, task, shape, provider, model, workstream, confirmation }) =>
+          text(await handlers.fleet_spawn({ workdir, task, shape, provider, model, ...(workstream ? { workstream } : {}), ...(confirmation ? { confirmation } : {}) })),
       ),
       tool(
         "fleet_interrupt",

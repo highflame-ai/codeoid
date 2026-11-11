@@ -437,6 +437,18 @@ export interface WindowScope {
   workdir: string;
 }
 
+/**
+ * What a send-class fleet call's card says of its workstream (workstreams
+ * §10), and — when approving it confirms something — what it was judged on,
+ * which the manager checks a confirmation against. `confirm` never leaves the
+ * daemon (the card shows `workstream` and `warning`).
+ */
+export interface FleetCardTarget {
+  workstream?: string;
+  warning?: string;
+  confirm?: { workdir: string; workstream?: string; revision: string; conflict?: string; asks: string[] };
+}
+
 export interface SessionCreateOptions {
   name: string;
   workdir: string;
@@ -642,7 +654,14 @@ export interface SessionCreateOptions {
    * (workstreams §10). Injected by the manager (the conductor's): a session
    * can't see its targets' homes. Undefined = nothing to say.
    */
-  fleetTargetWorkstream?: (toolName: string, input: unknown) => { workstream?: string; warning?: string } | undefined;
+  fleetTargetWorkstream?: (toolName: string, input: unknown) => FleetCardTarget | undefined;
+  /**
+   * The owner approved a card whose target needs confirming (an override, an
+   * `ask` folder): a one-time token for that very call, which the gate adds
+   * to its input (`confirmation`) for the fleet handler to present. Absent
+   * or undefined: none (the handler then refuses what needed it).
+   */
+  fleetConfirm?: (target: FleetCardTarget, input: unknown) => string | undefined;
   /**
    * Initial execution mode + autonomous tool budget. Spawned workers start
    * "autonomous" with a bounded budget so they can work unattended; when the
@@ -1438,7 +1457,8 @@ export class Session {
   #mode: SessionMode = "guarded";
   #onStatusChange?: (sessionId: string, status: SessionStatus, opts?: { settled: true }) => void;
   #collaborationCost?: () => CollaborationCost | undefined;
-  #fleetTargetWorkstream?: (toolName: string, input: unknown) => { workstream?: string; warning?: string } | undefined;
+  #fleetTargetWorkstream?: (toolName: string, input: unknown) => FleetCardTarget | undefined;
+  #fleetConfirm?: (target: FleetCardTarget, input: unknown) => string | undefined;
   #workerShape?: "ship" | "scout";
   #turnsRemaining: number | undefined = undefined;
   /** See SessionCreateOptions.onBudgetExhausted. */
@@ -1876,6 +1896,7 @@ export class Session {
     this.#workerShape = opts.workerShape;
     this.#collaborationCost = opts.collaborationCost;
     this.#fleetTargetWorkstream = opts.fleetTargetWorkstream;
+    this.#fleetConfirm = opts.fleetConfirm;
     this.#maxBudgetUsd = opts.maxBudgetUsd;
     this.#onBudgetExhausted = opts.onBudgetExhausted ?? "park";
     const envOf = opts.workstreamEnv;
@@ -6511,7 +6532,7 @@ export class Session {
         input: gated.input,
         ...this.#cardRisk(risk, this.#heldWrite(gated.toolName, gated.input)),
         ...this.#cardSandbox(gated.toolName, gated.input, gated.shellCwd),
-        ...(ws ? { targetWorkstream: ws.target } : {}),
+        ...(ws ? { targetWorkstream: { ...(ws.target.workstream ? { workstream: ws.target.workstream } : {}), ...(ws.target.warning ? { warning: ws.target.warning } : {}) } } : {}),
       });
     }
     return out;
@@ -7881,12 +7902,17 @@ export class Session {
    * Never throws. A roll-up that could fail an approval would be worse than no
    * roll-up at all — the dispatch path must not be wedgeable by a cost display.
    */
-  /** What each pending card said of its workstream, with the input it was judged on (the manager checks an approval against it). */
-  #approvalWorkstreams = new Map<string, { toolName: string; input: unknown; target: { workstream?: string; warning?: string } }>();
+  /** What each pending card said of its workstream, with the input it was judged on; let go when it settles. */
+  #approvalWorkstreams = new Map<string, { toolName: string; input: unknown; target: FleetCardTarget }>();
 
   /** What a pending approval's card said of its workstream (workstreams §10), or undefined. */
-  approvalWorkstream(approvalId: string): { toolName: string; input: unknown; target: { workstream?: string; warning?: string } } | undefined {
+  approvalWorkstream(approvalId: string): { toolName: string; input: unknown; target: FleetCardTarget } | undefined {
     return this.#approvalWorkstreams.get(approvalId);
+  }
+
+  /** Whether `sender` answers as this session's owner (its own user token), as an owner-only confirm needs. */
+  isOwnApprover(sender: AuthContext): boolean {
+    return this.#isOwnApproval(sender);
   }
 
   /** The workstream a send-class fleet call acts in, for its card (never throws: a display can't wedge an approval). */
@@ -7898,9 +7924,27 @@ export class Session {
         if (this.#approvalWorkstreams.size > 64) this.#approvalWorkstreams.delete(this.#approvalWorkstreams.keys().next().value!);
         this.#approvalWorkstreams.set(approvalId, { toolName, input, target: t });
       }
-      return t ? { targetWorkstream: t } : {};
+      // The card shows what it says; what it was judged on stays here.
+      return t ? { targetWorkstream: { ...(t.workstream ? { workstream: t.workstream } : {}), ...(t.warning ? { warning: t.warning } : {}) } } : {};
     } catch {
       return {};
+    }
+  }
+
+  /**
+   * The approved call's input with a confirmation token, when its card needed one (workstreams §10, G3): only
+   * for the owner's own approval of that very card, on the input the card was judged on. Never throws.
+   */
+  #withFleetConfirmation(approvalId: string, input: Record<string, unknown>): Record<string, unknown> {
+    const card = this.#approvalWorkstreams.get(approvalId);
+    this.#approvalWorkstreams.delete(approvalId);
+    if (!card?.target.confirm || !this.#fleetConfirm || !this.#ownerApproved.has(approvalId)) return input;
+    try {
+      if (JSON.stringify(card.input) !== JSON.stringify(input)) return input;
+      const token = this.#fleetConfirm(card.target, input);
+      return token ? { ...input, confirmation: token } : input;
+    } catch {
+      return input;
     }
   }
 
@@ -9963,8 +10007,9 @@ export class Session {
         this.#store.audit(sender.sub, "session.approve", this.id, `tool=${toolName} approvalId=${approvalId}`);
         if (unsandboxed) this.#store.audit(sender.sub, "session.unsandboxed_approve", this.id, `tool=${toolName} approvalId=${approvalId}`);
         const merged: Record<string, unknown> = sanitizedPatch ? { ...effectiveInput, ...sanitizedPatch } : effectiveInput;
-        return { behavior: "allow" as const, updatedInput: merged };
+        return { behavior: "allow" as const, updatedInput: sanitizedPatch ? merged : this.#withFleetConfirmation(approvalId, merged) };
       }
+      this.#approvalWorkstreams.delete(approvalId);
       this.#store.audit(sender.sub, "session.deny", this.id, `tool=${toolName} approvalId=${approvalId}`);
       return { behavior: "deny" as const, message: "Denied by user" };
     };

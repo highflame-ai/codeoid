@@ -197,6 +197,11 @@ export class WorkstreamService {
     return this.#cfg.isolateGlobalServers;
   }
 
+  /** Whether any workstream is `closed` (its text withheld from the conductor, under isolation). */
+  get anyClosed(): boolean {
+    return [...this.#effective.values()].some((w) => !w.abstract && w.share === "closed");
+  }
+
   get defaultId(): string | undefined {
     return this.#cfg.default;
   }
