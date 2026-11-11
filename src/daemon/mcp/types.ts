@@ -157,19 +157,21 @@ export function isProxied(spec: McpServerSpec): boolean {
 export function resolveEnvValue(value: string, env: Record<string, string | undefined>): string {
   const m = /^\$\{(\w+)\}$/.exec(value);
   if (!m) return value;
-  // Never codeoid's own: the daemon's environment carries every workstream's
-  // credential (CODEOID_CRED_*), its root key and bot tokens — a server
-  // config (a repo's .mcp.json included) naming one must not be handed it.
+  // Never a workstream credential: the daemon's environment carries every
+  // workstream's (CODEOID_CRED_*), and a server config naming one would hand
+  // one workstream's secret to a server of any (workstreams W1 audit).
   return isDaemonOwnedEnvName(m[1]) ? "" : (env[m[1]] ?? "");
 }
 
 /**
- * The daemon's own variables (providers/env.ts DENY_PREFIXES): kept out of
- * every agent process, and out of every value an MCP server config can name
- * by `${VAR}` or `bearerTokenEnv` (workstreams W1 audit).
+ * Variables no MCP server config may name by `${VAR}` or `bearerTokenEnv`:
+ * the workstream credentials (credentials/store.ts). Narrow on purpose — a
+ * user's own config naming one of their own `CODEOID_*` variables keeps
+ * working as before; a repository's config can name none of codeoid's at all
+ * (workdir-servers.ts withoutDaemonSecrets).
  */
 export function isDaemonOwnedEnvName(name: string): boolean {
-  return /^(CODEOID_|ZEROID_|TELEGRAM_)/.test(name);
+  return name.startsWith("CODEOID_CRED_");
 }
 
 /** Resolve every value in an env map via {@link resolveEnvValue}. */

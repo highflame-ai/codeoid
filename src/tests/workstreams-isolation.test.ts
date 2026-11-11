@@ -259,14 +259,21 @@ describe("secrets outside the obvious fields (W1 audit)", () => {
     expect(names(v.withheldFromNative("codex"))).toEqual(["tok"]);
   });
 
-  it("a server config can't name the daemon's own variables: ${CODEOID_*} resolves empty, a CODEOID_ bearerTokenEnv is dropped", async () => {
+  it("a server config can't name a workstream credential's variable; the user's own others resolve as before", async () => {
     const { resolveEnvValue } = await import("../daemon/mcp/types.js");
-    const env = { CODEOID_CRED_X: "secret", ZEROID_KEY: "k", MINE: "ok" };
+    const env = { CODEOID_CRED_X: "secret", CODEOID_GITHUB_TOKEN: "mine", MINE: "ok" };
     expect(resolveEnvValue("${CODEOID_CRED_X}", env)).toBe("");
-    expect(resolveEnvValue("${ZEROID_KEY}", env)).toBe("");
+    expect(resolveEnvValue("${CODEOID_GITHUB_TOKEN}", env)).toBe("mine");
     expect(resolveEnvValue("${MINE}", env)).toBe("ok");
-    const spec = new McpRegistry({ s: raw({ url: "https://s.example", bearerTokenEnv: "CODEOID_CRED_X" }) }, { memoryEnabled: false }).get("s");
-    expect(spec?.transport).not.toHaveProperty("bearerTokenEnv", "CODEOID_CRED_X");
+    const reg = new McpRegistry({ s: raw({ url: "https://s.example", bearerTokenEnv: "CODEOID_CRED_X" }), t: raw({ url: "https://t.example", bearerTokenEnv: "CODEOID_GITHUB_TOKEN" }) }, { memoryEnabled: false });
+    expect(reg.get("s")?.transport).not.toHaveProperty("bearerTokenEnv", "CODEOID_CRED_X");
+    expect(reg.get("t")?.transport).toHaveProperty("bearerTokenEnv", "CODEOID_GITHUB_TOKEN");
+  });
+
+  it("the Gemini CLI and Qwen get exactly codeoid's names, never an empty list (which would mean no filter)", async () => {
+    const { allowedMcpNames } = await import("../daemon/providers/acp/index.js");
+    expect(allowedMcpNames(["b", "a", "a"])).toEqual(["a", "b"]);
+    expect(allowedMcpNames([])).toEqual(["codeoid-isolated-none"]);
   });
 
   it("not isolated, the relay reaches exactly what it did before: the daemon registry's OAuth servers", async () => {

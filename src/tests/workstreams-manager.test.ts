@@ -444,3 +444,39 @@ describe("the hub's per-call check, wired by the manager (G4)", () => {
   });
 });
 
+describe("rejecting a changed origin keeps the record (W1 audit round 2)", () => {
+  it("choosing the original workstream after a remote change leaves the folder recorded as it was", async () => {
+    const repo = join(tmp, "home", "repo4");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    const origin = (url: string) => writeFileSync(join(repo, ".git", "config"), `[remote "origin"]\n\turl = ${url}\n`);
+    origin("https://github.com/mine/app");
+    const m = manager({ items: [{ id: "mine", match: { remotes: ["github.com/mine/*"] } }, { id: "corp", match: { remotes: ["github.com/corp/*"] } }] });
+    expect((await create(m, "k1", "repo4")).type).toBe("response.ok");
+    origin("https://github.com/corp/app");
+    expect(await create(m, "k2", "repo4")).toMatchObject({ type: "response.error", detail: { kind: "workstream_required" } });
+    expect((await create(m, "k3", "repo4", { workstream: "mine" })).type).toBe("response.ok");
+    // Still refused: the owner rejected the change, the record didn't move to corp.
+    expect(await create(m, "k4", "repo4")).toMatchObject({ type: "response.error", detail: { kind: "workstream_required" } });
+  });
+});
+
+describe("opencode under isolation", () => {
+  it("its turns are refused, saying why", async () => {
+    const registry = new ProviderRegistry("opencode");
+    registry.register({ id: "opencode", displayName: "opencode", create: () => new MockSessionProvider("opencode", []) });
+    const config = loadConfig({ raw: { dbPath: join(tmp, "codeoid.db"), transcriptDir: join(tmp, "transcripts"), workstreams: { ...WS, isolateGlobalServers: true } }, env: {}, quiet: true });
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, { config, providers: registry, _testFolderReader: new FolderReader({ home: join(tmp, "home"), sshConfig: "" }) });
+    managers.push(m);
+    m.setMcp(new McpRegistry({}, { memoryEnabled: false }), new McpHub({}));
+    const made = (await create(m, "oc", "mine")) as { data: SessionInfo };
+    // Acked, then refused before the backend runs anything (shown to the user as the send's failure).
+    await m.handle({ type: "session.send", id: "snd", sessionId: made.data.id, text: "hi" } as never, OWNER, client);
+    for (let i = 0; i < 50; i++) {
+      const row = store.database.prepare("SELECT detail FROM audit_log WHERE session_id = ? AND action = 'session.isolation_refused'").get(made.data.id);
+      if (row) return expect(row).toEqual({ detail: "opencode" });
+      await Bun.sleep(20);
+    }
+    throw new Error("the turn was not refused");
+  });
+});
+

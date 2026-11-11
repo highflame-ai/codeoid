@@ -4581,7 +4581,9 @@ mcpHub: this.#mcpHub,
       if (!hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE) || auth.delegationDepth > 0) {
         return { type: "response.error", requestId: msg.id, error: "Overriding a folder's workstream needs session:approve on an undelegated token", code: "forbidden" };
       }
-      if (msg.workstream === undefined || !this.#overrides.valid(msg.override.token, { sub: auth.sub, workdir, chosen: msg.workstream, revision: this.#workstreams.revision })) {
+      // Spent here, before anything else: single use even for two concurrent
+      // creates (a create that then fails means asking again).
+      if (msg.workstream === undefined || !this.#overrides.redeem(msg.override.token, { sub: auth.sub, workdir, chosen: msg.workstream, revision: this.#workstreams.revision })) {
         return { type: "response.error", requestId: msg.id, error: "The override token is invalid, used, or expired — or the workstreams changed since: ask again", code: "invalid_request" };
       }
       overridden = true;
@@ -4971,10 +4973,13 @@ mcpHub: this.#mcpHub,
     this.#rateLimiter.recordCreation(auth.sub);
     // Now the session exists: record what the folder matches (any create here
     // — a choice too — vouches for the folder as it is now).
-    // The override it confirmed is spent now that the session exists (G3).
-    if (msg.override && createWorkstream?.source === "override") this.#overrides.spend(msg.override.token);
-    // Never from a delegated token's create: what the folder matched is the owner's to vouch for.
-    if (folderMatch && auth.delegationDepth === 0) this.#store.setWorkstreamFolder({ accountId: auth.accountId, projectId: auth.projectId, workdir }, folderMatch);
+    // Recorded only when the owner accepted the folder's match — no choice, or
+    // choosing exactly it. Choosing another home (rejecting a changed origin
+    // included) keeps the record as it was (W1 audit round 2); never from a
+    // delegated token's create.
+    if (folderMatch && auth.delegationDepth === 0 && (msg.workstream === undefined || msg.workstream === folderMatch)) {
+      this.#store.setWorkstreamFolder({ accountId: auth.accountId, projectId: auth.projectId, workdir }, folderMatch);
+    }
     // What the sandbox resolves to here, said at once (#448).
     const sandboxInfo = await session.ensureSandbox();
     if (msg.sandbox?.provider === "off") this.#store.audit(auth.sub, "session.sandbox_off", session.id, "at create");

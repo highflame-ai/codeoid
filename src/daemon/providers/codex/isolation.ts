@@ -7,7 +7,7 @@
  * mcp_servers={}` override does not clear them (measured: codex 0.166 merges
  * the override into the table), but `-c mcp_servers.<name>.enabled=false`
  * turns one off. So every server any of those files declares, that codeoid
- * didn't add, is turned off by name, and apps with them.
+ * didn't add, is turned off by name, and apps and plugins with them.
  *
  * Each one also gets a placeholder transport of its own kind (a dead loopback
  * URL, a no-op command): a project file codex doesn't trust isn't loaded, and
@@ -34,11 +34,16 @@ export class CodexIsolationError extends Error {
   }
 }
 
-/** A small regular file's text, never through a final link, never blocking; undefined if absent. */
-function readConfig(path: string): string | undefined {
+/**
+ * A small regular file's text, never blocking; undefined if absent. A final
+ * link is followed only where the owner put one (`followLink`: codex's own
+ * home, where account overlays and dotfile managers link config.toml), never
+ * in the workdir walk.
+ */
+function readConfig(path: string, followLink = false): string | undefined {
   let fd: number | undefined;
   try {
-    fd = openSync(path, fsc.O_RDONLY | fsc.O_NOFOLLOW | fsc.O_NONBLOCK);
+    fd = openSync(path, fsc.O_RDONLY | fsc.O_NONBLOCK | (followLink ? 0 : fsc.O_NOFOLLOW));
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT" || (e as NodeJS.ErrnoException).code === "ENOTDIR") return undefined;
     throw new CodexIsolationError(`codex config ${path} can't be read (${(e as NodeJS.ErrnoException).code}): refusing to start without knowing its MCP servers`);
@@ -76,9 +81,9 @@ function serverNames(doc: unknown, out: Map<string, "url" | "command">, depth = 
   }
 }
 
-/** The config files codex may load for a session in `workdir`. */
+/** The config files codex may load for a session in `workdir`: system layers, its home's, a project's. */
 export function codexConfigFiles(codexHome: string, workdir: string): string[] {
-  const files = [join(codexHome, "config.toml")];
+  const files = ["/etc/codex/config.toml", "/etc/codex/managed_config.toml", join(codexHome, "config.toml")];
   let cur = workdir;
   for (let i = 0; i < MAX_WALK; i += 1) {
     files.push(join(cur, ".codex", "config.toml"));
@@ -95,8 +100,9 @@ export function codexConfigFiles(codexHome: string, workdir: string): string[] {
  */
 export function codexIsolationArgs(codexHome: string, workdir: string, own: ReadonlySet<string>): string[] {
   const declared = new Map<string, "url" | "command">();
+  const followed = new Set(["/etc/codex/config.toml", "/etc/codex/managed_config.toml", join(codexHome, "config.toml")]);
   for (const file of codexConfigFiles(codexHome, workdir)) {
-    const text = readConfig(file);
+    const text = readConfig(file, followed.has(file));
     if (text === undefined) continue;
     let doc: unknown;
     try {
@@ -108,7 +114,12 @@ export function codexIsolationArgs(codexHome: string, workdir: string, own: Read
   }
   const args: string[] = [];
   for (const [name, kind] of [...declared].sort(([a], [b]) => a.localeCompare(b))) {
-    if (own.has(name)) continue;
+    if (own.has(name)) {
+      // codex MERGES codeoid's `-c mcp_servers.<name>.*` into a same-named
+      // entry of its own config (measured): codeoid's server would be called
+      // with that entry's headers, env or bearer. Refused, not merged.
+      throw new CodexIsolationError(`codex's own config also declares an MCP server named "${name}": it would lend its headers or env to codeoid's — rename one to start codex under workstream isolation`);
+    }
     if (!codexKeySafe(name)) {
       throw new CodexIsolationError(`codex config declares an MCP server named ${JSON.stringify(name)}, which codeoid can't turn off by name: rename it to start codex under workstream isolation`);
     }
@@ -119,7 +130,10 @@ export function codexIsolationArgs(codexHome: string, workdir: string, own: Read
       `mcp_servers.${name}.enabled=false`,
     );
   }
-  args.push("-c", "features.apps=false");
+  // Apps (ChatGPT connectors) and plugins bring servers of their own, which
+  // can't be turned off by name (measured: a plugin server named as
+  // `enabled=false` is refused as "invalid transport"): both off whole.
+  args.push("-c", "features.apps=false", "-c", "features.plugins=false");
   return args;
 }
 

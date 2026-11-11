@@ -524,7 +524,7 @@ export class GeminiAcpProvider implements SessionProvider {
     if (this.#sandboxMcp?.()) names.add(SANDBOX_MCP_SERVER_NAME);
     for (const s of reg.forNativeMount(this.id)) names.add(s.name);
     for (const s of reg.relayFor(this.id)) names.add(s.name);
-    return ["--allowed-mcp-server-names", ...(names.size > 0 ? [...names].sort() : ["codeoid-isolated-none"])];
+    return ["--allowed-mcp-server-names", ...allowedMcpNames(names)];
   }
 
   #push(event: ProviderEvent): void {
@@ -676,5 +676,15 @@ function toolCallOutput(update: Record<string, unknown>): string {
       .join("\n");
   }
   return "";
+}
+
+/**
+ * The names a CLI with an MCP allowlist (the Gemini CLI, Qwen) is started
+ * with under workstream isolation: exactly codeoid's, sorted. Never empty —
+ * an empty list means "no filter" to them — so none gives one no server has.
+ */
+export function allowedMcpNames(names: Iterable<string>): string[] {
+  const list = [...new Set(names)].sort();
+  return list.length > 0 ? list : ["codeoid-isolated-none"];
 }
 

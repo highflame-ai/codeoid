@@ -152,7 +152,7 @@ export function normalizeSpec(name: string, raw: RawMcpServerConfig): McpServerS
           kind: "http",
           url: raw.url,
           headers: raw.headers,
-          // Never one of the daemon's own variables (isDaemonOwnedEnvName):
+          // Never a workstream credential's variable (isDaemonOwnedEnvName):
           // every backend reads this name from the daemon's environment.
           bearerTokenEnv: raw.bearerTokenEnv && !isDaemonOwnedEnvName(raw.bearerTokenEnv) ? raw.bearerTokenEnv : undefined,
           ...(raw.oauth !== undefined ? { oauth: raw.oauth === true ? {} : raw.oauth } : {}),
