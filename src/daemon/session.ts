@@ -638,6 +638,12 @@ export interface SessionCreateOptions {
    */
   collaborationCost?: () => CollaborationCost | undefined;
   /**
+   * The workstream a send-class fleet call acts in, for its approval card
+   * (workstreams §10). Injected by the manager (the conductor's): a session
+   * can't see its targets' homes. Undefined = nothing to say.
+   */
+  fleetTargetWorkstream?: (toolName: string, input: unknown) => { workstream?: string; warning?: string } | undefined;
+  /**
    * Initial execution mode + autonomous tool budget. Spawned workers start
    * "autonomous" with a bounded budget so they can work unattended; when the
    * budget exhausts, the mode reverts to guarded and the session waits for
@@ -1432,6 +1438,7 @@ export class Session {
   #mode: SessionMode = "guarded";
   #onStatusChange?: (sessionId: string, status: SessionStatus, opts?: { settled: true }) => void;
   #collaborationCost?: () => CollaborationCost | undefined;
+  #fleetTargetWorkstream?: (toolName: string, input: unknown) => { workstream?: string; warning?: string } | undefined;
   #workerShape?: "ship" | "scout";
   #turnsRemaining: number | undefined = undefined;
   /** See SessionCreateOptions.onBudgetExhausted. */
@@ -1470,7 +1477,9 @@ export class Session {
   #memoryWorkstreams(): readonly string[] | undefined {
     const fence = this.#workstreamFence?.();
     if (!fence) return undefined;
-    return [...new Set([...(fence.workstream ? [fence.workstream] : []), ...fence.references.map((r) => r.workstream)])];
+    // A reserved home (the conductor's) is no workstream's folders, but its own memory is its own.
+    const reserved = this.#workstream?.source === "reserved" && this.#workstream.id ? [this.#workstream.id] : [];
+    return [...new Set([...(fence.workstream ? [fence.workstream] : []), ...reserved, ...fence.references.map((r) => r.workstream)])];
   }
 
   #sandboxFence(): { roots: string[]; hidden: string[] } | undefined {
@@ -1866,6 +1875,7 @@ export class Session {
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
     this.#collaborationCost = opts.collaborationCost;
+    this.#fleetTargetWorkstream = opts.fleetTargetWorkstream;
     this.#maxBudgetUsd = opts.maxBudgetUsd;
     this.#onBudgetExhausted = opts.onBudgetExhausted ?? "park";
     const envOf = opts.workstreamEnv;
@@ -7863,6 +7873,17 @@ export class Session {
    * Never throws. A roll-up that could fail an approval would be worse than no
    * roll-up at all — the dispatch path must not be wedgeable by a cost display.
    */
+  /** The workstream a send-class fleet call acts in, for its card (never throws: a display can't wedge an approval). */
+  #targetWorkstreamFor(toolName: string, input: unknown): { targetWorkstream?: { workstream?: string; warning?: string } } {
+    if (!this.#fleetTargetWorkstream || !isFleetSendTool(toolName)) return {};
+    try {
+      const t = this.#fleetTargetWorkstream(toolName, input);
+      return t ? { targetWorkstream: t } : {};
+    } catch {
+      return {};
+    }
+  }
+
   #collaborationCostFor(toolName: string): { collaborationCost?: CollaborationCost } {
     if (!this.#collaborationCost || !isFleetSendTool(toolName)) return {};
     try {
@@ -10562,6 +10583,7 @@ export class Session {
                   description: `${event.name}(${Object.keys(event.input).join(", ")})`,
                   approvalId: event.approvalId,
                   ...this.#collaborationCostFor(event.name),
+                  ...this.#targetWorkstreamFor(event.name, event.input),
                   ...this.#cardRisk(risk, held),
                   ...this.#cardSandbox(event.name, event.input, event.shellCwd),
                 } as unknown as ToolState),

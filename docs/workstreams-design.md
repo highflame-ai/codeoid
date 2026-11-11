@@ -511,6 +511,15 @@ codeoid workstream move <session> <id>
 - **Known limits:** a reference with `paths` gives the workstream's whole memory (recall isn't filtered by folder yet); an episode is tagged with the home that wrote it, so what a session read through a reference stays in its home's recall after that workstream closes; the conductor's fleet reads (`fleet_summary`, the dispatch digest) are W4's.
 - **Deferred:** `Bash` commands naming another workstream's path in an unsandboxed session (§14 q4) are not yet asked about; fork *into* another workstream; skillDirs.
 
+### 12.2 W4 as built (2026-11-11)
+
+- **Fleet reads.** `FleetSessionView.workstream`; `fleet_list`, `fleet_find` and `fleet_recall` take a `workstream` filter and name each result's. `FleetDeps.textWithheld` (the manager: a `closed` workstream, under isolation) drops a closed workstream's episode text from `fleet_find` snippets, `fleet_summary` and `fleet_recall` (counted, not shown) and from the dispatch digest (`buildWorkerDigest`: status only), which is also what `fleet_tasks` shows.
+- **No rolling summaries yet.** §10 promises a closed workstream's session cards and summaries; nothing writes session cards today (`memory/cards.ts` has no caller), so a closed workstream gives status and metadata only until cards exist (backlog).
+- **Spawns.** `fleet_spawn.workstream`; `FleetDispatchDeps.checkWorkstream` before queueing (`#fleetSpawnHome`: `forCreate` with the folder required under isolation, `folderVerdict`), stored on the task (`dispatch_tasks.workstream`, `workstream_override`) and judged again at claim. The approval card (`ToolWaitingConfirmationState.targetWorkstream`, from `Session` `fleetTargetWorkstream`, the manager's `#fleetCardWorkstream`) names the workstream and warns of the override approving it confirms (G3), or of a refusal.
+- **Egress.** `workstreams/egress.ts` `planEgress`: a tested stub (G6) — a message names its workstream and is sent by a worker homed there, never by the conductor; wired when P6's Slack and email egress lands.
+- **The conductor's own memory.** Its recall includes its reserved workstream's episodes (it couldn't reach them under isolation before).
+- **Phones.** The fleet rail docks beside the chat from `md` up; below, the chat (and its approval card) has the width.
+
 ## 13. Phases
 
 | Phase | Ships | Enforced by the end |

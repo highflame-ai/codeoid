@@ -159,7 +159,7 @@ import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpT
 import { isOAuthServer, type McpServerSpec, OAUTH_UNSUPPORTED_BACKENDS } from "./mcp/types.js";
 import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, dotEnvShadowed, getConfigDir, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
-import { endpointNameOf, endpointProviderId, ORCHESTRATOR_ROLE, type ProviderInfo } from "../protocol/types.js";
+import { endpointNameOf, endpointProviderId, FLEET_TOOL_PREFIX, ORCHESTRATOR_ROLE, type ProviderInfo } from "../protocol/types.js";
 import type {
   AuthContext,
   ClaudeConfigMcpServer,
@@ -1203,6 +1203,7 @@ mcpHub: this.#mcpHub,
           // Conductor gets the tenant-wide surface; a collaboration
           // orchestrator gets the role-aware one scoped to its own children.
           // Its id is already known here, so the thunk is trivial.
+          ...(meta.role === "conductor" ? { fleetTargetWorkstream: this.#fleetCardWorkstream(meta.accountId, meta.projectId) } : {}),
           fleet:
             meta.role === "conductor"
               ? this.#buildFleetServer(meta.accountId, meta.projectId)
@@ -6284,6 +6285,7 @@ mcpHub: this.#mcpHub,
       providerId,
       defaultModel: conductorConfig?.model,
       fleet: this.#buildFleetServer(auth.accountId, auth.projectId),
+      fleetTargetWorkstream: this.#fleetCardWorkstream(auth.accountId, auth.projectId),
       auth,
       store: this.#store,
       transcriptStore: this.#transcriptStore,
@@ -7996,9 +7998,17 @@ mcpHub: this.#mcpHub,
             `provider "${task.provider}" is not registered on this daemon — available: ${this.#providers.ids().join(", ")}`,
           );
         }
+        // Its home: the workstream the spawn named, judged again now (the config may have changed since it
+        // was queued), else the folder's as before W4.
+        let home: WorkstreamBinding | undefined;
+        if (task.workstream) {
+          const h = this.#fleetSpawnHome(workdir, task.workstream, task.workstreamOverride);
+          if (!h.ok) throw new NonRetryableDispatchError(`workstream: ${h.error}`);
+          home = h.binding;
+        } else home = this.#workstreamForFolder(workdir, this.#dispatchSenderAuth(task));
         const budget = this.#dispatcher.config.workerToolBudget;
         const session = new Session({
-          ...this.#workstreamOpts(this.#workstreamForFolder(workdir, this.#dispatchSenderAuth(task))),
+          ...this.#workstreamOpts(home),
           name: `worker-${task.shape}-${task.id.slice(0, 8)}`,
           workdir,
           role: "worker",
@@ -8086,6 +8096,10 @@ mcpHub: this.#mcpHub,
         const worker = this.#sessionForTask(task.workerSessionId, task);
         const header = `task ${task.id.slice(0, 8)} (${task.kind}/${task.shape}) in ${task.workdir ?? task.targetSession ?? "?"}`;
         if (!worker) return `${header} — worker session unavailable; check the workdir/git state for artifacts.`;
+        // A closed workstream's worker reports its status, never its text (workstreams §10).
+        if (this.#workstreamTextWithheld(worker.workstream?.id)) {
+          return `${header} — done in workstream ${worker.workstream?.id}, which is closed: its result isn't shared with the conductor. Its owner sees it in the session ${worker.name}.`;
+        }
         const parts: string[] = [header];
         const finalText = worker.lastAssistantText;
         if (finalText) {
@@ -8397,9 +8411,80 @@ mcpHub: this.#mcpHub,
 
   /** The conductor's tenant-wide deps. Extracted from `#buildFleetServer` so a
    *  test can compare them against the orchestrator's scoped ones. */
+  /**
+   * Whether a workstream's episode text is withheld from the conductor and
+   * its digests (workstreams §10): a `closed` one, under isolation. Status
+   * and metadata still go.
+   */
+  #workstreamTextWithheld(workstream: string | undefined): boolean {
+    if (!workstream || !this.#workstreams.configured || !this.#workstreams.isolateGlobalServers) return false;
+    return this.#workstreams.get(workstream)?.share === "closed";
+  }
+
+  /**
+   * A dispatched worker's home (workstreams §10, §5): `workstream` if named,
+   * else the folder's — as a create judges it, a folder with none refused
+   * under isolation. `confirmed`: the spawn's approval card showed the
+   * conflict with the folder's exclusive workstream (G3), so an overridable
+   * one is an override. A closed workstream's folder refuses another's
+   * worker (folderVerdict).
+   */
+  #fleetSpawnHome(workdir: string, workstream: string | undefined, confirmed: boolean): { ok: true; binding: WorkstreamBinding | undefined; override: boolean } | { ok: false; error: string } {
+    if (!this.#workstreams.configured) {
+      return workstream ? { ok: false, error: "No workstreams are configured on this daemon: omit workstream" } : { ok: true, binding: undefined, override: false };
+    }
+    const r = this.#workstreams.forCreate(workdir, workstream, undefined, true, confirmed);
+    if (!r.ok) {
+      const c = r.kind === "workstream_conflict" ? r.resolution.conflict : undefined;
+      if (c && !c.overridable) return { ok: false, error: `${r.error} That workstream allows no override.` };
+      return { ok: false, error: r.kind === "workstream_required" ? `${r.error} Name it with workstream.` : r.error };
+    }
+    const fv = this.#workstreams.folderVerdict(workdir, r.binding?.id);
+    if (!fv.ok) return { ok: false, error: fv.error };
+    const binding = r.binding && fv.folder ? { ...r.binding, readFrom: [fv.folder] } : r.binding;
+    return { ok: true, binding, override: r.binding?.source === "override" };
+  }
+
+  /**
+   * What a send-class fleet call's approval card says of its workstream
+   * (workstreams §10): the target session's home (send, interrupt, a
+   * panel's members), or the spawned worker's — with the warning approving
+   * it confirms (past the folder's exclusive workstream), or why it will be
+   * refused. Undefined without workstreams.
+   */
+  #fleetCardWorkstream(accountId: string, projectId: string): (toolName: string, input: unknown) => { workstream?: string; warning?: string } | undefined {
+    return (toolName, input) => {
+      if (!this.#workstreams.configured) return undefined;
+      const tool = toolName.startsWith(FLEET_TOOL_PREFIX) ? toolName.slice(FLEET_TOOL_PREFIX.length) : toolName;
+      const i = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
+      const mine = [...this.#sessions.values()].filter((x) => x.accountId === accountId && x.projectId === projectId);
+      const find = (ref: unknown) =>
+        typeof ref === "string" ? (mine.find((x) => x.id === ref) ?? mine.find((x) => x.name === ref) ?? mine.find((x) => x.id.startsWith(ref))) : undefined;
+      if (tool === "fleet_spawn") {
+        const workdir = typeof i.workdir === "string" ? normalizeWorkdir(i.workdir) : null;
+        if (!workdir) return undefined;
+        const ws = typeof i.workstream === "string" ? i.workstream : undefined;
+        const plain = this.#fleetSpawnHome(workdir, ws, false);
+        if (plain.ok) return plain.binding?.id ? { workstream: plain.binding.id } : undefined;
+        const confirmed = this.#fleetSpawnHome(workdir, ws, true);
+        if (confirmed.ok && confirmed.override) {
+          return { ...(confirmed.binding?.id ? { workstream: confirmed.binding.id } : {}), warning: `Past the folder's own workstream (exclusive): approving this confirms a worker of "${confirmed.binding?.id}" there.` };
+        }
+        return { warning: `It will be refused: ${confirmed.ok ? plain.error : confirmed.error}` };
+      }
+      if (tool === "fleet_panel" && Array.isArray(i.sessions)) {
+        const homes = [...new Set(i.sessions.map((r) => find(r)?.workstream?.id ?? "none"))];
+        return { workstream: homes.join(", ") };
+      }
+      const target = find(i.session);
+      return target?.workstream?.id ? { workstream: target.workstream.id } : undefined;
+    };
+  }
+
   #conductorFleetDeps(accountId: string, projectId: string): FleetDeps {
     return {
       tenant: { accountId, projectId },
+      textWithheld: (ws) => this.#workstreamTextWithheld(ws),
       listSessions: (): FleetSessionView[] => {
         const views: FleetSessionView[] = [];
         for (const s of this.#sessions.values()) {
@@ -8415,6 +8500,7 @@ mcpHub: this.#mcpHub,
             model: s.toInfo().model,
             attachedClients: s.attachedClientCount,
             createdAt: s.createdAt,
+            ...(s.workstream?.id ? { workstream: s.workstream.id } : {}),
           });
         }
         return views;
@@ -8471,6 +8557,13 @@ mcpHub: this.#mcpHub,
       checkWorkdir: (path: string) => {
         const n = normalizeWorkdir(path);
         return n && !this.#loopWorktreeProblem(n) ? n : null;
+      },
+      // Run after the owner approved the spawn's card, which showed any conflict: confirmed.
+      checkWorkstream: (workdir: string, workstream?: string) => {
+        if (!this.#workstreams.configured && !workstream) return { ok: true };
+        const home = this.#fleetSpawnHome(workdir, workstream, true);
+        if (!home.ok) return home;
+        return { ok: true, ...(home.binding?.id ? { workstream: home.binding.id } : {}), ...(home.override ? { override: true } : {}) };
       },
       resolveBackend: (provider?: string, model?: string) => {
         // Fail closed on an unknown provider — same rule and same wording as
@@ -8599,6 +8692,10 @@ mcpHub: this.#mcpHub,
    * "the orchestrator doesn't get X" test proves nothing unless something in
    * the same run shows X was actually available to give.
    */
+  _fleetCardWorkstreamForTest(accountId: string, projectId: string): (toolName: string, input: unknown) => { workstream?: string; warning?: string } | undefined {
+    return this.#fleetCardWorkstream(accountId, projectId);
+  }
+
   _fleetDepsForTest(accountId: string, projectId: string): FleetDeps {
     return this.#conductorFleetDeps(accountId, projectId);
   }

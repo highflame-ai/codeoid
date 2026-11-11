@@ -1342,6 +1342,9 @@ export class TelegramFrontend implements Frontend {
       "collaborationCost" in tool.state && tool.state.collaborationCost
         ? `\n◇ ${formatCollaborationCost(tool.state.collaborationCost)}`
         : "";
+    // The workstream it acts in (workstreams §10): an approval is never made without knowing which line of work.
+    const tw = "targetWorkstream" in tool.state ? tool.state.targetWorkstream : undefined;
+    const workstream = tw ? `${tw.workstream ? `\n⌂ workstream ${tw.workstream}` : ""}${tw.warning ? `\n⚠ ${tw.warning}` : ""}` : "";
     // A shell command's risk (#431), in the same words as every other surface.
     const riskText = "risk" in tool.state ? formatToolRisk(tool.state.risk) : "";
     const risk = riskText ? `\n▲ ${riskText}` : "";
@@ -1354,7 +1357,7 @@ export class TelegramFrontend implements Frontend {
     this.#bot.api
       .sendMessage(
         chatId,
-        `⚠️ Permission needed — ${tool.name}\n${String(desc).slice(0, 800)}${risk}${sandbox}${cost}`,
+        `⚠️ Permission needed — ${tool.name}\n${String(desc).slice(0, 800)}${workstream}${risk}${sandbox}${cost}`,
         { reply_markup: kb } as Record<string, unknown>,
       )
       .catch(() => {});

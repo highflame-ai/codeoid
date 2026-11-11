@@ -1127,6 +1127,14 @@ export interface ToolWaitingConfirmationState {
    */
   collaborationCost?: CollaborationCost;
   /**
+   * Present only for a send-class fleet dispatch with workstreams: the
+   * workstream the action runs in (the target session's, or the spawned
+   * worker's home), and a warning when the spawn's home is chosen past the
+   * folder's own exclusive workstream (approving the card confirms it, G3)
+   * or can't be decided (the spawn will be refused). docs/workstreams-design.md §10.
+   */
+  targetWorkstream?: { workstream?: string; warning?: string };
+  /**
    * A shell command's risk, judged from what it runs (#431); for a file-tool
    * write into what the OS sandbox holds read-only, that reason first
    * ("writes the repository's git structure …"). Absent otherwise.

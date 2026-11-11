@@ -162,3 +162,17 @@ describe("SandboxLine (#448)", () => {
   });
 });
 
+
+describe("ApprovalBar — the workstream a fleet dispatch acts in (workstreams §10)", () => {
+  it("names it, and shows the override warning approving confirms", () => {
+    ingestSessionList([pendingSession()]);
+    focusSession("s");
+    const msg = pendingToolMsg() as unknown as { tool: { name: string; state: Record<string, unknown> } };
+    msg.tool.name = "mcp__codeoid_fleet__fleet_spawn";
+    msg.tool.state = { ...msg.tool.state, input: { workdir: "/w/acme", task: "t" }, targetWorkstream: { workstream: "mine", warning: "Past the folder's own workstream (exclusive)" } };
+    applyMessage(msg as unknown as SessionMessage);
+    const { getByTestId } = render(() => <ApprovalBar />);
+    expect(getByTestId("approval-workstream").textContent).toContain("workstream mine");
+    expect(getByTestId("approval-workstream").textContent).toContain("Past the folder's own");
+  });
+});

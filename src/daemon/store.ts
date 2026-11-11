@@ -51,6 +51,13 @@ export interface DispatchTaskRow {
   provider: string | null;
   /** Per-child model, already resolved against `provider`. NULL = provider default. */
   model: string | null;
+  /**
+   * A spawn's target home workstream (workstreams §10), checked when queued
+   * and again at claim. NULL = the folder's (every task before W4).
+   */
+  workstream: string | null;
+  /** The spawn confirmed past the folder's exclusive claim (its approval card said so). */
+  workstreamOverride: boolean;
   status: DispatchTaskStatus;
   attempts: number;
   failureLimit: number;
@@ -139,6 +146,8 @@ interface RawDispatchRow {
   attempt_id: string | null;
   generation: number;
   held_until: number | null;
+  workstream?: string | null;
+  workstream_override?: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -157,6 +166,8 @@ function rowToDispatchTask(r: RawDispatchRow): DispatchTaskRow {
     // missing-column undefined and a stored NULL to the same "use default".
     provider: r.provider ?? null,
     model: r.model ?? null,
+    workstream: r.workstream ?? null,
+    workstreamOverride: r.workstream_override === 1,
     status: r.status,
     attempts: r.attempts,
     failureLimit: r.failure_limit,
@@ -682,6 +693,9 @@ export class Store {
     this.#addColumnIfMissing("dispatch_tasks", "attempt_id", "TEXT");
     this.#addColumnIfMissing("dispatch_tasks", "generation", "INTEGER NOT NULL DEFAULT 0");
     this.#addColumnIfMissing("dispatch_tasks", "held_until", "INTEGER");
+    // A spawn's target workstream (workstreams W4); NULL = the folder's.
+    this.#addColumnIfMissing("dispatch_tasks", "workstream", "TEXT");
+    this.#addColumnIfMissing("dispatch_tasks", "workstream_override", "INTEGER");
     // AFTER the ALTERs, never inside the CREATE block above. On an existing
     // database `CREATE TABLE IF NOT EXISTS` is a no-op, so an index declared
     // there would run against a table that does not have the column yet and
@@ -1145,6 +1159,9 @@ export class Store {
     provider?: string;
     /** Per-child model, already resolved against `provider`. */
     model?: string;
+    /** A spawn's target workstream, and whether it was confirmed past the folder's claim. */
+    workstream?: string;
+    workstreamOverride?: boolean;
     failureLimit: number;
     createdBy: string;
     /** Dispatch group for a barrier fan-out; omit for a standalone task. */
@@ -1164,8 +1181,8 @@ export class Store {
         `INSERT INTO dispatch_tasks
            (id, account_id, project_id, kind, shape, target_session, workdir,
             prompt, provider, model, failure_limit, created_by, group_id,
-            group_ordinal, owner_daemon, run_id, attempt_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            group_ordinal, owner_daemon, run_id, attempt_id, workstream, workstream_override, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         task.id,
@@ -1185,6 +1202,8 @@ export class Store {
         task.ownerDaemon ?? null,
         task.runId ?? null,
         task.attemptId ?? null,
+        task.workstream ?? null,
+        task.workstreamOverride ? 1 : null,
         task.now,
         task.now,
       );

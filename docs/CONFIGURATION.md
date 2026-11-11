@@ -499,6 +499,13 @@ Each change is saved at once and applies at the session's next turn (a turn runn
 A search with no folder (Grep or Glob over the workdir) is refused when another workstream's folder is inside the workdir: search a narrower folder.
 
 
+### The conductor and workstreams
+
+The conductor is homed in a reserved workstream of its own: no workstream's servers, env or folders. It reads across all of them through its fleet tools, which take a `workstream` filter and name each result's workstream.
+With `isolateGlobalServers: true`, a `closed` workstream gives the conductor its sessions' status and metadata only, never their text: `fleet_find`, `fleet_summary` and `fleet_recall` leave its episodes out, and a worker of a closed workstream reports that it finished, not what it found.
+
+The conductor acts only through sessions homed where the work belongs. `fleet_spawn` takes `workstream` (else the folder's; a folder with none must be given one) and follows the same rules as a create: a workstream's exclusive folder is an override, which the spawn's approval card says, so approving the card confirms it; a closed workstream's folder never takes another's worker. Every send-class card (web, Telegram) names the workstream the action runs in.
+
 ### Moving an existing setup
 
 `codeoid workstream import [--root <dir>]` proposes workstreams from your repositories' remotes and lists Claude's global MCP servers to assign. It writes nothing; isolation stays off until you turn it on.

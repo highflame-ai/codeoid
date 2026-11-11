@@ -359,6 +359,9 @@ export class Dispatcher {
     provider?: string;
     /** Per-child model, already resolved against `provider`. */
     model?: string;
+    /** A spawn's target workstream (workstreams §10), checked by the caller; and whether its card confirmed an override. */
+    workstream?: string;
+    workstreamOverride?: boolean;
     createdBy: string;
   }): string {
     const isAttempt = input.kind === "attempt";
@@ -385,6 +388,7 @@ export class Dispatcher {
       "dispatch.enqueued",
       `task=${id} kind=${input.kind} shape=${input.shape} target=${input.targetSession ?? input.workdir ?? "-"}` +
         `${input.provider ? ` provider=${input.provider}` : ""}${input.model ? ` model=${input.model}` : ""}` +
+        `${input.workstream ? ` workstream=${input.workstream}${input.workstreamOverride ? " override" : ""}` : ""}` +
         `${isAttempt ? ` run=${input.runId} attempt=${input.attemptId}` : ""}`,
     );
     this.#signalBoardChange();

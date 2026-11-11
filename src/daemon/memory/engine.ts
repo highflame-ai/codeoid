@@ -55,6 +55,8 @@ export interface SessionSearchHit {
     createdAt: number;
     score: number;
     filePaths: string[];
+    /** The workstream that wrote it (workstreams §6.4); absent when untagged. */
+    workstreamId?: string;
   }>;
 }
 
@@ -503,6 +505,7 @@ export class MemoryEngine {
           createdAt: h.episode.createdAt,
           score: h.score,
           filePaths: h.episode.filePaths,
+          ...(h.episode.workstreamId ? { workstreamId: h.episode.workstreamId } : {}),
         })),
       });
     }
