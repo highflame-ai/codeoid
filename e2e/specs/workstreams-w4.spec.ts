@@ -46,7 +46,7 @@ test("the conductor's spawn card names the workstream, and warns of an override"
   await page.getByRole("button", { name: "Conductor", exact: true }).click();
   const line = page.getByTestId("approval-workstream");
   await expect(line).toContainText("workstream mine", { timeout: 15_000 });
-  await expect(line).toContainText("Past the folder's own workstream");
+  await expect(line).toContainText('Past workstream "acme"');
   for (const [w, h] of VIEWPORTS) {
     await page.setViewportSize({ width: w, height: h });
     // The bar re-renders on a resize: wait for the line as it is now, never a node swapped out.
