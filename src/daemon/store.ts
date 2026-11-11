@@ -419,6 +419,18 @@ export class Store {
       -- approved in codeoid to reach every backend there (#395). Bound to the
       -- entry's fingerprint: a repo that edits the entry needs consent again.
       -- Tenant- and workdir-scoped, like the sessions that use it.
+      -- How each folder last resolved to a workstream, per tenant
+      -- (docs/workstreams-design.md §5.1): a repository rule that matches
+      -- differently later (an edited origin) is refused, not a silent re-home.
+      CREATE TABLE IF NOT EXISTS workstream_folders (
+        account_id  TEXT NOT NULL,
+        project_id  TEXT NOT NULL,
+        workdir     TEXT NOT NULL,
+        workstream  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (account_id, project_id, workdir)
+      );
+
       CREATE TABLE IF NOT EXISTS mcp_workdir_approvals (
         account_id  TEXT NOT NULL,
         project_id  TEXT NOT NULL,
@@ -1911,6 +1923,23 @@ export class Store {
   }
 
   /** The (server, fingerprint) pairs a tenant approved for a workdir. */
+  /** The workstream a folder last resolved to, for this tenant (workstreams §5.1). */
+  workstreamFolder(scope: { accountId: string; projectId: string; workdir: string }): string | undefined {
+    const row = this.#db
+      .prepare("SELECT workstream FROM workstream_folders WHERE account_id = ? AND project_id = ? AND workdir = ?")
+      .get(scope.accountId, scope.projectId, scope.workdir) as { workstream: string } | null;
+    return row?.workstream;
+  }
+
+  setWorkstreamFolder(scope: { accountId: string; projectId: string; workdir: string }, workstream: string): void {
+    this.#db
+      .prepare(
+        `INSERT INTO workstream_folders (account_id, project_id, workdir, workstream) VALUES (?, ?, ?, ?)
+         ON CONFLICT (account_id, project_id, workdir) DO UPDATE SET workstream = excluded.workstream, updated_at = datetime('now')`,
+      )
+      .run(scope.accountId, scope.projectId, scope.workdir, workstream);
+  }
+
   workdirMcpApprovals(scope: { accountId: string; projectId: string; workdir: string }): Set<string> {
     const rows = this.#db
       .prepare("SELECT server, fingerprint FROM mcp_workdir_approvals WHERE account_id = ? AND project_id = ? AND workdir = ?")

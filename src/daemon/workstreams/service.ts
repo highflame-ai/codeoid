@@ -238,7 +238,12 @@ export class WorkstreamService {
           home: explicit,
           source: "explicit",
           ...base,
-          conflict: { folder: claimant, chosen: explicit, overridable: this.#effective.get(claimant)?.allowOverride ?? true },
+          conflict: {
+            folder: claimant,
+            chosen: explicit,
+            overridable: this.#effective.get(claimant)?.allowOverride ?? true,
+            changes: this.#overrideChanges(claimant, explicit),
+          },
         };
       }
       const by = matchedBy(explicit);
@@ -259,13 +264,34 @@ export class WorkstreamService {
    * with no choice, gets no home and a warning: W1 requires the choice once
    * isolation is on.
    */
-  forCreate(workdir: string, explicit?: string, given?: string, required = false): CreateBinding {
+  /** What homing a session in `chosen` instead of `folder` gives and withholds (§5.2 (c)). */
+  #overrideChanges(folder: string, chosen: string): { gains: string[]; withholds: string[]; env: string[]; git?: string } {
+    const f = this.#effective.get(folder);
+    const c = this.#effective.get(chosen);
+    const cs = new Set(c?.servers.map((s) => s.server) ?? []);
+    return {
+      gains: [...cs],
+      withholds: (f?.servers ?? []).map((s) => s.server).filter((s) => !cs.has(s)),
+      env: Object.keys(c?.env ?? {}),
+      ...(c?.git?.email ? { git: c.git.email } : {}),
+    };
+  }
+
+  /**
+   * `overridden`: the caller confirmed the choice past an exclusive claim
+   * (G3, a redeemed token — checked by the manager). The home is then the
+   * choice, `source: "override"`, unless the claimant allows no override.
+   */
+  forCreate(workdir: string, explicit?: string, given?: string, required = false, overridden = false): CreateBinding {
     if (explicit !== undefined) {
       const problem = this.choiceProblem(explicit);
       if (problem) return { ok: false, kind: "workstream_unknown", workstream: explicit, error: problem };
     }
     if (!this.configured) return { ok: true, binding: undefined, warnings: [] };
     const resolution = this.resolve(workdir, explicit, given);
+    if (resolution.conflict && overridden && resolution.conflict.overridable && explicit !== undefined) {
+      return { ok: true, binding: { id: explicit, source: "override", revision: this.#revision }, resolution, warnings: [] };
+    }
     if (resolution.conflict) {
       const c = resolution.conflict;
       return {

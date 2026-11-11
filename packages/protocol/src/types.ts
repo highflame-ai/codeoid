@@ -1597,6 +1597,13 @@ export interface SessionCreateMsg extends BaseClientMsg {
    * `"workstream_unknown"`.
    */
   workstream?: string;
+  /**
+   * Confirm a choice of `workstream` past another workstream's exclusive
+   * claim on the folder (docs/workstreams-design.md §5.2, G3): the token from
+   * the `workstream_conflict` refusal. Needs `session:approve` and an
+   * undelegated token.
+   */
+  override?: { token: string };
 }
 
 /**

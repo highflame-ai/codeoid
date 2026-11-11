@@ -88,7 +88,20 @@ export interface WorkstreamResolution {
    * claim on the folder (§5.2). `overridable: false` = that workstream set
    * `allowOverride: false`.
    */
-  conflict?: { folder: string; chosen: string; overridable: boolean };
+  conflict?: {
+    folder: string;
+    chosen: string;
+    overridable: boolean;
+    /** What an override would change: servers and env the chosen home gives, and the folder's withheld. */
+    changes?: { gains: string[]; withholds: string[]; env: string[]; git?: string };
+    /**
+     * On a `session.create` refused for this conflict, when overridable: the
+     * token a confirming retry sends as `override.token` (G3). Single use,
+     * minutes long, bound to the caller, the folder, the choice and the
+     * config revision — a changed config makes it stale.
+     */
+    overrideToken?: string;
+  };
 }
 
 // ── Messages (client → daemon) ────────────────────────────────────────────────

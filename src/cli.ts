@@ -1089,6 +1089,7 @@ program
     "--workstream <id>",
     "Home workstream (docs/workstreams-design.md): decides the session's servers, credentials and defaults. Default: the folder's (`codeoid workstream match <dir>`), else the configured default.",
   )
+  .option("--override", "with --workstream: confirm it past the folder's own exclusive workstream without asking (needs session:approve)")
   .option(
     "--pack <id>",
     "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents). With --collaborate, the collaboration ADOPTS the pack: role names bind strictly to the pack's declared roles.",
@@ -1131,6 +1132,7 @@ program
         projectRoot: string[];
         projectRoots?: boolean;
         workstream?: string;
+        override?: boolean;
       },
     ) => {
       const config = loadConfig();
@@ -1204,6 +1206,10 @@ program
         collaboration,
         ...(sandbox ? { sandbox } : {}),
         ...(opts.workstream ? { workstream: opts.workstream } : {}),
+        confirmOverride: async (warning: string) => {
+          console.error(warning);
+          return confirmOnTerminal("Start it anyway? [y/N] ", opts.override, "Not started: pass --override to confirm without a terminal.");
+        },
       });
       client.disconnect();
     },
@@ -1531,10 +1537,14 @@ const worktreeCmd = program
   .description("Worktrees codeoid creates (forks, compare, routines): trust a repository's setup recipe, .codeoid/setup.yaml");
 
 /** Ask y/N on the terminal; off a terminal, only --yes says yes. EOF is "no". */
-async function confirmOnTerminal(question: string, yes: boolean | undefined): Promise<boolean> {
+async function confirmOnTerminal(
+  question: string,
+  yes: boolean | undefined,
+  noTerminal = "Not trusted: pass --yes to trust without a terminal to confirm in.",
+): Promise<boolean> {
   if (yes) return true;
   if (!process.stdin.isTTY) {
-    console.error("Not trusted: pass --yes to trust without a terminal to confirm in.");
+    console.error(noTerminal);
     return false;
   }
   const { createInterface } = await import("node:readline");

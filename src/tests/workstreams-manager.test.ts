@@ -101,7 +101,7 @@ describe("session.create picks the home", () => {
     const resp = await create(manager(WS), "b", "client", { workstream: "mine" });
     expect(resp).toMatchObject({ type: "response.error", code: "invalid_request", detail: { kind: "workstream_conflict" } });
     if (resp.type === "response.error" && resp.detail?.kind === "workstream_conflict") {
-      expect(resp.detail.resolution.conflict).toEqual({ folder: "client", chosen: "mine", overridable: true });
+      expect(resp.detail.resolution.conflict).toMatchObject({ folder: "client", chosen: "mine", overridable: true });
     }
   });
 
@@ -315,3 +315,77 @@ describe("the home's environment reaches the backend (W1, §6.2)", () => {
     expect(load({ items: [{ id: "a", env: { GH_TOKEN: { secret: "nope" } } }] })).toThrow(/undeclared credential "nope"/);
   });
 });
+
+describe("a confirmed override (G3)", () => {
+  const conflictOf = (r: DaemonMessage) => (r.type === "response.error" && r.detail?.kind === "workstream_conflict" ? r.detail.resolution.conflict : undefined);
+
+  it("a conflict comes with a token; the confirming retry homes the session by override, once", async () => {
+    const m = manager(WS);
+    const first = await create(m, "o1", "client", { workstream: "mine" });
+    const c = conflictOf(first);
+    expect(c?.overrideToken).toBeString();
+    expect(c?.changes).toEqual({ gains: [], withholds: [], env: [] });
+    const ok = await create(m, "o1", "client", { workstream: "mine", override: { token: c!.overrideToken } });
+    expect((ok as { data: SessionInfo }).data.workstream).toMatchObject({ id: "mine", source: "override" });
+    const rows = store.database.prepare("SELECT detail FROM audit_log WHERE action = 'workstream.override'").all() as Array<{ detail: string }>;
+    expect(rows[0]!.detail).toContain("folder=client chosen=mine");
+    const again = await create(m, "o2", "client", { workstream: "mine", override: { token: c!.overrideToken } });
+    expect(again).toMatchObject({ type: "response.error", code: "invalid_request" });
+  });
+
+  it("the token is bound: another folder or choice, a delegated token, or a missing approve scope can't use it", async () => {
+    const m = manager({ items: [...WS.items, { id: "third" }] });
+    const c = conflictOf(await create(m, "b1", "client", { workstream: "mine" }));
+    const token = c!.overrideToken!;
+    expect(await create(m, "b2", "client", { workstream: "third", override: { token } })).toMatchObject({ type: "response.error", code: "invalid_request" });
+    const delegated = await m.handle(
+      { type: "session.create", id: "b3", name: "b3", workdir: join(tmp, "home", "client"), workstream: "mine", override: { token } } as never,
+      { ...OWNER, delegationDepth: 1 },
+      client,
+    );
+    expect(delegated).toMatchObject({ type: "response.error", code: "forbidden" });
+    const noApprove = await m.handle(
+      { type: "session.create", id: "b4", name: "b4", workdir: join(tmp, "home", "client"), workstream: "mine", override: { token } } as never,
+      { ...OWNER, scopes: [SCOPES.SESSION_CREATE] as AuthContext["scopes"] },
+      client,
+    );
+    expect(noApprove).toMatchObject({ type: "response.error", code: "forbidden" });
+    // Not spent by the refusals above: the right request still takes it.
+    expect((await create(m, "b5", "client", { workstream: "mine", override: { token } })).type).toBe("response.ok");
+  });
+
+  it("no token at all when the folder's workstream allows no override", async () => {
+    const m = manager({ items: WS.items.map((w) => (w.id === "client" ? { ...w, allowOverride: false } : w)) });
+    const c = conflictOf(await create(m, "n1", "client", { workstream: "mine" }));
+    expect(c?.overridable).toBe(false);
+    expect(c?.overrideToken).toBeUndefined();
+  });
+});
+
+describe("the folder record: a repository match that changed is refused, not a silent re-home", () => {
+  it("an edited origin makes the next create choose; the choice is recorded", async () => {
+    const repo = join(tmp, "home", "repo");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    const origin = (url: string) => writeFileSync(join(repo, ".git", "config"), `[remote "origin"]\n\turl = ${url}\n`);
+    origin("https://github.com/mine/app");
+    const m = manager({ items: [{ id: "mine", match: { remotes: ["github.com/mine/*"] } }, { id: "corp", match: { remotes: ["github.com/corp/*"] } }] });
+    expect(((await create(m, "r1", "repo")) as { data: SessionInfo }).data.workstream).toMatchObject({ id: "mine" });
+    origin("https://github.com/corp/app");
+    const refused = await create(m, "r2", "repo");
+    expect(refused).toMatchObject({ type: "response.error", detail: { kind: "workstream_required" } });
+    if (refused.type === "response.error") expect(refused.error).toContain('was workstream "mine"');
+    expect(((await create(m, "r3", "repo", { workstream: "corp" })) as { data: SessionInfo }).data.workstream).toMatchObject({ id: "corp" });
+    expect(((await create(m, "r4", "repo")) as { data: SessionInfo }).data.workstream).toMatchObject({ id: "corp", source: "matched" });
+  });
+});
+
+describe("under isolation a user's create must have a home", () => {
+  it("an unmatched folder is refused with the choices; a choice settles it", async () => {
+    const m = manager({ ...WS, isolateGlobalServers: true });
+    const r = await create(m, "i1", "loose");
+    expect(r).toMatchObject({ type: "response.error", detail: { kind: "workstream_required" } });
+    if (r.type === "response.error") expect(r.error).toContain("client, mine");
+    expect((await create(m, "i2", "loose", { workstream: "mine" })).type).toBe("response.ok");
+  });
+});
+

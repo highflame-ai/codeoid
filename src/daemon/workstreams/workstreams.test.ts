@@ -334,7 +334,7 @@ describe("WorkstreamService", () => {
     ]);
     const c = s.forCreate(join(tmp, "client"), "mine");
     expect(c.ok).toBe(false);
-    if (!c.ok && c.kind === "workstream_conflict") expect(c.resolution.conflict).toEqual({ folder: "client", chosen: "mine", overridable: false });
+    if (!c.ok && c.kind === "workstream_conflict") expect(c.resolution.conflict).toMatchObject({ folder: "client", chosen: "mine", overridable: false });
     const r = s.forCreate(join(tmp, "research"), "mine");
     expect(r.ok && r.binding).toMatchObject({ id: "mine", source: "explicit" });
     expect(s.forCreate(join(tmp, "client"), "client").ok).toBe(true);

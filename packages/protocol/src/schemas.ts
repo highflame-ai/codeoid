@@ -171,6 +171,7 @@ export const sessionCreateSchema = z.object({
    * `workstream_unknown` rather than an opaque schema rejection.
    */
   workstream: workstreamIdField.optional(),
+  override: z.object({ token: z.string().min(1).max(128) }).strict().optional(),
 });
 
 export const sessionListSchema = z.object({ ...base, type: z.literal("session.list") });

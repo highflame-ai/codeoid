@@ -11,6 +11,7 @@
 import { addedDirProblem, type OtherCheckout, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
 import { WorkstreamService, type WorkstreamBinding } from "./workstreams/service.js";
 import { grantRefusal, type McpGrant } from "./workstreams/grant.js";
+import { OverrideTokens } from "./workstreams/override.js";
 import type { FolderReader } from "./workstreams/folder.js";
 import { createSecretStore, type SecretStore } from "./credentials/store.js";
 import { registerSecretPaths } from "./secret-paths.js";
@@ -583,6 +584,8 @@ export class SessionManager {
   #workstreams: WorkstreamService;
   /** Where credential values live (workstreams G2): read when used, never cached. */
   #secrets: SecretStore;
+  /** Outstanding override confirmations (workstreams G3). */
+  readonly #overrides = new OverrideTokens();
   /**
    * `config.worktree.setup`, live: `codeoid worktree trust` changes it
    * without a restart (and writes it through to config.json).
@@ -1977,7 +1980,7 @@ mcpHub: this.#mcpHub,
             const problem = this.#loopWorktreeProblem(init.workdir);
             if (problem) throw new Error(problem);
             const session = new Session({
-              ...this.#workstreamOpts(this.#workstreamForFolder(init.workdir)),
+              ...this.#workstreamOpts(this.#workstreamForFolder(init.workdir, auth)),
               name: init.name,
               workdir: init.workdir,
               auth,
@@ -2332,10 +2335,20 @@ mcpHub: this.#mcpHub,
    * loop attempt, a routine run, a dispatch worker): its folder's, else the
    * default. Never refused: there is no explicit choice to conflict with.
    */
-  #workstreamForFolder(workdir: string): WorkstreamBinding | undefined {
+  #workstreamForFolder(workdir: string, auth?: { accountId: string; projectId: string }): WorkstreamBinding | undefined {
     try {
       const r = this.#workstreams.forCreate(workdir);
-      return r.ok ? r.binding : undefined;
+      if (!r.ok) return undefined;
+      // A repository match that differs from how the folder resolved before
+      // (§5.1): nobody is here to choose, so no home — built-ins only.
+      if (auth && r.binding?.source === "matched" && r.binding.id && r.binding.matchedBy?.startsWith("remote ")) {
+        const before = this.#store.workstreamFolder({ accountId: auth.accountId, projectId: auth.projectId, workdir });
+        if (before && before !== r.binding.id) {
+          console.warn(`[codeoid] workstream for ${workdir}: was "${before}", its repository now matches "${r.binding.id}" — no home until a session there chooses`);
+          return { source: "none", revision: r.binding.revision };
+        }
+      }
+      return r.binding;
     } catch (err) {
       console.warn(`[codeoid] workstream for ${workdir}: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;
@@ -4545,7 +4558,19 @@ mcpHub: this.#mcpHub,
     // Home workstream (docs/workstreams-design.md §5): an explicit choice, else
     // the folder's, else the default. Refused before anything is built.
     const givenWorkdir = givenPath(msg.workdir);
-    const homing = this.#workstreams.forCreate(workdir, msg.workstream, givenWorkdir, true);
+    // A confirmed override (G3): the token from the conflict refusal, bound to
+    // this caller, folder, choice and config revision; spent here, once.
+    let overridden = false;
+    if (msg.override) {
+      if (!hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE) || auth.delegationDepth > 0) {
+        return { type: "response.error", requestId: msg.id, error: "Overriding a folder's workstream needs session:approve on an undelegated token", code: "forbidden" };
+      }
+      if (msg.workstream === undefined || !this.#overrides.redeem(msg.override.token, { sub: auth.sub, workdir, chosen: msg.workstream, revision: this.#workstreams.revision })) {
+        return { type: "response.error", requestId: msg.id, error: "The override token is invalid, used, or expired — or the workstreams changed since: ask again", code: "invalid_request" };
+      }
+      overridden = true;
+    }
+    const homing = this.#workstreams.forCreate(workdir, msg.workstream, givenWorkdir, true, overridden);
     if (homing.ok && msg.workstream !== undefined && auth.delegationDepth > 0) {
       // A delegated token may confirm the folder's own home, never pick
       // another: the home will decide credentials (W1), as an account choice
@@ -4562,6 +4587,21 @@ mcpHub: this.#mcpHub,
       }
     }
     if (!homing.ok) {
+      // An overridable conflict comes back with the token a confirming retry
+      // sends (G3) — issued for this caller, folder, choice and revision.
+      const conflict = homing.kind === "workstream_conflict" ? homing.resolution.conflict : undefined;
+      const resolution =
+        homing.kind === "workstream_unknown"
+          ? undefined
+          : conflict?.overridable && msg.workstream !== undefined
+            ? {
+                ...homing.resolution,
+                conflict: {
+                  ...conflict,
+                  overrideToken: this.#overrides.issue({ sub: auth.sub, workdir, chosen: msg.workstream, revision: this.#workstreams.revision }),
+                },
+              }
+            : homing.resolution;
       return {
         type: "response.error",
         requestId: msg.id,
@@ -4570,12 +4610,35 @@ mcpHub: this.#mcpHub,
         detail:
           homing.kind === "workstream_unknown"
             ? { kind: "workstream_unknown", workstream: homing.workstream }
-            : { kind: homing.kind, resolution: homing.resolution },
+            : { kind: homing.kind, resolution: resolution! },
 
       };
     }
+    // A repository rule matching otherwise than this folder resolved before
+    // (§5.1): an `origin` is text an agent can edit, so a changed match is the
+    // owner's to confirm — by choosing — never a silent re-home.
+    if (homing.ok && homing.binding?.source === "matched" && homing.binding.id) {
+      const before = this.#store.workstreamFolder({ accountId: auth.accountId, projectId: auth.projectId, workdir });
+      if (before && before !== homing.binding.id && homing.binding.matchedBy?.startsWith("remote ")) {
+        this.#store.audit(auth.sub, "session.workstream.remote_changed", "", `workdir=${workdir} was=${before} now=${homing.binding.id}`);
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: `This folder was workstream "${before}", but its repository now matches "${homing.binding.id}" (${homing.binding.matchedBy}). Its remote may have been changed: choose the workstream with --workstream.`,
+          code: "invalid_request",
+          detail: { kind: "workstream_required", resolution: { source: "none", candidates: homing.resolution?.candidates ?? [], ambiguous: [before, homing.binding.id].sort() } },
+        };
+      }
+    }
     for (const w of homing.warnings) warn(w);
     const createWorkstream = homing.binding;
+    if (createWorkstream?.id && createWorkstream.source !== "default") {
+      this.#store.setWorkstreamFolder({ accountId: auth.accountId, projectId: auth.projectId, workdir }, createWorkstream.id);
+    }
+    if (createWorkstream?.source === "override") {
+      const c = homing.resolution?.conflict;
+      this.#store.audit(auth.sub, "workstream.override", "", `workdir=${workdir} folder=${c?.folder ?? "?"} chosen=${createWorkstream.id} revision=${createWorkstream.revision}`);
+    }
 
     if (msg.collaboration) {
       let collabConfig = msg.collaboration;
@@ -6254,7 +6317,7 @@ mcpHub: this.#mcpHub,
     const problem = this.#loopWorktreeProblem(opts.workdir);
     if (problem) throw new Error(problem);
     const session = new Session({
-      ...this.#workstreamOpts(this.#workstreamForFolder(opts.workdir)),
+      ...this.#workstreamOpts(this.#workstreamForFolder(opts.workdir, opts.auth)),
       name: opts.name,
       workdir: opts.workdir,
       providerId: opts.provider,
@@ -7283,7 +7346,7 @@ mcpHub: this.#mcpHub,
         // what the run delivered.
         const session = new Session({
           // The checkout the loop works on, not its worktree (`<repo>-worktrees/…` matches no rule written for the repo).
-          ...this.#workstreamOpts(this.#workstreamForFolder(run.contract.workdir)),
+          ...this.#workstreamOpts(this.#workstreamForFolder(run.contract.workdir, owned(run, 0))),
           name: `loop-${run.id.slice(5, 13)}`,
           workdir,
           ...(run.worktreeRoot && run.branch
@@ -7389,7 +7452,7 @@ mcpHub: this.#mcpHub,
         }
         const session = new Session({
           // The routine's own folder, not the worktree it may run in.
-          ...this.#workstreamOpts(this.#workstreamForFolder(o.workdir)),
+          ...this.#workstreamOpts(this.#workstreamForFolder(o.workdir, o.ownerAuth)),
           // The conductor's name is reserved for the singleton.
           name: o.name === this.#conductorName() ? `${o.name}-routine` : o.name,
           workdir,
@@ -7680,7 +7743,7 @@ mcpHub: this.#mcpHub,
         }
         const budget = this.#dispatcher.config.workerToolBudget;
         const session = new Session({
-          ...this.#workstreamOpts(this.#workstreamForFolder(workdir)),
+          ...this.#workstreamOpts(this.#workstreamForFolder(workdir, this.#dispatchSenderAuth(task))),
           name: `worker-${task.shape}-${task.id.slice(0, 8)}`,
           workdir,
           role: "worker",

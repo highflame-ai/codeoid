@@ -521,6 +521,13 @@ export class TerminalClient {
       sandbox?: SessionSandboxSetting;
       /** Home workstream (docs/workstreams-design.md); absent = the folder's. */
       workstream?: string;
+      /**
+       * Asked when the choice conflicts with the folder's exclusive workstream
+       * and may be overridden (G3): shown what would change; true = confirm.
+       */
+      confirmOverride?: (warning: string) => Promise<boolean>;
+      /** Internal: the confirming retry's token. */
+      overrideToken?: string;
     } = {},
   ): Promise<void> {
     const resp = await this.#request({
@@ -541,7 +548,21 @@ export class TerminalClient {
       ...(opts.collaboration ? { collaboration: opts.collaboration } : {}),
       ...(opts.sandbox ? { sandbox: opts.sandbox } : {}),
       ...(opts.workstream ? { workstream: opts.workstream } : {}),
+      ...(opts.overrideToken ? { override: { token: opts.overrideToken } } : {}),
     });
+
+    const conflict = resp.type === "response.error" && resp.detail?.kind === "workstream_conflict" ? resp.detail.resolution.conflict : undefined;
+    if (conflict?.overrideToken && opts.confirmOverride && !opts.overrideToken) {
+      const ch = conflict.changes;
+      const warning = [
+        `⚠ This folder belongs to workstream "${S(conflict.folder)}" (exclusive).`,
+        `  A session here in "${S(conflict.chosen)}" gets ${ch && ch.gains.length > 0 ? `its servers (${S(ch.gains.join(", "))})` : "no servers of the folder's workstream"}${ch && ch.env.length > 0 ? ` and env ${S(ch.env.join(", "))}` : ""}${ch?.git ? `, commits as ${S(ch.git)}` : ""},`,
+        `  writes into "${S(conflict.folder)}"'s code${ch && ch.withholds.length > 0 ? `, and is not given ${S(ch.withholds.join(", "))}` : ""}.`,
+      ].join("\n");
+      if (await opts.confirmOverride(warning)) {
+        return this.createSession(name, workdir, { ...opts, overrideToken: conflict.overrideToken });
+      }
+    }
 
     if (resp.type === "response.ok") {
       const data = resp.data as SessionInfo;
