@@ -217,7 +217,8 @@ export class WorkstreamService {
       if (!ws || ws.abstract || ws.share === "closed" || ref.workstream === homeId) continue;
       const all = of(ref.workstream);
       const folders = ref.paths ? ref.paths.filter((p) => all.some((f) => within(p, f))) : all;
-      if (folders.length > 0) references.push({ workstream: ref.workstream, folders });
+      // Kept with no folders here too: it still gives its memory (§7.2).
+      references.push({ workstream: ref.workstream, folders });
     }
     const readable = [...home, ...references.flatMap((r) => r.folders)];
     const foreign: WorkstreamFence["foreign"] = [];

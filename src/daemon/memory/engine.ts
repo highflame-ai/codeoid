@@ -13,7 +13,7 @@
 
 import type { Embedder } from "./embedder.js";
 import { normalize } from "./embedder.js";
-import type { SqliteEpisodeStore, WorkspaceTenant } from "./store.js";
+import { type SqliteEpisodeStore, type WorkspaceTenant, workstreamReadable } from "./store.js";
 import { DEFAULT_WEIGHTS, rank, type RankerWeights } from "./ranker.js";
 import type { Reranker } from "./reranker.js";
 import { embedWindows, indexView } from "./lossless.js";
@@ -212,8 +212,8 @@ export class MemoryEngine {
   }
 
   /** The verbatim body of an episode in `workspaceId` — not just its index view. */
-  getFullContentScoped(id: string, workspaceId: string): string | null {
-    if (!this.#store.getEpisodeInWorkspace(id, workspaceId)) return null;
+  getFullContentScoped(id: string, workspaceId: string, workstreams?: readonly string[]): string | null {
+    if (!this.getEpisodeScoped(id, workspaceId, workstreams)) return null;
     return this.#store.getFullContent(id);
   }
 
@@ -226,6 +226,26 @@ export class MemoryEngine {
     while (this.#embedRunning || this.#embedQueue.length > 0) {
       await new Promise((r) => setTimeout(r, 25));
     }
+  }
+
+  /** Each session's workstream filter (workstreams §6.4), read at every call by the memory tools. */
+  #workstreamScopes = new Map<string, () => readonly string[] | undefined>();
+
+  /**
+   * Scope a session's memory tools to the workstreams it may read (its home
+   * and references), read live; returns the unregister. Every transport's
+   * tools carry the session id, so this one seam covers them all.
+   */
+  scopeSession(sessionId: string, workstreams: () => readonly string[] | undefined): () => void {
+    this.#workstreamScopes.set(sessionId, workstreams);
+    return () => {
+      if (this.#workstreamScopes.get(sessionId) === workstreams) this.#workstreamScopes.delete(sessionId);
+    };
+  }
+
+  /** The workstreams a session's memory tools may read; undefined = no filter. */
+  workstreamsOf(sessionId: string): readonly string[] | undefined {
+    return this.#workstreamScopes.get(sessionId)?.();
   }
 
   /** Hybrid retrieval. */
@@ -348,14 +368,16 @@ export class MemoryEngine {
   }
 
   /** Tenant-scoped fetch by id — the only variant safe to expose to a model. */
-  getEpisodeScoped(id: string, workspaceId: string): Episode | null {
-    return this.#store.getEpisodeInWorkspace(id, workspaceId);
+  getEpisodeScoped(id: string, workspaceId: string, workstreams?: readonly string[]): Episode | null {
+    const ep = this.#store.getEpisodeInWorkspace(id, workspaceId);
+    return ep && workstreamReadable(ep.workstreamId, workstreams) ? ep : null;
   }
 
   /** List recent episodes (for the warm-tier index / timeline UI). `offset`
-   *  enables ordered pagination over the full workspace history. */
-  timeline(workspaceId: string, limit = 40, offset = 0): Episode[] {
-    return this.#store.listRecent(workspaceId, limit, offset);
+   *  enables ordered pagination over the full workspace history; `workstreams`
+   *  keeps it to what they may read (RecallQuery.workstreams). */
+  timeline(workspaceId: string, limit = 40, offset = 0, workstreams?: readonly string[]): Episode[] {
+    return this.#store.listRecent(workspaceId, limit, offset, workstreams);
   }
 
   /**

@@ -59,6 +59,12 @@ interface EpisodeRow {
   embedding_model: string | null;
   created_at: number;
   created_by: string;
+  workstream_id?: string | null;
+}
+
+/** Whether an episode's workstream is one `allowed` lets the caller read (RecallQuery.workstreams). */
+export function workstreamReadable(episodeWorkstream: string | undefined, allowed: readonly string[] | undefined): boolean {
+  return allowed === undefined || episodeWorkstream === undefined || allowed.includes(episodeWorkstream);
 }
 
 /** The tenant a workspace id is scoped to. Every episode query filters by
@@ -434,6 +440,11 @@ export class SqliteEpisodeStore {
       this.#db.prepare("SELECT COUNT(*) AS n FROM pragma_table_info('turn_usage') WHERE name = 'cost_source'").get() as { n: number } | undefined
     )?.n ?? 0;
     if (!hasCostSource) this.#db.exec("ALTER TABLE turn_usage ADD COLUMN cost_source TEXT");
+    // The writing session's home workstream (workstreams §6.4); NULL on episodes from before it.
+    const hasWorkstream = (
+      this.#db.prepare("SELECT COUNT(*) AS n FROM pragma_table_info('episodes') WHERE name = 'workstream_id'").get() as { n: number } | undefined
+    )?.n ?? 0;
+    if (!hasWorkstream) this.#db.exec("ALTER TABLE episodes ADD COLUMN workstream_id TEXT");
   }
 
   // ── Writes ────────────────────────────────────────────────────────────
@@ -453,8 +464,8 @@ export class SqliteEpisodeStore {
       .prepare(
         `INSERT INTO episodes (
           id, workspace_id, session_id, kind, tool_name, summary, content,
-          file_paths, token_estimate, embedding, embedding_model, created_at, created_by
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          file_paths, token_estimate, embedding, embedding_model, created_at, created_by, workstream_id
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -470,6 +481,7 @@ export class SqliteEpisodeStore {
         episode.embeddingModel ?? null,
         episode.createdAt,
         episode.createdBy,
+        episode.workstreamId ?? null,
       );
 
     if (episode.fullContent !== undefined && episode.fullContent !== episode.content) {
@@ -1008,7 +1020,17 @@ export class SqliteEpisodeStore {
     return row ? this.#rowToEpisode(row) : null;
   }
 
-  listRecent(workspaceId: string, limit: number, offset = 0): Episode[] {
+  listRecent(workspaceId: string, limit: number, offset = 0, workstreams?: readonly string[]): Episode[] {
+    if (workstreams !== undefined) {
+      // Only what the caller's workstreams may read (RecallQuery.workstreams), paged over that.
+      const marks = workstreams.map(() => "?").join(", ");
+      const rows = this.#db
+        .prepare(
+          `SELECT * FROM episodes WHERE workspace_id = ? AND (workstream_id IS NULL${workstreams.length > 0 ? ` OR workstream_id IN (${marks})` : ""}) ORDER BY created_at DESC LIMIT ? OFFSET ?`,
+        )
+        .all(workspaceId, ...workstreams, limit, offset) as EpisodeRow[];
+      return rows.map((r) => this.#rowToEpisode(r));
+    }
     const rows = this.#db
       .prepare(
         "SELECT * FROM episodes WHERE workspace_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
@@ -1580,6 +1602,7 @@ export class SqliteEpisodeStore {
       embeddingModel: row.embedding_model ?? undefined,
       createdAt: row.created_at,
       createdBy: row.created_by,
+      ...(row.workstream_id ? { workstreamId: row.workstream_id } : {}),
     };
   }
 }
@@ -1624,6 +1647,7 @@ function sanitizeFtsQuery(q: string): string {
 }
 
 function matchesQuery(ep: Episode, q: RecallQuery): boolean {
+  if (!workstreamReadable(ep.workstreamId, q.workstreams)) return false;
   if (q.sessionId && ep.sessionId !== q.sessionId) return false;
   if (q.excludeSessionId && ep.sessionId === q.excludeSessionId) return false;
   if (q.toolName && ep.toolName !== q.toolName) return false;
