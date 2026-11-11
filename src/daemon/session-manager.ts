@@ -745,6 +745,10 @@ export class SessionManager {
     this.#memory = memory;
     this.#config = opts?.config;
     this.#workstreams = new WorkstreamService(opts?.config?.workstreams, opts?._testFolderReader, opts?.config?.credentials);
+    const withSkills = (opts?.config?.workstreams?.items ?? []).filter((w) => w.skillDirs.length > 0).map((w) => w.id);
+    if (withSkills.length > 0) {
+      console.warn(`[codeoid] workstreams ${withSkills.join(", ")} set skillDirs, which aren't applied yet: those skills don't reach their sessions`);
+    }
     this.#secrets = opts?._testSecrets ?? createSecretStore(opts?.config?.credentialStore);
     // A `dir` store holds every credential's value in plain files: refused to
     // every agent's file tools and hidden from every sandbox, as codeoid's own

@@ -406,8 +406,56 @@ A session from before workstreams were configured is given its folder's home onc
 A home deleted from the config leaves its sessions marked orphaned; removing the whole `workstreams` block turns workstreams off instead.
 A session whose stored home is unreadable or invalid gets no home (it is never re-matched to its folder).
 
-This is phase W0: a session's workstream is decided, kept and shown, and nothing it is given changes yet.
-Servers, credentials, git identity and memory follow in later phases (the design's §13).
+### Credentials
+
+A credential is declared by id and kind in `credentials`; its value is never in `config.json`.
+
+```jsonc
+"credentials": [
+  { "id": "gh-acme",  "kind": "env" },                                   // an env var a workstream sets
+  { "id": "hf-key",   "kind": "header", "header": "X-Highflame-APIKey" }, // sent in a header to an MCP server
+  { "id": "gh-bot",   "kind": "bearer" },                                 // sent as Authorization: Bearer
+  { "id": "slack-hf", "kind": "oauth", "server": "slack" }                // a second OAuth sign-in to one server
+],
+"credentialStore": { "kind": "env-file" }   // or { "kind": "dir", "path": "/var/run/secrets/codeoid" }
+```
+
+- `env-file` (default) reads `CODEOID_CRED_<ID>` (`gh-acme` → `CODEOID_CRED_GH_ACME`) from the daemon's environment or `~/.codeoid/.env`. The `CODEOID_` prefix keeps every value out of every agent process.
+- `dir` reads one file per id from a directory: a mounted Kubernetes Secret, a Vault agent's sink. Read-only, and hidden from every agent like codeoid's own secrets.
+- An OAuth slot is signed in with `codeoid mcp signin <server> --credential <id>`.
+
+Every reference to a credential is checked when the config loads: declared once, of a kind that fits where it is used.
+
+### What a workstream gives its sessions
+
+```jsonc
+{ "id": "acme", "match": { "remotes": ["github.com/acme/*"] },
+  "env": { "GH_TOKEN": { "secret": "gh-acme" } },     // read from the store when the session starts
+  "git": { "name": "Acme Bot", "email": "bot@acme.example" },
+  "mcpServers": ["web", { "server": "github", "credential": "gh-bot" }, { "server": "slack", "credential": "slack-hf" }],
+  "extends": ["base"], "exclude": ["notes"] }
+```
+
+- **env and git identity** reach the backend's process (not opencode's shared server yet). A name codeoid owns for the backend (`ANTHROPIC_*`, `PATH`, `LD_*`, …) fails the config load.
+- **mcpServers** take effect with `isolateGlobalServers: true`. Then a session reaches built-ins, the servers its home names, and the folder's own servers only when the folder is the home's; no home, the conductor's, or a deleted one: built-ins only.
+  - Claude runs with a strict MCP config: nothing from `~/.claude.json`, a `.mcp.json`, a plugin or an agent's own; every server it reaches is codeoid's, called by the daemon. Tools only: an MCP server's prompts and resources don't pass.
+  - Other CLI backends (Codex, Gemini CLI, Qwen, opencode) mount natively only servers that need no secret; an HTTP server called with a credential goes through the daemon's relay, and a stdio server that needs env values is not given.
+  - A credential's value is read by the daemon when it calls the server, never handed to a backend. A server removed from a workstream fails on the next call, mid-turn; the tool list catches up at the next turn.
+- **skillDirs** are accepted but not applied yet (the daemon says so at start).
+
+Under isolation a session you create in a folder with no workstream is refused until you choose one; sessions the daemon starts there (loops, routines, dispatch) get built-ins only.
+
+### Overrides
+
+Choosing a workstream for a folder another workstream holds exclusively is refused with what it would change.
+`codeoid new … --workstream <id>` then asks to confirm, or `--override` confirms without asking (needs `session:approve` on an undelegated token; audited as `workstream.override`).
+A workstream with `allowOverride: false` can't be overridden at all.
+
+A folder's workstream is remembered: if its repository later matches a different one (its `origin` was changed), the next session there must choose.
+
+### Moving an existing setup
+
+`codeoid workstream import [--root <dir>]` proposes workstreams from your repositories' remotes and lists Claude's global MCP servers to assign. It writes nothing; isolation stays off until you turn it on.
 
 ## Signing a backend in, instead of pasting a key
 

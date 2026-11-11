@@ -1744,6 +1744,44 @@ workstreamCmd
     );
   });
 
+workstreamCmd
+  .command("import")
+  .description(
+    "Propose workstreams from what is on disk — your repositories grouped by their remote's owner, and the MCP servers in Claude's global config — as a config block to review. Writes nothing.",
+  )
+  .option("--root <dir>", "a folder whose subfolders are your repositories (repeatable; default ~/Workspace, else this folder)", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .option("--json", "print the proposal as JSON")
+  .action(async (o: { root: string[]; json?: boolean }) => {
+    const { existsSync } = await import("node:fs");
+    const { homedir } = await import("node:os");
+    const { proposeWorkstreams } = await import("./daemon/workstreams/import.js");
+    const { readGlobalServers } = await import("./daemon/mcp/workdir-servers.js");
+    const defaultRoot = join(homedir(), "Workspace");
+    const roots = o.root.length > 0 ? o.root.map(dirFlag) : [existsSync(defaultRoot) ? defaultRoot : process.cwd()];
+    const global = Object.keys((await readGlobalServers()) ?? {});
+    const p = proposeWorkstreams(roots, global);
+    if (o.json) return void console.log(JSON.stringify(p, null, 2));
+    if (p.items.length === 0) {
+      console.log(`No repositories with a remote under ${roots.join(", ")}.`);
+      return;
+    }
+    console.log("Proposed workstreams (one per remote owner). Review, rename, merge, then add to config.json:\n");
+    const block = {
+      workstreams: {
+        isolateGlobalServers: false,
+        items: p.items.map(({ id, name, match }) => ({ id, name, claim: "suggest", match, mcpServers: [] as string[] })),
+      },
+    };
+    console.log(JSON.stringify(block, null, 2));
+    console.log("\nFolders each would match:");
+    for (const it of p.items) console.log(`  ${clean(it.id)}: ${it.folders.length} — ${clean(it.folders.slice(0, 4).join(", "))}${it.folders.length > 4 ? ", …" : ""}`);
+    if (p.unmatched.length > 0) console.log(`\nNo remote (add a path rule, or leave them to a default): ${clean(p.unmatched.join(", "))}`);
+    if (p.globalServers.length > 0) {
+      console.log(`\nClaude's global MCP servers, reaching every session today: ${clean(p.globalServers.join(", "))}`);
+      console.log("Add each to the mcpServers of the workstreams that should reach it. Isolation stays off until you set isolateGlobalServers: true.");
+    }
+  });
+
 // ── Outward control plane (/mcp/control — docs/mcp-control.md) ─────────────
 
 const mcp = program

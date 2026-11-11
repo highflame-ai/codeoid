@@ -8,6 +8,7 @@ import { FolderReader, findGitDirs, parseGitRemotes } from "./folder.js";
 import { ancestry, expandHome, matchFolder, normalizePathRule, normalizeRemote, parseSshAliases, type MatchableWorkstream } from "./match.js";
 import { workstreamsSchema } from "./schema.js";
 import { WorkstreamService } from "./service.js";
+import { proposeWorkstreams } from "./import.js";
 import { EnvFileSecretStore } from "../credentials/store.js";
 
 const ws = (id: string, over: Partial<MatchableWorkstream> = {}): MatchableWorkstream => ({
@@ -530,3 +531,23 @@ describe("WorkstreamService", () => {
     expect(JSON.stringify(s.summaries())).not.toContain("gh-a");
   });
 });
+
+describe("proposeWorkstreams (codeoid workstream import)", () => {
+  test("groups repositories by remote owner; folders without a remote and the global servers are listed apart", () => {
+    const root = join(tmp, "Workspace");
+    repo(join(root, "a1"), { origin: "git@github.com:Acme/a1.git" });
+    repo(join(root, "a2"), { origin: "https://github.com/acme/a2" });
+    repo(join(root, "b1"), { origin: "https://gitlab.com/beta/b1" });
+    mkdirSync(join(root, "plain"), { recursive: true });
+    const p = proposeWorkstreams([root], ["slack", "github"], new FolderReader({ home: tmp, sshConfig: "" }));
+    expect(p.items.map((i) => [i.id, i.match.remotes[0], i.folders.length])).toEqual([
+      ["acme", "github.com/acme/*", 2],
+      ["beta", "gitlab.com/beta/*", 1],
+    ]);
+    expect(p.unmatched).toEqual([join(root, "plain")]);
+    expect(p.globalServers).toEqual(["github", "slack"]);
+    // Every proposed item is a valid config item.
+    expect(workstreamsSchema.safeParse({ items: p.items.map(({ id, name, match }) => ({ id, name, match })) }).success).toBe(true);
+  });
+});
+

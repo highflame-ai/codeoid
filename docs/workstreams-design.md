@@ -1,6 +1,6 @@
 # Codeoid Workstreams — Design Proposal
 
-> Status: **DRAFT for grilling** · Author: design session 2026-11-10
+> Status: **W0 in review (#461), W1 built** · Author: design session 2026-11-10
 > Companion to [conductor-design.md](./conductor-design.md) and [federation-design.md](./federation-design.md).
 > Goal: let one owner run several separate lines of work on one daemon. A line of work can be a company, a client, a project, a team, research, or just a different personal setup.
 > Each line of work gets its own MCP servers, credentials, models and memory.
@@ -527,6 +527,11 @@ How this fits [conductor-build-plan.md](./conductor-build-plan.md):
 **Still open:** none from the first round. The next round belongs to `/grill-feature` against W1's credential model (§6.5 case 2 and the OAuth credential slot).
 
 ## 15. Deferred (backlog)
+
+- **`skillDirs`** (W1): accepted, not applied. Delivering skills per session safely reuses the pack's per-entry plugin synthesis (pipeline/pack-service.ts `#ensureSkillPlugin`), which wants extracting rather than copying.
+- **Orphaned sessions refusing turns** (§8): under isolation an orphaned session already gets built-ins only; refusing its turns waits for `session.set_workstream` (W3), so there is a way out.
+- **Workstream env on opencode**: its one shared server takes no per-session process env; a session's shell environment could carry it.
+- **MCP prompts and resources through the Claude bridge**: the bridge serves tools only.
 
 - **Per-workstream spend caps** (was open question 5). A daily cap per workstream plus an overall cap, so an unattended loop in one workstream can't use up the subscription quota another needs.
   Deferred on 2026-11-10. It stays a prerequisite of unattended routines across workstreams, the same position as the amended R5 in conductor-design.
