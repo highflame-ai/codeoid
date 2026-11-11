@@ -40,6 +40,32 @@ function forms(folders: readonly string[]): string[] {
  * The fence's verdict on one call: null when it stays out of other
  * workstreams' folders (and writes no reference), else why not.
  */
+interface Prepared {
+  readable: string[];
+  foreign: Array<{ workstream: string; folders: Array<{ d: string; keep: string[] }> }>;
+  references: Array<{ workstream: string; folders: string[] }>;
+  mine: string[];
+}
+
+/** Each fence's folders in both spellings, worked out once per fence (the gate runs on every call). */
+const prepared = new WeakMap<WorkstreamFence, Prepared>();
+
+function prepare(fence: WorkstreamFence): Prepared {
+  const hit = prepared.get(fence);
+  if (hit) return hit;
+  const readable = forms(fence.readable);
+  const p: Prepared = {
+    readable,
+    // Each foreign folder with what is carved out of it: the readable paths inside it (never one holding it).
+    foreign: fence.foreign.map((f) => ({ workstream: f.workstream, folders: forms(f.folders).map((d) => ({ d, keep: readable.filter((r) => within(r, d)) })) })),
+    references: fence.references.map((r) => ({ workstream: r.workstream, folders: forms(r.folders) })),
+    // Where a write is the session's own: its home's folders and its own folder.
+    mine: forms([...fence.home, ...(fence.own ?? [])]),
+  };
+  prepared.set(fence, p);
+  return p;
+}
+
 export function fenceRefusal(toolName: string, input: unknown, opts: { workdir: string; cwd?: string | null; fence: WorkstreamFence }): FenceRefusal | null {
   const base = typeof opts.cwd === "string" ? opts.cwd : opts.workdir;
   // A relative path where the backend didn't say where it runs (null: it may have moved) can't be
@@ -49,14 +75,7 @@ export function fenceRefusal(toolName: string, input: unknown, opts: { workdir: 
     const relative = [...toolReadPaths(toolName, input), ...writesRaw.filter((p): p is string => typeof p === "string")].find((p) => !p.startsWith("/") && p !== "~" && !p.startsWith("~/"));
     if (relative !== undefined) return { path: relative, workstream: opts.fence.workstream ?? "", kind: "unresolved" };
   }
-  const readable = forms(opts.fence.readable);
-  // Each foreign folder with what is carved out of it: the readable paths inside it (never one holding it).
-  const foreign = opts.fence.foreign.map((f) => ({
-    workstream: f.workstream,
-    folders: forms(f.folders).map((d) => ({ d, keep: readable.filter((r) => within(r, d)) })),
-  }));
-  const references = opts.fence.references.map((r) => ({ workstream: r.workstream, folders: forms(r.folders) }));
-  const home = forms(opts.fence.home);
+  const { foreign, references, mine } = prepare(opts.fence);
   const inForeign = (p: string) => foreign.find((f) => f.folders.some(({ d, keep }) => within(p, d) && !keep.some((k) => within(p, k))));
   // Writes first: a write tool's path is also a read key, and the refusal should say it writes.
   const writes = input && typeof input === "object" ? writeTargets(toolName, input as Record<string, unknown>) : null;
@@ -67,7 +86,7 @@ export function fenceRefusal(toolName: string, input: unknown, opts: { workdir: 
       if (hit) return { path: raw, workstream: hit.workstream, kind: "write" };
       // A reference is read-only; a folder of the home's inside one is the home's.
       const ref = references.find((r) => r.folders.some((d) => within(p, d)));
-      if (ref && !home.some((h) => within(p, h))) return { path: raw, workstream: ref.workstream, kind: "write_reference" };
+      if (ref && !mine.some((h) => within(p, h))) return { path: raw, workstream: ref.workstream, kind: "write_reference" };
     }
   }
   const search = isSearchTool(toolName);

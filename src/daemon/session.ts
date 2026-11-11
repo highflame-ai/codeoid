@@ -1103,12 +1103,32 @@ export class Session {
    * recall), never mid-turn. Said on the session.
    */
   setWorkstream(next: WorkstreamBinding, said: string): void {
-    this.#workstream = next;
+    // Saved at once (a restart resumes with it), applied at the next turn's start: a turn running now
+    // keeps the binding it started with whole — its gate, servers, env and memory together.
+    this.#pendingWorkstream = next;
     this.#saveMetaNow();
+    if (!this.#mcpBusy()) this.#applyPendingWorkstream();
     const info = this.#makeMessage("info", `🧭 ${said}`, SYSTEM_IDENTITY, undefined, undefined, { event: "workstream.changed", workstream: next.id ?? null });
     this.#persistAndBuffer(info);
     this.#broadcastRaw(info);
     this.#broadcastInfoUpdate();
+  }
+
+  /** A binding change waiting for the turn boundary (setWorkstream). */
+  #pendingWorkstream: WorkstreamBinding | undefined;
+
+  /** The binding as it will be: the pending one, else the one in use. What is saved and shown. */
+  get workstreamAhead(): WorkstreamBinding | undefined {
+    return this.#pendingWorkstream ?? this.#workstream;
+  }
+
+  #applyPendingWorkstream(): void {
+    const next = this.#pendingWorkstream;
+    if (!next) return;
+    this.#pendingWorkstream = undefined;
+    this.#workstream = next;
+    // The frozen memory index was judged against the old scope.
+    this.#frozenMemoryIndex = null;
   }
 
   /**
@@ -2113,7 +2133,7 @@ export class Session {
         worktree: this.worktree,
         collaboration: this.collaboration,
         collaborationRole: this.collaborationRole,
-        ...(this.#workstream ? { workstream: this.#workstream } : {}),
+        ...(this.workstreamAhead ? { workstream: this.workstreamAhead } : {}),
         // Fire-and-forget: saveMeta's write chain owns the failure log; an
         // unconsumed rejection here would be an unhandled-rejection crash.
       }).catch(() => {});
@@ -5397,6 +5417,8 @@ export class Session {
     // The session's MCP servers: read before its first turn, and a refresh
     // asked for meanwhile applied (#395) — before the stop and adopted-turn
     // checks below, which must come after every await.
+    // A workstream change made during the last turn applies now, before the servers and env are read.
+    if (!this.#mcpBusy()) this.#applyPendingWorkstream();
     await this.#applyMcpView();
     // A thinking effort the backend takes only at startup (#417): rebuild it now, between turns.
     await this.#applyEffortRestart();
@@ -7991,7 +8013,9 @@ export class Session {
       worktree: this.worktree,
       collaboration: this.collaboration,
       collaborationRole: this.collaborationRole,
-      ...(this.#workstream ? { workstream: this.#describeWorkstream?.(this.#workstream) ?? { ...(this.#workstream.id ? { id: this.#workstream.id } : {}), source: this.#workstream.source } } : {}),
+      ...(this.workstreamAhead
+        ? { workstream: this.#describeWorkstream?.(this.workstreamAhead) ?? { ...(this.workstreamAhead.id ? { id: this.workstreamAhead.id } : {}), source: this.workstreamAhead.source } }
+        : {}),
       // Ambient pack driving this session (docs/pack-loading.md) — id, or
       // "id (role)" when a capability role is active.
       ...(this.#pack
@@ -12328,7 +12352,7 @@ export class Session {
       collaboration: this.collaboration,
       collaborationRole: this.collaborationRole,
       // Both meta writes, for the same reason as the collaboration above.
-      ...(this.#workstream ? { workstream: this.#workstream } : {}),
+      ...(this.workstreamAhead ? { workstream: this.workstreamAhead } : {}),
     }).catch(() => {});
   }
 }

@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import type { SessionWorkstreamInfo, WorkstreamResolution, WorkstreamSummary } from "../../protocol/types.js";
 import { readWorkstreamBinding, type WorkstreamBinding } from "./binding.js";
-import { carveOut, expandPathRule, outermost, within } from "./folders.js";
+import { CARVE_LIMIT, carveOut, expandPathRule, repositoryTopOf, within } from "./folders.js";
 import { effectiveWorkstreams, type EffectiveWorkstream } from "./effective.js";
 import { FolderReader } from "./folder.js";
 import { expandHome, type MatchableWorkstream, matchFolder, normalizePathRule } from "./match.js";
@@ -34,6 +34,8 @@ export interface WorkstreamFence {
   workstream?: string;
   /** The home's folders: readable and, as the sandbox allows, writable. */
   home: string[];
+  /** The session's own folder (its workdir; its repository's top where no other workstream holds it). */
+  own: string[];
   /** Readable only, never written. */
   references: Array<{ workstream: string; folders: string[] }>;
   /**
@@ -78,6 +80,15 @@ export interface ResumeMetaFacts {
   stored: unknown;
   /** A fork's or collaboration child's parent session id. */
   parentId?: string;
+}
+
+/** The real path, or the path itself when it can't be resolved (missing). */
+function realOr(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
 }
 
 export class WorkstreamService {
@@ -199,15 +210,42 @@ export class WorkstreamService {
    * name (each spelling: as written and, for `~`, the home's real path), plus
    * `recorded` (folders recorded as its home, repository tops).
    */
-  foldersOf(id: string, recorded: readonly string[] = []): { folders: string[]; limits: string[] } {
+  /** Each workstream's path-rule folders on disk (no recorded ones), once per fence. */
+  #ruleFolders(): Map<string, { folders: string[]; limits: string[] }> {
+    const out = new Map<string, { folders: string[]; limits: string[] }>();
+    for (const m of this.#matchables) {
+      if (m.abstract) continue;
+      const folders: string[] = [];
+      const limits: string[] = [];
+      for (const rule of m.paths) {
+        const e = expandPathRule(rule);
+        folders.push(...e.folders);
+        limits.push(...e.limits);
+      }
+      out.set(m.id, { folders, limits });
+    }
+    return out;
+  }
+
+  /**
+   * A workstream's folders on this machine: the directories its path rules
+   * name (each spelling: as written and, for `~`, the home's real path), plus
+   * `recorded` (workdirs its sessions were homed in by their folder's match),
+   * each as its repository's top — unless another workstream has a folder
+   * inside that top (a monorepo split by path rules): then only the workdir.
+   * Never the home or what holds it. Folders are kept as found, nested ones
+   * too: each is its own (a nested one may be fenced where its parent isn't).
+   */
+  foldersOf(id: string, recorded: readonly string[] = [], rules: Map<string, { folders: string[]; limits: string[] }> = this.#ruleFolders()): { folders: string[]; limits: string[] } {
     const m = this.#matchables.find((x) => x.id === id);
     if (!m || m.abstract) return { folders: [], limits: [] };
-    const limits: string[] = [];
-    const found: string[] = [...recorded];
-    for (const rule of m.paths) {
-      const e = expandPathRule(rule);
-      found.push(...e.folders);
-      limits.push(...e.limits);
+    const own = rules.get(id) ?? { folders: [], limits: [] };
+    const limits: string[] = [...own.limits];
+    const others = [...rules.entries()].filter(([k]) => k !== id).flatMap(([, v]) => v.folders);
+    const found: string[] = [...own.folders];
+    for (const w of recorded) {
+      const top = repositoryTopOf(w, this.#reader.home);
+      found.push(top !== w && others.some((f) => within(f, top)) ? w : top);
     }
     // The home (or what holds it) is never one workstream's folder: fencing it would fence everything.
     const homes = [this.#reader.home, this.#realHome()];
@@ -216,7 +254,7 @@ export class WorkstreamService {
       if (holds) limits.push(`${id}: ${f} is the home or holds it, so it isn't fenced`);
       return !holds;
     });
-    return { folders: outermost(kept), limits };
+    return { folders: [...new Set(kept)], limits };
   }
 
   /**
@@ -232,10 +270,17 @@ export class WorkstreamService {
     if (!this.configured || !this.#cfg.isolateGlobalServers) return undefined;
     const limits: string[] = [];
     const homeId = binding?.id && binding.source !== "reserved" && this.#effective.has(binding.id) ? binding.id : undefined;
+    const rules = this.#ruleFolders();
+    const cache = new Map<string, string[]>();
     const of = (id: string) => {
-      const r = this.foldersOf(id, recorded(id));
-      limits.push(...r.limits);
-      return r.folders;
+      let folders = cache.get(id);
+      if (!folders) {
+        const r = this.foldersOf(id, recorded(id), rules);
+        limits.push(...r.limits);
+        folders = r.folders;
+        cache.set(id, folders);
+      }
+      return folders;
     };
     const home = homeId ? of(homeId) : [];
     const references: WorkstreamFence["references"] = [];
@@ -244,15 +289,22 @@ export class WorkstreamService {
       // A reference whose workstream is gone or closed now gives nothing (§8).
       if (!ws || ws.abstract || ws.share === "closed" || ref.workstream === homeId) continue;
       const all = of(ref.workstream);
-      const folders = ref.paths ? ref.paths.filter((p) => all.some((f) => within(p, f))) : all;
+      // A granted path counts only where it really is inside that workstream's folders, as written and
+      // as it resolves now: a link put there later (or a `..`) never leads the grant elsewhere.
+      const inside = (p: string) => all.some((f) => within(p, f) || within(p, realOr(f)));
+      const folders = ref.paths ? ref.paths.filter((p) => inside(p) && inside(realOr(p))) : all;
       // Kept with no folders here too: it still gives its memory (§7.2).
       references.push({ workstream: ref.workstream, folders });
     }
-    // What stays readable even inside another workstream's folder: the
-    // session's own workdir (a session moved or homed past a claim keeps its
-    // folder), its home's folders, and what its references grant — exactly
-    // that, never the folder holding a reference's path.
-    const readable = [...new Set([...own, ...home, ...references.flatMap((r) => r.folders)])];
+    // The session's own: its workdir always (a session moved, or homed past a claim, keeps its folder);
+    // the rest (its repository's top) only where no other workstream's folder holds it — a package of a
+    // monorepo another workstream holds doesn't make the whole repository its own.
+    const [workdir, ...extra] = own;
+    const othersFolders = [...this.#effective.values()].filter((w) => !w.abstract && w.id !== homeId).flatMap((w) => of(w.id));
+    const ownKept = [...(workdir ? [workdir] : []), ...extra.filter((o) => !othersFolders.some((f) => within(o, f)))];
+    // What stays readable even inside another workstream's folder: the session's own, its home's
+    // folders, and what its references grant — exactly that, never the folder holding a granted path.
+    const readable = [...new Set([...ownKept, ...home, ...references.flatMap((r) => r.folders)])];
     const foreign: WorkstreamFence["foreign"] = [];
     for (const ws of this.#effective.values()) {
       if (ws.abstract || ws.id === homeId) continue;
@@ -270,13 +322,13 @@ export class WorkstreamService {
         hidden.push(d);
         continue;
       }
-      const carved = keep.some((k) => k === d) ? [] : carveOut(d, keep);
+      const carved = keep.some((k) => k === d) ? [] : (carveOut(d, keep) ?? carveOut(d, keep, CARVE_LIMIT * 10));
       if (carved === null) {
         limits.push(`${d}: too much to carve around what this session reads there, so it is hidden whole`);
         hidden.push(d);
       } else hidden.push(...carved);
     }
-    return { ...(homeId ? { workstream: homeId } : {}), home, references, foreign, readable, hidden: [...new Set(hidden)], limits: [...new Set(limits)] };
+    return { ...(homeId ? { workstream: homeId } : {}), home, own: ownKept, references, foreign, readable, hidden: [...new Set(hidden)], limits: [...new Set(limits)] };
   }
 
   /**
@@ -295,6 +347,23 @@ export class WorkstreamService {
       if (outside.length > 0) return { ok: false, error: `Not ${ws.id}'s folders: ${outside.join(", ")}` };
     }
     return { ok: true, ask: ws.share === "ask" ? [ws.id] : [] };
+  }
+
+  /**
+   * Whether a session homed in `chosen` may live in `workdir` when the
+   * folder is another workstream's (its own match, a claim of any kind): its
+   * workdir stays readable to it, so that is a read of the folder's
+   * workstream, judged by its `share` like a reference. Undefined `folder`:
+   * the folder is no other workstream's. Only under isolation.
+   */
+  folderVerdict(workdir: string, chosen: string | undefined, given?: string): ShareVerdict & { folder?: string } {
+    if (!this.configured || !this.#cfg.isolateGlobalServers || !chosen) return { ok: true, ask: [] };
+    const folder = this.resolve(workdir, undefined, given).home;
+    if (!folder || folder === chosen) return { ok: true, ask: [] };
+    const ws = this.#effective.get(folder);
+    if (!ws) return { ok: true, ask: [] };
+    if (ws.share === "closed") return { ok: false, error: `This folder is workstream "${folder}"'s, which is closed: a session of another workstream can't work in it` };
+    return { ok: true, ask: ws.share === "ask" ? [folder] : [], folder };
   }
 
   /**

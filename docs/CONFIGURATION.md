@@ -492,8 +492,11 @@ codeoid workstream ref rm <session> pub
 codeoid workstream move <session> <workstream>                         # another home
 ```
 
-Moving a session takes its whole conversation with it, so it follows the `share` of its old home and of every workstream it has read from (for its lifetime, even after the reference is gone). Moving from the default workstream, or from no home, is always allowed; past another workstream's exclusive folder it is an override (needs `session:approve`).
-Each change applies at the session's next turn: its backend is rebuilt with the new servers, credentials and sandbox.
+Moving a session takes its whole conversation with it, so it follows the `share` of its old home and of every workstream it has read from (for its lifetime, even after the reference is gone; each home it leaves counts too). Moving from the default workstream, or from no home, is always allowed; past another workstream's exclusive folder it is an override (needs `session:approve`).
+A session homed in another workstream's folder (chosen at create, or moved) reads that folder, so the folder's workstream's `share` decides there too: `closed` refuses it, `ask` needs `session:approve`.
+Each change is saved at once and applies at the session's next turn (a turn running keeps what it started with): its backend is rebuilt with the new servers, credentials and sandbox.
+
+A search with no folder (Grep or Glob over the workdir) is refused when another workstream's folder is inside the workdir: search a narrower folder.
 
 
 ### Moving an existing setup

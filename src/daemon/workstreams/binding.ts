@@ -76,6 +76,8 @@ export function referencePathsProblem(paths: readonly string[] | undefined): str
 
 /** Most references one session holds. */
 export const REFERENCE_LIMIT = MAX_REFERENCES;
+/** Most workstreams one session's read-from record holds. */
+export const READ_FROM_LIMIT = 256;
 
 const SOURCES: ReadonlySet<string> = new Set(["explicit", "matched", "default", "override", "migrated", "reserved", "none"]);
 
@@ -108,7 +110,7 @@ export function readWorkstreamBinding(raw: unknown): WorkstreamBinding | undefin
   }
   let readFrom: string[] | undefined;
   if (r.readFrom !== undefined) {
-    if (!Array.isArray(r.readFrom) || r.readFrom.length > 256 || !r.readFrom.every((x) => typeof x === "string" && ID.test(x))) return undefined;
+    if (!Array.isArray(r.readFrom) || r.readFrom.length > READ_FROM_LIMIT || !r.readFrom.every((x) => typeof x === "string" && ID.test(x))) return undefined;
     readFrom = [...new Set(r.readFrom as string[])];
   }
   return {

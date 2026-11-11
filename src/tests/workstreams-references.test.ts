@@ -115,8 +115,8 @@ describe("references and moves mid-session", () => {
     const removed = await h({ type: "session.remove_reference", id: "r4", sessionId: id, workstream: "pub" }, SENDER);
     expect(removed).toMatchObject({ type: "response.ok" });
     // Gone, but still counted as read from (a later move follows its policy).
-    expect(manager.findByName("s", OWNER)?.workstream).toMatchObject({ id: "mine", readFrom: ["pub"] });
-    expect(manager.findByName("s", OWNER)?.workstream?.references).toBeUndefined();
+    expect(manager.findByName("s", OWNER)?.workstreamAhead).toMatchObject({ id: "mine", readFrom: ["pub"] });
+    expect(manager.findByName("s", OWNER)?.workstreamAhead?.references).toBeUndefined();
   });
 
   it("only the owner", async () => {
@@ -180,5 +180,21 @@ describe("reference inputs are held to what a binding is read back with", () => 
     expect(await h({ type: "session.add_reference", id: "n", sessionId: id, workstream: "pub", paths: [`${join(home, "pub")}/\u0000x`] })).toMatchObject({ type: "response.error" });
     expect(await create("v2", "mine", { references: [{ workstream: "pub", paths: ["relative"] }] })).toMatchObject({ type: "response.error" });
     expect(manager.findByName("v", OWNER)?.workstream?.references).toBeUndefined();
+  });
+
+  it("a move counts the old home as read from: moving on follows its policy", async () => {
+    const made = await create("chain", "acme-api");
+    const id = made.data!.id;
+    expect(await h({ type: "session.set_workstream", id: "m1", sessionId: id, workstream: "pub" })).toMatchObject({ type: "response.ok" });
+    expect(manager.findByName("chain", OWNER)?.workstreamAhead?.readFrom).toContain("acme");
+    // From pub (open) to mine: acme (ask) was read, so a sender without approval rights is asked.
+    expect(await h({ type: "session.set_workstream", id: "m2", sessionId: id, workstream: "mine" }, SENDER)).toMatchObject({ data: { pending: true } });
+  });
+
+  it("a home chosen in a closed workstream's folder is refused; in an `ask` one it needs approval rights", async () => {
+    expect(await create("in-hf", "hf", { workstream: "pub" })).toMatchObject({ type: "response.error" });
+    expect(await create("in-acme", "acme-api", { workstream: "pub" }, SENDER)).toMatchObject({ type: "response.error", code: "forbidden" });
+    const ok = await create("in-acme2", "acme-api", { workstream: "pub" });
+    expect(ok.data?.workstream).toMatchObject({ id: "pub", readFrom: ["acme"] });
   });
 });
