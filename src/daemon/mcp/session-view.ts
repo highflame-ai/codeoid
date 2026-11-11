@@ -110,9 +110,17 @@ export class SessionMcpView implements McpServerView {
     return this.#loaded;
   }
 
-  /** What's applied, as one comparable value. */
+  /**
+   * What's applied, as one comparable value — the workstream grant included,
+   * read live: a workstream edited (a server removed, a credential swapped)
+   * rebuilds the backend at its next turn, as G4 and §8 promise, on backends
+   * that mount servers themselves too.
+   */
   get fingerprint(): string {
-    return this.#fingerprint;
+    const grant = this.#opts.grant?.();
+    if (!grant) return this.#fingerprint;
+    const servers = [...grant.servers].map(([n, s]) => `${n}=${s.credential?.id ?? ""}:${s.credential?.header ?? ""}:${s.oauthSlot ?? ""}`).sort();
+    return `${this.#fingerprint}\u0003${grant.workstream ?? ""}\u0001${grant.workdirServers ? 1 : 0}\u0001${servers.join("\u0001")}`;
   }
 
   /** This session's own servers in use, once each: their hub clients are its to let go. */

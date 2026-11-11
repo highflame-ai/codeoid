@@ -141,3 +141,83 @@ export interface WorkstreamResolveResultMsg {
   revision: string;
   resolution: WorkstreamResolution;
 }
+
+// ── Editing (W2): settings:write on an undelegated token ─────────────────────
+
+/** Add or replace one workstream (by `item.id`). The whole config is validated; nothing is written if it doesn't. Replies `workstream.list.result`. */
+export interface WorkstreamUpsertMsg {
+  type: "workstream.upsert";
+  id: string;
+  /** A `workstreams.items[]` entry as config.json takes it (docs/CONFIGURATION.md, Workstreams). */
+  item: Record<string, unknown>;
+}
+
+/** Remove a workstream. Sessions homed there keep their binding, shown orphaned. Replies `workstream.list.result`. */
+export interface WorkstreamDeleteMsg {
+  type: "workstream.delete";
+  id: string;
+  workstream: string;
+}
+
+/** The block-wide settings. `default: null` removes the default. Replies `workstream.list.result`. */
+export interface WorkstreamSettingsMsg {
+  type: "workstream.settings";
+  id: string;
+  isolateGlobalServers?: boolean;
+  default?: string | null;
+}
+
+/** Sent to subscribed clients after the workstreams or credentials change. */
+export interface WorkstreamsChangedMsg {
+  type: "workstreams.changed";
+  revision: string;
+}
+
+// ── Credentials (W2) ─────────────────────────────────────────────────────────
+
+export interface CredentialInfo {
+  id: string;
+  kind: "bearer" | "header" | "env" | "oauth";
+  header?: string;
+  server?: string;
+  description?: string;
+  /** Whether a value is set, and where (never the value). An `oauth` credential's is its sign-in, shown with its server. */
+  status: { set: boolean; source?: string };
+  /** Workstreams that reference it. */
+  usedBy: string[];
+}
+
+/** The declared credentials and where their values live. Needs `settings:read`. */
+export interface CredentialListMsg {
+  type: "credential.list";
+  id: string;
+}
+
+/** Declare or replace one credential (by `item.id`). Replies `credential.list.result`. */
+export interface CredentialUpsertMsg {
+  type: "credential.upsert";
+  id: string;
+  item: Record<string, unknown>;
+}
+
+/** Remove a credential's declaration (refused while a workstream references it) and its value. */
+export interface CredentialDeleteMsg {
+  type: "credential.delete";
+  id: string;
+  credential: string;
+}
+
+/** Set (or with null, clear) a credential's value in a writable store. The value is never sent back. */
+export interface CredentialSetValueMsg {
+  type: "credential.set_value";
+  id: string;
+  credential: string;
+  value: string | null;
+}
+
+export interface CredentialListResultMsg {
+  type: "credential.list.result";
+  requestId: string;
+  store: { kind: string; writable: boolean };
+  credentials: CredentialInfo[];
+}

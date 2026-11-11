@@ -1102,6 +1102,27 @@ export const workstreamResolveSchema = z.object({
   workstream: workstreamIdField.optional(),
 });
 
+// Items are bounded objects here: their SHAPE is the daemon's config schema's
+// to judge (one rule, one error message), not the wire's.
+const configItemField = z.record(z.string().max(128), z.unknown()).refine((o) => JSON.stringify(o).length <= 64 * 1024, "too large");
+export const workstreamUpsertSchema = z.object({ ...base, type: z.literal("workstream.upsert"), item: configItemField });
+export const workstreamDeleteSchema = z.object({ ...base, type: z.literal("workstream.delete"), workstream: workstreamIdField });
+export const workstreamSettingsSchema = z.object({
+  ...base,
+  type: z.literal("workstream.settings"),
+  isolateGlobalServers: z.boolean().optional(),
+  default: workstreamIdField.nullable().optional(),
+});
+export const credentialListSchema = z.object({ ...base, type: z.literal("credential.list") });
+export const credentialUpsertSchema = z.object({ ...base, type: z.literal("credential.upsert"), item: configItemField });
+export const credentialDeleteSchema = z.object({ ...base, type: z.literal("credential.delete"), credential: z.string().min(1).max(64) });
+export const credentialSetValueSchema = z.object({
+  ...base,
+  type: z.literal("credential.set_value"),
+  credential: z.string().min(1).max(64),
+  value: z.string().max(LIMITS.SETTING_VALUE_MAX).nullable(),
+});
+
 export const skillGrantSchema = z.object({
   ...base,
   type: z.literal("skill.grant"),
@@ -1337,6 +1358,13 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   worktreeTrustSchema,
   workstreamListSchema,
   workstreamResolveSchema,
+  workstreamUpsertSchema,
+  workstreamDeleteSchema,
+  workstreamSettingsSchema,
+  credentialListSchema,
+  credentialUpsertSchema,
+  credentialDeleteSchema,
+  credentialSetValueSchema,
   sessionTurnsSchema,
   sessionApprovalsSchema,
   claudeAccountsListSchema,
