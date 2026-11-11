@@ -681,6 +681,7 @@ describe("W3: the fence at the gate", () => {
       { workstream: "pub", folders: [join(tmp, "pub")] },
     ],
     readable: [join(tmp, "mine"), join(tmp, "pub")],
+    own: [join(tmp, "mine")],
     hidden: [],
     limits: [],
   });
@@ -729,5 +730,56 @@ describe("W3: the fence at the gate", () => {
     symlinkSync(join(tmp, "hf"), join(tmp, "mine", "link"));
     expect(judge("Read", { file_path: join(tmp, "mine", "link", "x") })).toMatchObject({ workstream: "hf" });
     expect(judge("Read", { file_path: "x" }, join(tmp, "hf"))).toMatchObject({ workstream: "hf" });
+  });
+});
+
+describe("W3 audit round 2: monorepos and granted paths", () => {
+  const service = (items: unknown[]) =>
+    new WorkstreamService(workstreamsSchema.parse({ isolateGlobalServers: true, items }), new FolderReader({ home: tmp, sshConfig: "" }));
+
+  test("a session in one workstream's package of another's monorepo reads its package, not the repository", () => {
+    for (const d of ["W/mono/.git", "W/mono/sdk", "W/mono/core"]) mkdirSync(join(tmp, d), { recursive: true });
+    writeFileSync(join(tmp, "W", "mono", "core", "x.ts"), "x");
+    const s = service([
+      { id: "a", share: "closed", claim: "exclusive", match: { paths: ["~/W/mono"] } },
+      { id: "b", claim: "exclusive", match: { paths: ["~/W/mono/sdk"] } },
+    ]);
+    const sdk = join(tmp, "W", "mono", "sdk");
+    const fence = s.fenceFor({ id: "b", source: "matched", revision: "r" }, () => [], [sdk, repositoryTopOf(sdk, tmp)])!;
+    expect(fence.own).toEqual([sdk]);
+    expect(fenceRefusal("Read", { file_path: join(tmp, "W", "mono", "core", "x.ts") }, { workdir: sdk, fence })).toMatchObject({ workstream: "a" });
+    expect(fenceRefusal("Write", { file_path: join(tmp, "W", "mono", "core", "x.ts") }, { workdir: sdk, fence })).toMatchObject({ kind: "write" });
+    expect(fenceRefusal("Read", { file_path: join(sdk, "y.ts") }, { workdir: sdk, fence })).toBeNull();
+    expect(fence.hidden).toContain(join(tmp, "W", "mono", "core"));
+    expect(fence.hidden).not.toContain(sdk);
+  });
+
+  test("a recorded session in a monorepo another workstream splits by path stays its package, never the top", () => {
+    for (const d of ["W/mono/.git", "W/mono/a", "W/mono/b"]) mkdirSync(join(tmp, d), { recursive: true });
+    const s = service([
+      { id: "a", share: "closed", match: { paths: ["~/W/mono/a"] } },
+      { id: "b", match: { paths: ["~/W/mono/b"] } },
+    ]);
+    expect(s.foldersOf("a", [join(tmp, "W", "mono", "a")]).folders).toEqual([join(tmp, "W", "mono", "a")]);
+    const b = join(tmp, "W", "mono", "b");
+    const fence = s.fenceFor({ id: "b", source: "matched", revision: "r" }, (id) => (id === "a" ? [join(tmp, "W", "mono", "a")] : []), [b, repositoryTopOf(b, tmp)])!;
+    expect(fenceRefusal("Read", { file_path: join(tmp, "W", "mono", "a", "k") }, { workdir: b, fence })).toMatchObject({ workstream: "a" });
+  });
+
+  test("a granted path counts only where it really is: no `..`, no link into another workstream", () => {
+    for (const d of ["W/b", "W/c/s"]) mkdirSync(join(tmp, d), { recursive: true });
+    writeFileSync(join(tmp, "W", "c", "s", "key.txt"), "k");
+    symlinkSync(join(tmp, "W", "c"), join(tmp, "W", "b", "future"));
+    const s = service([
+      { id: "home", match: { paths: ["~/W/home"] } },
+      { id: "b", share: "open", match: { paths: ["~/W/b"] } },
+      { id: "c", share: "closed", match: { paths: ["~/W/c"] } },
+    ]);
+    const ref = (p: string) => ({ id: "home", source: "explicit" as const, revision: "r", references: [{ workstream: "b", paths: [p], grantedBy: "u", grantedAt: "t" }] });
+    for (const p of [join(tmp, "W", "b", "future"), `${join(tmp, "W", "b")}/../c/s`]) {
+      const fence = s.fenceFor(ref(p))!;
+      expect(fence.references[0]?.folders).toEqual([]);
+      expect(fenceRefusal("Read", { file_path: join(tmp, "W", "c", "s", "key.txt") }, { workdir: tmp, fence })).toMatchObject({ workstream: "c" });
+    }
   });
 });

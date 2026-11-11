@@ -10,8 +10,7 @@
 
 import { addedDirProblem, type OtherCheckout, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
 import { WorkstreamService, type WorkstreamBinding, type WorkstreamFence, type WorkstreamReference } from "./workstreams/service.js";
-import { repositoryTopOf } from "./workstreams/folders.js";
-import { REFERENCE_LIMIT, referencePathsProblem } from "./workstreams/binding.js";
+import { READ_FROM_LIMIT, REFERENCE_LIMIT, referencePathsProblem } from "./workstreams/binding.js";
 import { grantRefusal, type McpGrant } from "./workstreams/grant.js";
 import { OverrideTokens } from "./workstreams/override.js";
 import { withSlot } from "./mcp/oauth.js";
@@ -2374,8 +2373,7 @@ mcpHub: this.#mcpHub,
     const hit = this.#fenceCache.get(key);
     if (hit && now - hit.at < 5_000) return hit.fence;
     const recorded = this.#store.workstreamFoldersByWorkstream();
-    const home = homedir();
-    const fence = this.#workstreams.fenceFor(binding, (id) => (recorded.get(id) ?? []).map((w) => repositoryTopOf(w, home)), own);
+    const fence = this.#workstreams.fenceFor(binding, (id) => recorded.get(id) ?? [], own);
     if (this.#fenceCache.size > 256) this.#fenceCache.clear();
     this.#fenceCache.set(key, { at: now, fence });
     return fence;
@@ -4848,6 +4846,16 @@ mcpHub: this.#mcpHub,
     }
     for (const w of homing.warnings) warn(w);
     let createWorkstream = homing.binding;
+    // A home chosen in another workstream's folder reads that folder (its workdir stays readable to it):
+    // judged by that workstream's share, as a reference is, and counted as read from.
+    if (createWorkstream?.id) {
+      const fv = this.#workstreams.folderVerdict(workdir, createWorkstream.id, givenWorkdir);
+      if (!fv.ok) return { type: "response.error", requestId: msg.id, error: fv.error, code: "forbidden" };
+      if (fv.ask.length > 0 && !(hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE) && auth.delegationDepth === 0)) {
+        return { type: "response.error", requestId: msg.id, error: `This folder is workstream "${fv.folder}"'s, which shares only with approval: a session of another workstream here needs session:approve on an undelegated token`, code: "forbidden" };
+      }
+      if (fv.folder) createWorkstream = { ...createWorkstream, readFrom: [...new Set([...(createWorkstream.readFrom ?? []), fv.folder])] };
+    }
     // References asked at create (§7.2): each by the share policy of the
     // workstream read. The creator asking with session:approve, undelegated,
     // is the confirm an `ask` workstream wants; anyone else gets `open` only.
@@ -4859,10 +4867,10 @@ mcpHub: this.#mcpHub,
       const recorded = this.#store.workstreamFoldersByWorkstream();
       const refs: WorkstreamReference[] = [];
       for (const asked of msg.references) {
-        const paths = asked.paths?.map((p) => normalizeWorkdir(p) ?? p);
+        const paths = asked.paths?.map(referenceFolder);
         const pathProblem = referencePathsProblem(paths);
         if (pathProblem) return { type: "response.error", requestId: msg.id, error: pathProblem, code: "invalid_request" };
-        const v = this.#workstreams.referenceVerdict(createWorkstream.id, { workstream: asked.workstream, ...(paths ? { paths } : {}) }, (recorded.get(asked.workstream) ?? []).map((w) => repositoryTopOf(w, homedir())));
+        const v = this.#workstreams.referenceVerdict(createWorkstream.id, { workstream: asked.workstream, ...(paths ? { paths } : {}) }, recorded.get(asked.workstream) ?? []);
         if (!v.ok) return { type: "response.error", requestId: msg.id, error: v.error, code: "forbidden" };
         if (v.ask.length > 0 && !approves) {
           return { type: "response.error", requestId: msg.id, error: `Workstream "${asked.workstream}" shares only with approval: referencing it needs session:approve on an undelegated token`, code: "forbidden" };
@@ -10022,12 +10030,12 @@ mcpHub: this.#mcpHub,
     const session = this.#getOwnedSession(msg.sessionId, auth);
     if (!session) return err("Session not found", "not_found");
     if (session.createdBy !== auth.sub) return err("Only the session's owner can change what workstreams it reads", "forbidden");
-    const binding = session.workstream;
+    const binding = session.workstreamAhead;
     if (!this.#workstreams.configured || !binding) return err("No workstreams are configured");
     if (binding.source === "reserved") return err("The conductor's workstream can't be changed");
     // The owner asking with approval rights, undelegated, is the confirm an `ask` policy wants.
     const approves = hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE) && auth.delegationDepth === 0;
-    const reply = (data: Record<string, unknown>): DaemonMessage => ({ type: "response.ok", requestId: msg.id, data: { ...data, workstream: this.#describeWorkstream(session.workstream) } });
+    const reply = (data: Record<string, unknown>): DaemonMessage => ({ type: "response.ok", requestId: msg.id, data: { ...data, workstream: this.#describeWorkstream(session.workstreamAhead) } });
 
     if (msg.type === "session.remove_reference") {
       const refs = binding.references ?? [];
@@ -10043,25 +10051,31 @@ mcpHub: this.#mcpHub,
       | { ask: string[]; recheck: () => string | undefined; apply: (by: string) => { next: WorkstreamBinding; said: string; audit: [string, string] } }
       | { error: string };
     if (msg.type === "session.add_reference") {
-      const paths = msg.paths?.map((p) => normalizeWorkdir(p) ?? p);
+      const paths = msg.paths?.map(referenceFolder);
       // Held to what a binding is read back with: one stored that can't be read would seal the session.
       const pathProblem = referencePathsProblem(paths);
       if (pathProblem) return err(pathProblem);
       const others = (binding.references ?? []).filter((r) => r.workstream !== msg.workstream);
       if (others.length >= REFERENCE_LIMIT) return err(`A session reads at most ${REFERENCE_LIMIT} other workstreams`);
       const recorded = this.#store.workstreamFoldersByWorkstream().get(msg.workstream) ?? [];
-      const v = this.#workstreams.referenceVerdict(binding.id, { workstream: msg.workstream, ...(paths ? { paths } : {}) }, recorded.map((w) => repositoryTopOf(w, homedir())));
+      const v = this.#workstreams.referenceVerdict(binding.id, { workstream: msg.workstream, ...(paths ? { paths } : {}) }, recorded);
       const again = () => {
-        const w = this.#workstreams.referenceVerdict(session.workstream?.id, { workstream: msg.workstream, ...(paths ? { paths } : {}) }, recorded.map((r) => repositoryTopOf(r, homedir())));
+        // Judged again as things are now, the bounds a binding is read back with included (several asks may be pending).
+        const cur = session.workstreamAhead;
+        if ((cur?.references ?? []).filter((r) => r.workstream !== msg.workstream).length >= REFERENCE_LIMIT) return `A session reads at most ${REFERENCE_LIMIT} other workstreams`;
+        if (new Set([...(cur?.readFrom ?? []), msg.workstream]).size > READ_FROM_LIMIT) return "This session has read from too many workstreams to record another";
+        const w = this.#workstreams.referenceVerdict(cur?.id, { workstream: msg.workstream, ...(paths ? { paths } : {}) }, recorded);
         return w.ok ? undefined : w.error;
       };
+      const tooMany = again();
+      if (tooMany && v.ok) return err(tooMany);
       decide = !v.ok
         ? { error: v.error }
         : {
             ask: v.ask,
             recheck: again,
             apply: (by) => {
-              const cur = session.workstream ?? binding;
+              const cur = session.workstreamAhead ?? binding;
               const ref = { workstream: msg.workstream, ...(paths ? { paths } : {}), grantedBy: by, grantedAt: new Date().toISOString() };
               const next: WorkstreamBinding = {
                 ...cur,
@@ -10073,35 +10087,45 @@ mcpHub: this.#mcpHub,
           };
     } else {
       if (msg.workstream === binding.id) return err(`The session is already in "${msg.workstream}"`);
-      const v = this.#workstreams.moveVerdict(binding, msg.workstream);
-      // Past another workstream's exclusive claim on the folder: an override (§5.2), never asked on the session.
-      const resolution = this.#workstreams.resolve(session.workdir, msg.workstream);
-      const conflict = resolution.conflict;
-      if (v.ok && conflict) {
-        if (!conflict.overridable) return err(`This folder belongs to workstream "${conflict.folder}", which allows no override`, "forbidden");
-        if (!approves) return err(`This folder belongs to workstream "${conflict.folder}" (exclusive): moving the session past it needs session:approve on an undelegated token`, "forbidden");
-      }
-      decide = !v.ok
-        ? { error: v.error }
-        : {
-            ask: v.ask,
-            recheck: () => {
-              const w = this.#workstreams.moveVerdict(session.workstream, msg.workstream);
-              return w.ok ? undefined : w.error;
-            },
-            apply: (by) => {
-              const cur = session.workstream ?? binding;
-              const refs = (cur.references ?? []).filter((r) => r.workstream !== msg.workstream);
-              const next: WorkstreamBinding = {
-                id: msg.workstream,
-                source: conflict ? "override" : "explicit",
-                revision: this.#workstreams.revision,
-                ...(refs.length > 0 ? { references: refs } : {}),
-                ...(cur.readFrom?.length ? { readFrom: cur.readFrom } : {}),
-              };
-              return { next, said: `Moved to workstream "${msg.workstream}"${cur.id ? ` from "${cur.id}"` : ""}: its servers, credentials and sandbox from the next turn`, audit: [conflict ? "workstream.override" : "workstream.moved", `from=${cur.id ?? "none"} to=${msg.workstream} by=${by}`] };
-            },
+      // Everything a move is judged by, as things are when asked — and again when the owner answers.
+      const judge = (cur: WorkstreamBinding | undefined): { error: string } | { ask: string[]; conflict: boolean; folder?: string } => {
+        const v = this.#workstreams.moveVerdict(cur, msg.workstream);
+        if (!v.ok) return { error: v.error };
+        if ((cur?.readFrom?.length ?? 0) + 2 > READ_FROM_LIMIT) return { error: "This session has read from too many workstreams to record another move" };
+        const fv = this.#workstreams.folderVerdict(session.workdir, msg.workstream);
+        if (!fv.ok) return { error: fv.error };
+        // Past another workstream's exclusive claim on the folder: an override (§5.2), never asked on the session.
+        const conflict = this.#workstreams.resolve(session.workdir, msg.workstream).conflict;
+        if (conflict && !conflict.overridable) return { error: `This folder belongs to workstream "${conflict.folder}", which allows no override` };
+        return { ask: [...new Set([...v.ask, ...fv.ask])], conflict: conflict !== undefined, ...(fv.folder ? { folder: fv.folder } : {}) };
+      };
+      const first = judge(binding);
+      if ("error" in first) return err(first.error, "forbidden");
+      if (first.conflict && !approves) return err("This folder belongs to another workstream (exclusive): moving the session past it needs session:approve on an undelegated token", "forbidden");
+      let answer = first;
+      decide = {
+        ask: first.ask,
+        recheck: () => {
+          const now = judge(session.workstreamAhead);
+          if ("error" in now) return now.error;
+          answer = now;
+          return undefined;
+        },
+        apply: (by) => {
+          const cur = session.workstreamAhead ?? binding;
+          const refs = (cur.references ?? []).filter((r) => r.workstream !== msg.workstream);
+          // The conversation goes with it: the old home (but the default) and the folder's workstream are read from now.
+          const readFrom = [...new Set([...(cur.readFrom ?? []), ...(cur.id && cur.id !== this.#workstreams.defaultId ? [cur.id] : []), ...(answer.folder ? [answer.folder] : [])])].filter((w) => w !== msg.workstream);
+          const next: WorkstreamBinding = {
+            id: msg.workstream,
+            source: answer.conflict ? "override" : "explicit",
+            revision: this.#workstreams.revision,
+            ...(refs.length > 0 ? { references: refs } : {}),
+            ...(readFrom.length > 0 ? { readFrom } : {}),
           };
+          return { next, said: `Moved to workstream "${msg.workstream}"${cur.id ? ` from "${cur.id}"` : ""}: its servers, credentials and sandbox from the next turn`, audit: [answer.conflict ? "workstream.override" : "workstream.moved", `from=${cur.id ?? "none"} to=${msg.workstream} by=${by}`] };
+        },
+      };
     }
     if ("error" in decide) return err(decide.error, "forbidden");
     const applyNow = (by: string) => {
@@ -10616,4 +10640,22 @@ function daemonSandboxRoot(): string[] {
 function withoutKey<T extends object, K extends keyof T>(obj: T, key: K): Omit<T, K> {
   const { [key]: _, ...rest } = obj;
   return rest;
+}
+
+/**
+ * A reference's folder as it is granted: `~` expanded, made absolute and
+ * resolved to where it really is (a `..` or a link never names one
+ * workstream's path for another's). One that doesn't exist is kept as
+ * written, which referencePathsProblem refuses unless it is absolute (and
+ * the fence counts it only where it really is inside the workstream).
+ */
+function referenceFolder(p: string): string {
+  const expanded = p === "~" ? homedir() : p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+  if (!expanded.startsWith("/")) return p;
+  const abs = resolve(expanded);
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
 }

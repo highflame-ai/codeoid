@@ -285,16 +285,21 @@ function candidatePaths(toolName: string, input: unknown): string[] {
     }
   }
   if (PI_PATH_TOOLS.has(toolName)) {
-    for (const [i, p] of out.entries()) if (p.startsWith("@") && p.length > 1) out[i] = p.slice(1);
+    // Only before an absolute or `~` path: another backend's relative `@x` (a file so named) stays as written.
+    for (const [i, p] of out.entries()) if (p.startsWith("@/") || p.startsWith("@~")) out[i] = p.slice(1);
   }
   // A glob's pattern can be absolute (`/home/u/.codeoid/*.json`): judge its
   // literal prefix, up to the first wildcard. Only for glob tools — Grep's
   // `pattern` is a regex, and searching code for "/proc/self/environ" is fine.
   if (GLOB_TOOLS.has(toolName) && typeof obj.pattern === "string" && (isAbsolute(obj.pattern) || obj.pattern.startsWith("~"))) {
     const literal = obj.pattern.split(/[*?[{]/, 1)[0] ?? "";
-    // Up to the last whole segment: `/w/h?/*` searches `/w` (any `h?` in it), not a folder named `/w/h`.
-    const root = literal.endsWith("/") ? literal.slice(0, -1) || "/" : obj.pattern === literal ? literal : dirname(literal);
-    if (root) out.push(root);
+    if (literal.endsWith("/")) out.push(literal.slice(0, -1) || "/");
+    else if (literal) {
+      // A wildcard inside the last segment (`/w/h?/*`, `~/.codeoid*`): judged where it starts (a credential
+      // dir it names is refused, as before) and at the dir it searches (`/w`: any `h?` there).
+      out.push(literal);
+      if (obj.pattern !== literal) out.push(dirname(literal));
+    }
   }
   // A search with no root searches the workdir.
   if (out.length === 0 && SEARCH_TOOLS.has(toolName)) out.push(".");
