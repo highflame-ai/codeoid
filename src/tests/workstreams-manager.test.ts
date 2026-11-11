@@ -6,7 +6,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type CodeoidConfig, loadConfig } from "../config.js";
@@ -126,6 +126,43 @@ describe("session.create picks the home", () => {
   });
 });
 
+describe("who may choose (W0 audit)", () => {
+  const DELEGATED: AuthContext = { ...OWNER, delegationDepth: 1 };
+
+  it("a delegated token may confirm the folder's own home, never pick another", async () => {
+    const m = manager(WS);
+    const own = await m.handle({ type: "session.create", id: "d1", name: "own", workdir: join(tmp, "home", "mine"), workstream: "mine" } as never, DELEGATED, client);
+    expect(own.type).toBe("response.ok");
+    const other = await m.handle({ type: "session.create", id: "d2", name: "other", workdir: join(tmp, "home", "loose"), workstream: "client" } as never, DELEGATED, client);
+    expect(other).toMatchObject({ type: "response.error", code: "forbidden" });
+  });
+
+  it("every create with a home is audited with how it was decided", async () => {
+    const resp = await create(manager(WS), "aud", "client");
+    const id = (resp as { data: SessionInfo }).data.id;
+    const rows = store.database.prepare("SELECT action, detail FROM audit_log WHERE session_id = ? AND action = 'session.workstream'").all(id) as Array<{ detail: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.detail).toContain("id=client source=matched");
+  });
+
+  it("an unknown id, even malformed, gets the specific error rather than a schema rejection", async () => {
+    const resp = await create(manager(WS), "bad", "mine", { workstream: "Not An Id" });
+    expect(resp).toMatchObject({ type: "response.error", detail: { kind: "workstream_unknown" } });
+  });
+});
+
+describe("forks keep their parent's home (W0 audit)", () => {
+  it("a fork into another workstream's exclusive folder is refused", async () => {
+    const m = manager({ items: [...WS.items.map((w) => (w.id === "client" ? { ...w, allowOverride: false } : w))] });
+    const parent = await create(m, "p", "mine");
+    const id = (parent as { data: SessionInfo }).data.id;
+    const fork = await m.handle({ type: "session.fork", id: "f1", sessionId: id, providerId: "claude", workdir: join(tmp, "home", "client") } as never, OWNER, client);
+    expect(fork).toMatchObject({ type: "response.error", detail: { kind: "workstream_conflict" } });
+    const ok = await m.handle({ type: "session.fork", id: "f2", sessionId: id, providerId: "claude", workdir: join(tmp, "home", "loose") } as never, OWNER, client);
+    if (ok.type === "response.error") expect(ok.detail?.kind).not.toBe("workstream_conflict");
+  });
+});
+
 describe("workstream.list and workstream.resolve", () => {
   it("list needs settings:read and shows env names only", async () => {
     const m = manager({ items: [{ id: "a", env: { GH_TOKEN: { secret: "gh-a" } } }] });
@@ -170,6 +207,33 @@ describe("resume (G5)", () => {
     const m3 = manager({ items: [{ id: "client", match: { paths: ["~/elsewhere"] } }, { id: "mine", match: { paths: ["~/client"] } }] });
     await m3.resumeSessions();
     expect((await listOne(m3, id))?.workstream).toMatchObject({ id: "client", source: "migrated" });
+  });
+
+  it("migrating a session's home changes only that field of its meta (W0 audit)", async () => {
+    const before = await create(manager(), "keep", "client");
+    const id = (before as { data: SessionInfo }).data.id;
+    await transcript.flush();
+    const path = join(tmp, "transcripts", `${id}.meta.json`);
+    const meta = JSON.parse(readFileSync(path, "utf8"));
+    writeFileSync(path, JSON.stringify({ ...meta, redactedBackings: ["backing-1"], providerId: "a-backend-now-gone" }));
+
+    const m2 = manager(WS);
+    await m2.resumeSessions();
+    const after = await metaOf(id);
+    expect(after.workstream).toMatchObject({ id: "client", source: "migrated" });
+    expect(after.redactedBackings).toEqual(["backing-1"]);
+    expect(after.providerId).toBe("a-backend-now-gone");
+  });
+
+  it("a tampered home fails closed: no home, never the folder's", async () => {
+    const created = await create(manager(WS), "tamper", "client");
+    const id = (created as { data: SessionInfo }).data.id;
+    await transcript.flush();
+    const path = join(tmp, "transcripts", `${id}.meta.json`);
+    writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), workstream: { id: "client" } }));
+    const m2 = manager(WS);
+    await m2.resumeSessions();
+    expect((await listOne(m2, id))?.workstream).toEqual({ source: "none" });
   });
 
   it("a home removed from the config leaves the session orphaned, not re-homed", async () => {

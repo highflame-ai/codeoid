@@ -164,7 +164,9 @@ At `session.create`:
    Where a rule matched never counts: `~/w/**` matching the folder itself must not beat `~/w/acme` matching its parent (found while building W0).
    The same rule written in two workstreams is a **config error** when the config loads.
    Two *different* rules that tie on a real folder can only be found against that folder, so they are reported at resolution: the folder gets no home until a workstream is chosen, and the picker shows the tie.
-   A path rule matches a folder reached through a symlink either way it is spelled (`~/Workspace/x` linked to `/Workspace/x`).
+   A folder matches as given and as its real path, and a rule with a symlinked fixed part (`~` itself, or `~/Workspace`) through its real path too.
+   Links are never searched for: the W0 audit showed a link anyone plants under a rule's folder becomes a spelling an attacker chose. When the given and real spellings match different workstreams, the folder gets no home until one is chosen.
+   **An exclusive claim outranks any suggestion**, whatever the specificity (W0 audit): a more specific `suggest` rule must not take a folder from the workstream holding it exclusively. Carving one out takes a more specific exclusive rule.
 
    **A remote is text an agent can edit.** `.git/config` is in the repository, so an agent that can write it could make the folder's *next* session resolve to a more privileged workstream.
    Three things bound this: a path rule outranks any remote rule, a live session's home never changes, and (W1) a remote-derived match that differs from how the folder resolved before is treated as a conflict, not a silent re-homing.

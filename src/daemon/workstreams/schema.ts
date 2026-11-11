@@ -9,11 +9,12 @@
  * rest of the config (server and credential names) are checked where both are
  * known (W1).
  *
- * Imports zod alone: `src/config.ts` imports this, so anything heavier here
- * would be pulled into every CLI start.
+ * Imports zod and the pure matcher alone: `src/config.ts` imports this, so
+ * anything heavier here would be pulled into every CLI start.
  */
 
 import { z } from "zod";
+import { normalizePathRule } from "./match.js";
 
 /** Ids a config may not use: they name a home the daemon assigns itself. */
 export const RESERVED_WORKSTREAM_IDS = ["conductor"] as const;
@@ -188,7 +189,9 @@ export function workstreamsProblems(cfg: {
       ["remote", item.match.remotes],
     ] as const) {
       rules.forEach((rule, j) => {
-        const key = `${kind}\u0000${rule}`;
+        // Compared as matched: `~/x`, `~/x/` and `~/x/**` are one rule; remotes are case-insensitive.
+        const norm = kind === "path" ? normalizePathRule(rule) : rule.toLowerCase();
+        const key = `${kind}\u0000${norm}`;
         const other = seen.get(key);
         if (other !== undefined && other !== item.id) {
           problems.push({ message: `${kind} rule "${rule}" is in both "${other}" and "${item.id}"`, path: ["items", i, "match", kind === "path" ? "paths" : "remotes", j] });

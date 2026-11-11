@@ -12,10 +12,14 @@
  *  - A remote rule matches the `origin` remote, or `upstream`. A match through
  *    `upstream` alone is only ever a suggestion: you see where the code came
  *    from, you are not held to it.
- *  - The most specific RULE wins (never where it matched: `/w/**` matching
- *    the folder itself must not beat `/w/acme` matching its parent): any path
- *    match beats any remote match; then the rule with more literal segments;
- *    then more literal characters; `origin` beats `upstream`.
+ *  - An exclusive claim outranks a suggestion, whatever their specificity: a
+ *    more specific `suggest` rule must not take a folder away from the
+ *    workstream that holds it exclusively (W0 audit). Carving a folder out of
+ *    an exclusive one takes a more specific exclusive rule.
+ *  - Then the most specific RULE wins (never where it matched: `/w/**`
+ *    matching the folder itself must not beat `/w/acme` matching its parent):
+ *    any path match beats any remote match; then the rule with more literal
+ *    segments; then more literal characters; `origin` beats `upstream`.
  *  - Two workstreams tied at the top are ambiguous: no home is picked, and the
  *    tie is reported so an explicit choice can settle it.
  */
@@ -111,15 +115,15 @@ function bestPathMatch(ws: MatchableWorkstream, folder: FolderFacts): MatchCandi
   for (const spelling of folder.paths) {
     for (const dir of ancestry(spelling)) {
       for (const rule of ws.paths) {
-        // `x/**` names x too: Bun's `**` needs at least one segment below it.
-        const matched = globMatch(rule, dir) || (rule.endsWith("/**") && globMatch(rule.slice(0, -3) || "/", dir));
-        if (!matched) continue;
+        // Rules are normalised (normalizePathRule): `x/**` is `x`, and the
+        // ancestor walk is what covers everything below it.
+        if (!globMatch(rule, dir)) continue;
         const cand: MatchCandidate = {
           workstream: ws.id,
           rule,
           kind: "path",
           claim: ws.claim,
-          score: [2, literalSegments(rule), literalLength(rule), 1],
+          score: [ws.claim === "exclusive" ? 1 : 0, 2, literalSegments(rule), literalLength(rule), 1],
         };
         if (!best || compareScore(cand.score, best.score) > 0) best = cand;
       }
@@ -144,7 +148,7 @@ function bestRemoteMatch(ws: MatchableWorkstream, folder: FolderFacts): MatchCan
         kind: "remote",
         via,
         claim: via === "upstream" ? "suggest" : ws.claim,
-        score: [1, literalSegments(rule), literalLength(rule), via === "origin" ? 1 : 0],
+        score: [via === "origin" && ws.claim === "exclusive" ? 1 : 0, 1, literalSegments(rule), literalLength(rule), via === "origin" ? 1 : 0],
       };
       if (!best || compareScore(cand.score, best.score) > 0) best = cand;
     }
@@ -212,10 +216,13 @@ export function normalizeRemote(url: string, aliases: ReadonlyMap<string, string
   if (!host || !path) return undefined;
   host = host.toLowerCase();
   host = aliases.get(host) ?? host;
+  // Lowercased whole: the forges people write rules for treat owner and repo
+  // names case-insensitively (a rule `github.com/Acme/*` must match `acme/x`).
   const cleanPath = path
     .replace(/^\/+/, "")
     .replace(/\/+$/, "")
-    .replace(/\.git$/i, "");
+    .replace(/\.git$/i, "")
+    .toLowerCase();
   if (cleanPath.length === 0 || cleanPath.split("/").some((s) => s === ".." || s === "")) return undefined;
   return `${host}/${cleanPath}`;
 }
@@ -254,24 +261,30 @@ export function expandHome(rule: string, home: string): string {
 }
 
 /**
+ * A path rule in the one form it is compared and matched in: trailing `/`
+ * and `/**` dropped (each names the same folder, and the ancestor walk covers
+ * what is below it), repeated slashes collapsed. `/` stays `/`.
+ */
+export function normalizePathRule(rule: string): string {
+  let r = rule.replace(/\/{2,}/g, "/");
+  for (;;) {
+    const next = r.replace(/\/\*\*$/, "").replace(/(.)\/$/, "$1");
+    if (next === r) break;
+    r = next;
+  }
+  return r.length === 0 ? "/" : r;
+}
+
+/**
  * The literal head of a path glob: the folders before the first segment with
- * a glob character. `~/Workspace/acme-*` → `~/Workspace`. Used to find
- * symlink aliases (folder.ts).
+ * a glob character. `/home/u/Workspace/acme-*` → `/home/u/Workspace`.
  */
 export function literalHead(glob: string): string {
-  const segs = glob.split("/");
   const out: string[] = [];
-  for (const s of segs) {
+  for (const s of glob.split("/")) {
     if (GLOB_CHARS.test(s)) break;
     out.push(s);
   }
   const head = out.join("/");
   return head.length === 0 ? "/" : head;
-}
-
-/** The pattern up to (not including) its first `**` segment: what a bounded scan may expand. */
-export function scanHead(glob: string): string {
-  const segs = glob.split("/");
-  const i = segs.indexOf("**");
-  return i < 0 ? glob : segs.slice(0, i).join("/") || "/";
 }

@@ -1,6 +1,12 @@
 /**
  * What the matcher needs to know about a folder (docs/workstreams-design.md
- * §5.1): every spelling of it, and its git remotes.
+ * §5.1): its two spellings (as given, and its real path), and its git remotes.
+ *
+ * Only those two spellings, never ones found by scanning for symlinks: a link
+ * anyone can plant under a rule's folder would otherwise be a spelling an
+ * attacker chose, re-homing an exclusive folder or pulling a foreign one into
+ * an exclusive workstream (W0 audit). The given path is the caller's choice
+ * and the real path is the kernel's; neither is a link someone else made.
  *
  * Read-only and bounded. The git remotes come from the repository's config
  * file, parsed here, never from running `git`: a repository an agent can
@@ -14,22 +20,23 @@
 import { closeSync, fstatSync, lstatSync, openSync, readSync, realpathSync, statSync, constants as fsc } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { type FolderFacts, literalHead, normalizeRemote, parseSshAliases, scanHead } from "./match.js";
+import { type FolderFacts, normalizeRemote, parseSshAliases } from "./match.js";
 
 /** Largest git config or ssh config read. */
 const MAX_CONFIG_BYTES = 1_000_000;
 /** Most folders above a workdir searched for `.git`. */
 const MAX_WALK = 64;
-/** Most entries one rule's scan may visit while looking for symlink aliases. */
-const MAX_SCAN_ENTRIES = 512;
-/** How long a scan for aliases is reused. Folders come and go; this is a hint, not state. */
-const ALIAS_TTL_MS = 30_000;
-
-/** Read a small regular file, never through a final symlink; undefined on anything odd. */
+/**
+ * Read a small regular file, never through a final symlink; undefined on
+ * anything odd. Opened non-blocking: a FIFO planted where a config is read
+ * would otherwise block `open` until a writer came, freezing the daemon's
+ * event loop (W0 audit) — non-blocking, the open returns and `fstat` refuses
+ * it as not a regular file.
+ */
 function readSmall(path: string): string | undefined {
   let fd: number | undefined;
   try {
-    fd = openSync(path, fsc.O_RDONLY | fsc.O_NOFOLLOW);
+    fd = openSync(path, fsc.O_RDONLY | fsc.O_NOFOLLOW | fsc.O_NONBLOCK);
     const st = fstatSync(fd);
     if (!st.isFile() || st.size > MAX_CONFIG_BYTES) return undefined;
     const buf = Buffer.alloc(st.size);
@@ -66,6 +73,10 @@ export function findGitDirs(start: string): { gitDir: string; commonDir: string 
     } catch {
       st = undefined;
     }
+    // A `.git` that is a link is no repository we read — and must not be
+    // walked past either, or a parent repository (a dotfiles repo in $HOME)
+    // would lend this folder its remotes.
+    if (st?.isSymbolicLink()) return undefined;
     if (st?.isDirectory()) return { gitDir: dotGit, commonDir: commonOf(dotGit) };
     if (st?.isFile()) {
       const text = readSmall(dotGit);
@@ -107,8 +118,7 @@ export function parseGitRemotes(text: string): Map<string, string> {
     if (remote === undefined) continue;
     const kv = /^([A-Za-z][A-Za-z0-9-]*)\s*=\s*(.*)$/.exec(t);
     if (!kv || kv[1].toLowerCase() !== "url") continue;
-    let value = kv[2].replace(/\s+[#;].*$/, "").trim();
-    if (value.startsWith('"') && value.endsWith('"') && value.length >= 2) value = value.slice(1, -1);
+    const value = gitConfigValue(kv[2]);
     if (!out.has(remote) && value.length > 0) out.set(remote, value);
   }
   return out;
@@ -118,27 +128,23 @@ export interface FolderReaderOptions {
   home?: string;
   /** ssh config text; default `~/.ssh/config`. */
   sshConfig?: string;
-  now?: () => number;
 }
 
 /**
  * Gathers FolderFacts. One per daemon; caches ssh aliases (by the file's
- * mtime) and symlink aliases (briefly), never a resolution — a session's home
- * is decided once and kept by the session, not here.
+ * mtime), never a resolution — a session's home is decided once and kept by
+ * the session, not here.
  */
 export class FolderReader {
   readonly home: string;
   #sshPath: string;
   #sshText: string | undefined;
   #sshAliases: { mtimeMs: number; map: Map<string, string> } | undefined;
-  #aliasScans = new Map<string, { at: number; pairs: Array<[string, string]> }>();
-  #now: () => number;
 
   constructor(opts: FolderReaderOptions = {}) {
     this.home = opts.home ?? homedir();
     this.#sshPath = join(this.home, ".ssh", "config");
     this.#sshText = opts.sshConfig;
-    this.#now = opts.now ?? Date.now;
   }
 
   /** `Host` → `HostName` aliases from the ssh config. */
@@ -176,67 +182,33 @@ export class FolderReader {
     };
   }
 
-  /**
-   * Symlinks a path rule's scannable head reaches: [real target, alias path].
-   * `~/Workspace/acme-*` where `~/Workspace/acme-api` links to
-   * `/Workspace/acme-api` yields [`/Workspace/acme-api`, `~/Workspace/acme-api`]
-   * (home expanded), so a session started in the real folder still matches.
-   * Bounded per rule; the head is scanned without following links.
-   */
-  aliasPairs(rule: string): Array<[string, string]> {
-    const head = scanHead(rule);
-    const cached = this.#aliasScans.get(head);
-    if (cached && this.#now() - cached.at < ALIAS_TTL_MS) return cached.pairs;
-    const pairs: Array<[string, string]> = [];
-    const consider = (path: string): void => {
-      let st: ReturnType<typeof lstatSync>;
-      try {
-        st = lstatSync(path);
-      } catch {
-        return;
-      }
-      if (!st.isSymbolicLink()) return;
-      const real = realOr(path);
-      if (real !== path) pairs.push([real, path]);
-    };
-    try {
-      // Scan from the literal folder down, never from `/`: the pattern's
-      // remainder holds the glob, so the walk stays inside what the rule names.
-      const base = literalHead(head);
-      const rest = head.slice(base.length).replace(/^\/+/, "");
-      if (rest.length === 0) {
-        consider(base);
-      } else {
-        const glob = new Bun.Glob(rest);
-        let seen = 0;
-        for (const rel of glob.scanSync({ cwd: base, onlyFiles: false, followSymlinks: false, dot: false })) {
-          if (++seen > MAX_SCAN_ENTRIES) break;
-          consider(join(base, rel));
-        }
-      }
-    } catch {
-      // An unreadable head is no alias, never an error.
-    }
-    if (this.#aliasScans.size > 256) this.#aliasScans.clear();
-    this.#aliasScans.set(head, { at: this.#now(), pairs });
-    return pairs;
+  /** The folder as given and as its real path (deduped). */
+  spellings(folder: string): string[] {
+    return [...new Set([folder, realOr(folder)])];
   }
 
-  /** Every spelling of `folder` worth matching against `rules` (already `~`-expanded). */
-  spellings(folder: string, rules: readonly string[]): string[] {
-    const out = new Set<string>([folder]);
-    const real = realOr(folder);
-    out.add(real);
-    for (const rule of rules) {
-      for (const [target, alias] of this.aliasPairs(rule)) {
-        if (real === target) out.add(alias);
-        else if (real.startsWith(`${target}/`)) out.add(alias + real.slice(target.length));
-      }
-    }
-    return [...out];
+  facts(folder: string, wantRemotes: boolean): FolderFacts {
+    return { paths: this.spellings(folder), ...(wantRemotes ? this.remotes(folder) : {}) };
   }
+}
 
-  facts(folder: string, pathRules: readonly string[], wantRemotes: boolean): FolderFacts {
-    return { paths: this.spellings(folder, pathRules), ...(wantRemotes ? this.remotes(folder) : {}) };
+/**
+ * A git config value as git reads it: `#` or `;` outside quotes ends it,
+ * quotes are dropped, `\"` `\\` `\n` `\t` unescaped. (A line ending in `\`
+ * continues git's value; such a url is not one anyone writes, and is left
+ * cut short here — a non-match, never a wrong one.)
+ */
+function gitConfigValue(raw: string): string {
+  let out = "";
+  let quoted = false;
+  for (let i = 0; i < raw.length; i += 1) {
+    const ch = raw[i];
+    if (ch === "\\" && i + 1 < raw.length) {
+      const nx = raw[++i];
+      out += nx === "n" ? "\n" : nx === "t" ? "\t" : nx;
+    } else if (ch === '"') quoted = !quoted;
+    else if (!quoted && (ch === "#" || ch === ";")) break;
+    else out += ch;
   }
+  return out.trim();
 }

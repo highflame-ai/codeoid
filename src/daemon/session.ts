@@ -1069,16 +1069,7 @@ export class Session {
   get workstream(): WorkstreamBinding | undefined {
     return this.#workstream;
   }
-  /**
-   * Give a session from before workstreams its home, once, on resume (G5).
-   * Never re-homes: a session that has one keeps it (moving is
-   * `session.set_workstream`, W1, which treats it as a share).
-   */
-  adoptWorkstream(binding: WorkstreamBinding): void {
-    if (this.#workstream) return;
-    this.#workstream = binding;
-    this.#saveMetaNow();
-  }
+
   /**
    * Goal + role→backend bindings when this session was created with the
    * Collaborative toggle (set from opts / restored from meta). Readonly: the

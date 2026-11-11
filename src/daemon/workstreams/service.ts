@@ -11,16 +11,13 @@
  */
 
 import { createHash } from "node:crypto";
-import type {
-  SessionWorkstreamInfo,
-  WorkstreamResolution,
-  WorkstreamSummary,
-} from "../../protocol/types.js";
+import { realpathSync } from "node:fs";
+import type { SessionWorkstreamInfo, WorkstreamResolution, WorkstreamSummary } from "../../protocol/types.js";
+import { readWorkstreamBinding, type WorkstreamBinding } from "./binding.js";
 import { effectiveWorkstreams, type EffectiveWorkstream } from "./effective.js";
 import { FolderReader } from "./folder.js";
-import { expandHome, type MatchableWorkstream, matchFolder } from "./match.js";
+import { expandHome, literalHead, type MatchableWorkstream, matchFolder, normalizePathRule } from "./match.js";
 import type { WorkstreamsConfig } from "./schema.js";
-import type { WorkstreamBinding } from "./binding.js";
 
 export { readWorkstreamBinding, type WorkstreamBinding } from "./binding.js";
 
@@ -29,14 +26,25 @@ export const CONDUCTOR_WORKSTREAM = "conductor";
 
 export type CreateBinding =
   | { ok: true; binding: WorkstreamBinding | undefined; resolution?: WorkstreamResolution; warnings: string[] }
-  | { ok: false; kind: "workstream_conflict" | "workstream_ambiguous"; resolution: WorkstreamResolution; error: string }
+  | { ok: false; kind: "workstream_conflict"; resolution: WorkstreamResolution; error: string }
   | { ok: false; kind: "workstream_unknown"; workstream: string; error: string };
+
+/** What a meta on disk says about its session, for the resume pre-pass. */
+export interface ResumeMetaFacts {
+  sessionId: string;
+  workdir: string;
+  role?: string;
+  /** The meta's `workstream` value, unvalidated; absent = it predates workstreams. */
+  stored: unknown;
+  /** A fork's or collaboration child's parent session id. */
+  parentId?: string;
+}
 
 export class WorkstreamService {
   #cfg: WorkstreamsConfig;
   #effective: Map<string, EffectiveWorkstream>;
   #matchables: MatchableWorkstream[];
-  /** expanded path rule → the rule as written (for `matchedBy`). */
+  /** Expanded (and real-head) path rule → the rule as written, for `matchedBy`. */
   #written = new Map<string, string>();
   #revision: string;
   #reader: FolderReader;
@@ -58,14 +66,32 @@ export class WorkstreamService {
       id: w.id,
       abstract: w.abstract,
       claim: w.claim,
-      paths: w.match.paths.map((p) => {
-        const expanded = expandHome(p, this.#reader.home);
-        this.#written.set(expanded, p);
-        return expanded;
-      }),
-      remotes: w.match.remotes,
+      paths: w.match.paths.flatMap((p) => this.#pathRuleForms(p)),
+      remotes: w.match.remotes.map((r) => r.toLowerCase()),
     }));
     this.#revision = createHash("sha256").update(JSON.stringify(cfg)).digest("hex").slice(0, 16);
+  }
+
+  /**
+   * The forms a path rule matches in: as written (`~` expanded, trailing
+   * `/` and `/**` dropped — they mean the same folder), and with its literal
+   * head resolved to its real path when that differs, so `~/Workspace/x`
+   * still matches when `~` (or `~/Workspace`) is a symlink and the workdir
+   * arrives canonical. The head is the owner's own config, resolved once at
+   * load — never a link found by scanning (folder.ts).
+   */
+  #pathRuleForms(written: string): string[] {
+    const rule = normalizePathRule(expandHome(written, this.#reader.home));
+    const forms = [rule];
+    const head = literalHead(rule);
+    try {
+      const real = realpathSync(head);
+      if (real !== head) forms.push(normalizePathRule(real + rule.slice(head.length)));
+    } catch {
+      // A head that doesn't exist yet: the rule as written is all there is.
+    }
+    for (const f of forms) this.#written.set(f, written);
+    return forms;
   }
 
   /** Replace the config (a settings write, W2). Live sessions keep their bindings. */
@@ -94,6 +120,14 @@ export class WorkstreamService {
     return this.#effective.get(id);
   }
 
+  /** Why `id` can't be chosen as a home, or undefined when it can. */
+  choiceProblem(id: string): string | undefined {
+    const ws = this.#effective.get(id);
+    if (!ws) return `Unknown workstream "${id}" — see \`codeoid workstream ls\``;
+    if (ws.abstract) return `"${id}" is a base workstream: it has no sessions of its own`;
+    return undefined;
+  }
+
   summaries(): WorkstreamSummary[] {
     return [...this.#effective.values()].map((w) => ({
       id: w.id,
@@ -114,12 +148,29 @@ export class WorkstreamService {
     }));
   }
 
-  /** What `workdir` (an absolute, existing folder) resolves to, with an optional explicit choice. */
-  resolve(workdir: string, explicit?: string): WorkstreamResolution {
-    const pathRules = this.#matchables.flatMap((m) => m.paths);
+  /**
+   * What `workdir` (an absolute, existing folder, canonical) resolves to,
+   * with an optional explicit choice. `given` is the path as the caller wrote
+   * it (`~` expanded), matched too: a rule written through a symlink matches
+   * the folder reached through it.
+   *
+   * When the spellings disagree — the given path matches one workstream and
+   * the real path another — the folder gets no home until one is chosen: a
+   * link someone planted must never decide the home (W0 audit).
+   */
+  resolve(workdir: string, explicit?: string, given?: string): WorkstreamResolution {
     const wantRemotes = this.#matchables.some((m) => m.remotes.length > 0);
-    const facts = this.#reader.facts(workdir, pathRules, wantRemotes);
-    const m = matchFolder(this.#matchables, facts);
+    const facts = this.#reader.facts(workdir, wantRemotes);
+    const spellings = [...new Set([...(given ? [given] : []), ...facts.paths])];
+    const m = matchFolder(this.#matchables, { ...facts, paths: spellings });
+    // Each spelling on its own (remotes belong to the folder, so they count once, in `m`).
+    const perSpelling = new Set(
+      spellings.map((p) => matchFolder(this.#matchables, { paths: [p] }).best?.workstream).filter((x): x is string => x !== undefined),
+    );
+    const disagree = perSpelling.size > 1 ? [...perSpelling].sort() : undefined;
+    const ambiguous = disagree ?? m.ambiguous;
+    const best = disagree ? undefined : m.best;
+
     const candidates = m.candidates.map((c) => ({
       workstream: c.workstream,
       rule: c.kind === "path" ? (this.#written.get(c.rule) ?? c.rule) : c.rule,
@@ -133,15 +184,17 @@ export class WorkstreamService {
     };
 
     if (explicit !== undefined) {
-      // The folder's claimant: the best match if exclusive; else, among tied
-      // best matches, the first exclusive one the choice isn't.
+      // The folder's claimant: the best match when it is exclusive (an
+      // exclusive claim outranks any suggestion, match.ts); else any OTHER
+      // exclusive workstream among those tied or disagreeing — choosing one
+      // of them never waives another's exclusive claim on the same folder.
       const claimant =
-        m.best?.claim === "exclusive"
-          ? m.best.workstream
-          : m.ambiguous && !m.ambiguous.includes(explicit)
-            ? m.candidates.find((c) => m.ambiguous?.includes(c.workstream) && c.claim === "exclusive")?.workstream
+        best?.claim === "exclusive"
+          ? best.workstream
+          : ambiguous
+            ? candidates.find((c) => ambiguous.includes(c.workstream) && c.workstream !== explicit && c.claim === "exclusive")?.workstream
             : undefined;
-      const base = { candidates, ...(m.ambiguous ? { ambiguous: m.ambiguous } : {}) };
+      const base = { candidates, ...(ambiguous ? { ambiguous } : {}) };
       if (claimant && claimant !== explicit) {
         return {
           home: explicit,
@@ -153,8 +206,8 @@ export class WorkstreamService {
       const by = matchedBy(explicit);
       return { home: explicit, source: "explicit", ...(by ? { matchedBy: by } : {}), ...base };
     }
-    if (m.best) return { home: m.best.workstream, source: "matched", matchedBy: matchedBy(m.best.workstream), candidates };
-    if (m.ambiguous) return { source: "none", candidates, ambiguous: m.ambiguous };
+    if (best) return { home: best.workstream, source: "matched", matchedBy: matchedBy(best.workstream), candidates };
+    if (ambiguous) return { source: "none", candidates, ambiguous };
     if (this.#cfg.default) return { home: this.#cfg.default, source: "default", candidates };
     return { source: "none", candidates };
   }
@@ -168,20 +221,13 @@ export class WorkstreamService {
    * with no choice, gets no home and a warning: W1 requires the choice once
    * isolation is on.
    */
-  forCreate(workdir: string, explicit?: string): CreateBinding {
+  forCreate(workdir: string, explicit?: string, given?: string): CreateBinding {
     if (explicit !== undefined) {
-      const ws = this.#effective.get(explicit);
-      if (!ws || ws.abstract) {
-        return {
-          ok: false,
-          kind: "workstream_unknown",
-          workstream: explicit,
-          error: ws ? `"${explicit}" is a base workstream: it has no sessions of its own` : `Unknown workstream "${explicit}" — see \`codeoid workstream ls\``,
-        };
-      }
+      const problem = this.choiceProblem(explicit);
+      if (problem) return { ok: false, kind: "workstream_unknown", workstream: explicit, error: problem };
     }
     if (!this.configured) return { ok: true, binding: undefined, warnings: [] };
-    const resolution = this.resolve(workdir, explicit);
+    const resolution = this.resolve(workdir, explicit, given);
     if (resolution.conflict) {
       const c = resolution.conflict;
       return {
@@ -192,13 +238,13 @@ export class WorkstreamService {
       };
     }
     const warnings: string[] = [];
-    if (resolution.ambiguous) {
-      warnings.push(`Workstreams ${resolution.ambiguous.map((a) => `"${a}"`).join(" and ")} both match this folder equally — the session has no workstream. Choose one, or make one rule more specific.`);
+    if (resolution.ambiguous && explicit === undefined) {
+      warnings.push(`Workstreams ${resolution.ambiguous.map((a) => `"${a}"`).join(" and ")} both match this folder — the session has no workstream. Choose one, or make one rule more specific.`);
     }
     return { ok: true, binding: this.#bind(resolution), resolution, warnings };
   }
 
-  /** A child or fork keeps its parent's home (G5), under the current revision. */
+  /** A child or fork keeps its parent's home exactly (G5), revision included. */
   inherit(parent: WorkstreamBinding | undefined): WorkstreamBinding | undefined {
     return parent ? { ...parent } : undefined;
   }
@@ -210,23 +256,70 @@ export class WorkstreamService {
   }
 
   /**
-   * The home of a session coming back from disk (G5). A stored binding is
-   * kept as it is — the folder is never matched again. A session from before
-   * workstreams is resolved once by its folder and marked `migrated`; with
-   * nothing matching and no default it has no home (fail closed, G5).
+   * The home of every session coming back from disk (G5), keyed by session
+   * id. `persist` = the binding differs from what the meta holds and must be
+   * written (once the session has resumed).
+   *
+   *  - Stored and valid: kept exactly; the folder is never matched again. A
+   *    home the config no longer has stays, shown orphaned.
+   *  - Stored but malformed, a base workstream, or a reserved home on a
+   *    session that isn't the conductor: no home. Never re-resolved — a
+   *    tampered or corrupt meta must not turn into "the folder's (or the
+   *    default's) credentials" (W0 audit).
+   *  - Absent (the session predates workstreams): a fork or collaboration
+   *    child takes its parent's home (G5: they inherit), anything else is
+   *    resolved once by its folder; with nothing matching and no default it
+   *    has no home (fail closed). Marked `migrated`.
+   *  - The conductor's is always the reserved home.
+   *
+   * With no workstreams configured, a stored binding is kept (it applies
+   * again if workstreams come back) and nothing is resolved.
    */
-  forResume(stored: WorkstreamBinding | undefined, workdir: string, role?: string): { binding: WorkstreamBinding | undefined; migrated: boolean } {
-    if (stored) return { binding: stored, migrated: false };
-    if (!this.configured) return { binding: undefined, migrated: false };
-    if (role === "conductor") return { binding: this.conductorBinding(), migrated: true };
-    let resolution: WorkstreamResolution;
-    try {
-      resolution = this.resolve(workdir);
-    } catch {
-      resolution = { source: "none", candidates: [] };
-    }
-    const bound = this.#bind(resolution);
-    return { binding: bound ? { ...bound, source: bound.id ? "migrated" : "none" } : undefined, migrated: true };
+  forResume(metas: readonly ResumeMetaFacts[]): Map<string, { binding: WorkstreamBinding | undefined; persist: boolean }> {
+    const out = new Map<string, { binding: WorkstreamBinding | undefined; persist: boolean }>();
+    const byId = new Map(metas.map((m) => [m.sessionId, m] as const));
+    const none = (): WorkstreamBinding => ({ source: "none", revision: this.#revision });
+
+    const decide = (m: ResumeMetaFacts, depth: number): { binding: WorkstreamBinding | undefined; persist: boolean } => {
+      const done = out.get(m.sessionId);
+      if (done) return done;
+      let result: { binding: WorkstreamBinding | undefined; persist: boolean };
+      if (!this.configured) {
+        result = { binding: m.stored === undefined ? undefined : readWorkstreamBinding(m.stored), persist: false };
+      } else if (m.role === "conductor") {
+        const same = readWorkstreamBinding(m.stored);
+        const ok = same?.source === "reserved" && same.id === CONDUCTOR_WORKSTREAM;
+        result = { binding: ok ? same : this.conductorBinding(), persist: !ok };
+      } else if (m.stored !== undefined) {
+        const parsed = readWorkstreamBinding(m.stored);
+        const bad =
+          !parsed ||
+          parsed.source === "reserved" ||
+          parsed.id === CONDUCTOR_WORKSTREAM ||
+          (parsed.id !== undefined && this.#effective.get(parsed.id)?.abstract === true);
+        result = bad ? { binding: none(), persist: true } : { binding: parsed, persist: false };
+      } else {
+        const parent = m.parentId && depth < 32 ? byId.get(m.parentId) : undefined;
+        const inherited = parent ? decide(parent, depth + 1).binding : undefined;
+        if (inherited) {
+          result = { binding: inherited.id ? { ...inherited, source: "migrated" } : none(), persist: true };
+        } else {
+          let resolution: WorkstreamResolution;
+          try {
+            resolution = this.resolve(m.workdir);
+          } catch {
+            resolution = { source: "none", candidates: [] };
+          }
+          const bound = this.#bind(resolution);
+          result = { binding: { ...bound, source: bound.id ? "migrated" : "none" }, persist: true };
+        }
+      }
+      out.set(m.sessionId, result);
+      return result;
+    };
+
+    for (const m of metas) decide(m, 0);
+    return out;
   }
 
   #bind(r: WorkstreamResolution): WorkstreamBinding {
@@ -234,9 +327,13 @@ export class WorkstreamService {
     return { id: r.home, source: r.source, ...(r.matchedBy ? { matchedBy: r.matchedBy } : {}), revision: this.#revision };
   }
 
-  /** What `SessionInfo.workstream` carries for a binding. */
+  /**
+   * What `SessionInfo.workstream` carries for a binding. Nothing at all when
+   * no workstreams are configured: removing the block turns workstreams off,
+   * it doesn't orphan every session.
+   */
   info(binding: WorkstreamBinding | undefined): SessionWorkstreamInfo | undefined {
-    if (!binding) return undefined;
+    if (!binding || !this.configured) return undefined;
     if (binding.id === undefined) return { source: binding.source };
     if (binding.id === CONDUCTOR_WORKSTREAM && binding.source === "reserved") {
       return { id: CONDUCTOR_WORKSTREAM, name: "Conductor", source: "reserved" };

@@ -524,10 +524,16 @@ folder match > `workstreams.default`; `forResume`: a stored binding sticks, a
 pre-workstreams session is homed once by its folder, `source: "migrated"`) and
 kept by the Session in `TranscriptMeta.workstream`, written in BOTH meta saves
 and validated when read (`readWorkstreamBinding`). Matching is pure
-(`match.ts`: the most specific RULE wins, never the match location; a path rule
-beats a remote rule; `upstream`-only matches only suggest); `folder.ts` reads a
-repository's remotes from its git config without running git, and a folder's
-symlink spellings. Every `new Session` site in SessionManager passes
+(`match.ts`: an exclusive claim outranks a suggestion, then the most specific
+RULE wins, never the match location; a path rule beats a remote rule;
+`upstream`-only matches only suggest); `folder.ts` reads a repository's remotes
+from its git config without running git (non-blocking opens: a planted FIFO
+must not hang the daemon) and gives a folder's two spellings only — as given
+and real — never links found by scanning; spellings that disagree leave no
+home. A stored binding that is malformed fails closed (`source: "none"`), never
+re-matched; the resume pre-pass (`forResume`) lets forks and children inherit,
+and the decided home is written with `TranscriptStore.patchMeta` after resume
+succeeded, touching no other field. Every `new Session` site in SessionManager passes
 `#workstreamOpts(...)`; children and forks inherit, the conductor's is reserved.
 With no workstreams configured no binding exists and nothing changes.
 

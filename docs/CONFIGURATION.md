@@ -387,21 +387,24 @@ A session's home is decided at create: `--workstream <id>` (or the web picker), 
 
 Matching:
 
-- A path rule matches the folder it names and everything below it; `~` is your home.
-  A folder reached through a symlink matches a rule written either way.
+- A path rule matches the folder it names and everything below it; `~` is your home; `x`, `x/` and `x/**` are the same rule.
+  A folder matches as you gave it and as its real path, and a rule whose fixed part (`~/Workspace` in `~/Workspace/acme-*`) is a symlink matches through it too.
+  Nothing else: links are never searched for. If the path you gave and the real path match different workstreams, the folder gets no home until you choose one.
 - A remote rule matches the repository's `origin` (or `upstream`) as `host/owner/repo`, read from the repository's git config without running git.
   An ssh `Host` alias in `~/.ssh/config` reads as its `HostName`.
   A match through `upstream` alone only suggests the workstream.
-- The most specific rule wins: any path rule beats any remote rule, then the rule with more literal folders, then more literal characters.
-  Two workstreams tied on a folder give it no home until you choose one.
+- An exclusive claim beats any suggestion. Then the most specific rule wins: any path rule beats any remote rule, then the rule with more literal folders, then more literal characters.
+  Two workstreams tied on a folder give it no home until you choose one. Remote rules are case-insensitive.
 
-`claim: "exclusive"` means the folder runs only with its own workstream: choosing another one for a session there is refused.
+`claim: "exclusive"` means the folder runs only with its own workstream: choosing another one for a session there, or forking a session of another workstream into it, is refused.
+A delegated token can confirm a folder's own workstream but not choose another; every choice is in the audit log (`session.workstream`).
 `claim: "suggest"` (the default) only pre-selects it.
 
 A session keeps its home.
 A restart never matches the folder again, so changing the rules affects new sessions only.
 A session from before workstreams were configured is given its folder's home once, the first time it resumes (`source: migrated`).
-A home deleted from the config leaves its sessions marked orphaned.
+A home deleted from the config leaves its sessions marked orphaned; removing the whole `workstreams` block turns workstreams off instead.
+A session whose stored home is unreadable or invalid gets no home (it is never re-matched to its folder).
 
 This is phase W0: a session's workstream is decided, kept and shown, and nothing it is given changes yet.
 Servers, credentials, git identity and memory follow in later phases (the design's §13).

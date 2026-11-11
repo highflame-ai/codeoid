@@ -9,7 +9,7 @@
  */
 
 import { addedDirProblem, type OtherCheckout, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
-import { readWorkstreamBinding, WorkstreamService, type WorkstreamBinding } from "./workstreams/service.js";
+import { WorkstreamService, type WorkstreamBinding } from "./workstreams/service.js";
 import type { FolderReader } from "./workstreams/folder.js";
 import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
@@ -269,6 +269,19 @@ function normalizeWorkdir(input: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * A workdir as the caller wrote it, `~` expanded and made absolute — not
+ * canonicalised: matched alongside the canonical path, so a workstream rule
+ * written through a symlink matches the folder reached through it.
+ */
+function givenPath(input: string): string | undefined {
+  const raw = (input ?? "").trim();
+  if (!raw) return undefined;
+  if (raw === "~") return homedir();
+  if (raw.startsWith("~/")) return resolve(homedir(), raw.slice(2));
+  return resolve(raw);
 }
 
 /** Eager-resume bounds. Resume runs before the daemon listens — so an
@@ -1044,6 +1057,19 @@ export class SessionManager {
     for (const m of allMetas) {
       if (m.collaboration) goalConfigs.set(m.sessionId, m.collaboration);
     }
+    // Every session's home workstream, from EVERY meta (a fork's parent may be
+    // outside the resume window): validated, failing closed (G5).
+    const resumeHomes = this.#workstreams.forResume(
+      allMetas.map((m) => ({
+        sessionId: m.sessionId,
+        workdir: normalizeWorkdir(m.workdir) ?? m.workdir,
+        ...(m.role ? { role: m.role } : {}),
+        stored: (m as { workstream?: unknown }).workstream,
+        ...((m.forkedFrom?.sessionId ?? m.collaborationRole?.parentSessionId)
+          ? { parentId: m.forkedFrom?.sessionId ?? m.collaborationRole?.parentSessionId }
+          : {}),
+      })),
+    );
     const deadline = Date.now() + RESUME_DEADLINE_MS;
     const lazyLoad = this.#config?.session?.lazyLoad ?? true;
     let resumed = 0;
@@ -1071,15 +1097,11 @@ export class SessionManager {
           if (child.orphaned) orphanedChildren++;
           else resumedChildren++;
         }
-        // Home workstream (G5): the stored one sticks; a session from before
-        // workstreams is resolved once by its folder, adopted below.
-        const resumedWorkstream = this.#workstreams.forResume(
-          readWorkstreamBinding(meta.workstream),
-          normalizeWorkdir(meta.workdir) ?? meta.workdir,
-          meta.role,
-        );
+        // Home workstream (G5), decided for every meta up front (forks and
+        // children inherit their parent's); persisted once resume succeeded.
+        const resumedWorkstream = resumeHomes.get(meta.sessionId) ?? { binding: undefined, persist: false };
         const session = new Session({
-          ...this.#workstreamOpts(resumedWorkstream.migrated ? undefined : resumedWorkstream.binding),
+          ...this.#workstreamOpts(resumedWorkstream.binding),
           name: meta.sessionName,
           // Heal a workdir persisted with a literal `~` or one that has since
           // moved — expand/validate it so the SDK can launch. Falls back to
@@ -1179,8 +1201,6 @@ mcpHub: this.#mcpHub,
         session.adoptForkIsolation(meta.forkIsolation);
         session.adoptReportedBackgroundTasks(meta.reportedBackgroundTasks);
         session.adoptKnownBackgroundTasks(meta.knownBackgroundTasks);
-        // After the adopts above: this one writes the meta.
-        if (resumedWorkstream.migrated && resumedWorkstream.binding) session.adoptWorkstream(resumedWorkstream.binding);
 
         // The history (scrollback + canonical conversation) loads the first
         // time something uses the session (`session.lazyLoad`, default on):
@@ -1200,6 +1220,12 @@ mcpHub: this.#mcpHub,
         if (loadNow || !lazyLoad || meta.backingFresh) await session.ensureHydrated({ deadlineAt: deadline, atResume: true });
 
         this.#sessions.set(session.id, session);
+        // Only now, once resume succeeded, and only the one field: everything
+        // else in the meta stays exactly as it was on disk (a backend that's
+        // gone keeps its id there, as before workstreams).
+        if (resumedWorkstream.persist && resumedWorkstream.binding) {
+          void this.#transcriptStore.patchMeta(session.id, { workstream: resumedWorkstream.binding }).catch(() => {});
+        }
         // Track a resumed child's mount so teardown revokes it. Without this a
         // restart leaks one still-valid blackboard credential per child on
         // every boot, and destroying the goal would not revoke them.
@@ -3339,12 +3365,6 @@ mcpHub: this.#mcpHub,
     return { type: "skill.grant.result", requestId: msg.id, workdir, command, allowed: msg.allowed };
   }
 
-  /**
-   * Trust (or stop trusting) a repository's worktree setup recipe, pinned to
-   * its git blob — direnv-allow style (protocol/worktree-trust.ts). Needs
-   * `settings:write` from an undelegated token: it lets the recipe's command
-   * run, unasked, in every later worktree of that repository.
-   */
   /** The configured workstreams, bases merged in (docs/workstreams-design.md). Secret values never leave: env is names only. */
   #workstreamList(msg: Extract<ClientMessage, { type: "workstream.list" }>, auth: AuthContext): DaemonMessage {
     if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_READ)) {
@@ -3374,27 +3394,25 @@ mcpHub: this.#mcpHub,
     if (!workdir) {
       return { type: "response.error", requestId: msg.id, error: `Working directory not found: ${msg.workdir}`, code: "invalid_request" };
     }
-    if (msg.workstream !== undefined) {
-      const chosen = this.#workstreams.get(msg.workstream);
-      if (!chosen || chosen.abstract) {
-        return {
-          type: "response.error",
-          requestId: msg.id,
-          error: chosen ? `"${msg.workstream}" is a base workstream: it has no sessions of its own` : `Unknown workstream "${msg.workstream}"`,
-          code: "invalid_request",
-          detail: { kind: "workstream_unknown", workstream: msg.workstream },
-        };
-      }
+    const problem = msg.workstream !== undefined ? this.#workstreams.choiceProblem(msg.workstream) : undefined;
+    if (problem && msg.workstream !== undefined) {
+      return { type: "response.error", requestId: msg.id, error: problem, code: "invalid_request", detail: { kind: "workstream_unknown", workstream: msg.workstream } };
     }
     return {
       type: "workstream.resolve.result",
       requestId: msg.id,
       workdir,
       revision: this.#workstreams.revision,
-      resolution: this.#workstreams.resolve(workdir, msg.workstream),
+      resolution: this.#workstreams.resolve(workdir, msg.workstream, givenPath(msg.workdir)),
     };
   }
 
+  /**
+   * Trust (or stop trusting) a repository's worktree setup recipe, pinned to
+   * its git blob — direnv-allow style (protocol/worktree-trust.ts). Needs
+   * `settings:write` from an undelegated token: it lets the recipe's command
+   * run, unasked, in every later worktree of that repository.
+   */
   async #worktreeTrust(msg: Extract<ClientMessage, { type: "worktree.trust" }>, auth: AuthContext): Promise<DaemonMessage> {
     const denied = (error: string, code: "forbidden" | "invalid_request"): DaemonMessage => {
       this.#store.audit(auth.sub, "worktree.trust.denied", "", `dir=${msg.dir} reason=${error}`);
@@ -4487,7 +4505,23 @@ mcpHub: this.#mcpHub,
 
     // Home workstream (docs/workstreams-design.md §5): an explicit choice, else
     // the folder's, else the default. Refused before anything is built.
-    const homing = this.#workstreams.forCreate(workdir, msg.workstream);
+    const givenWorkdir = givenPath(msg.workdir);
+    const homing = this.#workstreams.forCreate(workdir, msg.workstream, givenWorkdir);
+    if (homing.ok && msg.workstream !== undefined && auth.delegationDepth > 0) {
+      // A delegated token may confirm the folder's own home, never pick
+      // another: the home will decide credentials (W1), as an account choice
+      // does (which needs settings:write, above).
+      const folderHome = this.#workstreams.resolve(workdir, undefined, givenWorkdir).home;
+      if (folderHome !== msg.workstream) {
+        this.#store.audit(auth.sub, "session.workstream.denied", "", `workstream=${msg.workstream} folder=${folderHome ?? "none"} reason=delegated`);
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: `A delegated token can't choose workstream "${msg.workstream}" for this folder (its own is ${folderHome ? `"${folderHome}"` : "none"}).`,
+          code: "forbidden",
+        };
+      }
+    }
     if (!homing.ok) {
       return {
         type: "response.error",
@@ -4813,6 +4847,10 @@ mcpHub: this.#mcpHub,
     goalSessionId = session.id;
     this.#sessions.set(session.id, session);
     this.#rateLimiter.recordCreation(auth.sub);
+    // Which line of work it belongs to, and how that was decided — the home will decide its credentials (W1).
+    if (createWorkstream) {
+      this.#store.audit(auth.sub, "session.workstream", session.id, `id=${createWorkstream.id ?? "none"} source=${createWorkstream.source}${createWorkstream.matchedBy ? ` rule=${createWorkstream.matchedBy}` : ""}`);
+    }
     // What the sandbox resolves to here, said at once (#448).
     const sandboxInfo = await session.ensureSandbox();
     if (msg.sandbox?.provider === "off") this.#store.audit(auth.sub, "session.sandbox_off", session.id, "at create");
@@ -5488,6 +5526,21 @@ mcpHub: this.#mcpHub,
       }
       const looped = this.#loopWorktreeRefusal(msg.id, bound);
       if (looped) return looped;
+      // A fork into a folder of its own keeps the parent's home — so that
+      // folder must not be another workstream's exclusive one, exactly as
+      // for a create choosing that home there (W0 audit).
+      if (parent.workstream?.id && this.#workstreams.configured) {
+        const homing = this.#workstreams.forCreate(bound, parent.workstream.id, givenPath(msg.workdir));
+        if (!homing.ok && homing.kind === "workstream_conflict") {
+          return {
+            type: "response.error",
+            requestId: msg.id,
+            error: `${homing.error} A fork keeps its parent's workstream ("${parent.workstream.id}").`,
+            code: "invalid_request",
+            detail: { kind: "workstream_conflict", resolution: homing.resolution },
+          };
+        }
+      }
       forkWorkdir = bound;
       const branch = await currentBranch(bound);
       if (branch) worktree = { path: bound, branch, createdByCodeoid: false };

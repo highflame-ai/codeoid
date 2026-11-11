@@ -1617,6 +1617,9 @@ const workstreamCmd = program
   .command("workstream")
   .description("Named lines of work: which folders belong to which, and what their sessions get (docs/workstreams-design.md)");
 
+/** Daemon-supplied text, made safe for the terminal. */
+const clean = (s: string): string => sanitizeTerminalOutput(s);
+
 /** Run one request against the daemon and hand the reply to `show`; exits non-zero on an error reply. */
 async function workstreamRequest<T extends DaemonMessage["type"]>(
   msg: ClientMessage,
@@ -1628,7 +1631,7 @@ async function workstreamRequest<T extends DaemonMessage["type"]>(
   try {
     const reply = await client.request(msg);
     if (reply.type !== want) {
-      console.error(`Error: ${reply.type === "response.error" ? reply.error : `unexpected reply ${reply.type}`}`);
+      console.error(`Error: ${clean(reply.type === "response.error" ? reply.error : `unexpected reply ${reply.type}`)}`);
       process.exitCode = 1;
       return;
     }
@@ -1637,8 +1640,6 @@ async function workstreamRequest<T extends DaemonMessage["type"]>(
     client.disconnect();
   }
 }
-
-const clean = (s: string): string => sanitizeTerminalOutput(s);
 
 workstreamCmd
   .command("ls")
@@ -1711,7 +1712,7 @@ workstreamCmd
           const how = res.source === "matched" ? `matched by ${res.matchedBy}` : res.source === "default" ? "the default (no rule matched)" : res.source;
           console.log(`Workstream: ${clean(res.home)} — ${clean(how)}`);
         } else if (res.ambiguous) {
-          console.log(`Workstream: none — ${res.ambiguous.join(" and ")} match equally. Choose one with --workstream, or make one rule more specific.`);
+          console.log(`Workstream: none — ${clean(res.ambiguous.join(" and "))} both match. Choose one with --workstream, or make one rule more specific.`);
         } else {
           console.log("Workstream: none — no rule matches and no default is set.");
         }

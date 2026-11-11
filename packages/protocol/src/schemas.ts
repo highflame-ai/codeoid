@@ -29,8 +29,8 @@ const pathField = z.string().max(LIMITS.PATH_MAX);
 const nameField = z.string().min(1).max(LIMITS.NAME_MAX);
 
 const base = { id: idField };
-/** A workstream id's shape (the daemon's config rule, src/daemon/workstreams/schema.ts). */
-const workstreamIdField = z.string().regex(/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/);
+/** A workstream id, bounded only: a malformed one must PARSE so the daemon answers `workstream_unknown`. */
+const workstreamIdField = z.string().min(1).max(64);
 
 // ── Collaboration ─────────────────────────────────────────────────────────────
 

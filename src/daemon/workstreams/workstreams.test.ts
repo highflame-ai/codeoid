@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { readWorkstreamBinding } from "./binding.js";
 import { effectiveWorkstreams } from "./effective.js";
 import { FolderReader, findGitDirs, parseGitRemotes } from "./folder.js";
-import { ancestry, expandHome, matchFolder, normalizeRemote, parseSshAliases, type MatchableWorkstream } from "./match.js";
+import { ancestry, expandHome, matchFolder, normalizePathRule, normalizeRemote, parseSshAliases, type MatchableWorkstream } from "./match.js";
 import { workstreamsSchema } from "./schema.js";
 import { WorkstreamService } from "./service.js";
 
@@ -26,8 +26,11 @@ describe("matchFolder", () => {
     expect(matchFolder(w, { paths: ["/home/u/Workspace/other"] }).best).toBeUndefined();
   });
 
-  test("`x/**` also names x itself", () => {
-    const w = [ws("s", { paths: ["/w/sentisum/**"] })];
+  test("`x/**` also names x itself (rules arrive normalised)", () => {
+    expect(normalizePathRule("/w/sentisum/**")).toBe("/w/sentisum");
+    expect(normalizePathRule("/w/sentisum/")).toBe("/w/sentisum");
+    expect(normalizePathRule("/**")).toBe("/");
+    const w = [ws("s", { paths: [normalizePathRule("/w/sentisum/**")] })];
     expect(matchFolder(w, { paths: ["/w/sentisum"] }).best?.workstream).toBe("s");
     expect(matchFolder(w, { paths: ["/w/sentisum/a/b"] }).best?.workstream).toBe("s");
   });
@@ -100,6 +103,12 @@ describe("normalizeRemote", () => {
 });
 
 describe("parseGitRemotes", () => {
+  test("values as git reads them: comments outside quotes end them, quotes and escapes are dropped", () => {
+    const r = parseGitRemotes('[remote "origin"]\n\turl = "git@github.com:a/b.git"#trailing\n[remote "x"]\n\turl = https://h/a\\"b\n');
+    expect(r.get("origin")).toBe("git@github.com:a/b.git");
+    expect(r.get("x")).toBe('https://h/a"b');
+  });
+
   test("reads [remote \"…\"] urls only, first url wins", () => {
     const text = [
       "[core]",
@@ -252,14 +261,36 @@ describe("FolderReader", () => {
     expect(new FolderReader({ home: tmp, sshConfig: "" }).remotes(tmp)).toEqual({});
   });
 
-  test("finds the alias of a folder linked from where a rule points", () => {
+  test("spellings are the folder as given and its real path, never links found elsewhere", () => {
     const real = join(tmp, "real", "acme-api");
     mkdirSync(real, { recursive: true });
     mkdirSync(join(tmp, "home", "Workspace"), { recursive: true });
     symlinkSync(real, join(tmp, "home", "Workspace", "acme-api"));
     const reader = new FolderReader({ home: join(tmp, "home"), sshConfig: "" });
-    const rule = `${tmp}/home/Workspace/acme-*`;
-    expect(reader.spellings(join(real, "src"), [rule])).toContain(`${tmp}/home/Workspace/acme-api/src`);
+    expect(reader.spellings(join(tmp, "home", "Workspace", "acme-api")).sort()).toEqual([join(tmp, "home", "Workspace", "acme-api"), real].sort());
+    expect(reader.spellings(real)).toEqual([real]);
+  });
+
+  test("a FIFO where a git config is read never blocks (W0 audit)", async () => {
+    const { execFileSync } = await import("node:child_process");
+    const r = join(tmp, "repo");
+    const evil = join(tmp, "evil");
+    mkdirSync(r);
+    mkdirSync(evil);
+    execFileSync("mkfifo", [join(evil, "commondir")]);
+    writeFileSync(join(r, ".git"), `gitdir: ${evil}\n`);
+    const started = Date.now();
+    expect(new FolderReader({ home: tmp, sshConfig: "" }).remotes(r)).toEqual({});
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  test("a .git that is a symlink stops the walk: no parent repository lends its remotes", () => {
+    repo(tmp, { origin: "https://github.com/dotfiles/home" });
+    const inner = join(tmp, "project");
+    mkdirSync(join(tmp, "elsewhere"), { recursive: true });
+    mkdirSync(inner);
+    symlinkSync(join(tmp, "elsewhere"), join(inner, ".git"));
+    expect(new FolderReader({ home: tmp, sshConfig: "" }).remotes(inner)).toEqual({});
   });
 });
 
@@ -271,7 +302,7 @@ describe("WorkstreamService", () => {
     const s = service([]);
     expect(s.configured).toBe(false);
     expect(s.forCreate(tmp)).toEqual({ ok: true, binding: undefined, warnings: [] });
-    expect(s.forResume(undefined, tmp)).toEqual({ binding: undefined, migrated: false });
+    expect(s.forResume([{ sessionId: "s", workdir: tmp, stored: undefined }]).get("s")).toEqual({ binding: undefined, persist: false });
   });
 
   test("matched, default and none", () => {
@@ -317,7 +348,7 @@ describe("WorkstreamService", () => {
     ]);
     const tie = s.forCreate(join(tmp, "x"));
     expect(tie.ok && tie.binding).toMatchObject({ source: "none" });
-    expect(tie.ok && tie.warnings[0]).toMatch(/both match this folder equally/);
+    expect(tie.ok && tie.warnings[0]).toMatch(/both match this folder/);
     expect(s.forCreate(join(tmp, "x"), "b").ok).toBe(true);
   });
 
@@ -325,10 +356,104 @@ describe("WorkstreamService", () => {
     mkdirSync(join(tmp, "acme"));
     const s = service([{ id: "acme", match: { paths: ["~/acme"] } }]);
     const stored = { id: "other", source: "explicit" as const, revision: "old" };
-    expect(s.forResume(stored, join(tmp, "acme"))).toEqual({ binding: stored, migrated: false });
-    expect(s.forResume(undefined, join(tmp, "acme")).binding).toMatchObject({ id: "acme", source: "migrated" });
-    expect(s.forResume(undefined, tmp)).toMatchObject({ binding: { source: "none" }, migrated: true });
-    expect(s.forResume(undefined, tmp, "conductor").binding).toMatchObject({ id: "conductor", source: "reserved" });
+    const homes = s.forResume([
+      { sessionId: "kept", workdir: join(tmp, "acme"), stored },
+      { sessionId: "old", workdir: join(tmp, "acme"), stored: undefined },
+      { sessionId: "loose", workdir: tmp, stored: undefined },
+      { sessionId: "cond", workdir: tmp, role: "conductor", stored: undefined },
+    ]);
+    expect(homes.get("kept")).toEqual({ binding: stored, persist: false });
+    expect(homes.get("old")).toMatchObject({ binding: { id: "acme", source: "migrated" }, persist: true });
+    expect(homes.get("loose")).toMatchObject({ binding: { source: "none" }, persist: true });
+    expect(homes.get("cond")).toMatchObject({ binding: { id: "conductor", source: "reserved" }, persist: true });
+  });
+
+  test("resume fails closed on a tampered meta: malformed, a base, or a reserved home on a non-conductor (W0 audit)", () => {
+    mkdirSync(join(tmp, "acme"));
+    const s = service([{ id: "acme", match: { paths: ["~/acme"] } }, { id: "base", abstract: true }], { default: "acme" });
+    const homes = s.forResume([
+      { sessionId: "junk", workdir: join(tmp, "acme"), stored: { id: "acme" } },
+      { sessionId: "base", workdir: join(tmp, "acme"), stored: { id: "base", source: "explicit", revision: "r" } },
+      { sessionId: "fake", workdir: join(tmp, "acme"), stored: { id: "conductor", source: "reserved", revision: "r" } },
+    ]);
+    for (const id of ["junk", "base", "fake"]) expect(homes.get(id)).toMatchObject({ binding: { source: "none" }, persist: true });
+  });
+
+  test("a pre-workstreams fork or child takes its parent's home, not its own folder's", () => {
+    mkdirSync(join(tmp, "acme"));
+    mkdirSync(join(tmp, "elsewhere"));
+    const s = service([{ id: "acme", match: { paths: ["~/acme"] } }, { id: "other", match: { paths: ["~/elsewhere"] } }]);
+    const homes = s.forResume([
+      { sessionId: "fork", workdir: join(tmp, "elsewhere"), stored: undefined, parentId: "parent" },
+      { sessionId: "parent", workdir: join(tmp, "acme"), stored: undefined },
+      { sessionId: "grandchild", workdir: join(tmp, "elsewhere"), stored: undefined, parentId: "fork" },
+    ]);
+    expect(homes.get("fork")?.binding).toMatchObject({ id: "acme", source: "migrated" });
+    expect(homes.get("grandchild")?.binding).toMatchObject({ id: "acme", source: "migrated" });
+  });
+
+  test("with the workstreams block removed, stored homes are kept but not shown, nothing is orphaned", () => {
+    const s = service([]);
+    const stored = { id: "acme", source: "matched" as const, revision: "r" };
+    expect(s.forResume([{ sessionId: "a", workdir: tmp, stored }]).get("a")).toEqual({ binding: stored, persist: false });
+    expect(s.info(stored)).toBeUndefined();
+  });
+
+  test("an exclusive claim outranks a more specific suggestion (W0 audit)", () => {
+    mkdirSync(join(tmp, "client", "research"), { recursive: true });
+    const s = service([
+      { id: "client", claim: "exclusive", match: { paths: ["~/client/**"] } },
+      { id: "research", match: { paths: ["~/client/research"] } },
+    ]);
+    expect(s.resolve(join(tmp, "client", "research")).home).toBe("client");
+    expect(s.forCreate(join(tmp, "client", "research"), "research").ok).toBe(false);
+  });
+
+  test("a folder whose spellings disagree gets no home until chosen; a planted link can't re-home it (W0 audit)", () => {
+    const acme = join(tmp, "acme", "sub");
+    mkdirSync(acme, { recursive: true });
+    mkdirSync(join(tmp, "mine"));
+    symlinkSync(acme, join(tmp, "mine", "planted"));
+    const s = service([
+      { id: "acme", claim: "exclusive", allowOverride: false, match: { paths: ["~/acme/**"] } },
+      { id: "mine", match: { paths: ["~/mine/*"] } },
+    ]);
+    // Reached through the link: given says mine, real says acme.
+    const r = s.resolve(acme, undefined, join(tmp, "mine", "planted"));
+    expect(r.home).toBeUndefined();
+    expect(r.ambiguous).toEqual(["acme", "mine"]);
+    expect(s.forCreate(acme, "mine", join(tmp, "mine", "planted")).ok).toBe(false);
+    // Its real path alone is acme's, whatever links exist.
+    expect(s.resolve(acme).home).toBe("acme");
+  });
+
+  test("a rule written under a symlinked home matches the canonical workdir", () => {
+    const realHome = join(tmp, "realhome");
+    mkdirSync(join(realHome, "Workspace", "acme-api"), { recursive: true });
+    symlinkSync(realHome, join(tmp, "linkhome"));
+    const s = new WorkstreamService(
+      workstreamsSchema.parse({ items: [{ id: "acme", match: { paths: ["~/Workspace/acme-*"] } }] }),
+      new FolderReader({ home: join(tmp, "linkhome"), sshConfig: "" }),
+    );
+    expect(s.resolve(join(realHome, "Workspace", "acme-api")).home).toBe("acme");
+    expect(s.resolve(join(realHome, "Workspace", "acme-api")).matchedBy).toBe("~/Workspace/acme-*");
+  });
+
+  test("x, x/ and x/** are one rule: they tie, and two of them in different workstreams is a config error", () => {
+    mkdirSync(join(tmp, "x", "y"), { recursive: true });
+    const tie = service([
+      { id: "a", match: { paths: ["~/x/**"] } },
+      { id: "b", match: { paths: ["~/x"] } },
+    ].slice(0, 1).concat([{ id: "b", match: { paths: ["~/z"] } }]));
+    expect(tie.resolve(join(tmp, "x", "y")).home).toBe("a");
+    expect(tie.resolve(join(tmp, "x")).home).toBe("a");
+    expect(workstreamsSchema.safeParse({ items: [{ id: "a", match: { paths: ["~/x/**"] } }, { id: "b", match: { paths: ["~/x/"] } }] }).success).toBe(false);
+  });
+
+  test("remote rules are case-insensitive", () => {
+    const r = join(tmp, "repo");
+    repo(r, { origin: "git@github.com:dhishvari/website.git" });
+    expect(service([{ id: "d", match: { remotes: ["github.com/Dhishvari/*"] } }]).resolve(r).home).toBe("d");
   });
 
   test("info: name and color from the live config; a deleted home is orphaned", () => {
