@@ -14,6 +14,7 @@
  */
 
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, read, readFileSync, readSync, statSync } from "node:fs";
+import type { WorkstreamBinding } from "./workstreams/binding.js";
 import { appendFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CanonicalHistoryChange, CanonicalToolCall, CanonicalTurn } from "./providers/canonical.js";
@@ -233,6 +234,12 @@ export interface TranscriptMeta {
    * the first status transition.
    */
   collaborationRole?: SessionInfo["collaborationRole"];
+  /**
+   * Home workstream (docs/workstreams-design.md G5). Written in BOTH saveMeta
+   * calls, like `collaborationRole`. Validated when read
+   * (`readWorkstreamBinding`): it is read from a file.
+   */
+  workstream?: WorkstreamBinding;
 }
 
 /** Types we persist. Skip ephemeral events like heartbeats. */

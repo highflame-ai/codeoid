@@ -363,6 +363,49 @@ Prefer a command that runs no repository scripts, such as `bun install --ignore-
 A setup failure is reported as an infrastructure problem, not the agent's; a routine run fails before its agent starts.
 Recipes aren't supported on Windows.
 
+## Workstreams
+
+A workstream is a named line of work: a company, a client, a project, a team, a personal setup.
+Each session belongs to exactly one, its home, and the home decides what the session is given.
+The design is [workstreams-design.md](workstreams-design.md).
+
+```jsonc
+"workstreams": {
+  "default": "personal",            // home for a folder nothing matches; leave out to have none
+  "isolateGlobalServers": false,    // on: a session gets only its workstream's servers (W1)
+  "items": [
+    { "id": "acme", "name": "Acme", "claim": "exclusive",
+      "match": { "paths": ["~/Workspace/acme-*"], "remotes": ["github.com/acme/*"] } },
+    { "id": "research", "match": { "paths": ["~/Workspace/research/**"] } },
+    { "id": "personal" }
+  ]
+}
+```
+
+A session's home is decided at create: `--workstream <id>` (or the web picker), else the folder's, else `default`.
+`codeoid workstream match <dir>` says what a folder resolves to and which rule decided it; `codeoid workstream ls` and `show <id>` list the configuration.
+
+Matching:
+
+- A path rule matches the folder it names and everything below it; `~` is your home.
+  A folder reached through a symlink matches a rule written either way.
+- A remote rule matches the repository's `origin` (or `upstream`) as `host/owner/repo`, read from the repository's git config without running git.
+  An ssh `Host` alias in `~/.ssh/config` reads as its `HostName`.
+  A match through `upstream` alone only suggests the workstream.
+- The most specific rule wins: any path rule beats any remote rule, then the rule with more literal folders, then more literal characters.
+  Two workstreams tied on a folder give it no home until you choose one.
+
+`claim: "exclusive"` means the folder runs only with its own workstream: choosing another one for a session there is refused.
+`claim: "suggest"` (the default) only pre-selects it.
+
+A session keeps its home.
+A restart never matches the folder again, so changing the rules affects new sessions only.
+A session from before workstreams were configured is given its folder's home once, the first time it resumes (`source: migrated`).
+A home deleted from the config leaves its sessions marked orphaned.
+
+This is phase W0: a session's workstream is decided, kept and shown, and nothing it is given changes yet.
+Servers, credentials, git identity and memory follow in later phases (the design's §13).
+
 ## Signing a backend in, instead of pasting a key
 
 Settings → **Claude** → **Sign in with Claude** runs the backend's own login

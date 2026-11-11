@@ -44,6 +44,14 @@ import type {
 } from "./accounts.js";
 import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
 import type { WorktreeTrustMsg, WorktreeTrustResultMsg } from "./worktree-trust.js";
+import type {
+  SessionWorkstreamInfo,
+  WorkstreamListMsg,
+  WorkstreamListResultMsg,
+  WorkstreamResolution,
+  WorkstreamResolveMsg,
+  WorkstreamResolveResultMsg,
+} from "./workstreams.js";
 import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
 import type { SessionApprovalsMsg, SessionApprovalsResultMsg } from "./approvals.js";
 import type {
@@ -552,6 +560,11 @@ export interface SessionInfo {
    * sessions should set this too, so that refusal covers it without new code.
    */
   managedBy?: "pipeline" | "routine";
+  /**
+   * Home workstream (docs/workstreams-design.md). Absent on a daemon without
+   * workstreams configured, and on older daemons.
+   */
+  workstream?: SessionWorkstreamInfo;
   /**
    * A prompt has been accepted but its turn has not started yet (hooks, the
    * turn checkpoint, identity registration are still running). The session can
@@ -1342,6 +1355,8 @@ export type ClientMessage =
   | BackendLoginWaitMsg
   | SkillGrantMsg
   | WorktreeTrustMsg
+  | WorkstreamListMsg
+  | WorkstreamResolveMsg
   | SessionTurnsMsg
   | SessionApprovalsMsg
   | ClaudeAccountsListMsg
@@ -1574,6 +1589,14 @@ export interface SessionCreateMsg extends BaseClientMsg {
    *  (read-only). Requires `pack`; rejected with `collaboration` (a collab's
    *  roles each carry their own envelope from the pack). */
   packRole?: string;
+  /**
+   * Home workstream (docs/workstreams-design.md §5). Absent = the folder's,
+   * else the configured default. A choice that differs from a workstream
+   * holding an exclusive claim on the folder is refused with
+   * `detail.kind: "workstream_conflict"`; an unknown one with
+   * `"workstream_unknown"`.
+   */
+  workstream?: string;
 }
 
 /**
@@ -3249,6 +3272,8 @@ export type DaemonMessage =
   | BackendLoginWaitResultMsg
   | SkillGrantResultMsg
   | WorktreeTrustResultMsg
+  | WorkstreamListResultMsg
+  | WorkstreamResolveResultMsg
   | SessionTurnsResultMsg
   | SessionApprovalsResultMsg
   | ClaudeAccountsResultMsg
@@ -3358,7 +3383,18 @@ export interface ResponseErrorMsg {
  * refused because the branch's head is another commit now. `head` is that
  * commit's full id: pin to it, after looking at it, to vouch again.
  */
-export type ResponseErrorDetail = { kind: "head_moved"; branch: string; head: string; pinned: string };
+export type ResponseErrorDetail =
+  | { kind: "head_moved"; branch: string; head: string; pinned: string }
+  /**
+   * `workstream_conflict`: `session.create` chose a workstream other than the
+   * one holding an exclusive claim on the folder (docs/workstreams-design.md
+   * §5.2). `resolution` says what the folder resolves to and why.
+   */
+  | { kind: "workstream_conflict"; resolution: WorkstreamResolution }
+  /** `workstream_ambiguous`: two workstreams match the folder equally; choose one. */
+  | { kind: "workstream_ambiguous"; resolution: WorkstreamResolution }
+  /** `workstream_unknown`: the chosen workstream isn't configured (or is a base). */
+  | { kind: "workstream_unknown"; workstream: string };
 
 export type ErrorCode =
   | "unauthorized"

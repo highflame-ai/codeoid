@@ -100,6 +100,16 @@ export class Codeoid {
     git("commit", "-qm", "init");
   }
 
+  /**
+   * Merge `patch` into the daemon's config.json (top-level keys replaced).
+   * Takes effect at the next start: call `restart()` after.
+   */
+  configure(patch: Record<string, unknown>): void {
+    const path = join(this.configDir, "codeoid", "config.json");
+    const current = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    writeFileSync(path, JSON.stringify({ ...current, ...patch }));
+  }
+
   /** Replace the scripted backend's rules; read again on every turn. */
   setScript(rules: ScriptRule[]): void {
     writeFileSync(this.scriptPath, JSON.stringify({ rules }));

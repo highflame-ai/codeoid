@@ -20,6 +20,7 @@ import { DEFAULT_HOME_READABLE } from "./daemon/sandbox/home-readable.js";
 import { validAllowedHost } from "./daemon/sandbox/hosts.js";
 import { PROJECT_ROOT_PARENT, projectRootProblem } from "./daemon/sandbox/dir-rules.js";
 import { worktreeRootProblem } from "./daemon/sandbox/worktrees.js";
+import { workstreamsSchema, type WorkstreamsConfig } from "./daemon/workstreams/schema.js";
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, rmSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join, isAbsolute, resolve, dirname } from "node:path";
@@ -1370,6 +1371,8 @@ const RootSchema = z.object({
   pipeline: PipelineSchema,
   providers: ProvidersSchema,
   mcpServers: McpServersSchema,
+  /** Named lines of work (docs/workstreams-design.md). */
+  workstreams: workstreamsSchema,
   hooks: HooksSchema,
   embed: EmbedSchema,
   push: PushSchema,
@@ -1740,6 +1743,12 @@ export interface CodeoidConfig {
   mcpServers?: Record<string, RawMcpServerConfig>;
   /** OAuth for remote MCP servers — see `RootSchema.mcpOAuth`. */
   mcpOAuth?: { redirectBaseUrl?: string };
+  /**
+   * Workstreams (docs/workstreams-design.md). Optional in the type so
+   * hand-built test configs stay minimal; loadConfig always populates it
+   * (schema default: none, isolation off).
+   */
+  workstreams?: WorkstreamsConfig;
   /**
    * Daemon-native hooks — dispatched at Session's seams for every backend.
    * Optional in the type so hand-built test configs stay minimal;
@@ -2123,6 +2132,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     },
     mcpServers: parsed.mcpServers,
     mcpOAuth: parsed.mcpOAuth,
+    workstreams: parsed.workstreams,
     hooks: parsed.hooks,
     embed: parsed.embed,
     push: parsed.push,
