@@ -32,6 +32,7 @@ let home: string;
 let store: Store;
 let transcript: TranscriptStore;
 let manager: SessionManager;
+let script: ProviderEvent[][] | undefined;
 
 function items() {
   return [
@@ -42,6 +43,7 @@ function items() {
 }
 
 beforeEach(() => {
+  script = undefined;
   tmp = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-ws-cond-")));
   home = join(tmp, "home");
   for (const d of ["mine", "acme", "hf", "loose"]) mkdirSync(join(home, d), { recursive: true });
@@ -65,7 +67,7 @@ beforeEach(() => {
   } as unknown as CodeoidConfig;
   manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
     config,
-    _testProviderFactory: () => new MockSessionProvider("mock", [say("the closed customer secret result"), say("two"), say("three")]),
+    _testProviderFactory: () => new MockSessionProvider("mock", script ?? [say("the closed customer secret result"), say("two"), say("three")]),
     _testFolderReader: new FolderReader({ home, sshConfig: "" }),
   });
 });
@@ -100,8 +102,16 @@ describe("a spawn's home", () => {
     expect(check(join(home, "mine"), undefined)).toEqual({ ok: true, workstream: "mine" });
     expect(check(join(home, "loose"), undefined)).toMatchObject({ ok: false });
     expect(check(join(home, "loose"), "mine")).toEqual({ ok: true, workstream: "mine" });
-    expect(check(join(home, "acme"), "mine")).toEqual({ ok: true, workstream: "mine", override: true });
+    // Past acme's exclusive claim: refused unless the owner approved this very call's card.
+    expect(check(join(home, "acme"), "mine")).toMatchObject({ ok: false });
+    manager._noteFleetConfirmationForTest(AUTH.accountId, AUTH.projectId, { workdir: join(home, "acme"), workstream: "mine" });
+    expect(check(join(home, "acme"), "mine")).toMatchObject({ ok: true, workstream: "mine", override: true });
+    // Spent: a second spawn needs its own approval.
+    expect(check(join(home, "acme"), "mine")).toMatchObject({ ok: false });
     expect(check(join(home, "hf"), "mine")).toMatchObject({ ok: false });
+    // A closed workstream's worker works only in its own folders.
+    expect(check(join(home, "loose"), "hf")).toMatchObject({ ok: false });
+    expect(check(join(home, "hf"), "hf")).toEqual({ ok: true, workstream: "hf" });
     expect(check(join(home, "mine"), "nope")).toMatchObject({ ok: false });
   });
 
@@ -113,7 +123,10 @@ describe("a spawn's home", () => {
   });
 
   test("the worker is homed in the named workstream, an override as such", async () => {
-    const id = deps().enqueue({ kind: "spawn", shape: "scout", workdir: join(home, "acme"), prompt: "go", workstream: "mine", workstreamOverride: true });
+    manager._noteFleetConfirmationForTest(AUTH.accountId, AUTH.projectId, { workdir: join(home, "acme"), workstream: "mine" });
+    const ok = deps().checkWorkstream!(join(home, "acme"), "mine");
+    if (!ok.ok) throw new Error(ok.error);
+    const id = deps().enqueue({ kind: "spawn", shape: "scout", workdir: join(home, "acme"), prompt: "go", workstream: "mine", workstreamOverride: true, ...(ok.revision ? { workstreamRevision: ok.revision } : {}) });
     expect(id).toBeTruthy();
     await manager.dispatcher.tick();
     const listed = (await manager.handle({ type: "session.list", id: "l" }, AUTH, CLIENT)) as { sessions: SessionInfo[] };
@@ -129,6 +142,33 @@ describe("a spawn's home", () => {
     const digest = board()[0]?.resultDigest ?? "";
     expect(digest).toContain("closed");
     expect(digest).not.toContain("customer secret");
+  });
+});
+
+describe("approving a spawn card that warns", () => {
+  test("is the owner's own: a delegated token is refused; the owner's approval is what the handler counts", async () => {
+    script = [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "s1", name: "mcp__codeoid_fleet__fleet_spawn", input: { workdir: join(home, "acme"), task: "t", workstream: "mine" }, approvalId: "ap-1" } as ProviderEvent, done]];
+    const made = (await manager.handle({ type: "session.create", id: "c", name: "conductor", workdir: ".", role: "conductor" } as never, AUTH, CLIENT)) as { data: SessionInfo };
+    const conductor = manager._sessionForTest(made.data.id)!;
+    void conductor.send("spawn", AUTH);
+    await until(() => conductor.pendingToolApprovals().length > 0);
+    const pending = conductor.pendingToolApprovals()[0]!;
+    expect(pending.targetWorkstream).toMatchObject({ workstream: "mine", warning: expect.stringContaining("Past the folder's own") });
+    const delegated = { ...AUTH, delegationDepth: 1 };
+    expect(await manager.handle({ type: "session.approve", id: "a1", sessionId: conductor.id, approvalId: pending.approvalId, approved: true } as never, delegated, { ...CLIENT, auth: delegated })).toMatchObject({ code: "forbidden" });
+    expect(await manager.handle({ type: "session.approve", id: "a2", sessionId: conductor.id, approvalId: pending.approvalId, approved: true } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
+    expect(deps().checkWorkstream!(join(home, "acme"), "mine")).toMatchObject({ ok: true, override: true });
+  });
+});
+
+describe("a confirmation holds only where it was given", () => {
+  test("an override queued at one revision is refused at claim after the workstreams changed", async () => {
+    deps().enqueue({ kind: "spawn", shape: "scout", workdir: join(home, "acme"), prompt: "go", workstream: "mine", workstreamOverride: true, workstreamRevision: "an-old-revision" });
+    await manager.dispatcher.tick();
+    const listed = (await manager.handle({ type: "session.list", id: "l" }, AUTH, CLIENT)) as { sessions: SessionInfo[] };
+    expect(listed.sessions.find((s) => s.role === "worker")).toBeUndefined();
+    const board = manager._fleetDepsForTest(AUTH.accountId, AUTH.projectId).dispatch!.listTasks(5);
+    expect(board[0]?.error ?? "").toContain("workstream");
   });
 });
 

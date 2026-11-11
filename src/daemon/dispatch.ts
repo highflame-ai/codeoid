@@ -362,6 +362,7 @@ export class Dispatcher {
     /** A spawn's target workstream (workstreams §10), checked by the caller; and whether its card confirmed an override. */
     workstream?: string;
     workstreamOverride?: boolean;
+    workstreamRevision?: string;
     createdBy: string;
   }): string {
     const isAttempt = input.kind === "attempt";

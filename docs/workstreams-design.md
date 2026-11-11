@@ -441,7 +441,7 @@ The conductor is the one session whose job crosses workstreams, and this design 
   - That worker has only the target workstream's servers, credentials and memory.
   - A Highflame Slack reply is drafted by a worker that has never seen a Sentisum episode.
   - The approval card shows the workstream as well as recipient, repo and content.
-- **`fleet_spawn`** takes `workstream` and follows §5. A conflicting spawn returns `workstream_conflict` to the conductor, and it has to choose instead of guessing.
+- **`fleet_spawn`** takes `workstream` and follows §5. A conflict the owner can override is shown on the spawn's approval card, and the owner's own approval of that card confirms it (G3); one that can't be overridden, or wasn't confirmed, comes back to the conductor, which has to choose instead of guessing.
 - **Intake.** When the conductor's Slack and GitHub intake arrives (Slack front end, a later phase), each inbox source is bound to one workstream: Highflame Slack to `highflame`, Sentisum Slack to `sentisum`.
   A signal is born with its workstream, and its reply worker inherits it.
 
@@ -518,7 +518,8 @@ codeoid workstream move <session> <id>
 - **Spawns.** `fleet_spawn.workstream`; `FleetDispatchDeps.checkWorkstream` before queueing (`#fleetSpawnHome`: `forCreate` with the folder required under isolation, `folderVerdict`), stored on the task (`dispatch_tasks.workstream`, `workstream_override`) and judged again at claim. The approval card (`ToolWaitingConfirmationState.targetWorkstream`, from `Session` `fleetTargetWorkstream`, the manager's `#fleetCardWorkstream`) names the workstream and warns of the override approving it confirms (G3), or of a refusal.
 - **Egress.** `workstreams/egress.ts` `planEgress`: a tested stub (G6) — a message names its workstream and is sent by a worker homed there, never by the conductor; wired when P6's Slack and email egress lands.
 - **The conductor's own memory.** Its recall includes its reserved workstream's episodes (it couldn't reach them under isolation before).
-- **Phones.** The fleet rail docks beside the chat from `md` up; below, the chat (and its approval card) has the width.
+- **Phones.** The fleet rail docks beside the chat from `md` up; below, the chat (and its approval card) has the width. The rail's board has no phone view yet (backlog); `fleet_list` and `fleet_tasks` answer in chat.
+- **Audit round 1.** Untagged episodes are judged by their session (live, else its stored folder; unknown: withheld while any workstream is closed). A closed workstream's hits are dropped from queries before anything is counted. A worker's digest is withheld from the conductor only (an orchestrator's children share its workstream); the conductor's tenant-wide board withholds others'. A confirmation is the owner's approval of that very card (`Session.approvalWorkstream`, `#noteFleetConfirmation`), spent once, at the revision it was given (`dispatch_tasks.workstream_revision`, checked at claim); a delegated token can't give it. An unnamed spawn is stored without a workstream, so its claim goes through `#workstreamForFolder` (the remote-changed guard).
 
 ## 13. Phases
 

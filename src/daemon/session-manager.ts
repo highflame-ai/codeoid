@@ -8002,7 +8002,9 @@ mcpHub: this.#mcpHub,
         // was queued), else the folder's as before W4.
         let home: WorkstreamBinding | undefined;
         if (task.workstream) {
-          const h = this.#fleetSpawnHome(workdir, task.workstream, task.workstreamOverride);
+          // A confirmation the card gave holds only at the config revision it was given at.
+          const confirmed = task.workstreamOverride && task.workstreamRevision === this.#workstreams.revision;
+          const h = this.#fleetSpawnHome(workdir, task.workstream, confirmed, { accountId: task.accountId, projectId: task.projectId });
           if (!h.ok) throw new NonRetryableDispatchError(`workstream: ${h.error}`);
           home = h.binding;
         } else home = this.#workstreamForFolder(workdir, this.#dispatchSenderAuth(task));
@@ -8097,7 +8099,8 @@ mcpHub: this.#mcpHub,
         const header = `task ${task.id.slice(0, 8)} (${task.kind}/${task.shape}) in ${task.workdir ?? task.targetSession ?? "?"}`;
         if (!worker) return `${header} — worker session unavailable; check the workdir/git state for artifacts.`;
         // A closed workstream's worker reports its status, never its text (workstreams §10).
-        if (this.#workstreamTextWithheld(worker.workstream?.id)) {
+        // Withheld from the conductor only: an orchestrator's children share its workstream (they inherit it).
+        if (task.createdBy === this.#conductorCreatedBy(task.accountId, task.projectId) && this.#workstreamTextWithheld({ sessionId: worker.id, ...(worker.workstream?.id ? { workstream: worker.workstream.id } : {}) })) {
           return `${header} — done in workstream ${worker.workstream?.id}, which is closed: its result isn't shared with the conductor. Its owner sees it in the session ${worker.name}.`;
         }
         const parts: string[] = [header];
@@ -8411,38 +8414,116 @@ mcpHub: this.#mcpHub,
 
   /** The conductor's tenant-wide deps. Extracted from `#buildFleetServer` so a
    *  test can compare them against the orchestrator's scoped ones. */
+  /** The `createdBy` the conductor's dispatch tasks carry. */
+  #conductorCreatedBy(accountId: string, projectId: string): string {
+    return this.#identityManager?.conductorUri ?? `conductor:${accountId}/${projectId}`;
+  }
+
+  /** Whether any workstream is closed while isolation is on: then text whose workstream can't be told is withheld. */
+  #anyClosedWorkstream(): boolean {
+    if (!this.#workstreams.configured || !this.#workstreams.isolateGlobalServers) return false;
+    return this.#workstreams.summaries().some((w) => w.share === "closed");
+  }
+
   /**
-   * Whether a workstream's episode text is withheld from the conductor and
-   * its digests (workstreams §10): a `closed` one, under isolation. Status
-   * and metadata still go.
+   * Whether text is withheld from the conductor and its digests (workstreams
+   * §10): a `closed` workstream's, under isolation. Judged by the episode's
+   * workstream; an untagged one (written before workstreams) by its
+   * session's — live, else the folder the session was stored with —; one
+   * whose workstream can't be told at all is withheld while any is closed.
    */
-  #workstreamTextWithheld(workstream: string | undefined): boolean {
-    if (!workstream || !this.#workstreams.configured || !this.#workstreams.isolateGlobalServers) return false;
-    return this.#workstreams.get(workstream)?.share === "closed";
+  #workstreamTextWithheld(ref: { workstream?: string; sessionId?: string }): boolean {
+    if (!this.#anyClosedWorkstream()) return false;
+    let ws = ref.workstream;
+    if (!ws && ref.sessionId) {
+      const live = this.#sessions.get(ref.sessionId);
+      if (live) {
+        ws = live.workstream?.id;
+        if (!ws) return false; // a session with no home: nothing of a closed workstream's is in it
+        if (live.workstream?.source === "reserved") return false;
+      } else {
+        const stored = this.#store.getSession(ref.sessionId);
+        if (!stored) return true;
+        ws = this.#workstreams.resolve(stored.workdir).home;
+        if (!ws) return false;
+      }
+    }
+    if (!ws) return true;
+    return this.#workstreams.get(ws)?.share === "closed";
   }
 
   /**
    * A dispatched worker's home (workstreams §10, §5): `workstream` if named,
    * else the folder's — as a create judges it, a folder with none refused
-   * under isolation. `confirmed`: the spawn's approval card showed the
-   * conflict with the folder's exclusive workstream (G3), so an overridable
-   * one is an override. A closed workstream's folder refuses another's
-   * worker (folderVerdict).
+   * under isolation, and a folder whose repository's remote now matches
+   * another workstream than it did refused too (an agent can edit `origin`:
+   * #workstreamForFolder). `confirmed`: approving the spawn's card confirmed
+   * what it warned of — an override past the folder's exclusive workstream
+   * (G3), a home in an `ask` workstream's folder. A closed workstream's
+   * folder never takes another's worker, and a closed workstream's worker
+   * works only in its own folders (what it writes elsewhere is no one's).
    */
-  #fleetSpawnHome(workdir: string, workstream: string | undefined, confirmed: boolean): { ok: true; binding: WorkstreamBinding | undefined; override: boolean } | { ok: false; error: string } {
+  #fleetSpawnHome(
+    workdir: string,
+    workstream: string | undefined,
+    confirmed: boolean,
+    tenant?: { accountId: string; projectId: string },
+  ): { ok: true; binding: WorkstreamBinding | undefined; override: boolean; asks: string[] } | { ok: false; error: string } {
     if (!this.#workstreams.configured) {
-      return workstream ? { ok: false, error: "No workstreams are configured on this daemon: omit workstream" } : { ok: true, binding: undefined, override: false };
+      return workstream ? { ok: false, error: "No workstreams are configured on this daemon: omit workstream" } : { ok: true, binding: undefined, override: false, asks: [] };
     }
     const r = this.#workstreams.forCreate(workdir, workstream, undefined, true, confirmed);
     if (!r.ok) {
       const c = r.kind === "workstream_conflict" ? r.resolution.conflict : undefined;
       if (c && !c.overridable) return { ok: false, error: `${r.error} That workstream allows no override.` };
+      if (c) return { ok: false, error: `${r.error} Approving the spawn's card confirms it; this one wasn't confirmed (it changed since it was shown): ask again.` };
       return { ok: false, error: r.kind === "workstream_required" ? `${r.error} Name it with workstream.` : r.error };
+    }
+    if (!workstream && tenant && r.binding?.source === "matched" && r.binding.id && r.binding.matchedBy?.startsWith("remote ")) {
+      const before = this.#store.workstreamFolder({ ...tenant, workdir });
+      if (before && before !== r.binding.id) {
+        return { ok: false, error: `This folder matched workstream "${before}", but its repository now matches "${r.binding.id}": its remote may have been changed. Name the workstream.` };
+      }
     }
     const fv = this.#workstreams.folderVerdict(workdir, r.binding?.id);
     if (!fv.ok) return { ok: false, error: fv.error };
+    if (fv.ask.length > 0 && !confirmed) {
+      return { ok: false, error: `This folder is workstream "${fv.folder}"'s, which shares only with approval: approving the spawn's card confirms it; this one wasn't confirmed: ask again.` };
+    }
+    const home = r.binding?.id ? this.#workstreams.get(r.binding.id) : undefined;
+    if (home?.share === "closed") {
+      const recorded = this.#store.workstreamFoldersByWorkstream().get(home.id) ?? [];
+      const { folders } = this.#workstreams.foldersOf(home.id, recorded);
+      if (!folders.some((f) => workdir === f || workdir.startsWith(`${f}/`))) {
+        return { ok: false, error: `Workstream "${home.id}" is closed: its workers work only in its own folders` };
+      }
+    }
     const binding = r.binding && fv.folder ? { ...r.binding, readFrom: [fv.folder] } : r.binding;
-    return { ok: true, binding, override: r.binding?.source === "override" };
+    return { ok: true, binding, override: r.binding?.source === "override", asks: fv.ask };
+  }
+
+  /** Spawn cards the owner approved with a warning (an override, an `ask` folder): what the handler may count as confirmed. */
+  #fleetConfirmations = new Map<string, { at: number; revision: string }>();
+
+  #fleetConfirmKey(tenant: { accountId: string; projectId: string }, workdir: string, workstream: string | undefined): string {
+    return `${tenant.accountId}\u0000${tenant.projectId}\u0000${workdir}\u0000${workstream ?? ""}`;
+  }
+
+  /** The owner approved a spawn card with a warning: confirmed for that very call, at this config revision, for ten minutes. */
+  #noteFleetConfirmation(tenant: { accountId: string; projectId: string }, input: unknown): void {
+    const i = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
+    const workdir = typeof i.workdir === "string" ? normalizeWorkdir(i.workdir) : null;
+    if (!workdir) return;
+    if (this.#fleetConfirmations.size > 256) this.#fleetConfirmations.clear();
+    this.#fleetConfirmations.set(this.#fleetConfirmKey(tenant, workdir, typeof i.workstream === "string" ? i.workstream : undefined), { at: Date.now(), revision: this.#workstreams.revision });
+  }
+
+  /** Spend a confirmation for a spawn: only one the owner gave for this call, unchanged since. */
+  #takeFleetConfirmation(tenant: { accountId: string; projectId: string }, workdir: string, workstream: string | undefined): boolean {
+    const key = this.#fleetConfirmKey(tenant, workdir, workstream);
+    const c = this.#fleetConfirmations.get(key);
+    this.#fleetConfirmations.delete(key);
+    return c !== undefined && c.revision === this.#workstreams.revision && Date.now() - c.at < 10 * 60_000;
   }
 
   /**
@@ -8464,11 +8545,15 @@ mcpHub: this.#mcpHub,
         const workdir = typeof i.workdir === "string" ? normalizeWorkdir(i.workdir) : null;
         if (!workdir) return undefined;
         const ws = typeof i.workstream === "string" ? i.workstream : undefined;
-        const plain = this.#fleetSpawnHome(workdir, ws, false);
+        const tenant = { accountId, projectId };
+        const plain = this.#fleetSpawnHome(workdir, ws, false, tenant);
         if (plain.ok) return plain.binding?.id ? { workstream: plain.binding.id } : undefined;
-        const confirmed = this.#fleetSpawnHome(workdir, ws, true);
-        if (confirmed.ok && confirmed.override) {
-          return { ...(confirmed.binding?.id ? { workstream: confirmed.binding.id } : {}), warning: `Past the folder's own workstream (exclusive): approving this confirms a worker of "${confirmed.binding?.id}" there.` };
+        const confirmed = this.#fleetSpawnHome(workdir, ws, true, tenant);
+        if (confirmed.ok && (confirmed.override || confirmed.asks.length > 0)) {
+          const what = confirmed.override
+            ? `Past the folder's own workstream (exclusive): approving this confirms a worker of "${confirmed.binding?.id}" there.`
+            : `It reads workstream "${confirmed.asks.join(", ")}"'s folder, which shares only with approval: approving this confirms it.`;
+          return { ...(confirmed.binding?.id ? { workstream: confirmed.binding.id } : {}), warning: what };
         }
         return { warning: `It will be refused: ${confirmed.ok ? plain.error : confirmed.error}` };
       }
@@ -8484,7 +8569,7 @@ mcpHub: this.#mcpHub,
   #conductorFleetDeps(accountId: string, projectId: string): FleetDeps {
     return {
       tenant: { accountId, projectId },
-      textWithheld: (ws) => this.#workstreamTextWithheld(ws),
+      textWithheld: (ref) => this.#workstreamTextWithheld(ref),
       listSessions: (): FleetSessionView[] => {
         const views: FleetSessionView[] = [];
         for (const s of this.#sessions.values()) {
@@ -8561,9 +8646,13 @@ mcpHub: this.#mcpHub,
       // Run after the owner approved the spawn's card, which showed any conflict: confirmed.
       checkWorkstream: (workdir: string, workstream?: string) => {
         if (!this.#workstreams.configured && !workstream) return { ok: true };
-        const home = this.#fleetSpawnHome(workdir, workstream, true);
+        const tenant = { accountId, projectId };
+        // Confirmed only by the owner's approval of this very call's card (#noteFleetConfirmation), at this revision.
+        let home = this.#fleetSpawnHome(workdir, workstream, false, tenant);
+        if (!home.ok && this.#takeFleetConfirmation(tenant, workdir, workstream)) home = this.#fleetSpawnHome(workdir, workstream, true, tenant);
         if (!home.ok) return home;
-        return { ok: true, ...(home.binding?.id ? { workstream: home.binding.id } : {}), ...(home.override ? { override: true } : {}) };
+        const confirmed = home.override || home.asks.length > 0;
+        return { ok: true, ...(home.binding?.id ? { workstream: home.binding.id } : {}), ...(confirmed ? { override: true, revision: this.#workstreams.revision } : {}) };
       },
       resolveBackend: (provider?: string, model?: string) => {
         // Fail closed on an unknown provider — same rule and same wording as
@@ -8635,7 +8724,12 @@ mcpHub: this.#mcpHub,
             target: t.targetSession ?? t.workdir,
             createdAt: t.createdAt,
             error: t.error,
-            resultDigest: t.resultDigest,
+            // Another's task (an orchestrator's) carries its full digest: not the conductor's to read when
+            // its worker was a closed workstream's (§10). The conductor's own were withheld when built.
+            resultDigest:
+              t.createdBy !== this.#conductorCreatedBy(accountId, projectId) && this.#workstreamTextWithheld({ ...(t.workerSessionId ? { sessionId: t.workerSessionId } : t.targetSession ? { sessionId: t.targetSession } : {}) })
+                ? (t.resultDigest ? "(a closed workstream's result: not shared with the conductor)" : null)
+                : t.resultDigest,
           })),
     };
   }
@@ -8692,6 +8786,11 @@ mcpHub: this.#mcpHub,
    * "the orchestrator doesn't get X" test proves nothing unless something in
    * the same run shows X was actually available to give.
    */
+  /** The owner approved a spawn card with a warning (what #approve records), for tests. */
+  _noteFleetConfirmationForTest(accountId: string, projectId: string, input: unknown): void {
+    this.#noteFleetConfirmation({ accountId, projectId }, input);
+  }
+
   _fleetCardWorkstreamForTest(accountId: string, projectId: string): (toolName: string, input: unknown) => { workstream?: string; warning?: string } | undefined {
     return this.#fleetCardWorkstream(accountId, projectId);
   }
@@ -9843,6 +9942,16 @@ mcpHub: this.#mcpHub,
       return { type: "response.error", requestId: msg.id, error: "A delegated token can't approve a loop worker's tool calls", code: "forbidden" };
     }
 
+    // A card warning of a workstream override or an `ask` folder (workstreams §10, G3) is the owner's own to
+    // confirm, as an override at create is; and that approval is what the spawn handler may count as confirmed.
+    const card = session.approvalWorkstream(msg.approvalId);
+    if (msg.approved && card?.target.warning) {
+      if (auth.delegationDepth > 0) {
+        this.#store.audit(auth.sub, "workstream.override_refused", session.id, `approvalId=${msg.approvalId} reason=delegated`);
+        return { type: "response.error", requestId: msg.id, error: "A delegated token can't confirm what this card warns of: the owner approves it", code: "forbidden" };
+      }
+      if (msg.updatedInput === undefined) this.#noteFleetConfirmation({ accountId: session.accountId, projectId: session.projectId }, card.input);
+    }
     // Still `response.ok` for a stale id — the web ApprovalBar sends one to
     // dismiss a leftover prompt — but say so, for callers that report it.
     const outcome = session.approve(msg.approvalId, msg.approved, auth, msg.updatedInput);

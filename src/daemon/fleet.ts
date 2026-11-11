@@ -78,6 +78,7 @@ export interface FleetDispatchDeps {
     model?: string;
     workstream?: string;
     workstreamOverride?: boolean;
+    workstreamRevision?: string;
   }): string;
   /**
    * A spawn's home (workstreams §10, §5): the workstream asked for, else the
@@ -86,7 +87,7 @@ export interface FleetDispatchDeps {
    * exclusive claim, which the spawn's approval card said (G3). Absent = no
    * workstreams on this daemon.
    */
-  checkWorkstream?(workdir: string, workstream?: string): { ok: true; workstream?: string; override?: boolean } | { ok: false; error: string };
+  checkWorkstream?(workdir: string, workstream?: string): { ok: true; workstream?: string; override?: boolean; revision?: string } | { ok: false; error: string };
   /** Interrupt a running session immediately (post-approval). */
   interrupt(sessionId: string): Promise<void>;
   /** Normalize + validate a spawn workdir; null when unusable. */
@@ -135,11 +136,13 @@ export interface FleetDeps {
   /** Send-class dispatch (P4). Absent = read-only conductor. */
   dispatch?: FleetDispatchDeps;
   /**
-   * Whether a workstream's episode text is withheld from the conductor
-   * (workstreams §10: a `closed` one gives status, never text). Absent =
+   * Whether text is withheld from the conductor (workstreams §10: a
+   * `closed` workstream gives status, never text): judged by the episode's
+   * workstream, else its session's (an untagged episode, from before
+   * workstreams), else withheld while any workstream is closed. Absent =
    * nothing withheld (no workstreams, or isolation off).
    */
-  textWithheld?(workstream: string | undefined): boolean;
+  textWithheld?(ref: { workstream?: string; sessionId?: string }): boolean;
 }
 
 /**
@@ -271,7 +274,9 @@ export function createFleetHandlers(deps: FleetDeps) {
       )
         .filter((h) => h.sessionId !== conductorId)
         .map((h) => ({ ...h, workstream: sessionWorkstreams.get(h.sessionId) ?? h.snippets.find((sn) => sn.workstreamId)?.workstreamId }))
-        .filter((h) => !args.workstream || h.workstream === args.workstream);
+        .filter((h) => !args.workstream || h.workstream === args.workstream)
+        // A closed workstream's sessions never come back from a query: that they matched is text too (§10).
+        .filter((h) => !deps.textWithheld?.({ sessionId: h.sessionId, ...(h.workstream ? { workstream: h.workstream } : {}) }) && !h.snippets.some((sn) => deps.textWithheld?.({ sessionId: h.sessionId, ...(sn.workstreamId ? { workstream: sn.workstreamId } : {}) })));
       if (hits.length === 0) {
         return `No session matched "${args.query}". It may predate memory, or try different terms.`;
       }
@@ -280,7 +285,7 @@ export function createFleetHandlers(deps: FleetDeps) {
         // A closed workstream's snippets are its text: never shown (§10).
         const evidence = h.snippets
           .slice(0, 2)
-          .map((sn) => `    · [${sn.kind}] ${deps.textWithheld?.(sn.workstreamId ?? h.workstream) ? WITHHELD(sn.workstreamId ?? h.workstream) : sn.summary}`)
+          .map((sn) => `    · [${sn.kind}] ${sn.summary}`)
           .join("\n");
         return `${i + 1}. ${name} (${h.sessionId.slice(0, 8)})${h.workstream ? ` [${h.workstream}]` : ""} — ${h.matchCount} match(es), last activity ${ago(h.lastMatchAt)}\n${evidence}`;
       });
@@ -295,13 +300,13 @@ export function createFleetHandlers(deps: FleetDeps) {
         return `No session matches "${args.session}". Use fleet_list to see the fleet.`;
       }
       const head = sessionLine(target);
-      if (deps.textWithheld?.(target.workstream)) return `${head}\n${WITHHELD(target.workstream)}`;
+      if (deps.textWithheld?.({ sessionId: target.id, ...(target.workstream ? { workstream: target.workstream } : {}) })) return `${head}\n${WITHHELD(target.workstream)}`;
       if (!deps.memory) return `${head}\n(no memory engine — activity digest unavailable)`;
       // Compressed digest: the session's recent episode SUMMARIES (one line
       // each), never raw scrollback/transcript — the never-OOC guarantee.
       const episodes = deps.memory
         .timeline(target.workspaceId, 60)
-        .filter((e) => e.sessionId === target.id && !deps.textWithheld?.(e.workstreamId))
+        .filter((e) => e.sessionId === target.id && !deps.textWithheld?.({ sessionId: e.sessionId, ...(e.workstreamId ? { workstream: e.workstreamId } : {}) }))
         .slice(0, 12);
       if (episodes.length === 0) return `${head}\n(no recorded activity yet)`;
       const lines = episodes.map(
@@ -320,10 +325,12 @@ export function createFleetHandlers(deps: FleetDeps) {
       // Asked for more than shown: a closed workstream's episodes are dropped, never shown (§10).
       const all = await deps.memory.recallGlobal({ query: args.query, tenant: deps.tenant, limit: limit * 3 });
       const inScope = all.filter((h) => !args.workstream || h.episode.workstreamId === args.workstream);
-      const withheld = inScope.filter((h) => deps.textWithheld?.(h.episode.workstreamId));
-      const hits = inScope.filter((h) => !deps.textWithheld?.(h.episode.workstreamId)).slice(0, limit);
-      const note = withheld.length > 0 ? `\n(${withheld.length} more from closed workstreams — ${[...new Set(withheld.map((h) => h.episode.workstreamId))].join(", ")} — not shown)` : "";
-      if (hits.length === 0) return `Nothing recalled for "${args.query}".${note}`;
+      // Dropped before anything is counted or said: even "N more were withheld" would answer the query.
+      const hits = inScope
+        .filter((h) => !deps.textWithheld?.({ sessionId: h.episode.sessionId, ...(h.episode.workstreamId ? { workstream: h.episode.workstreamId } : {}) }))
+        .slice(0, limit);
+      const note = "";
+      if (hits.length === 0) return `Nothing recalled for "${args.query}".`;
       const lines = hits.map((h) => {
         const e = h.episode;
         const name = sessionNames.get(e.sessionId) ?? e.sessionId.slice(0, 8);
@@ -344,7 +351,9 @@ export function createFleetHandlers(deps: FleetDeps) {
       }
       const blocks = await Promise.all(
         [...byWorkdir.entries()].map(async ([workdir, group]) => {
-          const git = await probeGit(workdir);
+          // A closed workstream's branches are its text too (feat/acme-acquisition).
+          const closed = group.some((s) => deps.textWithheld?.({ sessionId: s.id, ...(s.workstream ? { workstream: s.workstream } : {}) }));
+          const git = closed ? "(a closed workstream's folder)" : await probeGit(workdir);
           const members = group
             .map((s) => `${s.name} (${s.status}${s.role === "conductor" ? ", conductor" : ""})`)
             .join(", ");
@@ -457,7 +466,7 @@ export function createFleetHandlers(deps: FleetDeps) {
       }
       if (!backend.ok) return backend.error;
       // Its home (§10): the workstream named, else the folder's — a conflict is the conductor's to resolve now.
-      const home: { ok: true; workstream?: string; override?: boolean } | { ok: false; error: string } = deps.dispatch.checkWorkstream
+      const home: { ok: true; workstream?: string; override?: boolean; revision?: string } | { ok: false; error: string } = deps.dispatch.checkWorkstream
         ? deps.dispatch.checkWorkstream(workdir, args.workstream)
         : { ok: true };
       if (!home.ok) return home.error;
@@ -468,8 +477,10 @@ export function createFleetHandlers(deps: FleetDeps) {
         prompt: args.task,
         provider: backend.provider,
         model: backend.model,
-        ...(home.workstream ? { workstream: home.workstream } : {}),
-        ...(home.override ? { workstreamOverride: true } : {}),
+        // Stored only when named: the folder's own is decided again at claim, as for any spawn (its
+        // remote may have been changed meanwhile: SessionManager #workstreamForFolder).
+        ...(args.workstream && home.workstream ? { workstream: home.workstream } : {}),
+        ...(home.override ? { workstreamOverride: true, ...(home.revision ? { workstreamRevision: home.revision } : {}) } : {}),
       });
       const on = backend.provider
         ? ` on ${backend.provider}${backend.model ? `/${backend.model}` : ""}`

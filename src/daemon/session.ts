@@ -6504,7 +6504,15 @@ export class Session {
       const gated = this.#approvalInputs.get(approvalId);
       if (!gated) continue;
       const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
-      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, this.#heldWrite(gated.toolName, gated.input)), ...this.#cardSandbox(gated.toolName, gated.input, gated.shellCwd) });
+      const ws = this.#approvalWorkstreams.get(approvalId);
+      out.push({
+        approvalId,
+        toolName: gated.toolName,
+        input: gated.input,
+        ...this.#cardRisk(risk, this.#heldWrite(gated.toolName, gated.input)),
+        ...this.#cardSandbox(gated.toolName, gated.input, gated.shellCwd),
+        ...(ws ? { targetWorkstream: ws.target } : {}),
+      });
     }
     return out;
   }
@@ -7873,11 +7881,23 @@ export class Session {
    * Never throws. A roll-up that could fail an approval would be worse than no
    * roll-up at all — the dispatch path must not be wedgeable by a cost display.
    */
+  /** What each pending card said of its workstream, with the input it was judged on (the manager checks an approval against it). */
+  #approvalWorkstreams = new Map<string, { toolName: string; input: unknown; target: { workstream?: string; warning?: string } }>();
+
+  /** What a pending approval's card said of its workstream (workstreams §10), or undefined. */
+  approvalWorkstream(approvalId: string): { toolName: string; input: unknown; target: { workstream?: string; warning?: string } } | undefined {
+    return this.#approvalWorkstreams.get(approvalId);
+  }
+
   /** The workstream a send-class fleet call acts in, for its card (never throws: a display can't wedge an approval). */
-  #targetWorkstreamFor(toolName: string, input: unknown): { targetWorkstream?: { workstream?: string; warning?: string } } {
+  #targetWorkstreamFor(toolName: string, input: unknown, approvalId?: string): { targetWorkstream?: { workstream?: string; warning?: string } } {
     if (!this.#fleetTargetWorkstream || !isFleetSendTool(toolName)) return {};
     try {
       const t = this.#fleetTargetWorkstream(toolName, input);
+      if (t && approvalId) {
+        if (this.#approvalWorkstreams.size > 64) this.#approvalWorkstreams.delete(this.#approvalWorkstreams.keys().next().value!);
+        this.#approvalWorkstreams.set(approvalId, { toolName, input, target: t });
+      }
       return t ? { targetWorkstream: t } : {};
     } catch {
       return {};
@@ -10583,7 +10603,7 @@ export class Session {
                   description: `${event.name}(${Object.keys(event.input).join(", ")})`,
                   approvalId: event.approvalId,
                   ...this.#collaborationCostFor(event.name),
-                  ...this.#targetWorkstreamFor(event.name, event.input),
+                  ...this.#targetWorkstreamFor(event.name, event.input, event.approvalId),
                   ...this.#cardRisk(risk, held),
                   ...this.#cardSandbox(event.name, event.input, event.shellCwd),
                 } as unknown as ToolState),
