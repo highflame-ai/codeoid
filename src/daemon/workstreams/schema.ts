@@ -9,11 +9,12 @@
  * rest of the config (server and credential names) are checked where both are
  * known (W1).
  *
- * Imports zod and the pure matcher alone: `src/config.ts` imports this, so
- * anything heavier here would be pulled into every CLI start.
+ * Imports zod, the pure matcher and the env denylist alone: `src/config.ts`
+ * imports this, so anything heavier here would be pulled into every CLI start.
  */
 
 import { z } from "zod";
+import { extraEnvViolations } from "../providers/env.js";
 import { normalizePathRule } from "./match.js";
 
 /** Ids a config may not use: they name a home the daemon assigns itself. */
@@ -64,7 +65,19 @@ const serverRefSchema = z.union([
 /** An env value is always a reference to a named credential, never inline (§4). */
 const envRefSchema = z.object({ secret: z.string().min(1).max(64) }).strict();
 
-const envNameSchema = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,127}$/, "an env var name");
+/**
+ * A name a workstream may set: one an agent's backend would accept from any
+ * daemon caller (providers/env.ts) — never a credential, account, proxy or
+ * code-loading variable codeoid owns (ANTHROPIC_*, PATH, LD_*, …). Refused at
+ * load, so a session never fails to start over it.
+ */
+function envNameProblem(name: string): string | undefined {
+  if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(name)) return "an env var name is upper-case letters, digits and underscores";
+  if (extraEnvViolations({ [name]: "x" }).length > 0) {
+    return "codeoid owns this variable for the backend (credentials, accounts, proxies, what runs): a workstream can't set it";
+  }
+  return undefined;
+}
 
 export const workstreamItemSchema = z
   .object({
@@ -101,7 +114,9 @@ export const workstreamItemSchema = z
       })
       .strict()
       .default({}),
-    env: z.record(envNameSchema, envRefSchema).default({}),
+    // Names checked in the refinement below: a record key's own refinement
+    // reaches the user only as "Invalid key in record".
+    env: z.record(z.string(), envRefSchema).default({}),
     git: z
       .object({
         name: z.string().min(1).max(256).optional(),
@@ -115,6 +130,12 @@ export const workstreamItemSchema = z
   .refine((w) => !w.abstract || (w.match.paths.length === 0 && w.match.remotes.length === 0), {
     message: "an abstract (base) workstream has no match rules",
     path: ["match"],
+  })
+  .superRefine((w, ctx) => {
+    for (const name of Object.keys(w.env)) {
+      const problem = envNameProblem(name);
+      if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `${name}: ${problem}`, path: ["env", name] });
+    }
   });
 
 export const workstreamsSchema = z

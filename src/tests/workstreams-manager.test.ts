@@ -15,6 +15,8 @@ import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { FolderReader } from "../daemon/workstreams/folder.js";
+import { EnvFileSecretStore } from "../daemon/credentials/store.js";
+import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { ALL_SCOPES, SCOPES } from "../protocol/scopes.js";
 import type { AuthContext, DaemonMessage, SessionInfo } from "../protocol/types.js";
 
@@ -54,13 +56,13 @@ afterEach(async () => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
-function manager(workstreams?: unknown): SessionManager {
+function manager(workstreams?: unknown, credentials: unknown[] = []): SessionManager {
   // A whole config, through the loader the daemon uses: the zod parse (and its
   // cross-item rules) runs exactly as at boot.
   const config: CodeoidConfig | undefined =
     workstreams === undefined
       ? undefined
-      : loadConfig({ raw: { dbPath: join(tmp, "codeoid.db"), transcriptDir: join(tmp, "transcripts"), workstreams }, env: {}, quiet: true });
+      : loadConfig({ raw: { dbPath: join(tmp, "codeoid.db"), transcriptDir: join(tmp, "transcripts"), workstreams, credentials }, env: {}, quiet: true });
   const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
     ...(config ? { config } : {}),
     _testProviderFactory: () => new MockSessionProvider(),
@@ -178,7 +180,7 @@ describe("forks keep their parent's home (W0 audit)", () => {
 
 describe("workstream.list and workstream.resolve", () => {
   it("list needs settings:read and shows env names only", async () => {
-    const m = manager({ items: [{ id: "a", env: { GH_TOKEN: { secret: "gh-a" } } }] });
+    const m = manager({ items: [{ id: "a", env: { GH_TOKEN: { secret: "gh-a" } } }] }, [{ id: "gh-a", kind: "env" }]);
     const denied = await m.handle({ type: "workstream.list", id: "l1" }, { ...OWNER, scopes: [SCOPES.SESSION_CREATE] as AuthContext["scopes"] }, client);
     expect(denied).toMatchObject({ type: "response.error", code: "forbidden" });
     const ok = await m.handle({ type: "workstream.list", id: "l2" }, OWNER, client);
@@ -263,3 +265,53 @@ async function listOne(m: SessionManager, id: string): Promise<SessionInfo | und
   const r = await m.handle({ type: "session.list", id: "ls" }, OWNER, client);
   return r.type === "session.list.result" ? r.sessions.find((s) => s.id === id) : undefined;
 }
+
+describe("the home's environment reaches the backend (W1, §6.2)", () => {
+  it("env credentials and git identity for sessions homed there, nothing for others", async () => {
+    const seen: Array<{ name: string; env: Record<string, string> }> = [];
+    const registry = new ProviderRegistry("rec");
+    registry.register({
+      id: "rec",
+      displayName: "rec",
+      create: (init) => {
+        seen.push({ name: init.sessionId, env: { ...(init.extraEnv ?? {}) } });
+        return new MockSessionProvider("rec", []);
+      },
+    });
+    const config = loadConfig({
+      raw: {
+        dbPath: join(tmp, "codeoid.db"),
+        transcriptDir: join(tmp, "transcripts"),
+        credentials: [{ id: "gh-client", kind: "env" }],
+        workstreams: {
+          items: [
+            { id: "client", match: { paths: ["~/client/**"] }, env: { GH_TOKEN: { secret: "gh-client" } }, git: { name: "Client Bot", email: "bot@client.example" } },
+            { id: "mine", match: { paths: ["~/mine"] } },
+          ],
+        },
+      },
+      env: {},
+      quiet: true,
+    });
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config,
+      providers: registry,
+      _testFolderReader: new FolderReader({ home: join(tmp, "home"), sshConfig: "" }),
+      _testSecrets: new EnvFileSecretStore({ CODEOID_CRED_GH_CLIENT: "ghp_client" }),
+    });
+    managers.push(m);
+    const a = (await create(m, "in-client", "client")) as { data: SessionInfo };
+    const b = (await create(m, "in-mine", "mine")) as { data: SessionInfo };
+    const client = seen.find((x) => x.name === a.data.id)?.env;
+    expect(client).toMatchObject({ GH_TOKEN: "ghp_client", GIT_AUTHOR_NAME: "Client Bot", GIT_COMMITTER_EMAIL: "bot@client.example" });
+    expect(seen.find((x) => x.name === b.data.id)?.env).toBeDefined();
+    expect(seen.find((x) => x.name === b.data.id)?.env.GH_TOKEN).toBeUndefined();
+  });
+
+  it("a config that sets a variable codeoid owns, or names an undeclared credential, fails to load", () => {
+    const load = (workstreams: unknown, credentials: unknown[] = []) => () =>
+      loadConfig({ raw: { dbPath: join(tmp, "x.db"), workstreams, credentials }, env: {}, quiet: true });
+    expect(load({ items: [{ id: "a", env: { ANTHROPIC_API_KEY: { secret: "k" } } }] }, [{ id: "k", kind: "env" }])).toThrow(/codeoid owns this variable/);
+    expect(load({ items: [{ id: "a", env: { GH_TOKEN: { secret: "nope" } } }] })).toThrow(/undeclared credential "nope"/);
+  });
+});

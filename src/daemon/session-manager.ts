@@ -11,6 +11,8 @@
 import { addedDirProblem, type OtherCheckout, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
 import { WorkstreamService, type WorkstreamBinding } from "./workstreams/service.js";
 import type { FolderReader } from "./workstreams/folder.js";
+import { createSecretStore, type SecretStore } from "./credentials/store.js";
+import { registerSecretPaths } from "./secret-paths.js";
 import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -578,6 +580,8 @@ export class SessionManager {
   #config?: CodeoidConfig;
   /** Workstreams (docs/workstreams-design.md): decides a session's home; the session keeps it. */
   #workstreams: WorkstreamService;
+  /** Where credential values live (workstreams G2): read when used, never cached. */
+  #secrets: SecretStore;
   /**
    * `config.worktree.setup`, live: `codeoid worktree trust` changes it
    * without a restart (and writes it through to config.json).
@@ -724,6 +728,8 @@ export class SessionManager {
       sandboxRegistry?: SandboxRegistry;
       /** Test-only: how folders are read for workstream matching (a fake home, an ssh config). */
       _testFolderReader?: FolderReader;
+      /** Test-only: where credential values come from. */
+      _testSecrets?: SecretStore;
     },
   ) {
     this.#store = store;
@@ -734,6 +740,11 @@ export class SessionManager {
     this.#memory = memory;
     this.#config = opts?.config;
     this.#workstreams = new WorkstreamService(opts?.config?.workstreams, opts?._testFolderReader);
+    this.#secrets = opts?._testSecrets ?? createSecretStore(opts?.config?.credentialStore);
+    // A `dir` store holds every credential's value in plain files: refused to
+    // every agent's file tools and hidden from every sandbox, as codeoid's own
+    // secrets are (secret-paths.ts).
+    if (opts?.config?.credentialStore?.kind === "dir") registerSecretPaths({ dirs: [opts.config.credentialStore.path] });
     this.#sandboxRegistry = opts?.sandboxRegistry;
     if (opts?.config?.worktree?.setup) this.#worktreeSetupPolicy = opts.config.worktree.setup;
     this.#compressionRegistry = opts?.compressionRegistry;
@@ -2290,9 +2301,26 @@ mcpHub: this.#mcpHub,
   /** Renders a binding for SessionInfo against the live config. */
   readonly #describeWorkstream = (binding: WorkstreamBinding | undefined) => this.#workstreams.info(binding);
 
-  /** The workstream options every Session this manager builds gets (docs/workstreams-design.md). */
-  #workstreamOpts(binding: WorkstreamBinding | undefined): { workstream?: WorkstreamBinding; describeWorkstream: (b: WorkstreamBinding | undefined) => ReturnType<WorkstreamService["info"]> } {
-    return { ...(binding ? { workstream: binding } : {}), describeWorkstream: this.#describeWorkstream };
+  /**
+   * The workstream options every Session this manager builds gets
+   * (docs/workstreams-design.md): the binding, how to show it, and the home's
+   * environment (§6.2), its credential values read now. A credential with no
+   * value is left out and logged: the session starts without it.
+   */
+  #workstreamOpts(binding: WorkstreamBinding | undefined): {
+    workstream?: WorkstreamBinding;
+    describeWorkstream: (b: WorkstreamBinding | undefined) => ReturnType<WorkstreamService["info"]>;
+    workstreamEnv?: Readonly<Record<string, string>>;
+  } {
+    const { env, missing } = this.#workstreams.envFor(binding, this.#secrets);
+    if (missing.length > 0) {
+      console.warn(`[codeoid] workstream "${binding?.id}": no value for ${missing.join(", ")} — set the credential (${this.#secrets.kind} store); the session starts without it`);
+    }
+    return {
+      ...(binding ? { workstream: binding } : {}),
+      describeWorkstream: this.#describeWorkstream,
+      ...(Object.keys(env).length > 0 ? { workstreamEnv: env } : {}),
+    };
   }
 
   /**

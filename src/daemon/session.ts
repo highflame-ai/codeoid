@@ -558,6 +558,14 @@ export interface SessionCreateOptions {
   /** Renders the binding for `SessionInfo` (name, color, orphaned) from the live config. */
   describeWorkstream?: (binding: WorkstreamBinding | undefined) => SessionWorkstreamInfo | undefined;
   /**
+   * The home workstream's environment for the backend's child process
+   * (docs/workstreams-design.md §6.2): its env credentials and git identity,
+   * resolved by the manager from the owner's config. Merged UNDER `extraEnv`
+   * and held to the same denylist (the schema already refused anything it
+   * would). Never persisted: recomputed from the config on every resume.
+   */
+  workstreamEnv?: Readonly<Record<string, string>>;
+  /**
    * Role-scoped goal-blackboard mount for a collaboration child: the endpoint
    * URL plus a bearer token that IS the scope (one goal, this role's read/write
    * set). Handed to the provider like `memoryMcp`, so any backend able to mount
@@ -1737,16 +1745,17 @@ export class Session {
     this.#collaborationCost = opts.collaborationCost;
     this.#maxBudgetUsd = opts.maxBudgetUsd;
     this.#onBudgetExhausted = opts.onBudgetExhausted ?? "park";
-    if (opts.extraEnv) {
+    const extra = opts.workstreamEnv && Object.keys(opts.workstreamEnv).length > 0 ? { ...opts.workstreamEnv, ...(opts.extraEnv ?? {}) } : opts.extraEnv;
+    if (extra) {
       // Before any side effect: a refused key must fail the create, not run a
       // backend with half the env the caller asked for.
-      const refused = extraEnvViolations(opts.extraEnv);
+      const refused = extraEnvViolations(extra);
       if (refused.length > 0) {
         throw new Error(
           `extraEnv may not set ${refused.join(", ")}: codeoid owns credential, account and process-loading variables for the backend`,
         );
       }
-      this.#extraEnv = Object.freeze({ ...opts.extraEnv });
+      this.#extraEnv = Object.freeze({ ...extra });
     }
     if (opts.sandboxRegistry) {
       this.#sandbox = new SessionSandbox({

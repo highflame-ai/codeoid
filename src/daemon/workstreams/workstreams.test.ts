@@ -8,6 +8,7 @@ import { FolderReader, findGitDirs, parseGitRemotes } from "./folder.js";
 import { ancestry, expandHome, matchFolder, normalizePathRule, normalizeRemote, parseSshAliases, type MatchableWorkstream } from "./match.js";
 import { workstreamsSchema } from "./schema.js";
 import { WorkstreamService } from "./service.js";
+import { EnvFileSecretStore } from "../credentials/store.js";
 
 const ws = (id: string, over: Partial<MatchableWorkstream> = {}): MatchableWorkstream => ({
   id,
@@ -162,6 +163,13 @@ describe("schema", () => {
 
   test("a base workstream has no match rules", () => {
     expect(parse({ items: [{ id: "b", abstract: true, match: { paths: ["~/w"] } }] }).success).toBe(false);
+  });
+
+  test("a workstream can't set a variable codeoid owns for the backend", () => {
+    for (const name of ["ANTHROPIC_API_KEY", "PATH", "LD_PRELOAD", "CODEOID_X", "GIT_SSH_COMMAND", "lower_case"]) {
+      expect(parse({ items: [{ id: "a", env: { [name]: { secret: "s" } } }] }).success).toBe(false);
+    }
+    expect(parse({ items: [{ id: "a", env: { GH_TOKEN: { secret: "s" }, NPM_TOKEN: { secret: "s" } } }] }).success).toBe(true);
   });
 
   test("env values are references, never inline secrets", () => {
@@ -503,6 +511,17 @@ describe("WorkstreamService", () => {
     const a = service([{ id: "a" }]);
     expect(service([{ id: "a" }]).revision).toBe(a.revision);
     expect(service([{ id: "b" }]).revision).not.toBe(a.revision);
+  });
+
+  test("envFor: the home's env from the store, its git identity; nothing for no home or a reserved one", () => {
+    const s = service([{ id: "a", env: { GH_TOKEN: { secret: "gh-a" }, NPM_TOKEN: { secret: "npm-a" } }, git: { name: "Ada", email: "ada@example.com" } }]);
+    const store = new EnvFileSecretStore({ CODEOID_CRED_GH_A: "tok" });
+    const r = s.envFor({ id: "a", source: "explicit", revision: "r" }, store);
+    expect(r.env).toEqual({ GH_TOKEN: "tok", GIT_AUTHOR_NAME: "Ada", GIT_COMMITTER_NAME: "Ada", GIT_AUTHOR_EMAIL: "ada@example.com", GIT_COMMITTER_EMAIL: "ada@example.com" });
+    expect(r.missing).toEqual(["NPM_TOKEN"]);
+    expect(s.envFor({ source: "none", revision: "r" }, store).env).toEqual({});
+    expect(s.envFor({ id: "conductor", source: "reserved", revision: "r" }, store).env).toEqual({});
+    expect(s.envFor(undefined, store).env).toEqual({});
   });
 
   test("summaries list env names, never values", () => {

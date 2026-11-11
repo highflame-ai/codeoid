@@ -18,6 +18,7 @@ import { effectiveWorkstreams, type EffectiveWorkstream } from "./effective.js";
 import { FolderReader } from "./folder.js";
 import { expandHome, type MatchableWorkstream, matchFolder, normalizePathRule } from "./match.js";
 import type { WorkstreamsConfig } from "./schema.js";
+import type { SecretStore } from "../credentials/store.js";
 
 export { readWorkstreamBinding, type WorkstreamBinding } from "./binding.js";
 
@@ -334,6 +335,32 @@ export class WorkstreamService {
       const m = byId.get(sessionId);
       return m ? decide(m, 0) : { binding: undefined, persist: false };
     };
+  }
+
+  /**
+   * The environment a session homed by `binding` gets (§6.2): its
+   * workstream's env, each value read from `secrets` now, and its git
+   * identity. Empty for no home, a reserved one, an orphaned one, or with no
+   * workstreams configured. `missing` names env vars whose credential has no
+   * value — the session starts without them, and says so.
+   */
+  envFor(binding: WorkstreamBinding | undefined, secrets: SecretStore): { env: Record<string, string>; missing: string[] } {
+    const env: Record<string, string> = {};
+    const missing: string[] = [];
+    if (!this.configured || !binding?.id || binding.source === "reserved") return { env, missing };
+    const ws = this.#effective.get(binding.id);
+    if (!ws) return { env, missing };
+    for (const [name, ref] of Object.entries(ws.env)) {
+      const value = secrets.get(ref.secret);
+      if (value === undefined || value.includes("\0")) missing.push(name);
+      else env[name] = value;
+    }
+    const oneLine = (v: string | undefined) => (v !== undefined && !/[\0\r\n]/.test(v) ? v : undefined);
+    const name = oneLine(ws.git?.name);
+    const email = oneLine(ws.git?.email);
+    if (name) Object.assign(env, { GIT_AUTHOR_NAME: name, GIT_COMMITTER_NAME: name });
+    if (email) Object.assign(env, { GIT_AUTHOR_EMAIL: email, GIT_COMMITTER_EMAIL: email });
+    return { env, missing };
   }
 
   #bind(r: WorkstreamResolution): WorkstreamBinding {
