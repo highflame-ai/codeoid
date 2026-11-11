@@ -561,7 +561,11 @@ export class WorkstreamService {
    */
   info(binding: WorkstreamBinding | undefined): SessionWorkstreamInfo | undefined {
     if (!binding || !this.configured) return undefined;
-    if (binding.id === undefined) return { source: binding.source };
+    const reads = {
+      ...(binding.references?.length ? { references: binding.references.map((r) => ({ workstream: r.workstream, ...(r.paths ? { paths: [...r.paths] } : {}) })) } : {}),
+      ...(binding.readFrom?.length ? { readFrom: [...binding.readFrom] } : {}),
+    };
+    if (binding.id === undefined) return { source: binding.source, ...reads };
     if (binding.id === CONDUCTOR_WORKSTREAM && binding.source === "reserved") {
       return { id: CONDUCTOR_WORKSTREAM, name: "Conductor", source: "reserved" };
     }
@@ -571,6 +575,7 @@ export class WorkstreamService {
       ...(ws ? { name: ws.name, ...(ws.color ? { color: ws.color } : {}) } : { orphaned: true }),
       source: binding.source,
       ...(binding.matchedBy ? { matchedBy: binding.matchedBy } : {}),
+      ...reads,
     };
   }
 }
