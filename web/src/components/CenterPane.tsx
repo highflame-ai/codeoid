@@ -120,7 +120,7 @@ const SessionHeader: Component = () => (
                 {s().model}
               </span>
             </Show>
-            <WorkstreamChip session={s()} />
+            <WorkstreamChip session={s()} editable />
             <AccountChip session={s()} />
             <SandboxChip session={s()} />
             <span class="ml-auto font-mono text-[11px] text-fg-faint">

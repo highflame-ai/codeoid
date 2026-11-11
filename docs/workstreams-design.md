@@ -494,6 +494,17 @@ codeoid new <name> <dir> --workstream <id> [--ref <workstream>[:<path>]]...
 codeoid workstream move <session> <id>
 ```
 
+### 12.1 W3 as built (2026-11-11)
+
+- **Enforcement switch.** Everything W3 enforces (the fence, recall scoping) is on only with `isolateGlobalServers`, like W1's servers. Without it, episodes are still tagged with `workstream_id` and references are recorded, but nothing is fenced.
+- **What is fenced.** Another workstream's folders, not everything outside the home: a blanket deny would refuse toolchains and system headers, and the cross-workstream read is the risk. A workstream's folders are its path rules expanded on disk (`workstreams/folders.ts`: one segment at a time, links followed only where the rule names a segment literally, at most 512) plus its recorded homes' repository tops. A folder that holds the session's home, a reference or the workspace is never fenced (the more specific rule made it theirs).
+- **Sandbox.** The fence's readable folders replace `@parent` as the project roots unless the session's own setting names roots; other workstreams' folders go into the spec's hidden paths (`SpecInputs.extraHidden`), and a root inside one is dropped. A change of fence is a change of directories, applied between turns (`SessionSandbox.dirsPending`).
+- **Gate.** `workstreams/gate.ts` judges every tool call's read, search and write paths (secret-paths.ts and held-writes.ts extractors), in every mode; Claude's PreToolUse hook refuses the same calls, since the CLI skips `canUseTool` for some.
+- **Memory.** `episodes.workstream_id`, tagged with the home at write time. Recall stays the repository's (`workspace_id`), filtered to the home and references; untagged episodes stay visible. Cross-repository recall over a whole workstream is deferred.
+- **`ask` grants.** The owner asking with `session:approve`, undelegated, is the approval. Anyone else (a delegated or send-only token) is asked of the owner on the session, and the verdict is judged again when they answer.
+- **Read-from record.** `readFrom` is recorded when a reference is granted (it may be read from then).
+- **Deferred:** `Bash` commands naming another workstream's path in an unsandboxed session (§14 q4) are not yet asked about; fork *into* another workstream; skillDirs.
+
 ## 13. Phases
 
 | Phase | Ships | Enforced by the end |

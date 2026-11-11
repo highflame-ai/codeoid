@@ -1,6 +1,18 @@
 // @vitest-environment jsdom
-import { cleanup, render } from "@solidjs/testing-library";
-import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render, waitFor } from "@solidjs/testing-library";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+const change = vi.hoisted(() => vi.fn());
+vi.mock("../state/workstreams", () => ({
+  changeSessionWorkstream: change,
+  fetchWorkstreams: vi.fn(() => Promise.resolve()),
+  homeChoices: () => [
+    { id: "acme", name: "Acme", share: "ask" },
+    { id: "pub", name: "Pub", share: "open" },
+    { id: "hf", name: "HF", share: "closed" },
+  ],
+  workstreamsState: () => ({ workstreams: [{ id: "acme", name: "Acme", share: "ask" }, { id: "pub", name: "Pub", share: "open" }, { id: "hf", name: "HF", share: "closed" }] }),
+}));
 
 import type { SessionInfo } from "../protocol/types";
 import { chipColor, WorkstreamChip } from "./WorkstreamChip";
@@ -35,5 +47,26 @@ describe("WorkstreamChip", () => {
     expect(chipColor("#f97316")).toBe("#f97316");
     expect(chipColor("red; background:url(x)")).toBeUndefined();
     expect(chipColor(undefined)).toBeUndefined();
+  });
+
+  it("editable: a panel with what it reads (remove), what it could read (never a closed one), and a move; a pending ask is said", async () => {
+    change.mockResolvedValue({ pending: false });
+    const r = render(() => <WorkstreamChip editable session={session({ id: "acme", name: "Acme", source: "matched", references: [{ workstream: "pub" }] })} />);
+    expect(r.getByTestId("workstream-chip").textContent).toContain("+1");
+    fireEvent.click(r.getByTestId("workstream-chip"));
+    const panel = r.getByRole("dialog", { name: "Workstream" });
+    expect(panel.textContent).toContain("Pub");
+    // Nothing more to read: pub is read already, hf is closed, acme is the home.
+    expect(r.queryByLabelText("Add a workstream to read")).toBeNull();
+    fireEvent.click(r.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(change).toHaveBeenCalledWith("s", { kind: "remove_reference", workstream: "pub" }));
+    change.mockResolvedValueOnce({ pending: true });
+    fireEvent.change(r.getByLabelText("Move to workstream"), { target: { value: "pub" } });
+    fireEvent.click(r.getByRole("button", { name: "Move" }));
+    await waitFor(() => expect(r.getByRole("status").textContent).toContain("Asked on the session"));
+    change.mockRejectedValueOnce(new Error("closed: no"));
+    fireEvent.change(r.getByLabelText("Move to workstream"), { target: { value: "hf" } });
+    fireEvent.click(r.getByRole("button", { name: "Move" }));
+    await waitFor(() => expect(r.getByRole("alert").textContent).toContain("closed: no"));
   });
 });

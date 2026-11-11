@@ -834,7 +834,10 @@ export class SessionSandbox {
    * rebuilt mid-work would end it; a process backend is restarted).
    */
   get dirsPending(): boolean {
-    return this.#dirsStale || this.#pinsBroken || (this.#workstreamDirs !== undefined && this.#workstreamKey() !== this.#workstreamKeyApplied);
+    // The fence changed since the last resolution (a reference, a move, a folder made): none before the
+    // first, which is no change of anything (it resolves with the fence as it is then).
+    const fenceChanged = this.#workstreamDirs !== undefined && this.#info !== null && this.#workstreamKey() !== this.#workstreamKeyApplied;
+    return this.#dirsStale || this.#pinsBroken || fenceChanged;
   }
 
   /** The added directories the running sandbox has (SandboxSpec.addedDirs as resolved): what host-side file tools are held to. */

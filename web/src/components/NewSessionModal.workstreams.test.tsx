@@ -19,12 +19,15 @@ vi.mock("../state/packs", () => ({
 }));
 vi.mock("../state/pipelines", () => ({ runPipeline: vi.fn() }));
 const resolveMock = vi.hoisted(() => vi.fn());
+const isolation = vi.hoisted(() => ({ on: false }));
 vi.mock("../state/workstreams", () => ({
   fetchWorkstreams: vi.fn(() => Promise.resolve()),
   homeChoices: () => [
-    { id: "acme", name: "Acme", abstract: false },
-    { id: "mine", name: "mine", abstract: false },
+    { id: "acme", name: "Acme", abstract: false, share: "ask" },
+    { id: "mine", name: "mine", abstract: false, share: "open" },
+    { id: "hf", name: "HF", abstract: false, share: "closed" },
   ],
+  workstreamsState: () => ({ isolateGlobalServers: isolation.on, workstreams: [] }),
   resolveWorkstream: resolveMock,
 }));
 
@@ -106,6 +109,25 @@ describe("the new-session dialog's workstream", () => {
     openPipelineModal("ship it");
     await waitFor(() => expect(r.queryByLabelText("Workstream")).toBeNull());
     openNewSessionModal();
+  });
+
+  it("under isolation, other workstreams it may read are offered (never a closed one, nor its home) and sent", async () => {
+    isolation.on = true;
+    try {
+      const r = setup();
+      fireEvent.input(r.getByLabelText(/^Name/), { target: { value: "s5" } });
+      fireEvent.input(r.getByLabelText(/^Workdir/), { target: { value: "/w/acme" } });
+      await waitFor(() => expect(r.getByLabelText("Workstream").textContent).toContain("The folder's: acme"), { timeout: 2000 });
+      expect(r.queryByLabelText(/HF/)).toBeNull();
+      expect(r.queryByLabelText(/^Acme/)).toBeNull();
+      fireEvent.click(r.getByLabelText(/^mine/));
+      requestMock.mockResolvedValueOnce({ info: { id: "s5", name: "s5" } });
+      fireEvent.click(r.getByRole("button", { name: /^create/i }));
+      await waitFor(() => expect(requestMock).toHaveBeenCalled());
+      expect(requestMock.mock.calls[0]![0]).toMatchObject({ references: [{ workstream: "mine" }] });
+    } finally {
+      isolation.on = false;
+    }
   });
 
   it("a failed check says so, and a changed folder never shows the last folder's answer", async () => {
