@@ -165,6 +165,8 @@ export interface ClaudeProviderInit {
   onForeignAgentDenied?: (agentId: string, toolName: string) => void;
   /** The session is in autonomous mode now (ProviderSessionInit.isAutonomous); absent: treated as so. */
   isAutonomous?: () => boolean;
+  /** The workstream fence's refusal of a call (ProviderSessionInit.workstreamFenceRefusal). */
+  workstreamFenceRefusal?: (toolName: string, input: unknown, cwd: string | null | undefined) => string | null;
   /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448). */
   sandbox?: () => SandboxRuntime | null;
   /** codeoid session id — used as the initial backing id and for audit/logging. */
@@ -1411,6 +1413,19 @@ export class ClaudeProvider implements SessionProvider {
               // Fail-closed too (#secretPathDecision).
               const secret = this.#secretPathDecision(input, opts.workdir);
               if (secret) return secret;
+              // The workstream fence (workstreams §7.3): a call in another
+              // workstream's folders is refused here, before any allow rule.
+              // Fail-closed: a throw refuses.
+              if (init.workstreamFenceRefusal) {
+                let fenced: string | null;
+                try {
+                  fenced = init.workstreamFenceRefusal(input.tool_name, input.tool_input, hookShellCwd(input));
+                } catch (err) {
+                  console.error(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] checking a call against the workstream fence failed, refusing it: ${err instanceof Error ? err.message : String(err)}`);
+                  fenced = "codeoid couldn't check this call against the session's workstream, so it was refused.";
+                }
+                if (fenced) return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const, permissionDecisionReason: fenced } };
+              }
               // A shell command is judged by what it runs (#431): a risky one,
               // one the gate can't read, or one naming a credential file never
               // runs on an allow rule — it goes to canUseTool, which decides.

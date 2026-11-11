@@ -103,6 +103,8 @@ import { type PinnedDir, PinnedPathError, pinDir, pinRecord } from "./sandbox/pi
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
 import type { EffortChangeResult, EffortLevel, RewindFiles, RewindIrreversible, SessionWorkstreamInfo, TurnSummary } from "../protocol/types.js";
 import type { WorkstreamBinding } from "./workstreams/binding.js";
+import type { WorkstreamFence } from "./workstreams/service.js";
+import { type FenceRefusal, fenceRefusal, fenceRefusalText } from "./workstreams/gate.js";
 import type { McpGrant } from "./workstreams/grant.js";
 import { LIMITS } from "../protocol/types.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
@@ -565,13 +567,20 @@ export interface SessionCreateOptions {
    * and held to the same denylist (the schema already refused anything it
    * would). Never persisted: recomputed from the config on every resume.
    */
-  workstreamEnv?: () => Readonly<Record<string, string>>;
+  workstreamEnv?: (binding: WorkstreamBinding | undefined) => Readonly<Record<string, string>>;
   /**
-   * The home's MCP grant under isolation (workstreams/grant.ts), read live;
-   * undefined result = no isolation. Applied by the session's MCP view, so
-   * every backend sees only what the home selects.
+   * The home's MCP grant under isolation (workstreams/grant.ts), read live
+   * for the session's binding as it is now; undefined result = no isolation.
+   * Applied by the session's MCP view, so every backend sees only what the
+   * home selects.
    */
-  mcpGrant?: () => McpGrant | undefined;
+  mcpGrant?: (binding: WorkstreamBinding | undefined) => McpGrant | undefined;
+  /**
+   * The session's read fence under isolation (workstreams §7.3), read live
+   * for its binding: its home's and references' folders, and every other
+   * workstream's. Undefined result = no fence.
+   */
+  workstreamFence?: (binding: WorkstreamBinding | undefined) => WorkstreamFence | undefined;
   /**
    * Role-scoped goal-blackboard mount for a collaboration child: the endpoint
    * URL plus a bearer token that IS the scope (one goal, this role's read/write
@@ -1405,10 +1414,26 @@ export class Session {
   #extraEnvStatic: Readonly<Record<string, string>> | undefined;
   /** The home workstream's env, read live (SessionCreateOptions.workstreamEnv). */
   #workstreamEnv: (() => Readonly<Record<string, string>>) | undefined;
+  /** The session's read fence (SessionCreateOptions.workstreamFence), for its binding as it is now. */
+  #workstreamFence: (() => WorkstreamFence | undefined) | undefined;
   /** What a backend gets as extra env: a live view over both (see #liveExtraEnv). */
   #extraEnv: Readonly<Record<string, string>> | undefined;
   /** The extra env the current backend was built with, to rebuild it when the workstream's changes. */
   #envBuiltWith: string | undefined;
+
+  /**
+   * The read fence as the sandbox takes it (workstreams §7.3): the home's and
+   * references' folders shown read-only (the project roots), every other
+   * workstream's hidden.
+   */
+  #sandboxFence(): { roots: string[]; hidden: string[] } | undefined {
+    const fence = this.#workstreamFence?.();
+    if (!fence) return undefined;
+    return {
+      roots: [...new Set([...fence.home, ...fence.references.flatMap((r) => r.folders)])],
+      hidden: [...new Set(fence.foreign.flatMap((f) => f.folders))],
+    };
+  }
 
   /** The workstream's env under the caller's extra env, held to the extra-env denylist. */
   #composedEnv(): Record<string, string> {
@@ -1796,7 +1821,10 @@ export class Session {
     this.#collaborationCost = opts.collaborationCost;
     this.#maxBudgetUsd = opts.maxBudgetUsd;
     this.#onBudgetExhausted = opts.onBudgetExhausted ?? "park";
-    this.#workstreamEnv = opts.workstreamEnv;
+    const envOf = opts.workstreamEnv;
+    this.#workstreamEnv = envOf ? () => envOf(this.#workstream) : undefined;
+    const fenceOf = opts.workstreamFence;
+    this.#workstreamFence = fenceOf ? () => fenceOf(this.#workstream) : undefined;
     const extra = opts.extraEnv;
     if (extra) {
       // Before any side effect: a refused key must fail the create, not run a
@@ -1820,6 +1848,7 @@ export class Session {
         ...(opts.sandbox ? { setting: opts.sandbox } : {}),
         onWarning: (text) => this.#sandboxWarning(text, "sandbox.login_not_saved"),
         onWorktreeEntries: (common, findings) => this.#worktreeEntriesFound(common, findings),
+        ...(this.#workstreamFence ? { workstreamDirs: () => this.#sandboxFence() } : {}),
       });
     }
     this.#requireSandbox = opts.requireSandbox === true;
@@ -1871,7 +1900,7 @@ export class Session {
         workdir: this.workdir,
         tenant: { accountId: this.accountId, projectId: this.projectId },
         approvals: () => this.#store.workdirMcpApprovals(scope),
-        ...(opts.mcpGrant ? { grant: opts.mcpGrant } : {}),
+        ...(opts.mcpGrant ? { grant: () => opts.mcpGrant?.(this.#workstream) } : {}),
       });
     }
     this.#config = opts.config;
@@ -2133,6 +2162,14 @@ export class Session {
       isOwnTask: (taskId) => this.#isOwnTask(taskId),
       onForeignAgentDenied: (agentId, toolName) => this.#noteForeignAgentRefused(agentId, toolName),
       isAutonomous: () => this.#mode === "autonomous",
+      ...(this.#workstreamFence
+        ? {
+            workstreamFenceRefusal: (toolName: string, input: unknown, cwd: string | null | undefined) => {
+              const r = this.#fenceRefusal(toolName, input, cwd);
+              return r ? fenceRefusalText(r) : null;
+            },
+          }
+        : {}),
       // Read each time the backend starts, and only what was resolved for THIS backend.
       sandbox: () => this.#sandbox?.runtimeFor(factory.id) ?? null,
       ...(this.#extraEnv ? { extraEnv: this.#extraEnv } : {}),
@@ -2468,6 +2505,37 @@ export class Session {
     } catch {
       return { path: "(couldn't be judged)", access: "read", why: "unresolved" };
     }
+  }
+
+  /** The workstream fence's verdict on a tool call (workstreams/gate.ts); null without a fence. Fails closed. */
+  #fenceRefusal(toolName: string, input: unknown, shellCwd: string | null | undefined): FenceRefusal | null {
+    let fence: WorkstreamFence | undefined;
+    try {
+      fence = this.#workstreamFence?.();
+    } catch (e) {
+      console.error(`[codeoid/session ${this.id}] workstream fence: ${e instanceof Error ? e.message : String(e)}`);
+      return { path: "(couldn't be judged)", workstream: this.#workstream?.id ?? "?", kind: "read" };
+    }
+    if (!fence) return null;
+    // paths: judging a tool call's input (fenceRefusal): no use of the path
+    return fenceRefusal(toolName, input, { workdir: this.workdir, ...(shellCwd !== undefined ? { cwd: shellCwd } : {}), fence });
+  }
+
+  /** Refuse a call the workstream fence holds: its card, the audit, and an info line. */
+  #refuseFenced(approvalId: string, toolName: string, r: FenceRefusal, sender: AuthContext): { behavior: "deny"; message: string } {
+    const reason = fenceRefusalText(r);
+    this.#approvalPatchKeys.delete(approvalId);
+    this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: reason });
+    this.#store.audit(sender.sub, "session.workstream_fence_refuse", this.id, `tool=${toolName} kind=${r.kind} workstream=${r.workstream}`);
+    const infoMsg = this.#makeMessage("info", `⛔ Refused ${toolName}: ${r.path} is workstream "${r.workstream}"'s`, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "workstream.fenced",
+      tool: toolName,
+      workstream: r.workstream,
+      kind: r.kind,
+    });
+    this.#persistAndBuffer(infoMsg);
+    this.#broadcastRaw(infoMsg);
+    return { behavior: "deny", message: reason };
   }
 
   /** A host-side file tool beyond the sandbox, in autonomous mode: refused (#outsideSandbox). Null in every other mode. */
@@ -9680,6 +9748,11 @@ export class Session {
         return { behavior: "deny" as const, message: reason };
       }
 
+      // The workstream fence (workstreams §7.3), every mode: a file tool in
+      // another workstream's folders, or writing a reference, is refused.
+      const fenced = this.#fenceRefusal(toolName, effectiveInput, shellCwd);
+      if (fenced) return this.#refuseFenced(approvalId, toolName, fenced, sender);
+
       // A file tool running outside the OS sandbox (Claude's, opencode's) is
       // held to the sandbox's own policy in autonomous mode (#448 rounds 8, 9):
       // beyond it, refused, never asked. Guarded and interactive mode decide
@@ -10385,11 +10458,21 @@ export class Session {
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
         // Autonomous mode refuses it outright (#autonomousRefusal): no approval card either.
         const deniedFirst = networkAsk || budgetDenied || secret?.action === "deny" || risk?.secret?.action === "deny";
+        // The workstream fence refuses it in every mode (#fenceRefusal): no approval card.
+        const fenced = deniedFirst ? null : this.#fenceRefusal(event.name, event.input, event.shellCwd);
         // A pinned directory changed (#448 round 13): the gate refuses every call (#sandboxPinRefusal).
         const pinned = budgetDenied ? null : this.#sandboxPinRefusal();
         // Beyond the sandbox, a host-side file tool is refused in autonomous mode (#outsideSandbox).
         const outside = deniedFirst || pinned ? null : this.#outsideSandboxRefusal(event.name, event.input, event.shellCwd);
-        const refused = pinned ? { reason: pinned } : deniedFirst ? null : outside ? { reason: hostFileBreachReason(outside) } : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
+        const refused = pinned
+          ? { reason: pinned }
+          : deniedFirst
+            ? null
+            : fenced
+              ? { reason: fenceRefusalText(fenced) }
+              : outside
+                ? { reason: hostFileBreachReason(outside) }
+                : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
         const toolMsg = this.#makeMessage(
           "tool_call",
           `${event.name}(${Object.keys(event.input).join(", ")})`,

@@ -10,6 +10,7 @@ import { workstreamsSchema } from "./schema.js";
 import { WorkstreamService } from "./service.js";
 import { proposeWorkstreams } from "./import.js";
 import { expandPathRule } from "./folders.js";
+import { fenceRefusal } from "./gate.js";
 import { EnvFileSecretStore } from "../credentials/store.js";
 
 const ws = (id: string, over: Partial<MatchableWorkstream> = {}): MatchableWorkstream => ({
@@ -625,10 +626,52 @@ describe("W3: folders, the fence, share verdicts", () => {
   });
 
   test("a binding's references and read-from record round-trip; a malformed one fails the binding", () => {
-    const good = { id: "a", source: "matched", revision: "r", references: [{ workstream: "b", paths: ["/x"], grantedBy: "u", grantedAt: "t" }], readFrom: ["b", "b"] };
+    const good = { id: "a", source: "matched" as const, revision: "r", references: [{ workstream: "b", paths: ["/x"], grantedBy: "u", grantedAt: "t" }], readFrom: ["b", "b"] };
     expect(readWorkstreamBinding(good)).toEqual({ ...good, readFrom: ["b"] });
     expect(readWorkstreamBinding({ ...good, references: [{ workstream: "B!", grantedBy: "u", grantedAt: "t" }] })).toBeUndefined();
     expect(readWorkstreamBinding({ ...good, references: [{ workstream: "b", paths: ["rel"], grantedBy: "u", grantedAt: "t" }] })).toBeUndefined();
     expect(readWorkstreamBinding({ ...good, readFrom: ["ok", 3] })).toBeUndefined();
+  });
+});
+
+describe("W3: the fence at the gate", () => {
+  const fence = () => ({
+    workstream: "mine",
+    home: [join(tmp, "mine")],
+    references: [{ workstream: "pub", folders: [join(tmp, "pub")] }],
+    foreign: [{ workstream: "hf", folders: [join(tmp, "hf")] }, { workstream: "nested", folders: [join(tmp, "mine", "vendor-x")] }],
+    limits: [],
+  });
+  beforeEach(() => {
+    for (const d of ["mine/vendor-x", "pub", "hf", "elsewhere"]) mkdirSync(join(tmp, d), { recursive: true });
+  });
+  const judge = (tool: string, input: Record<string, unknown>, cwd?: string) => fenceRefusal(tool, input, { workdir: join(tmp, "mine"), ...(cwd ? { cwd } : {}), fence: fence() });
+
+  test("reads and writes in another workstream's folders are refused; the home and elsewhere aren't", () => {
+    expect(judge("Read", { file_path: join(tmp, "hf", "secret.ts") })).toMatchObject({ workstream: "hf", kind: "read" });
+    expect(judge("Read", { file_path: join(tmp, "mine", "a.ts") })).toBeNull();
+    expect(judge("Read", { file_path: "/etc/hosts" })).toBeNull();
+    expect(judge("Read", { file_path: "vendor-x/x.ts" })).toMatchObject({ workstream: "nested" });
+    expect(judge("Read", { file_path: "../hf/x" })).toMatchObject({ workstream: "hf" });
+    expect(judge("Write", { file_path: join(tmp, "hf", "x") })).toMatchObject({ kind: "write" });
+    expect(judge("write_file", { file_path: join(tmp, "hf", "x") })).toMatchObject({ kind: "write" });
+  });
+
+  test("a reference is read, never written", () => {
+    expect(judge("Read", { file_path: join(tmp, "pub", "x") })).toBeNull();
+    expect(judge("Edit", { file_path: join(tmp, "pub", "x") })).toMatchObject({ workstream: "pub", kind: "write_reference" });
+  });
+
+  test("a search whose root holds a fenced folder reads into it", () => {
+    expect(judge("Grep", { path: tmp, pattern: "x" })).toMatchObject({ workstream: "hf", kind: "search" });
+    expect(judge("Grep", { pattern: "x" })).toMatchObject({ workstream: "nested", kind: "search" });
+    expect(judge("Grep", { path: join(tmp, "pub"), pattern: "x" })).toBeNull();
+    expect(judge("Glob", { pattern: `${join(tmp, "hf")}/**/*.ts` })).toMatchObject({ workstream: "hf" });
+  });
+
+  test("a link into a fenced folder is judged where it leads", () => {
+    symlinkSync(join(tmp, "hf"), join(tmp, "mine", "link"));
+    expect(judge("Read", { file_path: join(tmp, "mine", "link", "x") })).toMatchObject({ workstream: "hf" });
+    expect(judge("Read", { file_path: "x" }, join(tmp, "hf"))).toMatchObject({ workstream: "hf" });
   });
 });
