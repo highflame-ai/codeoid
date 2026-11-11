@@ -508,7 +508,7 @@ export class TerminalClient {
     }
     const data = resp.data as { pending?: boolean; message?: string; workstream?: SessionInfo["workstream"] };
     if (data.pending) console.log(`Asked on the session: it applies once its owner says yes (codeoid approve ${S(sessionIdOrName)}, or the web UI), from its next turn.`);
-    else console.log(change.kind === "set_workstream" ? `Moved: its servers, credentials and sandbox follow from its next turn.` : `Done, from its next turn.`);
+    else console.log(change.kind === "set_workstream" ? "Moved: its servers, credentials and sandbox follow from its next turn." : "Done, from its next turn.");
     const ws = workstreamSummary(data.workstream);
     if (ws) console.log(`  ${sanitizeTerminalOutput(ws)}`);
     const refs = data.workstream?.references ?? [];
