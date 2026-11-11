@@ -25,6 +25,11 @@ export interface MemoryToolContext {
   workspaceId: string;
   /** Excluded from recall by default so the caller doesn't recall its own turns. */
   sessionId: string;
+  /**
+   * The workstreams the calling session may read (workstreams §6.4: its home
+   * and references), read at each call; undefined = no filter (isolation off).
+   */
+  workstreams?: () => readonly string[] | undefined;
 }
 
 export interface MemoryToolDef {
@@ -57,6 +62,12 @@ const clampInt = (v: unknown, min: number, max: number, dflt: number): number =>
   if (n === undefined) return dflt;
   return Math.min(max, Math.max(min, Math.floor(n)));
 };
+
+/** The caller's workstream filter for a query (MemoryToolContext.workstreams). */
+function readable(ctx: MemoryToolContext): { workstreams?: readonly string[] } {
+  const w = ctx.workstreams ? ctx.workstreams() : ctx.engine.workstreamsOf(ctx.sessionId);
+  return w === undefined ? {} : { workstreams: w };
+}
 
 /** The four defs. A function (not a const) so each call gets fresh zod objects. */
 export function memoryToolDefs(): MemoryToolDef[] {
@@ -92,6 +103,7 @@ export function memoryToolDefs(): MemoryToolDef[] {
         limit: clampInt(args.limit, 1, 20, 6),
         toolName: str(args.tool_name),
         excludeSessionId: includeCurrent ? undefined : ctx.sessionId,
+        ...readable(ctx),
       });
       return formatHits(hits, ctx.sessionId, includeCurrent);
     },
@@ -117,6 +129,7 @@ export function memoryToolDefs(): MemoryToolDef[] {
         workspaceId: ctx.workspaceId,
         filePaths: [path],
         limit: 3,
+        ...readable(ctx),
       });
       if (hits.length === 0) return `No prior reads of ${path} in this workspace.`;
       return `Found ${hits.length} prior read(s) of ${path}:\n\n${formatHits(hits, ctx.sessionId, true)}`;
@@ -143,7 +156,7 @@ export function memoryToolDefs(): MemoryToolDef[] {
     async run(args, ctx) {
       const limit = clampInt(args.limit, 1, 60, 20);
       const offset = clampInt(args.offset, 0, Number.MAX_SAFE_INTEGER, 0);
-      const episodes = ctx.engine.timeline(ctx.workspaceId, limit, offset);
+      const episodes = ctx.engine.timeline(ctx.workspaceId, limit, offset, readable(ctx).workstreams);
       return formatTimeline(episodes, ctx.sessionId, offset);
     },
   };
@@ -185,9 +198,10 @@ export function memoryToolDefs(): MemoryToolDef[] {
     },
     async run(args, ctx) {
       const id = String(args.episode_id ?? "");
-      const ep = ctx.engine.getEpisodeScoped(id, ctx.workspaceId);
+      const { workstreams } = readable(ctx);
+      const ep = ctx.engine.getEpisodeScoped(id, ctx.workspaceId, workstreams);
       if (!ep) return `Episode ${id} not found in this workspace.`;
-      const full = ctx.engine.getFullContentScoped(id, ctx.workspaceId) ?? ep.content;
+      const full = ctx.engine.getFullContentScoped(id, ctx.workspaceId, workstreams) ?? ep.content;
       const offset = clampInt(args.offset, 0, Number.MAX_SAFE_INTEGER, 0);
       const maxChars = clampInt(args.max_chars, 1000, GET_EPISODE_MAX_PAGE, GET_EPISODE_DEFAULT_PAGE);
       return formatEpisode({ ...ep, content: full }, ctx.sessionId, { offset, maxChars });

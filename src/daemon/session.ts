@@ -1426,6 +1426,16 @@ export class Session {
    * references' folders shown read-only (the project roots), every other
    * workstream's hidden.
    */
+  /** Lets go of the session's recall scope (MemoryEngine.scopeSession), at destroy. */
+  #unscopeMemory: (() => void) | undefined;
+
+  /** The workstreams this session's recall may read: its home and references; undefined without a fence. */
+  #memoryWorkstreams(): readonly string[] | undefined {
+    const fence = this.#workstreamFence?.();
+    if (!fence) return undefined;
+    return [...new Set([...(fence.workstream ? [fence.workstream] : []), ...fence.references.map((r) => r.workstream)])];
+  }
+
   #sandboxFence(): { roots: string[]; hidden: string[] } | undefined {
     const fence = this.#workstreamFence?.();
     if (!fence) return undefined;
@@ -2017,6 +2027,8 @@ export class Session {
 
     if (this.#memory) {
       const memory = this.#memory;
+      // Recall kept to the home and its references under isolation (workstreams §6.4).
+      if (this.#workstreamFence) this.#unscopeMemory = memory.scopeSession(this.id, () => this.#memoryWorkstreams());
       this.#indexScheduler = new IndexScheduler({
         store: memory.store,
         workspaceId: this.#workspaceId,
@@ -2036,7 +2048,9 @@ export class Session {
             // Retry a registration that failed at construction; until it
             // succeeds the workspace is invisible to cross-workspace search.
             if (!this.#workspaceRegistered) this.#registerWorkspace();
-            memory.ingest(episode);
+            // Tagged with the home as it is now (workstreams §6.4): a session moved since writes into its new one.
+            const home = this.#workstream?.id;
+            memory.ingest(home ? { ...episode, workstreamId: home } : episode);
             scheduler.onEpisode();
           } catch (err) {
             console.error(
@@ -6522,6 +6536,7 @@ export class Session {
     // the commit look's git is bounded, and a destroy waits no longer.
     await Promise.race([this.#checkGitControl(sender.sub), new Promise<void>((r) => setTimeout(r, DESTROY_COMMIT_CHECK_MS).unref?.())]);
     this.#destroyed = true;
+    this.#unscopeMemory?.();
     // This session's own servers' clients in the hub: let go (the last user closes them).
     for (const spec of [...this.#mcpRetained.values(), ...this.#mcpToRelease.values()]) this.#mcpHub?.release(spec, this.#mcpTenant());
     this.#mcpRetained.clear();

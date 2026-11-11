@@ -34,6 +34,8 @@ export interface Episode {
   embeddingModel?: string;
   createdAt: number;
   createdBy: string;
+  /** The home workstream of the session that wrote it (workstreams §6.4); absent before workstreams, or with none. */
+  workstreamId?: string;
 }
 
 /** Result of a recall query. */
@@ -67,6 +69,12 @@ export interface RecallQuery {
   before?: number;
   /** Exclude episodes older than this (unix ms). */
   after?: number;
+  /**
+   * The workstreams the caller may read (workstreams §6.4: its home and its
+   * references). Set: an episode another workstream wrote is left out;
+   * one with none (from before workstreams) stays. Absent: no filter.
+   */
+  workstreams?: readonly string[];
 }
 
 /** File read cache entry — enables silent reuse across sessions in a workspace. */
