@@ -68,7 +68,9 @@ const PATH_LIST_KEYS = ["paths", "file_paths", "absolute_paths", "include", "dir
 /** Tools whose `pattern` is a path glob (not a regex) and whose absent root means the workdir. */
 const GLOB_TOOLS = new Set(["Glob", "glob"]);
 /** Search tools: an absent root means the workdir. */
-const SEARCH_TOOLS = new Set(["Glob", "glob", "Grep", "grep", "grep_search", "search_file_content", "LS", "list_directory"]);
+const SEARCH_TOOLS = new Set(["Glob", "glob", "Grep", "grep", "grep_search", "search_file_content", "LS", "list_directory", "find", "ls", "acp_search"]);
+/** pi's file tools: a path's leading `@` is dropped, as pi drops it. */
+const PI_PATH_TOOLS = new Set(["read", "find", "ls", "grep", "write", "edit"]);
 
 /** Files in codeoid's config dir that hold credentials. */
 function isSecretConfigFile(name: string): boolean {
@@ -275,12 +277,24 @@ function candidatePaths(toolName: string, input: unknown): string[] {
     const v = obj[k];
     if (Array.isArray(v)) for (const p of v) if (typeof p === "string" && p) out.push(p);
   }
+  // ACP's `locations` (acp/index.ts acpToolInput): paths, or `{path}` as the agent sent them.
+  if (Array.isArray(obj.locations)) {
+    for (const l of obj.locations) {
+      const p = typeof l === "string" ? l : l && typeof l === "object" ? (l as { path?: unknown }).path : undefined;
+      if (typeof p === "string" && p) out.push(p);
+    }
+  }
+  if (PI_PATH_TOOLS.has(toolName)) {
+    for (const [i, p] of out.entries()) if (p.startsWith("@") && p.length > 1) out[i] = p.slice(1);
+  }
   // A glob's pattern can be absolute (`/home/u/.codeoid/*.json`): judge its
   // literal prefix, up to the first wildcard. Only for glob tools — Grep's
   // `pattern` is a regex, and searching code for "/proc/self/environ" is fine.
   if (GLOB_TOOLS.has(toolName) && typeof obj.pattern === "string" && (isAbsolute(obj.pattern) || obj.pattern.startsWith("~"))) {
     const literal = obj.pattern.split(/[*?[{]/, 1)[0] ?? "";
-    if (literal) out.push(literal.endsWith("/") ? literal.slice(0, -1) || "/" : literal);
+    // Up to the last whole segment: `/w/h?/*` searches `/w` (any `h?` in it), not a folder named `/w/h`.
+    const root = literal.endsWith("/") ? literal.slice(0, -1) || "/" : obj.pattern === literal ? literal : dirname(literal);
+    if (root) out.push(root);
   }
   // A search with no root searches the workdir.
   if (out.length === 0 && SEARCH_TOOLS.has(toolName)) out.push(".");

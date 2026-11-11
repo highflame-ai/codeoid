@@ -1020,6 +1020,15 @@ export class SqliteEpisodeStore {
     return row ? this.#rowToEpisode(row) : null;
   }
 
+  /** Whether `workspaceId` holds an episode a workstream outside `allowed` wrote (its index would show it). */
+  hasOtherWorkstreams(workspaceId: string, allowed: readonly string[]): boolean {
+    const marks = allowed.map(() => "?").join(", ");
+    const row = this.#db
+      .prepare(`SELECT 1 FROM episodes WHERE workspace_id = ? AND workstream_id IS NOT NULL${allowed.length > 0 ? ` AND workstream_id NOT IN (${marks})` : ""} LIMIT 1`)
+      .get(workspaceId, ...allowed);
+    return row !== null && row !== undefined;
+  }
+
   listRecent(workspaceId: string, limit: number, offset = 0, workstreams?: readonly string[]): Episode[] {
     if (workstreams !== undefined) {
       // Only what the caller's workstreams may read (RecallQuery.workstreams), paged over that.

@@ -157,4 +157,28 @@ describe("the read fence at the gate", () => {
     expect(result?.message).toContain('workstream "hf"');
     expect(made.data?.workstream?.id).toBe("mine");
   });
+
+  it("a session moved to another workstream still reads its own folder", async () => {
+    script = [[{ type: "tool_start", toolId: "t2", sdkToolUseId: "sdk-t2", name: "Read", input: { file_path: join(home, "mine", "own.ts") }, approvalId: "ap-2" } as ProviderEvent, DONE]];
+    writeFileSync(join(home, "mine", "own.ts"), "x");
+    const made = await create("mv", "mine");
+    await h({ type: "session.set_workstream", id: "w", sessionId: made.data!.id, workstream: "pub" });
+    const session = manager.findByName("mv", OWNER)!;
+    expect(session.workstream?.id).toBe("pub");
+    await session.send("read", OWNER);
+    for (let i = 0; i < 100 && providers.at(-1)?.canUseToolResults.length === 0; i++) await Bun.sleep(10);
+    const r = providers.at(-1)?.canUseToolResults[0];
+    // Not refused by the fence (a guarded Read may still wait on its card: either way, never fenced).
+    expect(r?.message ?? "").not.toContain("workstream");
+  });
+});
+
+describe("reference inputs are held to what a binding is read back with", () => {
+  it("a NUL in a folder, or one reference too many, is refused before it is stored", async () => {
+    const made = await create("v", "mine");
+    const id = made.data!.id;
+    expect(await h({ type: "session.add_reference", id: "n", sessionId: id, workstream: "pub", paths: [`${join(home, "pub")}/\u0000x`] })).toMatchObject({ type: "response.error" });
+    expect(await create("v2", "mine", { references: [{ workstream: "pub", paths: ["relative"] }] })).toMatchObject({ type: "response.error" });
+    expect(manager.findByName("v", OWNER)?.workstream?.references).toBeUndefined();
+  });
 });

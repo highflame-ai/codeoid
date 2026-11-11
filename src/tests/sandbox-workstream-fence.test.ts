@@ -51,4 +51,24 @@ describe("extraHidden", () => {
     expect(open.hidden).not.toContain(theirs);
     expect(open.reexposed).toContain(inside);
   });
+
+  test("an added dir inside another workstream's folder isn't kept: adding it can't open the fence", () => {
+    const home = join(base, "home");
+    const mine = join(home, "mine");
+    const theirs = join(home, "theirs");
+    for (const d of [mine, join(theirs, "sub")]) mkdirSync(d, { recursive: true });
+    const tmp = join(base, "tmp");
+    mkdirSync(tmp);
+    const spec = buildSandboxSpec({
+      sessionId: "s",
+      workspace: mine,
+      tempDir: tmp,
+      network: { mode: "off" },
+      hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" },
+      addedDirs: [{ dir: join(theirs, "sub") }],
+      extraHidden: [theirs],
+    });
+    expect(spec.addedDirs ?? []).not.toContain(join(theirs, "sub"));
+    expect(spec.writable).not.toContain(join(theirs, "sub"));
+  });
 });

@@ -14,7 +14,7 @@ import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import type { SessionWorkstreamInfo, WorkstreamResolution, WorkstreamSummary } from "../../protocol/types.js";
 import { readWorkstreamBinding, type WorkstreamBinding } from "./binding.js";
-import { expandPathRule, outermost, within } from "./folders.js";
+import { carveOut, expandPathRule, outermost, within } from "./folders.js";
 import { effectiveWorkstreams, type EffectiveWorkstream } from "./effective.js";
 import { FolderReader } from "./folder.js";
 import { expandHome, type MatchableWorkstream, matchFolder, normalizePathRule } from "./match.js";
@@ -36,8 +36,25 @@ export interface WorkstreamFence {
   home: string[];
   /** Readable only, never written. */
   references: Array<{ workstream: string; folders: string[] }>;
-  /** Neither read nor written: every other workstream's folders that hold none of the above. */
+  /**
+   * Every other workstream's folders: neither read nor written, but for what
+   * `readable` keeps inside them (a folder of another's holding the home, a
+   * reference's own folder, the session's workdir).
+   */
   foreign: Array<{ workstream: string; folders: string[] }>;
+  /**
+   * What the session may read wherever it is: its workdir and workspace, its
+   * home's folders, and its references' (as granted: a reference's paths,
+   * else its folders). Inside a foreign folder these stay readable; the
+   * rest of that folder doesn't.
+   */
+  readable: string[];
+  /**
+   * What a sandbox hides for it: each foreign folder whole, or, where
+   * something readable is inside one, every other entry on the way to it
+   * (folders.ts `carveOut`; hidden whole when that can't be done).
+   */
+  hidden: string[];
   limits: string[];
 }
 
@@ -192,7 +209,14 @@ export class WorkstreamService {
       found.push(...e.folders);
       limits.push(...e.limits);
     }
-    return { folders: outermost(found), limits };
+    // The home (or what holds it) is never one workstream's folder: fencing it would fence everything.
+    const homes = [this.#reader.home, this.#realHome()];
+    const kept = found.filter((f) => {
+      const holds = homes.some((h) => within(h, f));
+      if (holds) limits.push(`${id}: ${f} is the home or holds it, so it isn't fenced`);
+      return !holds;
+    });
+    return { folders: outermost(kept), limits };
   }
 
   /**
@@ -200,7 +224,11 @@ export class WorkstreamService {
    * isolation is off (nothing is fenced then, as before W3). `recorded(id)`
    * gives a workstream's recorded home folders.
    */
-  fenceFor(binding: WorkstreamBinding | undefined, recorded: (id: string) => readonly string[] = () => []): WorkstreamFence | undefined {
+  fenceFor(
+    binding: WorkstreamBinding | undefined,
+    recorded: (id: string) => readonly string[] = () => [],
+    own: readonly string[] = [],
+  ): WorkstreamFence | undefined {
     if (!this.configured || !this.#cfg.isolateGlobalServers) return undefined;
     const limits: string[] = [];
     const homeId = binding?.id && binding.source !== "reserved" && this.#effective.has(binding.id) ? binding.id : undefined;
@@ -220,16 +248,35 @@ export class WorkstreamService {
       // Kept with no folders here too: it still gives its memory (§7.2).
       references.push({ workstream: ref.workstream, folders });
     }
-    const readable = [...home, ...references.flatMap((r) => r.folders)];
+    // What stays readable even inside another workstream's folder: the
+    // session's own workdir (a session moved or homed past a claim keeps its
+    // folder), its home's folders, and what its references grant — exactly
+    // that, never the folder holding a reference's path.
+    const readable = [...new Set([...own, ...home, ...references.flatMap((r) => r.folders)])];
     const foreign: WorkstreamFence["foreign"] = [];
     for (const ws of this.#effective.values()) {
       if (ws.abstract || ws.id === homeId) continue;
-      // A folder holding a readable one can't be fenced off without fencing
-      // that too: the more specific rule made it the home's or a reference's.
-      const folders = of(ws.id).filter((f) => !readable.some((r) => within(r, f) || within(f, r)));
+      // Every one of its folders, nested in the home's or holding it (the
+      // more specific rule decides): what is readable inside one is carved
+      // out of it (gate.ts, the sandbox). A reference's workstream is here
+      // too: only what the reference grants is carved out.
+      const folders = of(ws.id);
       if (folders.length > 0) foreign.push({ workstream: ws.id, folders });
     }
-    return { ...(homeId ? { workstream: homeId } : {}), home, references, foreign, limits: [...new Set(limits)] };
+    const hidden: string[] = [];
+    for (const d of foreign.flatMap((f) => f.folders)) {
+      const keep = readable.filter((r) => within(r, d));
+      if (keep.length === 0) {
+        hidden.push(d);
+        continue;
+      }
+      const carved = keep.some((k) => k === d) ? [] : carveOut(d, keep);
+      if (carved === null) {
+        limits.push(`${d}: too much to carve around what this session reads there, so it is hidden whole`);
+        hidden.push(d);
+      } else hidden.push(...carved);
+    }
+    return { ...(homeId ? { workstream: homeId } : {}), home, references, foreign, readable, hidden: [...new Set(hidden)], limits: [...new Set(limits)] };
   }
 
   /**
@@ -260,6 +307,7 @@ export class WorkstreamService {
     const problem = this.choiceProblem(target);
     if (problem) return { ok: false, error: problem };
     if (binding?.source === "reserved") return { ok: false, error: "The conductor's home can't be changed" };
+    if (binding?.sealed) return { ok: false, error: "This session's workstream record couldn't be read back, so what it read from is unknown: it can't move to another workstream" };
     const from = new Set<string>(binding?.readFrom ?? []);
     if (binding?.id && binding.id !== this.#cfg.default) from.add(binding.id);
     from.delete(target);
@@ -494,7 +542,8 @@ export class WorkstreamService {
           parsed.source === "reserved" ||
           parsed.id === CONDUCTOR_WORKSTREAM ||
           (parsed.id !== undefined && this.#effective.get(parsed.id)?.abstract === true);
-        result = bad ? { binding: none(), persist: true } : { binding: parsed, persist: false };
+        // Unreadable: no home, and sealed (what it read from is unknown, so it never moves).
+        result = bad ? { binding: { ...none(), sealed: true }, persist: true } : { binding: parsed, persist: false };
       } else {
         const parent = m.parentId && depth < 32 ? byId.get(m.parentId) : undefined;
         const inherited = parent ? decide(parent, depth + 1).binding : undefined;
