@@ -8,7 +8,8 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "../config.js";
+import { loadConfig, loadDotEnv } from "../config.js";
+import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
@@ -18,6 +19,7 @@ import { FolderReader } from "../daemon/workstreams/folder.js";
 import { ALL_SCOPES, SCOPES } from "../protocol/scopes.js";
 import type { AuthContext, DaemonMessage, SessionInfo } from "../protocol/types.js";
 
+const DONE: ProviderEvent = { type: "turn_done", result: { providerId: "rec", model: "m", inputTokens: 1, outputTokens: 1, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0, durationMs: 1 } };
 const OWNER: AuthContext = { sub: "user:edit", scopes: [...ALL_SCOPES] as AuthContext["scopes"], delegationDepth: 0, accountId: "acc", projectId: "proj" };
 const pushed: DaemonMessage[] = [];
 const client = { id: "c-edit", auth: OWNER, send: (m: DaemonMessage) => void pushed.push(m) };
@@ -156,6 +158,30 @@ describe("live edits after the W2 audit", () => {
     if (r.type === "response.error") expect(r.error).toContain("daemon's own environment");
   });
 
+  it("a value set in both .env and the real environment is refused too: .env was skipped at start", async () => {
+    await h({ type: "credential.upsert", id: "b1", item: { id: "both", kind: "env" } });
+    writeFileSync(join(tmp, "config", "codeoid", ".env"), "CODEOID_CRED_BOTH=from-file\n");
+    process.env.CODEOID_CRED_BOTH = "from-env";
+    loadDotEnv();
+    const r = await h({ type: "credential.set_value", id: "b2", credential: "both", value: "x" });
+    expect(r).toMatchObject({ type: "response.error" });
+    expect(readFileSync(join(tmp, "config", "codeoid", ".env"), "utf8")).toContain("CODEOID_CRED_BOTH=from-file");
+  });
+
+  it("forgetting an OAuth slot clears every tenant's sign-in to it, never the default sign-in", () => {
+    const a = { accountId: "a", projectId: "p" };
+    const b = { accountId: "b", projectId: "p" };
+    store.saveMcpOAuthTokens(a, { name: "slack", url: "https://s/mcp", slot: "work" }, { access_token: "1" }, 1);
+    store.saveMcpOAuthTokens(b, { name: "slack", url: "https://old/mcp", slot: "work" }, { access_token: "2" }, 1);
+    store.saveMcpOAuthTokens(a, { name: "slack", url: "https://s/mcp" }, { access_token: "3" }, 1);
+    const gone = store.clearMcpOAuthSlot("slack", "work");
+    expect(gone.map((t) => t.accountId).sort()).toEqual(["a", "b"]);
+    expect(store.getMcpOAuthCredential(a, { name: "slack", url: "https://s/mcp", slot: "work" })).toBeUndefined();
+    expect(store.getMcpOAuthCredential(b, { name: "slack", url: "https://old/mcp", slot: "work" })).toBeUndefined();
+    expect(store.getMcpOAuthCredential(a, { name: "slack", url: "https://s/mcp" })?.tokens).toEqual({ access_token: "3" });
+    expect(store.clearMcpOAuthSlot("slack", "")).toEqual([]);
+  });
+
   it("a live session's backend env follows the workstream: a cleared credential is gone at its next start", async () => {
     const seen: Array<Record<string, string>> = [];
     const registry = new ProviderRegistry("rec");
@@ -183,6 +209,47 @@ describe("live edits after the W2 audit", () => {
     expect({ ...env }.GH_TOKEN).toBe("tok-2");
     await hm({ type: "credential.set_value", id: "l6", credential: "gh", value: null });
     expect({ ...env }.GH_TOKEN).toBeUndefined();
+    await m.drain(2_000);
+  });
+
+  it("a backend that ran is rebuilt at the next turn when its workstream's env changed", async () => {
+    const made_: MockSessionProvider[] = [];
+    // A rebuild tears the backend down: its next turn starts it afresh with the env as it is now.
+    const torn = () => made_.reduce((n, p) => n + p.teardownCount, 0);
+    const registry = new ProviderRegistry("rec");
+    registry.register({
+      id: "rec",
+      displayName: "rec",
+      create: () => {
+        const p = new MockSessionProvider("rec", [[DONE], [DONE], [DONE]]);
+        made_.push(p);
+        return p;
+      },
+    });
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: loadConfig({ env: {}, quiet: true }),
+      providers: registry,
+      _testFolderReader: new FolderReader({ home: join(tmp, "home"), sshConfig: "" }),
+    });
+    const hm = (msg: Record<string, unknown>) => m.handle(msg as never, OWNER, client);
+    await hm({ type: "credential.upsert", id: "r1", item: { id: "gh", kind: "env" } });
+    await hm({ type: "credential.set_value", id: "r2", credential: "gh", value: "tok-1" });
+    await hm({ type: "workstream.upsert", id: "r3", item: { id: "acme", match: { paths: ["~/acme"] }, env: { GH_TOKEN: { secret: "gh" } } } });
+    const made = (await hm({ type: "session.create", id: "r4", name: "s", workdir: join(tmp, "home", "acme") })) as { data: SessionInfo };
+    const session = m.findByName(made.data.name, OWNER)!;
+    const idle = async () => {
+      for (let i = 0; i < 200 && session.toInfo().status !== "idle"; i++) await Bun.sleep(10);
+    };
+    await session.send("one", OWNER);
+    await idle();
+    const before = torn();
+    await session.send("two", OWNER);
+    await idle();
+    expect(torn()).toBe(before); // nothing changed: the same backend
+    await hm({ type: "credential.set_value", id: "r5", credential: "gh", value: "tok-2" });
+    await session.send("three", OWNER);
+    await idle();
+    expect(torn()).toBe(before + 1);
     await m.drain(2_000);
   });
 });

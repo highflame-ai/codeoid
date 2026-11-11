@@ -456,7 +456,12 @@ const NewSessionModal: Component = () => {
         void fetchAccounts(true).catch(() => {});
         // Workstreams, for the workstream picker (hidden without any).
         void fetchWorkstreams(true).catch(() => {});
-        requestAnimationFrame(() => nameRef?.focus());
+        // Only if focus is still outside the dialog: by the next frame the user
+        // may already be typing in another field, and moving focus then would
+        // send the rest of their typing into the name.
+        requestAnimationFrame(() => {
+          if (!nameRef?.form?.contains(document.activeElement)) nameRef?.focus();
+        });
       }
     }),
   );
@@ -508,6 +513,38 @@ const NewSessionModal: Component = () => {
     return w && w.name !== id ? w.name : id;
   }
 
+  /**
+   * A create refused: past another workstream's exclusive claim, the confirm
+   * is offered (never sent unasked); no home for the folder, the picker is
+   * the way where there is one (`picker`), Settings where not — the daemon's
+   * own text names a CLI flag. Anything else is the daemon's message.
+   */
+  function showCreateError(err: unknown, picker: boolean, overrideToken?: string): void {
+    const detail = err && typeof err === "object" && "detail" in err ? (err as { detail?: { kind?: string; resolution?: WorkstreamResolution } }).detail : undefined;
+    const conflict = detail?.kind === "workstream_conflict" ? detail.resolution?.conflict : undefined;
+    if (picker && conflict?.overrideToken && !overrideToken) {
+      setOverrideOffer(conflict);
+      setError(null);
+      return;
+    }
+    setOverrideOffer(null);
+    if (detail?.kind === "workstream_required") {
+      const ambiguous = detail.resolution?.ambiguous;
+      const why =
+        ambiguous && ambiguous.length > 0
+          ? `${ambiguous.map(nameOf).join(" and ")} both match this folder${/remote/.test(err instanceof Error ? err.message : "") ? " (its repository's remote changed)" : ""}`
+          : "This folder belongs to no workstream";
+      setError(picker ? `${why}: choose a workstream.` : `${why}: set one up for it, or a default, in Settings → Workstreams.`);
+      if (picker) workstreamSelect?.focus();
+      return;
+    }
+    if (!picker && detail?.kind === "workstream_conflict" && conflict) {
+      setError(`This folder belongs to workstream "${nameOf(conflict.folder)}" (exclusive): start the run from a session there.`);
+      return;
+    }
+    setError(err instanceof Error ? err.message : String(err));
+  }
+
   async function submit(ev: Event, overrideToken?: string): Promise<void> {
     ev.preventDefault();
     if (busy()) return;
@@ -542,7 +579,7 @@ const NewSessionModal: Component = () => {
         // PipelineRunner cockpit (state/pipelines carries them) — close here.
         closeAndReset();
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        showCreateError(err, false);
         setBusy(false);
       }
       return;
@@ -570,6 +607,8 @@ const NewSessionModal: Component = () => {
           // Pack ADOPTION (docs/role-model-binding.md §6): the pack — not the
           // collab machinery — defines what each role is. Omitted = free-form.
           ...(packId() ? { pack: packId() } : {}),
+          ...(workstream() ? { workstream: workstream() } : {}),
+          ...(overrideToken && workstream() ? { override: { token: overrideToken } } : {}),
           collaboration: {
             goal: goal().trim(),
             roles: roles().map((r) => ({
@@ -606,8 +645,9 @@ const NewSessionModal: Component = () => {
       } catch (err) {
         // The daemon's message is the useful one here — it names the exact
         // rule broken (unknown provider, non-claude orchestrator, over the
-        // child ceiling), so surface it verbatim rather than paraphrasing.
-        setError(err instanceof Error ? err.message : String(err));
+        // child ceiling), so surface it verbatim; a workstream refusal is
+        // worded for the picker.
+        showCreateError(err, true, overrideToken);
         setBusy(false);
       }
       return;
@@ -674,27 +714,7 @@ const NewSessionModal: Component = () => {
         closeAndReset();
       }
     } catch (err) {
-      // Past another workstream's exclusive claim, with a way to confirm it:
-      // offered, never sent unasked.
-      const detail = err && typeof err === "object" && "detail" in err ? (err as { detail?: { kind?: string; resolution?: WorkstreamResolution } }).detail : undefined;
-      const conflict = detail?.kind === "workstream_conflict" ? detail.resolution?.conflict : undefined;
-      if (conflict?.overrideToken && !overrideToken) {
-        setOverrideOffer(conflict);
-        setError(null);
-      } else if (detail?.kind === "workstream_required") {
-        // The daemon's text names a CLI flag; here the picker is the way.
-        setOverrideOffer(null);
-        const ambiguous = detail.resolution?.ambiguous;
-        setError(
-          ambiguous && ambiguous.length > 0
-            ? `Choose a workstream for this folder: ${ambiguous.map(nameOf).join(" and ")} both match${/remote/.test(err instanceof Error ? err.message : "") ? " (its repository's remote changed)" : ""}.`
-            : "This folder belongs to no workstream: choose one.",
-        );
-        workstreamSelect?.focus();
-      } else {
-        setOverrideOffer(null);
-        setError(err instanceof Error ? err.message : String(err));
-      }
+      showCreateError(err, true, overrideToken);
       setBusy(false);
     }
   }
@@ -1232,7 +1252,7 @@ const NewSessionModal: Component = () => {
             </Show>
           </div>
 
-          <Show when={mode() === "session" && homeChoices().length > 0}>
+          <Show when={mode() !== "pipeline" && homeChoices().length > 0}>
             <label class="block space-y-1.5">
               <span class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">Workstream</span>
               <select

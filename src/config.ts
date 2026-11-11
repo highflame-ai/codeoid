@@ -151,6 +151,16 @@ export function isLoopbackUrl(url: string): boolean {
  * optional surrounding single/double quotes are stripped. Intentionally
  * minimal — not a full dotenv dialect (no interpolation, no multiline).
  */
+const shadowedDotEnv = new Set<string>();
+
+/**
+ * Whether `.env` sets `key` but the daemon's real environment set it first,
+ * so the file's value isn't the one in use (recorded by `loadDotEnv`).
+ */
+export function dotEnvShadowed(key: string): boolean {
+  return shadowedDotEnv.has(key);
+}
+
 export function loadDotEnv(): string[] {
   const envPath = join(getConfigDir(), ".env");
   if (!existsSync(envPath)) return [];
@@ -169,7 +179,10 @@ export function loadDotEnv(): string[] {
     const key = line.slice(0, eq).trim();
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
     // Real environment wins — file is the fallback, not an override.
-    if (process.env[key] !== undefined) continue;
+    if (process.env[key] !== undefined) {
+      shadowedDotEnv.add(key);
+      continue;
+    }
     let value = line.slice(eq + 1).trim();
     if (
       value.length >= 2 &&

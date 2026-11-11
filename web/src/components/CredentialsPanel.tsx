@@ -63,8 +63,14 @@ export const CredentialsPanel: Component = () => {
         <Show when={credentialsState().loaded && credentialsState().credentials.length === 0}>
           <div class="px-3 py-3 text-[12px] text-fg-muted">None declared yet.</div>
         </Show>
-        <For each={credentialsState().credentials}>
-          {(c) => <CredentialRow c={c} writable={store().writable} run={run} busy={busy()} />}
+        {/* Keyed by id, not by object: every refresh hands new objects, and a row
+            remounting would drop a value being typed or an open confirm. */}
+        <For each={credentialsState().credentials.map((c) => c.id)}>
+          {(id) => (
+            <Show when={credentialsState().credentials.find((c) => c.id === id)}>
+              {(c) => <CredentialRow c={c()} writable={store().writable} run={run} busy={busy()} />}
+            </Show>
+          )}
         </For>
       </div>
       <Show

@@ -1441,8 +1441,11 @@ export class Session {
     });
   }
 
+  /** A hash of the composed env: held to compare, so the values themselves aren't kept around. */
   #envDigest(): string {
-    return JSON.stringify(Object.entries(this.#composedEnv()).sort(([a], [b]) => a.localeCompare(b)));
+    return createHash("sha256")
+      .update(JSON.stringify(Object.entries(this.#composedEnv()).sort(([a], [b]) => a.localeCompare(b))))
+      .digest("hex");
   }
   /** The session's OS sandbox (#448); null on a Session built without a sandbox registry. */
   #sandbox: SessionSandbox | null = null;
@@ -3005,8 +3008,8 @@ export class Session {
    */
   async #applyMcpView(): Promise<void> {
     const view = this.#mcpView;
-    if (!view || this.#mcpBusy()) return;
-    if (!view.loaded || this.#mcpRefreshPending) {
+    if ((!view && !this.#workstreamEnv) || this.#mcpBusy()) return;
+    if (view && (!view.loaded || this.#mcpRefreshPending)) {
       this.#mcpRefreshPending = false;
       try {
         await this.#loadMcp();
@@ -3154,18 +3157,20 @@ export class Session {
    * Whether it was rebuilt. The first time, nothing was built yet: just noted.
    */
   async #rebuildForMcp(): Promise<boolean> {
-    const view = this.#mcpView;
-    if (!view?.loaded) return false;
-    if (this.#mcpBuiltWith === undefined) {
-      this.#mcpBuiltWith = view.fingerprint;
-      this.#envBuiltWith ??= this.#envDigest();
-      this.#releaseMcp();
-      return false;
-    }
     // The workstream's env changed since the backend started (a credential
-    // cleared or swapped, an env entry removed): rebuilt too, like its servers.
+    // cleared or swapped, an env entry removed): rebuilt too, like its servers
+    // — with or without an MCP view (a session may have none).
     const envNow = this.#workstreamEnv ? this.#envDigest() : undefined;
-    if (view.fingerprint === this.#mcpBuiltWith && (envNow === undefined || envNow === (this.#envBuiltWith ??= envNow))) return false;
+    if (envNow !== undefined) this.#envBuiltWith ??= envNow;
+    const envChanged = envNow !== undefined && envNow !== this.#envBuiltWith;
+    const view = this.#mcpView;
+    if (!view?.loaded) {
+      if (!envChanged) return false;
+    } else if (this.#mcpBuiltWith === undefined) {
+      this.#mcpBuiltWith = view.fingerprint;
+      this.#releaseMcp();
+      if (!envChanged) return false;
+    } else if (view.fingerprint === this.#mcpBuiltWith && !envChanged) return false;
     await this.#teardownProvider(); // records what's applied, and lets go of what was removed
     await this.#reseedAfterTeardown();
     return true;

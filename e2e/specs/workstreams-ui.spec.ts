@@ -83,4 +83,24 @@ test("workstreams in the web UI: settings, the new-session picker, a confirmed o
     await page.setViewportSize({ width: w, height: h });
     await page.screenshot({ path: join(SHOTS, `session-${w}x${h}.png`), fullPage: false });
   }
+
+  // A collaborative session has the picker too, and it fits every window.
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.getByRole("button", { name: /new session/ }).click();
+  await page.getByRole("radio", { name: "Collaborative" }).click();
+  await page.getByRole("textbox", { name: /^Workdir/ }).fill(codeoid.workdir);
+  const picker = page.getByLabel("Workstream");
+  await expect(picker).toContainText("The folder's: acme", { timeout: 10_000 });
+  for (const [w, h] of VIEWPORTS) {
+    await page.setViewportSize({ width: w, height: h });
+    await picker.scrollIntoViewIfNeeded();
+    const box = await picker.boundingBox();
+    expect(box && box.width > 100 && box.height > 16 && box.x >= 0 && box.x + box.width <= w).toBe(true);
+    // The create button keeps its label below the picker, in every window.
+    const create = page.getByRole("button", { name: "create collaboration" });
+    await create.scrollIntoViewIfNeeded();
+    const cb = await create.boundingBox();
+    expect(cb && cb.width > 60 && cb.height > 16 && cb.x + cb.width <= w && cb.y >= 0 && cb.y + cb.height <= h).toBe(true);
+    await page.screenshot({ path: join(SHOTS, `collaborate-${w}x${h}.png`), fullPage: false });
+  }
 });

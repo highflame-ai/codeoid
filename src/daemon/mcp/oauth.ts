@@ -272,6 +272,21 @@ export class McpOAuth implements McpCredentialSource {
     this.#rejected.delete(keyOf(spec, tenant));
   }
 
+  /**
+   * Forget a credential slot of a server entirely (its credential was
+   * removed): every tenant's tokens and client registration, at every URL.
+   * Returns the tenants that had one, so their clients can be dropped.
+   */
+  forgetSlot(server: string, slot: string): McpTenant[] {
+    const tenants = this.#store.clearMcpOAuthSlot(server, slot);
+    for (const t of tenants) {
+      const key = keyOf({ name: server, slot }, t);
+      this.#signIns.set(key, (this.#signIns.get(key) ?? 0) + 1);
+      this.#rejected.delete(key);
+    }
+    return tenants;
+  }
+
   // ── internals ──────────────────────────────────────────────────────────────
 
   async #refresh(spec: McpServerSpec, tenant: McpTenant): Promise<string | undefined> {

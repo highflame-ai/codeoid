@@ -525,10 +525,11 @@ describe("WorkstreamService", () => {
     expect(s.envFor(undefined, store).env).toEqual({});
   });
 
-  test("summaries list env names, never values", () => {
+  test("summaries list env names and credential ids, never values", () => {
     const s = service([{ id: "a", env: { GH_TOKEN: { secret: "gh-a" } } }]);
     expect(s.summaries()[0].env).toEqual(["GH_TOKEN"]);
-    expect(JSON.stringify(s.summaries())).not.toContain("gh-a");
+    // A credential id is a reference the editor shows; a value never is here.
+    expect(s.summaries()[0].config).toMatchObject({ env: { GH_TOKEN: { secret: "gh-a" } } });
   });
 });
 

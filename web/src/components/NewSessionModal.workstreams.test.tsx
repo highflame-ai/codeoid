@@ -28,7 +28,7 @@ vi.mock("../state/workstreams", () => ({
   resolveWorkstream: resolveMock,
 }));
 
-import NewSessionModal, { openNewSessionModal } from "./NewSessionModal";
+import NewSessionModal, { openCollaborateModal, openNewSessionModal, openPipelineModal } from "./NewSessionModal";
 
 afterEach(() => {
   cleanup();
@@ -94,8 +94,18 @@ describe("the new-session dialog's workstream", () => {
       Object.assign(new Error("…choose the workstream with --workstream."), { detail: { kind: "workstream_required", resolution: { source: "none", candidates: [], ambiguous: ["acme", "mine"] } } }),
     );
     fireEvent.click(r.getByRole("button", { name: /^create/i }));
-    await waitFor(() => expect(r.container.textContent).toContain("Choose a workstream for this folder: Acme and mine both match"));
+    await waitFor(() => expect(r.container.textContent).toContain("Acme and mine both match this folder: choose a workstream."));
     expect(r.container.textContent).not.toContain("--workstream");
+  });
+
+  it("a collaborative session has the picker too; a pipeline run has none (it takes the folder's)", async () => {
+    resolveMock.mockResolvedValue({ home: "acme", source: "matched", matchedBy: "~/acme", candidates: [] });
+    const r = render(() => <NewSessionModal />);
+    openCollaborateModal("ship it");
+    expect(r.getByLabelText("Workstream")).toBeTruthy();
+    openPipelineModal("ship it");
+    await waitFor(() => expect(r.queryByLabelText("Workstream")).toBeNull());
+    openNewSessionModal();
   });
 
   it("a failed check says so, and a changed folder never shows the last folder's answer", async () => {

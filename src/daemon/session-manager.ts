@@ -156,7 +156,7 @@ import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
 import { isOAuthServer, type McpServerSpec, OAUTH_UNSUPPORTED_BACKENDS } from "./mcp/types.js";
-import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, getConfigDir, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
+import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, dotEnvShadowed, getConfigDir, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { endpointNameOf, endpointProviderId, ORCHESTRATOR_ROLE, type ProviderInfo } from "../protocol/types.js";
 import type {
@@ -3547,7 +3547,9 @@ mcpHub: this.#mcpHub,
       if (!this.#secrets.writable || this.#secrets.kind !== "env-file") return err(`The ${this.#secrets.kind} credential store is managed outside codeoid`);
       // A value from the daemon's real environment (not .env) wins at the next
       // start whatever is written here: say so rather than seem to change it.
-      if (process.env[credentialEnvName(decl.id)] !== undefined && !readDotEnvValueSet(credentialEnvName(decl.id))) {
+      // Set in both is the same: .env was skipped at start (dotEnvShadowed).
+      const name = credentialEnvName(decl.id);
+      if (process.env[name] !== undefined && (dotEnvShadowed(name) || !readDotEnvValueSet(name))) {
         return err(`${credentialEnvName(decl.id)} is set in the daemon's own environment, which wins over .env: change it there`);
       }
       const w = writeCredentialValue(credentialEnvName(decl.id), msg.value);
@@ -3577,12 +3579,11 @@ mcpHub: this.#mcpHub,
       });
       if (!written.ok) return err(written.error);
       if (msg.type === "credential.delete" && existing?.kind !== "oauth" && this.#secrets.writable && this.#secrets.kind === "env-file") writeCredentialValue(credentialEnvName(id), null);
-      // An OAuth slot's sign-in goes with it (the caller's): re-declaring the id
-      // later must not silently reuse an old sign-in.
+      // An OAuth slot's sign-ins go with it, every tenant's: re-declaring the
+      // id later must not silently reuse an old sign-in.
       if (msg.type === "credential.delete" && existing?.kind === "oauth") {
-        const spec = this.#mcpRegistry?.get(existing.server);
-        if (spec && this.#mcpOAuth) this.#mcpOAuth.disconnect(withSlot(spec, existing.id), tenantOf(auth));
-        this.#mcpHub?.dropTenant(existing.server, tenantOf(auth));
+        const tenants = this.#mcpOAuth?.forgetSlot(existing.server, existing.id) ?? [];
+        for (const t of tenants) this.#mcpHub?.dropTenant(existing.server, t);
       }
       this.#store.audit(auth.sub, msg.type, "", `id=${id}`);
       this.#applyWorkstreamConfig(written.config);

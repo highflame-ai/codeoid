@@ -1909,6 +1909,20 @@ export class Store {
   }
 
   /**
+   * Delete one named credential slot of a server for every tenant and URL
+   * (the credential was removed). Never the default sign-in (slot ""). Returns
+   * the tenants that had a row.
+   */
+  clearMcpOAuthSlot(server: string, slot: string): Array<{ accountId: string; projectId: string }> {
+    if (!slot) return [];
+    const rows = this.#db
+      .prepare("SELECT DISTINCT account_id, project_id FROM mcp_oauth_credentials WHERE server = ? AND credential = ?")
+      .all(server, slot) as Array<{ account_id: string; project_id: string }>;
+    this.#db.prepare("DELETE FROM mcp_oauth_credentials WHERE server = ? AND credential = ?").run(server, slot);
+    return rows.map((r) => ({ accountId: r.account_id, projectId: r.project_id }));
+  }
+
+  /**
    * Forget part of a tenant's OAuth state for a server: its tokens (sign out,
    * or the server rejected them), its client registration, or both. A hard
    * delete on purpose — a credential should not outlive the user's sign-out.

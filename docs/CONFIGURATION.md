@@ -452,6 +452,8 @@ Under isolation a session you create in a folder with no workstream is refused u
 Settings → Workstreams and Settings → Credentials in the web UI (or the `workstream.*` / `credential.*` messages) edit `config.json` and `.env` directly; the whole config is validated before anything is written.
 A change applies at once to new sessions and to every call a session makes through codeoid; a running session's backend is rebuilt with its workstream's servers, env and credentials as they are now at its next turn.
 A session keeps its workstream: editing rules never moves a session to another.
+A value set in the daemon's own environment (`CODEOID_CRED_<ID>=… codeoid start`) wins over `.env`, so setting it from the UI is refused: change it where it is set.
+Removing an OAuth credential signs every user out of that slot, so declaring the id again later starts from no sign-in.
 
 ### Overrides
 
