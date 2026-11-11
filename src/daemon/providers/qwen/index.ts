@@ -503,6 +503,12 @@ export class QwenProvider implements SessionProvider {
         ...(Object.keys(mcpServers).length > 0
           ? { mcpServers: mcpServers as never }
           : {}),
+        // Workstream isolation (G1): Qwen also loads MCP servers from its own
+        // settings (~/.qwen, a project's .qwen/ and .mcp.json): kept to the
+        // names codeoid mounts. Empty would mean "no filter".
+        ...(init.mcpRegistry?.isolated
+          ? { allowedMcpServerNames: Object.keys(mcpServers).length > 0 ? Object.keys(mcpServers).sort() : ["codeoid-isolated-none"] }
+          : {}),
         ...(desiredAppend
           ? {
               systemPrompt: {

@@ -2976,6 +2976,32 @@ export class Session {
     if (this.#destroyed) return;
     await this.#rebuildForMcp();
     this.#auditRepoServers(); // a backend switched to, or a sign-in hold that lapsed
+    this.#noteWithheldServers();
+  }
+
+  /** The servers last said to be withheld (workstream isolation), so each set is said once. */
+  #withheldSaid = "";
+
+  /**
+   * Under workstream isolation (G1), servers the home selects that this
+   * backend can't be given without holding a secret (a stdio server needing
+   * env values): an info line once per set, so a missing tool isn't a mystery.
+   */
+  #noteWithheldServers(): void {
+    const names = (this.#mcpView?.withheldFromNative(this.#provider.id) ?? []).map((s) => s.name).sort();
+    const key = `${this.#provider.id}\u0000${names.join("\u0000")}`;
+    if (names.length === 0 || key === this.#withheldSaid) return;
+    this.#withheldSaid = key;
+    const infoMsg = this.#makeMessage(
+      "info",
+      `⚠ Not given on ${this.#provider.id}: ${names.join(", ")} — a stdio MCP server that needs secret values can't be handed to this backend without exposing them (workstream isolation).`,
+      SYSTEM_IDENTITY,
+      undefined,
+      undefined,
+      { event: "workstream.servers_withheld", servers: names.join(",") },
+    );
+    this.#persistAndBuffer(infoMsg);
+    this.#broadcastRaw(infoMsg);
   }
 
   /**
@@ -4853,6 +4879,13 @@ export class Session {
     if (sandboxRefused) {
       this.#store.audit(sender.sub, "session.sandbox_refused", this.id, sandboxRefused);
       throw new SandboxRequiredError(`Not started: ${sandboxRefused}`);
+    }
+    // Workstream isolation (G1) on a backend that can't be kept to codeoid's
+    // MCP servers yet: opencode loads a project's own config, which codeoid
+    // doesn't filter. Refused rather than run with servers the home didn't give.
+    if (this.#provider.id === "opencode" && this.#mcpView?.isolated) {
+      this.#store.audit(sender.sub, "session.isolation_refused", this.id, "opencode");
+      throw new Error("Not started: opencode can't be kept to its workstream's MCP servers yet — switch this session to another backend, or turn workstream isolation off");
     }
     this.#store.audit(sender.sub, "session.send", this.id);
     // Its worktree folders, removed while empty at the last turn's end, are there again for this one's commands: only

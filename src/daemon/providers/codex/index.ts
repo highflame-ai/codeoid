@@ -47,6 +47,7 @@
  */
 
 import type { McpTenant } from "../../mcp/oauth.js";
+import { codexIsolationArgs, codexMountedNames } from "./isolation.js";
 import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { AsyncQueue } from "../../async-queue.js";
@@ -983,6 +984,11 @@ export class CodexProvider implements SessionProvider {
       // (codexSandboxPolicy) or, run whole inside, this one's.
       // Its home is a private copy (backend-home.ts): nothing its commands
       // write there runs later in a codex outside the sandbox.
+      // Workstream isolation (G1): codex's own configured servers and apps off,
+      // so the session reaches only what codeoid mounted. Fails the start
+      // (CodexIsolationError) rather than run with a server it can't name.
+      const own = codexMountedNames([...mcp.args, ...bb.args, ...sbx.args, ...reg.args, ...oauth.args]);
+      const isolation = this.#mcpRegistry?.isolated ? codexIsolationArgs(defaultCodexHome(env), opts.workdir, own) : [];
       const rt = this.#sandboxRuntime();
       let handle: SandboxHandle | null = null;
       let procEnv = env;
@@ -996,7 +1002,7 @@ export class CodexProvider implements SessionProvider {
       this.#proc = new CodexRpcProcess({
         command: this.#command,
         argsPrefix: this.#argsPrefix,
-        args: [...mcp.args, ...bb.args, ...sbx.args, ...reg.args, ...oauth.args, ...(shellEnv ?? [])],
+        args: [...mcp.args, ...bb.args, ...sbx.args, ...reg.args, ...oauth.args, ...(shellEnv ?? []), ...isolation],
         cwd: opts.workdir,
         env: procEnv,
         ...(handle?.wrap ? { wrap: handle.wrap.bind(handle) } : {}),

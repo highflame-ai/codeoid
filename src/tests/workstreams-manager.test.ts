@@ -376,7 +376,7 @@ describe("the folder record: a repository match that changed is refused, not a s
     origin("https://github.com/corp/app");
     const refused = await create(m, "r2", "repo");
     expect(refused).toMatchObject({ type: "response.error", detail: { kind: "workstream_required" } });
-    if (refused.type === "response.error") expect(refused.error).toContain('was workstream "mine"');
+    if (refused.type === "response.error") expect(refused.error).toContain('matched workstream "mine"');
     expect(((await create(m, "r3", "repo", { workstream: "corp" })) as { data: SessionInfo }).data.workstream).toMatchObject({ id: "corp" });
     expect(((await create(m, "r4", "repo")) as { data: SessionInfo }).data.workstream).toMatchObject({ id: "corp", source: "matched" });
   });
@@ -404,3 +404,43 @@ describe("signing in to a credential slot", () => {
     }
   });
 });
+
+describe("the folder record after the W1 audit", () => {
+  it("an explicit choice never poisons it: the next plain create in the folder still gets the folder's match", async () => {
+    const repo = join(tmp, "home", "repo2");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    writeFileSync(join(repo, ".git", "config"), `[remote "origin"]\n\turl = https://github.com/mine/app\n`);
+    const m = manager({ items: [{ id: "mine", match: { remotes: ["github.com/mine/*"] } }, { id: "research" }] });
+    expect((await create(m, "p1", "repo2", { workstream: "research" })).type).toBe("response.ok");
+    expect(((await create(m, "p2", "repo2")) as { data: SessionInfo }).data.workstream).toMatchObject({ id: "mine", source: "matched" });
+  });
+
+  it("a delegated token can't edit the origin and then choose the workstream it now matches", async () => {
+    const repo = join(tmp, "home", "repo3");
+    mkdirSync(join(repo, ".git"), { recursive: true });
+    const origin = (url: string) => writeFileSync(join(repo, ".git", "config"), `[remote "origin"]\n\turl = ${url}\n`);
+    origin("https://github.com/acme/x");
+    const m = manager({ items: [{ id: "acme", match: { remotes: ["github.com/acme/*"] } }, { id: "beta", match: { remotes: ["github.com/beta/*"] } }] });
+    expect((await create(m, "q1", "repo3")).type).toBe("response.ok");
+    origin("https://github.com/beta/x");
+    const r = await m.handle(
+      { type: "session.create", id: "q2", name: "q2", workdir: repo, workstream: "beta" } as never,
+      { ...OWNER, delegationDepth: 1 },
+      client,
+    );
+    expect(r).toMatchObject({ type: "response.error", detail: { kind: "workstream_required" } });
+  });
+});
+
+describe("the hub's per-call check, wired by the manager (G4)", () => {
+  it("under isolation an unknown session reaches nothing; a live one only its grant", async () => {
+    const m = manager({ ...WS, isolateGlobalServers: true });
+    const hub = new McpHub({});
+    m.setMcp(new McpRegistry({}, { memoryEnabled: false }), hub);
+    const spec = { name: "notes", builtin: false, transport: { kind: "stdio", command: "x", args: [], env: {} }, trust: "prompt", scope: "workspace", enabled: true, native: false } as never;
+    expect(await hub.callTool(spec, "t", {}, { workspaceId: "w", sessionId: "nope" })).toMatchObject({ isError: true, text: expect.stringContaining("no such session") });
+    const made = (await create(m, "g1", "mine")) as { data: SessionInfo };
+    expect(await hub.callTool(spec, "t", {}, { workspaceId: "w", sessionId: made.data.id })).toMatchObject({ isError: true, text: expect.stringContaining('not in workstream "mine"') });
+  });
+});
+

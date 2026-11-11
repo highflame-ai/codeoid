@@ -1065,7 +1065,12 @@ export class ClaudeProvider implements SessionProvider {
       ...withMcpToolTimeout(userServers, mcpToolTimeoutMs),
       // Registry servers — mounted natively on the SDK (claude owns its client);
       // tool calls surface as `mcp__<server>__<tool>` and gate via canUseTool.
-      ...(oauthMcp.strict ? {} : withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs)),
+      // Strict (isolated): only the stdio servers needing no secret are the
+      // CLI's to run (forNativeMount keeps to those); every HTTP one is a bridge.
+      ...withMcpToolTimeout(
+        oauthMcp.strict ? stdioOnly(registryServersForClaude(init.mcpRegistry)) : registryServersForClaude(init.mcpRegistry),
+        mcpToolTimeoutMs,
+      ),
       // Registry OAuth servers the tenant has signed in to — in-process, in
       // front of the daemon-owned client, which holds the token (#390). The
       // hub applies its own per-call timeout.
@@ -2665,6 +2670,11 @@ export function registryServersForClaude(registry: McpServerView | undefined): R
     }
   }
   return out;
+}
+
+/** The stdio entries of a server map (a strict, isolated Claude bridges every HTTP one). */
+function stdioOnly(servers: Record<string, McpServerConfig>): Record<string, McpServerConfig> {
+  return Object.fromEntries(Object.entries(servers).filter(([, cfg]) => typeof (cfg as { command?: unknown }).command === "string"));
 }
 
 /** User servers minus those codeoid owns now — by URL: a server of the same

@@ -156,7 +156,20 @@ export function isProxied(spec: McpServerSpec): boolean {
  *  of the config file; a literal (no `${...}`) passes through unchanged. */
 export function resolveEnvValue(value: string, env: Record<string, string | undefined>): string {
   const m = /^\$\{(\w+)\}$/.exec(value);
-  return m ? (env[m[1]] ?? "") : value;
+  if (!m) return value;
+  // Never codeoid's own: the daemon's environment carries every workstream's
+  // credential (CODEOID_CRED_*), its root key and bot tokens — a server
+  // config (a repo's .mcp.json included) naming one must not be handed it.
+  return isDaemonOwnedEnvName(m[1]) ? "" : (env[m[1]] ?? "");
+}
+
+/**
+ * The daemon's own variables (providers/env.ts DENY_PREFIXES): kept out of
+ * every agent process, and out of every value an MCP server config can name
+ * by `${VAR}` or `bearerTokenEnv` (workstreams W1 audit).
+ */
+export function isDaemonOwnedEnvName(name: string): boolean {
+  return /^(CODEOID_|ZEROID_|TELEGRAM_)/.test(name);
 }
 
 /** Resolve every value in an env map via {@link resolveEnvValue}. */

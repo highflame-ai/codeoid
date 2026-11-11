@@ -1,0 +1,134 @@
+/**
+ * Codex under workstream isolation (docs/workstreams-design.md §6.1, G1).
+ *
+ * Codex loads MCP servers of its own besides the ones codeoid passes with
+ * `-c mcp_servers.*`: from its user config (`$CODEX_HOME/config.toml`), from
+ * a project's `.codex/config.toml`, and its apps (ChatGPT connectors). A `-c
+ * mcp_servers={}` override does not clear them (measured: codex 0.166 merges
+ * the override into the table), but `-c mcp_servers.<name>.enabled=false`
+ * turns one off. So every server any of those files declares, that codeoid
+ * didn't add, is turned off by name, and apps with them.
+ *
+ * Each one also gets a placeholder transport of its own kind (a dead loopback
+ * URL, a no-op command): a project file codex doesn't trust isn't loaded, and
+ * an override naming only `enabled` would then be a server with no transport,
+ * which codex refuses to start with (measured). The placeholder keeps the
+ * entry valid either way — and no server's real URL ever reaches argv.
+ *
+ * Fails closed: a declared name that can't be written as a config key, or a
+ * config file that can't be read, refuses the start — a server codeoid can't
+ * name is a server it can't keep out.
+ */
+
+import { closeSync, constants as fsc, fstatSync, openSync, readSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { codexKeySafe } from "./shell-env.js";
+
+const MAX_CONFIG_BYTES = 1_000_000;
+const MAX_WALK = 64;
+
+export class CodexIsolationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CodexIsolationError";
+  }
+}
+
+/** A small regular file's text, never through a final link, never blocking; undefined if absent. */
+function readConfig(path: string): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, fsc.O_RDONLY | fsc.O_NOFOLLOW | fsc.O_NONBLOCK);
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code === "ENOENT" || (e as NodeJS.ErrnoException).code === "ENOTDIR") return undefined;
+    throw new CodexIsolationError(`codex config ${path} can't be read (${(e as NodeJS.ErrnoException).code}): refusing to start without knowing its MCP servers`);
+  }
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > MAX_CONFIG_BYTES) throw new CodexIsolationError(`codex config ${path} isn't a small regular file: refusing to start without knowing its MCP servers`);
+    const buf = Buffer.alloc(st.size);
+    let off = 0;
+    while (off < st.size) {
+      const n = readSync(fd, buf, off, st.size - off, off);
+      if (n <= 0) break;
+      off += n;
+    }
+    return buf.subarray(0, off).toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/** Every server of every `mcp_servers` table anywhere in a parsed config (profiles included), by transport kind. */
+function serverNames(doc: unknown, out: Map<string, "url" | "command">, depth = 0): void {
+  if (depth > 8 || typeof doc !== "object" || doc === null || Array.isArray(doc)) return;
+  for (const [k, v] of Object.entries(doc as Record<string, unknown>)) {
+    if (k === "mcp_servers" && typeof v === "object" && v !== null && !Array.isArray(v)) {
+      for (const [name, entry] of Object.entries(v as Record<string, unknown>)) {
+        const kind = typeof entry === "object" && entry !== null && "url" in entry ? "url" : "command";
+        const seen = out.get(name);
+        if (seen && seen !== kind) {
+          throw new CodexIsolationError(`codex configs declare MCP server "${name}" both as a URL and as a command: refusing to start without knowing which codex runs`);
+        }
+        out.set(name, kind);
+      }
+    } else serverNames(v, out, depth + 1);
+  }
+}
+
+/** The config files codex may load for a session in `workdir`. */
+export function codexConfigFiles(codexHome: string, workdir: string): string[] {
+  const files = [join(codexHome, "config.toml")];
+  let cur = workdir;
+  for (let i = 0; i < MAX_WALK; i += 1) {
+    files.push(join(cur, ".codex", "config.toml"));
+    const up = dirname(cur);
+    if (up === cur) break;
+    cur = up;
+  }
+  return files;
+}
+
+/**
+ * The `-c` arguments that keep codex to codeoid's servers: each server its
+ * own configs declare, other than `own`, turned off; apps off.
+ */
+export function codexIsolationArgs(codexHome: string, workdir: string, own: ReadonlySet<string>): string[] {
+  const declared = new Map<string, "url" | "command">();
+  for (const file of codexConfigFiles(codexHome, workdir)) {
+    const text = readConfig(file);
+    if (text === undefined) continue;
+    let doc: unknown;
+    try {
+      doc = Bun.TOML.parse(text);
+    } catch {
+      throw new CodexIsolationError(`codex config ${file} isn't valid TOML: refusing to start without knowing its MCP servers`);
+    }
+    serverNames(doc, declared);
+  }
+  const args: string[] = [];
+  for (const [name, kind] of [...declared].sort(([a], [b]) => a.localeCompare(b))) {
+    if (own.has(name)) continue;
+    if (!codexKeySafe(name)) {
+      throw new CodexIsolationError(`codex config declares an MCP server named ${JSON.stringify(name)}, which codeoid can't turn off by name: rename it to start codex under workstream isolation`);
+    }
+    args.push(
+      "-c",
+      kind === "url" ? `mcp_servers.${name}.url="http://127.0.0.1:9/codeoid-disabled"` : `mcp_servers.${name}.command="codeoid-disabled"`,
+      "-c",
+      `mcp_servers.${name}.enabled=false`,
+    );
+  }
+  args.push("-c", "features.apps=false");
+  return args;
+}
+
+/** The server names a set of `-c mcp_servers.<name>.…` arguments adds. */
+export function codexMountedNames(args: readonly string[]): Set<string> {
+  const out = new Set<string>();
+  for (const a of args) {
+    const m = /^mcp_servers\.([A-Za-z0-9_-]+)\./.exec(a);
+    if (m) out.add(m[1]!);
+  }
+  return out;
+}

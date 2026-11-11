@@ -1136,6 +1136,10 @@ program
       },
     ) => {
       const config = loadConfig();
+      if (opts.override && !opts.workstream) {
+        console.error("--override confirms a --workstream choice; give one (codeoid workstream match <dir> shows the folder's).");
+        process.exit(1);
+      }
       let sandbox: SessionSandboxSetting | undefined;
       try {
         sandbox = sandboxSettingFromFlags(opts);

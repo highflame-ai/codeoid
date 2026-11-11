@@ -438,8 +438,10 @@ Every reference to a credential is checked when the config loads: declared once,
 
 - **env and git identity** reach the backend's process (not opencode's shared server yet). A name codeoid owns for the backend (`ANTHROPIC_*`, `PATH`, `LD_*`, …) fails the config load.
 - **mcpServers** take effect with `isolateGlobalServers: true`. Then a session reaches built-ins, the servers its home names, and the folder's own servers only when the folder is the home's; no home, the conductor's, or a deleted one: built-ins only.
-  - Claude runs with a strict MCP config: nothing from `~/.claude.json`, a `.mcp.json`, a plugin or an agent's own; every server it reaches is codeoid's, called by the daemon. Tools only: an MCP server's prompts and resources don't pass.
-  - Other CLI backends (Codex, Gemini CLI, Qwen, opencode) mount natively only servers that need no secret; an HTTP server called with a credential goes through the daemon's relay, and a stdio server that needs env values is not given.
+  - Claude runs with a strict MCP config: nothing from `~/.claude.json`, a `.mcp.json`, a plugin or an agent's own. Every HTTP server it reaches is codeoid's, called by the daemon (tools only: a server's prompts and resources don't pass); a stdio server needing no secret is the CLI's to run, inside the session's sandbox as before.
+  - Codex, the Gemini CLI and Qwen are kept to codeoid's servers: Codex has every server its own configs declare (`~/.codex/config.toml`, a project's `.codex/config.toml`) turned off and its apps off; the Gemini CLI and Qwen are started with only codeoid's server names allowed. opencode can't be kept to them yet: under isolation its turns are refused.
+  - Every backend mounts natively only servers that need no secret — none in a header, an env value, the URL (a token in its path or query) or the command line. An HTTP server that needs one goes through the daemon's relay; a stdio one isn't given, and the session says so.
+  - A server config can never name codeoid's own variables: `${CODEOID_*}` (every credential's value lives there), `${ZEROID_*}`, `${TELEGRAM_*}` resolve empty, and such a `bearerTokenEnv` is ignored.
   - A credential's value is read by the daemon when it calls the server, never handed to a backend. A server removed from a workstream fails on the next call, mid-turn; the tool list catches up at the next turn.
 - **skillDirs** are accepted but not applied yet (the daemon says so at start).
 

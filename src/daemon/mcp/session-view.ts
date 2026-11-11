@@ -33,6 +33,7 @@ import type { RawMcpServerConfig } from "../../config.js";
 import type { McpHub } from "./hub.js";
 import type { McpGrant } from "../workstreams/grant.js";
 import { withSlot } from "./oauth.js";
+import { redactSecretText, urlHasHiddenParts } from "./redact.js";
 import type { McpTenant } from "./oauth.js";
 import { isReservedMcpName, normalizeSpec, type McpRegistry, type McpServerView } from "./registry.js";
 import { isOAuthServer, type McpServerSpec } from "./types.js";
@@ -243,8 +244,8 @@ export class SessionMcpView implements McpServerView {
 
   /** A name the project's .mcp.json declared, on a backend that loads that file itself: its tools may be the repo's. */
   leftToBackend(name: string, backendId: string): boolean {
-    // Isolated, Claude runs strict: it loads no .mcp.json, so nothing is its own.
-    if (backendId === "claude" && this.isolated) return false;
+    // Isolated, no backend loads a .mcp.json of its own: nothing is left to it.
+    if (this.isolated) return false;
     return READS_MCP_JSON.has(backendId) && (this.#repoUnreadable || this.#mcpJsonNames.has(name));
   }
 
@@ -278,9 +279,11 @@ export class SessionMcpView implements McpServerView {
   }
 
   relayFor(backendId: string): McpServerSpec[] {
+    // Not isolated: exactly what the relay reached before workstreams — the
+    // daemon-wide registry's OAuth servers.
+    if (!this.isolated) return this.#base.relayFor(backendId);
     const http = (s: McpServerSpec) => s.transport.kind === "http";
     const oauth = this.oauthFor(backendId).filter(http);
-    if (!this.isolated) return oauth;
     const credentialed = this.forBackend(backendId).filter((s) => !s.builtin && !isOAuthServer(s) && http(s) && !secretFree(s));
     return [...oauth, ...credentialed];
   }
@@ -351,8 +354,9 @@ export class SessionMcpView implements McpServerView {
     // Isolated, Claude runs with a strict MCP config and loads none of its
     // own: the workdir layer is codeoid's to give it, as to every backend.
     if (backendId !== "claude" || grant) {
-      // Strict (isolated) Claude reads no .mcp.json of its own: those are codeoid's to give.
-      const mcpJsonNames = backendId && READS_MCP_JSON.has(backendId) && !(grant && backendId === "claude") ? declared : null;
+      // Isolated, no backend reads a .mcp.json of its own (Claude runs strict,
+      // Qwen keeps to the names codeoid mounts): those are codeoid's to give.
+      const mcpJsonNames = backendId && READS_MCP_JSON.has(backendId) && !grant ? declared : null;
       for (const spec of layer) {
         if (mcpJsonNames?.has(spec.name)) continue;
         const existing = byName.get(spec.name);
@@ -427,11 +431,20 @@ function mcpJsonNamesOf(read: readonly WorkdirServer[]): ReadonlySet<string> {
   return new Set(read.filter((w) => isMcpJson(w.path)).map((w) => w.name));
 }
 
-/** A server a backend can mount itself without holding any secret. */
+/**
+ * A server a backend can mount itself without holding any secret: no
+ * credential, bearer, header or env value — and none in the address or the
+ * command line either (a token in a URL's path or query, `user:pass@`, a
+ * `--token …` argument), as the redaction rules read them (redact.ts).
+ */
 export function secretFree(spec: McpServerSpec): boolean {
   const t = spec.transport;
-  if (t.kind === "http") return !t.credential && !t.bearerTokenEnv && Object.keys(t.headers ?? {}).length === 0;
-  if (t.kind === "stdio") return Object.keys(t.env ?? {}).length === 0;
+  if (t.kind === "http") {
+    return !t.credential && !t.bearerTokenEnv && Object.keys(t.headers ?? {}).length === 0 && !urlHasHiddenParts(t.url);
+  }
+  if (t.kind === "stdio") {
+    return Object.keys(t.env ?? {}).length === 0 && [t.command, ...(t.args ?? [])].every((a) => redactSecretText(a) === a);
+  }
   return true;
 }
 

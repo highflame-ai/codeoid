@@ -266,6 +266,13 @@ export class McpProxy implements McpProxyMount {
     if (sessionId) {
       const relay = record.relays.get(sessionId);
       if (!relay || relay.server !== server) return rpcError(404, ErrorCode.InvalidRequest, "session not found");
+      // Its credential changed since it started (the workstream moved the
+      // server to another credential or slot): never keep calling with the
+      // old one. Closed, and a 404 makes the backend initialize again (W1 audit).
+      if (relay.variant !== (spec.variant ?? "")) {
+        void relay.close();
+        return rpcError(404, ErrorCode.InvalidRequest, "session not found");
+      }
       if (req.method !== "POST") {
         opts.liftIdleTimeout?.();
         return relay.handle(req);
@@ -423,6 +430,8 @@ const CLIENT_NOTIFICATIONS = new Set(["notifications/roots/list_changed"]);
 
 class Relay {
   readonly server: string;
+  /** Which credential it calls with (a workstream's slot or named credential lives in the variant). */
+  readonly variant: string;
   /** When the backend last used this session (for eviction at the cap). */
   lastUsed = Date.now();
   readonly #init: RelayInit;
@@ -443,6 +452,7 @@ class Relay {
   private constructor(init: RelayInit) {
     this.#init = init;
     this.server = init.spec.name;
+    this.variant = init.spec.variant ?? "";
     this.#transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: () => randomBytes(16).toString("hex"),
       onsessioninitialized: (id) => init.onSession(id, this),

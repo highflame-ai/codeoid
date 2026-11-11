@@ -339,6 +339,13 @@ export class McpHub {
   /** Drop one tenant's client for a server (it signed out or back in). */
   dropTenant(name: string, tenant: McpTenant): void {
     this.#drop(tenantKey(name, tenant));
+    // ...and every variant of it for this tenant: a credential slot's client
+    // (workstreams §6.5) is keyed by its variant, and a sign-in or sign-out
+    // to the server must not leave one connected on the old credential.
+    const suffix = tenantKey("", tenant);
+    for (const key of [...this.#clients.keys()]) {
+      if (key.startsWith(`${name}\u0001`) && key.endsWith(suffix)) this.#drop(key);
+    }
   }
 
   /** Drop `client` if this failure broke it — and only if it is still the

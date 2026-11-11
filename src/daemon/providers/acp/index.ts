@@ -358,7 +358,7 @@ export class GeminiAcpProvider implements SessionProvider {
       this.#proc = new StdioJsonRpcProcess({
         name: "gemini-cli",
         command: this.#command,
-        args: [...this.#argsPrefix, "--acp"],
+        args: [...this.#argsPrefix, ...this.#isolationArgs(), "--acp"],
         cwd: opts.workdir,
         env,
         ...(handle?.wrap ? { wrap: handle.wrap.bind(handle) } : {}),
@@ -506,6 +506,25 @@ export class GeminiAcpProvider implements SessionProvider {
       });
     }
     return servers;
+  }
+
+  /**
+   * Workstream isolation (G1): the Gemini CLI also loads MCP servers from its
+   * own settings (`~/.gemini/settings.json`, a project's `.gemini/`) and its
+   * extensions. `--allowed-mcp-server-names` keeps it to the names codeoid
+   * mounts (session/new's list: built-ins, native mounts, the relay's) — an
+   * empty list would mean "no filter", so none mounted names one that isn't.
+   */
+  #isolationArgs(): string[] {
+    const reg = this.#mcpRegistry;
+    if (!reg?.isolated) return [];
+    const names = new Set<string>();
+    if (this.#memoryMcp) names.add(MEMORY_MCP_SERVER_NAME);
+    if (this.#blackboardMcp?.()) names.add(BLACKBOARD_MCP_SERVER_NAME);
+    if (this.#sandboxMcp?.()) names.add(SANDBOX_MCP_SERVER_NAME);
+    for (const s of reg.forNativeMount(this.id)) names.add(s.name);
+    for (const s of reg.relayFor(this.id)) names.add(s.name);
+    return ["--allowed-mcp-server-names", ...(names.size > 0 ? [...names].sort() : ["codeoid-isolated-none"])];
   }
 
   #push(event: ProviderEvent): void {

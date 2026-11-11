@@ -4276,7 +4276,10 @@ mcpHub: this.#mcpHub,
     // workstream's grant as it is NOW (G4): a revoked server fails mid-turn.
     hub.setPermit((sessionId, spec) => {
       const session = this.#sessions.get(sessionId);
-      return session ? grantRefusal(this.#workstreams.grantFor(session.workstream), spec) : undefined;
+      if (session) return grantRefusal(this.#workstreams.grantFor(session.workstream), spec);
+      // Not (or no longer) a session here — a teardown racing a call: under
+      // isolation that is no grant at all, never every server (W1 audit).
+      return this.#workstreams.grantFor(undefined) ? `MCP server "${spec.name}": no such session` : undefined;
     });
     this.#mcpOAuth = oauth;
   }
@@ -4578,7 +4581,7 @@ mcpHub: this.#mcpHub,
       if (!hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE) || auth.delegationDepth > 0) {
         return { type: "response.error", requestId: msg.id, error: "Overriding a folder's workstream needs session:approve on an undelegated token", code: "forbidden" };
       }
-      if (msg.workstream === undefined || !this.#overrides.redeem(msg.override.token, { sub: auth.sub, workdir, chosen: msg.workstream, revision: this.#workstreams.revision })) {
+      if (msg.workstream === undefined || !this.#overrides.valid(msg.override.token, { sub: auth.sub, workdir, chosen: msg.workstream, revision: this.#workstreams.revision })) {
         return { type: "response.error", requestId: msg.id, error: "The override token is invalid, used, or expired — or the workstreams changed since: ask again", code: "invalid_request" };
       }
       overridden = true;
@@ -4606,7 +4609,7 @@ mcpHub: this.#mcpHub,
       const resolution =
         homing.kind === "workstream_unknown"
           ? undefined
-          : conflict?.overridable && msg.workstream !== undefined
+          : conflict?.overridable && msg.workstream !== undefined && hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE) && auth.delegationDepth === 0
             ? {
                 ...homing.resolution,
                 conflict: {
@@ -4627,27 +4630,30 @@ mcpHub: this.#mcpHub,
 
       };
     }
-    // A repository rule matching otherwise than this folder resolved before
-    // (§5.1): an `origin` is text an agent can edit, so a changed match is the
-    // owner's to confirm — by choosing — never a silent re-home.
-    if (homing.ok && homing.binding?.source === "matched" && homing.binding.id) {
+    // The folder record (§5.1) is what the FOLDER matches, never the home a
+    // session chose: an `origin` is text an agent can edit, so a repository
+    // match that changed since the folder was last used is the owner's to
+    // confirm — by choosing — never a silent re-home.
+    const own = homing.ok && this.#workstreams.configured ? this.#workstreams.resolve(workdir, undefined, givenWorkdir) : undefined;
+    const folderMatch = own?.source === "matched" ? own.home : undefined;
+    // An explicit choice settles it for the owner — but not for a delegated
+    // token, which could otherwise edit the origin and then "choose" the
+    // workstream it now matches (W1 audit).
+    if (homing.ok && (msg.workstream === undefined || auth.delegationDepth > 0) && folderMatch && own?.matchedBy?.startsWith("remote ")) {
       const before = this.#store.workstreamFolder({ accountId: auth.accountId, projectId: auth.projectId, workdir });
-      if (before && before !== homing.binding.id && homing.binding.matchedBy?.startsWith("remote ")) {
-        this.#store.audit(auth.sub, "session.workstream.remote_changed", "", `workdir=${workdir} was=${before} now=${homing.binding.id}`);
+      if (before && before !== folderMatch) {
+        this.#store.audit(auth.sub, "session.workstream.remote_changed", "", `workdir=${workdir} was=${before} now=${folderMatch}`);
         return {
           type: "response.error",
           requestId: msg.id,
-          error: `This folder was workstream "${before}", but its repository now matches "${homing.binding.id}" (${homing.binding.matchedBy}). Its remote may have been changed: choose the workstream with --workstream.`,
+          error: `This folder matched workstream "${before}", but its repository now matches "${folderMatch}" (${own.matchedBy}). Its remote may have been changed: choose the workstream with --workstream.`,
           code: "invalid_request",
-          detail: { kind: "workstream_required", resolution: { source: "none", candidates: homing.resolution?.candidates ?? [], ambiguous: [before, homing.binding.id].sort() } },
+          detail: { kind: "workstream_required", resolution: { source: "none", candidates: own.candidates, ambiguous: [before, folderMatch].sort() } },
         };
       }
     }
     for (const w of homing.warnings) warn(w);
     const createWorkstream = homing.binding;
-    if (createWorkstream?.id && createWorkstream.source !== "default") {
-      this.#store.setWorkstreamFolder({ accountId: auth.accountId, projectId: auth.projectId, workdir }, createWorkstream.id);
-    }
     if (createWorkstream?.source === "override") {
       const c = homing.resolution?.conflict;
       this.#store.audit(auth.sub, "workstream.override", "", `workdir=${workdir} folder=${c?.folder ?? "?"} chosen=${createWorkstream.id} revision=${createWorkstream.revision}`);
@@ -4963,6 +4969,12 @@ mcpHub: this.#mcpHub,
     goalSessionId = session.id;
     this.#sessions.set(session.id, session);
     this.#rateLimiter.recordCreation(auth.sub);
+    // Now the session exists: record what the folder matches (any create here
+    // — a choice too — vouches for the folder as it is now).
+    // The override it confirmed is spent now that the session exists (G3).
+    if (msg.override && createWorkstream?.source === "override") this.#overrides.spend(msg.override.token);
+    // Never from a delegated token's create: what the folder matched is the owner's to vouch for.
+    if (folderMatch && auth.delegationDepth === 0) this.#store.setWorkstreamFolder({ accountId: auth.accountId, projectId: auth.projectId, workdir }, folderMatch);
     // What the sandbox resolves to here, said at once (#448).
     const sandboxInfo = await session.ensureSandbox();
     if (msg.sandbox?.provider === "off") this.#store.audit(auth.sub, "session.sandbox_off", session.id, "at create");

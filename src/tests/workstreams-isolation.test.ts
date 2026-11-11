@@ -169,14 +169,17 @@ describe("every call is checked against the grant as it is now (G4)", () => {
 });
 
 describe("Claude under isolation", () => {
-  it("runs strict, and every reachable server is a bridge to the hub — no config, command or secret of its own", async () => {
-    const v = await view({ workstream: "acme", servers: new Map([["notes", {}], ["platform", {}]]), workdirServers: false });
+  it("runs strict; every reachable HTTP server is a bridge to the hub, a stdio one stays the CLI's to run in its sandbox", async () => {
+    const v = await view({ workstream: "acme", servers: new Map([["notes", {}], ["platform", {}], ["vault", {}]]), workdirServers: false });
     const hub = new McpHub({});
     const r = oauthServersForClaude(v, hub, { workspaceId: "w", sessionId: "s", tenant: TENANT });
     expect(r.strict).toBe(true);
     const mounts = r.mounts();
-    expect(Object.keys(mounts).sort()).toEqual(["notes", "platform"]);
+    expect(Object.keys(mounts)).toEqual(["platform"]);
     for (const m of Object.values(mounts)) expect(m.type).toBe("sdk");
+    // notes needs no secret: the CLI runs it; vault needs env values: withheld, and said.
+    expect(names(v.forNativeMount("claude"))).toEqual(["notes"]);
+    expect(names(v.withheldFromNative("claude"))).toEqual(["vault"]);
   });
 
   it("without isolation nothing changes: not strict, no bridges beyond signed-in OAuth servers", async () => {
@@ -231,3 +234,44 @@ describe("WorkstreamService.grantFor", () => {
     }
   });
 });
+
+describe("secrets outside the obvious fields (W1 audit)", () => {
+  it("a token in a URL or a command line isn't secret-free: relayed or withheld, never mounted natively", async () => {
+    const registry = new McpRegistry(
+      {
+        zap: raw({ url: "https://hooks.zapier.com/api/mcp/s/Zx9Kq2Lm8Np4Rt7Vw1Yb3Cd5Ef6Gh0Jk/mcp" }),
+        tok: raw({ command: "gh-mcp", args: ["--token", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"] }),
+        plain: raw({ command: "npx", args: ["-y", "@acme/mcp"] }),
+      },
+      { memoryEnabled: false },
+    );
+    const v = new SessionMcpView(registry, null, {
+      workdir: "/w",
+      tenant: TENANT,
+      approvals: () => new Set(),
+      read: async () => [],
+      readGlobal: async () => null,
+      grant: () => ({ workstream: "a", servers: new Map([["zap", {}], ["tok", {}], ["plain", {}]]), workdirServers: false }),
+    });
+    await v.load();
+    expect(names(v.forNativeMount("codex"))).toEqual(["plain"]);
+    expect(names(v.relayFor("codex"))).toEqual(["zap"]);
+    expect(names(v.withheldFromNative("codex"))).toEqual(["tok"]);
+  });
+
+  it("a server config can't name the daemon's own variables: ${CODEOID_*} resolves empty, a CODEOID_ bearerTokenEnv is dropped", async () => {
+    const { resolveEnvValue } = await import("../daemon/mcp/types.js");
+    const env = { CODEOID_CRED_X: "secret", ZEROID_KEY: "k", MINE: "ok" };
+    expect(resolveEnvValue("${CODEOID_CRED_X}", env)).toBe("");
+    expect(resolveEnvValue("${ZEROID_KEY}", env)).toBe("");
+    expect(resolveEnvValue("${MINE}", env)).toBe("ok");
+    const spec = new McpRegistry({ s: raw({ url: "https://s.example", bearerTokenEnv: "CODEOID_CRED_X" }) }, { memoryEnabled: false }).get("s");
+    expect(spec?.transport).not.toHaveProperty("bearerTokenEnv", "CODEOID_CRED_X");
+  });
+
+  it("not isolated, the relay reaches exactly what it did before: the daemon registry's OAuth servers", async () => {
+    const v = await view(undefined, [entry("mine", "claude-local", raw({ url: "https://mine.example", oauth: true }))]);
+    expect(names(v.relayFor("codex"))).toEqual([]);
+  });
+});
+

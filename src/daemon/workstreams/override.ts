@@ -41,16 +41,25 @@ export class OverrideTokens {
     return token;
   }
 
-  /** True once, for a live token bound to exactly this request. A wrong binding spends nothing. */
-  redeem(token: string, binding: OverrideBinding): boolean {
+  /** Whether `token` is live and bound to exactly this request. Spends nothing. */
+  valid(token: string, binding: OverrideBinding): boolean {
     this.#sweep();
-    const h = hashOf(token);
-    const held = this.#tokens.get(h);
+    const held = this.#tokens.get(hashOf(token));
     if (!held) return false;
     const want = Buffer.from(keyOf(binding));
     const have = Buffer.from(held.key);
-    if (want.length !== have.length || !timingSafeEqual(want, have)) return false;
-    this.#tokens.delete(h);
+    return want.length === have.length && timingSafeEqual(want, have);
+  }
+
+  /** Spend a token: once the session it confirmed exists, so a create that fails later can be retried with it. */
+  spend(token: string): void {
+    this.#tokens.delete(hashOf(token));
+  }
+
+  /** True once, for a live token bound to exactly this request. A wrong binding spends nothing. */
+  redeem(token: string, binding: OverrideBinding): boolean {
+    if (!this.valid(token, binding)) return false;
+    this.spend(token);
     return true;
   }
 

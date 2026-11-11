@@ -67,12 +67,13 @@ export function oauthServersForClaude(
   // The sign-in, not just whether there is one: signed out and back in (after
   // a revoked token) between two turns must still get a fresh connection.
   const stamps = signedIn.map((s) => [s.name, hub?.credentialStamp(s, scope.tenant) ?? ""]);
-  // Under workstream isolation every other server the session may reach is a
-  // bridge too — stdio and HTTP alike, credentialed or not — so the CLI,
-  // running with a strict MCP config, holds no server config, secret or
-  // command of its own: what the hub reaches is all there is (G1).
+  // Under workstream isolation every other HTTP server the session may reach
+  // is a bridge too, credentialed or not: the CLI, running with a strict MCP
+  // config, holds no address or secret of its own (G1). A stdio server stays
+  // the CLI's to run — inside the session's sandbox, as before — when it needs
+  // no secret (the provider mounts those natively); one that does is withheld.
   const strict = registry?.isolated === true;
-  const bridged = strict && hub ? (registry?.forBackend("claude") ?? []).filter((s) => !s.builtin && !isOAuthServer(s)) : [];
+  const bridged = strict && hub ? (registry?.forBackend("claude") ?? []).filter((s) => !s.builtin && !isOAuthServer(s) && s.transport.kind === "http") : [];
   return {
     // Built only for a query being constructed, not on every turn's check.
     mounts: () =>
@@ -82,7 +83,8 @@ export function oauthServersForClaude(
       specs.map((s, i) => [s.name, deniedUrls[i], s.toolAllowlist ?? null]),
       stamps,
       strict,
-      bridged.map((s) => [s.name, s.variant ?? "", s.toolAllowlist ?? null]),
+      // The address too: an edited URL must rebuild the query, not keep dialing the old one.
+      bridged.map((s) => [s.name, s.variant ?? "", s.toolAllowlist ?? null, s.transport.kind === "http" ? s.transport.url : ""]),
     ]),
     strict,
   };
