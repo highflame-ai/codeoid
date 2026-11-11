@@ -9,7 +9,8 @@
  */
 
 import { addedDirProblem, type OtherCheckout, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
-import { WorkstreamService, type WorkstreamBinding } from "./workstreams/service.js";
+import { WorkstreamService, type WorkstreamBinding, type WorkstreamFence } from "./workstreams/service.js";
+import { repositoryTopOf } from "./workstreams/folders.js";
 import { grantRefusal, type McpGrant } from "./workstreams/grant.js";
 import { OverrideTokens } from "./workstreams/override.js";
 import { withSlot } from "./mcp/oauth.js";
@@ -2331,8 +2332,9 @@ mcpHub: this.#mcpHub,
   #workstreamOpts(binding: WorkstreamBinding | undefined): {
     workstream?: WorkstreamBinding;
     describeWorkstream: (b: WorkstreamBinding | undefined) => ReturnType<WorkstreamService["info"]>;
-    workstreamEnv?: () => Readonly<Record<string, string>>;
-    mcpGrant: () => McpGrant | undefined;
+    workstreamEnv?: (b: WorkstreamBinding | undefined) => Readonly<Record<string, string>>;
+    mcpGrant: (b: WorkstreamBinding | undefined) => McpGrant | undefined;
+    workstreamFence: (b: WorkstreamBinding | undefined) => WorkstreamFence | undefined;
   } {
     const { missing } = this.#workstreams.envFor(binding, this.#secrets);
     if (missing.length > 0) {
@@ -2341,12 +2343,37 @@ mcpHub: this.#mcpHub,
     return {
       ...(binding ? { workstream: binding } : {}),
       describeWorkstream: this.#describeWorkstream,
-      // Read live: an edit to the workstream or a credential reaches the
-      // session's next backend start (its next turn), never only a restart.
-      ...(binding?.id ? { workstreamEnv: () => this.#workstreams.envFor(binding, this.#secrets).env } : {}),
-      // Read live: the grant follows the config as it is at each listing.
-      mcpGrant: () => this.#workstreams.grantFor(binding),
+      // Each read live, for the session's binding as it is then: an edit to
+      // the workstream or a credential, or a move to another (§5.3), reaches
+      // the session's next backend start (its next turn), never only a restart.
+      ...(this.#workstreams.configured || binding ? { workstreamEnv: (b: WorkstreamBinding | undefined) => (b?.id ? this.#workstreams.envFor(b, this.#secrets).env : {}) } : {}),
+      // The grant follows the config as it is at each listing.
+      mcpGrant: (b) => this.#workstreams.grantFor(b),
+      workstreamFence: (b) => this.#workstreamFence(b),
     };
+  }
+
+  /** Fences by binding and config revision, briefly: the gate reads one on every file tool call. */
+  #fenceCache = new Map<string, { at: number; fence: WorkstreamFence | undefined }>();
+
+  /**
+   * A session's read fence (workstreams §7.3), or undefined when isolation is
+   * off. Recorded home folders count as their workstream's (a remote rule
+   * names no path), as repository tops. Cached 5s: folders made meanwhile
+   * (a new clone) are fenced within that.
+   */
+  #workstreamFence(binding: WorkstreamBinding | undefined): WorkstreamFence | undefined {
+    if (!this.#workstreams.configured || !this.#workstreams.isolateGlobalServers) return undefined;
+    const key = `${this.#workstreams.revision}\u0000${JSON.stringify(binding ?? null)}`;
+    const now = Date.now();
+    const hit = this.#fenceCache.get(key);
+    if (hit && now - hit.at < 5_000) return hit.fence;
+    const recorded = this.#store.workstreamFoldersByWorkstream();
+    const home = homedir();
+    const fence = this.#workstreams.fenceFor(binding, (id) => (recorded.get(id) ?? []).map((w) => repositoryTopOf(w, home)));
+    if (this.#fenceCache.size > 256) this.#fenceCache.clear();
+    this.#fenceCache.set(key, { at: now, fence });
+    return fence;
   }
 
   /**

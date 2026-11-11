@@ -247,6 +247,25 @@ function within(child: string, parent: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+/**
+ * The paths a tool call reads or searches, as written (relative ones from its
+ * cwd), backend-neutral: also what the workstream fence judges (workstreams/gate.ts).
+ */
+export function toolReadPaths(toolName: string, input: unknown): string[] {
+  return candidatePaths(toolName, input);
+}
+
+/** Whether a tool searches (an absent root: the workdir): one whose root holds a fenced folder reads into it. */
+export function isSearchTool(toolName: string): boolean {
+  return SEARCH_TOOLS.has(toolName);
+}
+
+/** A tool's path made absolute from `cwd`, as the kernel resolves it, and its real path: the forms a check judges. */
+export function toolPathForms(p: string, cwd: string): string[] {
+  const literal = expand(p, cwd);
+  return [...new Set([literal, real(literal)])];
+}
+
 function candidatePaths(toolName: string, input: unknown): string[] {
   if (!input || typeof input !== "object") return [];
   const obj = input as Record<string, unknown>;

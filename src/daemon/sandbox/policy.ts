@@ -405,6 +405,12 @@ function within(child: string, parent: string): boolean {
 
 export interface SpecInputs {
   sessionId: string;
+  /**
+   * More paths hidden for this session alone: other workstreams' folders
+   * under its read fence (workstreams §7.3). Never the workspace or what
+   * holds it (SessionSandbox leaves those out).
+   */
+  extraHidden?: readonly string[];
   workspace: string;
   /**
    * The session's cwd, when it is below `workspace` (a monorepo's package,
@@ -1219,7 +1225,15 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
       if (record) refuse(pinProblem(r, "project root", { stored: record }));
       return dirIdentity(r) !== null ? r : realOr(r);
     })
-    .filter((r, i, all) => dirIdentity(r) !== null && all.indexOf(r) === i && !userHidden.some((u) => within(r, u)) && !inHidden(r));
+    .filter(
+      (r, i, all) =>
+        dirIdentity(r) !== null &&
+        all.indexOf(r) === i &&
+        !userHidden.some((u) => within(r, u)) &&
+        !inHidden(r) &&
+        // A root inside another workstream's folder: the session's own setting can't show it past its fence.
+        !(inputs.extraHidden ?? []).some((h) => within(r, resolve(h)) || within(realOr(r), realOr(resolve(h)))),
+    );
   // The credential files anywhere in a root and in an agent's own added dir (not the session's own); a root or such
   // a dir too big to look through whole isn't shown at all, nor written (fail closed: resolveSandbox says so).
   const scanned = [...rootCandidates, ...agentDirs];
@@ -1249,6 +1263,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     ...rootSecrets.hidden,
     ...locationSecrets.hidden,
     ...(root ? [root] : []),
+    ...(inputs.extraHidden ?? []).map((p) => resolve(p)),
   ];
   // The session's worktree folders: writable, but never inside something hidden (a root configured in a hidden
   // path), and, unlike the backend's own state, never taking a hidden path inside them out of the hidden list.

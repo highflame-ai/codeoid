@@ -1985,6 +1985,18 @@ export class Store {
     return row?.workstream;
   }
 
+  /** Every recorded folder by workstream, across tenants (the read fence: workstreams are daemon-wide config). */
+  workstreamFoldersByWorkstream(): Map<string, string[]> {
+    const rows = this.#db.prepare("SELECT DISTINCT workstream, workdir FROM workstream_folders").all() as { workstream: string; workdir: string }[];
+    const out = new Map<string, string[]>();
+    for (const r of rows) {
+      const list = out.get(r.workstream) ?? [];
+      list.push(r.workdir);
+      out.set(r.workstream, list);
+    }
+    return out;
+  }
+
   setWorkstreamFolder(scope: { accountId: string; projectId: string; workdir: string }, workstream: string): void {
     this.#db
       .prepare(
