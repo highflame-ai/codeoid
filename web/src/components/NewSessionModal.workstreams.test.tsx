@@ -53,8 +53,8 @@ describe("the new-session dialog's workstream", () => {
     requestMock.mockResolvedValueOnce({ info: { id: "s1", name: "s1" } });
     fireEvent.click(r.getByRole("button", { name: /^create/i }));
     await waitFor(() => expect(requestMock).toHaveBeenCalled());
-    expect(requestMock.mock.calls[0][0]).toMatchObject({ type: "session.create", workstream: "mine" });
-    expect(requestMock.mock.calls[0][0]).not.toHaveProperty("override");
+    expect(requestMock.mock.calls[0]![0]).toMatchObject({ type: "session.create", workstream: "mine" });
+    expect(requestMock.mock.calls[0]![0]).not.toHaveProperty("override");
   });
 
   it("a conflict is offered with what would change; Start anyway resends with the token", async () => {
@@ -70,11 +70,11 @@ describe("the new-session dialog's workstream", () => {
     fireEvent.click(r.getByRole("button", { name: /^create/i }));
     const offer = await r.findByRole("alert");
     expect(offer.textContent).toContain("belongs to workstream “acme” (exclusive)");
-    expect(offer.textContent).toContain("its servers (notes)");
+    expect(offer.textContent).toContain("“mine”'s servers (notes)");
     expect(offer.textContent).toContain("not given github");
     requestMock.mockResolvedValueOnce({ info: { id: "s2", name: "s2" } });
     fireEvent.click(r.getByRole("button", { name: "Start anyway" }));
     await waitFor(() => expect(requestMock).toHaveBeenCalledTimes(2));
-    expect(requestMock.mock.calls[1][0]).toMatchObject({ workstream: "mine", override: { token: "tok-1" } });
+    expect(requestMock.mock.calls[1]![0]).toMatchObject({ workstream: "mine", override: { token: "tok-1" } });
   });
 });

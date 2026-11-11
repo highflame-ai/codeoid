@@ -1237,11 +1237,16 @@ const NewSessionModal: Component = () => {
 
           <Show when={overrideOffer()}>
             {(c) => (
-              <div class="space-y-2 rounded border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-relaxed text-warn" role="alert">
+              <div
+                class="space-y-2 rounded border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-relaxed text-warn"
+                role="alert"
+                // Shown below the fold on a phone: brought into view as it appears.
+                ref={(el) => requestAnimationFrame(() => el.scrollIntoView?.({ block: "nearest", behavior: "smooth" }))}
+              >
                 <div class="font-semibold">This folder belongs to workstream “{c().folder}” (exclusive).</div>
                 <div>
                   A session here in “{c().chosen}” gets{" "}
-                  {c().changes && c().changes!.gains.length > 0 ? `its servers (${c().changes!.gains.join(", ")})` : "none of the folder's servers"}
+                  {c().changes && c().changes!.gains.length > 0 ? `“${c().chosen}”'s servers (${c().changes!.gains.join(", ")})` : `no MCP servers from “${c().chosen}”`}
                   {c().changes && c().changes!.env.length > 0 ? ` and env ${c().changes!.env.join(", ")}` : ""}
                   {c().changes?.git ? `, commits as ${c().changes!.git}` : ""}, and writes into “{c().folder}”'s code
                   {c().changes && c().changes!.withholds.length > 0 ? `; it is not given ${c().changes!.withholds.join(", ")}` : ""}.

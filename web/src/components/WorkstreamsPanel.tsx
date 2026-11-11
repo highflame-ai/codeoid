@@ -85,16 +85,17 @@ export const WorkstreamsPanel: Component = () => {
             </span>
           </span>
         </label>
-        <div class="flex items-center gap-2">
+        <p class="text-[12px] text-fg-muted">The default is the workstream of a folder nothing matches; with none, such a session has no workstream.</p>
+        <div class="flex flex-wrap items-center gap-2">
           <span class={label}>Default</span>
           <select
             aria-label="Default workstream"
-            class="rounded border border-border bg-bg px-2 py-1 text-[12px] text-fg"
+            class="min-w-0 max-w-full rounded border border-border bg-bg px-2 py-1 text-[12px] text-fg"
             value={workstreamsState().default ?? ""}
             disabled={busy() !== null}
             onChange={(e) => void run("default", () => saveWorkstreamSettings({ default: e.currentTarget.value || null }))}
           >
-            <option value="">none — a folder nothing matches has no workstream</option>
+            <option value="">none</option>
             <For each={homes()}>{(w) => <option value={w.id}>{w.name}</option>}</For>
           </select>
         </div>

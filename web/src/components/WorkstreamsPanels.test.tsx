@@ -2,7 +2,12 @@
 import { cleanup, fireEvent, render, waitFor } from "@solidjs/testing-library";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-const calls = vi.hoisted(() => ({ save: vi.fn(() => Promise.resolve()), settings: vi.fn(() => Promise.resolve()), setValue: vi.fn(() => Promise.resolve()), del: vi.fn(() => Promise.resolve()) }));
+const calls = vi.hoisted(() => ({
+  save: vi.fn((_item: Record<string, unknown>) => Promise.resolve()),
+  settings: vi.fn((_patch: Record<string, unknown>) => Promise.resolve()),
+  setValue: vi.fn((_id: string, _value: string | null) => Promise.resolve()),
+  del: vi.fn((_id: string) => Promise.resolve()),
+}));
 vi.mock("../state/connection", () => ({ getClient: () => ({ request: vi.fn() }), newRequestId: () => "r" }));
 vi.mock("../state/workstreams", () => ({
   fetchWorkstreams: vi.fn(() => Promise.resolve()),
@@ -63,7 +68,7 @@ describe("WorkstreamsPanel", () => {
     fireEvent.input(form.querySelector("textarea") as HTMLTextAreaElement, { target: { value: "~/acme\n~/acme-*" } });
     fireEvent.submit(form);
     await waitFor(() => expect(calls.save).toHaveBeenCalled());
-    expect(calls.save.mock.calls[0][0]).toMatchObject({ id: "acme", match: { paths: ["~/acme", "~/acme-*"] }, accounts: { claude: "work" }, mcpServers: [{ server: "github", credential: "gh" }] });
+    expect(calls.save.mock.calls[0]![0]).toMatchObject({ id: "acme", match: { paths: ["~/acme", "~/acme-*"] }, accounts: { claude: "work" }, mcpServers: [{ server: "github", credential: "gh" }] });
     fireEvent.click(r.getByRole("checkbox", { name: /Isolate MCP servers/ }));
     await waitFor(() => expect(calls.settings).toHaveBeenCalledWith({ isolateGlobalServers: true }));
   });
