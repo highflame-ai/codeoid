@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CodexIsolationError, codexIsolationArgs, codexMountedNames } from "./isolation.js";
+import { CodexIsolationError, codexIsolationArgs, codexMountedNames, tomlStructureProblem } from "./isolation.js";
 
 let tmp: string;
 beforeEach(() => {
@@ -70,5 +70,17 @@ describe("codex under workstream isolation", () => {
     symlinkSync(real, join(proj, ".codex", "config.toml"));
     expect(() => codexIsolationArgs(join(tmp, "none"), proj, new Set())).toThrow(CodexIsolationError);
   });
-});
 
+  test("the structure check doesn't lean on the runtime's TOML parser (Bun 1.3 takes an unclosed header)", () => {
+    expect(tomlStructureProblem("[mcp_servers.x\n")).toContain("table header");
+    expect(tomlStructureProblem('[mcp_servers."a b"]\ncommand = "x"\n')).toBeUndefined();
+    expect(tomlStructureProblem("[[profiles]]\nname = 'a' # [not a header\n")).toBeUndefined();
+    // A value spanning lines whose lines start with `[` is a value, not a header.
+    expect(tomlStructureProblem('args = [\n  ["a", "b"],\n  ["c"],\n]\n[mcp_servers.y]\ncommand = "c"\n')).toBeUndefined();
+    // A header-looking line inside a multi-line string is text.
+    expect(tomlStructureProblem('note = """\n[mcp_servers.z\n"""\n')).toBeUndefined();
+    expect(tomlStructureProblem('args = [\n  "a",\n')).toContain("left open");
+    expect(tomlStructureProblem('note = """\nnever closed\n')).toContain("left open");
+    expect(tomlStructureProblem('x = "unterminated\n')).toContain("string left open");
+  });
+});

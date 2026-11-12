@@ -105,7 +105,11 @@ export function codexIsolationArgs(codexHome: string, workdir: string, own: Read
     const text = readConfig(file, followed.has(file));
     if (text === undefined) continue;
     let doc: unknown;
+    // Held to its table headers first: a runtime's TOML parser may take a malformed one (Bun 1.3.x reads
+    // `[mcp_servers.x` as a table), where codex itself would read something else, or refuse.
+    const malformed = tomlStructureProblem(text);
     try {
+      if (malformed) throw new Error(malformed);
       doc = Bun.TOML.parse(text);
     } catch {
       throw new CodexIsolationError(`codex config ${file} isn't valid TOML: refusing to start without knowing its MCP servers`);
@@ -145,4 +149,59 @@ export function codexMountedNames(args: readonly string[]): Set<string> {
     if (m) out.add(m[1]!);
   }
   return out;
+}
+
+const TOML_KEY = String.raw`(?:[A-Za-z0-9_-]+|"(?:[^"\\\n]|\\.)*"|'[^'\n]*')`;
+const TOML_HEADER = new RegExp(String.raw`^\s*(?:\[\[\s*${TOML_KEY}(?:\s*\.\s*${TOML_KEY})*\s*\]\]|\[\s*${TOML_KEY}(?:\s*\.\s*${TOML_KEY})*\s*\])\s*(?:#.*)?$`);
+
+/**
+ * Why a TOML document's structure can't be trusted, or undefined: a table
+ * header that isn't well-formed, or a string, array or inline table left
+ * open at its end. Not a parser — only the shape every table header must
+ * have, found as a parser would find it: a line that starts with `[` outside
+ * any string and any open value (a multi-line array's `[1, 2],` is a value).
+ */
+export function tomlStructureProblem(text: string): string | undefined {
+  let depth = 0;
+  let multiline: string | null = null;
+  const lines = text.split(/\r?\n/);
+  for (const [n, line] of lines.entries()) {
+    let i = 0;
+    if (multiline) {
+      const end = line.indexOf(multiline);
+      if (end < 0) continue;
+      i = end + 3;
+      multiline = null;
+    } else if (depth === 0 && line.trimStart().startsWith("[")) {
+      if (!TOML_HEADER.test(line)) return `line ${n + 1}: a table header that isn't well-formed`;
+      continue;
+    }
+    while (i < line.length) {
+      const c = line[i]!;
+      if (c === "#") break;
+      if (line.startsWith('"""', i) || line.startsWith("'''", i)) {
+        const q = line.slice(i, i + 3);
+        const end = line.indexOf(q, i + 3);
+        if (end < 0) {
+          multiline = q;
+          break;
+        }
+        i = end + 3;
+        continue;
+      }
+      if (c === '"' || c === "'") {
+        let j = i + 1;
+        while (j < line.length && line[j] !== c) j += c === '"' && line[j] === "\\" ? 2 : 1;
+        if (j >= line.length) return `line ${n + 1}: a string left open`;
+        i = j + 1;
+        continue;
+      }
+      if (c === "[" || c === "{") depth++;
+      else if (c === "]" || c === "}") depth = Math.max(0, depth - 1);
+      i++;
+    }
+  }
+  if (multiline) return "a multi-line string left open";
+  if (depth > 0) return "an array or inline table left open";
+  return undefined;
 }
