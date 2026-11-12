@@ -470,3 +470,99 @@ describe("fleet handlers — send-class (P4, post-approval)", () => {
     expect(await handlers.fleet_tasks({})).toBe("Dispatch is disabled on this daemon.");
   });
 });
+
+describe("fleet handlers — workstreams (W4, §10)", () => {
+  /** authz-fix is in `hf` (closed), migration-work in `pub` (open). */
+  const wsFleet = () =>
+    fleet().map((s) => (s.id === "sess-authz-0001" ? { ...s, workstream: "hf" } : s.id === "sess-migr-0002" ? { ...s, workstream: "pub" } : { ...s, workstream: "conductor" }));
+  const withheld = (ref: { workstream?: string; sessionId?: string }) => (ref.workstream ?? (ref.sessionId === "sess-authz-0001" ? "hf" : undefined)) === "hf";
+  beforeEach(() => {
+    memory.ingest({
+      workspaceId: "ws-authz",
+      sessionId: "sess-authz-0001",
+      kind: "assistant_turn",
+      summary: "the authz secret customer detail",
+      content: "the authz secret customer detail in the closed workstream",
+      filePaths: [],
+      tokenEstimate: 10,
+      createdAt: Date.now() - 1000,
+      createdBy: "user:owner",
+      workstreamId: "hf",
+    });
+    memory.ingest({
+      workspaceId: "ws-admin",
+      sessionId: "sess-migr-0002",
+      kind: "assistant_turn",
+      summary: "the authz migration note in pub",
+      content: "the authz migration note in the open workstream",
+      filePaths: [],
+      tokenEstimate: 10,
+      createdAt: Date.now() - 500,
+      createdBy: "user:owner",
+      workstreamId: "pub",
+    });
+  });
+
+  test("a closed workstream's text never reaches the conductor; status does, and results name workstreams", async () => {
+    const h = createFleetHandlers(makeDeps({ listSessions: wsFleet, textWithheld: withheld }));
+    const list = await h.fleet_list();
+    expect(list).toContain("workstream=hf");
+    // A closed workstream's session never comes back from a query: that it matched is text too.
+    const found = await h.fleet_find({ query: "authz secret customer" });
+    expect(found).not.toContain("authz-fix");
+    expect(found).not.toContain("secret customer detail");
+    expect(found).toContain("[pub]");
+    const summary = await h.fleet_summary({ session: "authz-fix" });
+    expect(summary).toContain("idle");
+    expect(summary).not.toContain("secret customer");
+    const recalled = await h.fleet_recall({ query: "authz secret customer migration" });
+    expect(recalled).not.toContain("secret customer detail");
+    expect(recalled).not.toContain("hf");
+    expect(recalled).toContain("· pub");
+  });
+
+  test("an untagged episode (from before workstreams) is judged by its session: a closed one's never shows", async () => {
+    memory.ingest({
+      workspaceId: "ws-authz",
+      sessionId: "sess-authz-0001",
+      kind: "assistant_turn",
+      summary: "pre-workstreams zebra secret",
+      content: "pre-workstreams zebra secret",
+      filePaths: [],
+      tokenEstimate: 5,
+      createdAt: Date.now() - 100,
+      createdBy: "user:owner",
+    });
+    const h = createFleetHandlers(makeDeps({ listSessions: wsFleet, textWithheld: withheld }));
+    expect(await h.fleet_recall({ query: "zebra secret" })).not.toContain("zebra");
+    expect(await h.fleet_summary({ session: "authz-fix" })).not.toContain("zebra");
+  });
+
+  test("a workstream filter on list, find and recall", async () => {
+    const h = createFleetHandlers(makeDeps({ listSessions: wsFleet, textWithheld: withheld }));
+    expect(await h.fleet_list({ workstream: "pub" })).not.toContain("authz-fix");
+    expect(await h.fleet_find({ query: "authz", workstream: "pub" })).not.toContain("authz-fix");
+    expect(await h.fleet_recall({ query: "authz migration", workstream: "pub" })).not.toContain("[authz-fix");
+  });
+
+  test("fleet_spawn is homed where checkWorkstream says, and a refusal reaches the conductor before anything is queued", async () => {
+    const enqueued: Array<Record<string, unknown>> = [];
+    const dispatch: FleetDispatchDeps = {
+      enqueue: (input) => {
+        enqueued.push(input);
+        return "task-ws-0001";
+      },
+      interrupt: async () => {},
+      checkWorkdir: (p) => p,
+      resolveBackend: (provider, model) => ({ ok: true, provider, model }),
+      listTasks: () => [],
+      checkWorkstream: (_w, ws) => (ws === "nope" ? { ok: false, error: "Unknown workstream" } : ws === "acme" ? { ok: true, workstream: "acme", override: true } : { ok: true, workstream: "pub" }),
+    };
+    const h = createFleetHandlers(makeDeps({ dispatch }));
+    expect(await h.fleet_spawn({ workdir: "/ok/x", task: "t", workstream: "nope" })).toContain("Unknown workstream");
+    expect(enqueued).toEqual([]);
+    expect(await h.fleet_spawn({ workdir: "/ok/x", task: "t", workstream: "acme" })).toContain("homed in workstream acme (past the folder's own");
+    expect(enqueued[0]).toMatchObject({ workstream: "acme", workstreamOverride: true });
+    expect(await h.fleet_spawn({ workdir: "/ok/x", task: "t" })).toContain("homed in workstream pub");
+  });
+});

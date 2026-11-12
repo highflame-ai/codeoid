@@ -565,6 +565,13 @@ references' folders, every other workstream's as `foreign`; folders from
 `remove_reference` / `set_workstream` in `#sessionWorkstreamEdit`,
 `Session.setWorkstream`; the env, grant and fence closures take the binding,
 so a change applies at the next turn.
+W4: the conductor's fleet tools name each result's workstream and take a
+`workstream` filter; `FleetDeps.textWithheld` keeps a `closed` workstream's
+episode text out of fleet_find / fleet_summary / fleet_recall and the dispatch
+digest. `fleet_spawn.workstream` → `checkWorkstream` (`#fleetSpawnHome`) before
+queueing, `dispatch_tasks.workstream` judged again at claim; send-class cards
+carry `targetWorkstream` (`#fleetCardWorkstream`). `workstreams/egress.ts` is
+the egress stub.
 
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
 or an API call. `RoutineService` owns the scheduler and runs; it reaches

@@ -139,6 +139,7 @@ const ApprovalBar: Component = () => {
       input: s.input,
       toolName: m.tool.name,
       collaborationCost: s.collaborationCost,
+      targetWorkstream: s.targetWorkstream,
       risk: s.risk,
       sandboxed: s.sandboxed,
       sandboxNote: s.sandboxNote,
@@ -228,6 +229,7 @@ const ApprovalBar: Component = () => {
                 toolName={snap().toolName}
                 description={snap().description}
                 collaborationCost={snap().collaborationCost}
+                targetWorkstream={snap().targetWorkstream}
                 risk={snap().risk}
                 sandboxed={snap().sandboxed}
                 sandboxNote={snap().sandboxNote}
@@ -320,6 +322,8 @@ const BinaryBar: Component<{
   description: string;
   /** Present only for a send-class fleet dispatch from a collaborative session. */
   collaborationCost?: CollaborationCost;
+  /** The workstream a send-class fleet dispatch acts in, and a warning (workstreams §10). */
+  targetWorkstream?: { workstream?: string; warning?: string };
   /** A shell command's risk (#431). */
   risk?: ToolRisk;
   /** Whether it runs in the session's OS sandbox (#448). */
@@ -358,6 +362,15 @@ const BinaryBar: Component<{
             instruction is going outranks what it has spent. */}
         <Show when={props.dispatch}>
           {(d) => <DispatchDetails preview={d()} />}
+        </Show>
+        {/* Which line of work it acts in: never approved without knowing (workstreams §10). */}
+        <Show when={props.targetWorkstream}>
+          {(t) => (
+            <div class={`mt-1 font-mono text-[11px] ${t().warning ? "text-warn" : "text-fg-muted"}`} data-testid="approval-workstream">
+              <Show when={t().workstream}>{(w) => <div class="truncate">⌂ workstream {w()}</div>}</Show>
+              <Show when={t().warning}>{(w) => <div>⚠ {w()}</div>}</Show>
+            </div>
+          )}
         </Show>
         <RiskLine risk={props.risk} />
         <SandboxLine sandboxed={props.sandboxed} sandboxNote={props.sandboxNote} sandboxDocker={props.sandboxDocker} />

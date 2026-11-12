@@ -441,7 +441,7 @@ The conductor is the one session whose job crosses workstreams, and this design 
   - That worker has only the target workstream's servers, credentials and memory.
   - A Highflame Slack reply is drafted by a worker that has never seen a Sentisum episode.
   - The approval card shows the workstream as well as recipient, repo and content.
-- **`fleet_spawn`** takes `workstream` and follows §5. A conflicting spawn returns `workstream_conflict` to the conductor, and it has to choose instead of guessing.
+- **`fleet_spawn`** takes `workstream` and follows §5. A conflict the owner can override is shown on the spawn's approval card, and the owner's own approval of that card confirms it (G3); one that can't be overridden, or wasn't confirmed, comes back to the conductor, which has to choose instead of guessing.
 - **Intake.** When the conductor's Slack and GitHub intake arrives (Slack front end, a later phase), each inbox source is bound to one workstream: Highflame Slack to `highflame`, Sentisum Slack to `sentisum`.
   A signal is born with its workstream, and its reply worker inherits it.
 
@@ -510,6 +510,16 @@ codeoid workstream move <session> <id>
 - **Sealed.** A stored binding that can't be read back gives no home and `sealed: true`: what it read from is unknown, so it never moves.
 - **Known limits:** a reference with `paths` gives the workstream's whole memory (recall isn't filtered by folder yet); an episode is tagged with the home that wrote it, so what a session read through a reference stays in its home's recall after that workstream closes; the conductor's fleet reads (`fleet_summary`, the dispatch digest) are W4's.
 - **Deferred:** `Bash` commands naming another workstream's path in an unsandboxed session (§14 q4) are not yet asked about; fork *into* another workstream; skillDirs.
+
+### 12.2 W4 as built (2026-11-11)
+
+- **Fleet reads.** `FleetSessionView.workstream`; `fleet_list`, `fleet_find` and `fleet_recall` take a `workstream` filter and name each result's. `FleetDeps.textWithheld` (the manager: a `closed` workstream, under isolation) drops a closed workstream's episode text from `fleet_find` snippets, `fleet_summary` and `fleet_recall` (counted, not shown) and from the dispatch digest (`buildWorkerDigest`: status only), which is also what `fleet_tasks` shows.
+- **No rolling summaries yet.** §10 promises a closed workstream's session cards and summaries; nothing writes session cards today (`memory/cards.ts` has no caller), so a closed workstream gives status and metadata only until cards exist (backlog).
+- **Spawns.** `fleet_spawn.workstream`; `FleetDispatchDeps.checkWorkstream` before queueing (`#fleetSpawnHome`: `forCreate` with the folder required under isolation, `folderVerdict`), stored on the task (`dispatch_tasks.workstream`, `workstream_override`) and judged again at claim. The approval card (`ToolWaitingConfirmationState.targetWorkstream`, from `Session` `fleetTargetWorkstream`, the manager's `#fleetCardWorkstream`) names the workstream and warns of the override approving it confirms (G3), or of a refusal.
+- **Egress.** `workstreams/egress.ts` `planEgress`: a tested stub (G6) — a message names its workstream and is sent by a worker homed there, never by the conductor; wired when P6's Slack and email egress lands.
+- **The conductor's own memory.** Its recall includes its reserved workstream's episodes (it couldn't reach them under isolation before).
+- **Phones.** The fleet rail docks beside the chat from `md` up; below, the chat (and its approval card) has the width. The rail's board has no phone view yet (backlog); `fleet_list` and `fleet_tasks` answer in chat.
+- **Audit round 1.** Untagged episodes are judged by their session (live, else its stored folder; unknown: withheld while any workstream is closed). A closed workstream's hits are dropped from queries before anything is counted. A worker's digest is withheld from the conductor only (an orchestrator's children share its workstream); the conductor's tenant-wide board withholds others'. A confirmation is a one-time token (round 2): issued when the session owner's own approval (`isOwnApprover`) settles a card that needed one, added to that call's input by the gate (`#withFleetConfirmation`, `confirmation`), and accepted by its handler only for the tenant, workdir, workstream, conflicting workstream, `ask` folders and config revision the card was judged on (`#spendFleetToken`); the revision is stored on the task and checked at claim. A backend that drops the gate's input change gets no token: the spawn is refused. An unnamed spawn is stored without a workstream and judged again at claim by `#fleetSpawnHome` (remote-changed guard included).
 
 ## 13. Phases
 

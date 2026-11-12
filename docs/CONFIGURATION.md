@@ -499,6 +499,13 @@ Each change is saved at once and applies at the session's next turn (a turn runn
 A search with no folder (Grep or Glob over the workdir) is refused when another workstream's folder is inside the workdir: search a narrower folder.
 
 
+### The conductor and workstreams
+
+The conductor is homed in a reserved workstream of its own: no workstream's servers, env or folders. It reads across all of them through its fleet tools, which take a `workstream` filter and name each result's workstream.
+With `isolateGlobalServers: true`, a `closed` workstream gives the conductor its sessions' status and metadata only (in `fleet_list`), never their text: `fleet_find` and `fleet_recall` never return them (not even that something matched), `fleet_summary` gives status only, `machine_map` leaves out their branches, and a worker of a closed workstream reports that it finished, not what it found. Episodes from before workstreams are judged by their session's home (as recorded; for one that no longer runs, its stored binding, else its folder's record, else its folder now). A workstream deleted from the config has no policy left: its sessions' text is no longer withheld. Closing a workstream doesn't reach back: what the conductor was told while it was open (its own transcript, a task's digest on `fleet_tasks`) stays.
+
+The conductor acts only through sessions homed where the work belongs. `fleet_spawn` takes `workstream` (else the folder's; a folder with none, or one whose repository's remote now matches another workstream than before, must be given one) and follows the same rules as a create: past a workstream's exclusive folder, or into an `ask` workstream's folder, the spawn's approval card says so (naming the workstream it passes), and only the session owner's own approval of that card confirms it: the approval adds a one-time token to that very call, which its handler accepts only if the spawn would still be judged exactly as the card showed, at the config revision it was shown at. A closed workstream's folder never takes another's worker, and a closed workstream's worker works only in its own folders. Every send-class card (web, Telegram, the TUI, `codeoid approve`, the terminal) names the workstream the action runs in.
+
 ### Moving an existing setup
 
 `codeoid workstream import [--root <dir>]` proposes workstreams from your repositories' remotes and lists Claude's global MCP servers to assign. It writes nothing; isolation stays off until you turn it on.

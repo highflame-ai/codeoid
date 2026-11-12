@@ -158,7 +158,7 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
     }
 
     case "session.message": {
-      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string; risk?: ToolRisk; sandboxed?: boolean; sandboxNote?: string; sandboxDocker?: boolean } }; identity?: { name?: string; type?: string } };
+      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string; risk?: ToolRisk; sandboxed?: boolean; sandboxNote?: string; sandboxDocker?: boolean; targetWorkstream?: { workstream?: string; warning?: string } } }; identity?: { name?: string; type?: string } };
       const id = sm.identity?.name ? `${DIM}${S(sm.identity.name)}${RESET} ` : "";
       switch (sm.role) {
         case "user":
@@ -189,7 +189,9 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
             state.lastPrompt = "tool";
             const risk = formatToolRisk(sm.tool?.state?.risk);
             const sandbox = approvalSandboxLine(sm.tool?.state ?? {});
-            return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n${risk ? `  ${RED}▲ ${S(risk)}${RESET}\n` : ""}${sandbox ? `  ${S(sandbox)}\n` : ""}  Type 'yes' to approve, 'no' to deny\n`;
+            const tw = sm.tool?.state?.targetWorkstream;
+            const ws = `${tw?.workstream ? `  ⌂ workstream ${S(tw.workstream)}\n` : ""}${tw?.warning ? `  ${YELLOW}⚠ ${S(tw.warning)}${RESET}\n` : ""}`;
+            return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n${ws}${risk ? `  ${RED}▲ ${S(risk)}${RESET}\n` : ""}${sandbox ? `  ${S(sandbox)}\n` : ""}  Type 'yes' to approve, 'no' to deny\n`;
           }
           return `\n${id}${YELLOW}⚡ ${name} [${phase}]${RESET}\n${reshow}`;
         }
@@ -1328,6 +1330,9 @@ export class TerminalClient {
     if (risk) console.log(`▲ ${oneLine(risk)}`);
     const sandbox = approvalSandboxLine(pending);
     if (sandbox) console.log(oneLine(sandbox));
+    // The workstream it acts in, and what approving confirms (workstreams §10), as the card says.
+    if (pending.targetWorkstream?.workstream) console.log(`⌂ workstream ${oneLine(pending.targetWorkstream.workstream)}`);
+    if (pending.targetWorkstream?.warning) console.log(`⚠ ${oneLine(pending.targetWorkstream.warning)}`);
     const shown = plainText(pending.input === undefined ? "" : JSON.stringify(pending.input, null, 2) ?? "");
     const cut = shown.length > APPROVE_SHOW_MAX;
     console.log(cut ? shown.slice(0, APPROVE_SHOW_MAX) : shown);
