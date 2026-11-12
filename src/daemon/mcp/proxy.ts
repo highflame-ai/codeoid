@@ -36,8 +36,8 @@ import type { McpHub } from "./hub.js";
 import { upstreamBearer } from "./hub.js";
 import { McpSignInRequired, type McpCredentialSource, type McpTenant } from "./oauth.js";
 import { cleanMcpError } from "./redact.js";
-import type { McpRegistry } from "./registry.js";
-import type { McpServerSpec } from "./types.js";
+import type { McpRegistry, McpServerView } from "./registry.js";
+import { isOAuthServer, type McpServerSpec } from "./types.js";
 import { closeUpstream, FailureStreak, openUpstream, sessionGone, sessionTrouble } from "./upstream.js";
 
 export const MCP_PROXY_PATH_PREFIX = "/mcp/proxy/";
@@ -51,8 +51,14 @@ export const MCP_PROXY_TOKEN_ENV = "CODEOID_MCP_PROXY_TOKEN";
 export interface McpProxyBinding {
   tenant: McpTenant;
   sessionId: string;
-  /** The backend that mounts it: only its OAuth servers are reachable. */
+  /** The backend that mounts it: only its relayed servers are reachable. */
   backendId: string;
+  /**
+   * The session's MCP view: what it may reach, under its workstream's grant
+   * (G1). Asked at mint and again on every request, so a server the
+   * workstream drops stops at once (G4). Absent = the daemon-wide registry.
+   */
+  view?: McpServerView;
 }
 
 /** What a provider needs to mount OAuth servers through the relay. */
@@ -151,10 +157,7 @@ export class McpProxy implements McpProxyMount {
   }
 
   mint(binding: McpProxyBinding): { token: string; servers: string[] } {
-    const servers = this.#registry
-      .oauthFor(binding.backendId)
-      .filter((s) => s.transport.kind === "http")
-      .map((s) => s.name);
+    const servers = (binding.view ?? this.#registry).relayFor(binding.backendId).map((s) => s.name);
     const token = randomBytes(32).toString("base64url");
     this.#tokens.set(hashOf(token), { binding, servers: new Set(servers), relays: new Map(), starting: new Map(), calls: 0, initializes: [] });
     return { token, servers };
@@ -230,7 +233,7 @@ export class McpProxy implements McpProxyMount {
     // Bound at mint AND still the backend's OAuth server now: an entry edited
     // or re-scoped since isn't reachable on an old token.
     const spec = record.servers.has(server)
-      ? this.#registry.oauthFor(record.binding.backendId).find((s) => s.name === server && s.transport.kind === "http")
+      ? (record.binding.view ?? this.#registry).relayFor(record.binding.backendId).find((s) => s.name === server)
       : undefined;
     if (!spec) return rpcError(404, ErrorCode.InvalidRequest, `no MCP server "${server}" here`);
     return this.#route(req, record, spec, server, token!, opts);
@@ -263,6 +266,13 @@ export class McpProxy implements McpProxyMount {
     if (sessionId) {
       const relay = record.relays.get(sessionId);
       if (!relay || relay.server !== server) return rpcError(404, ErrorCode.InvalidRequest, "session not found");
+      // Its credential changed since it started (the workstream moved the
+      // server to another credential or slot): never keep calling with the
+      // old one. Closed, and a 404 makes the backend initialize again (W1 audit).
+      if (relay.variant !== (spec.variant ?? "")) {
+        void relay.close();
+        return rpcError(404, ErrorCode.InvalidRequest, "session not found");
+      }
       if (req.method !== "POST") {
         opts.liftIdleTimeout?.();
         return relay.handle(req);
@@ -321,6 +331,7 @@ export class McpProxy implements McpProxyMount {
         spec,
         binding: record.binding,
         credentials: this.#credentials,
+        secrets: (id) => this.#hub?.secretLookup(id),
         hub: this.#hub,
         env: this.#env,
         timeoutMs: this.#timeoutMs,
@@ -354,6 +365,8 @@ interface RelayInit {
   spec: McpServerSpec;
   binding: McpProxyBinding;
   credentials: McpCredentialSource | null;
+  /** Named credentials' values, for a server called with one (workstreams G1). */
+  secrets: (id: string) => string | undefined;
   hub: McpHub | null;
   env: Record<string, string | undefined>;
   timeoutMs: number;
@@ -417,6 +430,8 @@ const CLIENT_NOTIFICATIONS = new Set(["notifications/roots/list_changed"]);
 
 class Relay {
   readonly server: string;
+  /** Which credential it calls with (a workstream's slot or named credential lives in the variant). */
+  readonly variant: string;
   /** When the backend last used this session (for eviction at the cap). */
   lastUsed = Date.now();
   readonly #init: RelayInit;
@@ -437,6 +452,7 @@ class Relay {
   private constructor(init: RelayInit) {
     this.#init = init;
     this.server = init.spec.name;
+    this.variant = init.spec.variant ?? "";
     this.#transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: () => randomBytes(16).toString("hex"),
       onsessioninitialized: (id) => init.onSession(id, this),
@@ -677,14 +693,19 @@ class Relay {
   #ensureUpstream(): Promise<Client> {
     if (this.#closed) return Promise.reject(new Error("relay closed"));
     if (this.#upstream) return this.#upstream;
-    const { spec, binding, credentials, env, clientCapabilities, clientInfo } = this.#init;
+    const { spec, binding, credentials, env, clientCapabilities, clientInfo, secrets } = this.#init;
     if (spec.transport.kind !== "http") return Promise.reject(new Error(`${spec.name} is not an HTTP server`));
-    if (!credentials) return Promise.reject(new McpSignInRequired(spec.name));
+    // An OAuth server is called with the tenant's sign-in; one with a named
+    // credential (a workstream's, G1) with that — the relay holds either, the
+    // backend neither.
+    const oauth = isOAuthServer(spec);
+    if (oauth && !credentials) return Promise.reject(new McpSignInRequired(spec.name));
     const connecting: Promise<Client> = openUpstream({
       name: spec.name,
       transport: spec.transport,
       env,
-      oauth: upstreamBearer(credentials, spec, binding.tenant),
+      ...(oauth && credentials ? { oauth: upstreamBearer(credentials, spec, binding.tenant) } : {}),
+      secrets,
       clientInfo: {
         name: `codeoid relay${clientInfo?.name ? ` (${String(clientInfo.name).slice(0, 64)})` : ""}`,
         version: String(clientInfo?.version ?? "1.0").slice(0, 32),

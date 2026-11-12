@@ -165,6 +165,8 @@ export interface ClaudeProviderInit {
   onForeignAgentDenied?: (agentId: string, toolName: string) => void;
   /** The session is in autonomous mode now (ProviderSessionInit.isAutonomous); absent: treated as so. */
   isAutonomous?: () => boolean;
+  /** The workstream fence's refusal of a call (ProviderSessionInit.workstreamFenceRefusal). */
+  workstreamFenceRefusal?: (toolName: string, input: unknown, cwd: string | null | undefined) => string | null;
   /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448). */
   sandbox?: () => SandboxRuntime | null;
   /** codeoid session id — used as the initial backing id and for audit/logging. */
@@ -1044,7 +1046,9 @@ export class ClaudeProvider implements SessionProvider {
     // stall watchdog so the SDK signals first.
     const mcpToolTimeoutMs = init.config?.session.mcpToolTimeoutMs ?? 120_000;
     // A server codeoid now signs in to is codeoid's (mounted below), not the CLI's.
-    const userServers = withoutServers((init.userMcpServers ?? loadUserMcpServers)(opts.workdir), oauthMcp.deniedUrls);
+    // Under workstream isolation none of the user's own: the CLI runs strict,
+    // and every server it may reach is one of codeoid's bridges (G1).
+    const userServers = oauthMcp.strict ? {} : withoutServers((init.userMcpServers ?? loadUserMcpServers)(opts.workdir), oauthMcp.deniedUrls);
     // ...but never in place of the user's own server of that name at another
     // address — in this workdir's config, which adopting (from another
     // workdir, perhaps) couldn't see. Theirs stays; codeoid's isn't mounted here.
@@ -1063,7 +1067,12 @@ export class ClaudeProvider implements SessionProvider {
       ...withMcpToolTimeout(userServers, mcpToolTimeoutMs),
       // Registry servers — mounted natively on the SDK (claude owns its client);
       // tool calls surface as `mcp__<server>__<tool>` and gate via canUseTool.
-      ...withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs),
+      // Strict (isolated): only the stdio servers needing no secret are the
+      // CLI's to run (forNativeMount keeps to those); every HTTP one is a bridge.
+      ...withMcpToolTimeout(
+        oauthMcp.strict ? stdioOnly(registryServersForClaude(init.mcpRegistry)) : registryServersForClaude(init.mcpRegistry),
+        mcpToolTimeoutMs,
+      ),
       // Registry OAuth servers the tenant has signed in to — in-process, in
       // front of the daemon-owned client, which holds the token (#390). The
       // hub applies its own per-call timeout.
@@ -1340,6 +1349,9 @@ export class ClaudeProvider implements SessionProvider {
         // mode this also surfaces the user's own skills, which is the intended
         // behaviour.
         settingSources: ["project", "user"],
+        // Workstream isolation (G1): only the servers codeoid passes — no
+        // `~/.claude.json`, no `.mcp.json`, no plugin's, no agent's own.
+        ...(oauthMcp.strict ? { strictMcpConfig: true } : {}),
         // The CLI must not connect its own copy of a server codeoid signs in
         // to (from ~/.claude.json, a .mcp.json): the flag-settings denylist,
         // by URL, keeps it from dialing it at all (#390).
@@ -1401,6 +1413,19 @@ export class ClaudeProvider implements SessionProvider {
               // Fail-closed too (#secretPathDecision).
               const secret = this.#secretPathDecision(input, opts.workdir);
               if (secret) return secret;
+              // The workstream fence (workstreams §7.3): a call in another
+              // workstream's folders is refused here, before any allow rule.
+              // Fail-closed: a throw refuses.
+              if (init.workstreamFenceRefusal) {
+                let fenced: string | null;
+                try {
+                  fenced = init.workstreamFenceRefusal(input.tool_name, input.tool_input, hookShellCwd(input));
+                } catch (err) {
+                  console.error(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] checking a call against the workstream fence failed, refusing it: ${err instanceof Error ? err.message : String(err)}`);
+                  fenced = "codeoid couldn't check this call against the session's workstream, so it was refused.";
+                }
+                if (fenced) return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const, permissionDecisionReason: fenced } };
+              }
               // A shell command is judged by what it runs (#431): a risky one,
               // one the gate can't read, or one naming a credential file never
               // runs on an allow rule — it goes to canUseTool, which decides.
@@ -2660,6 +2685,11 @@ export function registryServersForClaude(registry: McpServerView | undefined): R
     }
   }
   return out;
+}
+
+/** The stdio entries of a server map (a strict, isolated Claude bridges every HTTP one). */
+function stdioOnly(servers: Record<string, McpServerConfig>): Record<string, McpServerConfig> {
+  return Object.fromEntries(Object.entries(servers).filter(([, cfg]) => typeof (cfg as { command?: unknown }).command === "string"));
 }
 
 /** User servers minus those codeoid owns now — by URL: a server of the same

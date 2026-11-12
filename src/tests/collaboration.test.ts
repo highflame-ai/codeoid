@@ -2711,7 +2711,7 @@ describe("the orchestrator's fleet surface is scoped to its own children", () =>
     // because the shared harness injects no engine at all — a mutation that
     // handed `this.#memory` straight to the orchestrator went undetected until
     // this test was written this way.
-    const stub = { marker: "memory-engine" } as unknown as MemoryEngine;
+    const stub = { marker: "memory-engine", scopeSession: () => () => {} } as unknown as MemoryEngine;
     manager.setMemory(stub);
     const mine = await createGoal("sf5");
 

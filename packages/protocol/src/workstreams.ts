@@ -36,6 +36,10 @@ export interface SessionWorkstreamInfo {
   matchedBy?: string;
   /** The home was deleted from the config: the session needs a new one. */
   orphaned?: boolean;
+  /** Other workstreams it may read (§7.2); `paths` absent = all their folders. */
+  references?: Array<{ workstream: string; paths?: string[] }>;
+  /** Every workstream it has read from, for its lifetime (a move follows each one's policy). */
+  readFrom?: string[];
 }
 
 export interface WorkstreamServerInfo {
@@ -63,6 +67,8 @@ export interface WorkstreamSummary {
   env: string[];
   git?: { name?: string; email?: string };
   skillDirs: string[];
+  /** The item as configured (bases NOT merged): what an editor edits and sends back to `workstream.upsert`. */
+  config: Record<string, unknown>;
 }
 
 export interface WorkstreamMatchInfo {
@@ -88,7 +94,20 @@ export interface WorkstreamResolution {
    * claim on the folder (§5.2). `overridable: false` = that workstream set
    * `allowOverride: false`.
    */
-  conflict?: { folder: string; chosen: string; overridable: boolean };
+  conflict?: {
+    folder: string;
+    chosen: string;
+    overridable: boolean;
+    /** What an override would change: servers and env the chosen home gives, and the folder's withheld. */
+    changes?: { gains: string[]; withholds: string[]; env: string[]; git?: string };
+    /**
+     * On a `session.create` refused for this conflict, when overridable: the
+     * token a confirming retry sends as `override.token` (G3). Single use,
+     * minutes long, bound to the caller, the folder, the choice and the
+     * config revision — a changed config makes it stale.
+     */
+    overrideToken?: string;
+  };
 }
 
 // ── Messages (client → daemon) ────────────────────────────────────────────────
@@ -127,4 +146,84 @@ export interface WorkstreamResolveResultMsg {
   workdir: string;
   revision: string;
   resolution: WorkstreamResolution;
+}
+
+// ── Editing (W2): settings:write on an undelegated token ─────────────────────
+
+/** Add or replace one workstream (by `item.id`). The whole config is validated; nothing is written if it doesn't. Replies `workstream.list.result`. */
+export interface WorkstreamUpsertMsg {
+  type: "workstream.upsert";
+  id: string;
+  /** A `workstreams.items[]` entry as config.json takes it (docs/CONFIGURATION.md, Workstreams). */
+  item: Record<string, unknown>;
+}
+
+/** Remove a workstream. Sessions homed there keep their binding, shown orphaned. Replies `workstream.list.result`. */
+export interface WorkstreamDeleteMsg {
+  type: "workstream.delete";
+  id: string;
+  workstream: string;
+}
+
+/** The block-wide settings. `default: null` removes the default. Replies `workstream.list.result`. */
+export interface WorkstreamSettingsMsg {
+  type: "workstream.settings";
+  id: string;
+  isolateGlobalServers?: boolean;
+  default?: string | null;
+}
+
+/** Sent to subscribed clients after the workstreams or credentials change. */
+export interface WorkstreamsChangedMsg {
+  type: "workstreams.changed";
+  revision: string;
+}
+
+// ── Credentials (W2) ─────────────────────────────────────────────────────────
+
+export interface CredentialInfo {
+  id: string;
+  kind: "bearer" | "header" | "env" | "oauth";
+  header?: string;
+  server?: string;
+  description?: string;
+  /** Whether a value is set, and where (never the value). An `oauth` credential's is its sign-in, shown with its server. */
+  status: { set: boolean; source?: string };
+  /** Workstreams that reference it. */
+  usedBy: string[];
+}
+
+/** The declared credentials and where their values live. Needs `settings:read`. */
+export interface CredentialListMsg {
+  type: "credential.list";
+  id: string;
+}
+
+/** Declare or replace one credential (by `item.id`). Replies `credential.list.result`. */
+export interface CredentialUpsertMsg {
+  type: "credential.upsert";
+  id: string;
+  item: Record<string, unknown>;
+}
+
+/** Remove a credential's declaration (refused while a workstream references it) and its value. */
+export interface CredentialDeleteMsg {
+  type: "credential.delete";
+  id: string;
+  credential: string;
+}
+
+/** Set (or with null, clear) a credential's value in a writable store. The value is never sent back. */
+export interface CredentialSetValueMsg {
+  type: "credential.set_value";
+  id: string;
+  credential: string;
+  value: string | null;
+}
+
+export interface CredentialListResultMsg {
+  type: "credential.list.result";
+  requestId: string;
+  store: { kind: string; writable: boolean };
+  credentials: CredentialInfo[];
 }

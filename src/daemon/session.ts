@@ -103,6 +103,10 @@ import { type PinnedDir, PinnedPathError, pinDir, pinRecord } from "./sandbox/pi
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
 import type { EffortChangeResult, EffortLevel, RewindFiles, RewindIrreversible, SessionWorkstreamInfo, TurnSummary } from "../protocol/types.js";
 import type { WorkstreamBinding } from "./workstreams/binding.js";
+import type { WorkstreamFence } from "./workstreams/service.js";
+import { type FenceRefusal, fenceRefusal, fenceRefusalText } from "./workstreams/gate.js";
+import { repositoryTopOf } from "./workstreams/folders.js";
+import type { McpGrant } from "./workstreams/grant.js";
 import { LIMITS } from "../protocol/types.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import type { PendingToolApproval, SessionApproveOutcome, SessionSandboxInfo, SessionSandboxSetting } from "../protocol/types.js";
@@ -433,6 +437,18 @@ export interface WindowScope {
   workdir: string;
 }
 
+/**
+ * What a send-class fleet call's card says of its workstream (workstreams
+ * §10), and — when approving it confirms something — what it was judged on,
+ * which the manager checks a confirmation against. `confirm` never leaves the
+ * daemon (the card shows `workstream` and `warning`).
+ */
+export interface FleetCardTarget {
+  workstream?: string;
+  warning?: string;
+  confirm?: { workdir: string; workstream?: string; revision: string; conflict?: string; asks: string[] };
+}
+
 export interface SessionCreateOptions {
   name: string;
   workdir: string;
@@ -558,6 +574,27 @@ export interface SessionCreateOptions {
   /** Renders the binding for `SessionInfo` (name, color, orphaned) from the live config. */
   describeWorkstream?: (binding: WorkstreamBinding | undefined) => SessionWorkstreamInfo | undefined;
   /**
+   * The home workstream's environment for the backend's child process
+   * (docs/workstreams-design.md §6.2): its env credentials and git identity,
+   * resolved by the manager from the owner's config. Merged UNDER `extraEnv`
+   * and held to the same denylist (the schema already refused anything it
+   * would). Never persisted: recomputed from the config on every resume.
+   */
+  workstreamEnv?: (binding: WorkstreamBinding | undefined) => Readonly<Record<string, string>>;
+  /**
+   * The home's MCP grant under isolation (workstreams/grant.ts), read live
+   * for the session's binding as it is now; undefined result = no isolation.
+   * Applied by the session's MCP view, so every backend sees only what the
+   * home selects.
+   */
+  mcpGrant?: (binding: WorkstreamBinding | undefined) => McpGrant | undefined;
+  /**
+   * The session's read fence under isolation (workstreams §7.3), read live
+   * for its binding: its home's and references' folders, and every other
+   * workstream's. Undefined result = no fence.
+   */
+  workstreamFence?: (binding: WorkstreamBinding | undefined, own: readonly string[]) => WorkstreamFence | undefined;
+  /**
    * Role-scoped goal-blackboard mount for a collaboration child: the endpoint
    * URL plus a bearer token that IS the scope (one goal, this role's read/write
    * set). Handed to the provider like `memoryMcp`, so any backend able to mount
@@ -612,6 +649,19 @@ export interface SessionCreateOptions {
    * role-child. Returns undefined when there is nothing to report.
    */
   collaborationCost?: () => CollaborationCost | undefined;
+  /**
+   * The workstream a send-class fleet call acts in, for its approval card
+   * (workstreams §10). Injected by the manager (the conductor's): a session
+   * can't see its targets' homes. Undefined = nothing to say.
+   */
+  fleetTargetWorkstream?: (toolName: string, input: unknown) => FleetCardTarget | undefined;
+  /**
+   * The owner approved a card whose target needs confirming (an override, an
+   * `ask` folder): a one-time token for that very call, which the gate adds
+   * to its input (`confirmation`) for the fleet handler to present. Absent
+   * or undefined: none (the handler then refuses what needed it).
+   */
+  fleetConfirm?: (target: FleetCardTarget, input: unknown) => string | undefined;
   /**
    * Initial execution mode + autonomous tool budget. Spawned workers start
    * "autonomous" with a bounded budget so they can work unattended; when the
@@ -1071,6 +1121,42 @@ export class Session {
   }
 
   /**
+   * Change the session's binding (workstreams W3: a reference granted or
+   * taken away, a move to another home, §5.3, §7). Authorized and judged by
+   * the manager. Saved at once; what it gives is read live, so the backend
+   * is rebuilt with it at the next turn (its servers, env, sandbox roots and
+   * recall), never mid-turn. Said on the session.
+   */
+  setWorkstream(next: WorkstreamBinding, said: string): void {
+    // Saved at once (a restart resumes with it), applied at the next turn's start: a turn running now
+    // keeps the binding it started with whole — its gate, servers, env and memory together.
+    this.#pendingWorkstream = next;
+    this.#saveMetaNow();
+    if (!this.#mcpBusy()) this.#applyPendingWorkstream();
+    const info = this.#makeMessage("info", `🧭 ${said}`, SYSTEM_IDENTITY, undefined, undefined, { event: "workstream.changed", workstream: next.id ?? null });
+    this.#persistAndBuffer(info);
+    this.#broadcastRaw(info);
+    this.#broadcastInfoUpdate();
+  }
+
+  /** A binding change waiting for the turn boundary (setWorkstream). */
+  #pendingWorkstream: WorkstreamBinding | undefined;
+
+  /** The binding as it will be: the pending one, else the one in use. What is saved and shown. */
+  get workstreamAhead(): WorkstreamBinding | undefined {
+    return this.#pendingWorkstream ?? this.#workstream;
+  }
+
+  #applyPendingWorkstream(): void {
+    const next = this.#pendingWorkstream;
+    if (!next) return;
+    this.#pendingWorkstream = undefined;
+    this.#workstream = next;
+    // The frozen memory index was judged against the old scope.
+    this.#frozenMemoryIndex = null;
+  }
+
+  /**
    * Goal + role→backend bindings when this session was created with the
    * Collaborative toggle (set from opts / restored from meta). Readonly: the
    * bindings are fixed for the life of the goal (§2, per-goal child
@@ -1371,6 +1457,8 @@ export class Session {
   #mode: SessionMode = "guarded";
   #onStatusChange?: (sessionId: string, status: SessionStatus, opts?: { settled: true }) => void;
   #collaborationCost?: () => CollaborationCost | undefined;
+  #fleetTargetWorkstream?: (toolName: string, input: unknown) => FleetCardTarget | undefined;
+  #fleetConfirm?: (target: FleetCardTarget, input: unknown) => string | undefined;
   #workerShape?: "ship" | "scout";
   #turnsRemaining: number | undefined = undefined;
   /** See SessionCreateOptions.onBudgetExhausted. */
@@ -1387,7 +1475,79 @@ export class Session {
   /** This turn's end-attempt interrupt has been scheduled (once per turn). */
   #endAttemptInterruptQueued = false;
   /** See SessionCreateOptions.extraEnv (validated in the constructor). */
+  #extraEnvStatic: Readonly<Record<string, string>> | undefined;
+  /** The home workstream's env, read live (SessionCreateOptions.workstreamEnv). */
+  #workstreamEnv: (() => Readonly<Record<string, string>>) | undefined;
+  /** The session's read fence (SessionCreateOptions.workstreamFence), for its binding as it is now. */
+  #workstreamFence: (() => WorkstreamFence | undefined) | undefined;
+  /** What a backend gets as extra env: a live view over both (see #liveExtraEnv). */
   #extraEnv: Readonly<Record<string, string>> | undefined;
+  /** The extra env the current backend was built with, to rebuild it when the workstream's changes. */
+  #envBuiltWith: string | undefined;
+
+  /**
+   * The read fence as the sandbox takes it (workstreams §7.3): the home's and
+   * references' folders shown read-only (the project roots), every other
+   * workstream's hidden.
+   */
+  /** Lets go of the session's recall scope (MemoryEngine.scopeSession), at destroy. */
+  #unscopeMemory: (() => void) | undefined;
+
+  /** The workstreams this session's recall may read: its home and references; undefined without a fence. */
+  #memoryWorkstreams(): readonly string[] | undefined {
+    const fence = this.#workstreamFence?.();
+    if (!fence) return undefined;
+    // A reserved home (the conductor's) is no workstream's folders, but its own memory is its own.
+    const reserved = this.#workstream?.source === "reserved" && this.#workstream.id ? [this.#workstream.id] : [];
+    return [...new Set([...(fence.workstream ? [fence.workstream] : []), ...reserved, ...fence.references.map((r) => r.workstream)])];
+  }
+
+  #sandboxFence(): { roots: string[]; hidden: string[] } | undefined {
+    const fence = this.#workstreamFence?.();
+    if (!fence) return undefined;
+    return {
+      roots: [...new Set([...fence.home, ...fence.references.flatMap((r) => r.folders)])],
+      hidden: fence.hidden,
+    };
+  }
+
+  /** The workstream's env under the caller's extra env, held to the extra-env denylist. */
+  #composedEnv(): Record<string, string> {
+    const out: Record<string, string> = { ...(this.#workstreamEnv?.() ?? {}), ...(this.#extraEnvStatic ?? {}) };
+    for (const k of extraEnvViolations(out)) delete out[k];
+    return out;
+  }
+
+  /**
+   * The extra env handed to the backend: a read-only view that is always the
+   * workstream's env as configured NOW. Providers read it when they start a
+   * process (spread or iterated), so a workstream edit — a credential cleared,
+   * an env entry removed — reaches the next backend start, which
+   * #rebuildForMcp brings to the next turn (design §8: narrowing applies at
+   * the next turn boundary).
+   */
+  #liveExtraEnv(): Readonly<Record<string, string>> {
+    const current = () => this.#composedEnv();
+    return new Proxy({} as Record<string, string>, {
+      get: (_t, k) => (typeof k === "string" ? current()[k] : undefined),
+      has: (_t, k) => typeof k === "string" && k in current(),
+      ownKeys: () => Object.keys(current()),
+      getOwnPropertyDescriptor: (_t, k) => {
+        const v = typeof k === "string" ? current()[k] : undefined;
+        return v === undefined ? undefined : { value: v, enumerable: true, configurable: true, writable: false };
+      },
+      set: () => false,
+      deleteProperty: () => false,
+      defineProperty: () => false,
+    });
+  }
+
+  /** A hash of the composed env: held to compare, so the values themselves aren't kept around. */
+  #envDigest(): string {
+    return createHash("sha256")
+      .update(JSON.stringify(Object.entries(this.#composedEnv()).sort(([a], [b]) => a.localeCompare(b))))
+      .digest("hex");
+  }
   /** The session's OS sandbox (#448); null on a Session built without a sandbox registry. */
   #sandbox: SessionSandbox | null = null;
   /** The repository's git settings as last looked at (#448: #checkGitControl), from the first turn on. */
@@ -1735,19 +1895,30 @@ export class Session {
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
     this.#collaborationCost = opts.collaborationCost;
+    this.#fleetTargetWorkstream = opts.fleetTargetWorkstream;
+    this.#fleetConfirm = opts.fleetConfirm;
     this.#maxBudgetUsd = opts.maxBudgetUsd;
     this.#onBudgetExhausted = opts.onBudgetExhausted ?? "park";
-    if (opts.extraEnv) {
+    const envOf = opts.workstreamEnv;
+    this.#workstreamEnv = envOf ? () => envOf(this.#workstream) : undefined;
+    const fenceOf = opts.workstreamFence;
+    // The session's own folder stays readable whatever its home (one moved, or homed past a claim): its
+    // workdir and the repository holding it (the sandbox's workspace in a monorepo).
+    const own = [...new Set([opts.workdir, repositoryTopOf(opts.workdir, homedir())])];
+    this.#workstreamFence = fenceOf ? () => fenceOf(this.#workstream, own) : undefined;
+    const extra = opts.extraEnv;
+    if (extra) {
       // Before any side effect: a refused key must fail the create, not run a
       // backend with half the env the caller asked for.
-      const refused = extraEnvViolations(opts.extraEnv);
+      const refused = extraEnvViolations(extra);
       if (refused.length > 0) {
         throw new Error(
           `extraEnv may not set ${refused.join(", ")}: codeoid owns credential, account and process-loading variables for the backend`,
         );
       }
-      this.#extraEnv = Object.freeze({ ...opts.extraEnv });
+      this.#extraEnvStatic = Object.freeze({ ...extra });
     }
+    if (this.#extraEnvStatic || this.#workstreamEnv) this.#extraEnv = this.#liveExtraEnv();
     if (opts.sandboxRegistry) {
       this.#sandbox = new SessionSandbox({
         sessionId: this.id,
@@ -1758,6 +1929,7 @@ export class Session {
         ...(opts.sandbox ? { setting: opts.sandbox } : {}),
         onWarning: (text) => this.#sandboxWarning(text, "sandbox.login_not_saved"),
         onWorktreeEntries: (common, findings) => this.#worktreeEntriesFound(common, findings),
+        ...(this.#workstreamFence ? { workstreamDirs: () => this.#sandboxFence() } : {}),
       });
     }
     this.#requireSandbox = opts.requireSandbox === true;
@@ -1809,6 +1981,7 @@ export class Session {
         workdir: this.workdir,
         tenant: { accountId: this.accountId, projectId: this.projectId },
         approvals: () => this.#store.workdirMcpApprovals(scope),
+        ...(opts.mcpGrant ? { grant: () => opts.mcpGrant?.(this.#workstream) } : {}),
       });
     }
     this.#config = opts.config;
@@ -1925,6 +2098,8 @@ export class Session {
 
     if (this.#memory) {
       const memory = this.#memory;
+      // Recall kept to the home and its references under isolation (workstreams §6.4).
+      if (this.#workstreamFence) this.#unscopeMemory = memory.scopeSession(this.id, () => this.#memoryWorkstreams());
       this.#indexScheduler = new IndexScheduler({
         store: memory.store,
         workspaceId: this.#workspaceId,
@@ -1944,7 +2119,9 @@ export class Session {
             // Retry a registration that failed at construction; until it
             // succeeds the workspace is invisible to cross-workspace search.
             if (!this.#workspaceRegistered) this.#registerWorkspace();
-            memory.ingest(episode);
+            // Tagged with the home as it is now (workstreams §6.4): a session moved since writes into its new one.
+            const home = this.#workstream?.id;
+            memory.ingest(home ? { ...episode, workstreamId: home } : episode);
             scheduler.onEpisode();
           } catch (err) {
             console.error(
@@ -1987,7 +2164,7 @@ export class Session {
         worktree: this.worktree,
         collaboration: this.collaboration,
         collaborationRole: this.collaborationRole,
-        ...(this.#workstream ? { workstream: this.#workstream } : {}),
+        ...(this.workstreamAhead ? { workstream: this.workstreamAhead } : {}),
         // Fire-and-forget: saveMeta's write chain owns the failure log; an
         // unconsumed rejection here would be an unhandled-rejection crash.
       }).catch(() => {});
@@ -2070,6 +2247,14 @@ export class Session {
       isOwnTask: (taskId) => this.#isOwnTask(taskId),
       onForeignAgentDenied: (agentId, toolName) => this.#noteForeignAgentRefused(agentId, toolName),
       isAutonomous: () => this.#mode === "autonomous",
+      ...(this.#workstreamFence
+        ? {
+            workstreamFenceRefusal: (toolName: string, input: unknown, cwd: string | null | undefined) => {
+              const r = this.#fenceRefusal(toolName, input, cwd);
+              return r ? fenceRefusalText(r) : null;
+            },
+          }
+        : {}),
       // Read each time the backend starts, and only what was resolved for THIS backend.
       sandbox: () => this.#sandbox?.runtimeFor(factory.id) ?? null,
       ...(this.#extraEnv ? { extraEnv: this.#extraEnv } : {}),
@@ -2405,6 +2590,38 @@ export class Session {
     } catch {
       return { path: "(couldn't be judged)", access: "read", why: "unresolved" };
     }
+  }
+
+  /** The workstream fence's verdict on a tool call (workstreams/gate.ts); null without a fence. Fails closed. */
+  #fenceRefusal(toolName: string, input: unknown, shellCwd: string | null | undefined): FenceRefusal | null {
+    let fence: WorkstreamFence | undefined;
+    try {
+      fence = this.#workstreamFence?.();
+    } catch (e) {
+      console.error(`[codeoid/session ${this.id}] workstream fence: ${e instanceof Error ? e.message : String(e)}`);
+      return { path: "(couldn't be judged)", workstream: this.#workstream?.id ?? "?", kind: "read" };
+    }
+    if (!fence) return null;
+    // paths: judging a tool call's input (fenceRefusal): no use of the path
+    return fenceRefusal(toolName, input, { workdir: this.workdir, ...(shellCwd !== undefined ? { cwd: shellCwd } : {}), fence });
+  }
+
+  /** Refuse a call the workstream fence holds: its card, the audit, and an info line. */
+  #refuseFenced(approvalId: string, toolName: string, r: FenceRefusal, sender: AuthContext): { behavior: "deny"; message: string } {
+    const reason = fenceRefusalText(r);
+    this.#approvalPatchKeys.delete(approvalId);
+    this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: reason });
+    this.#store.audit(sender.sub, "session.workstream_fence_refuse", this.id, `tool=${toolName} kind=${r.kind} workstream=${r.workstream}`);
+    const said = r.kind === "unresolved" ? `couldn't tell where ${r.path} is` : `${r.path} is workstream "${r.workstream}"'s`;
+    const infoMsg = this.#makeMessage("info", `⛔ Refused ${toolName}: ${said}`, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "workstream.fenced",
+      tool: toolName,
+      workstream: r.workstream,
+      kind: r.kind,
+    });
+    this.#persistAndBuffer(infoMsg);
+    this.#broadcastRaw(infoMsg);
+    return { behavior: "deny", message: reason };
   }
 
   /** A host-side file tool beyond the sandbox, in autonomous mode: refused (#outsideSandbox). Null in every other mode. */
@@ -2945,8 +3162,8 @@ export class Session {
    */
   async #applyMcpView(): Promise<void> {
     const view = this.#mcpView;
-    if (!view || this.#mcpBusy()) return;
-    if (!view.loaded || this.#mcpRefreshPending) {
+    if ((!view && !this.#workstreamEnv) || this.#mcpBusy()) return;
+    if (view && (!view.loaded || this.#mcpRefreshPending)) {
       this.#mcpRefreshPending = false;
       try {
         await this.#loadMcp();
@@ -2959,6 +3176,32 @@ export class Session {
     if (this.#destroyed) return;
     await this.#rebuildForMcp();
     this.#auditRepoServers(); // a backend switched to, or a sign-in hold that lapsed
+    this.#noteWithheldServers();
+  }
+
+  /** The servers last said to be withheld (workstream isolation), so each set is said once. */
+  #withheldSaid = "";
+
+  /**
+   * Under workstream isolation (G1), servers the home selects that this
+   * backend can't be given without holding a secret (a stdio server needing
+   * env values): an info line once per set, so a missing tool isn't a mystery.
+   */
+  #noteWithheldServers(): void {
+    const names = (this.#mcpView?.withheldFromNative(this.#provider.id) ?? []).map((s) => s.name).sort();
+    const key = `${this.#provider.id}\u0000${names.join("\u0000")}`;
+    if (names.length === 0 || key === this.#withheldSaid) return;
+    this.#withheldSaid = key;
+    const infoMsg = this.#makeMessage(
+      "info",
+      `⚠ Not given on ${this.#provider.id}: ${names.join(", ")} — a stdio MCP server that needs secret values can't be handed to this backend without exposing them (workstream isolation).`,
+      SYSTEM_IDENTITY,
+      undefined,
+      undefined,
+      { event: "workstream.servers_withheld", servers: names.join(",") },
+    );
+    this.#persistAndBuffer(infoMsg);
+    this.#broadcastRaw(infoMsg);
   }
 
   /**
@@ -3068,14 +3311,20 @@ export class Session {
    * Whether it was rebuilt. The first time, nothing was built yet: just noted.
    */
   async #rebuildForMcp(): Promise<boolean> {
+    // The workstream's env changed since the backend started (a credential
+    // cleared or swapped, an env entry removed): rebuilt too, like its servers
+    // — with or without an MCP view (a session may have none).
+    const envNow = this.#workstreamEnv ? this.#envDigest() : undefined;
+    if (envNow !== undefined) this.#envBuiltWith ??= envNow;
+    const envChanged = envNow !== undefined && envNow !== this.#envBuiltWith;
     const view = this.#mcpView;
-    if (!view?.loaded) return false;
-    if (this.#mcpBuiltWith === undefined) {
+    if (!view?.loaded) {
+      if (!envChanged) return false;
+    } else if (this.#mcpBuiltWith === undefined) {
       this.#mcpBuiltWith = view.fingerprint;
       this.#releaseMcp();
-      return false;
-    }
-    if (view.fingerprint === this.#mcpBuiltWith) return false;
+      if (!envChanged) return false;
+    } else if (view.fingerprint === this.#mcpBuiltWith && !envChanged) return false;
     await this.#teardownProvider(); // records what's applied, and lets go of what was removed
     await this.#reseedAfterTeardown();
     return true;
@@ -3561,7 +3810,11 @@ export class Session {
     const root = sandboxRootIfMade();
     const hidden = [...hiddenPathsFor(this.#config), ...(root ? [root] : [])];
     const problem = addedDirProblem(written, { home, configDir: getConfigDir(), hidden });
-    return problem ? { error: problem } : { dir, written };
+    if (problem) return { error: problem };
+    // Another workstream's folder (workstreams §7.3): writable would open the fence; reading it is a reference.
+    const fenced = this.#fenceRefusal("Write", { file_path: join(dir, ".codeoid-probe") }, null);
+    if (fenced) return { error: `${dir} is in workstream "${fenced.workstream}"'s folders: add a reference to read it (codeoid workstream ref add), never a writable directory` };
+    return { dir, written };
   }
 
   /**
@@ -4837,6 +5090,13 @@ export class Session {
       this.#store.audit(sender.sub, "session.sandbox_refused", this.id, sandboxRefused);
       throw new SandboxRequiredError(`Not started: ${sandboxRefused}`);
     }
+    // Workstream isolation (G1) on a backend that can't be kept to codeoid's
+    // MCP servers yet: opencode loads a project's own config, which codeoid
+    // doesn't filter. Refused rather than run with servers the home didn't give.
+    if (this.#provider.id === "opencode" && this.#mcpView?.isolated) {
+      this.#store.audit(sender.sub, "session.isolation_refused", this.id, "opencode");
+      throw new Error("Not started: opencode can't be kept to its workstream's MCP servers yet — switch this session to another backend, or turn workstream isolation off");
+    }
     this.#store.audit(sender.sub, "session.send", this.id);
     // Its worktree folders, removed while empty at the last turn's end, are there again for this one's commands: only
     // once its directories are what was pinned (#448 round 14), and never made through a link (worktrees.ts).
@@ -5188,6 +5448,8 @@ export class Session {
     // The session's MCP servers: read before its first turn, and a refresh
     // asked for meanwhile applied (#395) — before the stop and adopted-turn
     // checks below, which must come after every await.
+    // A workstream change made during the last turn applies now, before the servers and env are read.
+    if (!this.#mcpBusy()) this.#applyPendingWorkstream();
     await this.#applyMcpView();
     // A thinking effort the backend takes only at startup (#417): rebuild it now, between turns.
     await this.#applyEffortRestart();
@@ -6089,6 +6351,7 @@ export class Session {
     // still rebuilds it. Nothing still running can call a server the session
     // stopped using.
     if (this.#mcpView?.loaded) this.#mcpBuiltWith = this.#mcpView.fingerprint;
+    if (this.#workstreamEnv) this.#envBuiltWith = this.#envDigest();
     this.#releaseMcp();
     this.#mcpProjectNames.clear(); // the next backend reads its project files afresh
     try { await taskToAwait; } catch { /* consumer handles its own errors */ }
@@ -6262,7 +6525,15 @@ export class Session {
       const gated = this.#approvalInputs.get(approvalId);
       if (!gated) continue;
       const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
-      out.push({ approvalId, toolName: gated.toolName, input: gated.input, ...this.#cardRisk(risk, this.#heldWrite(gated.toolName, gated.input)), ...this.#cardSandbox(gated.toolName, gated.input, gated.shellCwd) });
+      const ws = this.#approvalWorkstreams.get(approvalId);
+      out.push({
+        approvalId,
+        toolName: gated.toolName,
+        input: gated.input,
+        ...this.#cardRisk(risk, this.#heldWrite(gated.toolName, gated.input)),
+        ...this.#cardSandbox(gated.toolName, gated.input, gated.shellCwd),
+        ...(ws ? { targetWorkstream: { ...(ws.target.workstream ? { workstream: ws.target.workstream } : {}), ...(ws.target.warning ? { warning: ws.target.warning } : {}) } } : {}),
+      });
     }
     return out;
   }
@@ -6351,6 +6622,7 @@ export class Session {
     // the commit look's git is bounded, and a destroy waits no longer.
     await Promise.race([this.#checkGitControl(sender.sub), new Promise<void>((r) => setTimeout(r, DESTROY_COMMIT_CHECK_MS).unref?.())]);
     this.#destroyed = true;
+    this.#unscopeMemory?.();
     // This session's own servers' clients in the hub: let go (the last user closes them).
     for (const spec of [...this.#mcpRetained.values(), ...this.#mcpToRelease.values()]) this.#mcpHub?.release(spec, this.#mcpTenant());
     this.#mcpRetained.clear();
@@ -7630,6 +7902,52 @@ export class Session {
    * Never throws. A roll-up that could fail an approval would be worse than no
    * roll-up at all — the dispatch path must not be wedgeable by a cost display.
    */
+  /** What each pending card said of its workstream, with the input it was judged on; let go when it settles. */
+  #approvalWorkstreams = new Map<string, { toolName: string; input: unknown; target: FleetCardTarget }>();
+
+  /** What a pending approval's card said of its workstream (workstreams §10), or undefined. */
+  approvalWorkstream(approvalId: string): { toolName: string; input: unknown; target: FleetCardTarget } | undefined {
+    return this.#approvalWorkstreams.get(approvalId);
+  }
+
+  /** Whether `sender` answers as this session's owner (its own user token), as an owner-only confirm needs. */
+  isOwnApprover(sender: AuthContext): boolean {
+    return this.#isOwnApproval(sender);
+  }
+
+  /** The workstream a send-class fleet call acts in, for its card (never throws: a display can't wedge an approval). */
+  #targetWorkstreamFor(toolName: string, input: unknown, approvalId?: string): { targetWorkstream?: { workstream?: string; warning?: string } } {
+    if (!this.#fleetTargetWorkstream || !isFleetSendTool(toolName)) return {};
+    try {
+      const t = this.#fleetTargetWorkstream(toolName, input);
+      if (t && approvalId) {
+        if (this.#approvalWorkstreams.size > 64) this.#approvalWorkstreams.delete(this.#approvalWorkstreams.keys().next().value!);
+        this.#approvalWorkstreams.set(approvalId, { toolName, input, target: t });
+      }
+      // The card shows what it says; what it was judged on stays here.
+      return t ? { targetWorkstream: { ...(t.workstream ? { workstream: t.workstream } : {}), ...(t.warning ? { warning: t.warning } : {}) } } : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /**
+   * The approved call's input with a confirmation token, when its card needed one (workstreams §10, G3): only
+   * for the owner's own approval of that very card, on the input the card was judged on. Never throws.
+   */
+  #withFleetConfirmation(approvalId: string, input: Record<string, unknown>): Record<string, unknown> {
+    const card = this.#approvalWorkstreams.get(approvalId);
+    this.#approvalWorkstreams.delete(approvalId);
+    if (!card?.target.confirm || !this.#fleetConfirm || !this.#ownerApproved.has(approvalId)) return input;
+    try {
+      if (JSON.stringify(card.input) !== JSON.stringify(input)) return input;
+      const token = this.#fleetConfirm(card.target, input);
+      return token ? { ...input, confirmation: token } : input;
+    } catch {
+      return input;
+    }
+  }
+
   #collaborationCostFor(toolName: string): { collaborationCost?: CollaborationCost } {
     if (!this.#collaborationCost || !isFleetSendTool(toolName)) return {};
     try {
@@ -7780,7 +8098,9 @@ export class Session {
       worktree: this.worktree,
       collaboration: this.collaboration,
       collaborationRole: this.collaborationRole,
-      ...(this.#workstream ? { workstream: this.#describeWorkstream?.(this.#workstream) ?? { ...(this.#workstream.id ? { id: this.#workstream.id } : {}), source: this.#workstream.source } } : {}),
+      ...(this.workstreamAhead
+        ? { workstream: this.#describeWorkstream?.(this.workstreamAhead) ?? { ...(this.workstreamAhead.id ? { id: this.workstreamAhead.id } : {}), source: this.workstreamAhead.source } }
+        : {}),
       // Ambient pack driving this session (docs/pack-loading.md) — id, or
       // "id (role)" when a capability role is active.
       ...(this.#pack
@@ -8771,7 +9091,7 @@ export class Session {
     let timelineEpisodes: ReturnType<MemoryEngine["timeline"]> = [];
     if (this.#memory) {
       try {
-        timelineEpisodes = this.#memory.timeline(this.#workspaceId, 30);
+        timelineEpisodes = this.#memory.timeline(this.#workspaceId, 30, 0, this.#memoryWorkstreams());
       } catch {
         /* graceful — the map still works without the page table */
       }
@@ -8910,7 +9230,11 @@ export class Session {
     // live scheduler every turn churns the append by a few bytes (relative times,
     // counts) and forces a per-turn query-loop rebuild that aborts the turn.
     if (this.#frozenMemoryIndex === null) {
-      this.#frozenMemoryIndex = this.#indexScheduler?.get() ?? "";
+      // The index is the repository's whole memory: left out where another workstream wrote some of it
+      // (a repository two workstreams share); recall, filtered, still reaches the session's own.
+      const scope = this.#memoryWorkstreams();
+      const mixed = scope !== undefined && (this.#memory?.store.hasOtherWorkstreams(this.#workspaceId, scope) ?? false);
+      this.#frozenMemoryIndex = mixed ? "" : (this.#indexScheduler?.get() ?? "");
     }
     const index = this.#frozenMemoryIndex;
     if (!index) return MEMORY_SYSTEM_PROMPT_APPEND;
@@ -9577,6 +9901,11 @@ export class Session {
         return { behavior: "deny" as const, message: reason };
       }
 
+      // The workstream fence (workstreams §7.3), every mode: a file tool in
+      // another workstream's folders, or writing a reference, is refused.
+      const fenced = this.#fenceRefusal(toolName, effectiveInput, shellCwd);
+      if (fenced) return this.#refuseFenced(approvalId, toolName, fenced, sender);
+
       // A file tool running outside the OS sandbox (Claude's, opencode's) is
       // held to the sandbox's own policy in autonomous mode (#448 rounds 8, 9):
       // beyond it, refused, never asked. Guarded and interactive mode decide
@@ -9678,8 +10007,9 @@ export class Session {
         this.#store.audit(sender.sub, "session.approve", this.id, `tool=${toolName} approvalId=${approvalId}`);
         if (unsandboxed) this.#store.audit(sender.sub, "session.unsandboxed_approve", this.id, `tool=${toolName} approvalId=${approvalId}`);
         const merged: Record<string, unknown> = sanitizedPatch ? { ...effectiveInput, ...sanitizedPatch } : effectiveInput;
-        return { behavior: "allow" as const, updatedInput: merged };
+        return { behavior: "allow" as const, updatedInput: sanitizedPatch ? merged : this.#withFleetConfirmation(approvalId, merged) };
       }
+      this.#approvalWorkstreams.delete(approvalId);
       this.#store.audit(sender.sub, "session.deny", this.id, `tool=${toolName} approvalId=${approvalId}`);
       return { behavior: "deny" as const, message: "Denied by user" };
     };
@@ -10282,11 +10612,21 @@ export class Session {
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
         // Autonomous mode refuses it outright (#autonomousRefusal): no approval card either.
         const deniedFirst = networkAsk || budgetDenied || secret?.action === "deny" || risk?.secret?.action === "deny";
+        // The workstream fence refuses it in every mode (#fenceRefusal): no approval card.
+        const fenced = deniedFirst ? null : this.#fenceRefusal(event.name, event.input, event.shellCwd);
         // A pinned directory changed (#448 round 13): the gate refuses every call (#sandboxPinRefusal).
         const pinned = budgetDenied ? null : this.#sandboxPinRefusal();
         // Beyond the sandbox, a host-side file tool is refused in autonomous mode (#outsideSandbox).
         const outside = deniedFirst || pinned ? null : this.#outsideSandboxRefusal(event.name, event.input, event.shellCwd);
-        const refused = pinned ? { reason: pinned } : deniedFirst ? null : outside ? { reason: hostFileBreachReason(outside) } : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
+        const refused = pinned
+          ? { reason: pinned }
+          : deniedFirst
+            ? null
+            : fenced
+              ? { reason: fenceRefusalText(fenced) }
+              : outside
+                ? { reason: hostFileBreachReason(outside) }
+                : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
         const toolMsg = this.#makeMessage(
           "tool_call",
           `${event.name}(${Object.keys(event.input).join(", ")})`,
@@ -10308,6 +10648,7 @@ export class Session {
                   description: `${event.name}(${Object.keys(event.input).join(", ")})`,
                   approvalId: event.approvalId,
                   ...this.#collaborationCostFor(event.name),
+                  ...this.#targetWorkstreamFor(event.name, event.input, event.approvalId),
                   ...this.#cardRisk(risk, held),
                   ...this.#cardSandbox(event.name, event.input, event.shellCwd),
                 } as unknown as ToolState),
@@ -12098,7 +12439,7 @@ export class Session {
       collaboration: this.collaboration,
       collaborationRole: this.collaborationRole,
       // Both meta writes, for the same reason as the collaboration above.
-      ...(this.#workstream ? { workstream: this.#workstream } : {}),
+      ...(this.workstreamAhead ? { workstream: this.workstreamAhead } : {}),
     }).catch(() => {});
   }
 }

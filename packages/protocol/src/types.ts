@@ -45,12 +45,21 @@ import type {
 import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
 import type { WorktreeTrustMsg, WorktreeTrustResultMsg } from "./worktree-trust.js";
 import type {
+  CredentialDeleteMsg,
+  CredentialListMsg,
+  CredentialListResultMsg,
+  CredentialSetValueMsg,
+  CredentialUpsertMsg,
   SessionWorkstreamInfo,
+  WorkstreamDeleteMsg,
   WorkstreamListMsg,
   WorkstreamListResultMsg,
   WorkstreamResolution,
   WorkstreamResolveMsg,
   WorkstreamResolveResultMsg,
+  WorkstreamSettingsMsg,
+  WorkstreamsChangedMsg,
+  WorkstreamUpsertMsg,
 } from "./workstreams.js";
 import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
 import type { SessionApprovalsMsg, SessionApprovalsResultMsg } from "./approvals.js";
@@ -1118,6 +1127,14 @@ export interface ToolWaitingConfirmationState {
    */
   collaborationCost?: CollaborationCost;
   /**
+   * Present only for a send-class fleet dispatch with workstreams: the
+   * workstream the action runs in (the target session's, or the spawned
+   * worker's home), and a warning when the spawn's home is chosen past the
+   * folder's own exclusive workstream (approving the card confirms it, G3)
+   * or can't be decided (the spawn will be refused). docs/workstreams-design.md §10.
+   */
+  targetWorkstream?: { workstream?: string; warning?: string };
+  /**
    * A shell command's risk, judged from what it runs (#431); for a file-tool
    * write into what the OS sandbox holds read-only, that reason first
    * ("writes the repository's git structure …"). Absent otherwise.
@@ -1321,6 +1338,9 @@ export type ClientMessage =
   | SessionSetModeMsg
   | SessionSetSandboxMsg
   | SessionSandboxDirMsg
+  | SessionAddReferenceMsg
+  | SessionRemoveReferenceMsg
+  | SessionSetWorkstreamMsg
   | SandboxProvidersMsg
   | SessionPinMsg
   | SessionUnpinMsg
@@ -1357,6 +1377,13 @@ export type ClientMessage =
   | WorktreeTrustMsg
   | WorkstreamListMsg
   | WorkstreamResolveMsg
+  | WorkstreamUpsertMsg
+  | WorkstreamDeleteMsg
+  | WorkstreamSettingsMsg
+  | CredentialListMsg
+  | CredentialUpsertMsg
+  | CredentialDeleteMsg
+  | CredentialSetValueMsg
   | SessionTurnsMsg
   | SessionApprovalsMsg
   | ClaudeAccountsListMsg
@@ -1597,6 +1624,20 @@ export interface SessionCreateMsg extends BaseClientMsg {
    * `"workstream_unknown"`.
    */
   workstream?: string;
+  /**
+   * Confirm a choice of `workstream` past another workstream's exclusive
+   * claim on the folder (docs/workstreams-design.md §5.2, G3): the token from
+   * the `workstream_conflict` refusal. Needs `session:approve` and an
+   * undelegated token.
+   */
+  override?: { token: string };
+  /**
+   * Other workstreams the session may read (docs/workstreams-design.md §7.2):
+   * their folders read-only and their memory. Each follows the share policy
+   * of the workstream read: `open` is granted, `ask` needs `session:approve`
+   * on an undelegated token (the creator's confirm), `closed` is refused.
+   */
+  references?: WorkstreamReferenceInput[];
 }
 
 /**
@@ -1915,6 +1956,45 @@ export interface SessionSetSandboxMsg extends BaseClientMsg {
  * (`data: { pending: true }`), and lands on a yes. It takes effect at the
  * session's next turn with no background work running.
  */
+/** A reference asked for (§7.2): a workstream, and optionally folders inside it (absolute; absent = all of them). */
+export interface WorkstreamReferenceInput {
+  workstream: string;
+  paths?: string[];
+}
+
+/**
+ * Give a session read access to another workstream (§7.1, §7.2). Owner-only.
+ * `open`: granted; `ask`: granted at once when the owner asks with
+ * `session:approve` on an undelegated token, else the owner confirms on the
+ * session (`response.ok` with `pending`); `closed`: refused.
+ */
+export interface SessionAddReferenceMsg extends BaseClientMsg {
+  type: "session.add_reference";
+  sessionId: string;
+  workstream: string;
+  paths?: string[];
+}
+
+/** Take a reference away (owner-only). The session still counts as having read from it (§14 q3). */
+export interface SessionRemoveReferenceMsg extends BaseClientMsg {
+  type: "session.remove_reference";
+  sessionId: string;
+  workstream: string;
+}
+
+/**
+ * Move a session to another home workstream (§5.3): a share of its whole
+ * transcript, so it follows the share policy of its old home and of every
+ * workstream it has read from (`ask` as for a reference; `closed` refuses).
+ * Past another workstream's exclusive claim on the folder it needs
+ * `session:approve` on an undelegated token. Applied at the next turn.
+ */
+export interface SessionSetWorkstreamMsg extends BaseClientMsg {
+  type: "session.set_workstream";
+  sessionId: string;
+  workstream: string;
+}
+
 export interface SessionSandboxDirMsg extends BaseClientMsg {
   type: "session.sandbox_dir";
   sessionId: string;
@@ -3274,6 +3354,8 @@ export type DaemonMessage =
   | WorktreeTrustResultMsg
   | WorkstreamListResultMsg
   | WorkstreamResolveResultMsg
+  | WorkstreamsChangedMsg
+  | CredentialListResultMsg
   | SessionTurnsResultMsg
   | SessionApprovalsResultMsg
   | ClaudeAccountsResultMsg
@@ -3391,6 +3473,8 @@ export type ResponseErrorDetail =
    * §5.2). `resolution` says what the folder resolves to and why.
    */
   | { kind: "workstream_conflict"; resolution: WorkstreamResolution }
+  /** `workstream_required`: isolation is on and the folder has no workstream; choose one. */
+  | { kind: "workstream_required"; resolution: WorkstreamResolution }
   /** `workstream_unknown`: the chosen workstream isn't configured (or is a base). */
   | { kind: "workstream_unknown"; workstream: string };
 

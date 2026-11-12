@@ -32,6 +32,15 @@ const base = { id: idField };
 /** A workstream id, bounded only: a malformed one must PARSE so the daemon answers `workstream_unknown`. */
 const workstreamIdField = z.string().min(1).max(64);
 
+/** A reference asked for (§7.2): absolute folders only, bounded. */
+export const workstreamReferenceInputSchema = z
+  .object({
+    workstream: workstreamIdField,
+    paths: z.array(z.string().min(1).max(4096)).max(64).optional(),
+  })
+  .strict();
+
+
 // ── Collaboration ─────────────────────────────────────────────────────────────
 
 /**
@@ -171,6 +180,8 @@ export const sessionCreateSchema = z.object({
    * `workstream_unknown` rather than an opaque schema rejection.
    */
   workstream: workstreamIdField.optional(),
+  override: z.object({ token: z.string().min(1).max(128) }).strict().optional(),
+  references: z.array(workstreamReferenceInputSchema).max(32).optional(),
 });
 
 export const sessionListSchema = z.object({ ...base, type: z.literal("session.list") });
@@ -285,6 +296,28 @@ export const sessionSetSandboxSchema = z.object({
   type: z.literal("session.set_sandbox"),
   sessionId: sessionIdField,
   sandbox: sessionSandboxSettingSchema,
+});
+
+export const sessionAddReferenceSchema = z.object({
+  ...base,
+  type: z.literal("session.add_reference"),
+  sessionId: sessionIdField,
+  workstream: workstreamIdField,
+  paths: z.array(z.string().min(1).max(4096)).max(64).optional(),
+});
+
+export const sessionRemoveReferenceSchema = z.object({
+  ...base,
+  type: z.literal("session.remove_reference"),
+  sessionId: sessionIdField,
+  workstream: workstreamIdField,
+});
+
+export const sessionSetWorkstreamSchema = z.object({
+  ...base,
+  type: z.literal("session.set_workstream"),
+  sessionId: sessionIdField,
+  workstream: workstreamIdField,
 });
 
 export const sessionSandboxDirSchema = z.object({
@@ -737,6 +770,7 @@ export const mcpOAuthBeginSchema = z.object({
   ...base,
   type: z.literal("mcp.oauth.begin"),
   server: mcpServerNameField,
+  credential: z.string().min(1).max(64).optional(),
 });
 
 export const mcpOAuthCompleteSchema = z.object({
@@ -750,6 +784,7 @@ export const mcpOAuthDisconnectSchema = z.object({
   ...base,
   type: z.literal("mcp.oauth.disconnect"),
   server: mcpServerNameField,
+  credential: z.string().min(1).max(64).optional(),
 });
 
 export const mcpAdoptSchema = z.object({
@@ -1099,6 +1134,29 @@ export const workstreamResolveSchema = z.object({
   workstream: workstreamIdField.optional(),
 });
 
+// Items are bounded objects here: their SHAPE is the daemon's config schema's
+// to judge (one rule, one error message), not the wire's.
+const configItemField = z.record(z.string().max(128), z.unknown()).refine((o) => JSON.stringify(o).length <= 64 * 1024, "too large");
+export const workstreamUpsertSchema = z.object({ ...base, type: z.literal("workstream.upsert"), item: configItemField });
+export const workstreamDeleteSchema = z.object({ ...base, type: z.literal("workstream.delete"), workstream: workstreamIdField });
+export const workstreamSettingsSchema = z.object({
+  ...base,
+  type: z.literal("workstream.settings"),
+  isolateGlobalServers: z.boolean().optional(),
+  default: workstreamIdField.nullable().optional(),
+});
+export const credentialListSchema = z.object({ ...base, type: z.literal("credential.list") });
+export const credentialUpsertSchema = z.object({ ...base, type: z.literal("credential.upsert"), item: configItemField });
+// A credential's id shape (the daemon's config rule): no line breaks or spaces reach an audit row.
+const credentialIdField = z.string().regex(/^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/);
+export const credentialDeleteSchema = z.object({ ...base, type: z.literal("credential.delete"), credential: credentialIdField });
+export const credentialSetValueSchema = z.object({
+  ...base,
+  type: z.literal("credential.set_value"),
+  credential: credentialIdField,
+  value: z.string().max(LIMITS.SETTING_VALUE_MAX).nullable(),
+});
+
 export const skillGrantSchema = z.object({
   ...base,
   type: z.literal("skill.grant"),
@@ -1298,6 +1356,9 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   sessionSetModeSchema,
   sessionSetSandboxSchema,
   sessionSandboxDirSchema,
+  sessionAddReferenceSchema,
+  sessionRemoveReferenceSchema,
+  sessionSetWorkstreamSchema,
   sandboxProvidersSchema,
   sessionPinSchema,
   sessionUnpinSchema,
@@ -1334,6 +1395,13 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   worktreeTrustSchema,
   workstreamListSchema,
   workstreamResolveSchema,
+  workstreamUpsertSchema,
+  workstreamDeleteSchema,
+  workstreamSettingsSchema,
+  credentialListSchema,
+  credentialUpsertSchema,
+  credentialDeleteSchema,
+  credentialSetValueSchema,
   sessionTurnsSchema,
   sessionApprovalsSchema,
   claudeAccountsListSchema,

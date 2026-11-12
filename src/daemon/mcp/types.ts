@@ -38,6 +38,13 @@ export interface McpHttpTransport {
   bearerTokenEnv?: string;
   /** OAuth per the MCP authorization spec; the daemon holds the token. */
   oauth?: McpOAuthConfig;
+  /**
+   * A named credential this server is called with (workstreams §6.5 case 2):
+   * a REFERENCE, never the value — the daemon reads the value from its secret
+   * store when it connects (mcp/upstream.ts), so no spec, config view or
+   * backend argv ever carries it. `header` absent = `Authorization: Bearer`.
+   */
+  credential?: { id: string; header?: string };
 }
 
 /** A remote server's OAuth settings. Everything is optional: with none, the
@@ -149,7 +156,22 @@ export function isProxied(spec: McpServerSpec): boolean {
  *  of the config file; a literal (no `${...}`) passes through unchanged. */
 export function resolveEnvValue(value: string, env: Record<string, string | undefined>): string {
   const m = /^\$\{(\w+)\}$/.exec(value);
-  return m ? (env[m[1]] ?? "") : value;
+  if (!m) return value;
+  // Never a workstream credential: the daemon's environment carries every
+  // workstream's (CODEOID_CRED_*), and a server config naming one would hand
+  // one workstream's secret to a server of any (workstreams W1 audit).
+  return isDaemonOwnedEnvName(m[1]) ? "" : (env[m[1]] ?? "");
+}
+
+/**
+ * Variables no MCP server config may name by `${VAR}` or `bearerTokenEnv`:
+ * the workstream credentials (credentials/store.ts). Narrow on purpose — a
+ * user's own config naming one of their own `CODEOID_*` variables keeps
+ * working as before; a repository's config can name none of codeoid's at all
+ * (workdir-servers.ts withoutDaemonSecrets).
+ */
+export function isDaemonOwnedEnvName(name: string): boolean {
+  return name.startsWith("CODEOID_CRED_");
 }
 
 /** Resolve every value in an env map via {@link resolveEnvValue}. */

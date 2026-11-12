@@ -30,6 +30,7 @@
  */
 
 import type { McpTenant } from "../../mcp/oauth.js";
+import { allowedMcpNames } from "../acp/index.js";
 import { query, type Query, type SDKMessage, type SDKUserMessage } from "@qwen-code/sdk";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
@@ -169,7 +170,7 @@ export class QwenProvider implements SessionProvider {
     this.#init = init;
     this.#proxy = new McpProxyLease(
       init.mcpProxy,
-      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
+      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id, ...(init.mcpRegistry ? { view: init.mcpRegistry } : {}) } : null,
     );
   }
 
@@ -502,6 +503,12 @@ export class QwenProvider implements SessionProvider {
         ],
         ...(Object.keys(mcpServers).length > 0
           ? { mcpServers: mcpServers as never }
+          : {}),
+        // Workstream isolation (G1): Qwen also loads MCP servers from its own
+        // settings (~/.qwen, a project's .qwen/ and .mcp.json): kept to the
+        // names codeoid mounts. Empty would mean "no filter".
+        ...(init.mcpRegistry?.isolated
+          ? { allowedMcpServerNames: allowedMcpNames(Object.keys(mcpServers)) }
           : {}),
         ...(desiredAppend
           ? {

@@ -406,8 +406,109 @@ A session from before workstreams were configured is given its folder's home onc
 A home deleted from the config leaves its sessions marked orphaned; removing the whole `workstreams` block turns workstreams off instead.
 A session whose stored home is unreadable or invalid gets no home (it is never re-matched to its folder).
 
-This is phase W0: a session's workstream is decided, kept and shown, and nothing it is given changes yet.
-Servers, credentials, git identity and memory follow in later phases (the design's §13).
+### Credentials
+
+A credential is declared by id and kind in `credentials`; its value is never in `config.json`.
+
+```jsonc
+"credentials": [
+  { "id": "gh-acme",  "kind": "env" },                                   // an env var a workstream sets
+  { "id": "hf-key",   "kind": "header", "header": "X-Highflame-APIKey" }, // sent in a header to an MCP server
+  { "id": "gh-bot",   "kind": "bearer" },                                 // sent as Authorization: Bearer
+  { "id": "slack-hf", "kind": "oauth", "server": "slack" }                // a second OAuth sign-in to one server
+],
+"credentialStore": { "kind": "env-file" }   // or { "kind": "dir", "path": "/var/run/secrets/codeoid" }
+```
+
+- `env-file` (default) reads `CODEOID_CRED_<ID>` (`gh-acme` → `CODEOID_CRED_GH_ACME`) from the daemon's environment or `~/.codeoid/.env`. The `CODEOID_` prefix keeps every value out of every agent process.
+- `dir` reads one file per id from a directory: a mounted Kubernetes Secret, a Vault agent's sink. Read-only, and hidden from every agent like codeoid's own secrets.
+- An OAuth slot is signed in with `codeoid mcp signin <server> --credential <id>`.
+
+Every reference to a credential is checked when the config loads: declared once, of a kind that fits where it is used.
+
+### What a workstream gives its sessions
+
+```jsonc
+{ "id": "acme", "match": { "remotes": ["github.com/acme/*"] },
+  "env": { "GH_TOKEN": { "secret": "gh-acme" } },     // read from the store when the session starts
+  "git": { "name": "Acme Bot", "email": "bot@acme.example" },
+  "mcpServers": ["web", { "server": "github", "credential": "gh-bot" }, { "server": "slack", "credential": "slack-hf" }],
+  "extends": ["base"], "exclude": ["notes"] }
+```
+
+- **env and git identity** reach the backend's process (not opencode's shared server yet). A name codeoid owns for the backend (`ANTHROPIC_*`, `PATH`, `LD_*`, …) fails the config load.
+- **mcpServers** take effect with `isolateGlobalServers: true`. Then a session reaches built-ins, the servers its home names, and the folder's own servers only when the folder is the home's; no home, the conductor's, or a deleted one: built-ins only.
+  - Claude runs with a strict MCP config: nothing from `~/.claude.json`, a `.mcp.json`, a plugin or an agent's own. Every HTTP server it reaches is codeoid's, called by the daemon (tools only: a server's prompts and resources don't pass); a stdio server needing no secret is the CLI's to run, inside the session's sandbox as before.
+  - Codex, the Gemini CLI and Qwen are kept to codeoid's servers: Codex has every server its own configs declare (`/etc/codex/`, `~/.codex/config.toml`, a project's `.codex/config.toml`) turned off, and its apps and plugins off — a codeoid server named like one of those is refused, since codex would lend it that entry's headers; the Gemini CLI and Qwen are started with only codeoid's server names allowed. opencode can't be kept to them yet: under isolation its turns are refused.
+  - Every backend mounts natively only servers that need no secret — none in a header, an env value, the URL (a token in its path or query) or the command line. An HTTP server that needs one goes through the daemon's relay; a stdio one isn't given, and the session says so.
+  - A server config can never name a workstream credential's variable: `${CODEOID_CRED_*}` resolves empty and such a `bearerTokenEnv` is ignored (a repository's config can name none of codeoid's variables at all, as before).
+  - A credential's value is read by the daemon when it calls the server, never handed to a backend. A server removed from a workstream fails on the next call, mid-turn; the tool list catches up at the next turn.
+- **skillDirs** are accepted but not applied yet (the daemon says so at start).
+
+Under isolation a session you create in a folder with no workstream is refused until you choose one; sessions the daemon starts there (loops, routines, dispatch) get built-ins only.
+
+### Editing them live
+
+Settings → Workstreams and Settings → Credentials in the web UI (or the `workstream.*` / `credential.*` messages) edit `config.json` and `.env` directly; the whole config is validated before anything is written.
+A change applies at once to new sessions and to every call a session makes through codeoid; a running session's backend is rebuilt with its workstream's servers, env and credentials as they are now at its next turn.
+A session keeps its workstream: editing rules never moves a session to another.
+A value set in the daemon's own environment (`CODEOID_CRED_<ID>=… codeoid start`) wins over `.env`, so setting it from the UI is refused: change it where it is set.
+Removing an OAuth credential signs every user out of that slot, so declaring the id again later starts from no sign-in.
+
+### Overrides
+
+Choosing a workstream for a folder another workstream holds exclusively is refused with what it would change.
+`codeoid new … --workstream <id>` then asks to confirm, or `--override` confirms without asking (needs `session:approve` on an undelegated token; audited as `workstream.override`).
+A workstream with `allowOverride: false` can't be overridden at all.
+
+A folder's workstream is remembered: if its repository later matches a different one (its `origin` was changed), the next session there must choose.
+
+### Reading another workstream, and moving a session
+
+With `isolateGlobalServers: true` a session is fenced off from every other workstream's folders and memory:
+- its sandbox shows its home's folders read-only as its project roots (never the whole `@parent`), and hides other workstreams' folders;
+- a file tool (Read, Grep, Glob, Write, Edit, on every backend, in every mode) in another workstream's folder is refused, naming that workstream;
+- `recall`, `timeline` and `get_episode` leave out episodes another workstream wrote (episodes from before workstreams stay visible in their repository).
+
+A workstream's folders are the directories its path rules name on this machine (a glob such as `~/Workspace/acme-*` expands to the folders it matches, never to `~/Workspace`), plus the folders where its sessions were started by their folder's own match.
+The more specific rule decides: a catch-all workstream over `~/Workspace` is fenced off from `~/Workspace/acme-api` when that is another's, and inside a folder of another workstream's, only what the session may read (its own workdir, its home's folders, what a reference grants) stays readable.
+The home itself is never a workstream's folder.
+
+Limits: a repository matched only by a remote rule is fenced once a session has been started there (its folder is recorded then); one never opened is not. A session's commands in an unsandboxed session (`--sandbox off`) can still read other workstreams' folders; only its file tools are fenced.
+
+A **reference** lets a session read another workstream: its folders read-only (or only some), and its memory. Never its servers, credentials or accounts, and never a write.
+The workstream being read decides, by its `share`:
+
+| `share` | A reference to it is… |
+| --- | --- |
+| `open` | granted. |
+| `ask` | granted when its owner asks with `session:approve` on an undelegated token; asked of the owner on the session otherwise. |
+| `closed` | refused. A reference granted before it was closed gives nothing. |
+
+```bash
+codeoid new <name> <dir> --ref pub --ref acme:~/Workspace/acme-api   # at create
+codeoid workstream ref add <session> pub                               # later (the session header's chip too)
+codeoid workstream ref rm <session> pub
+codeoid workstream move <session> <workstream>                         # another home
+```
+
+Moving a session takes its whole conversation with it, so it follows the `share` of its old home and of every workstream it has read from (for its lifetime, even after the reference is gone; each home it leaves counts too). Moving from the default workstream, or from no home, is always allowed; past another workstream's exclusive folder it is an override (needs `session:approve`).
+A session homed in another workstream's folder (chosen at create, or moved) reads that folder, so the folder's workstream's `share` decides there too: `closed` refuses it, `ask` needs `session:approve`.
+Each change is saved at once and applies at the session's next turn (a turn running keeps what it started with): its backend is rebuilt with the new servers, credentials and sandbox.
+
+A search with no folder (Grep or Glob over the workdir) is refused when another workstream's folder is inside the workdir: search a narrower folder.
+
+
+### The conductor and workstreams
+
+The conductor is homed in a reserved workstream of its own: no workstream's servers, env or folders. It reads across all of them through its fleet tools, which take a `workstream` filter and name each result's workstream.
+With `isolateGlobalServers: true`, a `closed` workstream gives the conductor its sessions' status and metadata only (in `fleet_list`), never their text: `fleet_find` and `fleet_recall` never return them (not even that something matched), `fleet_summary` gives status only, `machine_map` leaves out their branches, and a worker of a closed workstream reports that it finished, not what it found. Episodes from before workstreams are judged by their session's home (as recorded; for one that no longer runs, its stored binding, else its folder's record, else its folder now). A workstream deleted from the config has no policy left: its sessions' text is no longer withheld. Closing a workstream doesn't reach back: what the conductor was told while it was open (its own transcript, a task's digest on `fleet_tasks`) stays.
+
+The conductor acts only through sessions homed where the work belongs. `fleet_spawn` takes `workstream` (else the folder's; a folder with none, or one whose repository's remote now matches another workstream than before, must be given one) and follows the same rules as a create: past a workstream's exclusive folder, or into an `ask` workstream's folder, the spawn's approval card says so (naming the workstream it passes), and only the session owner's own approval of that card confirms it: the approval adds a one-time token to that very call, which its handler accepts only if the spawn would still be judged exactly as the card showed, at the config revision it was shown at. A closed workstream's folder never takes another's worker, and a closed workstream's worker works only in its own folders. Every send-class card (web, Telegram, the TUI, `codeoid approve`, the terminal) names the workstream the action runs in.
+
+### Moving an existing setup
+
+`codeoid workstream import [--root <dir>]` proposes workstreams from your repositories' remotes and lists Claude's global MCP servers to assign. It writes nothing; isolation stays off until you turn it on.
 
 ## Signing a backend in, instead of pasting a key
 

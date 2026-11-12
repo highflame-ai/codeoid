@@ -21,6 +21,7 @@ import { validAllowedHost } from "./daemon/sandbox/hosts.js";
 import { PROJECT_ROOT_PARENT, projectRootProblem } from "./daemon/sandbox/dir-rules.js";
 import { worktreeRootProblem } from "./daemon/sandbox/worktrees.js";
 import { workstreamsSchema, type WorkstreamsConfig } from "./daemon/workstreams/schema.js";
+import { credentialProblems, credentialsSchema, secretStoreSchema, type CredentialDecl, type SecretStoreConfig } from "./daemon/credentials/schema.js";
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, rmSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join, isAbsolute, resolve, dirname } from "node:path";
@@ -150,6 +151,16 @@ export function isLoopbackUrl(url: string): boolean {
  * optional surrounding single/double quotes are stripped. Intentionally
  * minimal — not a full dotenv dialect (no interpolation, no multiline).
  */
+const shadowedDotEnv = new Set<string>();
+
+/**
+ * Whether `.env` sets `key` but the daemon's real environment set it first,
+ * so the file's value isn't the one in use (recorded by `loadDotEnv`).
+ */
+export function dotEnvShadowed(key: string): boolean {
+  return shadowedDotEnv.has(key);
+}
+
 export function loadDotEnv(): string[] {
   const envPath = join(getConfigDir(), ".env");
   if (!existsSync(envPath)) return [];
@@ -168,7 +179,10 @@ export function loadDotEnv(): string[] {
     const key = line.slice(0, eq).trim();
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
     // Real environment wins — file is the fallback, not an override.
-    if (process.env[key] !== undefined) continue;
+    if (process.env[key] !== undefined) {
+      shadowedDotEnv.add(key);
+      continue;
+    }
     let value = line.slice(eq + 1).trim();
     if (
       value.length >= 2 &&
@@ -1373,6 +1387,10 @@ const RootSchema = z.object({
   mcpServers: McpServersSchema,
   /** Named lines of work (docs/workstreams-design.md). */
   workstreams: workstreamsSchema,
+  /** Named credentials: ids and kinds only, never values (workstreams G2). */
+  credentials: credentialsSchema,
+  /** Where credential values live (workstreams G2). */
+  credentialStore: secretStoreSchema,
   hooks: HooksSchema,
   embed: EmbedSchema,
   push: PushSchema,
@@ -1428,6 +1446,9 @@ const RootSchema = z.object({
         .default({ runCommands: "never", trustedRepos: [] }),
     })
     .default({ setup: { runCommands: "never", trustedRepos: [] } }),
+}).superRefine((cfg, ctx) => {
+  // Credential references across sections (workstreams G2): declared once, of a kind that fits.
+  for (const p of credentialProblems(cfg)) ctx.addIssue({ code: z.ZodIssueCode.custom, message: p.message, path: p.path });
 });
 
 type ParsedConfig = z.infer<typeof RootSchema>;
@@ -1749,6 +1770,10 @@ export interface CodeoidConfig {
    * (schema default: none, isolation off).
    */
   workstreams?: WorkstreamsConfig;
+  /** Named credentials (ids and kinds). Optional in the type; loadConfig always fills it. */
+  credentials?: CredentialDecl[];
+  /** Where credential values live; `dir` paths absolute once loaded. */
+  credentialStore?: SecretStoreConfig;
   /**
    * Daemon-native hooks — dispatched at Session's seams for every backend.
    * Optional in the type so hand-built test configs stay minimal;
@@ -2133,6 +2158,9 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     mcpServers: parsed.mcpServers,
     mcpOAuth: parsed.mcpOAuth,
     workstreams: parsed.workstreams,
+    credentials: parsed.credentials,
+    credentialStore:
+      parsed.credentialStore.kind === "dir" ? { kind: "dir", path: configRelResolve(parsed.credentialStore.path) } : parsed.credentialStore,
     hooks: parsed.hooks,
     embed: parsed.embed,
     push: parsed.push,

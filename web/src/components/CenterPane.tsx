@@ -25,6 +25,7 @@ import PromptBox from "./prompt/PromptBox";
 import SessionControls from "./SessionControls";
 import { AccountChip } from "./AccountChip";
 import { SandboxChip } from "./SandboxChip";
+import { WorkstreamChip } from "./WorkstreamChip";
 import Transcript from "./transcript/Transcript";
 import FleetRail from "./FleetRail";
 import WorkerIndicator from "./transcript/WorkerIndicator";
@@ -119,6 +120,7 @@ const SessionHeader: Component = () => (
                 {s().model}
               </span>
             </Show>
+            <WorkstreamChip session={s()} editable />
             <AccountChip session={s()} />
             <SandboxChip session={s()} />
             <span class="ml-auto font-mono text-[11px] text-fg-faint">

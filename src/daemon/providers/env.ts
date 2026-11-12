@@ -144,8 +144,16 @@ const EXTRA_ENV_DENY_SUFFIXES = ["_API_KEY", "_API_TOKEN", "_AUTH_TOKEN", "_ACCE
  */
 const ENV_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
 
+/**
+ * Git's identity variables, let through the `GIT_` deny: a name and an email
+ * run nothing (unlike GIT_SSH_COMMAND or GIT_CONFIG_*), and a workstream
+ * sets them so its commits carry its identity (docs/workstreams-design.md §6.2).
+ */
+export const GIT_IDENTITY_ENV: ReadonlySet<string> = new Set(["GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"]);
+
 function extraEnvRefused(name: string, value: unknown): boolean {
   if (!ENV_NAME.test(name) || typeof value !== "string" || value.includes("\0")) return true;
+  if (GIT_IDENTITY_ENV.has(name)) return value.includes("\n");
   return (
     EXTRA_ENV_DENY_EXACT.has(name) ||
     EXTRA_ENV_DENY_PREFIXES.some((p) => name.startsWith(p)) ||

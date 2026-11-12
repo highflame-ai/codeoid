@@ -18,7 +18,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { McpCallScope, McpHub } from "../../mcp/hub.js";
 import type { McpServerView } from "../../mcp/registry.js";
-import type { McpServerSpec } from "../../mcp/types.js";
+import { isOAuthServer, type McpServerSpec } from "../../mcp/types.js";
 
 /** One OAuth server as an in-process server forwarding to the hub. */
 export function oauthBridgeServer(spec: McpServerSpec, hub: McpHub, scope: McpCallScope): McpSdkServerConfigWithInstance {
@@ -58,6 +58,8 @@ export function oauthServersForClaude(
   /** What the query is built with — the servers, their URLs and allowlists,
    *  and which are signed in with which sign-in. Any change rebuilds it. */
   fingerprint: string;
+  /** Workstream isolation (G1): the query runs with a strict MCP config. */
+  strict: boolean;
 } {
   const specs = (registry?.oauthFor("claude") ?? []).filter((s) => s.transport.kind === "http");
   const deniedUrls = specs.map((s) => (s.transport.kind === "http" ? s.transport.url : ""));
@@ -65,10 +67,25 @@ export function oauthServersForClaude(
   // The sign-in, not just whether there is one: signed out and back in (after
   // a revoked token) between two turns must still get a fresh connection.
   const stamps = signedIn.map((s) => [s.name, hub?.credentialStamp(s, scope.tenant) ?? ""]);
+  // Under workstream isolation every other HTTP server the session may reach
+  // is a bridge too, credentialed or not: the CLI, running with a strict MCP
+  // config, holds no address or secret of its own (G1). A stdio server stays
+  // the CLI's to run — inside the session's sandbox, as before — when it needs
+  // no secret (the provider mounts those natively); one that does is withheld.
+  const strict = registry?.isolated === true;
+  const bridged = strict && hub ? (registry?.forBackend("claude") ?? []).filter((s) => !s.builtin && !isOAuthServer(s) && s.transport.kind === "http") : [];
   return {
     // Built only for a query being constructed, not on every turn's check.
-    mounts: () => Object.fromEntries(signedIn.map((s) => [s.name, oauthBridgeServer(s, hub!, scope)])),
+    mounts: () =>
+      Object.fromEntries([...signedIn, ...bridged].map((s) => [s.name, oauthBridgeServer(s, hub!, scope)])),
     deniedUrls,
-    fingerprint: JSON.stringify([specs.map((s, i) => [s.name, deniedUrls[i], s.toolAllowlist ?? null]), stamps]),
+    fingerprint: JSON.stringify([
+      specs.map((s, i) => [s.name, deniedUrls[i], s.toolAllowlist ?? null]),
+      stamps,
+      strict,
+      // The address too: an edited URL must rebuild the query, not keep dialing the old one.
+      bridged.map((s) => [s.name, s.variant ?? "", s.toolAllowlist ?? null, s.transport.kind === "http" ? s.transport.url : ""]),
+    ]),
+    strict,
   };
 }

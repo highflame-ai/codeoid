@@ -239,3 +239,12 @@ describe("extraEnv denylist (SessionCreateOptions.extraEnv)", () => {
     expect(withExtraEnv({ PATH: "/usr/bin" }, { OPENAI_API_KEY: "evil" })).toEqual({ PATH: "/usr/bin" });
   });
 });
+
+describe("git identity through extra env (workstreams §6.2)", () => {
+  it("GIT_AUTHOR_*/GIT_COMMITTER_* pass; every other GIT_ variable stays refused", () => {
+    const extra = { GIT_AUTHOR_NAME: "Ada", GIT_COMMITTER_EMAIL: "ada@example.com", GIT_SSH_COMMAND: "evil", GIT_CONFIG_COUNT: "1" };
+    expect(extraEnvViolations(extra).sort()).toEqual(["GIT_CONFIG_COUNT", "GIT_SSH_COMMAND"]);
+    expect(withExtraEnv({}, extra)).toEqual({ GIT_AUTHOR_NAME: "Ada", GIT_COMMITTER_EMAIL: "ada@example.com" });
+    expect(extraEnvViolations({ GIT_AUTHOR_NAME: "Ada\nx" })).toEqual(["GIT_AUTHOR_NAME"]);
+  });
+});

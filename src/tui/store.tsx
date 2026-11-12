@@ -319,6 +319,7 @@ function applyMessage(
       toolName: msg.tool.name,
       description: st.description,
       ...(formatToolRisk(st.risk) ? { risk: formatToolRisk(st.risk) } : {}),
+      ...(st.targetWorkstream?.warning ? { risk: `${st.targetWorkstream.warning}${formatToolRisk(st.risk) ? ` · ${formatToolRisk(st.risk)}` : ""}` } : {}),
     };
   }
 

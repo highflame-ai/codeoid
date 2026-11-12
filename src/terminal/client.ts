@@ -158,7 +158,7 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
     }
 
     case "session.message": {
-      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string; risk?: ToolRisk; sandboxed?: boolean; sandboxNote?: string; sandboxDocker?: boolean } }; identity?: { name?: string; type?: string } };
+      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string; risk?: ToolRisk; sandboxed?: boolean; sandboxNote?: string; sandboxDocker?: boolean; targetWorkstream?: { workstream?: string; warning?: string } } }; identity?: { name?: string; type?: string } };
       const id = sm.identity?.name ? `${DIM}${S(sm.identity.name)}${RESET} ` : "";
       switch (sm.role) {
         case "user":
@@ -189,7 +189,9 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
             state.lastPrompt = "tool";
             const risk = formatToolRisk(sm.tool?.state?.risk);
             const sandbox = approvalSandboxLine(sm.tool?.state ?? {});
-            return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n${risk ? `  ${RED}▲ ${S(risk)}${RESET}\n` : ""}${sandbox ? `  ${S(sandbox)}\n` : ""}  Type 'yes' to approve, 'no' to deny\n`;
+            const tw = sm.tool?.state?.targetWorkstream;
+            const ws = `${tw?.workstream ? `  ⌂ workstream ${S(tw.workstream)}\n` : ""}${tw?.warning ? `  ${YELLOW}⚠ ${S(tw.warning)}${RESET}\n` : ""}`;
+            return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n${ws}${risk ? `  ${RED}▲ ${S(risk)}${RESET}\n` : ""}${sandbox ? `  ${S(sandbox)}\n` : ""}  Type 'yes' to approve, 'no' to deny\n`;
           }
           return `\n${id}${YELLOW}⚡ ${name} [${phase}]${RESET}\n${reshow}`;
         }
@@ -483,6 +485,38 @@ export class TerminalClient {
     if (line) console.log(`  now: ${line}`);
   }
 
+  /**
+   * Change what workstreams a session reads, or move it to another
+   * (workstreams §5.3, §7): `session.add_reference` / `remove_reference` /
+   * `set_workstream`. An `ask` workstream may be asked of the owner on the session.
+   */
+  async sessionWorkstream(
+    sessionIdOrName: string,
+    change: { kind: "add_reference"; workstream: string; paths?: string[] } | { kind: "remove_reference"; workstream: string } | { kind: "set_workstream"; workstream: string },
+  ): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const base = { id: randomUUID(), sessionId, workstream: change.workstream };
+    const resp = await this.#request(
+      change.kind === "add_reference"
+        ? { type: "session.add_reference", ...base, ...(change.paths?.length ? { paths: change.paths } : {}) }
+        : change.kind === "remove_reference"
+          ? { type: "session.remove_reference", ...base }
+          : { type: "session.set_workstream", ...base },
+    );
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const data = resp.data as { pending?: boolean; message?: string; workstream?: SessionInfo["workstream"] };
+    if (data.pending) console.log(`Asked on the session: it applies once its owner says yes (codeoid approve ${S(sessionIdOrName)}, or the web UI), from its next turn.`);
+    else console.log(change.kind === "set_workstream" ? "Moved: its servers, credentials and sandbox follow from its next turn." : "Done, from its next turn.");
+    const ws = workstreamSummary(data.workstream);
+    if (ws) console.log(`  ${sanitizeTerminalOutput(ws)}`);
+    const refs = data.workstream?.references ?? [];
+    if (refs.length > 0) console.log(`  reads: ${sanitizeTerminalOutput(refs.map((r) => `${r.workstream}${r.paths ? ` (${r.paths.join(", ")})` : ""}`).join("; "))}`);
+  }
+
   /** The daemon's sandbox providers and whether each runs here (#448). */
   async sandboxProviders(): Promise<void> {
     const resp = await this.#request({ type: "sandbox.providers", id: randomUUID() });
@@ -521,6 +555,15 @@ export class TerminalClient {
       sandbox?: SessionSandboxSetting;
       /** Home workstream (docs/workstreams-design.md); absent = the folder's. */
       workstream?: string;
+      /** Other workstreams it may read (§7.2). */
+      references?: Array<{ workstream: string; paths?: string[] }>;
+      /**
+       * Asked when the choice conflicts with the folder's exclusive workstream
+       * and may be overridden (G3): shown what would change; true = confirm.
+       */
+      confirmOverride?: (warning: string) => Promise<boolean>;
+      /** Internal: the confirming retry's token. */
+      overrideToken?: string;
     } = {},
   ): Promise<void> {
     const resp = await this.#request({
@@ -541,7 +584,22 @@ export class TerminalClient {
       ...(opts.collaboration ? { collaboration: opts.collaboration } : {}),
       ...(opts.sandbox ? { sandbox: opts.sandbox } : {}),
       ...(opts.workstream ? { workstream: opts.workstream } : {}),
+      ...(opts.overrideToken ? { override: { token: opts.overrideToken } } : {}),
+      ...(opts.references?.length ? { references: opts.references } : {}),
     });
+
+    const conflict = resp.type === "response.error" && resp.detail?.kind === "workstream_conflict" ? resp.detail.resolution.conflict : undefined;
+    if (conflict?.overrideToken && opts.confirmOverride && !opts.overrideToken) {
+      const ch = conflict.changes;
+      const warning = [
+        `⚠ This folder belongs to workstream "${S(conflict.folder)}" (exclusive).`,
+        `  A session here in "${S(conflict.chosen)}" gets ${ch && ch.gains.length > 0 ? `its servers (${S(ch.gains.join(", "))})` : "no servers of the folder's workstream"}${ch && ch.env.length > 0 ? ` and env ${S(ch.env.join(", "))}` : ""}${ch?.git ? `, commits as ${S(ch.git)}` : ""},`,
+        `  writes into "${S(conflict.folder)}"'s code${ch && ch.withholds.length > 0 ? `, and is not given ${S(ch.withholds.join(", "))}` : ""}.`,
+      ].join("\n");
+      if (await opts.confirmOverride(warning)) {
+        return this.createSession(name, workdir, { ...opts, overrideToken: conflict.overrideToken });
+      }
+    }
 
     if (resp.type === "response.ok") {
       const data = resp.data as SessionInfo;
@@ -960,20 +1018,21 @@ export class TerminalClient {
    * finishes a sign-in on its own only for the browser the web UI started it
    * from. `callbackUrl` finishes one started earlier, without a terminal.
    */
-  async mcpSignin(server: string, callbackUrl?: string): Promise<void> {
+  async mcpSignin(server: string, callbackUrl?: string, credential?: string): Promise<void> {
     if (callbackUrl) {
       await this.#finishMcpSignin(callbackUrl);
       return;
     }
     // Discovery and client registration are a few round trips to the provider.
-    const begun = await this.#request({ type: "mcp.oauth.begin", id: randomUUID(), server }, 45_000);
+    const begun = await this.#request({ type: "mcp.oauth.begin", id: randomUUID(), server, ...(credential ? { credential } : {}) }, 45_000);
     if (begun.type !== "mcp.oauth.begin.result") {
       this.#printError(begun);
       process.exitCode = 1;
       return;
     }
+    const as = credential ? ` (credential ${S(credential)})` : "";
     if (begun.status === "connected" || !begun.url) {
-      console.log(`${S(server)} is signed in.`);
+      console.log(`${S(server)}${as} is signed in.`);
       return;
     }
     console.log(`Open this address to sign in to ${S(server)}:\n\n  ${begun.url}\n`);
@@ -1271,6 +1330,9 @@ export class TerminalClient {
     if (risk) console.log(`▲ ${oneLine(risk)}`);
     const sandbox = approvalSandboxLine(pending);
     if (sandbox) console.log(oneLine(sandbox));
+    // The workstream it acts in, and what approving confirms (workstreams §10), as the card says.
+    if (pending.targetWorkstream?.workstream) console.log(`⌂ workstream ${oneLine(pending.targetWorkstream.workstream)}`);
+    if (pending.targetWorkstream?.warning) console.log(`⚠ ${oneLine(pending.targetWorkstream.warning)}`);
     const shown = plainText(pending.input === undefined ? "" : JSON.stringify(pending.input, null, 2) ?? "");
     const cut = shown.length > APPROVE_SHOW_MAX;
     console.log(cut ? shown.slice(0, APPROVE_SHOW_MAX) : shown);

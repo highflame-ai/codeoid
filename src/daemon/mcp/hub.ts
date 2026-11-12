@@ -29,6 +29,7 @@ import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { ResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import { McpSignInRequired, type McpCredentialSource, type McpTenant } from "./oauth.js";
 import type { McpProxy } from "./proxy.js";
+import type { SecretStore } from "../credentials/store.js";
 import { cleanMcpError } from "./redact.js";
 import { closeUpstream, FailureStreak, McpServerWantsSignIn, openUpstream, sessionGone, sessionTrouble, type UpstreamBearer, type UpstreamOptions } from "./upstream.js";
 
@@ -73,6 +74,8 @@ export interface McpHubOptions {
   daemonEnv?: Record<string, string | undefined>;
   /** Where OAuth servers' tokens come from (docs/mcp-oauth-design.md). */
   credentials?: McpCredentialSource;
+  /** Where named credentials' values come from (workstreams G2). */
+  secrets?: SecretStore;
 }
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -97,6 +100,29 @@ export class McpHub {
     this.#timeoutMs = opts.toolTimeoutMs && opts.toolTimeoutMs > 0 ? opts.toolTimeoutMs : DEFAULT_TIMEOUT_MS;
     this.#env = opts.daemonEnv ?? process.env;
     this.#credentials = opts.credentials ?? null;
+    this.#secrets = opts.secrets ?? null;
+  }
+
+  #secrets: SecretStore | null;
+  /**
+   * Whether a session may still reach a server, asked on every list and call
+   * (workstreams G4): a server its workstream no longer selects fails at once,
+   * mid-turn, with the reason — the backend's tool list catches up at the next
+   * turn boundary. Returns the refusal, or undefined when allowed.
+   */
+  #permit: ((sessionId: string, spec: McpServerSpec) => string | undefined) | null = null;
+
+  setPermit(fn: (sessionId: string, spec: McpServerSpec) => string | undefined): void {
+    this.#permit = fn;
+  }
+
+  #refusal(spec: McpServerSpec, scope: McpCallScope | undefined): string | undefined {
+    return scope?.sessionId && !spec.builtin ? this.#permit?.(scope.sessionId, spec) : undefined;
+  }
+
+  /** The named-credential lookup upstream requests use (null store = none set). */
+  get secretLookup(): (id: string) => string | undefined {
+    return (id) => this.#secrets?.get(id);
   }
 
   /** Tools `spec` exposes, filtered by its allowlist. Never throws — a server
@@ -113,6 +139,8 @@ export class McpHub {
    * healthy server with no tools. Timed like a call.
    */
   async listToolsOrThrow(spec: McpServerSpec, scope?: McpCallScope): Promise<McpToolDef[]> {
+    const refused = this.#refusal(spec, scope);
+    if (refused) throw new Error(refused);
     const key = clientKey(spec, scope?.tenant);
     let client: McpClient | undefined;
     try {
@@ -146,6 +174,8 @@ export class McpHub {
     if (spec.toolAllowlist && !spec.toolAllowlist.includes(tool)) {
       return { text: `Tool "${tool}" is not in the allowlist for server "${spec.name}".`, isError: true };
     }
+    const refused = this.#refusal(spec, scope);
+    if (refused) return { text: refused, isError: true };
     let client: McpClient;
     try {
       client = this.#clientFor(spec, scope.tenant);
@@ -309,6 +339,13 @@ export class McpHub {
   /** Drop one tenant's client for a server (it signed out or back in). */
   dropTenant(name: string, tenant: McpTenant): void {
     this.#drop(tenantKey(name, tenant));
+    // ...and every variant of it for this tenant: a credential slot's client
+    // (workstreams §6.5) is keyed by its variant, and a sign-in or sign-out
+    // to the server must not leave one connected on the old credential.
+    const suffix = tenantKey("", tenant);
+    for (const key of [...this.#clients.keys()]) {
+      if (key.startsWith(`${name}\u0001`) && key.endsWith(suffix)) this.#drop(key);
+    }
   }
 
   /** Drop `client` if this failure broke it — and only if it is still the
@@ -345,7 +382,7 @@ export class McpHub {
       case "stdio":
         return new StdioMcpClient(spec.name, spec.transport, this.#env);
       case "http": {
-        const base = { name: spec.name, transport: spec.transport, env: this.#env };
+        const base = { name: spec.name, transport: spec.transport, env: this.#env, secrets: this.secretLookup };
         if (!isOAuthServer(spec)) return new HttpMcpClient(base, this.#timeoutMs);
         const credentials = this.#credentials;
         if (!credentials || !tenant) throw new McpSignInRequired(spec.name);

@@ -251,8 +251,11 @@ codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  #
 codeoid routine add <name> --loop --prompt … --verify "id: cmd" [--test] [--attempts N] [--attempt-minutes N] [--run-minutes N] [--budget N]  # start a loop (--check = gate, --verify = its acceptance checks)
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 codeoid worktree trust [dir] [--off] [--yes]  # trust the setup command of a repo's .codeoid/setup.yaml, pinned to its blob (docs/CONFIGURATION.md)
-codeoid workstream ls | show <id> | match [dir] [--workstream <id>]  # named lines of work and what a folder resolves to (docs/workstreams-design.md)
-codeoid new <n> <d> --workstream <id>  # a session's home workstream; default: the folder's, else workstreams.default
+codeoid workstream ls | show <id> | match [dir] [--workstream <id>] | import [--root <dir>]  # named lines of work, what a folder resolves to, a proposal from disk (docs/workstreams-design.md)
+codeoid new <n> <d> --workstream <id> [--override]  # a session's home workstream; default: the folder's, else workstreams.default
+codeoid mcp signin <server> --credential <id>        # a named OAuth slot: a second sign-in to one server (a workstream's own)
+codeoid new <n> <d> --ref <workstream>[:<dir>]       # another workstream it may read (its folders read-only, its memory), by that one's share policy
+codeoid workstream ref add|rm <session> <workstream>[:<dir>] | move <session> <workstream>  # references and moves (§5.3, §7)
 ```
 
 `/mcp/control` (off by default, `mcpControl.*`) lets external agents drive
@@ -536,6 +539,39 @@ and the decided home is written with `TranscriptStore.patchMeta` after resume
 succeeded, touching no other field. Every `new Session` site in SessionManager passes
 `#workstreamOpts(...)`; children and forks inherit, the conductor's is reserved.
 With no workstreams configured no binding exists and nothing changes.
+W1: `credentials[]` (ids and kinds, never values) behind a `SecretStore`
+(`credentials/store.ts`: env-file `CODEOID_CRED_<ID>`, or a read-only dir).
+A home's env and git identity reach the backend via `Session` `workstreamEnv`
+(merged under `extraEnv`; `GIT_IDENTITY_ENV` is the only `GIT_` exemption).
+Isolation (`isolateGlobalServers`): `WorkstreamService.grantFor` → `McpGrant`,
+applied by `SessionMcpView` (`applyGrant`) for every backend; Claude runs
+`strictMcpConfig` with every server bridged to the hub (oauth-bridge.ts);
+CLI backends mount natively only `secretFree` servers and reach credentialed
+HTTP ones through the relay, whose binding carries the session's view; a
+server's named credential is a REFERENCE on its transport, resolved by
+`upstreamFetch` per request. The hub's `setPermit` (G4) checks every list and
+call against the live grant. Overrides: `OverrideTokens` (G3); the folder
+record is `workstream_folders`. OAuth slots: `mcp_oauth_credentials.credential`
+in the key, `withSlot`/`slotOf` in mcp/oauth.ts.
+W3 (under isolation): the read fence `WorkstreamService.fenceFor` (home's and
+references' folders, every other workstream's as `foreign`; folders from
+`workstreams/folders.ts` and recorded homes), read live by Session through
+`workstreamFence(binding)`: the sandbox's project roots and `extraHidden`
+(`SessionSandbox` `workstreamDirs`), the gate's `workstreams/gate.ts`
+`fenceRefusal` in every mode (and Claude's PreToolUse hook), and recall
+(`MemoryEngine.scopeSession`; `episodes.workstream_id`). References
+(`WorkstreamBinding.references`, `readFrom`) by the read workstream's `share`
+(`referenceVerdict`), moves by `moveVerdict`; `session.add_reference` /
+`remove_reference` / `set_workstream` in `#sessionWorkstreamEdit`,
+`Session.setWorkstream`; the env, grant and fence closures take the binding,
+so a change applies at the next turn.
+W4: the conductor's fleet tools name each result's workstream and take a
+`workstream` filter; `FleetDeps.textWithheld` keeps a `closed` workstream's
+episode text out of fleet_find / fleet_summary / fleet_recall and the dispatch
+digest. `fleet_spawn.workstream` → `checkWorkstream` (`#fleetSpawnHome`) before
+queueing, `dispatch_tasks.workstream` judged again at claim; send-class cards
+carry `targetWorkstream` (`#fleetCardWorkstream`). `workstreams/egress.ts` is
+the egress stub.
 
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
 or an API call. `RoutineService` owns the scheduler and runs; it reaches

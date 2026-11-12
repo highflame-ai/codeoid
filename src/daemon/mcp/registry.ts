@@ -11,7 +11,7 @@
 
 import type { RawMcpServerConfig } from "../../config.js";
 import { MEMORY_MCP_SERVER_NAME } from "../memory/mcp-http.js";
-import { isOAuthServer, mcpToolPrefix, type McpServerSpec, type McpTransport } from "./types.js";
+import { isDaemonOwnedEnvName, isOAuthServer, mcpToolPrefix, type McpServerSpec, type McpTransport } from "./types.js";
 
 /** Names codeoid owns internally — a user entry using one is ignored (the
  *  built-in wins) rather than silently shadowing an internal server. Compared
@@ -46,6 +46,19 @@ export interface McpServerView {
   oauthFor(backendId: string): McpServerSpec[];
   /** External servers a native-mount backend mounts itself (no OAuth ones). */
   forNativeMount(backendId: string): McpServerSpec[];
+  /**
+   * HTTP servers a CLI backend reaches through the daemon's relay
+   * (mcp/proxy.ts), the daemon holding the credential: OAuth servers, and
+   * under workstream isolation every server called with a credential.
+   */
+  relayFor(backendId: string): McpServerSpec[];
+  /**
+   * Workstream isolation applies (docs/workstreams-design.md §6.1): what is
+   * listed is all the session may reach, and no backend may hold a secret —
+   * Claude runs with a strict MCP config, other CLIs mount only secret-free
+   * servers natively.
+   */
+  readonly isolated: boolean;
 }
 
 export class McpRegistry implements McpServerView {
@@ -121,6 +134,12 @@ export class McpRegistry implements McpServerView {
   forNativeMount(backendId: string): McpServerSpec[] {
     return this.forBackend(backendId).filter((s) => !s.builtin && !isOAuthServer(s));
   }
+
+  relayFor(backendId: string): McpServerSpec[] {
+    return this.oauthFor(backendId).filter((s) => s.transport.kind === "http");
+  }
+
+  readonly isolated = false;
 }
 
 /** Raw (zod-validated) config → normalized spec. Transport is inferred from
@@ -133,7 +152,9 @@ export function normalizeSpec(name: string, raw: RawMcpServerConfig): McpServerS
           kind: "http",
           url: raw.url,
           headers: raw.headers,
-          bearerTokenEnv: raw.bearerTokenEnv,
+          // Never a workstream credential's variable (isDaemonOwnedEnvName):
+          // every backend reads this name from the daemon's environment.
+          bearerTokenEnv: raw.bearerTokenEnv && !isDaemonOwnedEnvName(raw.bearerTokenEnv) ? raw.bearerTokenEnv : undefined,
           ...(raw.oauth !== undefined ? { oauth: raw.oauth === true ? {} : raw.oauth } : {}),
         }
       : { kind: "stdio", command: raw.command ?? "", args: raw.args, env: raw.env };

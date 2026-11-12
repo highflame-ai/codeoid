@@ -8,6 +8,10 @@ import { FolderReader, findGitDirs, parseGitRemotes } from "./folder.js";
 import { ancestry, expandHome, matchFolder, normalizePathRule, normalizeRemote, parseSshAliases, type MatchableWorkstream } from "./match.js";
 import { workstreamsSchema } from "./schema.js";
 import { WorkstreamService } from "./service.js";
+import { proposeWorkstreams } from "./import.js";
+import { expandPathRule, repositoryTopOf } from "./folders.js";
+import { fenceRefusal } from "./gate.js";
+import { EnvFileSecretStore } from "../credentials/store.js";
 
 const ws = (id: string, over: Partial<MatchableWorkstream> = {}): MatchableWorkstream => ({
   id,
@@ -162,6 +166,13 @@ describe("schema", () => {
 
   test("a base workstream has no match rules", () => {
     expect(parse({ items: [{ id: "b", abstract: true, match: { paths: ["~/w"] } }] }).success).toBe(false);
+  });
+
+  test("a workstream can't set a variable codeoid owns for the backend", () => {
+    for (const name of ["ANTHROPIC_API_KEY", "PATH", "LD_PRELOAD", "CODEOID_X", "GIT_SSH_COMMAND", "lower_case"]) {
+      expect(parse({ items: [{ id: "a", env: { [name]: { secret: "s" } } }] }).success).toBe(false);
+    }
+    expect(parse({ items: [{ id: "a", env: { GH_TOKEN: { secret: "s" }, NPM_TOKEN: { secret: "s" } } }] }).success).toBe(true);
   });
 
   test("env values are references, never inline secrets", () => {
@@ -326,7 +337,7 @@ describe("WorkstreamService", () => {
     ]);
     const c = s.forCreate(join(tmp, "client"), "mine");
     expect(c.ok).toBe(false);
-    if (!c.ok && c.kind === "workstream_conflict") expect(c.resolution.conflict).toEqual({ folder: "client", chosen: "mine", overridable: false });
+    if (!c.ok && c.kind === "workstream_conflict") expect(c.resolution.conflict).toMatchObject({ folder: "client", chosen: "mine", overridable: false });
     const r = s.forCreate(join(tmp, "research"), "mine");
     expect(r.ok && r.binding).toMatchObject({ id: "mine", source: "explicit" });
     expect(s.forCreate(join(tmp, "client"), "client").ok).toBe(true);
@@ -505,9 +516,270 @@ describe("WorkstreamService", () => {
     expect(service([{ id: "b" }]).revision).not.toBe(a.revision);
   });
 
-  test("summaries list env names, never values", () => {
+  test("envFor: the home's env from the store, its git identity; nothing for no home or a reserved one", () => {
+    const s = service([{ id: "a", env: { GH_TOKEN: { secret: "gh-a" }, NPM_TOKEN: { secret: "npm-a" } }, git: { name: "Ada", email: "ada@example.com" } }]);
+    const store = new EnvFileSecretStore({ CODEOID_CRED_GH_A: "tok" });
+    const r = s.envFor({ id: "a", source: "explicit", revision: "r" }, store);
+    expect(r.env).toEqual({ GH_TOKEN: "tok", GIT_AUTHOR_NAME: "Ada", GIT_COMMITTER_NAME: "Ada", GIT_AUTHOR_EMAIL: "ada@example.com", GIT_COMMITTER_EMAIL: "ada@example.com" });
+    expect(r.missing).toEqual(["NPM_TOKEN"]);
+    expect(s.envFor({ source: "none", revision: "r" }, store).env).toEqual({});
+    expect(s.envFor({ id: "conductor", source: "reserved", revision: "r" }, store).env).toEqual({});
+    expect(s.envFor(undefined, store).env).toEqual({});
+  });
+
+  test("summaries list env names and credential ids, never values", () => {
     const s = service([{ id: "a", env: { GH_TOKEN: { secret: "gh-a" } } }]);
     expect(s.summaries()[0].env).toEqual(["GH_TOKEN"]);
-    expect(JSON.stringify(s.summaries())).not.toContain("gh-a");
+    // A credential id is a reference the editor shows; a value never is here.
+    expect(s.summaries()[0].config).toMatchObject({ env: { GH_TOKEN: { secret: "gh-a" } } });
+  });
+});
+
+describe("proposeWorkstreams (codeoid workstream import)", () => {
+  test("groups repositories by remote owner; folders without a remote and the global servers are listed apart", () => {
+    const root = join(tmp, "Workspace");
+    repo(join(root, "a1"), { origin: "git@github.com:Acme/a1.git" });
+    repo(join(root, "a2"), { origin: "https://github.com/acme/a2" });
+    repo(join(root, "b1"), { origin: "https://gitlab.com/beta/b1" });
+    mkdirSync(join(root, "plain"), { recursive: true });
+    const p = proposeWorkstreams([root], ["slack", "github"], new FolderReader({ home: tmp, sshConfig: "" }));
+    expect(p.items.map((i) => [i.id, i.match.remotes[0], i.folders.length])).toEqual([
+      ["acme", "github.com/acme/*", 2],
+      ["beta", "gitlab.com/beta/*", 1],
+    ]);
+    expect(p.unmatched).toEqual([join(root, "plain")]);
+    expect(p.globalServers).toEqual(["github", "slack"]);
+    // Every proposed item is a valid config item.
+    expect(workstreamsSchema.safeParse({ items: p.items.map(({ id, name, match }) => ({ id, name, match })) }).success).toBe(true);
+  });
+});
+
+
+describe("W3: folders, the fence, share verdicts", () => {
+  const service = (items: unknown[], extra: Record<string, unknown> = {}) =>
+    new WorkstreamService(workstreamsSchema.parse({ isolateGlobalServers: true, items, ...extra }), new FolderReader({ home: tmp, sshConfig: "" }));
+
+  test("a glob rule expands to the folders it names, never its literal head; a link is never followed", () => {
+    for (const d of ["W/acme-api", "W/acme-web", "W/other", "elsewhere"]) mkdirSync(join(tmp, d), { recursive: true });
+    writeFileSync(join(tmp, "W", "acme-file"), "");
+    symlinkSync(join(tmp, "elsewhere"), join(tmp, "W", "acme-link"));
+    expect(expandPathRule(join(tmp, "W", "acme-*")).folders.sort()).toEqual([join(tmp, "W", "acme-api"), join(tmp, "W", "acme-web")]);
+    expect(expandPathRule(join(tmp, "W", "missing")).folders).toEqual([]);
+    expect(expandPathRule(join(tmp, "W", "**", "x")).limits[0]).toContain("**");
+    expect(expandPathRule(join(tmp, "W", "*"), 1).limits[0]).toContain("more than 1");
+  });
+
+  test("the fence: every other workstream's folders are foreign; what is readable inside one is carved out", () => {
+    for (const d of ["W/acme-api/src", "W/acme-web", "W/hf", "W/mine/inner", "W/stray"]) mkdirSync(join(tmp, d), { recursive: true });
+    writeFileSync(join(tmp, "W", "acme-api", ".env"), "x");
+    const s = service([
+      { id: "acme", share: "ask", match: { paths: ["~/W/acme-*"] } },
+      { id: "hf", share: "closed", match: { paths: ["~/W/hf"] } },
+      { id: "mine", share: "open", match: { paths: ["~/W/mine"] } },
+      { id: "broad", match: { paths: ["~/W"] } },
+    ]);
+    const src = join(tmp, "W", "acme-api", "src");
+    const fence = s.fenceFor({ id: "mine", source: "matched", revision: "r", references: [{ workstream: "acme", paths: [src], grantedBy: "u", grantedAt: "t" }] }, () => [], [join(tmp, "W", "mine")])!;
+    expect(fence.home).toEqual([join(tmp, "W", "mine")]);
+    expect(fence.references).toEqual([{ workstream: "acme", folders: [src] }]);
+    expect(fence.readable.sort()).toEqual([join(tmp, "W", "mine"), src].sort());
+    // acme's folder holding the granted path is foreign still (only `src` is carved out), and `broad`,
+    // which holds the home, is foreign with the home carved out of it.
+    expect(fence.foreign.map((f) => f.workstream).sort()).toEqual(["acme", "broad", "hf"]);
+    expect(fence.hidden).toContain(join(tmp, "W", "acme-web"));
+    expect(fence.hidden).toContain(join(tmp, "W", "hf"));
+    expect(fence.hidden).toContain(join(tmp, "W", "acme-api", ".env"));
+    expect(fence.hidden).toContain(join(tmp, "W", "stray"));
+    expect(fence.hidden).not.toContain(src);
+    expect(fence.hidden).not.toContain(join(tmp, "W", "mine"));
+    // A catch-all home: every narrower workstream inside it is fenced (the more specific rule decides).
+    const wide = s.fenceFor({ id: "broad", source: "matched", revision: "r" }, () => [], [join(tmp, "W")])!;
+    expect(wide.foreign.find((f) => f.workstream === "hf")?.folders).toEqual([join(tmp, "W", "hf")]);
+    expect(fenceRefusal("Read", { file_path: join(tmp, "W", "hf", "x") }, { workdir: join(tmp, "W"), fence: wide })).toMatchObject({ workstream: "hf" });
+    // A closed workstream's reference gives nothing, even one granted before.
+    const closed = s.fenceFor({ id: "mine", source: "matched", revision: "r", references: [{ workstream: "hf", grantedBy: "u", grantedAt: "t" }] })!;
+    expect(closed.references).toEqual([]);
+    // Recorded homes (a remote-rule workstream) count as its folders.
+    expect(s.fenceFor(undefined, (id) => (id === "hf" ? [join(tmp, "W", "hf"), "/srv/hf-clone"] : []))!.foreign.find((f) => f.workstream === "hf")?.folders.sort()).toEqual(["/srv/hf-clone", join(tmp, "W", "hf")].sort());
+    // Isolation off: no fence.
+    expect(new WorkstreamService(workstreamsSchema.parse({ items: [{ id: "a" }] }), new FolderReader({ home: tmp, sshConfig: "" })).fenceFor(undefined)).toBeUndefined();
+  });
+
+  test("a session's own workdir stays readable whatever its home (moved, or homed past a claim)", () => {
+    mkdirSync(join(tmp, "W", "mine"), { recursive: true });
+    const s = service([{ id: "mine", match: { paths: ["~/W/mine"] } }, { id: "pub" }]);
+    const fence = s.fenceFor({ id: "pub", source: "explicit", revision: "r" }, () => [], [join(tmp, "W", "mine")])!;
+    expect(fenceRefusal("Read", { file_path: join(tmp, "W", "mine", "own.ts") }, { workdir: join(tmp, "W", "mine"), fence })).toBeNull();
+    expect(fenceRefusal("Grep", { pattern: "x" }, { workdir: join(tmp, "W", "mine"), fence })).toBeNull();
+  });
+
+  test("the home is never a workstream's folder, nor a repository top for one (a dotfiles home)", () => {
+    mkdirSync(join(tmp, ".git"), { recursive: true });
+    mkdirSync(join(tmp, "plain", "pkg"), { recursive: true });
+    expect(repositoryTopOf(join(tmp, "plain", "pkg"), tmp)).toBe(join(tmp, "plain", "pkg"));
+    const s = service([{ id: "all", match: { paths: ["~"] } }, { id: "mine" }]);
+    expect(s.foldersOf("all").folders).toEqual([]);
+    expect(s.foldersOf("all").limits[0]).toContain("home");
+  });
+
+  test("a malformed stored binding seals the session: no home, and never moved", () => {
+    const s = service([{ id: "a" }, { id: "b" }]);
+    const r = s.forResume([{ sessionId: "x", workdir: tmp, stored: { id: "a", source: "matched", revision: "r", references: "bad" } }])("x");
+    expect(r.binding).toMatchObject({ source: "none", sealed: true });
+    expect(s.moveVerdict(r.binding, "b")).toMatchObject({ ok: false });
+    expect(readWorkstreamBinding(r.binding)).toMatchObject({ sealed: true });
+  });
+
+  test("reference verdicts follow the share policy of the workstream read", () => {
+    mkdirSync(join(tmp, "W", "acme-api"), { recursive: true });
+    const s = service([
+      { id: "acme", share: "ask", match: { paths: ["~/W/acme-*"] } },
+      { id: "hf", share: "closed" },
+      { id: "pub", share: "open" },
+      { id: "base", abstract: true },
+    ]);
+    expect(s.referenceVerdict("pub", { workstream: "acme" })).toEqual({ ok: true, ask: ["acme"] });
+    expect(s.referenceVerdict("acme", { workstream: "pub" })).toEqual({ ok: true, ask: [] });
+    expect(s.referenceVerdict("pub", { workstream: "hf" })).toMatchObject({ ok: false });
+    expect(s.referenceVerdict("pub", { workstream: "base" })).toMatchObject({ ok: false });
+    expect(s.referenceVerdict("pub", { workstream: "pub" })).toMatchObject({ ok: false });
+    expect(s.referenceVerdict("pub", { workstream: "nope" })).toMatchObject({ ok: false });
+    expect(s.referenceVerdict("pub", { workstream: "acme", paths: [join(tmp, "W", "acme-api", "src")] })).toEqual({ ok: true, ask: ["acme"] });
+    expect(s.referenceVerdict("pub", { workstream: "acme", paths: ["/etc"] })).toMatchObject({ ok: false });
+  });
+
+  test("move verdicts: the old home's policy and every workstream read from; from the default, always", () => {
+    const s = service([{ id: "acme", share: "ask" }, { id: "hf", share: "closed" }, { id: "pub", share: "open" }, { id: "scratch", share: "closed" }], { default: "scratch" });
+    const b = (id: string, readFrom?: string[]) => ({ id, source: "matched" as const, revision: "r", ...(readFrom ? { readFrom } : {}) });
+    expect(s.moveVerdict(b("pub"), "acme")).toEqual({ ok: true, ask: [] });
+    expect(s.moveVerdict(b("acme"), "pub")).toEqual({ ok: true, ask: ["acme"] });
+    expect(s.moveVerdict(b("hf"), "pub")).toMatchObject({ ok: false });
+    expect(s.moveVerdict(b("pub", ["hf"]), "acme")).toMatchObject({ ok: false });
+    expect(s.moveVerdict(b("pub", ["hf"]), "hf")).toEqual({ ok: true, ask: [] });
+    expect(s.moveVerdict(b("scratch"), "acme")).toEqual({ ok: true, ask: [] });
+    expect(s.moveVerdict(undefined, "acme")).toEqual({ ok: true, ask: [] });
+    expect(s.moveVerdict({ id: "conductor", source: "reserved", revision: "r" }, "pub")).toMatchObject({ ok: false });
+  });
+
+  test("a binding's references and read-from record round-trip; a malformed one fails the binding", () => {
+    const good = { id: "a", source: "matched" as const, revision: "r", references: [{ workstream: "b", paths: ["/x"], grantedBy: "u", grantedAt: "t" }], readFrom: ["b", "b"] };
+    expect(readWorkstreamBinding(good)).toEqual({ ...good, readFrom: ["b"] });
+    expect(readWorkstreamBinding({ ...good, references: [{ workstream: "B!", grantedBy: "u", grantedAt: "t" }] })).toBeUndefined();
+    expect(readWorkstreamBinding({ ...good, references: [{ workstream: "b", paths: ["rel"], grantedBy: "u", grantedAt: "t" }] })).toBeUndefined();
+    expect(readWorkstreamBinding({ ...good, readFrom: ["ok", 3] })).toBeUndefined();
+  });
+});
+
+describe("W3: the fence at the gate", () => {
+  const fence = () => ({
+    workstream: "mine",
+    home: [join(tmp, "mine")],
+    references: [{ workstream: "pub", folders: [join(tmp, "pub")] }],
+    foreign: [
+      { workstream: "hf", folders: [join(tmp, "hf")] },
+      { workstream: "nested", folders: [join(tmp, "mine", "vendor-x")] },
+      { workstream: "pub", folders: [join(tmp, "pub")] },
+    ],
+    readable: [join(tmp, "mine"), join(tmp, "pub")],
+    own: [join(tmp, "mine")],
+    hidden: [],
+    limits: [],
+  });
+  beforeEach(() => {
+    for (const d of ["mine/vendor-x", "pub", "hf", "elsewhere"]) mkdirSync(join(tmp, d), { recursive: true });
+  });
+  const judge = (tool: string, input: Record<string, unknown>, cwd?: string) => fenceRefusal(tool, input, { workdir: join(tmp, "mine"), ...(cwd ? { cwd } : {}), fence: fence() });
+
+  test("reads and writes in another workstream's folders are refused; the home and elsewhere aren't", () => {
+    expect(judge("Read", { file_path: join(tmp, "hf", "secret.ts") })).toMatchObject({ workstream: "hf", kind: "read" });
+    expect(judge("Read", { file_path: join(tmp, "mine", "a.ts") })).toBeNull();
+    expect(judge("Read", { file_path: "/etc/hosts" })).toBeNull();
+    expect(judge("Read", { file_path: "vendor-x/x.ts" })).toMatchObject({ workstream: "nested" });
+    expect(judge("Read", { file_path: "../hf/x" })).toMatchObject({ workstream: "hf" });
+    expect(judge("Write", { file_path: join(tmp, "hf", "x") })).toMatchObject({ kind: "write" });
+    expect(judge("write_file", { file_path: join(tmp, "hf", "x") })).toMatchObject({ kind: "write" });
+  });
+
+  test("a reference is read, never written", () => {
+    expect(judge("Read", { file_path: join(tmp, "pub", "x") })).toBeNull();
+    expect(judge("Edit", { file_path: join(tmp, "pub", "x") })).toMatchObject({ workstream: "pub", kind: "write_reference" });
+  });
+
+  test("a search whose root holds a fenced folder reads into it", () => {
+    expect(judge("Grep", { path: tmp, pattern: "x" })).toMatchObject({ workstream: "hf", kind: "search" });
+    expect(judge("Grep", { pattern: "x" })).toMatchObject({ workstream: "nested", kind: "search" });
+    expect(judge("Grep", { path: join(tmp, "pub"), pattern: "x" })).toBeNull();
+    expect(judge("Glob", { pattern: `${join(tmp, "hf")}/**/*.ts` })).toMatchObject({ workstream: "hf" });
+  });
+
+  test("what other backends name is judged too: a glob's partial segment, ACP locations, pi's @ and find/ls", () => {
+    expect(judge("Glob", { pattern: `${join(tmp, "h")}?/*` })).toMatchObject({ workstream: "hf" });
+    expect(judge("Read", { title: "read", locations: [join(tmp, "hf", "secret.ts")] })).toMatchObject({ workstream: "hf" });
+    expect(judge("Read", { locations: [{ path: join(tmp, "hf", "secret.ts") }] })).toMatchObject({ workstream: "hf" });
+    expect(judge("read", { path: `@${join(tmp, "hf", "secret.ts")}` })).toMatchObject({ workstream: "hf" });
+    expect(judge("find", { path: tmp })).toMatchObject({ kind: "search" });
+    expect(judge("ls", { path: tmp })).toMatchObject({ kind: "search" });
+  });
+
+  test("a relative path where the cwd isn't known is refused, never guessed", () => {
+    expect(fenceRefusal("Read", { file_path: "x.ts" }, { workdir: join(tmp, "mine"), cwd: null, fence: fence() })).toMatchObject({ kind: "unresolved" });
+    expect(fenceRefusal("Read", { file_path: join(tmp, "mine", "x.ts") }, { workdir: join(tmp, "mine"), cwd: null, fence: fence() })).toBeNull();
+  });
+
+  test("a link into a fenced folder is judged where it leads", () => {
+    symlinkSync(join(tmp, "hf"), join(tmp, "mine", "link"));
+    expect(judge("Read", { file_path: join(tmp, "mine", "link", "x") })).toMatchObject({ workstream: "hf" });
+    expect(judge("Read", { file_path: "x" }, join(tmp, "hf"))).toMatchObject({ workstream: "hf" });
+  });
+});
+
+describe("W3 audit round 2: monorepos and granted paths", () => {
+  const service = (items: unknown[]) =>
+    new WorkstreamService(workstreamsSchema.parse({ isolateGlobalServers: true, items }), new FolderReader({ home: tmp, sshConfig: "" }));
+
+  test("a session in one workstream's package of another's monorepo reads its package, not the repository", () => {
+    for (const d of ["W/mono/.git", "W/mono/sdk", "W/mono/core"]) mkdirSync(join(tmp, d), { recursive: true });
+    writeFileSync(join(tmp, "W", "mono", "core", "x.ts"), "x");
+    const s = service([
+      { id: "a", share: "closed", claim: "exclusive", match: { paths: ["~/W/mono"] } },
+      { id: "b", claim: "exclusive", match: { paths: ["~/W/mono/sdk"] } },
+    ]);
+    const sdk = join(tmp, "W", "mono", "sdk");
+    const fence = s.fenceFor({ id: "b", source: "matched", revision: "r" }, () => [], [sdk, repositoryTopOf(sdk, tmp)])!;
+    expect(fence.own).toEqual([sdk]);
+    expect(fenceRefusal("Read", { file_path: join(tmp, "W", "mono", "core", "x.ts") }, { workdir: sdk, fence })).toMatchObject({ workstream: "a" });
+    expect(fenceRefusal("Write", { file_path: join(tmp, "W", "mono", "core", "x.ts") }, { workdir: sdk, fence })).toMatchObject({ kind: "write" });
+    expect(fenceRefusal("Read", { file_path: join(sdk, "y.ts") }, { workdir: sdk, fence })).toBeNull();
+    expect(fence.hidden).toContain(join(tmp, "W", "mono", "core"));
+    expect(fence.hidden).not.toContain(sdk);
+  });
+
+  test("a recorded session in a monorepo another workstream splits by path stays its package, never the top", () => {
+    for (const d of ["W/mono/.git", "W/mono/a", "W/mono/b"]) mkdirSync(join(tmp, d), { recursive: true });
+    const s = service([
+      { id: "a", share: "closed", match: { paths: ["~/W/mono/a"] } },
+      { id: "b", match: { paths: ["~/W/mono/b"] } },
+    ]);
+    expect(s.foldersOf("a", [join(tmp, "W", "mono", "a")]).folders).toEqual([join(tmp, "W", "mono", "a")]);
+    const b = join(tmp, "W", "mono", "b");
+    const fence = s.fenceFor({ id: "b", source: "matched", revision: "r" }, (id) => (id === "a" ? [join(tmp, "W", "mono", "a")] : []), [b, repositoryTopOf(b, tmp)])!;
+    expect(fenceRefusal("Read", { file_path: join(tmp, "W", "mono", "a", "k") }, { workdir: b, fence })).toMatchObject({ workstream: "a" });
+  });
+
+  test("a granted path counts only where it really is: no `..`, no link into another workstream", () => {
+    for (const d of ["W/b", "W/c/s"]) mkdirSync(join(tmp, d), { recursive: true });
+    writeFileSync(join(tmp, "W", "c", "s", "key.txt"), "k");
+    symlinkSync(join(tmp, "W", "c"), join(tmp, "W", "b", "future"));
+    const s = service([
+      { id: "home", match: { paths: ["~/W/home"] } },
+      { id: "b", share: "open", match: { paths: ["~/W/b"] } },
+      { id: "c", share: "closed", match: { paths: ["~/W/c"] } },
+    ]);
+    const ref = (p: string) => ({ id: "home", source: "explicit" as const, revision: "r", references: [{ workstream: "b", paths: [p], grantedBy: "u", grantedAt: "t" }] });
+    for (const p of [join(tmp, "W", "b", "future"), `${join(tmp, "W", "b")}/../c/s`]) {
+      const fence = s.fenceFor(ref(p))!;
+      expect(fence.references[0]?.folders).toEqual([]);
+      expect(fenceRefusal("Read", { file_path: join(tmp, "W", "c", "s", "key.txt") }, { workdir: tmp, fence })).toMatchObject({ workstream: "c" });
+    }
   });
 });

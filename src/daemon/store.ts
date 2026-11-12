@@ -51,6 +51,15 @@ export interface DispatchTaskRow {
   provider: string | null;
   /** Per-child model, already resolved against `provider`. NULL = provider default. */
   model: string | null;
+  /**
+   * A spawn's target home workstream (workstreams §10), checked when queued
+   * and again at claim. NULL = the folder's (every task before W4).
+   */
+  workstream: string | null;
+  /** The spawn's card confirmed an override or an `ask` folder (its approval card said so). */
+  workstreamOverride: boolean;
+  /** The config revision that confirmation was given at: it holds only at that one. */
+  workstreamRevision: string | null;
   status: DispatchTaskStatus;
   attempts: number;
   failureLimit: number;
@@ -139,6 +148,9 @@ interface RawDispatchRow {
   attempt_id: string | null;
   generation: number;
   held_until: number | null;
+  workstream?: string | null;
+  workstream_override?: number | null;
+  workstream_revision?: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -157,6 +169,9 @@ function rowToDispatchTask(r: RawDispatchRow): DispatchTaskRow {
     // missing-column undefined and a stored NULL to the same "use default".
     provider: r.provider ?? null,
     model: r.model ?? null,
+    workstream: r.workstream ?? null,
+    workstreamOverride: r.workstream_override === 1,
+    workstreamRevision: r.workstream_revision ?? null,
     status: r.status,
     attempts: r.attempts,
     failureLimit: r.failure_limit,
@@ -229,6 +244,13 @@ function enableWalWithRetry(db: Database, dbPath: string): void {
   throw new Error(
     `could not switch ${dbPath} to WAL journal mode after ${WAL_RETRY_ATTEMPTS} attempts${because}`,
   );
+}
+
+/** Which stored OAuth credential: a server at a URL, and a slot ('' / absent = its default sign-in). */
+export interface McpOAuthServerKey {
+  name: string;
+  url: string;
+  slot?: string;
 }
 
 export class Store {
@@ -415,6 +437,18 @@ export class Store {
         PRIMARY KEY (account_id, project_id, workdir, provider_id, model)
       );
 
+      -- How each folder last resolved to a workstream, per tenant
+      -- (docs/workstreams-design.md §5.1): a repository rule that matches
+      -- differently later (an edited origin) is refused, not a silent re-home.
+      CREATE TABLE IF NOT EXISTS workstream_folders (
+        account_id  TEXT NOT NULL,
+        project_id  TEXT NOT NULL,
+        workdir     TEXT NOT NULL,
+        workstream  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (account_id, project_id, workdir)
+      );
+
       -- A repo's MCP server (a workdir's .mcp.json or project settings)
       -- approved in codeoid to reach every backend there (#395). Bound to the
       -- entry's fingerprint: a repo that edits the entry needs consent again.
@@ -442,11 +476,14 @@ export class Store {
         project_id      TEXT NOT NULL,
         server          TEXT NOT NULL,
         server_url      TEXT NOT NULL,
+        -- A named credential's slot (workstreams §6.5 case 2: a second
+        -- sign-in to one server). '' = the server's default sign-in.
+        credential      TEXT NOT NULL DEFAULT '',
         client_json     TEXT,
         tokens_json     TEXT,
         tokens_saved_at INTEGER,
         updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
-        PRIMARY KEY (account_id, project_id, server, server_url)
+        PRIMARY KEY (account_id, project_id, server, server_url, credential)
       );
 
       -- Durable conductor identity (design R2): one row per tenant, reloaded
@@ -606,6 +643,37 @@ export class Store {
       }
     }
 
+    // ── mcp_oauth_credentials: a credential slot in the key (rebuild) ─────
+    // Workstreams give one server several sign-ins (§6.5 case 2). The slot is
+    // part of the primary key, which SQLite can't change by ALTER, so the
+    // table is rebuilt once, in one transaction: every existing row becomes
+    // the default slot (''), exactly what it was.
+    {
+      const cols = this.#db.prepare("PRAGMA table_info(mcp_oauth_credentials)").all() as Array<{ name: string }>;
+      if (cols.length > 0 && !cols.some((c) => c.name === "credential")) {
+        this.#db.transaction(() => {
+          this.#db.exec(`
+            CREATE TABLE mcp_oauth_credentials_rebuild (
+              account_id      TEXT NOT NULL,
+              project_id      TEXT NOT NULL,
+              server          TEXT NOT NULL,
+              server_url      TEXT NOT NULL,
+              credential      TEXT NOT NULL DEFAULT '',
+              client_json     TEXT,
+              tokens_json     TEXT,
+              tokens_saved_at INTEGER,
+              updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+              PRIMARY KEY (account_id, project_id, server, server_url, credential)
+            );
+            INSERT INTO mcp_oauth_credentials_rebuild (account_id, project_id, server, server_url, credential, client_json, tokens_json, tokens_saved_at, updated_at)
+              SELECT account_id, project_id, server, server_url, '', client_json, tokens_json, tokens_saved_at, updated_at FROM mcp_oauth_credentials;
+            DROP TABLE mcp_oauth_credentials;
+            ALTER TABLE mcp_oauth_credentials_rebuild RENAME TO mcp_oauth_credentials;
+          `);
+        })();
+      }
+    }
+
     this.#addColumnIfMissing("dispatch_tasks", "group_id", "TEXT");
     this.#addColumnIfMissing("dispatch_tasks", "group_ordinal", "INTEGER");
     // Owning daemon (host:port) — the executor scope for claim + reclaim.
@@ -629,6 +697,10 @@ export class Store {
     this.#addColumnIfMissing("dispatch_tasks", "attempt_id", "TEXT");
     this.#addColumnIfMissing("dispatch_tasks", "generation", "INTEGER NOT NULL DEFAULT 0");
     this.#addColumnIfMissing("dispatch_tasks", "held_until", "INTEGER");
+    // A spawn's target workstream (workstreams W4); NULL = the folder's.
+    this.#addColumnIfMissing("dispatch_tasks", "workstream", "TEXT");
+    this.#addColumnIfMissing("dispatch_tasks", "workstream_override", "INTEGER");
+    this.#addColumnIfMissing("dispatch_tasks", "workstream_revision", "TEXT");
     // AFTER the ALTERs, never inside the CREATE block above. On an existing
     // database `CREATE TABLE IF NOT EXISTS` is a no-op, so an index declared
     // there would run against a table that does not have the column yet and
@@ -1092,6 +1164,10 @@ export class Store {
     provider?: string;
     /** Per-child model, already resolved against `provider`. */
     model?: string;
+    /** A spawn's target workstream, and whether it was confirmed past the folder's claim. */
+    workstream?: string;
+    workstreamOverride?: boolean;
+    workstreamRevision?: string;
     failureLimit: number;
     createdBy: string;
     /** Dispatch group for a barrier fan-out; omit for a standalone task. */
@@ -1111,8 +1187,8 @@ export class Store {
         `INSERT INTO dispatch_tasks
            (id, account_id, project_id, kind, shape, target_session, workdir,
             prompt, provider, model, failure_limit, created_by, group_id,
-            group_ordinal, owner_daemon, run_id, attempt_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            group_ordinal, owner_daemon, run_id, attempt_id, workstream, workstream_override, workstream_revision, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         task.id,
@@ -1132,6 +1208,9 @@ export class Store {
         task.ownerDaemon ?? null,
         task.runId ?? null,
         task.attemptId ?? null,
+        task.workstream ?? null,
+        task.workstreamOverride ? 1 : null,
+        task.workstreamRevision ?? null,
         task.now,
         task.now,
       );
@@ -1802,14 +1881,14 @@ export class Store {
   /** A tenant's stored OAuth state for one MCP server, or undefined. */
   getMcpOAuthCredential(
     tenant: { accountId: string; projectId: string },
-    server: { name: string; url: string },
+    server: McpOAuthServerKey,
   ): { client?: Record<string, unknown>; tokens?: Record<string, unknown>; tokensSavedAt?: number } | undefined {
     const row = this.#db
       .prepare(
         `SELECT client_json, tokens_json, tokens_saved_at FROM mcp_oauth_credentials
-         WHERE account_id = ? AND project_id = ? AND server = ? AND server_url = ?`,
+         WHERE account_id = ? AND project_id = ? AND server = ? AND server_url = ? AND credential = ?`,
       )
-      .get(tenant.accountId, tenant.projectId, server.name, server.url) as
+      .get(tenant.accountId, tenant.projectId, server.name, server.url, server.slot ?? "") as
       | { client_json: string | null; tokens_json: string | null; tokens_saved_at: number | null }
       | null;
     if (!row) return undefined;
@@ -1823,36 +1902,50 @@ export class Store {
   /** Save the client a server registered for this tenant (dynamic registration). */
   saveMcpOAuthClient(
     tenant: { accountId: string; projectId: string },
-    server: { name: string; url: string },
+    server: McpOAuthServerKey,
     client: object,
   ): void {
     this.#db
       .prepare(
-        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, client_json, updated_at)
-         VALUES (?, ?, ?, ?, ?, datetime('now'))
-         ON CONFLICT(account_id, project_id, server, server_url) DO UPDATE SET
+        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, credential, client_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(account_id, project_id, server, server_url, credential) DO UPDATE SET
            client_json = excluded.client_json, updated_at = excluded.updated_at`,
       )
-      .run(tenant.accountId, tenant.projectId, server.name, server.url, JSON.stringify(client));
+      .run(tenant.accountId, tenant.projectId, server.name, server.url, server.slot ?? "", JSON.stringify(client));
   }
 
   /** Save a tenant's tokens for a server, stamped with when they were issued. */
   saveMcpOAuthTokens(
     tenant: { accountId: string; projectId: string },
-    server: { name: string; url: string },
+    server: McpOAuthServerKey,
     tokens: object,
     savedAtMs: number,
   ): void {
     this.#db
       .prepare(
-        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, tokens_json, tokens_saved_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-         ON CONFLICT(account_id, project_id, server, server_url) DO UPDATE SET
+        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, credential, tokens_json, tokens_saved_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(account_id, project_id, server, server_url, credential) DO UPDATE SET
            tokens_json = excluded.tokens_json,
            tokens_saved_at = excluded.tokens_saved_at,
            updated_at = excluded.updated_at`,
       )
-      .run(tenant.accountId, tenant.projectId, server.name, server.url, JSON.stringify(tokens), savedAtMs);
+      .run(tenant.accountId, tenant.projectId, server.name, server.url, server.slot ?? "", JSON.stringify(tokens), savedAtMs);
+  }
+
+  /**
+   * Delete one named credential slot of a server for every tenant and URL
+   * (the credential was removed). Never the default sign-in (slot ""). Returns
+   * the tenants that had a row.
+   */
+  clearMcpOAuthSlot(server: string, slot: string): Array<{ accountId: string; projectId: string }> {
+    if (!slot) return [];
+    const rows = this.#db
+      .prepare("SELECT DISTINCT account_id, project_id FROM mcp_oauth_credentials WHERE server = ? AND credential = ?")
+      .all(server, slot) as Array<{ account_id: string; project_id: string }>;
+    this.#db.prepare("DELETE FROM mcp_oauth_credentials WHERE server = ? AND credential = ?").run(server, slot);
+    return rows.map((r) => ({ accountId: r.account_id, projectId: r.project_id }));
   }
 
   /**
@@ -1862,11 +1955,11 @@ export class Store {
    */
   clearMcpOAuth(
     tenant: { accountId: string; projectId: string },
-    server: { name: string; url: string },
+    server: McpOAuthServerKey,
     what: "tokens" | "client" | "all",
   ): void {
-    const where = "account_id = ? AND project_id = ? AND server = ? AND server_url = ?";
-    const args = [tenant.accountId, tenant.projectId, server.name, server.url] as const;
+    const where = "account_id = ? AND project_id = ? AND server = ? AND server_url = ? AND credential = ?";
+    const args = [tenant.accountId, tenant.projectId, server.name, server.url, server.slot ?? ""] as const;
     if (what === "all") {
       this.#db.prepare(`DELETE FROM mcp_oauth_credentials WHERE ${where}`).run(...args);
       return;
@@ -1908,6 +2001,35 @@ export class Store {
          VALUES (?, ?, ?, ?, ?, ?)`,
       )
       .run(scope.accountId, scope.projectId, scope.workdir, server, fingerprint, approvedBy);
+  }
+
+  /** The workstream a folder last resolved to, for this tenant (workstreams §5.1). */
+  workstreamFolder(scope: { accountId: string; projectId: string; workdir: string }): string | undefined {
+    const row = this.#db
+      .prepare("SELECT workstream FROM workstream_folders WHERE account_id = ? AND project_id = ? AND workdir = ?")
+      .get(scope.accountId, scope.projectId, scope.workdir) as { workstream: string } | null;
+    return row?.workstream;
+  }
+
+  /** Every recorded folder by workstream, across tenants (the read fence: workstreams are daemon-wide config). */
+  workstreamFoldersByWorkstream(): Map<string, string[]> {
+    const rows = this.#db.prepare("SELECT DISTINCT workstream, workdir FROM workstream_folders").all() as { workstream: string; workdir: string }[];
+    const out = new Map<string, string[]>();
+    for (const r of rows) {
+      const list = out.get(r.workstream) ?? [];
+      list.push(r.workdir);
+      out.set(r.workstream, list);
+    }
+    return out;
+  }
+
+  setWorkstreamFolder(scope: { accountId: string; projectId: string; workdir: string }, workstream: string): void {
+    this.#db
+      .prepare(
+        `INSERT INTO workstream_folders (account_id, project_id, workdir, workstream) VALUES (?, ?, ?, ?)
+         ON CONFLICT (account_id, project_id, workdir) DO UPDATE SET workstream = excluded.workstream, updated_at = datetime('now')`,
+      )
+      .run(scope.accountId, scope.projectId, scope.workdir, workstream);
   }
 
   /** The (server, fingerprint) pairs a tenant approved for a workdir. */

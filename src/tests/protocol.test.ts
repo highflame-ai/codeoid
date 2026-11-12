@@ -466,6 +466,10 @@ describe("DaemonMessage routing", () => {
           return `workstream.list:${msg.workstreams.length}`;
         case "workstream.resolve.result":
           return `workstream.resolve:${msg.resolution.home ?? "none"}`;
+        case "workstreams.changed":
+          return `workstreams.changed:${msg.revision}`;
+        case "credential.list.result":
+          return `credential.list:${msg.credentials.length}`;
         case "session.turns.result":
           return `turns:${msg.turns.length}`;
         case "session.approvals.result":

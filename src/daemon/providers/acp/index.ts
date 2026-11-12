@@ -171,7 +171,7 @@ export class GeminiAcpProvider implements SessionProvider {
     this.#mcpRegistry = init.mcpRegistry ?? null;
     this.#proxy = new McpProxyLease(
       init.mcpProxy,
-      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
+      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id, ...(init.mcpRegistry ? { view: init.mcpRegistry } : {}) } : null,
     );
   }
 
@@ -358,7 +358,7 @@ export class GeminiAcpProvider implements SessionProvider {
       this.#proc = new StdioJsonRpcProcess({
         name: "gemini-cli",
         command: this.#command,
-        args: [...this.#argsPrefix, "--acp"],
+        args: [...this.#argsPrefix, ...this.#isolationArgs(), "--acp"],
         cwd: opts.workdir,
         env,
         ...(handle?.wrap ? { wrap: handle.wrap.bind(handle) } : {}),
@@ -506,6 +506,25 @@ export class GeminiAcpProvider implements SessionProvider {
       });
     }
     return servers;
+  }
+
+  /**
+   * Workstream isolation (G1): the Gemini CLI also loads MCP servers from its
+   * own settings (`~/.gemini/settings.json`, a project's `.gemini/`) and its
+   * extensions. `--allowed-mcp-server-names` keeps it to the names codeoid
+   * mounts (session/new's list: built-ins, native mounts, the relay's) — an
+   * empty list would mean "no filter", so none mounted names one that isn't.
+   */
+  #isolationArgs(): string[] {
+    const reg = this.#mcpRegistry;
+    if (!reg?.isolated) return [];
+    const names = new Set<string>();
+    if (this.#memoryMcp) names.add(MEMORY_MCP_SERVER_NAME);
+    if (this.#blackboardMcp?.()) names.add(BLACKBOARD_MCP_SERVER_NAME);
+    if (this.#sandboxMcp?.()) names.add(SANDBOX_MCP_SERVER_NAME);
+    for (const s of reg.forNativeMount(this.id)) names.add(s.name);
+    for (const s of reg.relayFor(this.id)) names.add(s.name);
+    return ["--allowed-mcp-server-names", ...allowedMcpNames(names)];
   }
 
   #push(event: ProviderEvent): void {
@@ -657,5 +676,15 @@ function toolCallOutput(update: Record<string, unknown>): string {
       .join("\n");
   }
   return "";
+}
+
+/**
+ * The names a CLI with an MCP allowlist (the Gemini CLI, Qwen) is started
+ * with under workstream isolation: exactly codeoid's, sorted. Never empty —
+ * an empty list means "no filter" to them — so none gives one no server has.
+ */
+export function allowedMcpNames(names: Iterable<string>): string[] {
+  const list = [...new Set(names)].sort();
+  return list.length > 0 ? list : ["codeoid-isolated-none"];
 }
 

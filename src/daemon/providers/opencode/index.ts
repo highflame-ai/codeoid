@@ -556,7 +556,7 @@ export class OpencodeProvider implements SessionProvider {
     this.#modelPrices = init.modelPrices;
     this.#proxy = new McpProxyLease(
       init.mcpProxy,
-      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id } : null,
+      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id, ...(init.mcpRegistry ? { view: init.mcpRegistry } : {}) } : null,
     );
   }
 
