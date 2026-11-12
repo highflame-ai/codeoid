@@ -45,12 +45,21 @@ import type {
 import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
 import type { WorktreeTrustMsg, WorktreeTrustResultMsg } from "./worktree-trust.js";
 import type {
+  CredentialDeleteMsg,
+  CredentialListMsg,
+  CredentialListResultMsg,
+  CredentialSetValueMsg,
+  CredentialUpsertMsg,
   SessionWorkstreamInfo,
+  WorkstreamDeleteMsg,
   WorkstreamListMsg,
   WorkstreamListResultMsg,
   WorkstreamResolution,
   WorkstreamResolveMsg,
   WorkstreamResolveResultMsg,
+  WorkstreamSettingsMsg,
+  WorkstreamsChangedMsg,
+  WorkstreamUpsertMsg,
 } from "./workstreams.js";
 import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
 import type { SessionApprovalsMsg, SessionApprovalsResultMsg } from "./approvals.js";
@@ -1357,6 +1366,13 @@ export type ClientMessage =
   | WorktreeTrustMsg
   | WorkstreamListMsg
   | WorkstreamResolveMsg
+  | WorkstreamUpsertMsg
+  | WorkstreamDeleteMsg
+  | WorkstreamSettingsMsg
+  | CredentialListMsg
+  | CredentialUpsertMsg
+  | CredentialDeleteMsg
+  | CredentialSetValueMsg
   | SessionTurnsMsg
   | SessionApprovalsMsg
   | ClaudeAccountsListMsg
@@ -3281,6 +3297,8 @@ export type DaemonMessage =
   | WorktreeTrustResultMsg
   | WorkstreamListResultMsg
   | WorkstreamResolveResultMsg
+  | WorkstreamsChangedMsg
+  | CredentialListResultMsg
   | SessionTurnsResultMsg
   | SessionApprovalsResultMsg
   | ClaudeAccountsResultMsg

@@ -163,6 +163,9 @@ describe("every call is checked against the grant as it is now (G4)", () => {
     expect(grantRefusal(g, { name: "codeoid_memory", builtin: true, transport: { kind: "in-process" } })).toBeUndefined();
     expect(grantRefusal(g, { name: "gh", builtin: false, transport: { kind: "http", credential: { id: "new" } } as never })).toBeUndefined();
     expect(grantRefusal(g, { name: "gh", builtin: false, transport: { kind: "http", credential: { id: "old" } } as never })).toMatch(/another credential/);
+    // The same id with another header is another credential too (W2 audit).
+    const hg: McpGrant = { workstream: "acme", servers: new Map([["gh", { credential: { id: "new", header: "X-Api-Key" } }]]), workdirServers: false };
+    expect(grantRefusal(hg, { name: "gh", builtin: false, transport: { kind: "http", credential: { id: "new" } } as never })).toMatch(/another credential/);
     expect(grantRefusal(g, { name: "mine", builtin: false, origin: "claude-local", transport: { kind: "stdio" } })).toMatch(/this folder's own/);
     expect(grantRefusal(undefined, { name: "x", builtin: false, transport: { kind: "stdio" } })).toBeUndefined();
   });

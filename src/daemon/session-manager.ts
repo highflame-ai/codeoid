@@ -14,7 +14,9 @@ import { grantRefusal, type McpGrant } from "./workstreams/grant.js";
 import { OverrideTokens } from "./workstreams/override.js";
 import { withSlot } from "./mcp/oauth.js";
 import type { FolderReader } from "./workstreams/folder.js";
-import { createSecretStore, type SecretStore } from "./credentials/store.js";
+import { createSecretStore, credentialEnvName, type SecretStore } from "./credentials/store.js";
+import { credentialsSchema } from "./credentials/schema.js";
+import { workstreamsSchema } from "./workstreams/schema.js";
 import { registerSecretPaths } from "./secret-paths.js";
 import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
@@ -37,7 +39,7 @@ import type { HookBus } from "./hooks/bus.js";
 import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
-import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, writeMcpServerEntry, writeWorktreeTrust } from "./settings/store.js";
+import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, readDotEnvValueSet, writeConfigBlock, writeCredentialValue, writeMcpServerEntry, writeWorktreeTrust } from "./settings/store.js";
 import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption, shellArg } from "./mcp/adopt.js";
 import { readWorkdirServers } from "./mcp/workdir-servers.js";
 import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcpUrl, serverProgram, shownLabel, visibleCompact, visibleVerbatim } from "./mcp/redact.js";
@@ -154,7 +156,7 @@ import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
 import { isOAuthServer, type McpServerSpec, OAUTH_UNSUPPORTED_BACKENDS } from "./mcp/types.js";
-import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, getConfigDir, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
+import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, dotEnvShadowed, getConfigDir, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { endpointNameOf, endpointProviderId, ORCHESTRATOR_ROLE, type ProviderInfo } from "../protocol/types.js";
 import type {
@@ -1663,6 +1665,16 @@ mcpHub: this.#mcpHub,
         return this.#workstreamList(msg, auth);
       case "workstream.resolve":
         return this.#workstreamResolve(msg, auth);
+      case "workstream.upsert":
+      case "workstream.delete":
+      case "workstream.settings":
+        return this.#workstreamEdit(msg, auth);
+      case "credential.list":
+        return this.#credentialList(msg, auth);
+      case "credential.upsert":
+      case "credential.delete":
+      case "credential.set_value":
+        return this.#credentialEdit(msg, auth);
       case "mcp.oauth.begin":
         return this.#mcpOAuthBegin(msg, auth);
       case "mcp.oauth.complete":
@@ -2319,17 +2331,19 @@ mcpHub: this.#mcpHub,
   #workstreamOpts(binding: WorkstreamBinding | undefined): {
     workstream?: WorkstreamBinding;
     describeWorkstream: (b: WorkstreamBinding | undefined) => ReturnType<WorkstreamService["info"]>;
-    workstreamEnv?: Readonly<Record<string, string>>;
+    workstreamEnv?: () => Readonly<Record<string, string>>;
     mcpGrant: () => McpGrant | undefined;
   } {
-    const { env, missing } = this.#workstreams.envFor(binding, this.#secrets);
+    const { missing } = this.#workstreams.envFor(binding, this.#secrets);
     if (missing.length > 0) {
       console.warn(`[codeoid] workstream "${binding?.id}": no value for ${missing.join(", ")} — set the credential (${this.#secrets.kind} store); the session starts without it`);
     }
     return {
       ...(binding ? { workstream: binding } : {}),
       describeWorkstream: this.#describeWorkstream,
-      ...(Object.keys(env).length > 0 ? { workstreamEnv: env } : {}),
+      // Read live: an edit to the workstream or a credential reaches the
+      // session's next backend start (its next turn), never only a restart.
+      ...(binding?.id ? { workstreamEnv: () => this.#workstreams.envFor(binding, this.#secrets).env } : {}),
       // Read live: the grant follows the config as it is at each listing.
       mcpGrant: () => this.#workstreams.grantFor(binding),
     };
@@ -3430,6 +3444,152 @@ mcpHub: this.#mcpHub,
       ...(ws.defaultId ? { default: ws.defaultId } : {}),
       workstreams: ws.summaries(),
     };
+  }
+
+  /** Who may change workstreams and credentials: settings:write, never a delegated token. */
+  #configEditRefusal(requestId: string, auth: AuthContext): DaemonMessage | undefined {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+      return { type: "response.error", requestId, error: "Missing scope: settings:write", code: "forbidden" };
+    }
+    if (auth.delegationDepth > 0) {
+      return { type: "response.error", requestId, error: "A delegated token can't change workstreams or credentials", code: "forbidden" };
+    }
+    return undefined;
+  }
+
+  /**
+   * Apply a workstreams or credentials block just written to config.json:
+   * the live service (grants and new sessions follow it at once — live
+   * sessions keep their homes), this manager's config, and every subscriber.
+   */
+  #applyWorkstreamConfig(config: Record<string, unknown>): void {
+    // Both blocks from the file as written (W2 audit): a hand edit to the other
+    // block since boot is applied too, never shadowed by a stale copy.
+    const workstreams = workstreamsSchema.parse(config.workstreams);
+    const credentials = credentialsSchema.parse(config.credentials);
+    if (this.#config) this.#config = { ...this.#config, workstreams, credentials };
+    this.#workstreams.update(workstreams, credentials);
+    this.#pushToProviderSubscribers({ type: "workstreams.changed", revision: this.#workstreams.revision });
+  }
+
+  #workstreamEdit(msg: Extract<ClientMessage, { type: "workstream.upsert" | "workstream.delete" | "workstream.settings" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#configEditRefusal(msg.id, auth);
+    if (refused) return refused;
+    const asObject = (v: unknown): Record<string, unknown> => (v && typeof v === "object" && !Array.isArray(v) ? { ...(v as Record<string, unknown>) } : {});
+    const written = writeConfigBlock("workstreams", (current) => {
+      const block = asObject(current);
+      const items = Array.isArray(block.items) ? [...(block.items as unknown[])] : [];
+      const idOf = (i: unknown) => (i && typeof i === "object" ? (i as { id?: unknown }).id : undefined);
+      if (msg.type === "workstream.upsert") {
+        const at = items.findIndex((i) => idOf(i) === msg.item.id);
+        if (at >= 0) items[at] = msg.item;
+        else items.push(msg.item);
+        block.items = items;
+      } else if (msg.type === "workstream.delete") {
+        block.items = items.filter((i) => idOf(i) !== msg.workstream);
+        if (block.default === msg.workstream) delete block.default;
+      } else {
+        if (msg.isolateGlobalServers !== undefined) block.isolateGlobalServers = msg.isolateGlobalServers;
+        if (msg.default === null) delete block.default;
+        else if (msg.default !== undefined) block.default = msg.default;
+      }
+      return block;
+    });
+    if (!written.ok) return { type: "response.error", requestId: msg.id, error: written.error, code: "invalid_request" };
+    this.#store.audit(auth.sub, msg.type, "", msg.type === "workstream.upsert" ? `id=${String(msg.item.id)}` : msg.type === "workstream.delete" ? `id=${msg.workstream}` : `isolate=${msg.isolateGlobalServers ?? "-"} default=${msg.default === null ? "none" : (msg.default ?? "-")}`);
+    this.#applyWorkstreamConfig(written.config);
+    // The edit's own reply needs no settings:read: it is what the caller just wrote.
+    return this.#workstreamList({ type: "workstream.list", id: msg.id }, { ...auth, scopes: [...auth.scopes, SCOPES.SETTINGS_READ] as AuthContext["scopes"] });
+  }
+
+  #credentialList(msg: { id: string }, auth: AuthContext): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_READ)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: settings:read", code: "forbidden" };
+    }
+    const items = this.#config?.workstreams?.items ?? [];
+    const usedBy = (id: string) =>
+      items
+        .filter((w) => Object.values(w.env).some((r) => r.secret === id) || w.mcpServers.some((s) => typeof s !== "string" && s.credential === id))
+        .map((w) => w.id);
+    const tenant = tenantOf(auth);
+    const credentials = (this.#config?.credentials ?? []).map((c) => {
+      let status: { set: boolean; source?: string };
+      if (c.kind === "oauth") {
+        const spec = this.#mcpRegistry?.get(c.server);
+        const signedIn = spec && this.#mcpOAuth ? this.#mcpOAuth.signedIn(withSlot(spec, c.id), tenant) : false;
+        status = signedIn ? { set: true, source: `signed in to ${c.server}` } : { set: false };
+      } else {
+        const s = this.#secrets.status(c.id);
+        status = s.set ? { set: true, source: s.source } : { set: false };
+      }
+      return {
+        id: c.id,
+        kind: c.kind,
+        ...("header" in c && c.header ? { header: c.header } : {}),
+        ...("server" in c && c.server ? { server: c.server } : {}),
+        ...(c.description ? { description: c.description } : {}),
+        status,
+        usedBy: usedBy(c.id),
+      };
+    });
+    return { type: "credential.list.result", requestId: msg.id, store: { kind: this.#secrets.kind, writable: this.#secrets.writable }, credentials };
+  }
+
+  #credentialEdit(msg: Extract<ClientMessage, { type: "credential.upsert" | "credential.delete" | "credential.set_value" }>, auth: AuthContext): DaemonMessage {
+    const refused = this.#configEditRefusal(msg.id, auth);
+    if (refused) return refused;
+    const err = (error: string): DaemonMessage => ({ type: "response.error", requestId: msg.id, error, code: "invalid_request" });
+    const declared = this.#config?.credentials ?? [];
+    if (msg.type === "credential.set_value") {
+      const decl = declared.find((c) => c.id === msg.credential);
+      if (!decl) return err(`No credential "${msg.credential}" is declared`);
+      if (decl.kind === "oauth") return err(`"${decl.id}" is an OAuth sign-in: codeoid mcp signin ${decl.server} --credential ${decl.id}`);
+      if (!this.#secrets.writable || this.#secrets.kind !== "env-file") return err(`The ${this.#secrets.kind} credential store is managed outside codeoid`);
+      // A value from the daemon's real environment (not .env) wins at the next
+      // start whatever is written here: say so rather than seem to change it.
+      // Set in both is the same: .env was skipped at start (dotEnvShadowed).
+      const name = credentialEnvName(decl.id);
+      if (process.env[name] !== undefined && (dotEnvShadowed(name) || !readDotEnvValueSet(name))) {
+        return err(`${credentialEnvName(decl.id)} is set in the daemon's own environment, which wins over .env: change it there`);
+      }
+      const w = writeCredentialValue(credentialEnvName(decl.id), msg.value);
+      if (!w.ok) return err(w.error);
+      // The value never goes to the audit, only that it changed.
+      this.#store.audit(auth.sub, "credential.set_value", "", `id=${decl.id} ${msg.value === null ? "cleared" : "set"}`);
+    } else {
+      const id = msg.type === "credential.upsert" ? String(msg.item.id ?? "") : msg.credential;
+      const existing = declared.find((c) => c.id === id);
+      if (msg.type === "credential.delete" && !existing) return err(`No credential "${id}" is declared`);
+      if (msg.type === "credential.delete") {
+        const users = (this.#config?.workstreams?.items ?? []).filter(
+          (w) => Object.values(w.env).some((r) => r.secret === id) || w.mcpServers.some((s) => typeof s !== "string" && s.credential === id),
+        );
+        if (users.length > 0) return err(`"${id}" is used by ${users.map((u) => u.id).join(", ")}: remove it there first`);
+      }
+      const written = writeConfigBlock("credentials", (current) => {
+        const list = Array.isArray(current) ? [...(current as unknown[])] : [];
+        const idOf = (i: unknown) => (i && typeof i === "object" ? (i as { id?: unknown }).id : undefined);
+        if (msg.type === "credential.upsert") {
+          const at = list.findIndex((i) => idOf(i) === id);
+          if (at >= 0) list[at] = msg.item;
+          else list.push(msg.item);
+          return list;
+        }
+        return list.filter((i) => idOf(i) !== id);
+      });
+      if (!written.ok) return err(written.error);
+      if (msg.type === "credential.delete" && existing?.kind !== "oauth" && this.#secrets.writable && this.#secrets.kind === "env-file") writeCredentialValue(credentialEnvName(id), null);
+      // An OAuth slot's sign-ins go with it, every tenant's: re-declaring the
+      // id later must not silently reuse an old sign-in.
+      if (msg.type === "credential.delete" && existing?.kind === "oauth") {
+        const tenants = this.#mcpOAuth?.forgetSlot(existing.server, existing.id) ?? [];
+        for (const t of tenants) this.#mcpHub?.dropTenant(existing.server, t);
+      }
+      this.#store.audit(auth.sub, msg.type, "", `id=${id}`);
+      this.#applyWorkstreamConfig(written.config);
+    }
+    if (msg.type === "credential.set_value") this.#pushToProviderSubscribers({ type: "workstreams.changed", revision: this.#workstreams.revision });
+    return this.#credentialList(msg, { ...auth, scopes: [...auth.scopes, SCOPES.SETTINGS_READ] as AuthContext["scopes"] });
   }
 
   /**

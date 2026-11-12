@@ -565,7 +565,7 @@ export interface SessionCreateOptions {
    * and held to the same denylist (the schema already refused anything it
    * would). Never persisted: recomputed from the config on every resume.
    */
-  workstreamEnv?: Readonly<Record<string, string>>;
+  workstreamEnv?: () => Readonly<Record<string, string>>;
   /**
    * The home's MCP grant under isolation (workstreams/grant.ts), read live;
    * undefined result = no isolation. Applied by the session's MCP view, so
@@ -1402,7 +1402,51 @@ export class Session {
   /** This turn's end-attempt interrupt has been scheduled (once per turn). */
   #endAttemptInterruptQueued = false;
   /** See SessionCreateOptions.extraEnv (validated in the constructor). */
+  #extraEnvStatic: Readonly<Record<string, string>> | undefined;
+  /** The home workstream's env, read live (SessionCreateOptions.workstreamEnv). */
+  #workstreamEnv: (() => Readonly<Record<string, string>>) | undefined;
+  /** What a backend gets as extra env: a live view over both (see #liveExtraEnv). */
   #extraEnv: Readonly<Record<string, string>> | undefined;
+  /** The extra env the current backend was built with, to rebuild it when the workstream's changes. */
+  #envBuiltWith: string | undefined;
+
+  /** The workstream's env under the caller's extra env, held to the extra-env denylist. */
+  #composedEnv(): Record<string, string> {
+    const out: Record<string, string> = { ...(this.#workstreamEnv?.() ?? {}), ...(this.#extraEnvStatic ?? {}) };
+    for (const k of extraEnvViolations(out)) delete out[k];
+    return out;
+  }
+
+  /**
+   * The extra env handed to the backend: a read-only view that is always the
+   * workstream's env as configured NOW. Providers read it when they start a
+   * process (spread or iterated), so a workstream edit — a credential cleared,
+   * an env entry removed — reaches the next backend start, which
+   * #rebuildForMcp brings to the next turn (design §8: narrowing applies at
+   * the next turn boundary).
+   */
+  #liveExtraEnv(): Readonly<Record<string, string>> {
+    const current = () => this.#composedEnv();
+    return new Proxy({} as Record<string, string>, {
+      get: (_t, k) => (typeof k === "string" ? current()[k] : undefined),
+      has: (_t, k) => typeof k === "string" && k in current(),
+      ownKeys: () => Object.keys(current()),
+      getOwnPropertyDescriptor: (_t, k) => {
+        const v = typeof k === "string" ? current()[k] : undefined;
+        return v === undefined ? undefined : { value: v, enumerable: true, configurable: true, writable: false };
+      },
+      set: () => false,
+      deleteProperty: () => false,
+      defineProperty: () => false,
+    });
+  }
+
+  /** A hash of the composed env: held to compare, so the values themselves aren't kept around. */
+  #envDigest(): string {
+    return createHash("sha256")
+      .update(JSON.stringify(Object.entries(this.#composedEnv()).sort(([a], [b]) => a.localeCompare(b))))
+      .digest("hex");
+  }
   /** The session's OS sandbox (#448); null on a Session built without a sandbox registry. */
   #sandbox: SessionSandbox | null = null;
   /** The repository's git settings as last looked at (#448: #checkGitControl), from the first turn on. */
@@ -1752,7 +1796,8 @@ export class Session {
     this.#collaborationCost = opts.collaborationCost;
     this.#maxBudgetUsd = opts.maxBudgetUsd;
     this.#onBudgetExhausted = opts.onBudgetExhausted ?? "park";
-    const extra = opts.workstreamEnv && Object.keys(opts.workstreamEnv).length > 0 ? { ...opts.workstreamEnv, ...(opts.extraEnv ?? {}) } : opts.extraEnv;
+    this.#workstreamEnv = opts.workstreamEnv;
+    const extra = opts.extraEnv;
     if (extra) {
       // Before any side effect: a refused key must fail the create, not run a
       // backend with half the env the caller asked for.
@@ -1762,8 +1807,9 @@ export class Session {
           `extraEnv may not set ${refused.join(", ")}: codeoid owns credential, account and process-loading variables for the backend`,
         );
       }
-      this.#extraEnv = Object.freeze({ ...extra });
+      this.#extraEnvStatic = Object.freeze({ ...extra });
     }
+    if (this.#extraEnvStatic || this.#workstreamEnv) this.#extraEnv = this.#liveExtraEnv();
     if (opts.sandboxRegistry) {
       this.#sandbox = new SessionSandbox({
         sessionId: this.id,
@@ -2962,8 +3008,8 @@ export class Session {
    */
   async #applyMcpView(): Promise<void> {
     const view = this.#mcpView;
-    if (!view || this.#mcpBusy()) return;
-    if (!view.loaded || this.#mcpRefreshPending) {
+    if ((!view && !this.#workstreamEnv) || this.#mcpBusy()) return;
+    if (view && (!view.loaded || this.#mcpRefreshPending)) {
       this.#mcpRefreshPending = false;
       try {
         await this.#loadMcp();
@@ -3111,14 +3157,20 @@ export class Session {
    * Whether it was rebuilt. The first time, nothing was built yet: just noted.
    */
   async #rebuildForMcp(): Promise<boolean> {
+    // The workstream's env changed since the backend started (a credential
+    // cleared or swapped, an env entry removed): rebuilt too, like its servers
+    // — with or without an MCP view (a session may have none).
+    const envNow = this.#workstreamEnv ? this.#envDigest() : undefined;
+    if (envNow !== undefined) this.#envBuiltWith ??= envNow;
+    const envChanged = envNow !== undefined && envNow !== this.#envBuiltWith;
     const view = this.#mcpView;
-    if (!view?.loaded) return false;
-    if (this.#mcpBuiltWith === undefined) {
+    if (!view?.loaded) {
+      if (!envChanged) return false;
+    } else if (this.#mcpBuiltWith === undefined) {
       this.#mcpBuiltWith = view.fingerprint;
       this.#releaseMcp();
-      return false;
-    }
-    if (view.fingerprint === this.#mcpBuiltWith) return false;
+      if (!envChanged) return false;
+    } else if (view.fingerprint === this.#mcpBuiltWith && !envChanged) return false;
     await this.#teardownProvider(); // records what's applied, and lets go of what was removed
     await this.#reseedAfterTeardown();
     return true;
@@ -6139,6 +6191,7 @@ export class Session {
     // still rebuilds it. Nothing still running can call a server the session
     // stopped using.
     if (this.#mcpView?.loaded) this.#mcpBuiltWith = this.#mcpView.fingerprint;
+    if (this.#workstreamEnv) this.#envBuiltWith = this.#envDigest();
     this.#releaseMcp();
     this.#mcpProjectNames.clear(); // the next backend reads its project files afresh
     try { await taskToAwait; } catch { /* consumer handles its own errors */ }

@@ -41,6 +41,8 @@ import type {
 } from "../protocol/types";
 import { AccountsPanel, focusAccountsBackend } from "./AccountsPanel";
 import { EndpointsPanel } from "./EndpointsPanel";
+import { WorkstreamsPanel } from "./WorkstreamsPanel";
+import { CredentialsPanel } from "./CredentialsPanel";
 
 /**
  * A backend tab whose id names a backend whose OWN (daemon-wide) login codeoid
@@ -66,6 +68,8 @@ const [activeTab, setActiveTab] = createSignal<string>("");
 /** Tabs that render their own panel instead of manifest fields. */
 const SYNTHETIC_TABS = [
   { id: "accounts", icon: "⚿", title: "Accounts" },
+  { id: "workstreams", icon: "◈", title: "Workstreams" },
+  { id: "credentials", icon: "⚷", title: "Credentials" },
   { id: "endpoints", icon: "⇄", title: "OpenAI endpoints" },
 ] as const;
 const isSyntheticTab = (id: string) => SYNTHETIC_TABS.some((t) => t.id === id);
@@ -236,6 +240,12 @@ const SettingsDrawer: Component = () => {
               </Show>
               <Show when={activeTab() === "accounts"}>
                 <AccountsPanel />
+              </Show>
+              <Show when={activeTab() === "workstreams"}>
+                <WorkstreamsPanel />
+              </Show>
+              <Show when={activeTab() === "credentials"}>
+                <CredentialsPanel />
               </Show>
               <Show when={activeTab() === "endpoints"}>
                 <EndpointsPanel />

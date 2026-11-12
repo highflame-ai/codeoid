@@ -275,6 +275,55 @@ export function writeWorktreeTrust(
   return { ok: true, before, after };
 }
 
+/**
+ * Replace one top-level block of config.json (`workstreams`, `credentials`)
+ * with what `update` returns from the block as the file holds it NOW — so a
+ * hand edit made since the daemon started is never overwritten — then
+ * validate the whole config and write it atomically. Nothing is written if it
+ * doesn't validate; `undefined` from `update` removes the block. Returns the
+ * block as written.
+ */
+export function writeConfigBlock(
+  key: "workstreams" | "credentials",
+  update: (current: unknown) => unknown,
+): { ok: true; value: unknown; config: Record<string, unknown> } | { ok: false; error: string } {
+  let raw: Record<string, unknown>;
+  try {
+    raw = readRawConfig();
+  } catch (err) {
+    return { ok: false, error: `config.json is not valid JSON: ${errMsg(err)}` };
+  }
+  const value = update(raw[key]);
+  if (value === undefined) delete raw[key];
+  else raw[key] = value;
+  const validation = validateConfigObject(raw);
+  if (!validation.ok) return { ok: false, error: validation.issues.map((i) => `${i.path ? `${i.path}: ` : ""}${i.message}`).join("; ") };
+  writeConfigJson(raw);
+  // The whole file as written: a caller applies every block it depends on from
+  // it, never one block from here and another from what it loaded at boot.
+  return { ok: true, value, config: raw };
+}
+
+/** Whether `.env` itself defines `key` (not merely the daemon's environment). */
+export function readDotEnvValueSet(key: string): boolean {
+  return readDotEnvKeys(configFilePaths().envPath).has(key);
+}
+
+/**
+ * Set (or with `null`, clear) a named credential's value in the env-file
+ * secret store: `CODEOID_CRED_<ID>` in `.env` (0600) and the daemon's live
+ * environment, so it applies at the next use without a restart. The value is
+ * never read back out: callers get presence only (credentials/store.ts).
+ */
+export function writeCredentialValue(envName: string, value: string | null): { ok: true } | { ok: false; error: string } {
+  if (!/^CODEOID_CRED_[A-Z0-9_]{1,64}$/.test(envName)) return { ok: false, error: "not a credential's variable" };
+  if (value !== null && (value.length === 0 || /[\r\n\0]/.test(value))) return { ok: false, error: "a credential value is one non-empty line" };
+  writeDotEnv(new Map([[envName, value]]));
+  if (value === null) delete process.env[envName];
+  else process.env[envName] = value;
+  return { ok: true };
+}
+
 // ── config.json IO ──────────────────────────────────────────────────────────
 
 function readRawConfig(): Record<string, unknown> {

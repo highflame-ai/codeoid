@@ -409,7 +409,8 @@ An unsandboxed session (`--sandbox off`) keeps the weaker rows as written.
 - The config has a **revision** (a hash of the `workstreams` block, so it is the same across restarts for the same config), and each binding records the revision it applied.
 - **Narrowing** changes take effect at the **next turn boundary** of every affected live session, with a backend restart. That includes removing a server, removing a reference, and tightening `share`.
   Waiting for a manual refresh would leave a revoked credential live, which is the wrong failure.
-- **Widening** changes (adding a server, loosening `share`) take effect on the next refresh or the next new session, matching how the MCP session view works today ("what's applied changes only on `load()`").
+- **Widening** changes (adding a server, loosening `share`) take effect at the next turn boundary too (as built, W2: the session's MCP view fingerprint includes its grant, and a change either way rebuilds the backend — simpler, and a rebuild is cheap next to a turn).
+- A session's **env** (its workstream's env credentials and git identity) is read live as well: a credential cleared or an env entry removed is gone from the backend's next start, which the same next-turn rebuild brings (W2 audit).
 - **Deleting a workstream** re-homes its sessions to the default only if they have no running turn. Otherwise they are marked `orphaned` and refuse new turns until re-homed. Memory keeps its tag.
 - **Changing match rules** never re-homes a live session. It affects only new sessions. The panel lists the sessions that would resolve differently.
 

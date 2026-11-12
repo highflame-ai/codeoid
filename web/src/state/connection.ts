@@ -409,6 +409,10 @@ function routeBroadcast(msg: DaemonMessage): void {
       // Another client, a sign-in, or a hand edit changed a backend's accounts.
       void import("./accounts").then((m) => m.refreshAccounts()).catch(() => {});
       return;
+    case "workstreams.changed":
+      // A workstream or credential was edited (here or elsewhere): refetch what's shown.
+      void import("./workstreams").then((m) => m.refreshWorkstreams()).catch(() => {});
+      return;
     case "session.status_change":
       setSessionStatus(msg.sessionId, msg.status);
       return;
@@ -438,6 +442,9 @@ function routeBroadcast(msg: DaemonMessage): void {
     case "providers.result":
     case "claude.accounts.result":
     case "accounts.result":
+    case "workstream.list.result":
+    case "workstream.resolve.result":
+    case "credential.list.result":
     case "endpoints.result":
     case "endpoints.test.result":
     case "response.ok":
