@@ -36,6 +36,10 @@ export interface SessionWorkstreamInfo {
   matchedBy?: string;
   /** The home was deleted from the config: the session needs a new one. */
   orphaned?: boolean;
+  /** Other workstreams it may read (§7.2); `paths` absent = all their folders. */
+  references?: Array<{ workstream: string; paths?: string[] }>;
+  /** Every workstream it has read from, for its lifetime (a move follows each one's policy). */
+  readFrom?: string[];
 }
 
 export interface WorkstreamServerInfo {

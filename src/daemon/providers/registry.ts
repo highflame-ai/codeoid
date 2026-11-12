@@ -150,6 +150,13 @@ export interface ProviderSessionInit {
    */
   isAutonomous?: () => boolean;
   /**
+   * The workstream fence's refusal of a tool call (workstreams/gate.ts), or
+   * null. Claude only: its PreToolUse hook refuses such a call itself, since
+   * the CLI runs some calls (reads in the workdir, allow rules) without
+   * asking the gate. Throws fail closed (the hook refuses).
+   */
+  workstreamFenceRefusal?: (toolName: string, input: unknown, cwd: string | null | undefined) => string | null;
+  /**
    * The session's OS sandbox while it is on (#448, sandbox/session-sandbox.ts),
    * read each time the backend is started: null when it is off, unavailable,
    * or the backend runs no commands. How a backend uses it is its own
@@ -474,6 +481,7 @@ export function createDefaultProviderRegistry(
         isOwnTask: init.isOwnTask,
         onForeignAgentDenied: init.onForeignAgentDenied,
         ...(init.isAutonomous ? { isAutonomous: init.isAutonomous } : {}),
+        ...(init.workstreamFenceRefusal ? { workstreamFenceRefusal: init.workstreamFenceRefusal } : {}),
         sandbox: init.sandbox,
       }),
   });

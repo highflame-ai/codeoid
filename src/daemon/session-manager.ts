@@ -9,7 +9,8 @@
  */
 
 import { addedDirProblem, type OtherCheckout, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
-import { WorkstreamService, type WorkstreamBinding } from "./workstreams/service.js";
+import { WorkstreamService, type WorkstreamBinding, type WorkstreamFence, type WorkstreamReference } from "./workstreams/service.js";
+import { READ_FROM_LIMIT, REFERENCE_LIMIT, readWorkstreamBinding, referencePathsProblem } from "./workstreams/binding.js";
 import { grantRefusal, type McpGrant } from "./workstreams/grant.js";
 import { OverrideTokens } from "./workstreams/override.js";
 import { withSlot } from "./mcp/oauth.js";
@@ -19,10 +20,10 @@ import { credentialsSchema } from "./credentials/schema.js";
 import { workstreamsSchema } from "./workstreams/schema.js";
 import { registerSecretPaths } from "./secret-paths.js";
 import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
-import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
-import { type ForkPoint, RewindError, type SendHold, SendStoppedError, SHUTDOWN_AUTH, Session, type AttachedClient, type WindowScope } from "./session.js";
+import { type FleetCardTarget, type ForkPoint, RewindError, type SendHold, SendStoppedError, SHUTDOWN_AUTH, Session, type AttachedClient, type WindowScope } from "./session.js";
 import type { CanonicalTurn } from "./providers/canonical.js";
 import { sweepCheckpoints } from "./checkpoints.js";
 import type { CompareRunRow } from "./store.js";
@@ -158,7 +159,7 @@ import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpT
 import { isOAuthServer, type McpServerSpec, OAUTH_UNSUPPORTED_BACKENDS } from "./mcp/types.js";
 import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, dotEnvShadowed, getConfigDir, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
-import { endpointNameOf, endpointProviderId, ORCHESTRATOR_ROLE, type ProviderInfo } from "../protocol/types.js";
+import { endpointNameOf, endpointProviderId, FLEET_TOOL_PREFIX, ORCHESTRATOR_ROLE, type ProviderInfo } from "../protocol/types.js";
 import type {
   AuthContext,
   ClaudeConfigMcpServer,
@@ -1202,6 +1203,12 @@ mcpHub: this.#mcpHub,
           // Conductor gets the tenant-wide surface; a collaboration
           // orchestrator gets the role-aware one scoped to its own children.
           // Its id is already known here, so the thunk is trivial.
+          ...(meta.role === "conductor"
+            ? {
+                fleetTargetWorkstream: this.#fleetCardWorkstream(meta.accountId, meta.projectId),
+                fleetConfirm: (target: FleetCardTarget) => this.#issueFleetToken({ accountId: meta.accountId, projectId: meta.projectId }, target),
+              }
+            : {}),
           fleet:
             meta.role === "conductor"
               ? this.#buildFleetServer(meta.accountId, meta.projectId)
@@ -1547,6 +1554,10 @@ mcpHub: this.#mcpHub,
         return this.#loopWorkerGuard(msg, "change the sandbox of") ?? this.#setSandbox(msg, auth);
       case "session.sandbox_dir":
         return this.#loopWorkerGuard(msg, "change the sandbox of") ?? this.#sandboxDir(msg, auth);
+      case "session.add_reference":
+      case "session.remove_reference":
+      case "session.set_workstream":
+        return this.#loopWorkerGuard(msg, "change the workstream of") ?? this.#sessionWorkstreamEdit(msg, auth);
       case "sandbox.providers":
         return this.#sandboxProviders(msg, auth);
       case "session.pin":
@@ -2331,8 +2342,9 @@ mcpHub: this.#mcpHub,
   #workstreamOpts(binding: WorkstreamBinding | undefined): {
     workstream?: WorkstreamBinding;
     describeWorkstream: (b: WorkstreamBinding | undefined) => ReturnType<WorkstreamService["info"]>;
-    workstreamEnv?: () => Readonly<Record<string, string>>;
-    mcpGrant: () => McpGrant | undefined;
+    workstreamEnv?: (b: WorkstreamBinding | undefined) => Readonly<Record<string, string>>;
+    mcpGrant: (b: WorkstreamBinding | undefined) => McpGrant | undefined;
+    workstreamFence: (b: WorkstreamBinding | undefined, own: readonly string[]) => WorkstreamFence | undefined;
   } {
     const { missing } = this.#workstreams.envFor(binding, this.#secrets);
     if (missing.length > 0) {
@@ -2341,12 +2353,36 @@ mcpHub: this.#mcpHub,
     return {
       ...(binding ? { workstream: binding } : {}),
       describeWorkstream: this.#describeWorkstream,
-      // Read live: an edit to the workstream or a credential reaches the
-      // session's next backend start (its next turn), never only a restart.
-      ...(binding?.id ? { workstreamEnv: () => this.#workstreams.envFor(binding, this.#secrets).env } : {}),
-      // Read live: the grant follows the config as it is at each listing.
-      mcpGrant: () => this.#workstreams.grantFor(binding),
+      // Each read live, for the session's binding as it is then: an edit to
+      // the workstream or a credential, or a move to another (§5.3), reaches
+      // the session's next backend start (its next turn), never only a restart.
+      ...(this.#workstreams.configured || binding ? { workstreamEnv: (b: WorkstreamBinding | undefined) => (b?.id ? this.#workstreams.envFor(b, this.#secrets).env : {}) } : {}),
+      // The grant follows the config as it is at each listing.
+      mcpGrant: (b) => this.#workstreams.grantFor(b),
+      workstreamFence: (b, own) => this.#workstreamFence(b, own),
     };
+  }
+
+  /** Fences by binding and config revision, briefly: the gate reads one on every file tool call. */
+  #fenceCache = new Map<string, { at: number; fence: WorkstreamFence | undefined }>();
+
+  /**
+   * A session's read fence (workstreams §7.3), or undefined when isolation is
+   * off. Recorded home folders count as their workstream's (a remote rule
+   * names no path), as repository tops. Cached 5s: folders made meanwhile
+   * (a new clone) are fenced within that.
+   */
+  #workstreamFence(binding: WorkstreamBinding | undefined, own: readonly string[] = []): WorkstreamFence | undefined {
+    if (!this.#workstreams.configured || !this.#workstreams.isolateGlobalServers) return undefined;
+    const key = `${this.#workstreams.revision}\u0000${JSON.stringify(binding ?? null)}\u0000${own.join("\u0000")}`;
+    const now = Date.now();
+    const hit = this.#fenceCache.get(key);
+    if (hit && now - hit.at < 5_000) return hit.fence;
+    const recorded = this.#store.workstreamFoldersByWorkstream();
+    const fence = this.#workstreams.fenceFor(binding, (id) => recorded.get(id) ?? [], own);
+    if (this.#fenceCache.size > 256) this.#fenceCache.clear();
+    this.#fenceCache.set(key, { at: now, fence });
+    return fence;
   }
 
   /**
@@ -4815,7 +4851,42 @@ mcpHub: this.#mcpHub,
       }
     }
     for (const w of homing.warnings) warn(w);
-    const createWorkstream = homing.binding;
+    let createWorkstream = homing.binding;
+    // A home chosen in another workstream's folder reads that folder (its workdir stays readable to it):
+    // judged by that workstream's share, as a reference is, and counted as read from.
+    if (createWorkstream?.id) {
+      const fv = this.#workstreams.folderVerdict(workdir, createWorkstream.id, givenWorkdir);
+      if (!fv.ok) return { type: "response.error", requestId: msg.id, error: fv.error, code: "forbidden" };
+      if (fv.ask.length > 0 && !(hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE) && auth.delegationDepth === 0)) {
+        return { type: "response.error", requestId: msg.id, error: `This folder is workstream "${fv.folder}"'s, which shares only with approval: a session of another workstream here needs session:approve on an undelegated token`, code: "forbidden" };
+      }
+      if (fv.folder) createWorkstream = { ...createWorkstream, readFrom: [...new Set([...(createWorkstream.readFrom ?? []), fv.folder])] };
+    }
+    // References asked at create (§7.2): each by the share policy of the
+    // workstream read. The creator asking with session:approve, undelegated,
+    // is the confirm an `ask` workstream wants; anyone else gets `open` only.
+    if (msg.references && msg.references.length > 0) {
+      if (!this.#workstreams.configured || !createWorkstream) {
+        return { type: "response.error", requestId: msg.id, error: "No workstreams are configured: a session can't reference one", code: "invalid_request" };
+      }
+      const approves = hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE) && auth.delegationDepth === 0;
+      const recorded = this.#store.workstreamFoldersByWorkstream();
+      const refs: WorkstreamReference[] = [];
+      for (const asked of msg.references) {
+        const paths = asked.paths?.map(referenceFolder);
+        const pathProblem = referencePathsProblem(paths);
+        if (pathProblem) return { type: "response.error", requestId: msg.id, error: pathProblem, code: "invalid_request" };
+        const v = this.#workstreams.referenceVerdict(createWorkstream.id, { workstream: asked.workstream, ...(paths ? { paths } : {}) }, recorded.get(asked.workstream) ?? []);
+        if (!v.ok) return { type: "response.error", requestId: msg.id, error: v.error, code: "forbidden" };
+        if (v.ask.length > 0 && !approves) {
+          return { type: "response.error", requestId: msg.id, error: `Workstream "${asked.workstream}" shares only with approval: referencing it needs session:approve on an undelegated token`, code: "forbidden" };
+        }
+        refs.push({ workstream: asked.workstream, ...(paths ? { paths } : {}), grantedBy: auth.sub, grantedAt: new Date().toISOString() });
+      }
+      const unique = [...new Map(refs.map((r) => [r.workstream, r])).values()];
+      createWorkstream = { ...createWorkstream, references: unique, readFrom: [...new Set([...(createWorkstream.readFrom ?? []), ...unique.map((r) => r.workstream)])] };
+      this.#store.audit(auth.sub, "workstream.reference_added", "", `workdir=${workdir} references=${unique.map((r) => r.workstream).join(",")} at=create`);
+    }
     if (createWorkstream?.source === "override") {
       const c = homing.resolution?.conflict;
       this.#store.audit(auth.sub, "workstream.override", "", `workdir=${workdir} folder=${c?.folder ?? "?"} chosen=${createWorkstream.id} revision=${createWorkstream.revision}`);
@@ -6219,6 +6290,8 @@ mcpHub: this.#mcpHub,
       providerId,
       defaultModel: conductorConfig?.model,
       fleet: this.#buildFleetServer(auth.accountId, auth.projectId),
+      fleetTargetWorkstream: this.#fleetCardWorkstream(auth.accountId, auth.projectId),
+      fleetConfirm: (target) => this.#issueFleetToken({ accountId: auth.accountId, projectId: auth.projectId }, target),
       auth,
       store: this.#store,
       transcriptStore: this.#transcriptStore,
@@ -7931,9 +8004,24 @@ mcpHub: this.#mcpHub,
             `provider "${task.provider}" is not registered on this daemon — available: ${this.#providers.ids().join(", ")}`,
           );
         }
+        // Its home: the workstream the spawn named, judged again now (the config may have changed since it
+        // was queued), else the folder's as before W4.
+        let home: WorkstreamBinding | undefined;
+        if (task.workstream) {
+          // A confirmation the card gave holds only at the config revision it was given at.
+          const confirmed = task.workstreamOverride && task.workstreamRevision === this.#workstreams.revision;
+          const h = this.#fleetSpawnHome(workdir, task.workstream, confirmed, { accountId: task.accountId, projectId: task.projectId });
+          if (!h.ok) throw new NonRetryableDispatchError(`workstream: ${h.error}`);
+          home = h.binding;
+        } else if (this.#workstreams.configured && task.createdBy && !goalIdFromCreatedBy(task.createdBy)) {
+          // The conductor's unnamed spawn: the folder's own, judged as when it was queued (remote guard included).
+          const h = this.#fleetSpawnHome(workdir, undefined, false, { accountId: task.accountId, projectId: task.projectId });
+          if (!h.ok) throw new NonRetryableDispatchError(`workstream: ${h.error}`);
+          home = h.binding;
+        } else home = this.#workstreamForFolder(workdir, this.#dispatchSenderAuth(task));
         const budget = this.#dispatcher.config.workerToolBudget;
         const session = new Session({
-          ...this.#workstreamOpts(this.#workstreamForFolder(workdir, this.#dispatchSenderAuth(task))),
+          ...this.#workstreamOpts(home),
           name: `worker-${task.shape}-${task.id.slice(0, 8)}`,
           workdir,
           role: "worker",
@@ -8021,6 +8109,11 @@ mcpHub: this.#mcpHub,
         const worker = this.#sessionForTask(task.workerSessionId, task);
         const header = `task ${task.id.slice(0, 8)} (${task.kind}/${task.shape}) in ${task.workdir ?? task.targetSession ?? "?"}`;
         if (!worker) return `${header} — worker session unavailable; check the workdir/git state for artifacts.`;
+        // A closed workstream's worker reports its status, never its text (workstreams §10).
+        // Withheld from the conductor only: an orchestrator's children share its workstream (they inherit it).
+        if (!goalIdFromCreatedBy(task.createdBy) && this.#workstreamTextWithheld({ sessionId: worker.id, ...(worker.workstream?.id ? { workstream: worker.workstream.id } : {}) })) {
+          return `${header} — done in workstream ${worker.workstream?.id}, which is closed: its result isn't shared with the conductor. Its owner sees it in the session ${worker.name}.`;
+        }
         const parts: string[] = [header];
         const finalText = worker.lastAssistantText;
         if (finalText) {
@@ -8332,9 +8425,208 @@ mcpHub: this.#mcpHub,
 
   /** The conductor's tenant-wide deps. Extracted from `#buildFleetServer` so a
    *  test can compare them against the orchestrator's scoped ones. */
+  /** Whether any workstream is closed while isolation is on: then text whose workstream can't be told is withheld. */
+  #anyClosedWorkstream(): boolean {
+    return this.#workstreams.configured && this.#workstreams.isolateGlobalServers && this.#workstreams.anyClosed;
+  }
+
+  /** #workstreamTextWithheld's answers, briefly: a fleet tool asks once per episode. */
+  #withheldMemo = new Map<string, { at: number; withheld: boolean }>();
+
+  /** A session's home as last recorded, for one not running: its meta's binding, else its folder's record, else its folder now. */
+  #storedSessionWorkstream(sessionId: string): string | undefined | null {
+    const stored = this.#store.getSession(sessionId);
+    if (!stored) return null;
+    try {
+      const meta = JSON.parse(readFileSync(this.#transcriptStore.metaPath(sessionId), "utf8")) as { workstream?: unknown };
+      const b = meta.workstream !== undefined ? readWorkstreamBinding(meta.workstream) : undefined;
+      if (b) return b.sealed ? null : b.id;
+    } catch {}
+    const owner = stored as { accountId?: string; projectId?: string };
+    if (owner.accountId && owner.projectId) {
+      const recorded = this.#store.workstreamFolder({ accountId: owner.accountId, projectId: owner.projectId, workdir: stored.workdir });
+      if (recorded) return recorded;
+    }
+    return this.#workstreams.resolve(stored.workdir).home;
+  }
+
+  /**
+   * Whether text is withheld from the conductor and its digests (workstreams
+   * §10): a `closed` workstream's, under isolation. Judged by the episode's
+   * workstream; an untagged one (written before workstreams) by its
+   * session's — live, else the folder the session was stored with —; one
+   * whose workstream can't be told at all is withheld while any is closed.
+   */
+  #workstreamTextWithheld(ref: { workstream?: string; sessionId?: string }): boolean {
+    if (!this.#anyClosedWorkstream()) return false;
+    const key = `${this.#workstreams.revision}\u0000${ref.workstream ?? ""}\u0000${ref.sessionId ?? ""}`;
+    const hit = this.#withheldMemo.get(key);
+    if (hit && Date.now() - hit.at < 2_000) return hit.withheld;
+    const withheld = this.#judgeWithheld(ref);
+    if (this.#withheldMemo.size > 2_000) this.#withheldMemo.clear();
+    this.#withheldMemo.set(key, { at: Date.now(), withheld });
+    return withheld;
+  }
+
+  #judgeWithheld(ref: { workstream?: string; sessionId?: string }): boolean {
+    let ws = ref.workstream;
+    if (!ws && ref.sessionId) {
+      const live = this.#sessions.get(ref.sessionId);
+      if (live) {
+        ws = live.workstream?.id;
+        if (!ws) return false; // a session with no home: nothing of a closed workstream's is in it
+        if (live.workstream?.source === "reserved") return false;
+      } else {
+        const recorded = this.#storedSessionWorkstream(ref.sessionId);
+        if (recorded === null) return true; // unknown, or its record unreadable: withheld while any is closed
+        ws = recorded;
+        if (!ws) return false;
+      }
+    }
+    if (!ws) return true;
+    return this.#workstreams.get(ws)?.share === "closed";
+  }
+
+  /**
+   * A dispatched worker's home (workstreams §10, §5): `workstream` if named,
+   * else the folder's — as a create judges it, a folder with none refused
+   * under isolation, and a folder whose repository's remote now matches
+   * another workstream than it did refused too (an agent can edit `origin`:
+   * #workstreamForFolder). `confirmed`: approving the spawn's card confirmed
+   * what it warned of — an override past the folder's exclusive workstream
+   * (G3), a home in an `ask` workstream's folder. A closed workstream's
+   * folder never takes another's worker, and a closed workstream's worker
+   * works only in its own folders (what it writes elsewhere is no one's).
+   */
+  #fleetSpawnHome(
+    workdir: string,
+    workstream: string | undefined,
+    confirmed: boolean,
+    tenant?: { accountId: string; projectId: string },
+  ): { ok: true; binding: WorkstreamBinding | undefined; override: boolean; conflict?: string; asks: string[] } | { ok: false; error: string } {
+    if (!this.#workstreams.configured) {
+      return workstream ? { ok: false, error: "No workstreams are configured on this daemon: omit workstream" } : { ok: true, binding: undefined, override: false, asks: [] };
+    }
+    const r = this.#workstreams.forCreate(workdir, workstream, undefined, true, confirmed);
+    if (!r.ok) {
+      const c = r.kind === "workstream_conflict" ? r.resolution.conflict : undefined;
+      if (c && !c.overridable) return { ok: false, error: `${r.error} That workstream allows no override.` };
+      if (c) return { ok: false, error: `${r.error} Approving the spawn's card confirms it; this one wasn't confirmed (it changed since it was shown): ask again.` };
+      return { ok: false, error: r.kind === "workstream_required" ? `${r.error} Name it with workstream.` : r.error };
+    }
+    if (!workstream && tenant && r.binding?.source === "matched" && r.binding.id && r.binding.matchedBy?.startsWith("remote ")) {
+      const before = this.#store.workstreamFolder({ ...tenant, workdir });
+      if (before && before !== r.binding.id) {
+        return { ok: false, error: `This folder matched workstream "${before}", but its repository now matches "${r.binding.id}": its remote may have been changed. Name the workstream.` };
+      }
+    }
+    const fv = this.#workstreams.folderVerdict(workdir, r.binding?.id);
+    if (!fv.ok) return { ok: false, error: fv.error };
+    if (fv.ask.length > 0 && !confirmed) {
+      return { ok: false, error: `This folder is workstream "${fv.folder}"'s, which shares only with approval: approving the spawn's card confirms it; this one wasn't confirmed: ask again.` };
+    }
+    const home = r.binding?.id ? this.#workstreams.get(r.binding.id) : undefined;
+    if (home?.share === "closed") {
+      const recorded = this.#store.workstreamFoldersByWorkstream().get(home.id) ?? [];
+      const { folders } = this.#workstreams.foldersOf(home.id, recorded);
+      // Its own: a folder of its, or one it matches (a remote rule names no folder until one is recorded).
+      const own = folders.some((f) => workdir === f || workdir.startsWith(`${f}/`)) || this.#workstreams.resolve(workdir).home === home.id;
+      if (!own) return { ok: false, error: `Workstream "${home.id}" is closed: its workers work only in its own folders` };
+    }
+    const binding = r.binding && fv.folder ? { ...r.binding, readFrom: [fv.folder] } : r.binding;
+    const override = r.binding?.source === "override";
+    return { ok: true, binding, override, ...(override && r.resolution?.conflict ? { conflict: r.resolution.conflict.folder } : {}), asks: fv.ask };
+  }
+
+  /**
+   * Confirmation tokens (workstreams §10, G3): one per approved card that
+   * needed one, issued when the owner's own approval settled it and added to
+   * that call's input; spent once by its handler, which re-judges the spawn
+   * and accepts only the very verdict the card showed, at the revision it was
+   * shown at. Ten minutes.
+   */
+  #fleetTokens = new Map<string, { at: number; tenant: { accountId: string; projectId: string }; confirm: NonNullable<FleetCardTarget["confirm"]> }>();
+
+  #issueFleetToken(tenant: { accountId: string; projectId: string }, target: FleetCardTarget): string | undefined {
+    if (!target.confirm) return undefined;
+    if (this.#fleetTokens.size > 256) this.#fleetTokens.clear();
+    const token = randomUUID();
+    this.#fleetTokens.set(token, { at: Date.now(), tenant, confirm: target.confirm });
+    return token;
+  }
+
+  /** Spend `token` for a spawn: valid only for this tenant, call and verdict, unchanged since the card. */
+  #spendFleetToken(
+    token: string | undefined,
+    tenant: { accountId: string; projectId: string },
+    workdir: string,
+    workstream: string | undefined,
+    verdict: { conflict?: string; asks: string[] },
+  ): boolean {
+    if (!token) return false;
+    const t = this.#fleetTokens.get(token);
+    this.#fleetTokens.delete(token);
+    if (!t || Date.now() - t.at > 10 * 60_000) return false;
+    const c = t.confirm;
+    return (
+      t.tenant.accountId === tenant.accountId &&
+      t.tenant.projectId === tenant.projectId &&
+      c.workdir === workdir &&
+      (c.workstream ?? "") === (workstream ?? "") &&
+      c.revision === this.#workstreams.revision &&
+      (c.conflict ?? "") === (verdict.conflict ?? "") &&
+      JSON.stringify([...c.asks].sort()) === JSON.stringify([...verdict.asks].sort())
+    );
+  }
+
+  /**
+   * What a send-class fleet call's approval card says of its workstream
+   * (workstreams §10): the target session's home (send, interrupt, a
+   * panel's members), or the spawned worker's — with the warning approving
+   * it confirms (past the folder's exclusive workstream), or why it will be
+   * refused. Undefined without workstreams.
+   */
+  #fleetCardWorkstream(accountId: string, projectId: string): (toolName: string, input: unknown) => FleetCardTarget | undefined {
+    return (toolName, input) => {
+      if (!this.#workstreams.configured) return undefined;
+      const tool = toolName.startsWith(FLEET_TOOL_PREFIX) ? toolName.slice(FLEET_TOOL_PREFIX.length) : toolName;
+      const i = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
+      const mine = [...this.#sessions.values()].filter((x) => x.accountId === accountId && x.projectId === projectId);
+      const find = (ref: unknown) =>
+        typeof ref === "string" ? (mine.find((x) => x.id === ref) ?? mine.find((x) => x.name === ref) ?? mine.find((x) => x.id.startsWith(ref))) : undefined;
+      if (tool === "fleet_spawn") {
+        const workdir = typeof i.workdir === "string" ? normalizeWorkdir(i.workdir) : null;
+        if (!workdir) return undefined;
+        const ws = typeof i.workstream === "string" ? i.workstream : undefined;
+        const tenant = { accountId, projectId };
+        const plain = this.#fleetSpawnHome(workdir, ws, false, tenant);
+        if (plain.ok) return plain.binding?.id ? { workstream: plain.binding.id } : undefined;
+        const confirmed = this.#fleetSpawnHome(workdir, ws, true, tenant);
+        if (confirmed.ok && (confirmed.override || confirmed.asks.length > 0)) {
+          const what = confirmed.override
+            ? `Past workstream "${confirmed.conflict ?? "?"}"'s own folder (exclusive): approving this confirms a worker of "${confirmed.binding?.id}" there.`
+            : `It reads workstream "${confirmed.asks.join(", ")}"'s folder, which shares only with approval: approving this confirms it.`;
+          return {
+            ...(confirmed.binding?.id ? { workstream: confirmed.binding.id } : {}),
+            warning: what,
+            confirm: { workdir, ...(ws ? { workstream: ws } : {}), revision: this.#workstreams.revision, ...(confirmed.conflict ? { conflict: confirmed.conflict } : {}), asks: confirmed.asks },
+          };
+        }
+        return { warning: `It will be refused: ${confirmed.ok ? plain.error : confirmed.error}` };
+      }
+      if (tool === "fleet_panel" && Array.isArray(i.sessions)) {
+        const homes = [...new Set(i.sessions.map((r) => find(r)?.workstream?.id ?? "none"))];
+        return { workstream: homes.join(", ") };
+      }
+      const target = find(i.session);
+      return target?.workstream?.id ? { workstream: target.workstream.id } : undefined;
+    };
+  }
+
   #conductorFleetDeps(accountId: string, projectId: string): FleetDeps {
     return {
       tenant: { accountId, projectId },
+      textWithheld: (ref) => this.#workstreamTextWithheld(ref),
       listSessions: (): FleetSessionView[] => {
         const views: FleetSessionView[] = [];
         for (const s of this.#sessions.values()) {
@@ -8350,6 +8642,7 @@ mcpHub: this.#mcpHub,
             model: s.toInfo().model,
             attachedClients: s.attachedClientCount,
             createdAt: s.createdAt,
+            ...(s.workstream?.id ? { workstream: s.workstream.id } : {}),
           });
         }
         return views;
@@ -8406,6 +8699,21 @@ mcpHub: this.#mcpHub,
       checkWorkdir: (path: string) => {
         const n = normalizeWorkdir(path);
         return n && !this.#loopWorktreeProblem(n) ? n : null;
+      },
+      // Run after the owner approved the spawn's card, which showed any conflict: confirmed.
+      checkWorkstream: (workdir: string, workstream?: string, token?: string) => {
+        if (!this.#workstreams.configured && !workstream) return { ok: true };
+        const tenant = { accountId, projectId };
+        // Confirmed only by the token the owner's approval of this very call's card put in its input, for
+        // exactly the verdict that card showed (#spendFleetToken).
+        let home = this.#fleetSpawnHome(workdir, workstream, false, tenant);
+        if (!home.ok) {
+          const confirmed = this.#fleetSpawnHome(workdir, workstream, true, tenant);
+          if (confirmed.ok && this.#spendFleetToken(token, tenant, workdir, workstream, { ...(confirmed.conflict ? { conflict: confirmed.conflict } : {}), asks: confirmed.asks })) home = confirmed;
+        } else if (token) this.#fleetTokens.delete(token);
+        if (!home.ok) return home;
+        const confirmed = home.override || home.asks.length > 0;
+        return { ok: true, ...(home.binding?.id ? { workstream: home.binding.id } : {}), ...(confirmed ? { override: true, revision: this.#workstreams.revision } : {}) };
       },
       resolveBackend: (provider?: string, model?: string) => {
         // Fail closed on an unknown provider — same rule and same wording as
@@ -8477,7 +8785,12 @@ mcpHub: this.#mcpHub,
             target: t.targetSession ?? t.workdir,
             createdAt: t.createdAt,
             error: t.error,
-            resultDigest: t.resultDigest,
+            // Another's task (an orchestrator's) carries its full digest: not the conductor's to read when
+            // its worker was a closed workstream's (§10). The conductor's own were withheld when built.
+            resultDigest:
+              goalIdFromCreatedBy(t.createdBy) !== undefined && this.#workstreamTextWithheld({ ...(t.workerSessionId ? { sessionId: t.workerSessionId } : t.targetSession ? { sessionId: t.targetSession } : {}) })
+                ? (t.resultDigest ? "(a closed workstream's result: not shared with the conductor)" : null)
+                : t.resultDigest,
           })),
     };
   }
@@ -8534,6 +8847,15 @@ mcpHub: this.#mcpHub,
    * "the orchestrator doesn't get X" test proves nothing unless something in
    * the same run shows X was actually available to give.
    */
+  /** The token the owner's approval of `target`'s card would add to the call, for tests. */
+  _issueFleetTokenForTest(accountId: string, projectId: string, target: FleetCardTarget): string | undefined {
+    return this.#issueFleetToken({ accountId, projectId }, target);
+  }
+
+  _fleetCardWorkstreamForTest(accountId: string, projectId: string): (toolName: string, input: unknown) => FleetCardTarget | undefined {
+    return this.#fleetCardWorkstream(accountId, projectId);
+  }
+
   _fleetDepsForTest(accountId: string, projectId: string): FleetDeps {
     return this.#conductorFleetDeps(accountId, projectId);
   }
@@ -9681,6 +10003,13 @@ mcpHub: this.#mcpHub,
       return { type: "response.error", requestId: msg.id, error: "A delegated token can't approve a loop worker's tool calls", code: "forbidden" };
     }
 
+    // A card warning of a workstream override or an `ask` folder (workstreams §10, G3) is the owner's own to
+    // confirm, as an override at create is; and that approval is what the spawn handler may count as confirmed.
+    const card = session.approvalWorkstream(msg.approvalId);
+    if (msg.approved && card?.target.confirm && !session.isOwnApprover(auth)) {
+      this.#store.audit(auth.sub, "workstream.override_refused", session.id, `approvalId=${msg.approvalId} reason=not_owner`);
+      return { type: "response.error", requestId: msg.id, error: "Only the session's owner can confirm what this card warns of", code: "forbidden" };
+    }
     // Still `response.ok` for a stale id — the web ApprovalBar sends one to
     // dismiss a leftover prompt — but say so, for callers that report it.
     const outcome = session.approve(msg.approvalId, msg.approved, auth, msg.updatedInput);
@@ -9946,6 +10275,170 @@ mcpHub: this.#mcpHub,
     const result = await session.changeSandboxDir(msg.action, msg.path, auth);
     if (!result.ok) return { type: "response.error", requestId: msg.id, error: result.error, code: "invalid_request" };
     return { type: "response.ok", requestId: msg.id, data: { ...(result.pending ? { pending: true } : {}), message: result.message, sandbox: session.sandboxInfo } };
+  }
+
+  /**
+   * `session.add_reference` / `remove_reference` / `set_workstream`
+   * (workstreams §5.3, §7): owner-only. A grant or a move follows the share
+   * policy of each workstream it reads from (WorkstreamService
+   * `referenceVerdict` / `moveVerdict`): `closed` refuses; `ask` is granted
+   * at once to the owner asking with session:approve on an undelegated token,
+   * else asked of the owner on the session. Applied at the next turn.
+   */
+  async #sessionWorkstreamEdit(
+    msg: Extract<ClientMessage, { type: "session.add_reference" | "session.remove_reference" | "session.set_workstream" }>,
+    auth: AuthContext,
+  ): Promise<DaemonMessage> {
+    const err = (error: string, code: "forbidden" | "invalid_request" | "not_found" = "invalid_request"): DaemonMessage => ({ type: "response.error", requestId: msg.id, error, code });
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_SEND)) return err("Missing scope: session:send", "forbidden");
+    const session = this.#getOwnedSession(msg.sessionId, auth);
+    if (!session) return err("Session not found", "not_found");
+    if (session.createdBy !== auth.sub) return err("Only the session's owner can change what workstreams it reads", "forbidden");
+    const binding = session.workstreamAhead;
+    if (!this.#workstreams.configured || !binding) return err("No workstreams are configured");
+    if (binding.source === "reserved") return err("The conductor's workstream can't be changed");
+    // The owner asking with approval rights, undelegated, is the confirm an `ask` policy wants.
+    const approves = hasScope(auth.scopes as string[], SCOPES.SESSION_APPROVE) && auth.delegationDepth === 0;
+    const reply = (data: Record<string, unknown>): DaemonMessage => ({ type: "response.ok", requestId: msg.id, data: { ...data, workstream: this.#describeWorkstream(session.workstreamAhead) } });
+
+    if (msg.type === "session.remove_reference") {
+      const refs = binding.references ?? [];
+      if (!refs.some((r) => r.workstream === msg.workstream)) return err(`This session has no reference to "${msg.workstream}"`);
+      const rest = refs.filter((r) => r.workstream !== msg.workstream);
+      session.setWorkstream({ ...withoutKey(binding, "references"), ...(rest.length > 0 ? { references: rest } : {}) }, `No longer reads workstream "${msg.workstream}" (from the next turn)`);
+      this.#store.audit(auth.sub, "workstream.reference_removed", session.id, `workstream=${msg.workstream}`);
+      return reply({ message: `removed the reference to ${msg.workstream}` });
+    }
+
+    // What is asked, as it will be granted; null = refused (with why).
+    let decide:
+      | { ask: string[]; recheck: () => string | undefined; apply: (by: string) => { next: WorkstreamBinding; said: string; audit: [string, string] } }
+      | { error: string };
+    if (msg.type === "session.add_reference") {
+      const paths = msg.paths?.map(referenceFolder);
+      // Held to what a binding is read back with: one stored that can't be read would seal the session.
+      const pathProblem = referencePathsProblem(paths);
+      if (pathProblem) return err(pathProblem);
+      const others = (binding.references ?? []).filter((r) => r.workstream !== msg.workstream);
+      if (others.length >= REFERENCE_LIMIT) return err(`A session reads at most ${REFERENCE_LIMIT} other workstreams`);
+      const recorded = this.#store.workstreamFoldersByWorkstream().get(msg.workstream) ?? [];
+      const v = this.#workstreams.referenceVerdict(binding.id, { workstream: msg.workstream, ...(paths ? { paths } : {}) }, recorded);
+      const again = () => {
+        // Judged again as things are now, the bounds a binding is read back with included (several asks may be pending).
+        const cur = session.workstreamAhead;
+        if ((cur?.references ?? []).filter((r) => r.workstream !== msg.workstream).length >= REFERENCE_LIMIT) return `A session reads at most ${REFERENCE_LIMIT} other workstreams`;
+        if (new Set([...(cur?.readFrom ?? []), msg.workstream]).size > READ_FROM_LIMIT) return "This session has read from too many workstreams to record another";
+        const w = this.#workstreams.referenceVerdict(cur?.id, { workstream: msg.workstream, ...(paths ? { paths } : {}) }, recorded);
+        return w.ok ? undefined : w.error;
+      };
+      const tooMany = again();
+      if (tooMany && v.ok) return err(tooMany);
+      decide = !v.ok
+        ? { error: v.error }
+        : {
+            ask: v.ask,
+            recheck: again,
+            apply: (by) => {
+              const cur = session.workstreamAhead ?? binding;
+              const ref = { workstream: msg.workstream, ...(paths ? { paths } : {}), grantedBy: by, grantedAt: new Date().toISOString() };
+              const next: WorkstreamBinding = {
+                ...cur,
+                references: [...(cur.references ?? []).filter((r) => r.workstream !== msg.workstream), ref],
+                readFrom: [...new Set([...(cur.readFrom ?? []), msg.workstream])],
+              };
+              return { next, said: `Reads workstream "${msg.workstream}"${paths ? ` (${paths.join(", ")})` : ""} from the next turn: its folders read-only, and its memory`, audit: ["workstream.reference_added", `workstream=${msg.workstream}${paths ? ` paths=${paths.join(",")}` : ""} by=${by}`] };
+            },
+          };
+    } else {
+      if (msg.workstream === binding.id) return err(`The session is already in "${msg.workstream}"`);
+      // Everything a move is judged by, as things are when asked — and again when the owner answers.
+      const judge = (cur: WorkstreamBinding | undefined): { error: string } | { ask: string[]; conflict: boolean; folder?: string } => {
+        const v = this.#workstreams.moveVerdict(cur, msg.workstream);
+        if (!v.ok) return { error: v.error };
+        if ((cur?.readFrom?.length ?? 0) + 2 > READ_FROM_LIMIT) return { error: "This session has read from too many workstreams to record another move" };
+        const fv = this.#workstreams.folderVerdict(session.workdir, msg.workstream);
+        if (!fv.ok) return { error: fv.error };
+        // Past another workstream's exclusive claim on the folder: an override (§5.2), never asked on the session.
+        const conflict = this.#workstreams.resolve(session.workdir, msg.workstream).conflict;
+        if (conflict && !conflict.overridable) return { error: `This folder belongs to workstream "${conflict.folder}", which allows no override` };
+        return { ask: [...new Set([...v.ask, ...fv.ask])], conflict: conflict !== undefined, ...(fv.folder ? { folder: fv.folder } : {}) };
+      };
+      const first = judge(binding);
+      if ("error" in first) return err(first.error, "forbidden");
+      if (first.conflict && !approves) return err("This folder belongs to another workstream (exclusive): moving the session past it needs session:approve on an undelegated token", "forbidden");
+      let answer = first;
+      decide = {
+        ask: first.ask,
+        recheck: () => {
+          const now = judge(session.workstreamAhead);
+          if ("error" in now) return now.error;
+          answer = now;
+          return undefined;
+        },
+        apply: (by) => {
+          const cur = session.workstreamAhead ?? binding;
+          const refs = (cur.references ?? []).filter((r) => r.workstream !== msg.workstream);
+          // The conversation goes with it: the old home (but the default) and the folder's workstream are read from now.
+          const readFrom = [...new Set([...(cur.readFrom ?? []), ...(cur.id && cur.id !== this.#workstreams.defaultId ? [cur.id] : []), ...(answer.folder ? [answer.folder] : [])])].filter((w) => w !== msg.workstream);
+          const next: WorkstreamBinding = {
+            id: msg.workstream,
+            source: answer.conflict ? "override" : "explicit",
+            revision: this.#workstreams.revision,
+            ...(refs.length > 0 ? { references: refs } : {}),
+            ...(readFrom.length > 0 ? { readFrom } : {}),
+          };
+          return { next, said: `Moved to workstream "${msg.workstream}"${cur.id ? ` from "${cur.id}"` : ""}: its servers, credentials and sandbox from the next turn`, audit: [answer.conflict ? "workstream.override" : "workstream.moved", `from=${cur.id ?? "none"} to=${msg.workstream} by=${by}`] };
+        },
+      };
+    }
+    if ("error" in decide) return err(decide.error, "forbidden");
+    const applyNow = (by: string) => {
+      const { next, said, audit } = decide.apply(by);
+      session.setWorkstream(next, said);
+      this.#store.audit(by, audit[0], session.id, audit[1]);
+    };
+    if (decide.ask.length === 0 || approves) {
+      applyNow(auth.sub);
+      return reply({ message: "done" });
+    }
+    // An `ask` workstream, and the asker can't approve it: the owner confirms on the session.
+    const what = msg.type === "session.add_reference" ? `read workstream "${msg.workstream}"` : `move to workstream "${msg.workstream}"`;
+    this.#store.audit(auth.sub, "workstream.share_ask", session.id, `${msg.type} ${msg.workstream} ask=${decide.ask.join(",")}`);
+    let answeredBy: string | undefined;
+    void session
+      .requestUserInput(
+        {
+          method: "confirm",
+          title: `Let "${session.name}" ${what}?`,
+          message:
+            msg.type === "session.add_reference"
+              ? `"${msg.workstream}" shares only with approval. The session could read its folders and recall its memory; it gets none of its servers or credentials, and writes nothing there.`
+              : `${decide.ask.map((w) => `"${w}"`).join(" and ")} share${decide.ask.length === 1 ? "s" : ""} only with approval, and the session's whole conversation would go with it.`,
+        },
+        {
+          ownerOnly: true,
+          onAnswer: (sub) => {
+            answeredBy = sub;
+          },
+        },
+      )
+      .then(
+        (answer) => {
+          if (answer.cancelled || answer.confirmed !== true) {
+            this.#store.audit(answeredBy ?? auth.sub, "workstream.share_denied", session.id, `${msg.type} ${msg.workstream} ${answer.reason ?? "declined"}`);
+            return;
+          }
+          // Judged again as it is now: a policy tightened while the owner was asked wins.
+          const now = decide.recheck();
+          if (now) {
+            this.#store.audit(answeredBy ?? auth.sub, "workstream.share_denied", session.id, `${msg.type} ${msg.workstream} ${now}`);
+            return;
+          }
+          applyNow(answeredBy ?? auth.sub);
+        },
+        () => {},
+      );
+    return reply({ pending: true, message: `asked on the session: ${what}?` });
   }
 
   /** `sandbox.providers` (#448): what the daemon has and whether each runs here. */
@@ -10405,4 +10898,28 @@ function tenantOf(auth: AuthContext): McpTenant {
 function daemonSandboxRoot(): string[] {
   const root = sandboxRootIfMade();
   return root ? [root] : [];
+}
+
+/** `obj` without `key` (an optional field taken away). */
+function withoutKey<T extends object, K extends keyof T>(obj: T, key: K): Omit<T, K> {
+  const { [key]: _, ...rest } = obj;
+  return rest;
+}
+
+/**
+ * A reference's folder as it is granted: `~` expanded, made absolute and
+ * resolved to where it really is (a `..` or a link never names one
+ * workstream's path for another's). One that doesn't exist is kept as
+ * written, which referencePathsProblem refuses unless it is absolute (and
+ * the fence counts it only where it really is inside the workstream).
+ */
+function referenceFolder(p: string): string {
+  const expanded = p === "~" ? homedir() : p.startsWith("~/") ? join(homedir(), p.slice(2)) : p;
+  if (!expanded.startsWith("/")) return p;
+  const abs = resolve(expanded);
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
 }

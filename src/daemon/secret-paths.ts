@@ -68,7 +68,9 @@ const PATH_LIST_KEYS = ["paths", "file_paths", "absolute_paths", "include", "dir
 /** Tools whose `pattern` is a path glob (not a regex) and whose absent root means the workdir. */
 const GLOB_TOOLS = new Set(["Glob", "glob"]);
 /** Search tools: an absent root means the workdir. */
-const SEARCH_TOOLS = new Set(["Glob", "glob", "Grep", "grep", "grep_search", "search_file_content", "LS", "list_directory"]);
+const SEARCH_TOOLS = new Set(["Glob", "glob", "Grep", "grep", "grep_search", "search_file_content", "LS", "list_directory", "find", "ls", "acp_search"]);
+/** pi's file tools: a path's leading `@` is dropped, as pi drops it. */
+const PI_PATH_TOOLS = new Set(["read", "find", "ls", "grep", "write", "edit"]);
 
 /** Files in codeoid's config dir that hold credentials. */
 function isSecretConfigFile(name: string): boolean {
@@ -247,6 +249,25 @@ function within(child: string, parent: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
+/**
+ * The paths a tool call reads or searches, as written (relative ones from its
+ * cwd), backend-neutral: also what the workstream fence judges (workstreams/gate.ts).
+ */
+export function toolReadPaths(toolName: string, input: unknown): string[] {
+  return candidatePaths(toolName, input);
+}
+
+/** Whether a tool searches (an absent root: the workdir): one whose root holds a fenced folder reads into it. */
+export function isSearchTool(toolName: string): boolean {
+  return SEARCH_TOOLS.has(toolName);
+}
+
+/** A tool's path made absolute from `cwd`, as the kernel resolves it, and its real path: the forms a check judges. */
+export function toolPathForms(p: string, cwd: string): string[] {
+  const literal = expand(p, cwd);
+  return [...new Set([literal, real(literal)])];
+}
+
 function candidatePaths(toolName: string, input: unknown): string[] {
   if (!input || typeof input !== "object") return [];
   const obj = input as Record<string, unknown>;
@@ -256,12 +277,29 @@ function candidatePaths(toolName: string, input: unknown): string[] {
     const v = obj[k];
     if (Array.isArray(v)) for (const p of v) if (typeof p === "string" && p) out.push(p);
   }
+  // ACP's `locations` (acp/index.ts acpToolInput): paths, or `{path}` as the agent sent them.
+  if (Array.isArray(obj.locations)) {
+    for (const l of obj.locations) {
+      const p = typeof l === "string" ? l : l && typeof l === "object" ? (l as { path?: unknown }).path : undefined;
+      if (typeof p === "string" && p) out.push(p);
+    }
+  }
+  if (PI_PATH_TOOLS.has(toolName)) {
+    // Only before an absolute or `~` path: another backend's relative `@x` (a file so named) stays as written.
+    for (const [i, p] of out.entries()) if (p.startsWith("@/") || p.startsWith("@~")) out[i] = p.slice(1);
+  }
   // A glob's pattern can be absolute (`/home/u/.codeoid/*.json`): judge its
   // literal prefix, up to the first wildcard. Only for glob tools — Grep's
   // `pattern` is a regex, and searching code for "/proc/self/environ" is fine.
   if (GLOB_TOOLS.has(toolName) && typeof obj.pattern === "string" && (isAbsolute(obj.pattern) || obj.pattern.startsWith("~"))) {
     const literal = obj.pattern.split(/[*?[{]/, 1)[0] ?? "";
-    if (literal) out.push(literal.endsWith("/") ? literal.slice(0, -1) || "/" : literal);
+    if (literal.endsWith("/")) out.push(literal.slice(0, -1) || "/");
+    else if (literal) {
+      // A wildcard inside the last segment (`/w/h?/*`, `~/.codeoid*`): judged where it starts (a credential
+      // dir it names is refused, as before) and at the dir it searches (`/w`: any `h?` there).
+      out.push(literal);
+      if (obj.pattern !== literal) out.push(dirname(literal));
+    }
   }
   // A search with no root searches the workdir.
   if (out.length === 0 && SEARCH_TOOLS.has(toolName)) out.push(".");

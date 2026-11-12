@@ -405,6 +405,12 @@ function within(child: string, parent: string): boolean {
 
 export interface SpecInputs {
   sessionId: string;
+  /**
+   * More paths hidden for this session alone: other workstreams' folders
+   * under its read fence (workstreams §7.3). Never the workspace or what
+   * holds it (SessionSandbox leaves those out).
+   */
+  extraHidden?: readonly string[];
   workspace: string;
   /**
    * The session's cwd, when it is below `workspace` (a monorepo's package,
@@ -1204,7 +1210,11 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const baseHidden = hiddenPathsFor(inputs.config, inputs.hidden);
   // What the hidden list hides, the home aside: no root or added dir is inside it (validated; again here).
   const inHidden = (p: string) => [...baseHidden, ...(root ? [root] : [])].some((h) => within(p, h) || within(realOr(p), realOr(h)));
-  const addedKept = added.filter((a) => !inHidden(a.dir) && !userHidden.some((u) => within(a.dir, u)));
+  // An added dir inside another workstream's folder isn't kept either: adding it can't open the fence.
+  const extraHidden = (inputs.extraHidden ?? []).map((h) => resolve(h));
+  const addedKept = added.filter(
+    (a) => !inHidden(a.dir) && !userHidden.some((u) => within(a.dir, u)) && !extraHidden.some((h) => within(a.dir, h) || within(realOr(a.dir), realOr(h))),
+  );
   // The session's own: its workspace and the dirs its owner added (their credentials are its to use, as the
   // workspace's are). A dir the agent added itself (autonomous `request_directory`) keeps the hiding a root has.
   // Its repository's git dir too (a fork's worktree uses its main checkout's): git there reads its config.
@@ -1219,7 +1229,15 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
       if (record) refuse(pinProblem(r, "project root", { stored: record }));
       return dirIdentity(r) !== null ? r : realOr(r);
     })
-    .filter((r, i, all) => dirIdentity(r) !== null && all.indexOf(r) === i && !userHidden.some((u) => within(r, u)) && !inHidden(r));
+    .filter(
+      (r, i, all) =>
+        dirIdentity(r) !== null &&
+        all.indexOf(r) === i &&
+        !userHidden.some((u) => within(r, u)) &&
+        !inHidden(r) &&
+        // A root inside another workstream's folder: the session's own setting can't show it past its fence.
+        !(inputs.extraHidden ?? []).some((h) => within(r, resolve(h)) || within(realOr(r), realOr(resolve(h)))),
+    );
   // The credential files anywhere in a root and in an agent's own added dir (not the session's own); a root or such
   // a dir too big to look through whole isn't shown at all, nor written (fail closed: resolveSandbox says so).
   const scanned = [...rootCandidates, ...agentDirs];
@@ -1249,6 +1267,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     ...rootSecrets.hidden,
     ...locationSecrets.hidden,
     ...(root ? [root] : []),
+    ...(inputs.extraHidden ?? []).map((p) => resolve(p)),
   ];
   // The session's worktree folders: writable, but never inside something hidden (a root configured in a hidden
   // path), and, unlike the backend's own state, never taking a hidden path inside them out of the hidden list.

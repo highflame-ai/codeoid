@@ -441,7 +441,7 @@ The conductor is the one session whose job crosses workstreams, and this design 
   - That worker has only the target workstream's servers, credentials and memory.
   - A Highflame Slack reply is drafted by a worker that has never seen a Sentisum episode.
   - The approval card shows the workstream as well as recipient, repo and content.
-- **`fleet_spawn`** takes `workstream` and follows §5. A conflicting spawn returns `workstream_conflict` to the conductor, and it has to choose instead of guessing.
+- **`fleet_spawn`** takes `workstream` and follows §5. A conflict the owner can override is shown on the spawn's approval card, and the owner's own approval of that card confirms it (G3); one that can't be overridden, or wasn't confirmed, comes back to the conductor, which has to choose instead of guessing.
 - **Intake.** When the conductor's Slack and GitHub intake arrives (Slack front end, a later phase), each inbox source is bound to one workstream: Highflame Slack to `highflame`, Sentisum Slack to `sentisum`.
   A signal is born with its workstream, and its reply worker inherits it.
 
@@ -493,6 +493,33 @@ codeoid workstream match <dir>          # what would this folder resolve to, and
 codeoid new <name> <dir> --workstream <id> [--ref <workstream>[:<path>]]...
 codeoid workstream move <session> <id>
 ```
+
+### 12.1 W3 as built (2026-11-11)
+
+- **Enforcement switch.** Everything W3 enforces (the fence, recall scoping) is on only with `isolateGlobalServers`, like W1's servers. Without it, episodes are still tagged with `workstream_id` and references are recorded, but nothing is fenced.
+- **What is fenced.** Another workstream's folders, not everything outside the home: a blanket deny would refuse toolchains and system headers, and the cross-workstream read is the risk. A workstream's folders are its path rules expanded on disk (`workstreams/folders.ts`: one segment at a time, links followed only where the rule names a segment literally, at most 512) plus its recorded homes' repository tops (never the home, nor a top at or above it). Every one is fenced, nested in the home's or holding it: what the session may read inside one (`WorkstreamFence.readable`: its workdir and repository, its home's folders, exactly what its references grant) is carved out of it (the gate: a path in a foreign folder and in none of those; the sandbox: every other entry on the way to them, `carveOut`, else the folder whole).
+- **Sandbox.** The fence's readable folders replace `@parent` as the project roots unless the session's own setting names roots; other workstreams' folders go into the spec's hidden paths (`SpecInputs.extraHidden`), and a root inside one is dropped. A change of fence is a change of directories, applied between turns (`SessionSandbox.dirsPending`).
+- **Gate.** `workstreams/gate.ts` judges every tool call's read, search and write paths (secret-paths.ts and held-writes.ts extractors), in every mode; Claude's PreToolUse hook refuses the same calls, since the CLI skips `canUseTool` for some.
+- **Memory.** `episodes.workstream_id`, tagged with the home at write time. Recall stays the repository's (`workspace_id`), filtered to the home and references; untagged episodes stay visible. Cross-repository recall over a whole workstream is deferred.
+- **`ask` grants.** The owner asking with `session:approve`, undelegated, is the approval. Anyone else (a delegated or send-only token) is asked of the owner on the session, and the verdict is judged again when they answer.
+- **Read-from record.** `readFrom` is recorded when a reference is granted (it may be read from then).
+- **Monorepos.** A session's repository top is its own only where no other workstream's folder holds it; a recorded home is widened to its repository's top only where no other workstream has a folder inside that top. A granted reference path counts only where it really is (written and real) inside the granting workstream's folders, at grant (resolved then) and at every fence.
+- **Turn boundary.** `Session.setWorkstream` saves the new binding at once and applies it at the next turn's start (`#applyPendingWorkstream`); a running turn keeps its gate, servers, env and memory scope together.
+- **Homed in another's folder.** `folderVerdict`: a home chosen in, or moved into, a folder another workstream holds (any claim) reads it, judged by that workstream's `share`, and it is added to `readFrom`. A move adds the old home (but the default) to `readFrom`.
+- **Carve limit.** A carve past `CARVE_LIMIT` is tried at ten times it, then the folder is hidden whole; one holding the session's workspace can't be hidden whole, and is then left visible to its commands (said in `limits`), the gate still fencing its file tools.
+- **Sealed.** A stored binding that can't be read back gives no home and `sealed: true`: what it read from is unknown, so it never moves.
+- **Known limits:** a reference with `paths` gives the workstream's whole memory (recall isn't filtered by folder yet); an episode is tagged with the home that wrote it, so what a session read through a reference stays in its home's recall after that workstream closes; the conductor's fleet reads (`fleet_summary`, the dispatch digest) are W4's.
+- **Deferred:** `Bash` commands naming another workstream's path in an unsandboxed session (§14 q4) are not yet asked about; fork *into* another workstream; skillDirs.
+
+### 12.2 W4 as built (2026-11-11)
+
+- **Fleet reads.** `FleetSessionView.workstream`; `fleet_list`, `fleet_find` and `fleet_recall` take a `workstream` filter and name each result's. `FleetDeps.textWithheld` (the manager: a `closed` workstream, under isolation) drops a closed workstream's episode text from `fleet_find` snippets, `fleet_summary` and `fleet_recall` (counted, not shown) and from the dispatch digest (`buildWorkerDigest`: status only), which is also what `fleet_tasks` shows.
+- **No rolling summaries yet.** §10 promises a closed workstream's session cards and summaries; nothing writes session cards today (`memory/cards.ts` has no caller), so a closed workstream gives status and metadata only until cards exist (backlog).
+- **Spawns.** `fleet_spawn.workstream`; `FleetDispatchDeps.checkWorkstream` before queueing (`#fleetSpawnHome`: `forCreate` with the folder required under isolation, `folderVerdict`), stored on the task (`dispatch_tasks.workstream`, `workstream_override`) and judged again at claim. The approval card (`ToolWaitingConfirmationState.targetWorkstream`, from `Session` `fleetTargetWorkstream`, the manager's `#fleetCardWorkstream`) names the workstream and warns of the override approving it confirms (G3), or of a refusal.
+- **Egress.** `workstreams/egress.ts` `planEgress`: a tested stub (G6) — a message names its workstream and is sent by a worker homed there, never by the conductor; wired when P6's Slack and email egress lands.
+- **The conductor's own memory.** Its recall includes its reserved workstream's episodes (it couldn't reach them under isolation before).
+- **Phones.** The fleet rail docks beside the chat from `md` up; below, the chat (and its approval card) has the width. The rail's board has no phone view yet (backlog); `fleet_list` and `fleet_tasks` answer in chat.
+- **Audit round 1.** Untagged episodes are judged by their session (live, else its stored folder; unknown: withheld while any workstream is closed). A closed workstream's hits are dropped from queries before anything is counted. A worker's digest is withheld from the conductor only (an orchestrator's children share its workstream); the conductor's tenant-wide board withholds others'. A confirmation is a one-time token (round 2): issued when the session owner's own approval (`isOwnApprover`) settles a card that needed one, added to that call's input by the gate (`#withFleetConfirmation`, `confirmation`), and accepted by its handler only for the tenant, workdir, workstream, conflicting workstream, `ask` folders and config revision the card was judged on (`#spendFleetToken`); the revision is stored on the task and checked at claim. A backend that drops the gate's input change gets no token: the spawn is refused. An unnamed spawn is stored without a workstream and judged again at claim by `#fleetSpawnHome` (remote-changed guard included).
 
 ## 13. Phases
 

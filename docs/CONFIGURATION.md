@@ -463,6 +463,49 @@ A workstream with `allowOverride: false` can't be overridden at all.
 
 A folder's workstream is remembered: if its repository later matches a different one (its `origin` was changed), the next session there must choose.
 
+### Reading another workstream, and moving a session
+
+With `isolateGlobalServers: true` a session is fenced off from every other workstream's folders and memory:
+- its sandbox shows its home's folders read-only as its project roots (never the whole `@parent`), and hides other workstreams' folders;
+- a file tool (Read, Grep, Glob, Write, Edit, on every backend, in every mode) in another workstream's folder is refused, naming that workstream;
+- `recall`, `timeline` and `get_episode` leave out episodes another workstream wrote (episodes from before workstreams stay visible in their repository).
+
+A workstream's folders are the directories its path rules name on this machine (a glob such as `~/Workspace/acme-*` expands to the folders it matches, never to `~/Workspace`), plus the folders where its sessions were started by their folder's own match.
+The more specific rule decides: a catch-all workstream over `~/Workspace` is fenced off from `~/Workspace/acme-api` when that is another's, and inside a folder of another workstream's, only what the session may read (its own workdir, its home's folders, what a reference grants) stays readable.
+The home itself is never a workstream's folder.
+
+Limits: a repository matched only by a remote rule is fenced once a session has been started there (its folder is recorded then); one never opened is not. A session's commands in an unsandboxed session (`--sandbox off`) can still read other workstreams' folders; only its file tools are fenced.
+
+A **reference** lets a session read another workstream: its folders read-only (or only some), and its memory. Never its servers, credentials or accounts, and never a write.
+The workstream being read decides, by its `share`:
+
+| `share` | A reference to it is… |
+| --- | --- |
+| `open` | granted. |
+| `ask` | granted when its owner asks with `session:approve` on an undelegated token; asked of the owner on the session otherwise. |
+| `closed` | refused. A reference granted before it was closed gives nothing. |
+
+```bash
+codeoid new <name> <dir> --ref pub --ref acme:~/Workspace/acme-api   # at create
+codeoid workstream ref add <session> pub                               # later (the session header's chip too)
+codeoid workstream ref rm <session> pub
+codeoid workstream move <session> <workstream>                         # another home
+```
+
+Moving a session takes its whole conversation with it, so it follows the `share` of its old home and of every workstream it has read from (for its lifetime, even after the reference is gone; each home it leaves counts too). Moving from the default workstream, or from no home, is always allowed; past another workstream's exclusive folder it is an override (needs `session:approve`).
+A session homed in another workstream's folder (chosen at create, or moved) reads that folder, so the folder's workstream's `share` decides there too: `closed` refuses it, `ask` needs `session:approve`.
+Each change is saved at once and applies at the session's next turn (a turn running keeps what it started with): its backend is rebuilt with the new servers, credentials and sandbox.
+
+A search with no folder (Grep or Glob over the workdir) is refused when another workstream's folder is inside the workdir: search a narrower folder.
+
+
+### The conductor and workstreams
+
+The conductor is homed in a reserved workstream of its own: no workstream's servers, env or folders. It reads across all of them through its fleet tools, which take a `workstream` filter and name each result's workstream.
+With `isolateGlobalServers: true`, a `closed` workstream gives the conductor its sessions' status and metadata only (in `fleet_list`), never their text: `fleet_find` and `fleet_recall` never return them (not even that something matched), `fleet_summary` gives status only, `machine_map` leaves out their branches, and a worker of a closed workstream reports that it finished, not what it found. Episodes from before workstreams are judged by their session's home (as recorded; for one that no longer runs, its stored binding, else its folder's record, else its folder now). A workstream deleted from the config has no policy left: its sessions' text is no longer withheld. Closing a workstream doesn't reach back: what the conductor was told while it was open (its own transcript, a task's digest on `fleet_tasks`) stays.
+
+The conductor acts only through sessions homed where the work belongs. `fleet_spawn` takes `workstream` (else the folder's; a folder with none, or one whose repository's remote now matches another workstream than before, must be given one) and follows the same rules as a create: past a workstream's exclusive folder, or into an `ask` workstream's folder, the spawn's approval card says so (naming the workstream it passes), and only the session owner's own approval of that card confirms it: the approval adds a one-time token to that very call, which its handler accepts only if the spawn would still be judged exactly as the card showed, at the config revision it was shown at. A closed workstream's folder never takes another's worker, and a closed workstream's worker works only in its own folders. Every send-class card (web, Telegram, the TUI, `codeoid approve`, the terminal) names the workstream the action runs in.
+
 ### Moving an existing setup
 
 `codeoid workstream import [--root <dir>]` proposes workstreams from your repositories' remotes and lists Claude's global MCP servers to assign. It writes nothing; isolation stays off until you turn it on.

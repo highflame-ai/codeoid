@@ -167,6 +167,12 @@ export interface EffectiveSandbox {
   agentDirs: string[];
 }
 
+/** A session's workstream fence as the sandbox takes it: the roots shown read-only, the folders hidden. */
+export interface WorkstreamDirs {
+  roots: string[];
+  hidden: string[];
+}
+
 /** The setting a session ends up with: its own fields over the config's. */
 export function effectiveSetting(config: SandboxConfig, setting: SessionSandboxSetting | undefined): EffectiveSandbox {
   const choice = setting?.provider ?? config.provider;
@@ -596,6 +602,31 @@ export class SessionSandbox {
   readonly #onWarning: ((text: string) => void) | undefined;
   readonly #onWorktreeEntries: ((common: string, findings: WorktreeEntryFinding[]) => void) | undefined;
   readonly #name: () => string;
+  readonly #workstreamDirs: (() => WorkstreamDirs | undefined) | undefined;
+  /** The fence the last resolution was made with, to see when it changed. */
+  #workstreamKeyApplied = "";
+
+  /** The fence now, with what would hide the workspace or an added dir left out (those are the session's own). */
+  #workstreamNow(): WorkstreamDirs | undefined {
+    const wd = this.#workstreamDirs?.();
+    if (!wd) return undefined;
+    const workspace = this.#workspace();
+    const holds = (h: string, p: string) => h === "/" || p === h || p.startsWith(`${h}/`);
+    // An added dir doesn't un-hide one: one inside a hidden folder is dropped (policy.ts), one holding it keeps it hidden.
+    const hidden = wd.hidden.filter((h) => !holds(h, workspace) && !holds(h, this.#workdir));
+    return { roots: wd.roots, hidden };
+  }
+
+  #workstreamKey(): string {
+    const wd = this.#workstreamNow();
+    return wd ? JSON.stringify(wd) : "";
+  }
+
+  /** The setting with the fence's folders as its project roots, when it names none of its own. */
+  #withWorkstream(setting: SessionSandboxSetting | undefined, wd: WorkstreamDirs | undefined = this.#workstreamNow()): SessionSandboxSetting | undefined {
+    if (!wd || setting?.projectRoots !== undefined) return setting;
+    return { ...(setting ?? {}), projectRoots: wd.roots };
+  }
 
   constructor(opts: {
     sessionId: string;
@@ -609,7 +640,15 @@ export class SessionSandbox {
     onWarning?: (text: string) => void;
     /** What a look at the repository's worktree entries found (checkWorktreeEntries): said on the session and audited. */
     onWorktreeEntries?: (common: string, findings: WorktreeEntryFinding[]) => void;
+    /**
+     * The session's workstream fence (workstreams §7.3), read live: its
+     * readable folders replace the default project roots (never a root the
+     * session's own setting names), and other workstreams' are hidden.
+     * Undefined result = no fence.
+     */
+    workstreamDirs?: () => WorkstreamDirs | undefined;
   }) {
+    this.#workstreamDirs = opts.workstreamDirs;
     this.#onWarning = opts.onWarning;
     this.#onWorktreeEntries = opts.onWorktreeEntries;
     this.#sessionId = opts.sessionId;
@@ -637,7 +676,7 @@ export class SessionSandbox {
 
   /** What `setting` means with the config filled in. */
   effective(setting: SessionSandboxSetting | undefined = this.#setting): EffectiveSandbox {
-    return effectiveSetting(this.config, setting);
+    return effectiveSetting(this.config, this.#withWorkstream(setting));
   }
 
   /** The last resolution, or null before the first. */
@@ -795,7 +834,10 @@ export class SessionSandbox {
    * rebuilt mid-work would end it; a process backend is restarted).
    */
   get dirsPending(): boolean {
-    return this.#dirsStale || this.#pinsBroken;
+    // The fence changed since the last resolution (a reference, a move, a folder made): none before the
+    // first, which is no change of anything (it resolves with the fence as it is then).
+    const fenceChanged = this.#workstreamDirs !== undefined && this.#info !== null && this.#workstreamKey() !== this.#workstreamKeyApplied;
+    return this.#dirsStale || this.#pinsBroken || fenceChanged;
   }
 
   /** The added directories the running sandbox has (SandboxSpec.addedDirs as resolved): what host-side file tools are held to. */
@@ -854,13 +896,15 @@ export class SessionSandbox {
 
   async #refreshNow(backendId: string): Promise<SessionSandboxInfo> {
     let r: Awaited<ReturnType<typeof resolveSandbox>>;
+    let wsKey = "";
     for (;;) {
       const generation = this.#generation;
       this.#pinWorkspace();
+      wsKey = this.#workstreamKey();
       r = await resolveSandbox({
         registry: this.#registry,
         config: this.config,
-        setting: this.#setting,
+        setting: this.#withWorkstream(this.#setting),
         backendId,
         workspace: this.#workdir,
         top: this.#workspace(),
@@ -880,6 +924,7 @@ export class SessionSandbox {
     this.#resolvedFor = backendId;
     this.#stale = false;
     this.#dirsStale = false;
+    this.#workstreamKeyApplied = wsKey;
     const dirs = { roots: [...(r.info.projectRoots ?? [])], added: [...(r.info.addedDirs ?? [])], ...(r.rootScan ? { scan: r.rootScan } : {}) };
     this.#dirs = dirs;
     this.#droppedDirs = r.droppedDirs ?? [];
@@ -1075,6 +1120,8 @@ export class SessionSandbox {
       for (const d of dirs.added) this.#checkEntriesOf(d);
     }
     const agent = new Set(this.effective().agentDirs);
+    // Other workstreams' folders, as at the last resolution (a change since is a dirs change, applied between turns).
+    const hiddenForWorkstream = this.#workstreamKeyApplied ? (JSON.parse(this.#workstreamKeyApplied) as WorkstreamDirs).hidden : [];
     const build = () => buildSandboxSpec({
       backendReadable: readable,
       sessionId: this.#sessionId,
@@ -1088,6 +1135,7 @@ export class SessionSandbox {
       dockerSocket,
       hideLocalServices,
       projectRoots: dirs.roots,
+      ...(hiddenForWorkstream.length > 0 ? { extraHidden: hiddenForWorkstream } : {}),
       addedDirs: dirs.added.map((dir) => {
         const guard = this.#guardFor(dir);
         return { dir, ...(agent.has(dir) ? { agent: true } : {}), ...(folder && guard ? { ownWorktreeEntries: guard.ownEntries() } : {}) };

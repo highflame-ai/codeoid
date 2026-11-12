@@ -32,6 +32,15 @@ const base = { id: idField };
 /** A workstream id, bounded only: a malformed one must PARSE so the daemon answers `workstream_unknown`. */
 const workstreamIdField = z.string().min(1).max(64);
 
+/** A reference asked for (§7.2): absolute folders only, bounded. */
+export const workstreamReferenceInputSchema = z
+  .object({
+    workstream: workstreamIdField,
+    paths: z.array(z.string().min(1).max(4096)).max(64).optional(),
+  })
+  .strict();
+
+
 // ── Collaboration ─────────────────────────────────────────────────────────────
 
 /**
@@ -172,6 +181,7 @@ export const sessionCreateSchema = z.object({
    */
   workstream: workstreamIdField.optional(),
   override: z.object({ token: z.string().min(1).max(128) }).strict().optional(),
+  references: z.array(workstreamReferenceInputSchema).max(32).optional(),
 });
 
 export const sessionListSchema = z.object({ ...base, type: z.literal("session.list") });
@@ -286,6 +296,28 @@ export const sessionSetSandboxSchema = z.object({
   type: z.literal("session.set_sandbox"),
   sessionId: sessionIdField,
   sandbox: sessionSandboxSettingSchema,
+});
+
+export const sessionAddReferenceSchema = z.object({
+  ...base,
+  type: z.literal("session.add_reference"),
+  sessionId: sessionIdField,
+  workstream: workstreamIdField,
+  paths: z.array(z.string().min(1).max(4096)).max(64).optional(),
+});
+
+export const sessionRemoveReferenceSchema = z.object({
+  ...base,
+  type: z.literal("session.remove_reference"),
+  sessionId: sessionIdField,
+  workstream: workstreamIdField,
+});
+
+export const sessionSetWorkstreamSchema = z.object({
+  ...base,
+  type: z.literal("session.set_workstream"),
+  sessionId: sessionIdField,
+  workstream: workstreamIdField,
 });
 
 export const sessionSandboxDirSchema = z.object({
@@ -1324,6 +1356,9 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   sessionSetModeSchema,
   sessionSetSandboxSchema,
   sessionSandboxDirSchema,
+  sessionAddReferenceSchema,
+  sessionRemoveReferenceSchema,
+  sessionSetWorkstreamSchema,
   sandboxProvidersSchema,
   sessionPinSchema,
   sessionUnpinSchema,

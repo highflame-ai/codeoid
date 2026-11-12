@@ -109,8 +109,10 @@ const FleetRail: Component = () => {
     return fleetEconomics(b.conductor ? [b.conductor, ...b.workers] : b.workers);
   });
 
+  // Docked beside the chat from a tablet up; on a phone it would leave the chat (and the approval card
+  // naming what a dispatch does) a sliver, so there the chat has the width and the fleet is in fleet_list.
   return (
-    <aside class="flex w-72 shrink-0 flex-col overflow-y-auto border-l border-border bg-bg-elev/40">
+    <aside class="hidden w-72 shrink-0 flex-col overflow-y-auto border-l border-border bg-bg-elev/40 md:flex">
       <header class="sticky top-0 z-10 space-y-1 border-b border-border bg-bg-elev/95 px-3 py-2 backdrop-blur">
         <div class="flex items-center gap-2">
           <h3 class="text-[11px] font-semibold uppercase tracking-wider text-fg-muted">Fleet</h3>

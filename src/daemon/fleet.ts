@@ -44,6 +44,8 @@ export interface FleetSessionView {
   model?: string;
   attachedClients: number;
   createdAt: string;
+  /** Its home workstream (workstreams §10); absent with none configured, or no home. */
+  workstream?: string;
 }
 
 /** A dispatch task as the conductor sees it on the fleet_tasks board. */
@@ -74,7 +76,18 @@ export interface FleetDispatchDeps {
     prompt: string;
     provider?: string;
     model?: string;
+    workstream?: string;
+    workstreamOverride?: boolean;
+    workstreamRevision?: string;
   }): string;
+  /**
+   * A spawn's home (workstreams §10, §5): the workstream asked for, else the
+   * folder's — checked before the task is queued, so a conflict reaches the
+   * conductor while it can still choose. `override`: past the folder's
+   * exclusive claim, which the spawn's approval card said (G3). Absent = no
+   * workstreams on this daemon.
+   */
+  checkWorkstream?(workdir: string, workstream?: string, confirmation?: string): { ok: true; workstream?: string; override?: boolean; revision?: string } | { ok: false; error: string };
   /** Interrupt a running session immediately (post-approval). */
   interrupt(sessionId: string): Promise<void>;
   /** Normalize + validate a spawn workdir; null when unusable. */
@@ -122,6 +135,14 @@ export interface FleetDeps {
   conductorSessionId(): string;
   /** Send-class dispatch (P4). Absent = read-only conductor. */
   dispatch?: FleetDispatchDeps;
+  /**
+   * Whether text is withheld from the conductor (workstreams §10: a
+   * `closed` workstream gives status, never text): judged by the episode's
+   * workstream, else its session's (an untagged episode, from before
+   * workstreams), else withheld while any workstream is closed. Absent =
+   * nothing withheld (no workstreams, or isolation off).
+   */
+  textWithheld?(ref: { workstream?: string; sessionId?: string }): boolean;
 }
 
 /**
@@ -189,8 +210,12 @@ function ago(iso: string | number): string {
 function sessionLine(s: FleetSessionView): string {
   const marker = s.role === "conductor" ? " [conductor — you]" : "";
   const model = s.model ? ` model=${s.model}` : "";
-  return `- ${s.name} (${s.id.slice(0, 8)})${marker} — ${s.status}, ${s.attachedClients} client(s), provider=${s.providerId}${model}, workdir=${s.workdir}, created ${ago(s.createdAt)}`;
+  const ws = s.workstream ? `, workstream=${s.workstream}` : "";
+  return `- ${s.name} (${s.id.slice(0, 8)})${marker} — ${s.status}, ${s.attachedClients} client(s), provider=${s.providerId}${model}${ws}, workdir=${s.workdir}, created ${ago(s.createdAt)}`;
 }
+
+/** What the conductor is told in place of a closed workstream's text. */
+const WITHHELD = (ws: string | undefined) => `(workstream ${ws ?? "?"} is closed: its text isn't shared — status only)`;
 
 /** Resolve a user-supplied session reference (name or id/prefix) to a view. */
 function resolveSession(
@@ -211,8 +236,8 @@ function resolveSession(
  */
 export function createFleetHandlers(deps: FleetDeps) {
   return {
-    async fleet_list(): Promise<string> {
-      const sessions = deps.listSessions();
+    async fleet_list(args: { workstream?: string } = {}): Promise<string> {
+      const sessions = deps.listSessions().filter((s) => !args.workstream || s.workstream === args.workstream);
       deps.audit("fleet.list", `sessions=${sessions.length}`);
       if (sessions.length === 0) return "No sessions in the fleet.";
       // Group by workdir so the fleet reads as a machine map, not a flat list.
@@ -229,13 +254,14 @@ export function createFleetHandlers(deps: FleetDeps) {
       return `${sessions.length} session(s) across ${byWorkdir.size} workspace(s):\n\n${blocks.join("\n\n")}`;
     },
 
-    async fleet_find(args: { query: string; limit?: number }): Promise<string> {
+    async fleet_find(args: { query: string; limit?: number; workstream?: string }): Promise<string> {
       deps.audit("fleet.find", `query=${args.query.slice(0, 200)}`);
       if (!deps.memory) {
         return "Memory is disabled on this daemon — fleet_find needs the memory engine. Use fleet_list instead.";
       }
       const sessions = deps.listSessions();
       const sessionNames = new Map(sessions.map((s) => [s.id, s.name]));
+      const sessionWorkstreams = new Map(sessions.map((s) => [s.id, s.workstream]));
       const conductorId = deps.conductorSessionId();
       const hits = (
         await deps.memory.searchSessions({
@@ -245,17 +271,23 @@ export function createFleetHandlers(deps: FleetDeps) {
           limit: Math.min(args.limit ?? 5, MAX_LIMIT) + 1,
           sessionNames,
         })
-      ).filter((h) => h.sessionId !== conductorId);
+      )
+        .filter((h) => h.sessionId !== conductorId)
+        .map((h) => ({ ...h, workstream: sessionWorkstreams.get(h.sessionId) ?? h.snippets.find((sn) => sn.workstreamId)?.workstreamId }))
+        .filter((h) => !args.workstream || h.workstream === args.workstream)
+        // A closed workstream's sessions never come back from a query: that they matched is text too (§10).
+        .filter((h) => !deps.textWithheld?.({ sessionId: h.sessionId, ...(h.workstream ? { workstream: h.workstream } : {}) }) && !h.snippets.some((sn) => deps.textWithheld?.({ sessionId: h.sessionId, ...(sn.workstreamId ? { workstream: sn.workstreamId } : {}) })));
       if (hits.length === 0) {
         return `No session matched "${args.query}". It may predate memory, or try different terms.`;
       }
       const lines = hits.slice(0, Math.min(args.limit ?? 5, MAX_LIMIT)).map((h, i) => {
         const name = sessionNames.get(h.sessionId) ?? "(no longer running)";
+        // A closed workstream's snippets are its text: never shown (§10).
         const evidence = h.snippets
           .slice(0, 2)
           .map((sn) => `    · [${sn.kind}] ${sn.summary}`)
           .join("\n");
-        return `${i + 1}. ${name} (${h.sessionId.slice(0, 8)}) — ${h.matchCount} match(es), last activity ${ago(h.lastMatchAt)}\n${evidence}`;
+        return `${i + 1}. ${name} (${h.sessionId.slice(0, 8)})${h.workstream ? ` [${h.workstream}]` : ""} — ${h.matchCount} match(es), last activity ${ago(h.lastMatchAt)}\n${evidence}`;
       });
       return `Top session(s) for "${args.query}":\n${lines.join("\n")}`;
     },
@@ -268,12 +300,13 @@ export function createFleetHandlers(deps: FleetDeps) {
         return `No session matches "${args.session}". Use fleet_list to see the fleet.`;
       }
       const head = sessionLine(target);
+      if (deps.textWithheld?.({ sessionId: target.id, ...(target.workstream ? { workstream: target.workstream } : {}) })) return `${head}\n${WITHHELD(target.workstream)}`;
       if (!deps.memory) return `${head}\n(no memory engine — activity digest unavailable)`;
       // Compressed digest: the session's recent episode SUMMARIES (one line
       // each), never raw scrollback/transcript — the never-OOC guarantee.
       const episodes = deps.memory
         .timeline(target.workspaceId, 60)
-        .filter((e) => e.sessionId === target.id)
+        .filter((e) => e.sessionId === target.id && !deps.textWithheld?.({ sessionId: e.sessionId, ...(e.workstreamId ? { workstream: e.workstreamId } : {}) }))
         .slice(0, 12);
       if (episodes.length === 0) return `${head}\n(no recorded activity yet)`;
       const lines = episodes.map(
@@ -282,24 +315,28 @@ export function createFleetHandlers(deps: FleetDeps) {
       return `${head}\n\nRecent activity (${episodes.length} episode(s), newest first):\n${lines.join("\n")}`;
     },
 
-    async fleet_recall(args: { query: string; limit?: number }): Promise<string> {
+    async fleet_recall(args: { query: string; limit?: number; workstream?: string }): Promise<string> {
       deps.audit("fleet.recall", `query=${args.query.slice(0, 200)}`);
       if (!deps.memory) {
         return "Memory is disabled on this daemon — fleet_recall needs the memory engine.";
       }
       const sessionNames = new Map(deps.listSessions().map((s) => [s.id, s.name]));
-      const hits = await deps.memory.recallGlobal({
-        query: args.query,
-        tenant: deps.tenant,
-        limit: Math.min(args.limit ?? 6, MAX_LIMIT),
-      });
+      const limit = Math.min(args.limit ?? 6, MAX_LIMIT);
+      // Asked for more than shown: a closed workstream's episodes are dropped, never shown (§10).
+      const all = await deps.memory.recallGlobal({ query: args.query, tenant: deps.tenant, limit: limit * 3 });
+      const inScope = all.filter((h) => !args.workstream || h.episode.workstreamId === args.workstream);
+      // Dropped before anything is counted or said: even "N more were withheld" would answer the query.
+      const hits = inScope
+        .filter((h) => !deps.textWithheld?.({ sessionId: h.episode.sessionId, ...(h.episode.workstreamId ? { workstream: h.episode.workstreamId } : {}) }))
+        .slice(0, limit);
+      const note = "";
       if (hits.length === 0) return `Nothing recalled for "${args.query}".`;
       const lines = hits.map((h) => {
         const e = h.episode;
         const name = sessionNames.get(e.sessionId) ?? e.sessionId.slice(0, 8);
-        return `- [${name}] ${e.kind}${e.toolName ? `/${e.toolName}` : ""}: ${e.summary}`;
+        return `- [${name}${e.workstreamId ? ` · ${e.workstreamId}` : ""}] ${e.kind}${e.toolName ? `/${e.toolName}` : ""}: ${e.summary}`;
       });
-      return `Recalled ${hits.length} episode(s) across the fleet:\n${lines.join("\n")}`;
+      return `Recalled ${hits.length} episode(s) across the fleet:\n${lines.join("\n")}${note}`;
     },
 
     async machine_map(): Promise<string> {
@@ -314,7 +351,9 @@ export function createFleetHandlers(deps: FleetDeps) {
       }
       const blocks = await Promise.all(
         [...byWorkdir.entries()].map(async ([workdir, group]) => {
-          const git = await probeGit(workdir);
+          // A closed workstream's branches are its text too (feat/acme-acquisition).
+          const closed = group.some((s) => deps.textWithheld?.({ sessionId: s.id, ...(s.workstream ? { workstream: s.workstream } : {}) }));
+          const git = closed ? "(a closed workstream's folder)" : await probeGit(workdir);
           const members = group
             .map((s) => `${s.name} (${s.status}${s.role === "conductor" ? ", conductor" : ""})`)
             .join(", ");
@@ -350,7 +389,7 @@ export function createFleetHandlers(deps: FleetDeps) {
         targetSession: target.id,
         prompt: args.message,
       });
-      return `Queued task ${taskId.slice(0, 8)}: send to ${target.name} (${target.workdir}). Delivery happens on the next dispatcher tick — track it with fleet_tasks.`;
+      return `Queued task ${taskId.slice(0, 8)}: send to ${target.name} (${target.workdir}${target.workstream ? `, workstream ${target.workstream}` : ""}). Delivery happens on the next dispatcher tick — track it with fleet_tasks.`;
     },
 
     /**
@@ -409,6 +448,9 @@ export function createFleetHandlers(deps: FleetDeps) {
       shape?: "ship" | "scout";
       provider?: string;
       model?: string;
+      workstream?: string;
+      /** Set by codeoid on an approved call whose card confirmed something (workstreams §10); never the model's. */
+      confirmation?: string;
     }): Promise<string> {
       if (!deps.dispatch) return "Dispatch is disabled on this daemon.";
       const shape = args.shape ?? "scout";
@@ -425,6 +467,11 @@ export function createFleetHandlers(deps: FleetDeps) {
         return `Workdir not usable: ${args.workdir} (missing, protected, or outside the allowed root).`;
       }
       if (!backend.ok) return backend.error;
+      // Its home (§10): the workstream named, else the folder's — a conflict is the conductor's to resolve now.
+      const home: { ok: true; workstream?: string; override?: boolean; revision?: string } | { ok: false; error: string } = deps.dispatch.checkWorkstream
+        ? deps.dispatch.checkWorkstream(workdir, args.workstream, args.confirmation)
+        : { ok: true };
+      if (!home.ok) return home.error;
       const taskId = deps.dispatch.enqueue({
         kind: "spawn",
         shape,
@@ -432,11 +479,16 @@ export function createFleetHandlers(deps: FleetDeps) {
         prompt: args.task,
         provider: backend.provider,
         model: backend.model,
+        // Stored only when named: the folder's own is decided again at claim, as for any spawn (its
+        // remote may have been changed meanwhile: SessionManager #workstreamForFolder).
+        ...(args.workstream && home.workstream ? { workstream: home.workstream } : {}),
+        ...(home.override ? { workstreamOverride: true, ...(home.revision ? { workstreamRevision: home.revision } : {}) } : {}),
       });
       const on = backend.provider
         ? ` on ${backend.provider}${backend.model ? `/${backend.model}` : ""}`
         : "";
-      return `Queued task ${taskId.slice(0, 8)}: spawn ${shape} worker${on} in ${workdir}. You'll receive a <fleet_events> digest when it finishes — track it with fleet_tasks.`;
+      const ws = home.workstream ? `, homed in workstream ${home.workstream}${home.override ? " (past the folder's own, as approved)" : ""}` : "";
+      return `Queued task ${taskId.slice(0, 8)}: spawn ${shape} worker${on} in ${workdir}${ws}. You'll receive a <fleet_events> digest when it finishes — track it with fleet_tasks.`;
     },
 
     async fleet_interrupt(args: { session: string }): Promise<string> {
@@ -568,9 +620,9 @@ export function buildFleetMcpServer(
   const registered = pick([
       tool(
         "fleet_list",
-        "List every session in the fleet, grouped by workspace — names, status, provider, attached clients. Your view of what exists right now.",
-        {},
-        async () => text(await handlers.fleet_list()),
+        "List every session in the fleet, grouped by workspace — names, status, provider, workstream, attached clients. Your view of what exists right now.",
+        { workstream: z.string().max(64).optional().describe("Only this workstream's sessions (each result names its workstream)"), },
+        async ({ workstream }) => text(await handlers.fleet_list({ ...(workstream ? { workstream } : {}) })),
       ),
       tool(
         "fleet_find",
@@ -578,8 +630,9 @@ export function buildFleetMcpServer(
         {
           query: z.string().describe("Natural-language description of the work/session to find"),
           limit: z.number().int().min(1).max(MAX_LIMIT).optional().describe("Max sessions to return (default 5)"),
+          workstream: z.string().max(64).optional().describe("Only this workstream's sessions (each result names its workstream)"),
         },
-        async ({ query, limit }) => text(await handlers.fleet_find({ query, limit })),
+        async ({ query, limit, workstream }) => text(await handlers.fleet_find({ query, limit, ...(workstream ? { workstream } : {}) })),
       ),
       tool(
         "fleet_summary",
@@ -595,8 +648,9 @@ export function buildFleetMcpServer(
         {
           query: z.string().describe("What to recall"),
           limit: z.number().int().min(1).max(MAX_LIMIT).optional().describe("Max episodes (default 6)"),
+          workstream: z.string().max(64).optional().describe("Only this workstream's episodes. A closed workstream's are never returned"),
         },
-        async ({ query, limit }) => text(await handlers.fleet_recall({ query, limit })),
+        async ({ query, limit, workstream }) => text(await handlers.fleet_recall({ query, limit, ...(workstream ? { workstream } : {}) })),
       ),
       tool(
         "machine_map",
@@ -654,9 +708,15 @@ export function buildFleetMcpServer(
           shape: z.enum(["ship", "scout"]).optional().describe("scout = investigate/report (default, read-only identity); ship = deliver a change"),
           provider: z.string().optional().describe("Backend the worker runs on (e.g. claude, gemini, openai, codex, pi). Omit for the daemon default. An unregistered id is rejected before the task is queued."),
           model: z.string().optional().describe("Model for the worker, valid for the chosen provider. Omit for that provider's default."),
+          workstream: z
+            .string()
+            .max(64)
+            .optional()
+            .describe("The workstream the worker is homed in: it gets that workstream's servers, credentials and memory only. Omit for the folder's own; required where the folder has none. A conflict with the folder's exclusive workstream is shown on the approval card."),
+          confirmation: z.string().max(64).optional().describe("Set by codeoid when the owner approves; never set it yourself."),
         },
-        async ({ workdir, task, shape, provider, model }) =>
-          text(await handlers.fleet_spawn({ workdir, task, shape, provider, model })),
+        async ({ workdir, task, shape, provider, model, workstream, confirmation }) =>
+          text(await handlers.fleet_spawn({ workdir, task, shape, provider, model, ...(workstream ? { workstream } : {}), ...(confirmation ? { confirmation } : {}) })),
       ),
       tool(
         "fleet_interrupt",

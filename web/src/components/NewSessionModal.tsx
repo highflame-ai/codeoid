@@ -59,7 +59,7 @@ function sandboxDefaultLabel(d: SandboxProvidersData | null): string {
 import DirectoryPicker from "./files/DirectoryPicker";
 import { providerIds, providerLabel } from "../state/providers";
 import { accountDetail, backendAccounts, DEFAULT_ACCOUNT, fetchAccounts } from "../state/accounts";
-import { fetchWorkstreams, homeChoices, resolveWorkstream } from "../state/workstreams";
+import { fetchWorkstreams, homeChoices, resolveWorkstream, workstreamsState } from "../state/workstreams";
 import type { WorkstreamResolution } from "../protocol/types";
 
 /** The modal serves three flows from one dialog: a plain session, a governed
@@ -167,6 +167,8 @@ const NewSessionModal: Component = () => {
   // Home workstream (docs/workstreams-design.md): "" = the folder's (what
   // `workstream.resolve` says), else an explicit choice.
   const [workstream, setWorkstream] = createSignal("");
+  // Other workstreams the session may read (§7.2): their folders read-only, and their memory.
+  const [references, setReferences] = createSignal<string[]>([]);
   const [resolution, setResolution] = createSignal<WorkstreamResolution | null>(null);
   // The folder couldn't be checked (a scope, an unreadable folder): said as such, never as "none matches".
   const [resolveFailed, setResolveFailed] = createSignal(false);
@@ -495,6 +497,7 @@ const NewSessionModal: Component = () => {
     setProviderId("");
     setAccount("");
     setWorkstream("");
+    setReferences([]);
     setResolution(null);
     setOverrideOffer(null);
     setPackId("");
@@ -506,6 +509,13 @@ const NewSessionModal: Component = () => {
     setRoles(defaultRoles());
     setWarnings([]);
   }
+
+  /** The home the session would get: the choice, else what the folder resolves to. */
+  const homeNow = () => workstream() || resolution()?.home || "";
+  /** Workstreams it could read: not closed, not its home. Only under isolation, where a reference means something. */
+  const readable = () => (workstreamsState().isolateGlobalServers ? homeChoices().filter((w) => w.share !== "closed" && w.id !== homeNow()) : []);
+  /** What is sent: the ticked ones still offered (a home changed since drops its own). */
+  const readsSent = () => references().filter((r) => readable().some((w) => w.id === r));
 
   /** A workstream as the picker names it. */
   function nameOf(id: string): string {
@@ -609,6 +619,7 @@ const NewSessionModal: Component = () => {
           ...(packId() ? { pack: packId() } : {}),
           ...(workstream() ? { workstream: workstream() } : {}),
           ...(overrideToken && workstream() ? { override: { token: overrideToken } } : {}),
+          ...(readsSent().length > 0 ? { references: readsSent().map((w) => ({ workstream: w })) } : {}),
           collaboration: {
             goal: goal().trim(),
             roles: roles().map((r) => ({
@@ -683,6 +694,7 @@ const NewSessionModal: Component = () => {
         ...(packRole() ? { packRole: packRole() } : {}),
         ...(workstream() ? { workstream: workstream() } : {}),
         ...(overrideToken && workstream() ? { override: { token: overrideToken } } : {}),
+        ...(readsSent().length > 0 ? { references: readsSent().map((w) => ({ workstream: w })) } : {}),
         ...(sandboxChoice() || sandboxNetwork() || sandboxDocker() || sandboxRoots().trim() || sandboxAdded().trim()
           ? {
               sandbox: {
@@ -1282,6 +1294,31 @@ const NewSessionModal: Component = () => {
                 <For each={homeChoices()}>{(w) => <option value={w.id}>{w.name === w.id ? w.id : `${w.name} (${w.id})`}</option>}</For>
               </select>
             </label>
+          </Show>
+
+          <Show when={mode() !== "pipeline" && readable().length > 0}>
+            <fieldset class="space-y-1.5">
+              <legend class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">Also reads</legend>
+              <div class="flex flex-wrap gap-x-4 gap-y-1">
+                <For each={readable()}>
+                  {(w) => (
+                    <label class="inline-flex items-center gap-1.5 text-[12px] text-fg-muted">
+                      <input
+                        type="checkbox"
+                        checked={references().includes(w.id)}
+                        disabled={busy()}
+                        onChange={(e) => setReferences((r) => (e.currentTarget.checked ? [...r, w.id] : r.filter((x) => x !== w.id)))}
+                      />
+                      <span>
+                        {w.name}
+                        {w.share === "ask" ? <span class="text-fg-faint"> (asks)</span> : null}
+                      </span>
+                    </label>
+                  )}
+                </For>
+              </div>
+              <p class="text-[11px] text-fg-faint">Their folders read-only, and their memory — never their servers or credentials.</p>
+            </fieldset>
           </Show>
 
           <Show when={overrideOffer()}>

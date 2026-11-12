@@ -10,7 +10,7 @@
 
 import { createSignal } from "solid-js";
 
-import { getClient, newRequestId } from "./connection";
+import { getClient, newRequestId, request } from "./connection";
 import type {
   ClientMessage,
   CredentialInfo,
@@ -174,4 +174,26 @@ export async function resolveWorkstream(workdir: string, workstream?: string): P
 /** The workstreams a session can be homed in (no bases). */
 export function homeChoices(): WorkstreamSummary[] {
   return state().workstreams.filter((w) => !w.abstract);
+}
+
+/**
+ * Change what workstreams a session reads, or move it (workstreams §5.3,
+ * §7). Resolves `pending` when an `ask` workstream was asked of the owner on
+ * the session; throws with the daemon's message when refused. The session's
+ * info update follows on its own.
+ */
+export async function changeSessionWorkstream(
+  sessionId: string,
+  change: { kind: "add_reference"; workstream: string; paths?: string[] } | { kind: "remove_reference"; workstream: string } | { kind: "set_workstream"; workstream: string },
+): Promise<{ pending: boolean }> {
+  const base = { id: newRequestId(), sessionId, workstream: change.workstream };
+  const data = (await request(
+    change.kind === "add_reference"
+      ? { type: "session.add_reference", ...base, ...(change.paths?.length ? { paths: change.paths } : {}) }
+      : change.kind === "remove_reference"
+        ? { type: "session.remove_reference", ...base }
+        : { type: "session.set_workstream", ...base },
+  )) as { data?: { pending?: boolean } } | { pending?: boolean } | undefined;
+  const d = data && "data" in data ? data.data : (data as { pending?: boolean } | undefined);
+  return { pending: d?.pending === true };
 }

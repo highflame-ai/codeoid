@@ -254,6 +254,8 @@ codeoid worktree trust [dir] [--off] [--yes]  # trust the setup command of a rep
 codeoid workstream ls | show <id> | match [dir] [--workstream <id>] | import [--root <dir>]  # named lines of work, what a folder resolves to, a proposal from disk (docs/workstreams-design.md)
 codeoid new <n> <d> --workstream <id> [--override]  # a session's home workstream; default: the folder's, else workstreams.default
 codeoid mcp signin <server> --credential <id>        # a named OAuth slot: a second sign-in to one server (a workstream's own)
+codeoid new <n> <d> --ref <workstream>[:<dir>]       # another workstream it may read (its folders read-only, its memory), by that one's share policy
+codeoid workstream ref add|rm <session> <workstream>[:<dir>] | move <session> <workstream>  # references and moves (§5.3, §7)
 ```
 
 `/mcp/control` (off by default, `mcpControl.*`) lets external agents drive
@@ -551,6 +553,25 @@ server's named credential is a REFERENCE on its transport, resolved by
 call against the live grant. Overrides: `OverrideTokens` (G3); the folder
 record is `workstream_folders`. OAuth slots: `mcp_oauth_credentials.credential`
 in the key, `withSlot`/`slotOf` in mcp/oauth.ts.
+W3 (under isolation): the read fence `WorkstreamService.fenceFor` (home's and
+references' folders, every other workstream's as `foreign`; folders from
+`workstreams/folders.ts` and recorded homes), read live by Session through
+`workstreamFence(binding)`: the sandbox's project roots and `extraHidden`
+(`SessionSandbox` `workstreamDirs`), the gate's `workstreams/gate.ts`
+`fenceRefusal` in every mode (and Claude's PreToolUse hook), and recall
+(`MemoryEngine.scopeSession`; `episodes.workstream_id`). References
+(`WorkstreamBinding.references`, `readFrom`) by the read workstream's `share`
+(`referenceVerdict`), moves by `moveVerdict`; `session.add_reference` /
+`remove_reference` / `set_workstream` in `#sessionWorkstreamEdit`,
+`Session.setWorkstream`; the env, grant and fence closures take the binding,
+so a change applies at the next turn.
+W4: the conductor's fleet tools name each result's workstream and take a
+`workstream` filter; `FleetDeps.textWithheld` keeps a `closed` workstream's
+episode text out of fleet_find / fleet_summary / fleet_recall and the dispatch
+digest. `fleet_spawn.workstream` → `checkWorkstream` (`#fleetSpawnHome`) before
+queueing, `dispatch_tasks.workstream` judged again at claim; send-class cards
+carry `targetWorkstream` (`#fleetCardWorkstream`). `workstreams/egress.ts` is
+the egress stub.
 
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
 or an API call. `RoutineService` owns the scheduler and runs; it reaches
