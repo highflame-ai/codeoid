@@ -57,6 +57,7 @@ import { TerminalClient } from "./terminal/client.js";
 import { bedrockFromSettings, formatAccounts, formatClaudeAccounts, parseHeaderFlags, parseSettingFlags } from "./terminal/claude-accounts.js";
 import { formatEndpoints, importPiModels, parseModelFlags, parseTokens } from "./terminal/endpoints.js";
 import type { ClientMessage, DaemonMessage, EffortLevel, SessionInfo, SessionSandboxSetting } from "./protocol/types.js";
+import { sanitizeTerminalOutput } from "./tui/ansi/codes.js";
 import { parseEffort } from "@highflame/codeoid-core";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
 import { cleartextOffHost, controlUrl, MCP_SCOPE_PRESETS, TokenError } from "./terminal/token.js";
@@ -1085,6 +1086,10 @@ program
   .option("--project-root <dir>", "Where its sandboxed commands may read other repositories, read-only, repeatable; replaces sandbox.projectRoots (@parent = the repository's parent, the default).", (v: string, p: string[] = []) => [...p, v], [] as string[])
   .option("--no-project-roots", "No project root: its commands read only the workspace (and the toolchains the sandbox shows)")
   .option(
+    "--workstream <id>",
+    "Home workstream (docs/workstreams-design.md): decides the session's servers, credentials and defaults. Default: the folder's (`codeoid workstream match <dir>`), else the configured default.",
+  )
+  .option(
     "--pack <id>",
     "Activate an installed SDLC pack on the session (inject its constitution, expose its skills/subagents). With --collaborate, the collaboration ADOPTS the pack: role names bind strictly to the pack's declared roles.",
   )
@@ -1125,6 +1130,7 @@ program
         addDir: string[];
         projectRoot: string[];
         projectRoots?: boolean;
+        workstream?: string;
       },
     ) => {
       const config = loadConfig();
@@ -1197,6 +1203,7 @@ program
         packRole: opts.packRole,
         collaboration,
         ...(sandbox ? { sandbox } : {}),
+        ...(opts.workstream ? { workstream: opts.workstream } : {}),
       });
       client.disconnect();
     },
@@ -1602,6 +1609,129 @@ worktreeCmd
     } finally {
       client.disconnect();
     }
+  });
+
+// ── Workstreams (docs/workstreams-design.md) ────────────────────────────────
+
+const workstreamCmd = program
+  .command("workstream")
+  .description("Named lines of work: which folders belong to which, and what their sessions get (docs/workstreams-design.md)");
+
+/** Daemon-supplied text, made safe for the terminal. */
+const clean = (s: string): string => sanitizeTerminalOutput(s);
+
+/** Run one request against the daemon and hand the reply to `show`; exits non-zero on an error reply. */
+async function workstreamRequest<T extends DaemonMessage["type"]>(
+  msg: ClientMessage,
+  want: T,
+  show: (reply: Extract<DaemonMessage, { type: T }>) => void,
+): Promise<void> {
+  const client = new TerminalClient(loadConfig());
+  await client.connect();
+  try {
+    const reply = await client.request(msg);
+    if (reply.type !== want) {
+      console.error(`Error: ${clean(reply.type === "response.error" ? reply.error : `unexpected reply ${reply.type}`)}`);
+      process.exitCode = 1;
+      return;
+    }
+    show(reply as Extract<DaemonMessage, { type: T }>);
+  } finally {
+    client.disconnect();
+  }
+}
+
+workstreamCmd
+  .command("ls")
+  .description("List the configured workstreams")
+  .option("--json", "print the daemon's reply as JSON")
+  .action(async (o: { json?: boolean }) => {
+    await workstreamRequest({ type: "workstream.list", id: randomUUID() }, "workstream.list.result", (r) => {
+      if (o.json) return void console.log(JSON.stringify(r, null, 2));
+      if (r.workstreams.length === 0) {
+        console.log("No workstreams configured. Add a `workstreams` block to config.json (docs/workstreams-design.md §4).");
+        return;
+      }
+      for (const w of r.workstreams) {
+        const tags = [w.abstract ? "base" : w.claim, `share:${w.share}`, ...(r.default === w.id ? ["default"] : [])];
+        const rules = w.match.paths.length + w.match.remotes.length;
+        console.log(
+          `${clean(w.id).padEnd(20)} ${clean(w.name).padEnd(24)} ${tags.join(", ").padEnd(32)} ${rules} rule${rules === 1 ? "" : "s"}, ${w.servers.length} server${w.servers.length === 1 ? "" : "s"}`,
+        );
+      }
+      console.log(`\nServer isolation: ${r.isolateGlobalServers ? "on" : "off — every session still gets every server"} · revision ${r.revision}`);
+    });
+  });
+
+workstreamCmd
+  .command("show <id>")
+  .description("Show one workstream, its bases merged in")
+  .option("--json", "print it as JSON")
+  .action(async (id: string, o: { json?: boolean }) => {
+    await workstreamRequest({ type: "workstream.list", id: randomUUID() }, "workstream.list.result", (r) => {
+      const w = r.workstreams.find((x) => x.id === id);
+      if (!w) {
+        console.error(`No workstream "${id}" — see \`codeoid workstream ls\`.`);
+        process.exitCode = 1;
+        return;
+      }
+      if (o.json) return void console.log(JSON.stringify(w, null, 2));
+      const line = (k: string, v: string): void => console.log(`${k.padEnd(14)} ${clean(v)}`);
+      line("id", w.id);
+      line("name", w.name);
+      if (w.abstract) line("kind", "base (no folders or sessions of its own)");
+      if (w.extends.length > 0) line("extends", w.extends.join(", "));
+      line("claim", w.claim === "exclusive" ? `exclusive${w.allowOverride ? "" : " (no override)"}` : "suggest");
+      line("share", w.share);
+      for (const p of w.match.paths) line("path", p);
+      for (const rr of w.match.remotes) line("remote", rr);
+      for (const s of w.servers) line("server", `${s.server}${s.credential ? ` (credential ${s.credential})` : ""}${s.from !== w.id ? ` — from ${s.from}` : ""}`);
+      for (const [backend, account] of Object.entries(w.accounts)) line("account", `${backend}: ${account}`);
+      for (const [k, v] of Object.entries(w.defaults)) if (v) line("default", `${k}: ${v}`);
+      for (const e of w.env) line("env", e);
+      if (w.git?.name || w.git?.email) line("git", [w.git.name, w.git.email && `<${w.git.email}>`].filter(Boolean).join(" "));
+      for (const d of w.skillDirs) line("skills", d);
+    });
+  });
+
+workstreamCmd
+  .command("match [dir]")
+  .description("Which workstream a folder belongs to, and why — what a new session there would get")
+  .option("--workstream <id>", "check an explicit choice against the folder")
+  .option("--json", "print the resolution as JSON")
+  .action(async (dir: string | undefined, o: { workstream?: string; json?: boolean }) => {
+    const target = dir ? dirFlag(dir) : process.cwd();
+    await workstreamRequest(
+      { type: "workstream.resolve", id: randomUUID(), workdir: target, ...(o.workstream ? { workstream: o.workstream } : {}) },
+      "workstream.resolve.result",
+      (r) => {
+        if (o.json) return void console.log(JSON.stringify(r, null, 2));
+        const res = r.resolution;
+        console.log(`Folder:     ${clean(r.workdir)}`);
+        if (res.home) {
+          const how = res.source === "matched" ? `matched by ${res.matchedBy}` : res.source === "default" ? "the default (no rule matched)" : res.source;
+          console.log(`Workstream: ${clean(res.home)} — ${clean(how)}`);
+        } else if (res.ambiguous) {
+          console.log(`Workstream: none — ${clean(res.ambiguous.join(" and "))} both match. Choose one with --workstream, or make one rule more specific.`);
+        } else {
+          console.log("Workstream: none — no rule matches and no default is set.");
+        }
+        if (res.conflict) {
+          const c = res.conflict;
+          console.log(
+            `\n⚠ This folder belongs to "${clean(c.folder)}" (exclusive). A session here in "${clean(c.chosen)}" would ${
+              c.overridable ? "need a confirmed override" : "be refused: that workstream allows no override"
+            }.`,
+          );
+        }
+        if (res.candidates.length > 0) {
+          console.log("\nMatching rules, best first:");
+          for (const m of res.candidates) {
+            console.log(`  ${clean(m.workstream).padEnd(20)} ${m.kind === "remote" ? `remote ${clean(m.rule)}${m.via === "upstream" ? " (upstream)" : ""}` : clean(m.rule)}  [${m.claim}]`);
+          }
+        }
+      },
+    );
   });
 
 // ── Outward control plane (/mcp/control — docs/mcp-control.md) ─────────────

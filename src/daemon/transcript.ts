@@ -14,7 +14,8 @@
  */
 
 import { closeSync, existsSync, fstatSync, mkdirSync, openSync, read, readFileSync, readSync, statSync } from "node:fs";
-import { appendFile, rename, rm, writeFile } from "node:fs/promises";
+import type { WorkstreamBinding } from "./workstreams/binding.js";
+import { appendFile, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { CanonicalHistoryChange, CanonicalToolCall, CanonicalTurn } from "./providers/canonical.js";
 import type { SessionSandboxSetting, TurnSummary } from "../protocol/types.js";
@@ -233,6 +234,12 @@ export interface TranscriptMeta {
    * the first status transition.
    */
   collaborationRole?: SessionInfo["collaborationRole"];
+  /**
+   * Home workstream (docs/workstreams-design.md G5). Written in BOTH saveMeta
+   * calls, like `collaborationRole`. Validated when read
+   * (`readWorkstreamBinding`): it is read from a file.
+   */
+  workstream?: WorkstreamBinding;
 }
 
 /** Types we persist. Skip ephemeral events like heartbeats. */
@@ -671,13 +678,37 @@ export class TranscriptStore {
    * keyed by sessionId.
    */
   async saveMeta(meta: TranscriptMeta): Promise<void> {
-    const id = meta.sessionId;
+    return this.#enqueueMeta(meta.sessionId, () => this.#writeMetaAtomic(meta));
+  }
+
+  /**
+   * Change only some fields of a session's meta as it is on disk, in the same
+   * write chain as `saveMeta` (so it lands after any write queued before it).
+   * For resume (workstreams G5): recording a home decided at this resume must
+   * not rewrite what the session holds in memory over what the file says.
+   * A meta that can't be read is left as it is (the error is logged by the chain).
+   */
+  async patchMeta(sessionId: string, patch: Partial<Omit<TranscriptMeta, "sessionId">>): Promise<void> {
+    return this.#enqueueMeta(sessionId, async () => {
+      let text: string;
+      try {
+        text = await readFile(this.metaPath(sessionId), "utf-8");
+      } catch (err) {
+        // Gone (the session was destroyed meanwhile): a patch never recreates a meta.
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+        throw err;
+      }
+      await this.#writeMetaAtomic({ ...(JSON.parse(text) as TranscriptMeta), ...patch, sessionId });
+    });
+  }
+
+  #enqueueMeta(id: string, write: () => Promise<void>): Promise<void> {
     const prev = this.#metaWriteChain.get(id) ?? Promise.resolve();
     // Absorb the previous write's failure so one rejected write can't skip
     // every write queued behind it — and LOG failures: *.meta.json is the
     // sole restart-resume discovery mechanism, so silent failures here mean
     // sessions vanish on the next restart with zero diagnostic.
-    const attempt = prev.then(() => this.#writeMetaAtomic(meta));
+    const attempt = prev.then(write);
     // The STORED chain absorbs the rejection (fire-and-forget callers never
     // consume it — a rejected promise in the map is an unhandled-rejection
     // crash under Bun) and owns the exactly-once error log. The RETURNED

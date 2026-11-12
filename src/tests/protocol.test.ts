@@ -462,6 +462,10 @@ describe("DaemonMessage routing", () => {
           return `skill.grant:${msg.allowed}`;
         case "worktree.trust.result":
           return `worktree.trust:${msg.trusted}`;
+        case "workstream.list.result":
+          return `workstream.list:${msg.workstreams.length}`;
+        case "workstream.resolve.result":
+          return `workstream.resolve:${msg.resolution.home ?? "none"}`;
         case "session.turns.result":
           return `turns:${msg.turns.length}`;
         case "session.approvals.result":

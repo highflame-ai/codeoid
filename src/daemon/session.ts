@@ -101,7 +101,8 @@ import {
 } from "./checkpoints.js";
 import { type PinnedDir, PinnedPathError, pinDir, pinRecord } from "./sandbox/pinned.js";
 import { applyRewinds, REWIND_EVENT, type TurnIndexEntry } from "./transcript.js";
-import type { EffortChangeResult, EffortLevel, RewindFiles, RewindIrreversible, TurnSummary } from "../protocol/types.js";
+import type { EffortChangeResult, EffortLevel, RewindFiles, RewindIrreversible, SessionWorkstreamInfo, TurnSummary } from "../protocol/types.js";
+import type { WorkstreamBinding } from "./workstreams/binding.js";
 import { LIMITS } from "../protocol/types.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import type { PendingToolApproval, SessionApproveOutcome, SessionSandboxInfo, SessionSandboxSetting } from "../protocol/types.js";
@@ -552,6 +553,10 @@ export interface SessionCreateOptions {
    * orphan an agent subprocess.
    */
   collaborationRole?: SessionInfo["collaborationRole"];
+  /** Home workstream (docs/workstreams-design.md), as the manager decided it. Absent = none configured. */
+  workstream?: WorkstreamBinding;
+  /** Renders the binding for `SessionInfo` (name, color, orphaned) from the live config. */
+  describeWorkstream?: (binding: WorkstreamBinding | undefined) => SessionWorkstreamInfo | undefined;
   /**
    * Role-scoped goal-blackboard mount for a collaboration child: the endpoint
    * URL plus a bearer token that IS the scope (one goal, this role's read/write
@@ -1060,6 +1065,11 @@ export class Session {
   get worktree(): SessionWorktree | undefined {
     return this.#worktree;
   }
+  /** Home workstream binding (docs/workstreams-design.md G5). */
+  get workstream(): WorkstreamBinding | undefined {
+    return this.#workstream;
+  }
+
   /**
    * Goal + role→backend bindings when this session was created with the
    * Collaborative toggle (set from opts / restored from meta). Readonly: the
@@ -1069,6 +1079,9 @@ export class Session {
   readonly collaboration?: CollaborationConfig;
   /** Which collaboration + role this session serves, when it is a child. */
   readonly collaborationRole?: SessionInfo["collaborationRole"];
+  /** Home workstream (docs/workstreams-design.md G5). Sticks: set at create, or once on resume. */
+  #workstream?: WorkstreamBinding;
+  #describeWorkstream?: (binding: WorkstreamBinding | undefined) => SessionWorkstreamInfo | undefined;
   /** Role-scoped blackboard mount. NOT readonly: the orchestrator's own mount
    *  is scoped to a goal id that IS this session's id, so it can only be
    *  attached after construction (see attachBlackboard). */
@@ -1713,6 +1726,8 @@ export class Session {
     this.#worktree = opts.worktree;
     this.collaboration = opts.collaboration;
     this.collaborationRole = opts.collaborationRole;
+    this.#workstream = opts.workstream;
+    this.#describeWorkstream = opts.describeWorkstream;
     this.#blackboardMcp = opts.blackboardMcp;
     this.#sandboxMcp = opts.sandboxMcp;
     this.#sandboxCheckouts = opts.sandboxCheckouts;
@@ -1946,7 +1961,11 @@ export class Session {
         accountId: opts.auth.accountId,
         projectId: opts.auth.projectId,
       });
-      this.#store.audit(opts.auth.sub, "session.create", this.id, `name=${this.name}${this.#effort ? ` effort=${this.#effort}` : ""}`);
+      // The home is in the one row every creation path writes (import, loops,
+      // routines, dispatch, forks, children): it will decide credentials (W1).
+      const ws = this.#workstream;
+      const wsDetail = ws ? ` workstream=${ws.id ?? "none"} source=${ws.source}${ws.matchedBy ? ` rule=${JSON.stringify(ws.matchedBy)}` : ""}` : "";
+      this.#store.audit(opts.auth.sub, "session.create", this.id, `name=${this.name}${this.#effort ? ` effort=${this.#effort}` : ""}${wsDetail}`);
       if (this.#effort) this.#store.setSessionEffort(this.id, this.#effort);
 
       this.#transcriptStore.saveMeta({
@@ -1968,6 +1987,7 @@ export class Session {
         worktree: this.worktree,
         collaboration: this.collaboration,
         collaborationRole: this.collaborationRole,
+        ...(this.#workstream ? { workstream: this.#workstream } : {}),
         // Fire-and-forget: saveMeta's write chain owns the failure log; an
         // unconsumed rejection here would be an unhandled-rejection crash.
       }).catch(() => {});
@@ -7760,6 +7780,7 @@ export class Session {
       worktree: this.worktree,
       collaboration: this.collaboration,
       collaborationRole: this.collaborationRole,
+      ...(this.#workstream ? { workstream: this.#describeWorkstream?.(this.#workstream) ?? { ...(this.#workstream.id ? { id: this.#workstream.id } : {}), source: this.#workstream.source } } : {}),
       // Ambient pack driving this session (docs/pack-loading.md) — id, or
       // "id (role)" when a capability role is active.
       ...(this.#pack
@@ -12076,6 +12097,8 @@ export class Session {
       // transition — i.e. on every session that had taken a single turn.
       collaboration: this.collaboration,
       collaborationRole: this.collaborationRole,
+      // Both meta writes, for the same reason as the collaboration above.
+      ...(this.#workstream ? { workstream: this.#workstream } : {}),
     }).catch(() => {});
   }
 }

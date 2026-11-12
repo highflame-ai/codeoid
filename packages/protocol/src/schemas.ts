@@ -29,6 +29,8 @@ const pathField = z.string().max(LIMITS.PATH_MAX);
 const nameField = z.string().min(1).max(LIMITS.NAME_MAX);
 
 const base = { id: idField };
+/** A workstream id, bounded only: a malformed one must PARSE so the daemon answers `workstream_unknown`. */
+const workstreamIdField = z.string().min(1).max(64);
 
 // ── Collaboration ─────────────────────────────────────────────────────────────
 
@@ -163,6 +165,12 @@ export const sessionCreateSchema = z.object({
   packRole: z.string().max(64).optional(),
   /** OS sandbox (#448); absent = the daemon's config. */
   sandbox: sessionSandboxSettingSchema.optional(),
+  /**
+   * Home workstream (docs/workstreams-design.md §5). A bounded string, not an
+   * enum of configured ids: the frame must PARSE so the daemon can answer with
+   * `workstream_unknown` rather than an opaque schema rejection.
+   */
+  workstream: workstreamIdField.optional(),
 });
 
 export const sessionListSchema = z.object({ ...base, type: z.literal("session.list") });
@@ -1083,6 +1091,14 @@ export const worktreeTrustSchema = z.object({
     .optional(),
 });
 
+export const workstreamListSchema = z.object({ ...base, type: z.literal("workstream.list") });
+export const workstreamResolveSchema = z.object({
+  ...base,
+  type: z.literal("workstream.resolve"),
+  workdir: pathField.min(1),
+  workstream: workstreamIdField.optional(),
+});
+
 export const skillGrantSchema = z.object({
   ...base,
   type: z.literal("skill.grant"),
@@ -1316,6 +1332,8 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   backendLoginWaitSchema,
   skillGrantSchema,
   worktreeTrustSchema,
+  workstreamListSchema,
+  workstreamResolveSchema,
   sessionTurnsSchema,
   sessionApprovalsSchema,
   claudeAccountsListSchema,

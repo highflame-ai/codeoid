@@ -9,6 +9,8 @@
  */
 
 import { addedDirProblem, type OtherCheckout, PROJECT_ROOT_PARENT, projectRootProblem } from "./sandbox/project-roots.js";
+import { WorkstreamService, type WorkstreamBinding } from "./workstreams/service.js";
+import type { FolderReader } from "./workstreams/folder.js";
 import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
 import { existsSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
@@ -267,6 +269,19 @@ function normalizeWorkdir(input: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * A workdir as the caller wrote it, `~` expanded and made absolute — not
+ * canonicalised: matched alongside the canonical path, so a workstream rule
+ * written through a symlink matches the folder reached through it.
+ */
+function givenPath(input: string): string | undefined {
+  const raw = (input ?? "").trim();
+  if (!raw) return undefined;
+  if (raw === "~") return homedir();
+  if (raw.startsWith("~/")) return resolve(homedir(), raw.slice(2));
+  return resolve(raw);
 }
 
 /** Eager-resume bounds. Resume runs before the daemon listens — so an
@@ -561,6 +576,8 @@ export class SessionManager {
    */
   #modelLimits = new Map<string, number>();
   #config?: CodeoidConfig;
+  /** Workstreams (docs/workstreams-design.md): decides a session's home; the session keeps it. */
+  #workstreams: WorkstreamService;
   /**
    * `config.worktree.setup`, live: `codeoid worktree trust` changes it
    * without a restart (and writes it through to config.json).
@@ -705,6 +722,8 @@ export class SessionManager {
       _testEndpointFetch?: typeof fetch;
       /** The OS sandbox providers (#448, sandbox/registry.ts). Absent = sessions aren't sandboxed. */
       sandboxRegistry?: SandboxRegistry;
+      /** Test-only: how folders are read for workstream matching (a fake home, an ssh config). */
+      _testFolderReader?: FolderReader;
     },
   ) {
     this.#store = store;
@@ -714,6 +733,7 @@ export class SessionManager {
     this.#rateLimiter = rateLimiter ?? new RateLimiter();
     this.#memory = memory;
     this.#config = opts?.config;
+    this.#workstreams = new WorkstreamService(opts?.config?.workstreams, opts?._testFolderReader);
     this.#sandboxRegistry = opts?.sandboxRegistry;
     if (opts?.config?.worktree?.setup) this.#worktreeSetupPolicy = opts.config.worktree.setup;
     this.#compressionRegistry = opts?.compressionRegistry;
@@ -1037,6 +1057,20 @@ export class SessionManager {
     for (const m of allMetas) {
       if (m.collaboration) goalConfigs.set(m.sessionId, m.collaboration);
     }
+    // Every session's home workstream, from EVERY meta (a fork's parent may be
+    // outside the resume window), decided on demand for the sessions resumed:
+    // validated, failing closed (G5). No folder is read here.
+    const resumeHomes = this.#workstreams.forResume(
+      allMetas.map((m) => ({
+        sessionId: m.sessionId,
+        workdir: m.workdir,
+        ...(m.role ? { role: m.role } : {}),
+        stored: (m as { workstream?: unknown }).workstream,
+        ...((m.forkedFrom?.sessionId ?? m.collaborationRole?.parentSessionId)
+          ? { parentId: m.forkedFrom?.sessionId ?? m.collaborationRole?.parentSessionId }
+          : {}),
+      })),
+    );
     const deadline = Date.now() + RESUME_DEADLINE_MS;
     const lazyLoad = this.#config?.session?.lazyLoad ?? true;
     let resumed = 0;
@@ -1064,7 +1098,11 @@ export class SessionManager {
           if (child.orphaned) orphanedChildren++;
           else resumedChildren++;
         }
+        // Home workstream (G5), decided for every meta up front (forks and
+        // children inherit their parent's); persisted once resume succeeded.
+        const resumedWorkstream = resumeHomes(meta.sessionId);
         const session = new Session({
+          ...this.#workstreamOpts(resumedWorkstream.binding),
           name: meta.sessionName,
           // Heal a workdir persisted with a literal `~` or one that has since
           // moved — expand/validate it so the SDK can launch. Falls back to
@@ -1183,6 +1221,12 @@ mcpHub: this.#mcpHub,
         if (loadNow || !lazyLoad || meta.backingFresh) await session.ensureHydrated({ deadlineAt: deadline, atResume: true });
 
         this.#sessions.set(session.id, session);
+        // Only now, once resume succeeded, and only the one field: everything
+        // else in the meta stays exactly as it was on disk (a backend that's
+        // gone keeps its id there, as before workstreams).
+        if (resumedWorkstream.persist && resumedWorkstream.binding) {
+          void this.#transcriptStore.patchMeta(session.id, { workstream: resumedWorkstream.binding }).catch(() => {});
+        }
         // Track a resumed child's mount so teardown revokes it. Without this a
         // restart leaks one still-valid blackboard credential per child on
         // every boot, and destroying the goal would not revoke them.
@@ -1595,6 +1639,10 @@ mcpHub: this.#mcpHub,
         return this.#skillGrant(msg, auth);
       case "worktree.trust":
         return this.#worktreeTrust(msg, auth);
+      case "workstream.list":
+        return this.#workstreamList(msg, auth);
+      case "workstream.resolve":
+        return this.#workstreamResolve(msg, auth);
       case "mcp.oauth.begin":
         return this.#mcpOAuthBegin(msg, auth);
       case "mcp.oauth.complete":
@@ -1917,6 +1965,7 @@ mcpHub: this.#mcpHub,
             const problem = this.#loopWorktreeProblem(init.workdir);
             if (problem) throw new Error(problem);
             const session = new Session({
+              ...this.#workstreamOpts(this.#workstreamForFolder(init.workdir)),
               name: init.name,
               workdir: init.workdir,
               auth,
@@ -2235,6 +2284,29 @@ mcpHub: this.#mcpHub,
       }
     } catch {
       // A missing/old table just means nothing is warm yet.
+    }
+  }
+
+  /** Renders a binding for SessionInfo against the live config. */
+  readonly #describeWorkstream = (binding: WorkstreamBinding | undefined) => this.#workstreams.info(binding);
+
+  /** The workstream options every Session this manager builds gets (docs/workstreams-design.md). */
+  #workstreamOpts(binding: WorkstreamBinding | undefined): { workstream?: WorkstreamBinding; describeWorkstream: (b: WorkstreamBinding | undefined) => ReturnType<WorkstreamService["info"]> } {
+    return { ...(binding ? { workstream: binding } : {}), describeWorkstream: this.#describeWorkstream };
+  }
+
+  /**
+   * The home of a session the daemon starts itself in `workdir` (an import, a
+   * loop attempt, a routine run, a dispatch worker): its folder's, else the
+   * default. Never refused: there is no explicit choice to conflict with.
+   */
+  #workstreamForFolder(workdir: string): WorkstreamBinding | undefined {
+    try {
+      const r = this.#workstreams.forCreate(workdir);
+      return r.ok ? r.binding : undefined;
+    } catch (err) {
+      console.warn(`[codeoid] workstream for ${workdir}: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
     }
   }
 
@@ -3292,6 +3364,48 @@ mcpHub: this.#mcpHub,
     this.#store.setSkillCommandGrant(workspaceIdFromPath(workdir, auth), `Bash(${command})`, msg.allowed);
     this.#store.audit(auth.sub, msg.allowed ? "skill.grant" : "skill.deny", "", `workdir=${workdir} command=${redactCommand(command)}`);
     return { type: "skill.grant.result", requestId: msg.id, workdir, command, allowed: msg.allowed };
+  }
+
+  /** The configured workstreams, bases merged in (docs/workstreams-design.md). Secret values never leave: env is names only. */
+  #workstreamList(msg: Extract<ClientMessage, { type: "workstream.list" }>, auth: AuthContext): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_READ)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: settings:read", code: "forbidden" };
+    }
+    const ws = this.#workstreams;
+    return {
+      type: "workstream.list.result",
+      requestId: msg.id,
+      revision: ws.revision,
+      isolateGlobalServers: ws.isolateGlobalServers,
+      ...(ws.defaultId ? { default: ws.defaultId } : {}),
+      workstreams: ws.summaries(),
+    };
+  }
+
+  /**
+   * What a folder resolves to (and whether an explicit choice conflicts), for
+   * the new-session picker. Gated like a create: it answers the question a
+   * create would, and nothing more (no remote URL, only which rule matched).
+   */
+  #workstreamResolve(msg: Extract<ClientMessage, { type: "workstream.resolve" }>, auth: AuthContext): DaemonMessage {
+    if (!hasScope(auth.scopes as string[], SCOPES.SESSION_CREATE)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: session:create", code: "forbidden" };
+    }
+    const workdir = normalizeWorkdir(msg.workdir);
+    if (!workdir) {
+      return { type: "response.error", requestId: msg.id, error: `Working directory not found: ${msg.workdir}`, code: "invalid_request" };
+    }
+    const problem = msg.workstream !== undefined ? this.#workstreams.choiceProblem(msg.workstream) : undefined;
+    if (problem && msg.workstream !== undefined) {
+      return { type: "response.error", requestId: msg.id, error: problem, code: "invalid_request", detail: { kind: "workstream_unknown", workstream: msg.workstream } };
+    }
+    return {
+      type: "workstream.resolve.result",
+      requestId: msg.id,
+      workdir,
+      revision: this.#workstreams.revision,
+      resolution: this.#workstreams.resolve(workdir, msg.workstream, givenPath(msg.workdir)),
+    };
   }
 
   /**
@@ -4389,6 +4503,41 @@ mcpHub: this.#mcpHub,
       warnings.push(m);
       console.warn(`[codeoid] ${m}`);
     };
+
+    // Home workstream (docs/workstreams-design.md §5): an explicit choice, else
+    // the folder's, else the default. Refused before anything is built.
+    const givenWorkdir = givenPath(msg.workdir);
+    const homing = this.#workstreams.forCreate(workdir, msg.workstream, givenWorkdir);
+    if (homing.ok && msg.workstream !== undefined && auth.delegationDepth > 0) {
+      // A delegated token may confirm the folder's own home, never pick
+      // another: the home will decide credentials (W1), as an account choice
+      // does (which needs settings:write, above).
+      const folderHome = this.#workstreams.resolve(workdir, undefined, givenWorkdir).home;
+      if (folderHome !== msg.workstream) {
+        this.#store.audit(auth.sub, "session.workstream.denied", "", `workstream=${msg.workstream} folder=${folderHome ?? "none"} reason=delegated`);
+        return {
+          type: "response.error",
+          requestId: msg.id,
+          error: `A delegated token can't choose workstream "${msg.workstream}" for this folder (its own is ${folderHome ? `"${folderHome}"` : "none"}).`,
+          code: "forbidden",
+        };
+      }
+    }
+    if (!homing.ok) {
+      return {
+        type: "response.error",
+        requestId: msg.id,
+        error: homing.error,
+        code: "invalid_request",
+        detail:
+          homing.kind === "workstream_unknown"
+            ? { kind: "workstream_unknown", workstream: homing.workstream }
+            : { kind: homing.kind, resolution: homing.resolution },
+      };
+    }
+    for (const w of homing.warnings) warn(w);
+    const createWorkstream = homing.binding;
+
     if (msg.collaboration) {
       let collabConfig = msg.collaboration;
       if (msg.pack) {
@@ -4651,6 +4800,7 @@ mcpHub: this.#mcpHub,
       : undefined;
 
     const session = new Session({
+      ...this.#workstreamOpts(createWorkstream),
       name: msg.name,
       workdir,
       auth,
@@ -5054,6 +5204,7 @@ mcpHub: this.#mcpHub,
           child,
         );
         const childSession = new Session({
+          ...this.#workstreamOpts(this.#workstreams.inherit(parent.workstream)),
           name: childSessionName(parent.name, child),
           workdir: parent.workdir,
           auth,
@@ -5372,6 +5523,34 @@ mcpHub: this.#mcpHub,
       }
       const looped = this.#loopWorktreeRefusal(msg.id, bound);
       if (looped) return looped;
+      // A fork into a folder of its own keeps the parent's home — so that
+      // folder must not be another workstream's exclusive one, exactly as
+      // for a create choosing that home there (W0 audit).
+      if (parent.workstream?.id && this.#workstreams.configured) {
+        // A delegated token may not carry a home into a folder that isn't
+        // that home's — the same rule as choosing one at create.
+        if (auth.delegationDepth > 0) {
+          const folderHome = this.#workstreams.resolve(bound, undefined, givenPath(msg.workdir)).home;
+          if (folderHome !== parent.workstream.id) {
+            return {
+              type: "response.error",
+              requestId: msg.id,
+              error: `A delegated token can't fork a "${parent.workstream.id}" session into a folder whose workstream is ${folderHome ? `"${folderHome}"` : "none"}.`,
+              code: "forbidden",
+            };
+          }
+        }
+        const homing = this.#workstreams.forCreate(bound, parent.workstream.id, givenPath(msg.workdir));
+        if (!homing.ok && homing.kind === "workstream_conflict") {
+          return {
+            type: "response.error",
+            requestId: msg.id,
+            error: `${homing.error} A fork keeps its parent's workstream ("${parent.workstream.id}").`,
+            code: "invalid_request",
+            detail: { kind: "workstream_conflict", resolution: homing.resolution },
+          };
+        }
+      }
       forkWorkdir = bound;
       const branch = await currentBranch(bound);
       if (branch) worktree = { path: bound, branch, createdByCodeoid: false };
@@ -5485,6 +5664,8 @@ mcpHub: this.#mcpHub,
     let fork: Session;
     try {
       fork = new Session({
+        // A fork continues its parent's line of work: same home (G5).
+        ...this.#workstreamOpts(this.#workstreams.inherit(parent.workstream)),
         name: msg.name ?? `${parentInfo.name} (fork)`,
         workdir: forkWorkdir,
         auth,
@@ -5739,6 +5920,7 @@ mcpHub: this.#mcpHub,
     }
 
     const session = new Session({
+      ...this.#workstreamOpts(this.#workstreams.conductorBinding()),
       name: this.#conductorName(),
       workdir,
       role: "conductor",
@@ -6033,6 +6215,7 @@ mcpHub: this.#mcpHub,
     const problem = this.#loopWorktreeProblem(opts.workdir);
     if (problem) throw new Error(problem);
     const session = new Session({
+      ...this.#workstreamOpts(this.#workstreamForFolder(opts.workdir)),
       name: opts.name,
       workdir: opts.workdir,
       providerId: opts.provider,
@@ -7060,6 +7243,8 @@ mcpHub: this.#mcpHub,
         // worktree like any codeoid-made fork; the branch stays, holding only
         // what the run delivered.
         const session = new Session({
+          // The checkout the loop works on, not its worktree (`<repo>-worktrees/…` matches no rule written for the repo).
+          ...this.#workstreamOpts(this.#workstreamForFolder(run.contract.workdir)),
           name: `loop-${run.id.slice(5, 13)}`,
           workdir,
           ...(run.worktreeRoot && run.branch
@@ -7164,6 +7349,8 @@ mcpHub: this.#mcpHub,
           }
         }
         const session = new Session({
+          // The routine's own folder, not the worktree it may run in.
+          ...this.#workstreamOpts(this.#workstreamForFolder(o.workdir)),
           // The conductor's name is reserved for the singleton.
           name: o.name === this.#conductorName() ? `${o.name}-routine` : o.name,
           workdir,
@@ -7454,6 +7641,7 @@ mcpHub: this.#mcpHub,
         }
         const budget = this.#dispatcher.config.workerToolBudget;
         const session = new Session({
+          ...this.#workstreamOpts(this.#workstreamForFolder(workdir)),
           name: `worker-${task.shape}-${task.id.slice(0, 8)}`,
           workdir,
           role: "worker",

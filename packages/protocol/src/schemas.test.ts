@@ -163,6 +163,8 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "mcp.adopt": { type: "mcp.adopt", id: "r93", server: "notion", sessionId: "s1" },
   "skill.grant": { type: "skill.grant", id: "r93", workdir: "/tmp/w", command: "./probe.sh", allowed: true },
   "worktree.trust": { type: "worktree.trust", id: "wt1", dir: "/tmp/repo", recipeHash: "0123456789abcdef0123456789abcdef01234567" },
+  "workstream.list": { type: "workstream.list", id: "ws1" },
+  "workstream.resolve": { type: "workstream.resolve", id: "ws2", workdir: "/tmp/repo", workstream: "acme" },
   "session.turns": { type: "session.turns", id: "r94", sessionId: "s1" },
   "session.approvals": { type: "session.approvals", id: "r94a", sessionId: "s1" },
   "claude.accounts.list": { type: "claude.accounts.list", id: "ca1" },

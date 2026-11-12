@@ -365,6 +365,8 @@ export class TerminalClient {
         if (sandbox) console.log(`  ${"".padEnd(20)} ${sandbox}`);
         const mode = modeSummary(s);
         if (mode) console.log(`  ${"".padEnd(20)} ${mode}`);
+        const ws = workstreamSummary(s.workstream);
+        if (ws) console.log(`  ${"".padEnd(20)} ${sanitizeTerminalOutput(ws)}`);
         const effective = s.effectiveAccount ?? s.effectiveClaudeAccount;
         if (effective) {
           // Which account it bills on its backend, and whether that is its own choice.
@@ -517,6 +519,8 @@ export class TerminalClient {
       collaboration?: CollaborationConfig;
       /** OS sandbox (#448); absent = the daemon's config. */
       sandbox?: SessionSandboxSetting;
+      /** Home workstream (docs/workstreams-design.md); absent = the folder's. */
+      workstream?: string;
     } = {},
   ): Promise<void> {
     const resp = await this.#request({
@@ -536,6 +540,7 @@ export class TerminalClient {
       ...(opts.packRole ? { packRole: opts.packRole } : {}),
       ...(opts.collaboration ? { collaboration: opts.collaboration } : {}),
       ...(opts.sandbox ? { sandbox: opts.sandbox } : {}),
+      ...(opts.workstream ? { workstream: opts.workstream } : {}),
     });
 
     if (resp.type === "response.ok") {
@@ -545,6 +550,8 @@ export class TerminalClient {
       console.log(`Session created: ${data.name} (${data.id})${provider}${profile}`);
       const sandbox = sandboxSummary(data.sandbox);
       if (sandbox) console.log(`  ${sandbox}`);
+      const ws = workstreamSummary(data.workstream);
+      if (ws) console.log(`  ${sanitizeTerminalOutput(ws)}`);
       // Non-fatal binding notes (skipped cross-vendor bindings, unmapped
       // tiers) — the daemon adjusted something the operator should know about.
       for (const w of resp.warnings ?? []) console.log(`  ⚠ ${w}`);
@@ -561,6 +568,8 @@ export class TerminalClient {
       }
     } else {
       this.#printError(resp);
+      // A refused create is a failed command: scripts must be able to tell.
+      process.exitCode = 1;
     }
   }
 
@@ -1563,4 +1572,19 @@ export class TerminalClient {
       console.error(`Error: ${S(resp.error)} (${resp.code})`);
     }
   }
+}
+
+/** One line saying a session's home workstream and how it got it; undefined when it has none to say. */
+export function workstreamSummary(ws: SessionInfo["workstream"]): string | undefined {
+  if (!ws) return undefined;
+  if (!ws.id) return "workstream: none — choose one (`codeoid workstream match <dir>` says why)";
+  const label = ws.name && ws.name !== ws.id ? `${ws.name} (${ws.id})` : ws.id;
+  const how =
+    ws.source === "matched" ? `matched by ${ws.matchedBy ?? "a rule"}`
+    : ws.source === "default" ? "the default"
+    : ws.source === "explicit" ? "chosen"
+    : ws.source === "override" ? "chosen past the folder's own workstream"
+    : ws.source === "migrated" ? `from its folder${ws.matchedBy ? ` (${ws.matchedBy})` : ""}`
+    : ws.source;
+  return `workstream: ${label} — ${how}${ws.orphaned ? " — no longer configured: move it to another workstream" : ""}`;
 }

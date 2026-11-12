@@ -251,6 +251,8 @@ codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  #
 codeoid routine add <name> --loop --prompt … --verify "id: cmd" [--test] [--attempts N] [--attempt-minutes N] [--run-minutes N] [--budget N]  # start a loop (--check = gate, --verify = its acceptance checks)
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 codeoid worktree trust [dir] [--off] [--yes]  # trust the setup command of a repo's .codeoid/setup.yaml, pinned to its blob (docs/CONFIGURATION.md)
+codeoid workstream ls | show <id> | match [dir] [--workstream <id>]  # named lines of work and what a folder resolves to (docs/workstreams-design.md)
+codeoid new <n> <d> --workstream <id>  # a session's home workstream; default: the folder's, else workstreams.default
 ```
 
 `/mcp/control` (off by default, `mcpControl.*`) lets external agents drive
@@ -515,6 +517,25 @@ allow-list (`notLow` in shell-risk.ts); keep it one, never widen it by rules.
 On Claude the PreToolUse hook routes high and not-understood ones to the gate past any allow rule.
 Autonomous mode never waits on a person: the OS sandbox (#448) is its boundary (it doesn't start without one that runs, or the owner's own off). So in autonomous mode a shell command of any level runs (`#riskAsks` is false there; the level goes to the audit, `session.auto_approve … risk=high`), and a write runs where the sandbox lets it land (a host-side file tool beyond its spec is refused there, `#outsideSandbox`). What the sandbox can't be left to hold is refused at once, never asked (`Session#autonomousRefusal`, shared by the gate and the tool_start card; `#refuseAutonomous`: the reason to the agent and on the card, an info line `autonomous.refused`, audit `session.autonomous_refuse kind=…`, no budget spent): `unsandboxed` (`#unsandboxedRequest`), `held_write` (`#heldWrite`), `claude_settings` (`#writesClaudeSettingsOnNamedAccount`), `credential_dir` (a secret-path `ask`, or a shell risk carrying one on a session that isn't sandboxed: `ls ~` runs inside one), `unresolved_path` (`isUnresolvedPathTool`). Credential reads stay refused in every mode. Elicitation tools and fleet send-class dispatch still ask (so they are all an unattended run parks on). When the budget runs out (park) the session reverts to guarded and says so (`#noteAutonomousBudgetSpent`: info line `budget.spent`, `SessionInfo.autonomousBudgetSpent` until a mode is set, `modeSummary` in `codeoid ls`). Guarded and interactive are unchanged. `approvals.askOnUnknown` is inert. Relative paths are judged from the cwd the backend reports (`ToolApprovalFn`'s `shellCwd`: Claude's PreToolUse hook `cwd`, kept for every tool, since the CLI resolves Bash's targets and a Grep/Glob relative `path` from its persisted cwd; null = unknown, asks). Claude's `Monitor` command is a shell call, `PowerShell` never understood. Claude's CLI gets `CDPATH=` and opencode's shells have none, so a bare `cd` goes where the shell reader places it. Codex autonomous asks nothing (#442).
 A command that could read another process's environment (a `/proc/<pid>/environ` however written, what a search of /proc hands on, `ps` unless its options and the line's variables prove it shows none) is refused as a credential read on every backend, failing closed (`refuseEnvironRead`, shell-risk.ts); a word's possible values are its `shape` (parse.ts).
+
+Workstreams (`src/daemon/workstreams/`, docs/workstreams-design.md): a session's
+home workstream is decided once by `WorkstreamService` (`forCreate`: explicit >
+folder match > `workstreams.default`; `forResume`: a stored binding sticks, a
+pre-workstreams session is homed once by its folder, `source: "migrated"`) and
+kept by the Session in `TranscriptMeta.workstream`, written in BOTH meta saves
+and validated when read (`readWorkstreamBinding`). Matching is pure
+(`match.ts`: an exclusive claim outranks a suggestion, then the most specific
+RULE wins, never the match location; a path rule beats a remote rule;
+`upstream`-only matches only suggest); `folder.ts` reads a repository's remotes
+from its git config without running git (non-blocking opens: a planted FIFO
+must not hang the daemon) and gives a folder's two spellings only — as given
+and real — never links found by scanning; spellings that disagree leave no
+home. A stored binding that is malformed fails closed (`source: "none"`), never
+re-matched; the resume pre-pass (`forResume`) lets forks and children inherit,
+and the decided home is written with `TranscriptStore.patchMeta` after resume
+succeeded, touching no other field. Every `new Session` site in SessionManager passes
+`#workstreamOpts(...)`; children and forks inherit, the conductor's is reserved.
+With no workstreams configured no binding exists and nothing changes.
 
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
 or an API call. `RoutineService` owns the scheduler and runs; it reaches
