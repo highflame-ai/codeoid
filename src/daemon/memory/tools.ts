@@ -411,6 +411,15 @@ export function formatEpisodeLines(ep: Episode, currentSessionId: string, ranges
     if (last && s[0] <= last[1] + 1) last[1] = Math.max(last[1], s[1]);
     else merged.push([...s]);
   }
+  // Past the line limit, earlier ranges give way: the end an agent asks for is what it came for.
+  let budget = MAX_LINES;
+  for (let r = merged.length - 1; r >= 0; r--) {
+    const [a, b] = merged[r]!;
+    const take = Math.min(b - a + 1, Math.max(0, budget));
+    if (take < b - a + 1) merged[r] = [a, a + take - 1];
+    budget -= take;
+  }
+  for (let r = merged.length - 1; r >= 0; r--) if (merged[r]![0] > merged[r]![1]) merged.splice(r, 1);
   const width = String(total).length;
   const body: string[] = [];
   let shown = 0;

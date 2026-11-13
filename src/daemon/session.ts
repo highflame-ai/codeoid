@@ -6094,6 +6094,9 @@ export class Session {
       run.endTurn?.();
       return;
     }
+    // A turn the backend began itself (a background wake): no prompt of the user's, so memory
+    // doesn't carry the last one into it.
+    this.#chunker?.onAdoptedTurn();
     const systemAuth: AuthContext = {
       sub: "system:background",
       scopes: [],
@@ -6686,7 +6689,6 @@ export class Session {
     // Said to whoever is attached (and audited) before the session goes;
     // the commit look's git is bounded, and a destroy waits no longer.
     await Promise.race([this.#checkGitControl(sender.sub), new Promise<void>((r) => setTimeout(r, DESTROY_COMMIT_CHECK_MS).unref?.())]);
-    this.flushMemory();
     this.#destroyed = true;
     this.#unscopeMemory?.();
     // This session's own servers' clients in the hub: let go (the last user closes them).
@@ -6711,6 +6713,8 @@ export class Session {
     // Tear down the streamInput loop cleanly before wiping storage so we
     // don't leave a zombie SDK subprocess alive holding the transcript file.
     await this.#teardownProvider();
+    // After the teardown has settled what was running (interrupted): every call still open is stored.
+    this.flushMemory();
     await this.#sandbox?.close();
     // What its backends kept across starts (their conversations, #448): gone with it.
     this.#sandbox?.removeState();

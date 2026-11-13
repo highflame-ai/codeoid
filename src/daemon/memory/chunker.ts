@@ -205,6 +205,12 @@ export class EpisodeChunker {
     this.#pendingAssistantText = [];
   }
 
+  /** A turn the backend began itself (a background wake): what came before is stored, and no prompt goes on. */
+  onAdoptedTurn(): void {
+    this.#flushReply();
+    this.#pendingUserPrompt = null;
+  }
+
   /**
    * The session is ending (destroyed, the daemon stopping): every call still open is stored as
    * unfinished, and what the turn said is stored, so nothing it did is lost.

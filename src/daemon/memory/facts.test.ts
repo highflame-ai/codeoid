@@ -142,6 +142,20 @@ describe("chunker", () => {
     expect(calls.find((e) => e.summary.includes("serve"))?.content).toContain("## Result\nunfinished");
   });
 
+  test("a background wake doesn't carry the last prompt", () => {
+    const out: Array<Omit<Episode, "id">> = [];
+    const c = new EpisodeChunker({ workspaceId: "w", sessionId: "s", createdBy: "u" }, (ep) => out.push(ep));
+    c.onMessage(user("m1", "please do it"));
+    c.onMessage(assistant("m2", "Answer one."));
+    c.onTurnEnd();
+    c.onAdoptedTurn();
+    c.onMessage(assistant("m3", "Background finished: all good."));
+    c.onTurnEnd();
+    const wake = out.find((e) => e.content.includes("Background finished"))!;
+    expect(wake.kind).toBe("assistant_turn");
+    expect(wake.content).not.toContain("please do it");
+  });
+
   test("a call's origin and workstream are as they were when it opened", () => {
     const out: Array<Omit<Episode, "id">> = [];
     let facts: { origin: "user" | "delegated"; workstream: string } = { origin: "user", workstream: "a" };
@@ -266,6 +280,13 @@ describe("get_episode lines", () => {
     const out = formatEpisodeLines(big, "s", [[1, -1]]);
     expect(out.length).toBeLessThan(270_000);
     expect(out).toContain("…[line cut: the rest with get_episode offset");
+  });
+
+  test("past the line limit the tail asked for is still shown", () => {
+    const long = { ...ep, content: Array.from({ length: 3000 }, (_, i) => `line ${i + 1}`).join("\n") };
+    const out = formatEpisodeLines(long, "s", [[-5, -1], [1, 2500]]);
+    expect(out).toContain("3000  line 3000");
+    expect(out).toContain("   1  line 1");
   });
 
   test("ranges merged and in order", () => {
