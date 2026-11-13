@@ -61,7 +61,7 @@ Slack works only with ZeroID sign-in, never in local mode.
 - `/codeoid ls` lists your sessions; `/codeoid attach <name>` talks to one instead; `/codeoid conductor` goes back.
 - `/codeoid stop` interrupts the current turn; `/codeoid who` shows who you are signed in as.
 - When the session you're talking to asks to run something, a card shows what it would do, the workstream it acts in, its risk and whether it is sandboxed, with Approve and Deny buttons. Only the person a card was sent to can press it, and only once; a card answered elsewhere (the web UI, the CLI) closes.
-- When another of your sessions is waiting on you, you get a message naming it.
+- When another of your sessions is waiting on you, you get a message naming it (at most once every ten minutes per session).
 
 Only the people in `CODEOID_SLACK_ALLOWED_USER_IDS` can use it, and each acts with their own key: what they can do is what that key allows.
 Your sign-in ends when the key's token expires; run `/codeoid auth` again.

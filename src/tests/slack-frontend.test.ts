@@ -15,7 +15,7 @@ import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import type { TokenVerifier } from "../daemon/verifier.js";
-import { SlackFrontend, esc, looksLikeSecret } from "../frontends/slack/index.js";
+import { CALL_SHOWN, SlackFrontend, callText, esc, looksLikeSecret } from "../frontends/slack/index.js";
 import type { SlackTransport, SocketLike } from "../frontends/slack/socket.js";
 import type { FrontendContext } from "../frontends/types.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
@@ -183,9 +183,12 @@ describe("approvals", () => {
     await until(() => (providers.at(-1)?.canUseToolResults.length ?? 0) > 0);
     expect(providers.at(-1)!.canUseToolResults[0]!.behavior).toBe("allow");
     await until(() => calls.some((c) => c.method === "chat.update" && String(c.body.text).includes("Approved")));
-    // Pressed once: a second press finds nothing waiting.
+    // Pressed once: a second press decides nothing more, and says nothing more.
+    const updates = calls.filter((c) => c.method === "chat.update").length;
     await press(OWNER, "approve", "ap-1");
-    await until(() => calls.some((c) => c.method === "chat.update" && String(c.body.text).includes("no longer waiting")));
+    await Bun.sleep(50);
+    expect(calls.filter((c) => c.method === "chat.update").length).toBe(updates);
+    expect(providers.at(-1)!.canUseToolResults.length).toBe(1);
   });
 
   it("another session of yours waiting on you is told in your DM", async () => {
@@ -268,5 +271,39 @@ describe("one workspace", () => {
     await frontend.start({ manager, store, auth: { baseUrl: "http://localhost:1" }, verifier, httpServer: null as never, host: "127.0.0.1", port: 0 } as FrontendContext);
     expect(await frontend.handleEnvelope({ envelope_id: "e", type: "slash_commands", payload: { team_id: "T2", user_id: OWNER, text: "auth tok-owner" } })).toBeUndefined();
     expect(await frontend.handleEnvelope({ envelope_id: "e", type: "slash_commands", payload: { team_id: "T1", user_id: OWNER, text: "auth tok-owner" } })).toMatchObject({ text: expect.stringContaining("Signed in") });
+  });
+});
+
+describe("audit round 2", () => {
+  it("a card shows what runs: the command, the file and what it writes, cut only with a note", async () => {
+    script = [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "s1", name: "Bash", input: { command: "rm -rf ~/important", description: "tidy" }, approvalId: "ap-c1" } as ProviderEvent, done]];
+    await slash(OWNER, "auth tok-owner");
+    await dm(OWNER, "tidy up");
+    await until(() => calls.some((c) => Array.isArray(c.body.blocks)));
+    expect(JSON.stringify(calls.find((c) => Array.isArray(c.body.blocks))!.body.blocks)).toContain("rm -rf ~/important");
+    expect(callText("Write", { file_path: "/w/a.ts", content: "export const x = 1;" })).toContain("/w/a.ts");
+    expect(callText("Write", { file_path: "/w/a.ts", content: "export const x = 1;" })).toContain("export const x = 1;");
+    const long = callText("Bash", { command: `${"a".repeat(CALL_SHOWN)}; rm -rf ~` });
+    expect(long).toContain("cut short");
+    expect(callText("Bash", { command: "echo <!channel>" })).toContain("&lt;!channel&gt;");
+  });
+
+  it("common provider keys and private keys are caught too", () => {
+    for (const k of ["sk-ant-api03-abcdefghij", "ghp_abcdefghij1234", "github_pat_abcdefghij123", "AKIAABCDEFGHIJKLMNOP", "AIzaSyABCDEFGHIJKLMNOPQRSTU", "MY_KEY_zid_sk_abcdefghij", "-----BEGIN OPENSSH PRIVATE KEY-----"]) {
+      expect([k, looksLikeSecret(k)]).toEqual([k, true]);
+    }
+  });
+
+  it("a press repeated after the card was answered says nothing more", async () => {
+    script = [[{ type: "tool_start", toolId: "t2", sdkToolUseId: "s2", name: "Write", input: { file_path: join(tmp, "r.txt"), content: "x" }, approvalId: "ap-r1" } as ProviderEvent, done]];
+    await slash(OWNER, "auth tok-owner");
+    await dm(OWNER, "write");
+    await until(() => calls.some((c) => Array.isArray(c.body.blocks)));
+    await press(OWNER, "approve", "ap-r1");
+    await until(() => calls.some((c) => c.method === "chat.update" && String(c.body.text).includes("Approved")));
+    const updates = calls.filter((c) => c.method === "chat.update").length;
+    await press(OWNER, "approve", "ap-r1");
+    await Bun.sleep(50);
+    expect(calls.filter((c) => c.method === "chat.update").length).toBe(updates);
   });
 });

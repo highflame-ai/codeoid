@@ -815,7 +815,7 @@ const frontends: SettingsTab = {
         env("CODEOID_SLACK_ALLOWED_USER_IDS", "Allowed member ids", "Slack member ids permitted to use the app (required with the tokens).", {
           kind: "string[]",
         }),
-        env("CODEOID_SLACK_TEAM_ID", "Workspace id", "Only messages from this Slack workspace (T…) are taken. Unset: the workspace the app is installed in.", {}),
+        env("CODEOID_SLACK_TEAM_ID", "Workspace id", "Only messages from this Slack workspace (T…) are taken. Unset: any workspace the app receives from.", {}),
       ],
     },
     {

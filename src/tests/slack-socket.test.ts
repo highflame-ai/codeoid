@@ -110,4 +110,81 @@ describe("SlackSocket", () => {
     expect(posted).toEqual([JSON.stringify({ text: "late answer" })]);
     socket.stop();
   });
+
+  it("one user's slow handling never holds up another's", async () => {
+    const slack = fakeSlack();
+    const done: string[] = [];
+    const socket = new SlackSocket("xapp", async (env) => {
+      const user = String((env.payload.event as { user?: string }).user);
+      if (user === "SLOW") await new Promise(() => {});
+      done.push(user);
+      return undefined;
+    }, slack.transport);
+    await socket.start();
+    const s = slack.sockets[0]!;
+    s.onmessage?.({ data: JSON.stringify({ envelope_id: "e1", type: "events_api", payload: { event_id: "A", event: { user: "SLOW" } } }) });
+    s.onmessage?.({ data: JSON.stringify({ envelope_id: "e2", type: "events_api", payload: { event_id: "B", event: { user: "FAST" } } }) });
+    await Bun.sleep(20);
+    expect(done).toEqual(["FAST"]);
+    socket.stop();
+  });
+
+  it("an envelope Slack resends (a press, a command) is acknowledged and not handled again", async () => {
+    const slack = fakeSlack();
+    let handled = 0;
+    const socket = new SlackSocket("xapp", async () => {
+      handled++;
+      return undefined;
+    }, slack.transport);
+    await socket.start();
+    const s = slack.sockets[0]!;
+    const press = JSON.stringify({ envelope_id: "same", type: "interactive", payload: { type: "block_actions", user: { id: "U" } } });
+    s.onmessage?.({ data: press });
+    s.onmessage?.({ data: press });
+    await Bun.sleep(20);
+    expect(handled).toBe(1);
+    expect(s.sent.length).toBe(2);
+    socket.stop();
+  });
+
+  it("stop closes every socket, the one being replaced included", async () => {
+    const slack = fakeSlack();
+    const closed: number[] = [];
+    const connect = slack.transport.connect;
+    slack.transport.connect = (url) => {
+      const sock = connect(url);
+      const n = slack.sockets.length;
+      sock.close = () => {
+        closed.push(n);
+      };
+      return sock;
+    };
+    const socket = new SlackSocket("xapp", async () => undefined, slack.transport);
+    await socket.start();
+    slack.sockets[0]!.onmessage?.({ data: JSON.stringify({ type: "disconnect" }) });
+    await Bun.sleep(20);
+    expect(slack.sockets.length).toBe(2);
+    socket.stop();
+    expect(closed.sort()).toEqual([1, 2]);
+  });
+
+  it("a start that can't reach Slack keeps trying; a refused token stops it", async () => {
+    let tries = 0;
+    const down: SlackTransport = {
+      fetch: async () => {
+        tries++;
+        throw new Error("network down");
+      },
+      connect: () => {
+        throw new Error("never");
+      },
+    };
+    const socket = new SlackSocket("xapp", async () => undefined, down);
+    await socket.start();
+    for (let i = 0; i < 200 && tries < 2; i++) await Bun.sleep(10);
+    expect(tries).toBe(2);
+    socket.stop();
+    const refused: SlackTransport = { fetch: async () => Response.json({ ok: false, error: "invalid_auth" }), connect: () => { throw new Error("never"); } };
+    await expect(new SlackSocket("xapp", async () => undefined, refused).start()).rejects.toThrow("invalid_auth");
+  });
 });

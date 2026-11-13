@@ -30,6 +30,7 @@ import type { SessionManager } from "../../daemon/session-manager.js";
 import type { Store } from "../../daemon/store.js";
 import type { TokenVerifier } from "../../daemon/verifier.js";
 import type { Frontend, FrontendContext } from "../types.js";
+import { KNOWN_KEY_FORMATS } from "../../daemon/mcp/redact.js";
 import { defaultTransport, type SlackEnvelope, SlackSocket, type SlackTransport, slackApi } from "./socket.js";
 
 /** An approval card awaiting a button press, keyed `${slackUserId}:${approvalId}`. */
@@ -39,6 +40,8 @@ interface PendingApproval {
   userId: string;
   channel: string;
   ts?: string;
+  /** The tool call's message, whose later updates close the card. */
+  messageId?: string;
   createdAt: number;
 }
 
@@ -85,8 +88,12 @@ export class SlackFrontend implements Frontend {
   /** When each non-allowlisted user was last told so, and each session's last "needs you": neither repeated often. */
   #toldStranger = new Map<string, number>();
   #toldNeeds = new Map<string, number>();
-  /** A card's tool-call message → its approval key, to close the card when the call is answered elsewhere. */
-  #cardOfMessage = new Map<string, string>();
+  /** A card's tool-call message → its cards' approval keys (one per Slack user holding it), to close them when answered elsewhere. */
+  #cardOfMessage = new Map<string, Set<string>>();
+  /** Tool-call messages already answered: a card queued for one isn't posted. */
+  #answered = new Set<string>();
+  /** Cards just answered here: a repeated press says nothing more. */
+  #justAnswered = new Set<string>();
   #manager!: SessionManager;
   #authConfig!: AuthConfig;
   #verifier!: TokenVerifier;
@@ -214,6 +221,7 @@ export class SlackFrontend implements Frontend {
           state.dmChannel = opened.channel.id;
         } catch {}
       }
+      if (!state.dmChannel) return `Signed in as ${auth.name ?? auth.sub}. Message me once so I can reply to you (I couldn't open our DM).`;
       return `Signed in as ${auth.name ?? auth.sub}. Message me to talk to the conductor.`;
     } catch (err) {
       return `Sign-in failed: ${err instanceof Error ? err.message : "unknown error"}`;
@@ -286,7 +294,7 @@ export class SlackFrontend implements Frontend {
         const tool = {
           name: a.toolName,
           toolId: a.approvalId,
-          state: { phase: "waiting_confirmation", approvalId: a.approvalId, input: a.input, description: `${a.toolName} ${JSON.stringify(a.input).slice(0, 1_500)}`, risk: a.risk, sandboxed: a.sandboxed, sandboxNote: a.sandboxNote, sandboxDocker: a.sandboxDocker, targetWorkstream: a.targetWorkstream },
+          state: { phase: "waiting_confirmation", approvalId: a.approvalId, input: a.input, description: a.toolName, risk: a.risk, sandboxed: a.sandboxed, sandboxNote: a.sandboxNote, sandboxDocker: a.sandboxDocker, targetWorkstream: a.targetWorkstream },
         } as unknown as ToolInfo;
         this.#queue(userId, () => (state.epoch === epoch ? this.#approvalCard(userId, state, tool, sessionId, channel, a.messageId) : Promise.resolve()));
       }
@@ -332,6 +340,7 @@ export class SlackFrontend implements Frontend {
       await this.#post(channel, authed);
       return;
     }
+    const epoch = state.epoch;
     if (!state.attachedSessionId) {
       const id = await this.#conductorId(userId, state);
       if (typeof id !== "string") {
@@ -344,8 +353,13 @@ export class SlackFrontend implements Frontend {
         return;
       }
     }
+    // Signed in again, or attached elsewhere, while this waited: the message isn't sent under the new sign-in.
+    if (state.epoch !== epoch || !state.auth || !state.attachedSessionId) {
+      await this.#post(channel, "⚠️ Not sent: your sign-in changed meanwhile. Send it again.");
+      return;
+    }
     const resp = await this.#manager.handle(
-      { type: "session.send", id: randomUUID(), sessionId: state.attachedSessionId!, text },
+      { type: "session.send", id: randomUUID(), sessionId: state.attachedSessionId, text },
       state.auth!,
       this.#client(userId, state),
     );
@@ -385,14 +399,16 @@ export class SlackFrontend implements Frontend {
       if (msg.contentAppend && state.streams.has(msg.messageId)) state.streams.set(msg.messageId, (state.streams.get(msg.messageId) ?? "") + msg.contentAppend);
       // A card's call answered elsewhere (the web UI, the CLI) or cancelled: its buttons go.
       const phase = msg.toolStateUpdate?.phase;
-      const key = this.#cardOfMessage.get(msg.messageId);
-      if (key && phase && phase !== "waiting_confirmation") {
-        this.#cardOfMessage.delete(msg.messageId);
-        const card = this.#approvals.get(key);
-        if (card) {
-          this.#approvals.delete(key);
-          if (card.ts) this.#queue(userId, () => this.#update(card.channel, card.ts!, "Answered elsewhere."));
+      if (phase && phase !== "waiting_confirmation") {
+        this.#answered.add(msg.messageId);
+        if (this.#answered.size > 1000) this.#answered.delete(this.#answered.values().next().value!);
+        for (const key of this.#cardOfMessage.get(msg.messageId) ?? []) {
+          const card = this.#approvals.get(key);
+          if (!card) continue;
+          this.#dropCard(key);
+          if (card.ts) this.#queue(card.userId, () => this.#update(card.channel, card.ts!, "Answered elsewhere."));
         }
+        this.#cardOfMessage.delete(msg.messageId);
       }
       return;
     }
@@ -429,15 +445,19 @@ export class SlackFrontend implements Frontend {
       return;
     }
     this.#prune();
+    // Answered meanwhile (in the web UI, while this waited its turn to post): nothing to show.
+    if (messageId && this.#answered.has(messageId)) return;
     const key = `${userId}:${st.approvalId}`;
     if (this.#approvals.has(key)) return;
-    const pending: PendingApproval = { approvalId: st.approvalId, sessionId, userId, channel, createdAt: Date.now() };
+    const pending: PendingApproval = { approvalId: st.approvalId, sessionId, userId, channel, createdAt: Date.now(), ...(messageId ? { messageId } : {}) };
     this.#approvals.set(key, pending);
-    if (messageId) this.#cardOfMessage.set(messageId, key);
-    const full = esc(String(st.description ?? tool.name));
-    // Never cut silently: a tail it doesn't show could be what runs.
-    const shown = full.length > 2_000 ? `${full.slice(0, 2_000)}…\n_(cut short: see the whole call in the web UI or with \`codeoid approve\`)_` : full;
-    const lines = [`*Approval needed* — \`${esc(tool.name)}\``, shown];
+    if (messageId) {
+      const keys = this.#cardOfMessage.get(messageId) ?? new Set<string>();
+      keys.add(key);
+      this.#cardOfMessage.set(messageId, keys);
+    }
+    // What runs, from its input: the description only names the tool and its arguments.
+    const lines = [`*Approval needed* — \`${esc(tool.name)}\``, callText(tool.name, st.input)];
     const tw = st.targetWorkstream;
     if (tw?.workstream) lines.push(`⌂ workstream *${esc(tw.workstream)}*`);
     if (tw?.warning) lines.push(`⚠ ${esc(tw.warning)}`);
@@ -454,7 +474,8 @@ export class SlackFrontend implements Frontend {
         unfurl_links: false,
         unfurl_media: false,
         blocks: [
-          { type: "section", text: { type: "mrkdwn", text: text.slice(0, CHUNK) } },
+          // Split across sections (each holds 3000), never cut.
+          ...sections(text),
           {
             type: "actions",
             block_id: "codeoid_approval",
@@ -485,11 +506,15 @@ export class SlackFrontend implements Frontend {
     const key = `${userId}:${action.value ?? ""}`;
     const pending = this.#approvals.get(key);
     if (!pending) {
+      // A press repeated (a double click, Slack resending it): the first already said what happened.
+      if (this.#justAnswered.has(key)) return;
       const someoneElses = [...this.#approvals.keys()].some((k) => k.endsWith(`:${action.value}`));
       await say(someoneElses ? "This approval isn't yours." : "This approval is no longer waiting.");
       return;
     }
-    this.#approvals.delete(key);
+    this.#dropCard(key);
+    this.#justAnswered.add(key);
+    if (this.#justAnswered.size > 500) this.#justAnswered.delete(this.#justAnswered.values().next().value!);
     if (Date.now() - pending.createdAt > this.#approvalTtlMs) {
       await say("This approval expired.");
       return;
@@ -511,12 +536,22 @@ export class SlackFrontend implements Frontend {
 
   #prune(): void {
     const now = Date.now();
-    for (const [k, a] of this.#approvals) if (now - a.createdAt > this.#approvalTtlMs) this.#approvals.delete(k);
+    for (const [k, a] of this.#approvals) if (now - a.createdAt > this.#approvalTtlMs) this.#dropCard(k);
     while (this.#approvals.size >= MAX_PENDING_APPROVALS) {
       const oldest = this.#approvals.keys().next().value;
       if (!oldest) break;
-      this.#approvals.delete(oldest);
+      this.#dropCard(oldest);
     }
+  }
+
+  /** Forget one card, and its place in #cardOfMessage. */
+  #dropCard(key: string): void {
+    const card = this.#approvals.get(key);
+    this.#approvals.delete(key);
+    if (!card?.messageId) return;
+    const keys = this.#cardOfMessage.get(card.messageId);
+    keys?.delete(key);
+    if (keys && keys.size === 0) this.#cardOfMessage.delete(card.messageId);
   }
 
   // ── "Needs you": another of your sessions waits on you ────────────────
@@ -575,7 +610,7 @@ export class SlackFrontend implements Frontend {
     state.attachedSessionId = null;
     state.attachedName = null;
     state.streams.clear();
-    for (const [k, a] of this.#approvals) if (a.userId === userId) this.#approvals.delete(k);
+    for (const [k, a] of this.#approvals) if (a.userId === userId) this.#dropCard(k);
   }
 
   #client(userId: string, state: UserState): AttachedClient {
@@ -616,5 +651,48 @@ export function esc(text: string): string {
  * JWT, or a Slack token. It is never forwarded to a session.
  */
 export function looksLikeSecret(text: string): boolean {
-  return /\bzid_sk_[A-Za-z0-9_-]{8,}/.test(text) || /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/.test(text) || /\bxox[abposr]-[A-Za-z0-9-]{8,}|\bxapp-[A-Za-z0-9-]{8,}/.test(text);
+  return (
+    new RegExp(`(?:${KNOWN_KEY_FORMATS})`).test(text) ||
+    /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/.test(text) ||
+    /-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(text)
+  );
+}
+
+/** Most characters of a call a card shows; past it the card says it was cut. */
+export const CALL_SHOWN = 2_400;
+
+/**
+ * What a tool call would do, as a card shows it: the command a shell runs,
+ * the file a write or edit touches with what it writes, a plan; else its
+ * input whole. Escaped for Slack, and cut only with a note saying so.
+ */
+export function callText(_toolName: string, input: unknown): string {
+  const i = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
+  const str = (v: unknown) => (typeof v === "string" ? v : undefined);
+  let head = "";
+  let body: string;
+  const command = str(i.command) ?? str(i.cmd);
+  const path = str(i.file_path) ?? str(i.path) ?? str(i.notebook_path);
+  if (command !== undefined) body = command;
+  else if (str(i.plan) !== undefined) body = str(i.plan)!;
+  else if (path !== undefined && (str(i.content) !== undefined || str(i.new_string) !== undefined)) {
+    head = path;
+    body = str(i.content) ?? `${str(i.old_string) ?? ""}\n→\n${str(i.new_string) ?? ""}`;
+  } else body = JSON.stringify(input ?? {}, null, 2);
+  const cut = body.length > CALL_SHOWN;
+  const shown = esc(cut ? body.slice(0, CALL_SHOWN) : body).replace(/```/g, "ˋˋˋ");
+  return `${head ? `\`${esc(head)}\`\n` : ""}\`\`\`${shown}\`\`\`${cut ? `\n_(cut short at ${CALL_SHOWN} of ${body.length} characters: see the whole call in the web UI or with \`codeoid approve\`)_` : ""}`;
+}
+
+/** Text as mrkdwn section blocks of at most CHUNK characters each, split at line ends where it can. */
+function sections(text: string): Array<Record<string, unknown>> {
+  const out: Array<Record<string, unknown>> = [];
+  let rest = text;
+  while (rest.length > 0) {
+    let at = rest.length <= CHUNK ? rest.length : rest.lastIndexOf("\n", CHUNK);
+    if (at <= 0) at = Math.min(CHUNK, rest.length);
+    out.push({ type: "section", text: { type: "mrkdwn", text: rest.slice(0, at) } });
+    rest = rest.slice(at).replace(/^\n/, "");
+  }
+  return out;
 }
