@@ -170,6 +170,8 @@ program
       daemon = new DaemonServer({
         dataLock,
         sandboxRegistry,
+        // What sessions store is scrubbed of secrets (docs/secrets-and-memory-design.md §2).
+        secretsConfigDir: getConfigDir(),
         port: bindPort,
         host: bindHost,
         dbPath: config.dbPath,
@@ -1685,6 +1687,159 @@ async function workstreamRequest<T extends DaemonMessage["type"]>(
     client.disconnect();
   }
 }
+
+// ── Secrets (docs/secrets-and-memory-design.md §2) ──────────────────────
+
+const secretCmd = program
+  .command("secret")
+  .description("Secrets in what codeoid stores: the ones workstreams keep, and scrubbing older data (docs/secrets-and-memory-design.md)");
+
+/** `<workstream>:<fingerprint>`, or a bare fingerprint (a session with no workstream), or `‹secret:kind:fp›` as copied. */
+function keptRef(ref: string, workstream?: string): { workstream: string; fingerprint: string } | null {
+  const copied = /^‹secret:[a-z0-9-]+:([0-9a-f]{8})›$/.exec(ref.trim());
+  if (copied) return { workstream: workstream ?? "", fingerprint: copied[1]! };
+  const m = /^(?:([a-z0-9][a-z0-9-]{0,63}):)?([0-9a-f]{8})$/.exec(ref.trim());
+  return m ? { workstream: workstream ?? m[1] ?? "", fingerprint: m[2]! } : null;
+}
+
+secretCmd
+  .command("ls")
+  .description("List the detected secrets workstreams keep (captureSecrets: vault) — never their values")
+  .option("--workstream <id>", "only this workstream's")
+  .option("--json", "print the daemon's reply as JSON")
+  .action(async (o: { workstream?: string; json?: boolean }) => {
+    await workstreamRequest({ type: "secret.list", id: randomUUID(), ...(o.workstream ? { workstream: o.workstream } : {}) }, "secret.list.result", (r) => {
+      if (o.json) return void console.log(JSON.stringify(r, null, 2));
+      if (!r.enabled) console.log("Secret handling is off in this daemon (secrets.enabled).");
+      if (r.secrets.length === 0) {
+        console.log("No kept secrets. A workstream keeps detected secrets only with captureSecrets: \"vault\"; the default drops them.");
+        return;
+      }
+      for (const k of r.secrets) {
+        const ref = `${k.workstream ? `${clean(k.workstream)}:` : ""}${k.fingerprint}`;
+        console.log(`${ref.padEnd(32)} ${clean(k.kind).padEnd(20)} last seen ${new Date(k.lastSeen).toISOString()}${k.sessionId ? `  session ${clean(k.sessionId.slice(0, 8))}` : ""}`);
+      }
+    });
+  });
+
+secretCmd
+  .command("reveal <ref>")
+  .description("Print a kept secret's value (<workstream>:<fingerprint>, or as copied: ‹secret:kind:fingerprint›). Your own token only; audited")
+  .option("--workstream <id>", "the workstream that keeps it")
+  .action(async (ref: string, o: { workstream?: string }) => {
+    const k = keptRef(ref, o.workstream);
+    if (!k) {
+      console.error("Error: give <workstream>:<fingerprint>, a fingerprint, or the reference as copied");
+      process.exitCode = 1;
+      return;
+    }
+    await workstreamRequest({ type: "secret.reveal", id: randomUUID(), ...k }, "secret.reveal.result", (r) => {
+      // The value itself, unaltered: it is what was asked for.
+      console.log(r.value);
+    });
+  });
+
+secretCmd
+  .command("forget <ref>")
+  .description("Forget a kept secret")
+  .option("--workstream <id>", "the workstream that keeps it")
+  .action(async (ref: string, o: { workstream?: string }) => {
+    const k = keptRef(ref, o.workstream);
+    if (!k) {
+      console.error("Error: give <workstream>:<fingerprint>, a fingerprint, or the reference as copied");
+      process.exitCode = 1;
+      return;
+    }
+    await workstreamRequest({ type: "secret.forget", id: randomUUID(), ...k }, "response.ok", () => console.log(`Forgot ${k.workstream ? `${k.workstream}:` : ""}${k.fingerprint}.`));
+  });
+
+secretCmd
+  .command("promote <ref>")
+  .description("Make a kept secret a declared credential (an env credential), so it is matched by name from now on")
+  .requiredOption("--as <id>", "the credential's id (lowercase letters, digits, dashes)")
+  .option("--workstream <id>", "the workstream that keeps it")
+  .action(async (ref: string, o: { as: string; workstream?: string }) => {
+    const k = keptRef(ref, o.workstream);
+    if (!k) {
+      console.error("Error: give <workstream>:<fingerprint>, a fingerprint, or the reference as copied");
+      process.exitCode = 1;
+      return;
+    }
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    try {
+      const fail = (reply: DaemonMessage): boolean => {
+        if (reply.type !== "response.error") return false;
+        console.error(`Error: ${clean(reply.error)}`);
+        process.exitCode = 1;
+        return true;
+      };
+      const revealed = await client.request({ type: "secret.reveal", id: randomUUID(), ...k });
+      if (fail(revealed) || revealed.type !== "secret.reveal.result") return;
+      if (fail(await client.request({ type: "credential.upsert", id: randomUUID(), item: { id: o.as, kind: "env", description: `promoted from ${revealed.kind} ${k.fingerprint}` } }))) return;
+      if (fail(await client.request({ type: "credential.set_value", id: randomUUID(), credential: o.as, value: revealed.value }))) return;
+      if (fail(await client.request({ type: "secret.forget", id: randomUUID(), ...k }))) return;
+      console.log(`Credential "${o.as}" now holds it; from now on it shows as ‹credential:${o.as}›. Give it to a workstream's env to use it.`);
+    } finally {
+      client.disconnect();
+    }
+  });
+
+secretCmd
+  .command("scrub")
+  .description("Rewrite what was stored before secret handling (transcripts, memory, dispatch tasks) with secrets replaced by references. Stop the daemon first")
+  .option("--dry-run", "say what would change, change nothing")
+  .action(async (o: { dryRun?: boolean }) => {
+    const config = loadConfig();
+    const { acquireDaemonLocks: acquire, daemonOwnedDirs: owned, DataDirLockError: LockError } = await import("./daemon/data-lock.js");
+    let locks: { release(): void };
+    try {
+      locks = acquire(owned(config), { log: () => {} });
+    } catch (err) {
+      if (err instanceof LockError) {
+        console.error(`Error: the daemon is running (${clean(err.message)}). Stop it first: scrubbing rewrites what it writes to.`);
+        process.exitCode = 1;
+        return;
+      }
+      throw err;
+    }
+    try {
+      const { Store: DaemonStore } = await import("./daemon/store.js");
+      const { SecretService, addDaemonKnownSources } = await import("./daemon/secrets/service.js");
+      const { createSecretStore } = await import("./daemon/credentials/store.js");
+      const { AccountStore } = await import("./daemon/accounts.js");
+      const { EndpointStore } = await import("./daemon/openai-endpoints.js");
+      const { scrubTranscripts, scrubMemoryDb, scrubDispatchTasks } = await import("./daemon/secrets/scrub-stored.js");
+      const store = new DaemonStore(config.dbPath);
+      try {
+        // No vault: a scrub of old data keeps nothing, whatever the workstreams say.
+        const secrets = new SecretService({ ...(config.secrets ? { config: { ...config.secrets, captureSecrets: "drop" } } : {}), configDir: getConfigDir() });
+        addDaemonKnownSources(secrets, {
+          credentials: () => config.credentials ?? [],
+          secretStore: createSecretStore(config.credentialStore),
+          accounts: new AccountStore(),
+          endpoints: new EndpointStore(),
+          store,
+        });
+        const scrub = <T,>(v: T) => secrets.scrubValue(v);
+        const t = scrubTranscripts(config.transcriptDir, scrub, !!o.dryRun);
+        const episodes = config.memory?.dbPath ? scrubMemoryDb(config.memory.dbPath, scrub, !!o.dryRun) : 0;
+        store.close();
+        const tasks = scrubDispatchTasks(config.dbPath, scrub, !!o.dryRun);
+        const verb = o.dryRun ? "would change" : "changed";
+        console.log(`Transcripts: ${t.filesChanged} of ${t.files} files ${verb} (${t.linesChanged} lines).`);
+        console.log(`Memory: ${episodes} episode bodies ${verb}.`);
+        console.log(`Dispatch tasks: ${tasks} ${verb}.`);
+        if (!o.dryRun && t.filesChanged + episodes + tasks > 0) console.log("Done. A backend's own copy (Claude Code's ~/.claude/projects, Codex's sessions) is its own, and isn't changed.");
+      } finally {
+        try {
+          store.close();
+        } catch {}
+      }
+    } finally {
+      locks.release();
+    }
+  });
 
 workstreamCmd
   .command("ls")

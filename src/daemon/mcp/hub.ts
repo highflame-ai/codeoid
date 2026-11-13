@@ -116,6 +116,17 @@ export class McpHub {
     this.#permit = fn;
   }
 
+  /**
+   * Applied to every tool result before it goes back to the backend
+   * (docs/secrets-and-memory-design.md §2.7): through the hub, the model gets
+   * a secret as a reference, never its value. Unset: as the server sent it.
+   */
+  #scrubResult: ((text: string) => string) | null = null;
+
+  setResultScrub(fn: (text: string) => string): void {
+    this.#scrubResult = fn;
+  }
+
   #refusal(spec: McpServerSpec, scope: McpCallScope | undefined): string | undefined {
     return scope?.sessionId && !spec.builtin ? this.#permit?.(scope.sessionId, spec) : undefined;
   }
@@ -183,7 +194,8 @@ export class McpHub {
       return { text: `mcp: ${spec.name} unavailable: ${cleanMcpError(errMsg(e))}`, isError: true };
     }
     try {
-      return await withTimeout(client.callTool(tool, args, scope), this.#timeoutMs, `${spec.name}/${tool}`);
+      const result = await withTimeout(client.callTool(tool, args, scope), this.#timeoutMs, `${spec.name}/${tool}`);
+      return this.#scrubResult && !spec.builtin ? { ...result, text: this.#scrubResult(result.text) } : result;
     } catch (e) {
       if (e instanceof McpServerWantsSignIn && spec.transport.kind === "http") {
         this.markNeedsSignIn(spec.transport.url, scope.tenant);

@@ -470,6 +470,10 @@ describe("DaemonMessage routing", () => {
           return `workstreams.changed:${msg.revision}`;
         case "credential.list.result":
           return `credential.list:${msg.credentials.length}`;
+        case "secret.list.result":
+          return `secrets:${msg.secrets.length}`;
+        case "secret.reveal.result":
+          return `secret:${msg.kind}`;
         case "session.turns.result":
           return `turns:${msg.turns.length}`;
         case "session.approvals.result":

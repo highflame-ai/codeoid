@@ -1157,6 +1157,13 @@ export const credentialSetValueSchema = z.object({
   value: z.string().max(LIMITS.SETTING_VALUE_MAX).nullable(),
 });
 
+// A kept secret's fingerprint (secrets/fingerprint.ts: 8 hex characters) and its workstream ('' = none).
+const fingerprintField = z.string().regex(/^[0-9a-f]{8}$/);
+const keptWorkstreamField = z.union([z.literal(""), workstreamIdField]);
+export const secretListSchema = z.object({ ...base, type: z.literal("secret.list"), workstream: keptWorkstreamField.optional() });
+export const secretRevealSchema = z.object({ ...base, type: z.literal("secret.reveal"), workstream: keptWorkstreamField, fingerprint: fingerprintField });
+export const secretForgetSchema = z.object({ ...base, type: z.literal("secret.forget"), workstream: keptWorkstreamField, fingerprint: fingerprintField });
+
 export const skillGrantSchema = z.object({
   ...base,
   type: z.literal("skill.grant"),
@@ -1402,6 +1409,9 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   credentialUpsertSchema,
   credentialDeleteSchema,
   credentialSetValueSchema,
+  secretListSchema,
+  secretRevealSchema,
+  secretForgetSchema,
   sessionTurnsSchema,
   sessionApprovalsSchema,
   claudeAccountsListSchema,

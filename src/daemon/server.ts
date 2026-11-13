@@ -22,6 +22,7 @@ import {
   removeLocalTokenFile,
   writeLocalTokenFile,
 } from "./local-auth.js";
+import { SecretService } from "./secrets/service.js";
 import { SessionManager } from "./session-manager.js";
 import { Store } from "./store.js";
 import { TranscriptStore } from "./transcript.js";
@@ -214,6 +215,12 @@ export interface DaemonConfig {
    * sessions aren't sandboxed and carry no `sandbox` in their info.
    */
   sandboxRegistry?: SandboxRegistry;
+  /**
+   * Where the keys for secret handling live (docs/secrets-and-memory-design.md
+   * §2): `codeoid start` passes the config dir, so what sessions store is
+   * scrubbed. Absent (tests, embedders): stored as it came.
+   */
+  secretsConfigDir?: string;
 }
 
 interface AuthenticatedSocket {
@@ -232,6 +239,8 @@ export class DaemonServer {
   #memoryMcp: MemoryMcpHttp | null = null;
   #mcpRegistry: McpRegistry | null = null;
   #mcpHub: McpHub | null = null;
+  /** Secret handling for what sessions store and what the hub hands back (docs/secrets-and-memory-design.md §2). */
+  #secretService?: SecretService;
   #mcpProxy: McpProxy | null = null;
   #bunServer: ReturnType<typeof Bun.serve> | null = null;
   /** Boot recovery done: until then every request is answered 503 (`start`). */
@@ -354,6 +363,9 @@ export class DaemonServer {
           `${maxCreationsPerHour || "unlimited"}/hr per subject`,
       );
     }
+    if (config.secretsConfigDir) {
+      this.#secretService = new SecretService({ ...(config.fullConfig?.secrets ? { config: config.fullConfig.secrets } : {}), configDir: config.secretsConfigDir, store: this.#store });
+    }
     this.#manager = new SessionManager(
       this.#store, this.#transcriptStore, identityManager, rateLimiter,
       // Memory is wired post-construction via initMemory() — see start()
@@ -367,6 +379,7 @@ export class DaemonServer {
         // restarts so a daemon still recognises its own crashed run.
         daemonId: `${this.#config.host}:${this.#config.port}`,
         ...(config.sandboxRegistry ? { sandboxRegistry: config.sandboxRegistry } : {}),
+        ...(this.#secretService ? { secretService: this.#secretService } : {}),
       },
     );
 
@@ -626,6 +639,8 @@ export class DaemonServer {
       requestTimeoutMs: this.#config.fullConfig?.session.mcpToolTimeoutMs,
     });
     this.#mcpHub.proxy = this.#mcpProxy;
+    const secretService = this.#secretService;
+    if (secretService?.enabled && secretService.config.beforeModel) this.#mcpHub.setResultScrub((text) => secretService.scrub(text).text);
     for (const w of this.#mcpRegistry.warnings) console.warn(`[codeoid] ${w}`);
     // Goal blackboard: loopback URL regardless of bind address — the agent
     // subprocess runs on this host, and the endpoint must not become

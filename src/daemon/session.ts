@@ -240,6 +240,12 @@ import { worktreeFolderNote } from "./sandbox/worktrees.js";
 import { hiddenPathsFor, protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
 import { addedDirProblem, addedDirReal, autonomousGrantProblem, checkoutOverlap, inAnyDir, nestedControl, normalizeSandboxDir, type OtherCheckout } from "./sandbox/project-roots.js";
 import { sandboxRootIfMade } from "./sandbox/root.js";
+import type { SecretService } from "./secrets/service.js";
+import { StreamScrubber } from "./secrets/scrub.js";
+import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/verdict.js";
+
+/** What is recorded of a call the user listed in `secrets.dropCommands`. */
+const NOT_STORED = "‹not stored›";
 import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -662,6 +668,12 @@ export interface SessionCreateOptions {
    * or undefined: none (the handler then refuses what needed it).
    */
   fleetConfirm?: (target: FleetCardTarget, input: unknown) => string | undefined;
+  /**
+   * The daemon's secret handling (docs/secrets-and-memory-design.md §2):
+   * what the session stores, shows and hands on never holds a secret's
+   * value. Absent: stored as it came (tests, embedders).
+   */
+  secrets?: SecretService;
   /**
    * Initial execution mode + autonomous tool budget. Spawned workers start
    * "autonomous" with a bounded budget so they can work unattended; when the
@@ -1459,6 +1471,12 @@ export class Session {
   #collaborationCost?: () => CollaborationCost | undefined;
   #fleetTargetWorkstream?: (toolName: string, input: unknown) => FleetCardTarget | undefined;
   #fleetConfirm?: (target: FleetCardTarget, input: unknown) => string | undefined;
+  #secrets?: SecretService;
+  /** The reply and the reasoning streaming now, scrubbed as they arrive (a secret split across deltas is never sent). */
+  #textStream: StreamScrubber | null = null;
+  #thinkingStream: StreamScrubber | null = null;
+  /** Each running tool call's verdict (secrets/verdict.ts), by the backend's tool-use id. */
+  #toolVerdicts = new Map<string, ToolVerdict>();
   #workerShape?: "ship" | "scout";
   #turnsRemaining: number | undefined = undefined;
   /** See SessionCreateOptions.onBudgetExhausted. */
@@ -1897,6 +1915,7 @@ export class Session {
     this.#collaborationCost = opts.collaborationCost;
     this.#fleetTargetWorkstream = opts.fleetTargetWorkstream;
     this.#fleetConfirm = opts.fleetConfirm;
+    this.#secrets = opts.secrets;
     this.#maxBudgetUsd = opts.maxBudgetUsd;
     this.#onBudgetExhausted = opts.onBudgetExhausted ?? "park";
     const envOf = opts.workstreamEnv;
@@ -1957,6 +1976,7 @@ export class Session {
     // Durable canonical history (#354): every change is appended to the
     // session's log so forks, backend switches and rewinds after a restart
     // still carry the conversation.
+    if (this.#secrets) this.#historyAccumulator.scrubTurn = (turn) => this.#scrubValue(turn);
     this.#historyAccumulator.onChange = (change) => {
       if (this.#destroyed) return;
       // Never write a history that couldn't be read over the log it lost;
@@ -6529,7 +6549,8 @@ export class Session {
       out.push({
         approvalId,
         toolName: gated.toolName,
-        input: gated.input,
+        // Shown as the card shows it: scrubbed (the call still runs with what the backend made).
+        input: this.#scrubValue(gated.input),
         ...this.#cardRisk(risk, this.#heldWrite(gated.toolName, gated.input)),
         ...this.#cardSandbox(gated.toolName, gated.input, gated.shellCwd),
         ...(ws ? { targetWorkstream: { ...(ws.target.workstream ? { workstream: ws.target.workstream } : {}), ...(ws.target.warning ? { warning: ws.target.warning } : {}) } } : {}),
@@ -7257,6 +7278,8 @@ export class Session {
       const row = transcript[i]!;
       if (row.type !== "session.message") continue;
       const msg = reconcileResumedMessage({ ...row, sessionId: this.id });
+      // The parent's rows may predate secret scrubbing: the fork's copy is scrubbed as it is written.
+      this.#scrubMessage(msg);
       this.#scrollback.push(msg, sizeHints?.[i]);
       this.#transcriptStore.append(this.id, msg, this.#seq++).catch((e) => {
         console.error(
@@ -10020,9 +10043,16 @@ export class Session {
    * transcript and broadcast the state delta. Shared by the manual
    * approval/deny path and the hook-block path so the two can't drift.
    */
-  #resolveToolCallMessage(approvalId: string, resolvedState: ToolState): void {
+  #resolveToolCallMessage(approvalId: string, settled: ToolState): void {
     const msgId = this.#approvalIdToMessageId.get(approvalId);
     if (!msgId) return;
+    // What is recorded of the input the call runs with: as its tool_start was (secrets/verdict.ts).
+    const runs = (settled as { input?: unknown }).input;
+    const toolUseId = this.#messageIdToToolUseId.get(msgId);
+    const resolvedState =
+      this.#secrets && runs && typeof runs === "object"
+        ? ({ ...settled, input: this.#recordedToolInput((toolUseId && this.#toolVerdicts.get(toolUseId)) || "keep", runs as Record<string, unknown>) } as unknown as ToolState)
+        : this.#scrubValue(settled);
     this.#scrollback.updateMessage(msgId, (m) => {
       const sm = m as SessionMessage;
       if (sm.tool) sm.tool.state = resolvedState;
@@ -10471,6 +10501,7 @@ export class Session {
       case "text_delta": {
         if (!this.#activeAssistantMsg) {
           this.#activeAssistantMsg = this.#makeMessage("assistant", "", this.#agentIdentity, []);
+          this.#textStream = this.#secrets ? new StreamScrubber(this.#secrets.scrubber, this.#scrubContext()) : null;
           // Scrollback only — no transcript row, no chunker event. The buffer
           // holds the message by reference so clients attaching mid-stream see
           // it grow; the durable row and the chunker event are emitted once,
@@ -10480,12 +10511,15 @@ export class Session {
           this.#broadcastRaw(this.#activeAssistantMsg);
           if (this.#status === "tool_running") this.#setStatus("thinking");
         }
-        this.#activeAssistantMsg.content += event.content;
+        // Scrubbed as it streams: a secret split across deltas is held until it can be scrubbed whole.
+        const piece = this.#textStream && this.#secrets?.enabled ? this.#textStream.push(event.content) : event.content;
+        if (!piece) break;
+        this.#activeAssistantMsg.content += piece;
         const delta: SessionMessageDelta = {
           type: "session.message.delta",
           sessionId: this.id,
           messageId: this.#activeAssistantMsg.messageId,
-          contentAppend: event.content,
+          contentAppend: piece,
           timestamp: new Date().toISOString(),
         };
         this.#broadcastRaw(delta);
@@ -10493,30 +10527,33 @@ export class Session {
       }
 
       case "text_done": {
-        this.#accumulator.handleEvent(event);
+        this.#textStream = null;
+        // The whole reply scrubbed again: it replaces what was streamed.
+        const done = this.#secrets ? { ...event, content: this.#scrubText(event.content) } : event;
+        this.#accumulator.handleEvent(done);
         // NOTE: do NOT call #completeActiveTools() here.
         // In the real SDK the committed assistant message (which fires text_done)
         // is emitted BEFORE the user/tool_result message (which fires tool_complete).
         // Calling completeActiveTools here cancels tools that are still executing.
         // Cleanup is handled solely by the #consumeEvents finally block.
         if (this.#activeAssistantMsg) {
-          this.#activeAssistantMsg.content = event.content;
-          this.#activeAssistantMsg.parts = [{ kind: "text", text: event.content, markdown: true }];
+          this.#activeAssistantMsg.content = done.content;
+          this.#activeAssistantMsg.parts = [{ kind: "text", text: done.content, markdown: true }];
           this.#commitStreamed(this.#activeAssistantMsg);
           this.#broadcastRaw(this.#activeAssistantMsg);
           this.#activeAssistantMsg = null;
-        } else if (event.content && this.#turnInterrupted) {
+        } else if (done.content && this.#turnInterrupted) {
           // A stopped turn's last reply, shown whole: animating it held the
           // turn's end, and so a shutdown's drain, for up to half a second.
-          const msg = this.#makeMessage("assistant", event.content, this.#agentIdentity, []);
-          msg.parts = [{ kind: "text", text: event.content, markdown: true }];
+          const msg = this.#makeMessage("assistant", done.content, this.#agentIdentity, []);
+          msg.parts = [{ kind: "text", text: done.content, markdown: true }];
           this.#commitStreamed(msg);
           this.#broadcastRaw(msg);
-        } else if (event.content) {
+        } else if (done.content) {
           // No preceding text_delta — the SDK returned the response as a batch
           // (happens for mid-turn now-priority continuations). Simulate streaming
           // so the UI shows a typing animation instead of an instant text pop-in.
-          await this.#artificiallyStreamText(event.content);
+          await this.#artificiallyStreamText(done.content);
         }
         break;
       }
@@ -10528,18 +10565,20 @@ export class Session {
           this.#finalizeActiveThinking();
           this.#activeThinkingMsg = this.#makeMessage("thinking", "", this.#agentIdentity, []);
           this.#activeThinkingIndex = event.blockIndex ?? null;
+          this.#thinkingStream = this.#secrets ? new StreamScrubber(this.#secrets.scrubber, this.#scrubContext()) : null;
           // Scrollback only — see the text_delta note; committed by
           // #finalizeActiveThinking → #commitStreamed.
           this.#scrollback.push(this.#activeThinkingMsg);
           this.#broadcastRaw(this.#activeThinkingMsg);
         }
-        if (event.content) {
-          this.#activeThinkingMsg.content += event.content;
+        const thought = event.content && this.#thinkingStream && this.#secrets?.enabled ? this.#thinkingStream.push(event.content) : event.content;
+        if (thought) {
+          this.#activeThinkingMsg.content += thought;
           const delta: SessionMessageDelta = {
             type: "session.message.delta",
             sessionId: this.id,
             messageId: this.#activeThinkingMsg.messageId,
-            contentAppend: event.content,
+            contentAppend: thought,
             timestamp: new Date().toISOString(),
           };
           this.#broadcastRaw(delta);
@@ -10553,7 +10592,12 @@ export class Session {
       }
 
       case "tool_start": {
-        this.#accumulator.handleEvent(event);
+        // What of this call is stored (docs/secrets-and-memory-design.md §2.4): judged on what it really runs.
+        // The canonical history keeps what the transcript keeps.
+        const verdict = this.#secrets ? this.#secrets.verdict(event.name, event.input, event.shellCwd ?? this.workdir) : "keep";
+        if (verdict !== "keep") this.#toolVerdicts.set(event.sdkToolUseId, verdict);
+        const recordedInput = this.#secrets ? this.#recordedToolInput(verdict, event.input) : event.input;
+        this.#accumulator.handleEvent(recordedInput === event.input ? event : { ...event, input: recordedInput });
         // NOTE: do NOT call #completeActiveTools() here. It would cancel all
         // currently in-flight tools, which is correct for sequential calls but
         // silently kills parallel tool calls from concurrent subagents.
@@ -10635,16 +10679,16 @@ export class Session {
           {
             toolId: event.toolId,
             name: event.name,
-            input: event.input,
+            input: recordedInput,
             state: budgetDenied
               ? { phase: "cancelled", reason: "denied", message: "autonomous tool budget spent" }
               : refused
               ? { phase: "cancelled", reason: "denied", message: refused.reason }
               : autoApprove
-              ? ({ phase: "executing", input: event.input } as unknown as ToolState)
+              ? ({ phase: "executing", input: recordedInput } as unknown as ToolState)
               : ({
                   phase: "waiting_confirmation",
-                  input: event.input,
+                  input: recordedInput,
                   description: `${event.name}(${Object.keys(event.input).join(", ")})`,
                   approvalId: event.approvalId,
                   ...this.#collaborationCostFor(event.name),
@@ -10705,20 +10749,31 @@ export class Session {
             );
           }
         }
-        let output = event.output;
+        // Secrets out first (docs/secrets-and-memory-design.md §2): a call whose output is a credential keeps
+        // none of it; every other is scrubbed. Not a redaction of the backend's record — the backend saw the
+        // same — so it doesn't mark the backing session the way a hook's change does.
+        const verdict = this.#toolVerdicts.get(event.sdkToolUseId) ?? "keep";
+        this.#toolVerdicts.delete(event.sdkToolUseId);
+        const stored =
+          verdict === "drop" ? NOT_STORED : verdict === "withhold-output" ? OUTPUT_WITHHELD : typeof event.output === "string" ? this.#scrubText(event.output) : event.output;
+        let output = stored;
+        let hooked = false;
         if (this.#hookBus?.hasHooks("tool_result", hookToolName)) {
           const patched = await this.#hookBus.dispatchToolResult(this.#hookContext(), {
             toolName: hookToolName ?? "",
             output,
             success: event.success,
           });
-          if (patched.updatedOutput !== undefined) output = patched.updatedOutput;
+          if (patched.updatedOutput !== undefined && patched.updatedOutput !== output) {
+            output = this.#scrubText(patched.updatedOutput);
+            hooked = true;
+          }
         }
-        if (output !== event.output) {
+        if (hooked) {
           this.#turnRedacted = true;
           this.#noteRedactedBacking(this.#provider.backingSessionId);
         }
-        this.#accumulator.handleEvent(output === event.output ? event : { ...event, output, redacted: true });
+        this.#accumulator.handleEvent(output === event.output ? event : { ...event, output, ...(hooked ? { redacted: true } : {}) });
         if (msgId) {
           const toolMsg = this.#toolCallMessages.get(msgId);
           if (toolMsg?.tool) {
@@ -11019,6 +11074,11 @@ export class Session {
     if (!this.#activeAssistantMsg) return;
     const m = this.#activeAssistantMsg;
     this.#activeAssistantMsg = null;
+    // What the stream scrubber still held of a cut-off reply.
+    if (this.#textStream) {
+      m.content += this.#textStream.flush();
+      this.#textStream = null;
+    }
     // Rebroadcast ALWAYS — even with empty content. The TUI's store
     // looks for "same messageId with content" to move a live-region
     // entry to committed; an empty rebroadcast wouldn't trigger that,
@@ -11045,7 +11105,8 @@ export class Session {
    * (#flushActiveAssistant nulled it), we return early — the partial content was
    * already committed by the flush.
    */
-  async #artificiallyStreamText(content: string): Promise<void> {
+  async #artificiallyStreamText(raw: string): Promise<void> {
+    const content = this.#scrubText(raw);
     const FRAME_MS = 16;
     const steps = Math.min(30, content.length);
     const charsPerStep = Math.ceil(content.length / steps);
@@ -11091,6 +11152,10 @@ export class Session {
     const m = this.#activeThinkingMsg;
     this.#activeThinkingMsg = null;
     this.#activeThinkingIndex = null;
+    if (this.#thinkingStream) {
+      m.content += this.#thinkingStream.flush();
+      this.#thinkingStream = null;
+    }
     if (!m.content || m.content.length === 0) {
       // Not an elision by codeoid — the backend returned no readable reasoning.
       // Claude does this whenever `thinking.display` is `"omitted"`; backends
@@ -12220,6 +12285,7 @@ export class Session {
    * of two half-episodes.
    */
   #commitStreamed(msg: SessionMessage): void {
+    this.#scrubMessage(msg);
     this.#scrollback.push(msg);
     this.#transcriptStore.append(this.id, msg, this.#seq++).catch((e) => {
       console.error(
@@ -12229,8 +12295,59 @@ export class Session {
     this.#chunker?.onMessage(msg);
   }
 
+  /** Who and where a scrub is for: a kept secret lands in this tenant and home workstream. */
+  #scrubContext() {
+    return { accountId: this.accountId, projectId: this.projectId, workstream: this.#workstream?.id, sessionId: this.id };
+  }
+
+  /** `text` with no secret's value in it (docs/secrets-and-memory-design.md §2). */
+  #scrubText(text: string): string {
+    return this.#secrets ? this.#secrets.scrub(text, this.#scrubContext()).text : text;
+  }
+
+  #scrubValue<T>(value: T): T {
+    return this.#secrets ? this.#secrets.scrubValue(value, this.#scrubContext()).value : value;
+  }
+
+  /**
+   * Scrub a message in place before it is buffered, written or sent: its
+   * text, parts, tool input and state, and meta. Scrubbing is idempotent (a
+   * reference is never taken for a secret), so a message scrubbed twice is
+   * unchanged.
+   */
+  #scrubMessage(msg: SessionMessage): void {
+    if (!this.#secrets) return;
+    if (typeof msg.content === "string" && msg.content) msg.content = this.#scrubText(msg.content);
+    if (msg.parts) msg.parts = this.#scrubValue(msg.parts);
+    if (msg.tool) {
+      msg.tool.input = this.#scrubValue(msg.tool.input);
+      msg.tool.state = this.#scrubValue(msg.tool.state);
+    }
+    if (msg.metadata) msg.metadata = this.#scrubValue(msg.metadata);
+  }
+
+  /**
+   * What is recorded of a tool call's input: scrubbed, or, for a write of a
+   * credential file, without what was written (secrets/verdict.ts).
+   */
+  #recordedToolInput(verdict: ToolVerdict, input: Record<string, unknown>): Record<string, unknown> {
+    if (verdict === "drop") {
+      // A call the user listed as never stored: nothing of what it was given is kept.
+      return Object.fromEntries(Object.entries(input).map(([k, v]) => [k, typeof v === "string" ? NOT_STORED : v]));
+    }
+    if (verdict === "withhold-written") {
+      // A file tool writing a credential file: the path stays, what it writes doesn't. A shell line
+      // writing one stays readable (it is on the approval card), scrubbed.
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(input)) out[k] = /^(?:content|new_string|old_string|edits|new_source|patch)$/.test(k) ? WRITTEN_WITHHELD : v;
+      return this.#scrubValue(out);
+    }
+    return this.#scrubValue(input);
+  }
+
   /** Persist to transcript + scrollback buffer + memory chunker */
   #persistAndBuffer(msg: SessionMessage): void {
+    this.#scrubMessage(msg);
     // A notice for a session whose history isn't loaded (a mode change, a
     // rename) doesn't load it: it is kept for the load.
     this.#buffer(msg);

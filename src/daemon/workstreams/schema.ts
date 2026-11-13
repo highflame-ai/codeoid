@@ -101,6 +101,8 @@ export const workstreamItemSchema = z
     allowOverride: z.boolean().default(true),
     /** Whether other workstreams may reference this one (§7.1). */
     share: z.enum(["open", "ask", "closed"]).default("ask"),
+    /** A detected secret's value: dropped, or kept in the vault for the owner (docs/secrets-and-memory-design.md §2.5). */
+    captureSecrets: z.enum(["drop", "vault"]).default("drop"),
     mcpServers: z.array(serverRefSchema).max(256).default([]),
     /** Names (from the lists above, after `extends`) taken away again. */
     exclude: z.array(z.string().min(1).max(128)).max(256).default([]),
