@@ -39,6 +39,15 @@ interface Needle {
   ref: string;
 }
 
+/**
+ * Whether what stands just before `at` is an escape, not part of a longer token: `\n` / `\r` /
+ * `\t` in JSON text, or a URL-encoded character (`%22`, `%3A`).
+ */
+function escapedBefore(text: string, at: number): boolean {
+  if (at > 1 && text[at - 2] === "\\" && "nrt".includes(text[at - 1]!)) return true;
+  return at > 2 && text[at - 3] === "%" && /^[0-9A-Fa-f]{2}$/.test(text.slice(at - 2, at));
+}
+
 /** A multi-pattern matcher: every needle found in one pass. */
 class Matcher {
   readonly #goto: Array<Map<string, number>> = [new Map()];
@@ -125,7 +134,7 @@ function replaceMatches(text: string, matcher: Matcher, deadline: number): { tex
     if (++n % 4096 === 0 && performance.now() > deadline) return null;
     const [s, e] = m;
     if (own.length > 0 && inOwn(s, e)) continue;
-    if ((s > 0 && TOKEN_CHAR.test(text[s - 1]!)) || (e < text.length && TOKEN_CHAR.test(text[e]!))) continue;
+    if ((s > 0 && TOKEN_CHAR.test(text[s - 1]!) && !escapedBefore(text, s)) || (e < text.length && TOKEN_CHAR.test(text[e]!))) continue;
     found.push(m);
   }
   if (found.length === 0) return { text, refs, labels };
@@ -306,7 +315,7 @@ export class LearnedSecrets {
     let o = 0;
     for (let i = 0; i + MIN_LEARNED_LENGTH <= text.length; i++) {
       if ((i & 0xffff) === 0 && i > 0 && performance.now() > deadline) return null;
-      if (i > 0 && TOKEN_CHAR.test(text[i - 1]!)) continue;
+      if (i > 0 && TOKEN_CHAR.test(text[i - 1]!) && !escapedBefore(text, i)) continue;
       while (o < own.length && own[o]![1] <= i) o++;
       if (o < own.length && own[o]![0] <= i) {
         i = own[o]![1] - 1;

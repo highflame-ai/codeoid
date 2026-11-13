@@ -460,3 +460,40 @@ describe("round-2 audit", () => {
     expect(r.structuredContent.n).toBe(3);
   });
 });
+
+describe("verification pass", () => {
+  test.each([
+    ["DB_PASSWORD=Xy7&kLm9pQ", "Xy7&kLm9pQ"],
+    ["DB_PASSWORD=ab\\cd12ef", "ab\\cd12ef"],
+    ["TOKEN=abc123&def=1", "abc123"],
+    ["sshpass -p x0secret ssh -p 2222 host", "x0secret"],
+  ])("finds exactly the value in %s", (text, value) => {
+    expect((findSecrets(text) ?? []).map((s) => text.slice(s.start, s.end))).toEqual([value]);
+  });
+
+  test.each(["INFO token: refreshed", "Error: password: incorrect", "secret: !vault |", "sshpass -f pw.txt ssh -p 22 host", "docker run -p8080:80 mysql:8", "?key=static"])(
+    "leaves %s",
+    (text) => {
+      expect(kinds(text)).toEqual([]);
+    },
+  );
+
+  test("repeated eyJ stays linear", () => {
+    const t0 = performance.now();
+    findSecrets("eyJ".repeat(660_000));
+    expect(performance.now() - t0).toBeLessThan(1_000);
+  });
+
+  test("a known value after a JSON escape or a URL-encoded character", () => {
+    const known = new KnownSecrets();
+    known.register("t", () => [{ label: "v", value: "VALUE12345678" }]);
+    expect(known.replace('"line\\nVALUE12345678"')!.text).toBe('"line\\n‹credential:v›"');
+    expect(known.replace("data=%22VALUE12345678%22")!.text).toBe("data=%22‹credential:v›%22");
+    expect(known.replace("xVALUE12345678")!.text).toBe("xVALUE12345678");
+  });
+
+  test.each(["docker exec c sh -c 'cat .env'", "kubectl exec p -- sh -c 'cat /app/.env'", "ssh host -- env", "docker compose exec web env"])("withholds what %s runs", async (command) => {
+    await loadShellParser();
+    expect(toolVerdict("Bash", { command }, { cwd: "/w" })).toBe("withhold-output");
+  });
+});

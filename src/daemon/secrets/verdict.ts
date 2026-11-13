@@ -219,23 +219,36 @@ function pathLike(raw: string): string {
   return raw.replace(/^["']|["']$/g, "").replace(/\{[^}]*\}/g, "").replace(/[*?]+$/, "").replace(/\[[^\]]*\]$/, "");
 }
 
-/** The command another program runs for it: `ssh host CMD…`, `docker exec C CMD…`, `kubectl exec P -- CMD…`. */
+/** One word as a shell reads it back. */
+function shellQuote(w: string): string {
+  return /^[A-Za-z0-9_./=:@%+,-]+$/.test(w) ? w : `'${w.replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * The command another program runs for it: `ssh host CMD…` (ssh joins its words with spaces, as
+ * a shell on the other side reads them), `docker exec C CMD…` / `docker compose exec S CMD…` /
+ * `kubectl exec P -- CMD…` (an argv, each word kept as it is).
+ */
 function innerCommand(argv: string[]): string | null {
   const program = programName(argv[0] ?? "");
   const rest = argv.slice(1);
   if (program === "ssh") {
     let i = 0;
-    while (i < rest.length && rest[i]!.startsWith("-")) i += /^-[bcDEeFIiJLlmOopQRSWw]$/.test(rest[i]!) ? 2 : 1;
-    return rest.length > i + 1 ? rest.slice(i + 1).join(" ") : null;
+    while (i < rest.length && rest[i]!.startsWith("-") && rest[i] !== "--") i += /^-[bcDEeFIiJLlmOopQRSWw]$/.test(rest[i]!) ? 2 : 1;
+    if (rest[i] === "--") i++;
+    let cmd = rest.slice(i + 1);
+    if (cmd[0] === "--") cmd = cmd.slice(1);
+    return cmd.length > 0 ? cmd.join(" ") : null;
   }
-  if ((program === "docker" || program === "podman") && rest[0] === "exec") {
-    let i = 1;
-    while (i < rest.length && rest[i]!.startsWith("-")) i += /^-(?:e|u|w|-env|-user|-workdir)$/.test(rest[i]!) ? 2 : 1;
-    return rest.length > i + 1 ? rest.slice(i + 1).join(" ") : null;
+  const execAt = (program === "docker" || program === "podman") && rest[0] === "exec" ? 1 : (program === "docker" || program === "podman") && rest[0] === "compose" && rest[1] === "exec" ? 2 : -1;
+  if (execAt > 0) {
+    let i = execAt;
+    while (i < rest.length && rest[i]!.startsWith("-")) i += /^-(?:e|u|w|-env|-env-file|-user|-workdir|-index)$/.test(rest[i]!) ? 2 : 1;
+    return rest.length > i + 1 ? rest.slice(i + 1).map(shellQuote).join(" ") : null;
   }
   if (program === "kubectl" && rest.includes("exec")) {
     const dash = rest.indexOf("--");
-    return dash >= 0 && dash < rest.length - 1 ? rest.slice(dash + 1).join(" ") : null;
+    return dash >= 0 && dash < rest.length - 1 ? rest.slice(dash + 1).map(shellQuote).join(" ") : null;
   }
   return null;
 }
