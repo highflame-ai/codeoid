@@ -243,11 +243,11 @@ program
       }
     }
 
-    // Slack (enabled when SLACK_APP_TOKEN and SLACK_BOT_TOKEN are set; docs/slack.md)
+    // Slack (enabled when CODEOID_SLACK_APP_TOKEN and CODEOID_SLACK_BOT_TOKEN are set; docs/slack.md)
     if (opts.slack !== false) {
-      const appToken = process.env.SLACK_APP_TOKEN;
-      const botToken = process.env.SLACK_BOT_TOKEN;
-      const allowed = (process.env.SLACK_ALLOWED_USER_IDS ?? "")
+      const appToken = process.env.CODEOID_SLACK_APP_TOKEN;
+      const botToken = process.env.CODEOID_SLACK_BOT_TOKEN;
+      const allowed = (process.env.CODEOID_SLACK_ALLOWED_USER_IDS ?? "")
         .split(",")
         .map((s) => s.trim())
         .filter(Boolean);
@@ -256,9 +256,10 @@ program
         console.warn("[codeoid] local mode: Slack frontend NOT started (it needs ZeroID identities). Run `codeoid login` and start without --local to use it.");
       } else if (appToken && botToken && allowed.length > 0) {
         const { SlackFrontend } = await import("./frontends/slack/index.js");
-        daemon.use(new SlackFrontend(appToken, botToken, allowed));
+        const teamId = process.env.CODEOID_SLACK_TEAM_ID?.trim();
+        daemon.use(new SlackFrontend(appToken, botToken, allowed, teamId ? { teamId } : {}));
       } else if (appToken || botToken) {
-        console.log("[codeoid] Slack needs SLACK_APP_TOKEN, SLACK_BOT_TOKEN and SLACK_ALLOWED_USER_IDS — skipping Slack");
+        console.log("[codeoid] Slack needs CODEOID_SLACK_APP_TOKEN, CODEOID_SLACK_BOT_TOKEN and CODEOID_SLACK_ALLOWED_USER_IDS — skipping Slack");
       }
     }
 

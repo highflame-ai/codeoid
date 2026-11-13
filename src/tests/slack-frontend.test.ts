@@ -15,7 +15,7 @@ import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import type { TokenVerifier } from "../daemon/verifier.js";
-import { SlackFrontend, esc } from "../frontends/slack/index.js";
+import { SlackFrontend, esc, looksLikeSecret } from "../frontends/slack/index.js";
 import type { SlackTransport, SocketLike } from "../frontends/slack/socket.js";
 import type { FrontendContext } from "../frontends/types.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
@@ -47,6 +47,7 @@ function transport(): SlackTransport {
       const body = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
       calls.push({ method, body });
       if (method === "apps.connections.open") return Response.json({ ok: true, url: "wss://test" });
+      if (method === "conversations.open") return Response.json({ ok: true, channel: { id: `D-${String(body.users)}` } });
       return Response.json({ ok: true, ts: `${calls.length}.0` });
     },
     connect: () => ({ send() {}, close() {}, onopen: null, onmessage: null, onclose: null, onerror: null }) as SocketLike,
@@ -203,5 +204,69 @@ describe("approvals", () => {
 describe("text", () => {
   it("Slack's control characters are escaped, so a name can't make a mention or a link", () => {
     expect(esc("<!channel> & <https://x|y>")).toBe("&lt;!channel&gt; &amp; &lt;https://x|y&gt;");
+  });
+});
+
+describe("audit round 1", () => {
+  it("a key pasted into the DM is never sent on", async () => {
+    await slash(OWNER, "auth tok-owner");
+    await dm(OWNER, "here it is zid_sk_live_SECRET1234567890");
+    await until(() => posts().some((t) => t.includes("looks like a key")));
+    expect(providers.length).toBe(0);
+    expect(looksLikeSecret("eyJhbGciOiJFUzI1.eyJzdWIiOiJ1c2Vy.c2lnbmF0dXJlMTI")).toBe(true);
+    expect(looksLikeSecret("xoxb-1234567890-abcdefgh")).toBe(true);
+    expect(looksLikeSecret("please fix the zid parsing")).toBe(false);
+  });
+
+  it("a card raised under one sign-in is never answered under another", async () => {
+    script = [[{ type: "tool_start", toolId: "t1", sdkToolUseId: "s1", name: "Write", input: { file_path: join(tmp, "a.txt"), content: "x" }, approvalId: "ap-h1" } as ProviderEvent, done]];
+    await slash(OWNER, "auth tok-owner");
+    await dm(OWNER, "write it");
+    await until(() => calls.some((c) => Array.isArray(c.body.blocks)));
+    // The same Slack user signs in as someone else: the card they held is let go.
+    await slash(OWNER, "auth tok-other");
+    await press(OWNER, "approve", "ap-h1");
+    await until(() => calls.some((c) => c.method === "chat.update" && String(c.body.text).includes("no longer waiting")));
+    expect(providers.at(-1)!.canUseToolResults.length).toBe(0);
+  });
+
+  it("attaching to a session already waiting shows its card; one answered elsewhere closes", async () => {
+    await slash(OWNER, "auth tok-owner");
+    script = [[{ type: "tool_start", toolId: "t3", sdkToolUseId: "s3", name: "Write", input: { file_path: join(tmp, "c.txt"), content: "x" }, approvalId: "ap-m1" } as ProviderEvent, done]];
+    await manager.handle({ type: "session.create", id: "c", name: "waiter", workdir: tmp } as never, AUTH["tok-owner"]!, { id: "cli", auth: AUTH["tok-owner"]!, send: () => {} });
+    const session = manager.findByName("waiter", AUTH["tok-owner"]!)!;
+    void session.send("go", AUTH["tok-owner"]!);
+    await until(() => session.pendingToolApprovals().length > 0);
+    await slash(OWNER, "attach waiter");
+    await until(() => calls.some((c) => Array.isArray(c.body.blocks) && JSON.stringify(c.body.blocks).includes("ap-m1")));
+    // Answered from elsewhere (the CLI): the card's buttons go.
+    await manager.handle({ type: "session.approve", id: "a", sessionId: session.id, approvalId: "ap-m1", approved: false } as never, AUTH["tok-owner"]!, { id: "cli2", auth: AUTH["tok-owner"]!, send: () => {} });
+    await until(() => calls.some((c) => c.method === "chat.update" && String(c.body.text).includes("Answered elsewhere")));
+  });
+
+  it("model text is escaped and links don't unfurl", async () => {
+    script = [[{ type: "text_done", content: "<!channel> look <https://evil|Approve here>" } as ProviderEvent, done]];
+    await slash(OWNER, "auth tok-owner");
+    await dm(OWNER, "hi");
+    await until(() => posts().some((t) => t.includes("&lt;!channel&gt;")));
+    const post = calls.find((c) => String(c.body.text).includes("&lt;!channel&gt;"))!;
+    expect(post.body.unfurl_links).toBe(false);
+    expect(String(post.body.text)).not.toContain("<!channel>");
+  });
+
+  it("signing in opens the DM, so replies have somewhere to go before the first message", async () => {
+    await slash(OWNER, "auth tok-owner");
+    expect(calls.some((c) => c.method === "conversations.open" && c.body.users === OWNER)).toBe(true);
+  });
+});
+
+describe("one workspace", () => {
+  it("with a workspace id set, another workspace's events are ignored", async () => {
+    await frontend.stop();
+    frontend = new SlackFrontend("xapp-test", "xoxb-test", [OWNER], { transport: transport(), teamId: "T1" });
+    const verifier = { mode: "zeroid", verify: async (t: string) => AUTH[t] ?? Promise.reject(new Error("bad")) } as unknown as TokenVerifier;
+    await frontend.start({ manager, store, auth: { baseUrl: "http://localhost:1" }, verifier, httpServer: null as never, host: "127.0.0.1", port: 0 } as FrontendContext);
+    expect(await frontend.handleEnvelope({ envelope_id: "e", type: "slash_commands", payload: { team_id: "T2", user_id: OWNER, text: "auth tok-owner" } })).toBeUndefined();
+    expect(await frontend.handleEnvelope({ envelope_id: "e", type: "slash_commands", payload: { team_id: "T1", user_id: OWNER, text: "auth tok-owner" } })).toMatchObject({ text: expect.stringContaining("Signed in") });
   });
 });

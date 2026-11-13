@@ -65,6 +65,8 @@ export async function slackApi<T extends Record<string, unknown>>(
       method: "POST",
       headers: { "Content-Type": "application/json; charset=utf-8", Authorization: `Bearer ${token}` },
       body: JSON.stringify(body),
+      // A call that hangs must not hold up everything queued behind it.
+      signal: AbortSignal.timeout(15_000),
     });
     if (res.status === 429 && attempt === 0) {
       const wait = Math.min(30, Number(res.headers.get("retry-after")) || 1);
@@ -77,10 +79,20 @@ export async function slackApi<T extends Record<string, unknown>>(
   }
 }
 
+/** How long a slash command's handler has to answer inside the ack; a slower answer goes to its response_url. */
+const SLASH_ACK_MS = 2_500;
+/** Event ids remembered to drop Slack's retries of what was already handled. */
+const SEEN_EVENTS = 500;
+
 /**
  * One Socket Mode connection, kept open: reconnects when Slack sends a
  * `disconnect` (it refreshes connections every few hours) or the socket
  * drops, backing off from 1 s to 30 s while it can't connect.
+ *
+ * Slack resends an envelope not acknowledged within 3 s, so events and
+ * button presses are acknowledged at once and handled after, one at a time
+ * in arrival order, and an event Slack retries is dropped. A slash command
+ * answers inside its ack when it can, else at its response_url.
  */
 export class SlackSocket {
   #appToken: string;
@@ -90,6 +102,8 @@ export class SlackSocket {
   #stopped = false;
   #backoffMs = 1_000;
   #timer: ReturnType<typeof setTimeout> | null = null;
+  #inbound: Promise<void> = Promise.resolve();
+  #seen = new Set<string>();
 
   constructor(
     appToken: string,
@@ -101,7 +115,7 @@ export class SlackSocket {
     this.#transport = transport;
   }
 
-  /** Open the connection; resolves once the first one is open, or throws if Slack refuses the app token. */
+  /** Ask Slack for a connection and open it; throws if Slack refuses the app token. Reconnects on its own after. */
   async start(): Promise<void> {
     this.#stopped = false;
     await this.#open();
@@ -119,16 +133,23 @@ export class SlackSocket {
   async #open(): Promise<void> {
     const { url } = await slackApi<{ url: string }>(this.#transport, this.#appToken, "apps.connections.open", {});
     if (this.#stopped) return;
+    const previous = this.#socket;
     const socket = this.#transport.connect(url);
     this.#socket = socket;
-    socket.onopen = () => {
-      this.#backoffMs = 1_000;
-    };
-    socket.onmessage = (ev) => void this.#receive(socket, ev.data);
+    socket.onmessage = (ev) => this.#receive(socket, ev.data);
     socket.onerror = () => {};
     socket.onclose = () => {
-      if (this.#socket === socket) this.#socket = null;
-      this.#reconnect();
+      if (this.#socket === socket) {
+        this.#socket = null;
+        this.#reconnect();
+      }
+    };
+    // The one being replaced goes only once this one is up, so nothing in between is lost.
+    socket.onopen = () => {
+      if (previous && previous !== socket) {
+        previous.onclose = null;
+        previous.close();
+      }
     };
   }
 
@@ -145,21 +166,21 @@ export class SlackSocket {
     }, wait);
   }
 
-  async #receive(socket: SocketLike, data: unknown): Promise<void> {
+  #receive(socket: SocketLike, data: unknown): void {
     let msg: { type?: string; envelope_id?: string; payload?: unknown; accepts_response_payload?: boolean };
     try {
       msg = JSON.parse(typeof data === "string" ? data : new TextDecoder().decode(data as ArrayBuffer));
     } catch {
       return;
     }
-    if (msg.type === "hello") return;
+    if (msg.type === "hello") {
+      // Connected for real: the next drop starts backing off afresh.
+      this.#backoffMs = 1_000;
+      return;
+    }
     if (msg.type === "disconnect") {
-      // Slack is about to close this connection: open the next one now, then let this one go.
-      const old = socket;
-      if (this.#socket === old) this.#socket = null;
-      old.onclose = null;
-      old.close();
-      this.#reconnect();
+      // Slack is about to close this one: open the next, which closes this when it is up.
+      this.#open().catch(() => this.#reconnect());
       return;
     }
     if (!msg.envelope_id || !msg.payload || typeof msg.payload !== "object") return;
@@ -169,16 +190,56 @@ export class SlackSocket {
       payload: msg.payload as Record<string, unknown>,
       ...(msg.accepts_response_payload ? { accepts_response_payload: true } : {}),
     };
-    let response: Record<string, unknown> | undefined;
+    const ack = (payload?: Record<string, unknown>) => {
+      try {
+        socket.send(JSON.stringify({ envelope_id: env.envelope_id, ...(payload && env.accepts_response_payload ? { payload } : {}) }));
+      } catch {
+        // Closed meanwhile: Slack resends it on the next connection (and a resent event is dropped below).
+      }
+    };
+    if (env.type === "slash_commands") {
+      void this.#slash(env, ack);
+      return;
+    }
+    ack();
+    const eventId = typeof env.payload.event_id === "string" ? env.payload.event_id : undefined;
+    if (eventId) {
+      if (this.#seen.has(eventId)) return;
+      this.#seen.add(eventId);
+      if (this.#seen.size > SEEN_EVENTS) this.#seen.delete(this.#seen.values().next().value!);
+    }
+    this.#inbound = this.#inbound.then(async () => {
+      await this.#handle(env);
+    });
+  }
+
+  async #handle(env: SlackEnvelope): Promise<Record<string, unknown> | undefined> {
     try {
-      response = await this.#onEnvelope(env);
+      return await this.#onEnvelope(env);
     } catch (err) {
       console.error(`[codeoid:slack] handling ${env.type} failed: ${err instanceof Error ? err.message : String(err)}`);
+      return undefined;
     }
-    try {
-      socket.send(JSON.stringify({ envelope_id: env.envelope_id, ...(response && env.accepts_response_payload ? { payload: response } : {}) }));
-    } catch {
-      // The socket closed meanwhile: Slack retries the envelope on the next connection.
+  }
+
+  /** A slash command: its answer in the ack if it comes within SLASH_ACK_MS, else posted to its response_url. */
+  async #slash(env: SlackEnvelope, ack: (payload?: Record<string, unknown>) => void): Promise<void> {
+    let late = false;
+    const timer = new Promise<"late">((r) => setTimeout(() => r("late"), SLASH_ACK_MS));
+    const work = this.#handle(env);
+    const first = await Promise.race([work, timer]);
+    if (first !== "late") {
+      ack(first);
+      return;
+    }
+    late = true;
+    ack();
+    const answer = await work;
+    const url = typeof env.payload.response_url === "string" ? env.payload.response_url : undefined;
+    if (late && answer && url?.startsWith("https://hooks.slack.com/")) {
+      await this.#transport
+        .fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(answer), signal: AbortSignal.timeout(15_000) })
+        .catch(() => {});
     }
   }
 }

@@ -75,6 +75,7 @@ src/
 │   ├── types.ts                  # Frontend plugin interface
 │   ├── index.ts
 │   ├── telegram/index.ts         # Grammy bot, embedded in daemon process
+│   ├── slack/                    # Slack app over Socket Mode (socket.ts) and the frontend (index.ts), docs/slack.md
 │   └── web-ui/index.ts           # Serves the built SolidJS app (web/dist) at /ui, also Telegram Mini App
 └── terminal/
     └── client.ts                 # WebSocket client, connects to daemon
@@ -605,7 +606,7 @@ ZEROID_URL=highflame                 # issuer: preset (highflame | highflame-dev
 ZEROID_ISSUER=                       # override the expected `iss` claim (default: resolved ZEROID_URL)
 TELEGRAM_BOT_TOKEN=...              # Optional: enables Telegram frontend
 TELEGRAM_ALLOWED_USER_IDS=123,456   # Required with bot token
-SLACK_APP_TOKEN=xapp-...             # Optional, with SLACK_BOT_TOKEN and SLACK_ALLOWED_USER_IDS: the Slack frontend (docs/slack.md)
+CODEOID_SLACK_APP_TOKEN=xapp-...             # Optional, with CODEOID_SLACK_BOT_TOKEN and CODEOID_SLACK_ALLOWED_USER_IDS: the Slack frontend (docs/slack.md)
 CODEOID_MCP_CONTROL_ENABLED=false   # mount /mcp/control (docs/mcp-control.md)
 CODEOID_MCP_CONTROL_ACTIONS=false   # also allow create / send / interrupt / destroy there
 CODEOID_ROUTINES_ENABLED=true       # scheduler + routine commands (docs/routines.md)

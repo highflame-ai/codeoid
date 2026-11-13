@@ -2,8 +2,8 @@
  * Slack frontend: talk to codeoid's conductor from a Slack DM.
  *
  * Runs inside the daemon, over Socket Mode (socket.ts), so it needs no public
- * URL. Enabled when SLACK_APP_TOKEN, SLACK_BOT_TOKEN and
- * SLACK_ALLOWED_USER_IDS are set; ZeroID only, never in local mode.
+ * URL. Enabled when CODEOID_SLACK_APP_TOKEN, CODEOID_SLACK_BOT_TOKEN and
+ * CODEOID_SLACK_ALLOWED_USER_IDS are set; ZeroID only, never in local mode.
  *
  * - `/codeoid auth <zid_sk_…>`: sign in with your own ZeroID key. A slash
  *   command is never posted to the conversation, so the key isn't left in it.
@@ -55,6 +55,8 @@ interface UserState {
   streams: Map<string, string>;
   /** Posts to this user, in order. */
   outbox: Promise<void>;
+  /** Bumped when the sign-in changes: work queued under an earlier one is dropped, never done under this. */
+  epoch: number;
 }
 
 const APPROVAL_TTL_MS = 60 * 60 * 1000;
@@ -66,6 +68,8 @@ export interface SlackFrontendOptions {
   /** Transport for Slack (tests inject one). */
   transport?: SlackTransport;
   approvalTtlMs?: number;
+  /** Only this Slack workspace's events (CODEOID_SLACK_TEAM_ID); unset: any the app receives. */
+  teamId?: string;
 }
 
 export class SlackFrontend implements Frontend {
@@ -76,7 +80,13 @@ export class SlackFrontend implements Frontend {
   #allowed: Set<string>;
   #transport: SlackTransport | undefined;
   #approvalTtlMs: number;
+  #teamId: string | undefined;
   #socket: SlackSocket | null = null;
+  /** When each non-allowlisted user was last told so, and each session's last "needs you": neither repeated often. */
+  #toldStranger = new Map<string, number>();
+  #toldNeeds = new Map<string, number>();
+  /** A card's tool-call message → its approval key, to close the card when the call is answered elsewhere. */
+  #cardOfMessage = new Map<string, string>();
   #manager!: SessionManager;
   #authConfig!: AuthConfig;
   #verifier!: TokenVerifier;
@@ -91,6 +101,7 @@ export class SlackFrontend implements Frontend {
     this.#allowed = new Set(allowedUserIds);
     this.#transport = opts.transport;
     this.#approvalTtlMs = opts.approvalTtlMs ?? APPROVAL_TTL_MS;
+    this.#teamId = opts.teamId;
   }
 
   async start(ctx: FrontendContext): Promise<void> {
@@ -102,9 +113,10 @@ export class SlackFrontend implements Frontend {
     if (ctx.verifier.mode !== "zeroid") {
       throw new Error("the Slack frontend requires ZeroID auth — it is not available in local mode (run `codeoid login`, then start without --local)");
     }
-    this.#unsubscribe = this.#manager.onNeedsOwner((sessionId, name, owner) => this.#needsYou(sessionId, name, owner));
     this.#socket = new SlackSocket(this.#appToken, (env) => this.handleEnvelope(env), this.#transport);
     await this.#socket.start();
+    // Only once connected: a start that fails leaves nothing subscribed.
+    this.#unsubscribe = this.#manager.onNeedsOwner((sessionId, name, owner) => this.#needsYou(sessionId, name, owner));
   }
 
   async stop(): Promise<void> {
@@ -119,6 +131,11 @@ export class SlackFrontend implements Frontend {
 
   /** One Socket Mode envelope; what it returns is the ack's payload (a slash command's ephemeral reply). Public for tests. */
   async handleEnvelope(env: SlackEnvelope): Promise<Record<string, unknown> | undefined> {
+    if (this.#teamId) {
+      const p = env.payload;
+      const team = p.team_id ?? (p.team as { id?: unknown } | undefined)?.id ?? (p.event as { team?: unknown } | undefined)?.team;
+      if (team !== this.#teamId) return undefined;
+    }
     if (env.type === "slash_commands") return this.#slashCommand(env.payload);
     if (env.type === "events_api") {
       const event = env.payload.event as Record<string, unknown> | undefined;
@@ -190,6 +207,13 @@ export class SlackFrontend implements Frontend {
       state.auth = auth;
       state.rawToken = token;
       this.#store.audit(auth.sub, "slack.auth", undefined, `slack_user_id=${userId}${auth.name ? ` name=${auth.name}` : ""}`);
+      // Their DM with the app, so replies have somewhere to go before they first write there.
+      if (!state.dmChannel) {
+        try {
+          const opened = await slackApi<{ channel: { id: string } }>(this.#transportOrDefault(), this.#botToken, "conversations.open", { users: userId });
+          state.dmChannel = opened.channel.id;
+        } catch {}
+      }
       return `Signed in as ${auth.name ?? auth.sub}. Message me to talk to the conductor.`;
     } catch (err) {
       return `Sign-in failed: ${err instanceof Error ? err.message : "unknown error"}`;
@@ -252,6 +276,21 @@ export class SlackFrontend implements Frontend {
       state.attachedName = prev.name;
       return `Couldn't attach: ${resp.error}`;
     }
+    // What it was already waiting on was said before this attach: shown now, as cards.
+    if (state.dmChannel) {
+      const approvals = await this.#manager.handle({ type: "session.approvals", id: randomUUID(), sessionId }, state.auth!, this.#client(userId, state));
+      const pending = (approvals as { approvals?: Array<{ approvalId: string; messageId?: string; toolName: string; input: unknown; risk?: unknown; sandboxed?: boolean; sandboxNote?: string; sandboxDocker?: boolean; targetWorkstream?: { workstream?: string; warning?: string } }> }).approvals ?? [];
+      const epoch = state.epoch;
+      const channel = state.dmChannel;
+      for (const a of pending) {
+        const tool = {
+          name: a.toolName,
+          toolId: a.approvalId,
+          state: { phase: "waiting_confirmation", approvalId: a.approvalId, input: a.input, description: `${a.toolName} ${JSON.stringify(a.input).slice(0, 1_500)}`, risk: a.risk, sandboxed: a.sandboxed, sandboxNote: a.sandboxNote, sandboxDocker: a.sandboxDocker, targetWorkstream: a.targetWorkstream },
+        } as unknown as ToolInfo;
+        this.#queue(userId, () => (state.epoch === epoch ? this.#approvalCard(userId, state, tool, sessionId, channel, a.messageId) : Promise.resolve()));
+      }
+    }
     return `Talking to *${esc(name)}* now.`;
   }
 
@@ -273,7 +312,17 @@ export class SlackFrontend implements Frontend {
     const text = String(event.text ?? "").trim();
     if (!userId || !channel || !text) return;
     if (!this.#allowed.has(userId)) {
-      await this.#post(channel, "You're not on this codeoid's allowlist.");
+      const last = this.#toldStranger.get(userId) ?? 0;
+      if (Date.now() - last > 60 * 60 * 1000) {
+        this.#toldStranger.set(userId, Date.now());
+        if (this.#toldStranger.size > 1000) this.#toldStranger.clear();
+        await this.#post(channel, "You're not on this codeoid's allowlist.");
+      }
+      return;
+    }
+    // A key or a token pasted here would reach the model and its transcript: never forwarded.
+    if (looksLikeSecret(text)) {
+      await this.#post(channel, "⚠️ That looks like a key or a token, so it wasn't sent. Revoke it, and delete your message (I can't). Sign in with `/codeoid auth <key>`: a slash command isn't kept in the conversation.");
       return;
     }
     const state = this.#state(userId);
@@ -318,28 +367,43 @@ export class SlackFrontend implements Frontend {
         // hasn't been posted is posted at the turn's end.
         if (m.content) {
           state.streams.delete(m.messageId);
-          this.#say(userId, channel, m.content);
+          this.#say(userId, channel, esc(m.content));
         } else if (!state.streams.has(m.messageId)) state.streams.set(m.messageId, "");
       } else if (m.role === "tool_call" && m.tool?.state.phase === "waiting_confirmation" && "approvalId" in m.tool.state) {
         const tool = m.tool;
-        this.#queue(userId, () => this.#approvalCard(userId, state, tool));
+        // Bound now: the session it came from and the sign-in it came to (H1).
+        const epoch = state.epoch;
+        const sessionId = m.sessionId;
+        const messageId = m.messageId;
+        this.#queue(userId, () => (state.epoch === epoch ? this.#approvalCard(userId, state, tool, sessionId, channel, messageId) : Promise.resolve()));
       } else if (m.role === "system" && m.content) {
-        this.#say(userId, channel, `⚠️ ${m.content}`);
+        this.#say(userId, channel, `⚠️ ${esc(m.content)}`);
       }
       return;
     }
     if (msg.type === "session.message.delta") {
       if (msg.contentAppend && state.streams.has(msg.messageId)) state.streams.set(msg.messageId, (state.streams.get(msg.messageId) ?? "") + msg.contentAppend);
+      // A card's call answered elsewhere (the web UI, the CLI) or cancelled: its buttons go.
+      const phase = msg.toolStateUpdate?.phase;
+      const key = this.#cardOfMessage.get(msg.messageId);
+      if (key && phase && phase !== "waiting_confirmation") {
+        this.#cardOfMessage.delete(msg.messageId);
+        const card = this.#approvals.get(key);
+        if (card) {
+          this.#approvals.delete(key);
+          if (card.ts) this.#queue(userId, () => this.#update(card.channel, card.ts!, "Answered elsewhere."));
+        }
+      }
       return;
     }
     if (msg.type === "session.status_change" && (msg.status === "idle" || msg.status === "error")) {
-      for (const text of state.streams.values()) if (text.trim()) this.#say(userId, channel, text);
+      for (const text of state.streams.values()) if (text.trim()) this.#say(userId, channel, esc(text));
       state.streams.clear();
       if (msg.status === "error") this.#say(userId, channel, "❌ The turn ended with an error.");
       return;
     }
     if (msg.type === "session.ui_request") {
-      this.#say(userId, channel, `❓ ${msg.title} — answer it in the web UI or with \`codeoid attach\`.`);
+      this.#say(userId, channel, `❓ ${esc(msg.title)} — answer it in the web UI or with \`codeoid attach\`.`);
     }
   }
 
@@ -356,15 +420,24 @@ export class SlackFrontend implements Frontend {
 
   // ── Approval cards ────────────────────────────────────────────────────
 
-  async #approvalCard(userId: string, state: UserState, tool: ToolInfo): Promise<void> {
+  async #approvalCard(userId: string, state: UserState, tool: ToolInfo, sessionId: string, channel: string, messageId?: string): Promise<void> {
     const st = tool.state;
-    if (st.phase !== "waiting_confirmation") return;
+    if (st.phase !== "waiting_confirmation" || !state.auth) return;
+    // A question for you (AskUserQuestion) needs its options, which a card here can't take: say where to answer.
+    if (tool.name === "AskUserQuestion") {
+      await this.#post(channel, "❓ A question is waiting for you — answer it in the web UI or with `codeoid attach`.");
+      return;
+    }
     this.#prune();
     const key = `${userId}:${st.approvalId}`;
     if (this.#approvals.has(key)) return;
-    const pending: PendingApproval = { approvalId: st.approvalId, sessionId: state.attachedSessionId!, userId, channel: state.dmChannel!, createdAt: Date.now() };
+    const pending: PendingApproval = { approvalId: st.approvalId, sessionId, userId, channel, createdAt: Date.now() };
     this.#approvals.set(key, pending);
-    const lines = [`*Approval needed* — \`${esc(tool.name)}\``, esc(String(st.description ?? tool.name)).slice(0, 2_000)];
+    if (messageId) this.#cardOfMessage.set(messageId, key);
+    const full = esc(String(st.description ?? tool.name));
+    // Never cut silently: a tail it doesn't show could be what runs.
+    const shown = full.length > 2_000 ? `${full.slice(0, 2_000)}…\n_(cut short: see the whole call in the web UI or with \`codeoid approve\`)_` : full;
+    const lines = [`*Approval needed* — \`${esc(tool.name)}\``, shown];
     const tw = st.targetWorkstream;
     if (tw?.workstream) lines.push(`⌂ workstream *${esc(tw.workstream)}*`);
     if (tw?.warning) lines.push(`⚠ ${esc(tw.warning)}`);
@@ -378,6 +451,8 @@ export class SlackFrontend implements Frontend {
       const res = await slackApi<{ ts: string }>(this.#transportOrDefault(), this.#botToken, "chat.postMessage", {
         channel: pending.channel,
         text: `Approval needed — ${tool.name}`,
+        unfurl_links: false,
+        unfurl_media: false,
         blocks: [
           { type: "section", text: { type: "mrkdwn", text: text.slice(0, CHUNK) } },
           {
@@ -454,6 +529,10 @@ export class SlackFrontend implements Frontend {
       if (a.sub !== owner.sub || a.accountId !== owner.accountId || a.projectId !== owner.projectId) continue;
       // The attached session's cards come with the conversation.
       if (state.attachedSessionId === sessionId) continue;
+      const told = `${userId}:${sessionId}`;
+      if (Date.now() - (this.#toldNeeds.get(told) ?? 0) < 10 * 60 * 1000) continue;
+      this.#toldNeeds.set(told, Date.now());
+      if (this.#toldNeeds.size > 1000) this.#toldNeeds.clear();
       this.#queue(userId, () => this.#post(channel, `🔔 *${esc(name)}* is waiting for you. \`/codeoid attach ${esc(name)}\` to answer it here.`));
     }
   }
@@ -463,7 +542,7 @@ export class SlackFrontend implements Frontend {
   #state(userId: string): UserState {
     let s = this.#users.get(userId);
     if (!s) {
-      s = { auth: null, rawToken: null, attachedSessionId: null, attachedName: null, clientId: `slack:${userId}`, dmChannel: null, streams: new Map(), outbox: Promise.resolve() };
+      s = { auth: null, rawToken: null, attachedSessionId: null, attachedName: null, clientId: `slack:${userId}`, dmChannel: null, streams: new Map(), outbox: Promise.resolve(), epoch: 0 };
       this.#users.set(userId, s);
     }
     return s;
@@ -487,6 +566,7 @@ export class SlackFrontend implements Frontend {
 
   /** Let go of a user's identity, attachment and pending cards: a card is never answered under another sign-in. */
   #forget(userId: string, state: UserState): void {
+    state.epoch++;
     state.auth = null;
     state.rawToken = null;
     try {
@@ -509,7 +589,7 @@ export class SlackFrontend implements Frontend {
   async #post(channel: string, text: string): Promise<void> {
     for (let i = 0; i < text.length || i === 0; i += CHUNK) {
       try {
-        await slackApi(this.#transportOrDefault(), this.#botToken, "chat.postMessage", { channel, text: text.slice(i, i + CHUNK), mrkdwn: true });
+        await slackApi(this.#transportOrDefault(), this.#botToken, "chat.postMessage", { channel, text: text.slice(i, i + CHUNK), mrkdwn: true, unfurl_links: false, unfurl_media: false });
       } catch (err) {
         console.error(`[codeoid:slack] post failed: ${err instanceof Error ? err.message : String(err)}`);
         return;
@@ -529,4 +609,12 @@ export class SlackFrontend implements Frontend {
 /** Slack's three control characters, escaped for mrkdwn (a name or text can't make a mention or a link). */
 export function esc(text: string): string {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+/**
+ * Whether a DM looks like a credential pasted by mistake: a ZeroID key, a
+ * JWT, or a Slack token. It is never forwarded to a session.
+ */
+export function looksLikeSecret(text: string): boolean {
+  return /\bzid_sk_[A-Za-z0-9_-]{8,}/.test(text) || /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/.test(text) || /\bxox[abposr]-[A-Za-z0-9-]{8,}|\bxapp-[A-Za-z0-9-]{8,}/.test(text);
 }

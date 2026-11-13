@@ -638,8 +638,7 @@ export class SessionManager {
    *  pipeline run drives phases on a live session; the phase resolves when that
    *  session next reaches a resting status (see #statusObserver). */
   #phaseWaiters = new Map<string, (status: PhaseTurnResult["finalStatus"]) => void>();
-  /** Stable observer identity — every Session reports status transitions here. */
-  #needsOwnerListeners = new Set<(sessionId: string, name: string, owner: { sub: string; accountId: string; projectId: string }) => void>();
+    #needsOwnerListeners = new Set<(sessionId: string, name: string, owner: { sub: string; accountId: string; projectId: string }) => void>();
 
   /**
    * Hear when a session starts waiting on its owner (an approval): its id,
@@ -653,6 +652,7 @@ export class SessionManager {
     };
   }
 
+/** Stable observer identity — every Session reports status transitions here. */
   #statusObserver = (sessionId: string, status: SessionInfo["status"], opts?: { settled: true }): void => {
     // A turn settled without a status change: only what waits on spend cares (#430).
     if (opts?.settled) {

@@ -806,6 +806,19 @@ const frontends: SettingsTab = {
       ],
     },
     {
+      id: "slack",
+      title: "Slack",
+      description: "Set the app and bot tokens and an allowlist to run the Slack frontend (docs/slack.md).",
+      fields: [
+        secret("CODEOID_SLACK_APP_TOKEN", "App token", "App-level token (xapp-…) with connections:write: the Socket Mode connection."),
+        secret("CODEOID_SLACK_BOT_TOKEN", "Bot token", "Bot User OAuth Token (xoxb-…) the app posts with."),
+        env("CODEOID_SLACK_ALLOWED_USER_IDS", "Allowed member ids", "Slack member ids permitted to use the app (required with the tokens).", {
+          kind: "string[]",
+        }),
+        env("CODEOID_SLACK_TEAM_ID", "Workspace id", "Only messages from this Slack workspace (T…) are taken. Unset: the workspace the app is installed in.", {}),
+      ],
+    },
+    {
       id: "web",
       title: "Web",
       fields: [

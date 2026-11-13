@@ -29,7 +29,7 @@ Slack works only with ZeroID sign-in, never in local mode.
          - chat:write
          - commands
          - im:history
-         - im:read
+         - im:write
    settings:
      event_subscriptions:
        bot_events:
@@ -45,9 +45,10 @@ Slack works only with ZeroID sign-in, never in local mode.
 5. Add to `~/.codeoid/.env`, then restart the daemon:
 
    ```bash
-   SLACK_APP_TOKEN=xapp-…
-   SLACK_BOT_TOKEN=xoxb-…
-   SLACK_ALLOWED_USER_IDS=U0123ABCD   # comma-separated
+   CODEOID_SLACK_APP_TOKEN=xapp-…
+   CODEOID_SLACK_BOT_TOKEN=xoxb-…
+   CODEOID_SLACK_ALLOWED_USER_IDS=U0123ABCD   # comma-separated
+   CODEOID_SLACK_TEAM_ID=T0123ABCD            # optional: only this workspace
    ```
 
 6. In Slack, run `/codeoid auth <zid_sk_…>` once with your ZeroID key. A slash command isn't posted to the conversation, so the key doesn't stay in it.
@@ -59,8 +60,9 @@ Slack works only with ZeroID sign-in, never in local mode.
 - Message the codeoid app to talk to the conductor. It is created the first time you write.
 - `/codeoid ls` lists your sessions; `/codeoid attach <name>` talks to one instead; `/codeoid conductor` goes back.
 - `/codeoid stop` interrupts the current turn; `/codeoid who` shows who you are signed in as.
-- When the session you're talking to asks to run something, a card shows what it would do, the workstream it acts in, its risk and whether it is sandboxed, with Approve and Deny buttons. Only you can press your cards.
+- When the session you're talking to asks to run something, a card shows what it would do, the workstream it acts in, its risk and whether it is sandboxed, with Approve and Deny buttons. Only the person a card was sent to can press it, and only once; a card answered elsewhere (the web UI, the CLI) closes.
 - When another of your sessions is waiting on you, you get a message naming it.
 
-Only the people in `SLACK_ALLOWED_USER_IDS` can use it, and each acts with their own key: what they can do is what that key allows.
+Only the people in `CODEOID_SLACK_ALLOWED_USER_IDS` can use it, and each acts with their own key: what they can do is what that key allows.
 Your sign-in ends when the key's token expires; run `/codeoid auth` again.
+A key or token pasted into the DM by mistake is never sent on; revoke it, and delete the message.
