@@ -12,7 +12,8 @@ import { join } from "node:path";
 import { draftConnection, EndpointError, EndpointStore, isPrivateHost } from "../daemon/openai-endpoints.js";
 import { EndpointCatalog, syncEndpointProviders, watchEndpointProviders } from "../daemon/providers/endpoint/index.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
-import { SessionManager } from "../daemon/session-manager.js";
+import { resolveOnEndpoint, SessionManager } from "../daemon/session-manager.js";
+import { backendLabel } from "../daemon/session.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
@@ -674,5 +675,98 @@ describe("daemon", () => {
     await transcript.flush();
     const meta = JSON.parse(readFileSync(join(dir, "transcripts", `${created.data!.id}.meta.json`), "utf8"));
     expect(meta.providerId).toBe("oai:box");
+  });
+
+  test("a model the dropdown offers is one the switch accepts, and the server answers on it; a custom id passes through, a Claude one is refused", async () => {
+    await handle({ type: "endpoints.set", id: "s", name: "box", displayName: "GPU box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "conf-a" }, { id: "conf-b" }] });
+    const listed = (await handle({ type: "models.list", id: "m", provider: "oai:box" })) as unknown as { models: Array<{ value: string }> };
+    expect(listed.models.map((m) => m.value)).toEqual(["conf-a", "conf-b"]);
+    const created = (await handle({ type: "session.create", id: "c", name: "sm", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
+    const sessionId = created.data!.id;
+    await handle({ type: "session.attach", id: "a", sessionId });
+
+    // A model from the dropdown: accepted (it was refused with "Available: " and nothing after it), and used.
+    expect(await handle({ type: "session.set_model", id: "sm1", sessionId, model: "conf-b" })).toMatchObject({ type: "response.ok", data: { model: "conf-b" } });
+    await handle({ type: "session.send", id: "m1", sessionId, text: "hi" });
+    await waitFor(() => assistantTexts().length === 1);
+    expect(assistantTexts()[0]).toBe("hello from conf-b");
+
+    // The dropdown's custom model id: not configured, so the server is the judge.
+    expect(await handle({ type: "session.set_model", id: "sm2", sessionId, model: "served-a" })).toMatchObject({ type: "response.ok", data: { model: "served-a" } });
+    await handle({ type: "session.send", id: "m2", sessionId, text: "again" });
+    await waitFor(() => assistantTexts().length === 2);
+    expect(assistantTexts()[1]).toBe("hello from served-a");
+
+    // A Claude model isn't the endpoint's: refused, saying why and what is configured.
+    for (const model of ["claude-sonnet-4-5", "opus"]) {
+      const refused = await handle({ type: "session.set_model", id: `sm-${model}`, sessionId, model });
+      expect(refused).toMatchObject({ type: "response.error", code: "invalid_request" });
+      expect(String(refused.error)).toContain("is a Claude model");
+      expect(String(refused.error)).toContain("Configured: conf-a, conf-b");
+    }
+
+    // Its replies are labelled with the endpoint, not "(Claude)".
+    const replies = pushed.flatMap((m) => (m.type === "session.message" && m.role === "assistant" ? [m.identity.name] : []));
+    expect(replies.length).toBeGreaterThan(0);
+    for (const name of replies) expect(name).toBe("sm (GPU box)");
+  });
+
+  test("a Claude model a gateway lists is a model it serves; a removed endpoint takes no model (round-1 audit)", async () => {
+    await handle({ type: "endpoints.set", id: "s", name: "gw", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "claude-sonnet-4-5" }] });
+    const created = (await handle({ type: "session.create", id: "c", name: "gw1", workdir: dir, providerId: "oai:gw" })) as { data?: SessionInfo };
+    const sessionId = created.data!.id;
+    await handle({ type: "session.attach", id: "a", sessionId });
+    expect(await handle({ type: "session.set_model", id: "m1", sessionId, model: "claude-sonnet-4-5" })).toMatchObject({ type: "response.ok", data: { model: "claude-sonnet-4-5" } });
+    await handle({ type: "session.send", id: "t1", sessionId, text: "hi" });
+    await waitFor(() => assistantTexts().length === 1);
+    expect(assistantTexts()[0]).toBe("hello from claude-sonnet-4-5");
+    // Not listed: refused.
+    expect(await handle({ type: "session.set_model", id: "m2", sessionId, model: "us.anthropic.claude-3-5-sonnet-20241022-v2:0" })).toMatchObject({ type: "response.error" });
+    // A control character never reaches the gateway.
+    const bad = await handle({ type: "session.set_model", id: "m3", sessionId, model: "x\r\nX-Injected: 1" });
+    expect(bad).toMatchObject({ type: "response.error" });
+    expect(String(bad.error)).toContain("isn't a model id");
+    await handle({ type: "endpoints.remove", id: "r", name: "gw" });
+    const gone = await handle({ type: "session.set_model", id: "m4", sessionId, model: "anything" });
+    expect(gone).toMatchObject({ type: "response.error" });
+    expect(String(gone.error)).toContain("no longer exists");
+  });
+});
+
+describe("a session's agent label", () => {
+  test("names its backend, without the vendor in parentheses: Claude sessions read as before", () => {
+    expect(backendLabel({ id: "claude", displayName: "Claude (Anthropic)" })).toBe("Claude");
+    expect(backendLabel({ id: "codex", displayName: "Codex (OpenAI)" })).toBe("Codex");
+    expect(backendLabel({ id: "qwen", displayName: "Qwen Code (Alibaba)" })).toBe("Qwen Code");
+    expect(backendLabel({ id: "oai:box", displayName: "GPU box" })).toBe("GPU box");
+    expect(backendLabel({ id: "oai:rakuten-oss", displayName: "rakuten-oss" })).toBe("rakuten-oss");
+    expect(backendLabel({ id: "opencode", displayName: "" })).toBe("opencode");
+    // An endpoint's display name is the user's own words: kept whole.
+    expect(backendLabel({ id: "oai:rakuten", displayName: "Rakuten (internal)" })).toBe("Rakuten (internal)");
+    expect(backendLabel({ id: "oai:rakuten", displayName: "" })).toBe("rakuten");
+  });
+});
+
+describe("a model pick on an endpoint (round-1 audit of #468)", () => {
+  const listed = [
+    { value: "conf-a", displayName: "Conf A" },
+    { value: "claude-sonnet-4-5", displayName: "Claude via gateway" },
+  ];
+  test("a model the endpoint lists is taken, Claude-shaped or not, by id or display name", () => {
+    expect(resolveOnEndpoint("conf-a", listed, "oai:gw")).toBe("conf-a");
+    expect(resolveOnEndpoint("conf a", listed, "oai:gw")).toBe("conf-a");
+    expect(resolveOnEndpoint("claude-sonnet-4-5", listed, "oai:gw")).toBe("claude-sonnet-4-5");
+  });
+  test("a Claude model it doesn't list is refused, in Claude's, Bedrock's and alias forms; any other id passes", () => {
+    for (const id of ["claude-opus-4-1", "opus", "us.anthropic.claude-3-5-sonnet-20241022-v2:0", "anthropic.claude-3-haiku-20240307-v1:0"]) {
+      expect([id, resolveOnEndpoint(id, listed, "oai:gw")]).toEqual([id, null]);
+    }
+    expect(resolveOnEndpoint("org/model:tag", listed, "oai:gw")).toBe("org/model:tag");
+    expect(resolveOnEndpoint("  deepseek-v4  ", [], "oai:gw")).toBe("deepseek-v4");
+  });
+  test("an id the endpoint store wouldn't accept is refused: empty, over 256 characters, control characters", () => {
+    for (const id of ["", "   ", "x".repeat(257), "a\nb", "a\rb", "a\u0000b", "a\u007fb"]) {
+      expect([JSON.stringify(id), resolveOnEndpoint(id, [], "oai:gw")]).toEqual([JSON.stringify(id), null]);
+    }
   });
 });

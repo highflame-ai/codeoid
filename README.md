@@ -422,6 +422,7 @@ Full detail — keybindings, slash commands, ranking weights, rotation threshold
 - **[Parallel sessions + git worktrees](docs/FEATURES.md#parallel-sessions--git-worktrees)** — run features side by side; branches share one workspace memory, anchored on `git-common-dir`.
 - **[Execution modes](docs/FEATURES.md#execution-modes)** — `guarded` / `interactive` / `autonomous`, the last with a write-action budget that reverts to guarded when spent.
 - **[Mid-turn streaming input](docs/FEATURES.md#mid-turn-streaming-input-vscode-parity)** — send a follow-up while Claude is still responding; `now` / `next` / `later` priority.
+- **[Workstreams](docs/CONFIGURATION.md#setting-up-workstreams)** — group your work (a client, a team, a personal setup) so each session gets only its own MCP servers, credentials, folders and memory.
 - **[Attachments](docs/FEATURES.md#attachments)** — `@file` mentions, one-shot `/context`, and persistent `/pin`; drag-drop in the web UI.
 
 **Automation**

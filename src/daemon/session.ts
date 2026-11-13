@@ -2110,7 +2110,7 @@ export class Session {
     // Default agent identity — upgraded to ZeroID identity in SessionStart hook if manager is available
     this.#agentIdentity = {
       sub: `agent:${this.id}`,
-      name: `${opts.name} (Claude)`,
+      name: `${opts.name} (${backendLabel(this.#provider)})`,
       type: "agent",
     };
 
@@ -2860,6 +2860,10 @@ export class Session {
     // Resolved for the incoming backend before it is built (it may start at once to take the history).
     await this.#sandbox?.refresh(requested);
     this.#provider = this.#createProvider(requested);
+    // The local identity names the backend its replies come from (a ZeroID identity has its own name).
+    if (this.#agentIdentity.sub === `agent:${this.id}`) {
+      this.#agentIdentity = { ...this.#agentIdentity, name: `${this.name} (${backendLabel(this.#provider)})` };
+    }
     this.#warnIfBudgetUnenforced();
     this.#effortRestartPending = false; // the new backend starts with the session's effort
     this.#appliedAccount = this.#accountState(requested);
@@ -12740,4 +12744,16 @@ function isNativeRef(ref: unknown): ref is NativeTurnRef {
   const r = ref as Record<string, unknown>;
   const id = (v: unknown) => typeof v === "string" && /^[A-Za-z0-9-]{8,128}$/.test(v);
   return id(r.backingId) && id(r.ref) && (r.dir === undefined || (typeof r.dir === "string" && r.dir.startsWith("/")));
+}
+
+/**
+ * A backend's short name for a session's agent label ("my-session (Codex)"):
+ * its display name without the vendor in parentheses ("Codex (OpenAI)" →
+ * "Codex"), an endpoint's own name, else its id.
+ */
+export function backendLabel(provider: { displayName?: string; id: string }): string {
+  // An endpoint's display name is the user's own words: used as is.
+  if (provider.id.startsWith("oai:")) return provider.displayName?.trim() || provider.id.slice("oai:".length);
+  const name = (provider.displayName ?? "").replace(/\s+\([^()]*\)\s*$/, "").trim();
+  return name || provider.id;
 }
