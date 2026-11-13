@@ -13,7 +13,7 @@
 
 import type { Embedder } from "./embedder.js";
 import { normalize } from "./embedder.js";
-import { type SqliteEpisodeStore, type WorkspaceTenant, workstreamReadable } from "./store.js";
+import { type SqliteEpisodeStore, type WorkspaceTenant, workstreamReadable , hasFactFilter } from "./store.js";
 import { DEFAULT_WEIGHTS, rank, type RankerWeights } from "./ranker.js";
 import type { Reranker } from "./reranker.js";
 import { embedWindows, indexView } from "./lossless.js";
@@ -281,12 +281,18 @@ export class MemoryEngine {
     if (queryVector) bestWindowScores(this.#store.loadVectorMatrix(q.workspaceId), queryVector, vectorScores);
     const vectorIds = topIds(vectorScores, this.#vectorK);
 
+    // A query by a fact ("what failed in this repo") also takes what matches it directly.
+    const factIds = hasFactFilter(q) ? this.#store.recentMatching(q.workspaceId, q, 200) : [];
+    // A query for exact text (quoted, a command, an identifier): what holds it comes first.
+    const exactText = exactQueryText(q.query);
+    const exactIds = exactText ? this.#store.containing(q.workspaceId, exactText, Math.max(limit, 10)) : [];
+
     // Union candidates.
-    const candidateIds = [...new Set([...ftsHits.keys(), ...vectorIds])];
+    const candidateIds = [...new Set([...exactIds, ...ftsHits.keys(), ...vectorIds, ...factIds])];
     if (candidateIds.length === 0) return [];
 
     const episodes = this.#store.filter(candidateIds, q);
-    const hits = rank(episodes, {
+    const ranked = rank(episodes, {
       queryVector,
       vectorScores,
       ftsHits,
@@ -294,8 +300,11 @@ export class MemoryEngine {
       now,
       weights: this.#weights,
     });
-
-    return hits.slice(0, limit);
+    if (exactIds.length === 0) return ranked.slice(0, limit);
+    const exact = new Set(exactIds);
+    const first = ranked.filter((h) => exact.has(h.episode.id)).map((h) => ({ ...h, exact: true }));
+    const rest = ranked.filter((h) => !exact.has(h.episode.id));
+    return [...first, ...rest].slice(0, limit);
   }
 
   /** Record that `tenant` owns `workspaceId`, making the workspace reachable by
@@ -683,4 +692,20 @@ function excerpt(content: string, query: string, maxLen: number): string {
   const prefix = start > 0 ? "…" : "";
   const suffix = end < content.length ? "…" : "";
   return prefix + content.slice(start, end).trim() + suffix;
+}
+
+/**
+ * The text a query asks for exactly, or null: a quoted query (`"npm run build"`), or one that
+ * reads as a command or an identifier rather than prose — a single token with a path, flag or
+ * dot in it (`src/daemon/session.ts`, `--frozen-lockfile`, `MAX_TOKENS`), or words with a flag
+ * (`git rebase --onto`). Embeddings do badly on these; exact matches go first.
+ */
+export function exactQueryText(query: string): string | null {
+  const q = query.trim();
+  const quoted = /^(["'`])(.+)\1$/.exec(q);
+  if (quoted && quoted[2]!.trim().length >= 2) return quoted[2]!.trim();
+  if (q.length < 3 || q.length > 200) return null;
+  if (!/\s/.test(q) && /[./_=:@-]|[a-z][A-Z]|^[A-Z0-9_]{4,}$/.test(q)) return q;
+  if (/(?:^|\s)--?[A-Za-z]/.test(q) && q.split(/\s+/).length <= 8) return q;
+  return null;
 }

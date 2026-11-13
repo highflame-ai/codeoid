@@ -187,10 +187,12 @@ Claude
 
 Codeoid records every tool call, result, and reasoning block as an **episode** — stored verbatim, never summarized or truncated, retrievable via hybrid search. Every backend gets four tools:
 
-- `recall(query)` — semantic + keyword search across all prior sessions in this workspace
+- `recall(query)` — semantic + keyword search across all prior sessions in this workspace. A quoted query, a command, a path or an identifier gets the episodes holding it exactly first. `only_failed`, `backend`, `origin` and `cwd` narrow it: `recall("tests", only_failed: true)` finds what failed last time, with its output.
 - `recall_file(path)` — past episodes that touched a file
 - `timeline(limit)` — chronological list of recent activity across sessions
-- `get_episode(id)` — the full verbatim content of one episode, paged for long ones
+- `get_episode(id)` — the full verbatim content of one episode, paged for long ones, or by line ranges: `lines: [[-80, -1]]` returns the end first, where an error is
+
+Each tool call is stored with its exit code (when the backend reports or prints one), the directory it ran in and how long it took, and every episode with the backend, model and whose turn it was (the owner's, another person's, the agent's own background work, a dispatched worker's). The conductor's `fleet_recall` takes the same `only_failed`, `backend` and `origin`.
 
 **Nothing is cut.** A tool result of any size is kept whole, zstd-compressed (a 10 MiB build log stores in about 5 ms at ~5% of its size). What gets full-text indexed and embedded is a bounded view of it — the head, the tail, and the error/warning lines from the middle — so a huge output never stalls the daemon while SQLite indexes it. When [output compression](#context-reduction-stack) shortens a command's output for the agent, memory stores the uncompressed original.
 

@@ -259,6 +259,30 @@ PreToolUse rewrite, the tool loops codeoid runs, opencode's shell shim), so it c
 
 Old episodes keep null for the new fields; nothing is backfilled.
 
+### 3.1 S2 as built
+
+- A completed tool call had not reached memory since its completion moved to its own write path
+  (the chunker saw only its start, and stored it as "unfinished" when the next call began; the
+  reply after a call never became an episode). The tool_complete seam now hands the completed
+  message to the chunker, which tracks every open call by its message id (parallel calls), closes
+  a denied one when it is refused, and at the turn's end closes what never got a result and keeps
+  the reply that came while a call ran.
+- Facts: `Session#toolFacts` records a shell call's cwd (the backend's `shellCwd`, else the
+  workdir) and when it started running (at tool_start when it runs unasked, else at its
+  approval); at completion its duration and exit code (`memory/facts.ts` `exitCodeOf`: the code a
+  result names near its start or end, else 0 when the backend says it succeeded). Every episode
+  takes the session's backend, model and the turn's origin (`turnOrigin`, `dispatch` for a
+  worker). Columns `exit_code`, `cwd`, `duration_ms`, `backend`, `model`, `origin` on `episodes`.
+- Recall: `RecallQuery.onlyFailed` / `backend` / `origin` / `cwd`, applied in `matchesQuery`; a
+  query with one also takes `recentMatching` (the newest 200 by the columns) as candidates.
+  `exactQueryText` (quoted, or a token with a path, flag, dot or `CONST`, or words with a flag)
+  takes `containing` (an FTS phrase search, then checked) first, marked `exact`.
+- Tools: the recall tool's new arguments, a `facts:` line per hit, a divider after the exact ones,
+  "Try loosening: …" when filters leave nothing; `get_episode` `lines` (1-based, negative from
+  the end, merged, `[… N lines skipped …]`, at most 2,000 lines); `MEMORY_INSTRUCTIONS` as the
+  memory MCP server's `instructions`, and two lines more in the sessions' memory prompt;
+  `fleet_recall` `only_failed` / `backend` / `origin`.
+
 ## 4. S3 — saved approvals
 
 In guarded mode every shell command that isn't low asks, every time. S3 lets the owner answer once for

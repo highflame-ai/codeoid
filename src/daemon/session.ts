@@ -223,6 +223,7 @@ import { type CodeoidConfig, getConfigDir } from "../config.js";
 import { type SecretPathVerdict, secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir, takeSpill } from "./compress/spill.js";
+import { exitCodeOf } from "./memory/facts.js";
 import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
 import { type HeldPath, heldWriteOf, heldWriteReason, writeLandings, writeTargets } from "./held-writes.js";
 import { outsideEffects } from "./risk/effects.js";
@@ -270,7 +271,8 @@ const MEMORY_SYSTEM_PROMPT_APPEND = [
   "- Before reading a file, call recall_file(path) — if it was read recently and hasn't changed, reuse that content instead of issuing a fresh Read.",
   "- When the user references earlier work ('what we did yesterday', 'the bug we hit', 'that auth flow'), call recall(query) first. Don't guess from your own session history; it may be out of date.",
   "- At the start of a new session in a known workspace, consider calling timeline() to orient yourself on recent activity.",
-  "- recall and timeline results each carry an episode_id; pass it to get_episode(episode_id) to fetch that turn's exact stored bytes verbatim, with nothing summarized or dropped.",
+  "- recall and timeline results each carry an episode_id; pass it to get_episode(episode_id) to fetch that turn's exact stored bytes verbatim, with nothing summarized or dropped. For a long tool output, pass lines: [[-80, -1]] first: the end is where an error is.",
+  "- Before re-running a command to find out what failed, or what fixed it last time, call recall(query, only_failed: true): each tool call is stored with its full output, exit code and directory. Quote an exact command, path or identifier to get the episodes holding it first.",
   "",
   "Memory stores every tool call and assistant reply across all past sessions in this directory verbatim. It is the source of truth for history — the transcript in your context may be partial or truncated, so when a detail matters, page it in with these tools rather than relying on what you can see.",
 ].join("\n");
@@ -1475,6 +1477,8 @@ export class Session {
   /** The reply and the reasoning streaming now, scrubbed as they arrive (a secret split across deltas is never sent). */
   #textStream: StreamScrubber | null = null;
   #thinkingStream: StreamScrubber | null = null;
+  /** What memory keeps of each running tool call, by its message id (memory/chunker.ts toolFacts). */
+  #toolFacts = new Map<string, { shell: boolean; cwd?: string; startedAt?: number; durationMs?: number; exitCode?: number }>();
   /** Each running tool call's verdict (secrets/verdict.ts), by the backend's tool-use id. */
   #toolVerdicts = new Map<string, ToolVerdict>();
   #workerShape?: "ship" | "scout";
@@ -2143,6 +2147,15 @@ export class Session {
           sessionId: this.id,
           createdBy: opts.auth.sub,
           spillDir: defaultSpillDir(),
+          toolFacts: (messageId) => {
+            const f = this.#toolFacts.get(messageId);
+            return f ? { ...(f.cwd ? { cwd: f.cwd } : {}), ...(f.exitCode !== undefined ? { exitCode: f.exitCode } : {}), ...(f.durationMs !== undefined ? { durationMs: f.durationMs } : {}) } : undefined;
+          },
+          turnFacts: () => ({
+            backend: this.#provider.id,
+            ...(this.#model ? { model: this.#model } : {}),
+            origin: this.role === "worker" ? "dispatch" : this.#lastTurnOrigin,
+          }),
         },
         (episode) => {
           try {
@@ -10078,6 +10091,13 @@ export class Session {
       toolMsg.tool.state = resolvedState;
       const resolvedMsg: SessionMessage = { ...toolMsg, tool: { ...toolMsg.tool, state: resolvedState }, timestamp: new Date().toISOString() };
       this.#transcriptStore.append(this.id, resolvedMsg, this.#seq++).catch(() => {});
+      // It runs from now (approved), or never (refused: its episode closes now).
+      const facts = this.#toolFacts.get(msgId);
+      if (facts && (resolvedState as { phase?: string }).phase === "executing") facts.startedAt = Date.now();
+      if ((resolvedState as { phase?: string }).phase === "cancelled") {
+        this.#chunker?.onMessage(resolvedMsg);
+        this.#toolFacts.delete(msgId);
+      }
       this.#broadcastRaw({
         type: "session.message.delta",
         sessionId: this.id,
@@ -10726,6 +10746,15 @@ export class Session {
         );
         this.#activeToolMsgIds.push(toolMsg.messageId);
         this.#toolCallMessages.set(toolMsg.messageId, toolMsg);
+        // What memory keeps of it (docs/secrets-and-memory-design.md §3): where a shell call runs, and from when.
+        {
+          const shell = shellCallOf(event.name, event.input) !== null;
+          this.#toolFacts.set(toolMsg.messageId, {
+            shell,
+            ...(shell ? { cwd: event.shellCwd ?? this.workdir } : {}),
+            ...(autoApprove ? { startedAt: Date.now() } : {}),
+          });
+        }
         if (event.sdkAgentId || !this.#turnActive()) this.#backgroundToolMsgIds.add(toolMsg.messageId);
         this.#toolUseIdToMessageId.set(event.sdkToolUseId, toolMsg.messageId);
         this.#messageIdToToolUseId.set(toolMsg.messageId, event.sdkToolUseId);
@@ -10828,6 +10857,17 @@ export class Session {
               timestamp: new Date().toISOString(),
             };
             this.#transcriptStore.append(this.id, completedMsg, this.#seq++).catch(() => {});
+            // Memory closes the call's episode with its result and facts (it had only its start).
+            const facts = this.#toolFacts.get(msgId);
+            if (facts) {
+              if (facts.startedAt !== undefined) facts.durationMs = Date.now() - facts.startedAt;
+              if (facts.shell && typeof event.output === "string") {
+                const code = exitCodeOf(event.output, event.success);
+                if (code !== undefined) facts.exitCode = code;
+              }
+            }
+            this.#chunker?.onMessage(completedMsg);
+            this.#toolFacts.delete(msgId);
             this.#broadcastRaw({
               type: "session.message.delta",
               sessionId: this.id,

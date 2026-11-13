@@ -13,7 +13,7 @@
  */
 
 import type { SessionMessage } from "../../protocol/types.js";
-import type { Episode } from "./types.js";
+import type { Episode, EpisodeOrigin } from "./types.js";
 import { takeSpill } from "../compress/spill.js";
 
 export interface ChunkerContext {
@@ -24,6 +24,10 @@ export interface ChunkerContext {
    *  When set, a tool result naming a spill file is stored with the raw
    *  output in place of the compressed text the agent saw. */
   spillDir?: string;
+  /** What the session knows of a tool call (docs/secrets-and-memory-design.md §3): where it ran, its exit code, how long it ran. */
+  toolFacts?: (messageId: string) => { cwd?: string; exitCode?: number; durationMs?: number } | undefined;
+  /** Who and what produced the episodes of the turn running now. */
+  turnFacts?: () => { backend?: string; model?: string; origin?: EpisodeOrigin };
 }
 
 /** Paths seen in a tool input — used for path-overlap ranking. */
@@ -65,6 +69,17 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+interface OpenToolCall {
+  messageId: string;
+  toolName: string;
+  input: unknown;
+  filePaths: string[];
+  startedAt: number;
+  userPrompt: string | null;
+  priorAssistantText: string;
+  createdBy: string;
+}
+
 export class EpisodeChunker {
   #ctx: ChunkerContext;
   #onEpisode: (ep: Omit<Episode, "id">) => void;
@@ -73,16 +88,9 @@ export class EpisodeChunker {
   #pendingUserPrompt: string | null = null;
   /** Assistant reasoning accumulated between tool calls. */
   #pendingAssistantText: string[] = [];
-  /** Open tool_call episode awaiting completion. */
-  #openToolCall: {
-    messageId: string;
-    toolName: string;
-    input: unknown;
-    filePaths: string[];
-    startedAt: number;
-    userPrompt: string | null;
-    priorAssistantText: string;
-  } | null = null;
+  /** Tool calls awaiting their result, by message id: a turn can run several at once. */
+  #openToolCalls = new Map<string, OpenToolCall>();
+  #lastAssistantBy: string | null = null;
 
   constructor(ctx: ChunkerContext, onEpisode: (ep: Omit<Episode, "id">) => void) {
     this.#ctx = ctx;
@@ -99,9 +107,11 @@ export class EpisodeChunker {
         break;
 
       case "assistant":
-        if (this.#openToolCall) {
-          // Assistant text between tool calls — treat as follow-up reasoning for next tool call.
+        if (this.#openToolCalls.size > 0) {
+          // Assistant text while a call runs: reasoning for the next call (or, if none follows, the
+          // turn's answer, emitted at the turn's end).
           this.#pendingAssistantText.push(msg.content);
+          this.#lastAssistantBy = msg.identity.sub;
         } else {
           // Plain assistant turn with no tool use — emit user+assistant combined.
           this.#emitTurnEpisode(msg.content, msg.timestamp, msg.identity.sub);
@@ -114,42 +124,35 @@ export class EpisodeChunker {
         if (!msg.tool) break;
         const phase = msg.tool.state.phase;
         if (phase === "executing" || phase === "waiting_confirmation") {
-          // Close any prior unfinished tool_call before opening a new one.
-          if (this.#openToolCall) {
-            this.#emitOpenToolCall("unfinished", msg.timestamp, msg.identity.sub);
-          }
+          // Already open (a call asked, then approved): keep what it opened with.
+          if (this.#openToolCalls.has(msg.messageId)) break;
           const input =
             "input" in msg.tool.state ? (msg.tool.state.input as unknown) : {};
-          this.#openToolCall = {
+          this.#openToolCalls.set(msg.messageId, {
             messageId: msg.messageId,
             toolName: msg.tool.name,
             input,
             filePaths: extractFilePaths(msg.tool.name, input),
             startedAt: Date.parse(msg.timestamp),
+            createdBy: msg.identity.sub,
             userPrompt: this.#pendingUserPrompt,
             priorAssistantText: this.#pendingAssistantText.join("\n\n"),
-          };
+          });
           this.#pendingAssistantText = [];
         } else if (phase === "completed" || phase === "cancelled") {
-          if (
-            this.#openToolCall &&
-            this.#openToolCall.messageId === msg.messageId
-          ) {
-            const output =
-              phase === "completed" && "output" in msg.tool.state
-                ? (msg.tool.state.output as string | undefined)
-                : undefined;
-            this.#emitOpenToolCall(output ?? "", msg.timestamp, msg.identity.sub);
+          if (this.#openToolCalls.has(msg.messageId)) {
+            const state = msg.tool.state as { output?: unknown; message?: unknown };
+            const output = phase === "completed" ? state.output : state.message;
+            this.#emitOpenToolCall(msg.messageId, typeof output === "string" ? output : "", msg.timestamp, msg.identity.sub);
           }
         }
         break;
       }
 
       case "tool_result": {
-        // If the SDK ever surfaces explicit tool_result messages, treat as completion.
-        if (this.#openToolCall) {
-          this.#emitOpenToolCall(msg.content, msg.timestamp, msg.identity.sub);
-        }
+        // If the SDK ever surfaces explicit tool_result messages, treat as the oldest open call's completion.
+        const first = this.#openToolCalls.keys().next().value;
+        if (first !== undefined) this.#emitOpenToolCall(first, msg.content, msg.timestamp, msg.identity.sub);
         break;
       }
 
@@ -168,17 +171,27 @@ export class EpisodeChunker {
     }
   }
 
-  /** Call when the turn is done (SDK result message) to flush any standalone assistant turn. */
+  /**
+   * Call when the turn is done (SDK result message): a call still open never
+   * got its result (a backend that settled it unseen) and closes as
+   * unfinished; a reply that came after the turn's tool calls is the turn's
+   * answer, and becomes its episode.
+   */
   onTurnEnd(): void {
+    for (const id of [...this.#openToolCalls.keys()]) this.#emitOpenToolCall(id, "unfinished", new Date().toISOString(), this.#openToolCalls.get(id)!.createdBy);
+    if (this.#pendingAssistantText.length > 0) {
+      this.#emitTurnEpisode(this.#pendingAssistantText.join("\n\n"), new Date().toISOString(), this.#lastAssistantBy ?? this.#ctx.createdBy, true);
+      this.#pendingAssistantText = [];
+    }
     this.#closeStandaloneAssistantTurnIfAny();
   }
 
   // ── Episode emission ──────────────────────────────────────────────────
 
-  #emitOpenToolCall(output: string, timestamp: string, createdBy: string): void {
-    const tc = this.#openToolCall;
+  #emitOpenToolCall(messageId: string, output: string, timestamp: string, createdBy: string): void {
+    const tc = this.#openToolCalls.get(messageId);
     if (!tc) return;
-    this.#openToolCall = null;
+    this.#openToolCalls.delete(messageId);
 
     const parts: string[] = [];
     if (tc.userPrompt) parts.push(`# User intent\n${tc.userPrompt}`);
@@ -198,6 +211,7 @@ export class EpisodeChunker {
     const content = parts.join("\n\n");
     const summary = `${tc.toolName}(${summarizeInput(tc.input)})`;
 
+    const facts = this.#ctx.toolFacts?.(tc.messageId);
     this.#onEpisode({
       workspaceId: this.#ctx.workspaceId,
       sessionId: this.#ctx.sessionId,
@@ -209,13 +223,18 @@ export class EpisodeChunker {
       tokenEstimate: estimateTokens(content),
       createdAt: Date.parse(timestamp) || Date.now(),
       createdBy,
+      ...this.#turnFacts(),
+      ...(facts?.cwd ? { cwd: facts.cwd } : {}),
+      ...(facts?.exitCode !== undefined ? { exitCode: facts.exitCode } : {}),
+      ...(facts?.durationMs !== undefined ? { durationMs: facts.durationMs } : {}),
     });
 
     // Leave pendingUserPrompt in place — later tool calls in the same turn share it.
   }
 
-  #emitTurnEpisode(assistantText: string, timestamp: string, createdBy: string): void {
-    const userPrompt = this.#pendingUserPrompt;
+  #emitTurnEpisode(assistantText: string, timestamp: string, createdBy: string, afterTools = false): void {
+    // After tool calls the prompt is with them already: the reply stands alone.
+    const userPrompt = afterTools ? null : this.#pendingUserPrompt;
     if (!userPrompt && !assistantText) return;
 
     const content = [
@@ -239,6 +258,7 @@ export class EpisodeChunker {
       tokenEstimate: estimateTokens(content),
       createdAt: Date.parse(timestamp) || Date.now(),
       createdBy,
+      ...this.#turnFacts(),
     });
   }
 
@@ -253,7 +273,14 @@ export class EpisodeChunker {
       tokenEstimate: estimateTokens(text),
       createdAt: Date.parse(timestamp) || Date.now(),
       createdBy,
+      ...this.#turnFacts(),
     });
+  }
+
+  #turnFacts(): { backend?: string; model?: string; origin?: EpisodeOrigin } {
+    const f = this.#ctx.turnFacts?.();
+    if (!f) return {};
+    return { ...(f.backend ? { backend: f.backend } : {}), ...(f.model ? { model: f.model } : {}), ...(f.origin ? { origin: f.origin } : {}) };
   }
 
   #closeStandaloneAssistantTurnIfAny(): void {

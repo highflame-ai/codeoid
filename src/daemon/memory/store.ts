@@ -60,6 +60,12 @@ interface EpisodeRow {
   created_at: number;
   created_by: string;
   workstream_id?: string | null;
+  exit_code?: number | null;
+  cwd?: string | null;
+  duration_ms?: number | null;
+  backend?: string | null;
+  model?: string | null;
+  origin?: string | null;
 }
 
 /** Whether an episode's workstream is one `allowed` lets the caller read (RecallQuery.workstreams). */
@@ -445,6 +451,11 @@ export class SqliteEpisodeStore {
       this.#db.prepare("SELECT COUNT(*) AS n FROM pragma_table_info('episodes') WHERE name = 'workstream_id'").get() as { n: number } | undefined
     )?.n ?? 0;
     if (!hasWorkstream) this.#db.exec("ALTER TABLE episodes ADD COLUMN workstream_id TEXT");
+    // Episode facts (docs/secrets-and-memory-design.md §3); NULL on episodes from before them.
+    const cols = new Set((this.#db.prepare("SELECT name FROM pragma_table_info('episodes')").all() as { name: string }[]).map((c) => c.name));
+    for (const [name, type] of [["exit_code", "INTEGER"], ["cwd", "TEXT"], ["duration_ms", "INTEGER"], ["backend", "TEXT"], ["model", "TEXT"], ["origin", "TEXT"]] as const) {
+      if (!cols.has(name)) this.#db.exec(`ALTER TABLE episodes ADD COLUMN ${name} ${type}`);
+    }
   }
 
   // ── Writes ────────────────────────────────────────────────────────────
@@ -464,8 +475,9 @@ export class SqliteEpisodeStore {
       .prepare(
         `INSERT INTO episodes (
           id, workspace_id, session_id, kind, tool_name, summary, content,
-          file_paths, token_estimate, embedding, embedding_model, created_at, created_by, workstream_id
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          file_paths, token_estimate, embedding, embedding_model, created_at, created_by, workstream_id,
+          exit_code, cwd, duration_ms, backend, model, origin
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         id,
@@ -482,6 +494,12 @@ export class SqliteEpisodeStore {
         episode.createdAt,
         episode.createdBy,
         episode.workstreamId ?? null,
+        episode.exitCode ?? null,
+        episode.cwd ?? null,
+        episode.durationMs ?? null,
+        episode.backend ?? null,
+        episode.model ?? null,
+        episode.origin ?? null,
       );
 
     if (episode.fullContent !== undefined && episode.fullContent !== episode.content) {
@@ -1320,6 +1338,55 @@ export class SqliteEpisodeStore {
   }
 
   /** Apply post-retrieval filters from RecallQuery. */
+  /**
+   * The newest episodes matching a query's fact filters (failed calls, a backend, an origin, a
+   * directory), by the columns themselves: recall's candidates for "what failed here", which
+   * neither keywords nor meaning would find.
+   */
+  recentMatching(workspaceId: string, q: RecallQuery, limit: number): string[] {
+    const where = ["workspace_id = ?"];
+    const args: Array<string | number> = [workspaceId];
+    if (q.onlyFailed) where.push("(kind = 'error' OR (exit_code IS NOT NULL AND exit_code != 0))");
+    if (q.backend) {
+      where.push("backend = ?");
+      args.push(q.backend);
+    }
+    if (q.origin) {
+      where.push("origin = ?");
+      args.push(q.origin);
+    }
+    if (q.cwd) {
+      where.push("(cwd = ? OR substr(cwd, 1, ?) = ?)");
+      const prefix = q.cwd.endsWith("/") ? q.cwd : `${q.cwd}/`;
+      args.push(q.cwd, prefix.length, prefix);
+    }
+    const rows = this.#db.prepare(`SELECT id FROM episodes WHERE ${where.join(" AND ")} ORDER BY created_at DESC LIMIT ?`).all(...args, limit) as { id: string }[];
+    return rows.map((r) => r.id);
+  }
+
+  /** The newest episodes in a workspace whose text holds `text` exactly (a phrase search, then checked). */
+  containing(workspaceId: string, text: string, limit: number): string[] {
+    const phrase = `"${text.replace(/"/g, '""')}"`;
+    let ids: string[];
+    try {
+      ids = (
+        this.#db
+          .prepare(
+            `SELECT e.id FROM episodes_fts f JOIN episodes e ON e.rowid = f.rowid
+             WHERE episodes_fts MATCH ? AND e.workspace_id = ? ORDER BY e.created_at DESC LIMIT ?`,
+          )
+          .all(phrase, workspaceId, limit * 4) as { id: string }[]
+      ).map((r) => r.id);
+    } catch {
+      return [];
+    }
+    if (ids.length === 0) return [];
+    const marks = ids.map(() => "?").join(",");
+    const rows = this.#db.prepare(`SELECT id, summary, content FROM episodes WHERE id IN (${marks})`).all(...ids) as { id: string; summary: string; content: string }[];
+    const holds = new Set(rows.filter((r) => r.content.includes(text) || r.summary.includes(text)).map((r) => r.id));
+    return ids.filter((id) => holds.has(id)).slice(0, limit);
+  }
+
   filter(ids: string[], query: RecallQuery): Episode[] {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(",");
@@ -1612,6 +1679,12 @@ export class SqliteEpisodeStore {
       createdAt: row.created_at,
       createdBy: row.created_by,
       ...(row.workstream_id ? { workstreamId: row.workstream_id } : {}),
+      ...(row.exit_code !== null && row.exit_code !== undefined ? { exitCode: row.exit_code } : {}),
+      ...(row.cwd ? { cwd: row.cwd } : {}),
+      ...(row.duration_ms !== null && row.duration_ms !== undefined ? { durationMs: row.duration_ms } : {}),
+      ...(row.backend ? { backend: row.backend } : {}),
+      ...(row.model ? { model: row.model } : {}),
+      ...(row.origin ? { origin: row.origin as Episode["origin"] } : {}),
     };
   }
 }
@@ -1666,7 +1739,21 @@ function matchesQuery(ep: Episode, q: RecallQuery): boolean {
     const has = ep.filePaths.some((p) => q.filePaths!.includes(p));
     if (!has) return false;
   }
+  if (q.onlyFailed && !(ep.kind === "error" || (ep.exitCode !== undefined && ep.exitCode !== 0))) return false;
+  if (q.backend && ep.backend !== q.backend) return false;
+  if (q.origin && ep.origin !== q.origin) return false;
+  if (q.cwd && !(ep.cwd === q.cwd || ep.cwd?.startsWith(q.cwd.endsWith("/") ? q.cwd : `${q.cwd}/`))) return false;
   return true;
+}
+
+/** Whether an episode meets a query's fact filters alone (failed, backend, origin, directory). */
+export function matchesFacts(ep: Episode, q: Pick<RecallQuery, "onlyFailed" | "backend" | "origin" | "cwd">): boolean {
+  return matchesQuery(ep, { query: "", workspaceId: ep.workspaceId, ...q });
+}
+
+/** Whether a query asks by a fact (§3), not only by its text: recall then also looks at what matches it directly. */
+export function hasFactFilter(q: RecallQuery): boolean {
+  return q.onlyFailed === true || q.backend !== undefined || q.origin !== undefined || q.cwd !== undefined;
 }
 
 const COST_SOURCES = new Set(["backend", "estimated", "free", "unknown"]);
