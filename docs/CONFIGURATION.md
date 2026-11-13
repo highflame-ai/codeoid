@@ -369,6 +369,18 @@ A workstream is a named line of work: a company, a client, a project, a team, a 
 Each session belongs to exactly one, its home, and the home decides what the session is given.
 The design is [workstreams-design.md](workstreams-design.md).
 
+### Setting up workstreams
+
+Nothing is enforced until the last step, so you can try each one safely.
+
+1. See a proposal: `codeoid workstream import` (it looks in `~/Workspace`; `--root <dir>` for another folder) groups your repositories by their git remote's owner and lists the MCP servers in Claude's global config, as a config block to review. It writes nothing.
+2. Add the workstreams you want, in Settings → Workstreams in the web UI or in the `workstreams` block of `config.json` (below). Give each one an id and match rules, and a `share` policy if other workstreams shouldn't read it.
+3. Check a few folders with `codeoid workstream match <dir>`. It shows the workstream a folder gets and the rule that chose it. A path rule wins over a remote rule, so add one for a repository whose remote matches the wrong workstream.
+4. Declare the credentials your workstreams use and set their values, in Settings → Credentials or as described under [Credentials](#credentials). Then give each workstream its servers, env and git identity.
+5. Turn on isolation: the toggle in Settings → Workstreams, or `"isolateGlobalServers": true`. From then on a session gets only its workstream's servers and credentials, and can't read other workstreams' folders or memory.
+
+To go back, turn isolation off. Your workstreams stay configured, and sessions get every server again.
+
 ```jsonc
 "workstreams": {
   "default": "personal",            // home for a folder nothing matches; leave out to have none
