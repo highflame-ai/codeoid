@@ -398,13 +398,19 @@ export class CanonicalHistoryAccumulator {
    * no backend is ever seeded with a value codeoid wouldn't store.
    */
   scrubTurn: ((turn: CanonicalTurn) => CanonicalTurn) | undefined;
+  /** Applied to every turn a seed brings in (a fork's parent's history, a rewind's): it may predate scrubbing. */
+  scrubSeed: ((turn: CanonicalTurn) => CanonicalTurn) | undefined;
 
-  #scrubbed(turn: CanonicalTurn): CanonicalTurn {
-    if (!this.scrubTurn) return turn;
+  /** Fails closed: a turn that can't be scrubbed keeps none of its text. */
+  #scrubbed(turn: CanonicalTurn, scrub = this.scrubTurn): CanonicalTurn {
+    if (!scrub) return turn;
     try {
-      return this.scrubTurn(turn);
+      return scrub(turn);
     } catch {
-      return turn;
+      const content = "‹not stored: it couldn't be checked for secrets›";
+      return turn.role === "user"
+        ? { ...turn, content, ...(turn.prompt !== undefined ? { prompt: content } : {}) }
+        : { ...turn, content, ...(turn.thinking ? { thinking: "" } : {}), ...(turn.toolCalls ? { toolCalls: [] } : {}) };
     }
   }
 
@@ -565,7 +571,7 @@ export class CanonicalHistoryAccumulator {
    */
   seed(turns: readonly CanonicalTurn[]): void {
     this.#clear();
-    this.#history = turns.map((t) => structuredClone(t));
+    this.#history = turns.map((t) => this.#scrubbed(structuredClone(t), this.scrubSeed));
     this.#currentTurnId = lastTurnId(this.#history);
     this.#emit({ op: "replace", turns: this.#history });
   }

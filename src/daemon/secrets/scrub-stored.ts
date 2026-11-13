@@ -63,12 +63,12 @@ function replaceFile(path: string, content: string): void {
   renameSync(tmp, path);
 }
 
-/** Every `*.jsonl` directly in the transcript dir. */
+/** Every `*.jsonl` directly in the transcript dir, and their rotated segments (`<id>.jsonl.1`, …). */
 export function scrubTranscripts(dir: string, scrub: ScrubFn, dryRun: boolean): Pick<ScrubReport, "files" | "filesChanged" | "linesChanged"> {
   const report = { files: 0, filesChanged: 0, linesChanged: 0 };
   if (!existsSync(dir)) return report;
   for (const name of readdirSync(dir)) {
-    if (!name.endsWith(".jsonl")) continue;
+    if (!/\.jsonl(?:\.\d+)?$/.test(name)) continue;
     const path = join(dir, name);
     try {
       if (!statSync(path).isFile()) continue;
@@ -113,10 +113,29 @@ export function scrubMemoryDb(dbPath: string, scrub: ScrubFn, dryRun: boolean): 
       }
     });
     tx();
+    if (changed > 0 && !dryRun) purgeOldCopies(db, ["episodes_fts"]);
   } finally {
     db.close();
   }
   return changed;
+}
+
+/**
+ * Rewritten rows' old text can stay in the file (free pages, the WAL, FTS
+ * segments): merge the full-text index, checkpoint the WAL and rebuild the
+ * file, so what was replaced is gone from disk too.
+ */
+function purgeOldCopies(db: Database, ftsTables: readonly string[]): void {
+  for (const t of ftsTables) {
+    try {
+      db.exec(`INSERT INTO ${t}(${t}) VALUES('optimize')`);
+    } catch {
+      // No such index here.
+    }
+  }
+  db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  db.exec("VACUUM");
+  db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
 }
 
 /** Dispatch tasks' prompts and result digests in the daemon's database (the conductor reads them back). */
@@ -143,6 +162,7 @@ export function scrubDispatchTasks(dbPath: string, scrub: ScrubFn, dryRun: boole
       }
     });
     tx();
+    if (changed > 0 && !dryRun) purgeOldCopies(db, []);
   } finally {
     db.close();
   }

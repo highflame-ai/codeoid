@@ -1813,7 +1813,13 @@ secretCmd
       const store = new DaemonStore(config.dbPath);
       try {
         // No vault: a scrub of old data keeps nothing, whatever the workstreams say.
-        const secrets = new SecretService({ ...(config.secrets ? { config: { ...config.secrets, captureSecrets: "drop" } } : {}), configDir: getConfigDir() });
+        let unchecked = 0;
+        const secrets = new SecretService({
+          ...(config.secrets ? { config: { ...config.secrets, captureSecrets: "drop" } } : {}),
+          configDir: getConfigDir(),
+          offline: true,
+          onUnchecked: () => void unchecked++,
+        });
         addDaemonKnownSources(secrets, {
           credentials: () => config.credentials ?? [],
           secretStore: createSecretStore(config.credentialStore),
@@ -1830,6 +1836,7 @@ secretCmd
         console.log(`Transcripts: ${t.filesChanged} of ${t.files} files ${verb} (${t.linesChanged} lines).`);
         console.log(`Memory: ${episodes} episode bodies ${verb}.`);
         console.log(`Dispatch tasks: ${tasks} ${verb}.`);
+        if (unchecked > 0) console.log(`${unchecked} text(s) were too large to check and were left as they are.`);
         if (!o.dryRun && t.filesChanged + episodes + tasks > 0) console.log("Done. A backend's own copy (Claude Code's ~/.claude/projects, Codex's sessions) is its own, and isn't changed.");
       } finally {
         try {

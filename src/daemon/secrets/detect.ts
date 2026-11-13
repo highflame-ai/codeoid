@@ -20,6 +20,12 @@ export interface SecretSpan {
   end: number;
   /** A slug for the reference: `github-token`, `password`, `private-key`, … */
   kind: string;
+  /**
+   * A format that can't be mistaken for anything else (a vendor's token, a JWT, a key): safe to
+   * remember and match bare from then on. A value found only by the name it sits under
+   * (`password: …`) isn't: the same word is often ordinary text elsewhere.
+   */
+  distinct: boolean;
 }
 
 interface Pattern {
@@ -27,6 +33,10 @@ interface Pattern {
   re: RegExp;
   /** A structural or named value that is plainly not a credential is left as it is. */
   check?: "placeholder" | "word";
+  /** See {@link SecretSpan.distinct}. */
+  distinct?: boolean;
+  /** Only where the match's line also matches this (checked after the match, so the pattern stays linear). */
+  line?: RegExp;
 }
 
 /** Not inside a longer token: no letter, digit or `_` just before. */
@@ -34,7 +44,7 @@ const B = "(?<![A-Za-z0-9_])";
 /** Nor just after. */
 const E = "(?![A-Za-z0-9_])";
 
-const vendor = (kind: string, body: string): Pattern => ({ kind, re: new RegExp(`${B}(?<secret>${body})${E}`, "g") });
+const vendor = (kind: string, body: string): Pattern => ({ kind, re: new RegExp(`${B}(?<secret>${body})${E}`, "g"), distinct: true });
 
 /** Formats with a prefix of their own: they can't be mistaken for anything else. */
 const VENDOR: Pattern[] = [
@@ -98,27 +108,29 @@ const VENDOR: Pattern[] = [
   vendor("npm-token", "npm_[A-Za-z0-9]{36}"),
   vendor("pulumi-token", "pul-[0-9a-f]{40}"),
   vendor("zeroid-key", "zid_sk_[A-Za-z0-9_-]{16,200}"),
+  // codeoid's own: the blackboard, memory and sandbox MCP tokens, a routine's API token.
+  vendor("codeoid-token", "(?:bbt|mmt|sbt)_[0-9a-f]{32}|rt_[0-9a-f]{12}_[A-Za-z0-9_-]{32}"),
   vendor("highflame-key", "hf_sk_[A-Za-z0-9_-]{16,200}"),
 ];
 
 /** Credentials recognised by where they sit. */
 const STRUCTURAL: Pattern[] = [
-  {
-    kind: "private-key",
-    re: /-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----(?<secret>[\s\S]{1,20000}?)(?:-----END[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----|$)/g,
-  },
-  { kind: "jwt", re: new RegExp(`(?:${B}|(?<=\\\\[nrt]))(?<secret>eyJ[A-Za-z0-9_-]{10,4000}\\.eyJ[A-Za-z0-9_-]{10,8000}\\.[A-Za-z0-9_-]{10,2000})`, "g") },
-  { kind: "bearer-token", re: /(?<![A-Za-z0-9_])bearer[ \t]+(?<secret>[A-Za-z0-9._~+/-]{16,4000}=*)/gi, check: "placeholder" },
-  { kind: "authorization", re: /(?<![A-Za-z0-9_])authorization["']?[ \t]*[:=][ \t]*["']?(?:basic|token)[ \t]+(?<secret>[A-Za-z0-9._~+/-]{8,4000}=*)/gi, check: "placeholder" },
-  { kind: "password", re: /(?<![A-Za-z0-9_])curl\b[^\n]{0,2000}?[ \t](?:-u|--user)(?:=|[ \t]+)["']?[^:\s"']{0,200}:(?<secret>[^\s"']{1,500})/g, check: "placeholder" },
+  { kind: "jwt", re: new RegExp(`(?:${B}|(?<=\\\\[nrt]))(?<secret>eyJ[A-Za-z0-9_-]{10,4000}\\.eyJ[A-Za-z0-9_-]{10,8000}\\.[A-Za-z0-9_-]{10,2000})`, "g"), distinct: true },
+  { kind: "bearer-token", re: /(?<![A-Za-z0-9_])bearer[ \t]+(?<secret>[A-Za-z0-9._~+/-]{16,4000}=*)/gi, check: "placeholder", distinct: true },
+  { kind: "authorization", re: /(?<![A-Za-z0-9_])authorization["']?[ \t]*[:=][ \t]*["']?(?:basic|token)[ \t]+(?<secret>[A-Za-z0-9._~+/-]{8,4000}=*)/gi, check: "placeholder", distinct: true },
+  // curl's `-u user:password`: the line must run curl (checked in findSecrets: `line: /\bcurl\b/`).
+  { kind: "password", re: /(?:^|[ \t])(?:-u|--user)(?:=|[ \t]+)["']?[^:\s"']{0,200}:(?<secret>[^\s"']{1,500})/gm, check: "placeholder", line: /\bcurl\b/ },
+  // A .netrc entry's password.
+  { kind: "password", re: /(?:^|\s)machine\s+\S{1,253}\s+(?:login\s+\S{1,200}\s+)?password\s+(?<secret>\S{1,500})/g, check: "placeholder" },
+  { kind: "password", re: /^[ \t]*password[ \t]+(?<secret>\S{1,500})[ \t]*$/gm, check: "placeholder" },
   { kind: "password", re: /(?<![A-Za-z0-9_])[a-z][a-z0-9+.-]{1,31}:\/\/[^\s/?#@"'`<>:]{0,200}:(?<secret>[^\s/?#@"'`<>]{1,500})@/gi, check: "placeholder" },
   { kind: "password", re: /(?:^|[?&;\s-])(?:password|pwd)=(?<secret>"[^"\n]{0,500}"|'[^'\n]{0,500}'|[^&;\s"'`]{0,500}[^&;\s"'`,])/gim, check: "placeholder" },
-  { kind: "aws-secret", re: /aws_secret_access_key["']?(?:[ \t]*[:=][ \t]*|[ \t]+)["']?(?<secret>[A-Za-z0-9/+]{40,100})/gi },
-  { kind: "twilio-key", re: new RegExp(`${B}(?<secret>SK[0-9a-fA-F]{32})${E}`, "g") },
+  { kind: "aws-secret", re: /aws_secret_access_key["']?(?:[ \t]*[:=][ \t]*|[ \t]+)["']?(?<secret>[A-Za-z0-9/+]{40,100})/gi, distinct: true },
+  { kind: "twilio-key", re: new RegExp(`${B}(?<secret>SK[0-9a-fA-F]{32})${E}`, "g"), distinct: true },
 ];
 
 /** The words an environment variable's name ends with when it holds a credential. */
-const ENV_NAME = "(?<![A-Za-z0-9_])[A-Z0-9_]{0,100}(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|_PWD|API_?KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|SECRET_KEY|CREDENTIALS?|AUTH)S?(?![A-Za-z0-9_])";
+const ENV_NAME = "(?<![A-Za-z0-9_])[A-Z0-9_]{0,100}(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|_PWD|API_?KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|SECRET_KEY|CREDENTIALS?|AUTH)(?![A-Za-z0-9_])";
 /** The same as code, JSON and config files spell them; not `auth` alone, nor `tokens` (`max_tokens`). */
 const CODE_NAME =
   "[\\w.-]{0,100}?(?:passw(?:or)?d|passphrase|secret|api[_-]?key|private[_-]?key|access[_-]?key|(?:auth|access|refresh|bearer|id|session)[_-]?token|token)";
@@ -134,9 +146,16 @@ const NAMED: Pattern[] = [
     re: /(?:^|[ \t])--passw(?:or)?d[ \t]+(?<secret>"(?:[^"\\\n]|\\.){1,500}"|'[^'\n]{1,500}'|(?:[^\s"'\\<>[{()|&;`-][^\s"'\\|&;<>()`]{0,500}?)?[^A-Za-z\s"'\\.,:;()[\]{}<>|&`-][^\s"'\\|&;<>()`]{0,500})(?=[\s"';&|)\\]|$)/g,
     check: "placeholder",
   },
+  // YAML-like `name: value`: the value runs to the end of the line (`password: correct horse`).
   {
     kind: "credential",
-    re: new RegExp(`^\\+?[ \\t]*(?:-[ \\t]+)?["']?${CODE_NAME}["']?[ \\t]*[:=][ \\t]*(?<secret>[^\\s"'#|>&*!{}\\[\\],=][^\\n#="]{0,1000}?)[ \\t]*$`, "gim"),
+    re: new RegExp(`^\\+?[ \\t]*(?:-[ \\t]+)?["']?${CODE_NAME}["']?[ \\t]*:[ \\t]*(?<secret>[^\\s"'#|>&*!{}\\[\\],=][^\\n#="]{0,1000})$`, "gim"),
+    check: "word",
+  },
+  // `.env`/INI-like `name=value`: up to the first space (`PGPASSWORD=x psql -h db` is a command).
+  {
+    kind: "credential",
+    re: new RegExp(`^\\+?[ \\t]*["']?${CODE_NAME}["']?[ \\t]*=[ \\t]*(?<secret>[^\\s"'#|>&*!{}\\[\\],=][^\\s#="]{0,1000})`, "gim"),
     check: "word",
   },
 ];
@@ -144,12 +163,50 @@ const NAMED: Pattern[] = [
 /** With indices (`d`), so the `secret` group's position is exact. */
 const PATTERNS: readonly Pattern[] = [...VENDOR, ...STRUCTURAL, ...NAMED].map((p) => ({ ...p, re: new RegExp(p.re.source, p.re.flags.includes("d") ? p.re.flags : `${p.re.flags}d`) }));
 
+const KEY_HEADER = /-----BEGIN[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----/y;
+const KEY_FOOTER = /^-----END[ A-Z0-9_-]{0,100}PRIVATE KEY(?: BLOCK)?-----/;
+/** What a key's armour holds: base64 lines, PEM headers (`Proc-Type: 4,ENCRYPTED`), escaped newlines in JSON. */
+const KEY_BODY = /^[A-Za-z0-9+/=\s:,.\\-]{16,64000}$/;
+const MAX_KEY_BODY = 64_000;
+
+/**
+ * Private keys, by their armour: the body between a BEGIN line and its END
+ * line (or the end of the text, for clipped output), when it is what armour
+ * holds — so a header string in source code never swallows the code after
+ * it. Found with indexOf, one forward pass: a text of repeated headers costs
+ * no more than its length.
+ */
+function privateKeySpans(text: string): SecretSpan[] {
+  const out: SecretSpan[] = [];
+  let from = 0;
+  let nextEnd = -2;
+  while (true) {
+    const begin = text.indexOf("-----BEGIN", from);
+    if (begin < 0) break;
+    from = begin + 10;
+    KEY_HEADER.lastIndex = begin;
+    const header = KEY_HEADER.exec(text);
+    if (!header) continue;
+    const bodyStart = begin + header[0].length;
+    if (nextEnd !== -1 && nextEnd < bodyStart) nextEnd = text.indexOf("-----END", bodyStart);
+    let bodyEnd: number;
+    if (nextEnd >= 0 && nextEnd - bodyStart <= MAX_KEY_BODY && KEY_FOOTER.test(text.slice(nextEnd, nextEnd + 140))) bodyEnd = nextEnd;
+    else if (text.length - bodyStart <= MAX_KEY_BODY) bodyEnd = text.length;
+    else continue;
+    if (!KEY_BODY.test(text.slice(bodyStart, bodyEnd))) continue;
+    out.push({ start: bodyStart, end: bodyEnd, kind: "private-key", distinct: true });
+    from = bodyEnd;
+  }
+  return out;
+}
+
 /** The references codeoid writes itself: never taken for a secret again. */
 const OWN_REFERENCE = /^‹(?:credential|secret|output withheld|not stored)[:\s›]/;
 
 const STAND_INS = new Set([
   "changeme", "change_me", "change-me", "example", "password", "passwd", "secret", "token", "your_password", "your-password",
   "yourpassword", "your_token", "your_api_key", "redacted", "placeholder", "dummy", "undefined", "required", "optional",
+  "enabled", "disabled", "on", "off", "yes", "no", "bearer", "basic", "auto", "none", "default", "test", "local", "localhost",
 ]);
 const TYPES = new Set(["str", "string", "bool", "boolean", "int", "integer", "number", "float", "any", "object", "bytes", "char", "none", "null", "nil", "true", "false"]);
 
@@ -170,7 +227,14 @@ export function isPlaceholder(raw: string): boolean {
 function isWord(raw: string): boolean {
   const value = raw.trim();
   if (isPlaceholder(value)) return true;
-  if (value.startsWith('"') || value.startsWith("'") || /[0-9]/.test(value)) return false;
+  if (value.startsWith('"') || value.startsWith("'")) return false;
+  // Code, not a value: another name — a dotted path or a call (`self.token`, `config.apiKey`,
+  // `getToken()`), a snake_case or camelCase identifier (`api_key`, `idToken`). A plain word
+  // (`Violetmeadow`, `postgres`) can be a password, and stays one.
+  const bare = value.replace(/[,;)]+$/, "");
+  if (/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+(?:\(\))?$/.test(bare) || /^[A-Za-z_$][\w$]*\(\)$/.test(bare)) return true;
+  if (/^[A-Za-z_$][\w$]*$/.test(bare) && (bare.includes("_") || /[a-z][A-Z]/.test(bare)) && !/[0-9]/.test(bare)) return true;
+  if (/[0-9]/.test(value)) return false;
   return /[<>[\]&:(){},;]/.test(value) || TYPES.has(value.toLowerCase());
 }
 
@@ -181,26 +245,39 @@ function isWord(raw: string): boolean {
  * past it, null — the caller must not store what couldn't be checked.
  */
 export function findSecrets(text: string, deadline = Number.POSITIVE_INFINITY): SecretSpan[] | null {
-  const spans: SecretSpan[] = [];
+  const spans: SecretSpan[] = privateKeySpans(text);
   for (const p of PATTERNS) {
     if (performance.now() > deadline) return null;
     p.re.lastIndex = 0;
+    let n = 0;
     for (const m of text.matchAll(p.re)) {
-      const secret = m.groups?.secret;
+      if (++n % 256 === 0 && performance.now() > deadline) return null;
+      const raw = m.groups?.secret;
       const at = m.indices?.groups?.secret;
-      if (secret === undefined || secret.length === 0 || !at) continue;
+      if (raw === undefined || raw.length === 0 || !at) continue;
+      // A value to the end of its line loses the spaces after it.
+      const secret = raw.replace(/[ \t]+$/, "");
+      if (secret.length === 0) continue;
       if (p.check === "placeholder" && isPlaceholder(secret)) continue;
       if (p.check === "word" && isWord(secret)) continue;
+      if (p.line) {
+        const lineStart = text.lastIndexOf("\n", at[0]) + 1;
+        const lineEnd = text.indexOf("\n", at[0]);
+        if (!p.line.test(text.slice(lineStart, lineEnd < 0 ? text.length : lineEnd))) continue;
+      }
       // A quoted value keeps its quotes: `"api_key": "‹secret:…›"` still reads as JSON.
       const quoted = secret.length >= 2 && (secret[0] === '"' || secret[0] === "'") && secret.at(-1) === secret[0];
-      spans.push({ start: at[0] + (quoted ? 1 : 0), end: at[1] - (quoted ? 1 : 0), kind: p.kind });
+      spans.push({ start: at[0] + (quoted ? 1 : 0), end: at[0] + secret.length - (quoted ? 1 : 0), kind: p.kind, distinct: p.distinct === true });
     }
   }
   spans.sort((a, b) => a.start - b.start || b.end - a.end);
   const merged: SecretSpan[] = [];
   for (const s of spans) {
     const last = merged[merged.length - 1];
-    if (last && s.start < last.end) last.end = Math.max(last.end, s.end);
+    if (last && s.start < last.end) {
+      last.end = Math.max(last.end, s.end);
+      last.distinct = last.distinct && s.distinct;
+    }
     else merged.push({ ...s });
   }
   return merged;

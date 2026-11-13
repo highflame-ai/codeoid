@@ -5,6 +5,7 @@ import { createSessionInUi, expect, messages, openUi, send, test, waitIdle } fro
 // Made-up credentials of the right shape, split so no contiguous token sits in this file.
 const GHP = `ghp_${"Zx9Qw3Er5Ty7Ui1Op2As4Df6Gh8Jk0Lz3Xc5V"}`;
 const PASSWORD = `hunter${"2xyz"}`;
+const BEARER = `8f2d0c1e${"9b7a4f6e8d2c"}`;
 
 /** Every transcript, canonical history and turn index the daemon wrote. */
 function storedText(configDir: string): string {
@@ -28,8 +29,8 @@ test("a leaked token is shown and stored as a reference, kept where the workstre
     {
       match: "^leak",
       steps: [
-        { tool: "Read", input: { file_path: "notes.md" }, output: `token=${GHP}\nDB_PASSWORD=${PASSWORD}\n` },
-        { text: `The token is ${GHP}, and the password is ${PASSWORD}.` },
+        { tool: "Read", input: { file_path: "notes.md" }, output: `token=${GHP}\nDB_PASSWORD=${PASSWORD}\nAuthorization: Bearer ${BEARER}\n` },
+        { text: `The token is ${GHP}, and the session token is ${BEARER}.` },
       ],
     },
   ]);
@@ -46,11 +47,13 @@ test("a leaked token is shown and stored as a reference, kept where the workstre
   await expect(main).toContainText(/‹secret:github-token:[0-9a-f]{8}›/);
   await expect(main).not.toContainText(GHP);
   await expect(main).not.toContainText(PASSWORD);
+  await expect(main).not.toContainText(BEARER);
 
   // On disk: the same.
   const stored = storedText(codeoid.configDir);
   expect(stored).not.toContain(GHP);
   expect(stored).not.toContain(PASSWORD);
+  expect(stored).not.toContain(BEARER);
   expect(stored).toMatch(/‹secret:github-token:[0-9a-f]{8}›/);
 
   // A new page load replays the scrollback: still references.

@@ -70,7 +70,7 @@ export class CapturedSecretVault {
 
   #seal(value: string, scope: VaultScope, fingerprint: string): Uint8Array {
     const iv = randomBytes(12);
-    const c = createCipheriv("aes-256-gcm", this.#key, iv);
+    const c = createCipheriv("aes-256-gcm", this.#key, iv, { authTagLength: 16 });
     c.setAAD(this.#aad(scope, fingerprint));
     const body = Buffer.concat([c.update(value, "utf8"), c.final()]);
     return Buffer.concat([iv, c.getAuthTag(), body]);
@@ -78,7 +78,7 @@ export class CapturedSecretVault {
 
   #open(sealed: Uint8Array, scope: VaultScope, fingerprint: string): string {
     const buf = Buffer.from(sealed);
-    const d = createDecipheriv("aes-256-gcm", this.#key, buf.subarray(0, 12));
+    const d = createDecipheriv("aes-256-gcm", this.#key, buf.subarray(0, 12), { authTagLength: 16 });
     d.setAAD(this.#aad(scope, fingerprint));
     d.setAuthTag(buf.subarray(12, 28));
     return Buffer.concat([d.update(buf.subarray(28)), d.final()]).toString("utf8");

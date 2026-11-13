@@ -50,12 +50,14 @@ let memory: MemoryEngine;
 let manager: SessionManager;
 let secrets: SecretService;
 let script: ProviderEvent[][];
+let providers: MockSessionProvider[] = [];
 
 beforeAll(async () => {
   await loadShellParser();
 });
 
 beforeEach(() => {
+  providers = [];
   tmp = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-secrets-")));
   home = join(tmp, "home");
   for (const d of ["mine", "vaulted"]) mkdirSync(join(home, d), { recursive: true });
@@ -85,7 +87,11 @@ beforeEach(() => {
   secrets.addKnown("test", () => [{ label: "gh-test", value: KNOWN }]);
   manager = new SessionManager(store, transcript, undefined, undefined, memory, {
     config,
-    _testProviderFactory: () => new MockSessionProvider("mock", script),
+    _testProviderFactory: () => {
+      const p = new MockSessionProvider("mock", script);
+      providers.push(p);
+      return p;
+    },
     _testFolderReader: new FolderReader({ home, sshConfig: "" }),
     secretService: secrets,
   });
@@ -207,5 +213,25 @@ describe("kept secrets", () => {
     expect(await manager.handle({ type: "secret.reveal", id: "r4", workstream: "vaulted", fingerprint: kept.fingerprint } as never, other, CLIENT)).toMatchObject({ code: "not_found" });
     expect(await manager.handle({ type: "secret.forget", id: "f1", workstream: "vaulted", fingerprint: kept.fingerprint } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
     expect(((await manager.handle({ type: "secret.list", id: "l3" } as never, AUTH, CLIENT)) as { secrets: unknown[] }).secrets).toEqual([]);
+  });
+});
+
+describe("what the backend is given", () => {
+  test("the prompt of the turn goes as written (a stateless backend sends it); earlier turns as stored", async () => {
+    script = [[{ type: "text_done", content: "ok" } as ProviderEvent, done], [{ type: "text_done", content: "ok" } as ProviderEvent, done]];
+    const { id } = await runIn("mine");
+    const session = manager._sessionForTest(id)!;
+    await session.send("now add DB_PASSWORD=hunter2xyz to compose", AUTH);
+    const end = Date.now() + 3000;
+    while (session.status !== "idle") {
+      if (Date.now() > end) throw new Error("timed out");
+      await Bun.sleep(5);
+    }
+    const opts = providers.at(-1)!.capturedOpts.at(-1)!;
+    expect(opts.history.at(-1)?.content).toBe("now add DB_PASSWORD=hunter2xyz to compose");
+    // The first prompt, as stored: its known value a reference.
+    expect(opts.history[0]?.content).toContain("‹credential:gh-test›");
+    // And stored scrubbed.
+    expect(readFileSync(transcript.canonicalPath(id), "utf8")).not.toContain("hunter2xyz");
   });
 });

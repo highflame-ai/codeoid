@@ -21,6 +21,7 @@ import type {
 } from "../../protocol/types.js";
 
 import { resolveSafe } from "../fs.js";
+import { isCredentialFile } from "../secrets/files.js";
 import { resolveWorkdirAlias } from "./git-alias.js";
 import {
   SHARE_FORMAT_VERSION,
@@ -137,8 +138,15 @@ export async function packSession(
         continue;
       }
       const captured = await capturePinnedFile(abs, cap);
-      // Text only: a binary file's base64 isn't text a secret could be found in, and changing it would break it.
-      const snap = captured && deps.scrub && captured.encoding === "utf-8" ? { ...captured, content: deps.scrub(captured.content) } : captured;
+      // A credential file (`.env`, a key) isn't packed at all: it holds nothing else (secrets/files.ts).
+      // Text otherwise scrubbed; a binary file's base64 isn't text a secret could be found in.
+      const snap = !captured || !deps.scrub
+        ? captured
+        : isCredentialFile(abs, workdir)
+          ? { ...captured, content: "‹content withheld: a credential file›", encoding: "utf-8" as const }
+          : captured.encoding === "utf-8"
+            ? { ...captured, content: deps.scrub(captured.content) }
+            : captured;
       if (snap) {
         const key = encodePath(abs, workdir, alias);
         pinnedFiles[key] = snap;

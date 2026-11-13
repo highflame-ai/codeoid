@@ -81,15 +81,27 @@ const PRINTS_CREDENTIALS: ReadonlyArray<readonly string[]> = [
 const ENV_PRINTERS = new Set(["env", "set", "export", "declare", "typeset"]);
 
 /** Programs that print a file's contents: a credential file among their operands is read out. */
-const FILE_PRINTERS = new Set(["cat", "less", "more", "head", "tail", "bat", "batcat", "nl", "tac", "strings", "xxd", "hexdump", "od", "base64", "grep", "rg", "ag", "awk", "sed", "jq", "yq", "cut", "sort", "diff", "cp", "source", "."]);
+const FILE_PRINTERS = new Set(["cat", "less", "more", "head", "tail", "bat", "batcat", "nl", "tac", "strings", "xxd", "hexdump", "od", "base64", "grep", "rg", "ag", "awk", "sed", "jq", "yq", "cut", "sort", "diff"]);
 
 const PROGRAM_OPTION_WITH_VALUE = /^--?(?:profile|region|output|namespace|context|kubeconfig|n|address|format|account|vault|project)$/;
 
-function words(c: SimpleCommand): string[] | null {
+/** argv as text: a word only known at run time is null, but one that is only `$HOME/…` reads as `~/…`. */
+function words(c: SimpleCommand): Array<string | null> {
+  return c.argv.map((w) => w.value ?? w.home ?? null);
+}
+
+/** The paths a program reads besides its plain operands: `dd if=FILE`, `git show REV:FILE`. */
+function readsOf(argv: Array<string | null>): string[] {
+  const program = programName(argv[0] ?? "");
   const out: string[] = [];
-  for (const w of c.argv) {
-    if (w.value === null) return null;
-    out.push(w.value);
+  for (const a of argv.slice(1)) {
+    if (a === null) continue;
+    if (program === "dd" && a.startsWith("if=")) out.push(a.slice(3));
+    if (program === "git" && /^[^-:][^:]*:[^:]+$/.test(a) && argv.slice(1).some((w) => w === "show" || w === "cat-file")) out.push(a.slice(a.indexOf(":") + 1));
+  }
+  // git's commands that print a file's contents or changes: their path operands are read out.
+  if (program === "git" && argv.slice(1).some((w) => w !== null && ["show", "diff", "log", "blame", "grep", "cat-file"].includes(w))) {
+    for (const a of argv.slice(1)) if (a !== null && !a.startsWith("-")) out.push(a);
   }
   return out;
 }
@@ -142,7 +154,7 @@ function printsCredentials(argv: string[]): boolean {
 
 /** The same, matched as text when the line can't be parsed: fails toward withholding. */
 const PRINTS_CREDENTIALS_TEXT =
-  /(?:^|[;&|(`{!\n]|\$\()\s*(?:(?:sudo|command|exec|time|env|nohup)\s+|\w+=\S*\s+)*(?:\S*\/)?(?:gh\s+auth\s+token|printenv|gcloud\s+auth\s+(?:application-default\s+)?print-(?:access|identity)-token|aws\b[^\n;&|]*\bconfigure\s+(?:get|export-credentials)|op\s+(?:read|inject|item\s+get)|vault\s+(?:read|login|kv\s+get|print\s+token)|kubectl\b[^\n;&|]*\b(?:get|describe)\s+secrets?|git\s+credential\s+fill|pass\s+show|secret-tool\s+lookup)\b/;
+  /(?:^|[;&|(`{!\n'"]|\$\()\s*(?:(?:sudo|command|exec|time|nohup)\s+|\w+=\S*\s+)*(?:\S*\/)?(?:(?:env|set|export\s+-p)\s*(?:$|[;&|)\n'"])|gh\s+auth\s+token|printenv|gcloud\s+auth\s+(?:application-default\s+)?print-(?:access|identity)-token|aws\b[^\n;&|]*\bconfigure\s+(?:get|export-credentials)|op\s+(?:read|inject|item\s+get)|vault\s+(?:read|login|kv\s+get|print\s+token)|kubectl\b[^\n;&|]*\b(?:get|describe)\s+secrets?|git\s+credential\s+fill|pass\s+show|secret-tool\s+lookup)\b/;
 
 export interface VerdictOptions {
   /** Where the call runs, for relative paths. */
@@ -179,20 +191,23 @@ function shellVerdict(command: string, cwd: string, opts: VerdictOptions): ToolV
   const drops = (opts.dropCommands ?? []).map((d) => d.trim().split(/\s+/).filter(Boolean)).filter((d) => d.length > 0);
   if (parsed.unreadable) {
     if (drops.some((d) => command.includes(d.join(" ")))) return "drop";
-    return PRINTS_CREDENTIALS_TEXT.test(command) ? "withhold-output" : "keep";
+    if (PRINTS_CREDENTIALS_TEXT.test(command)) return "withhold-output";
+    // A reader and a credential file named anywhere on the line: withheld, since the line can't be read.
+    const tokens = command.split(/[\s;&|()<>]+/).map((t) => t.replace(/^["']|["']$/g, "")).filter(Boolean);
+    if (tokens.some((t) => FILE_PRINTERS.has(programName(t))) && tokens.some((t) => isCredentialFile(t, cwd, opts.credentialFiles))) return "withhold-output";
+    return "keep";
   }
   let verdict: ToolVerdict = "keep";
   for (const c of parsed.commands) {
     const argv = words(c);
-    if (!argv || argv.length === 0) {
-      // A word only known at run time: still, a credential file it names plainly counts.
-      continue;
-    }
-    if (drops.some((d) => d.every((w, i) => (i === 0 ? programName(argv[0]!) === w : argv[i] === w)))) return "drop";
-    if (printsCredentials(argv)) verdict = "withhold-output";
-    const program = programName(argv[0]!);
-    // A credential file read out: an operand of a printer, or a redirect it reads (`< .env`).
-    const operands = FILE_PRINTERS.has(program) ? argv.slice(1).filter((a) => !a.startsWith("-")) : [];
+    if (argv.length === 0 || argv[0] === null) continue;
+    const program = programName(argv[0]);
+    if (drops.some((d) => d.every((w, i) => (i === 0 ? program === w : argv[i] === w)))) return "drop";
+    // A word only known at run time can't be a subcommand that prints a credential; the rest still counts.
+    if (argv.every((a) => a !== null) && printsCredentials(argv as string[])) verdict = "withhold-output";
+    // A credential file read out: an operand of a printer, what dd or git show reads, or a redirect it reads (`< .env`).
+    const known = argv.filter((a): a is string => a !== null);
+    const operands = [...(FILE_PRINTERS.has(program) ? known.slice(1).filter((a) => !a.startsWith("-")) : []), ...readsOf(argv)];
     const reads = c.redirects.filter((r) => r.op === "<" && r.target?.value).map((r) => r.target!.value!);
     if ([...operands, ...reads].some((p) => isCredentialFile(p, cwd, opts.credentialFiles))) verdict = "withhold-output";
     // A credential file written by a redirect (`echo KEY=… > .env`): the line holds the value.

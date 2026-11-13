@@ -26,6 +26,14 @@ export interface SecretServiceOptions {
   store?: Store;
   /** Whether a workstream keeps detected secrets ('' = sessions with no workstream). */
   capturePolicy?: (workstream: string | undefined) => "drop" | "vault";
+  /**
+   * A batch rewrite of stored data (`codeoid secret scrub`): no time budget (nothing waits on it,
+   * and a text over budget would be lost for good), and nothing remembered across texts (a value
+   * learned from one file must not rewrite every other).
+   */
+  offline?: boolean;
+  /** Offline: a text that couldn't be checked, kept as it is (counted by the caller). */
+  onUnchecked?: (text: string) => void;
 }
 
 /** Scrub context with the owner, so a kept secret lands in the right tenant. */
@@ -38,8 +46,20 @@ export const DEFAULT_SECRETS_CONFIG: SecretsConfig = { enabled: true, beforeMode
 
 export class SecretService {
   readonly known = new KnownSecrets();
-  /** Values found by shape this run, matched exactly from then on (memory only). */
-  readonly learned = new LearnedSecrets();
+  /** Values found by a distinct format this run, per tenant, matched exactly from then on (memory only). */
+  readonly #learned = new Map<string, LearnedSecrets>();
+
+  /** A tenant's remembered values; none without a tenant. */
+  learnedFor(ctx: { accountId?: string; projectId?: string }): LearnedSecrets | undefined {
+    if (!ctx.accountId || !ctx.projectId) return undefined;
+    const key = `${ctx.accountId}\u0000${ctx.projectId}`;
+    let l = this.#learned.get(key);
+    if (!l) {
+      l = new LearnedSecrets();
+      this.#learned.set(key, l);
+    }
+    return l;
+  }
   readonly config: SecretsConfig;
   readonly vault: CapturedSecretVault | undefined;
   readonly #scrubber: Scrubber;
@@ -51,11 +71,11 @@ export class SecretService {
     const fingerprint = new Fingerprinter(loadOrCreateKey(dir, "fingerprint.key"));
     this.vault = opts.store ? new CapturedSecretVault(opts.store, loadOrCreateKey(dir, "vault.key")) : undefined;
     this.#capturePolicy = opts.capturePolicy ?? (() => this.config.captureSecrets);
-    this.known.register("learned", () => this.learned.values());
-    this.learned.onChange(() => this.known.invalidate());
     this.#scrubber = new Scrubber({
       known: this.known,
-      learned: this.learned,
+      ...(opts.offline
+        ? { budgetMs: 60_000, ...(opts.onUnchecked ? { onUnchecked: opts.onUnchecked } : {}) }
+        : { learnedFor: (ctx: ScrubContext) => this.learnedFor(ctx as StoreScrubContext) }),
       fingerprint,
       onDetected: (secret, ctx) => {
         const c = ctx as StoreScrubContext;
@@ -112,7 +132,7 @@ export class SecretService {
  */
 export function environmentSecrets(env: Record<string, string | undefined> = process.env): KnownSecret[] {
   const out: KnownSecret[] = [];
-  const NAME = /(?:^CODEOID_CRED_|_API_KEY$|_TOKEN$|_SECRET$|_PASSWORD$|_ACCESS_KEY$|^ANTHROPIC_AUTH_TOKEN$|_KEY$)/;
+  const NAME = /(?:^CODEOID_CRED_|_API_KEY$|_TOKEN$|_SECRET$|_PASSWORD$|_ACCESS_KEY$|_SECRET_KEY$|_PRIVATE_KEY$|^ANTHROPIC_AUTH_TOKEN$|^CODEOID_API_KEY$)/;
   for (const [name, value] of Object.entries(env)) {
     if (!value || !NAME.test(name)) continue;
     out.push({ label: name.startsWith("CODEOID_CRED_") ? name.slice("CODEOID_CRED_".length).toLowerCase().replace(/_/g, "-") : `daemon:${name}`, value });

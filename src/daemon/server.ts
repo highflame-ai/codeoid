@@ -641,6 +641,21 @@ export class DaemonServer {
     this.#mcpHub.proxy = this.#mcpProxy;
     const secretService = this.#secretService;
     if (secretService?.enabled && secretService.config.beforeModel) this.#mcpHub.setResultScrub((text) => secretService.scrub(text).text);
+    if (secretService) {
+      // The relay's per-session tokens are credentials too: matched while they live.
+      const live = new Set<string>();
+      this.#mcpProxy.tokenListener = {
+        minted: (t) => {
+          live.add(t);
+          secretService.known.invalidate();
+        },
+        revoked: (t) => {
+          live.delete(t);
+          secretService.known.invalidate();
+        },
+      };
+      secretService.addKnown("mcp-proxy", () => [...live].map((value) => ({ label: "daemon:mcp-relay-token", value })));
+    }
     for (const w of this.#mcpRegistry.warnings) console.warn(`[codeoid] ${w}`);
     // Goal blackboard: loopback URL regardless of bind address — the agent
     // subprocess runs on this host, and the endpoint must not become

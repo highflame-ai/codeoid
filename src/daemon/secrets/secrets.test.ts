@@ -277,17 +277,111 @@ describe("vault", () => {
 });
 
 describe("learned", () => {
-  test("a value found by its name is matched bare from then on, in the same text and later ones", async () => {
+  test("a value found by a distinct format is matched bare from then on; one found only by its name isn't", async () => {
     const { LearnedSecrets } = await import("./known.js");
-    const known = new KnownSecrets();
     const learned = new LearnedSecrets();
-    known.register("learned", () => learned.values());
-    learned.onChange(() => known.invalidate());
-    const scrubber = new Scrubber({ known, learned, fingerprint: fp });
-    const first = scrubber.scrub("DB_PASSWORD=hunter2xyz\nso the password is hunter2xyz").text;
-    expect(first).not.toContain("hunter2xyz");
-    const ref = /‹secret:credential:[0-9a-f]{8}›/.exec(first)![0];
+    const scrubber = new Scrubber({ known: new KnownSecrets(), learnedFor: () => learned, fingerprint: fp });
+    const first = scrubber.scrub("Authorization: Bearer 8f2d0c1e9b7a4f6e8d2c\nthe token is 8f2d0c1e9b7a4f6e8d2c").text;
+    expect(first).not.toContain("8f2d0c1e9b7a4f6e8d2c");
+    const ref = /‹secret:bearer-token:[0-9a-f]{8}›/.exec(first)![0];
     expect(first.split(ref)).toHaveLength(3);
-    expect(scrubber.scrub("later: hunter2xyz again").text).toBe(`later: ${ref} again`);
+    expect(scrubber.scrub("later: 8f2d0c1e9b7a4f6e8d2c again").text).toBe(`later: ${ref} again`);
+    // Only as a whole token: inside a longer word it is left.
+    expect(scrubber.scrub("x8f2d0c1e9b7a4f6e8d2cx").text).toBe("x8f2d0c1e9b7a4f6e8d2cx");
+    // A password found by its name isn't remembered: the same word is often ordinary elsewhere.
+    scrubber.scrub("DB_PASSWORD=localhost-dev-pw");
+    expect(scrubber.scrub("connect to localhost-dev-pw").text).toBe("connect to localhost-dev-pw");
+  });
+
+  test("scrubbing is idempotent even when a remembered value appears inside a reference", async () => {
+    const { LearnedSecrets } = await import("./known.js");
+    const learned = new LearnedSecrets();
+    const scrubber = new Scrubber({ known: new KnownSecrets(), learnedFor: () => learned, fingerprint: fp });
+    learned.learn("github-token-value", "‹secret:x:00000000›");
+    const once = scrubber.scrub(`a ${GHP} b`).text;
+    expect(scrubber.scrub(scrubber.scrub(once).text).text).toBe(once);
+  });
+});
+
+describe("round-1 audit", () => {
+  test.each([
+    "    token = self.token",
+    "api_key = args.api_key",
+    "self.api_key = api_key",
+    "apiKey: config.apiKey",
+    "id_token = idToken",
+    "MAX_TOKENS=100000",
+    "DISABLE_AUTH=enabled",
+    "AUTH=Bearer",
+    'const pem = "-----BEGIN PRIVATE KEY-----"; foo(); const end = "-----END PRIVATE KEY-----"',
+    "if (s.startsWith('-----BEGIN RSA PRIVATE KEY-----')) { return parse(s); }",
+  ])("code isn't a secret: %s", (text) => {
+    expect(kinds(text)).toEqual([]);
+  });
+
+  test("a value under a name stops at the command's next word", () => {
+    expect(kinds("PGPASSWORD=postgres psql -h db")).toEqual(["credential:postgres"]);
+  });
+
+  test("a .netrc entry", () => {
+    expect(kinds("machine example.com login bob password s3cr3tPassw0rd")).toEqual(["password:s3cr3tPassw0rd"]);
+  });
+
+  test("hostile input stays linear", () => {
+    for (const text of ["-----BEGIN PRIVATE KEY-----".repeat(100_000), "curl ".repeat(400_000), `token: x${" ".repeat(990)}y\n`.repeat(2000)]) {
+      const t0 = performance.now();
+      findSecrets(text, t0 + 2_000);
+      expect(performance.now() - t0).toBeLessThan(2_500);
+    }
+  });
+
+  test.each(["source .env && bun test", ". ./.env; make test", "cp .env.example .env && bun run dev", "cat certs/ca.pem"])("keeps the output of %s", async (command) => {
+    await loadShellParser();
+    expect(toolVerdict("Bash", { command }, { cwd: "/w" })).toBe("keep");
+  });
+
+  test.each(["cat $HOME/.aws/credentials", "git show HEAD:.env", "git diff -- .env.production", "dd if=.env"])("withholds the output of %s", async (command) => {
+    await loadShellParser();
+    expect(toolVerdict("Bash", { command }, { cwd: "/w" })).toBe("withhold-output");
+  });
+
+  test("a stream judges a piece with what was sent of its line, and never cuts a spaced known value", () => {
+    const known = new KnownSecrets();
+    known.register("t", () => [{ label: "pp", value: "correct horse battery staple" }]);
+    const scrubber = new Scrubber({ known, fingerprint: fp });
+    const jwt = `eyJ${"a".repeat(600)}.eyJ${"b".repeat(300)}.${"c".repeat(100)}`;
+    for (const [text, secret] of [
+      ["AWS_ACCESS_KEY = Zx9qWvLk3mNp8RtY\n", "Zx9qWvLk3mNp8RtY"],
+      ["the phrase is correct horse battery staple ok\n", "battery staple"],
+      [`here ${jwt} done`, "a".repeat(100)],
+      ['MY_PASSPHRASE = "hunter2-xyz-abc"\n', "hunter2-xyz-abc"],
+    ] as const) {
+      for (const step of [1, 3, 7]) {
+        const s = new StreamScrubber(scrubber);
+        let out = "";
+        for (let i = 0; i < text.length; i += step) out += s.push(text.slice(i, i + step));
+        out += s.flush();
+        expect(out).not.toContain(secret);
+      }
+    }
+    // Prose that only mentions the words streams.
+    const s = new StreamScrubber(scrubber);
+    expect(s.push("We use token-based authentication here and ")).toBe("We use token-based authentication here and ");
+  });
+
+  test("offline, a text that can't be checked is left as it is, and said", () => {
+    let unchecked = 0;
+    const scrubber = new Scrubber({ known: new KnownSecrets(), fingerprint: fp, budgetMs: -1, onUnchecked: () => void unchecked++ });
+    expect(scrubber.scrub("keep me").text).toBe("keep me");
+    expect(unchecked).toBe(1);
+  });
+
+  test("a relayed MCP result is scrubbed like a hub result", async () => {
+    const { McpHub } = await import("../mcp/hub.js");
+    const hub = new McpHub();
+    const scrubber = new Scrubber({ known: new KnownSecrets(), fingerprint: fp });
+    hub.setResultScrub((t) => scrubber.scrub(t).text);
+    const r = hub.scrubRelayed("tools/call", { content: [{ type: "text", text: `t=${GHP}` }], structuredContent: { token: GHP } });
+    expect(JSON.stringify(r)).not.toContain(GHP);
   });
 });

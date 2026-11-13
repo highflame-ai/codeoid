@@ -222,7 +222,7 @@ import { resolveAttachments } from "./attachments.js";
 import { type CodeoidConfig, getConfigDir } from "../config.js";
 import { type SecretPathVerdict, secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
-import { defaultSpillDir } from "./compress/spill.js";
+import { defaultSpillDir, takeSpill } from "./compress/spill.js";
 import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
 import { type HeldPath, heldWriteOf, heldWriteReason, writeLandings, writeTargets } from "./held-writes.js";
 import { outsideEffects } from "./risk/effects.js";
@@ -1976,7 +1976,17 @@ export class Session {
     // Durable canonical history (#354): every change is appended to the
     // session's log so forks, backend switches and rewinds after a restart
     // still carry the conversation.
-    if (this.#secrets) this.#historyAccumulator.scrubTurn = (turn) => this.#scrubValue(turn);
+    if (this.#secrets) {
+      // At commit only what wasn't scrubbed on the way in: a user turn's text, and reasoning (a
+      // reply's text, tool inputs and outputs are scrubbed as they arrive). A seed is scrubbed whole.
+      this.#historyAccumulator.scrubTurn = (turn) =>
+        turn.role === "user"
+          ? { ...turn, content: this.#scrubText(turn.content), ...(turn.prompt !== undefined ? { prompt: this.#scrubText(turn.prompt) } : {}) }
+          : turn.thinking
+            ? { ...turn, thinking: this.#scrubText(turn.thinking) }
+            : turn;
+      this.#historyAccumulator.scrubSeed = (turn) => this.#scrubValue(turn);
+    }
     this.#historyAccumulator.onChange = (change) => {
       if (this.#destroyed) return;
       // Never write a history that couldn't be read over the log it lost;
@@ -5427,7 +5437,7 @@ export class Session {
         this.#noteProjectMcpNames(); // what this backend may load (readonly trust)
         const recoveryRun = this.#provider.runTurn({
           ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
-          history: this.#accumulator.history,
+          history: this.#historyForTurn(content),
           userMessage: content,
           model: this.#model ?? undefined,
           effort: this.#turnEffort() ?? undefined,
@@ -5535,7 +5545,7 @@ export class Session {
     this.#noteProjectMcpNames(); // what this backend may load (readonly trust)
     const run = this.#provider.runTurn({
       ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
-      history: this.#accumulator.history,
+      history: this.#historyForTurn(effectivePrompt),
       userMessage: turnPrompt,
       model: this.#model ?? undefined,
       effort: this.#turnEffort() ?? undefined,
@@ -6549,8 +6559,8 @@ export class Session {
       out.push({
         approvalId,
         toolName: gated.toolName,
-        // Shown as the card shows it: scrubbed (the call still runs with what the backend made).
-        input: this.#scrubValue(gated.input),
+        // Shown as the card shows it: as recorded (the call still runs with what the backend made).
+        input: this.#approvalShown(approvalId, gated.input),
         ...this.#cardRisk(risk, this.#heldWrite(gated.toolName, gated.input)),
         ...this.#cardSandbox(gated.toolName, gated.input, gated.shellCwd),
         ...(ws ? { targetWorkstream: { ...(ws.target.workstream ? { workstream: ws.target.workstream } : {}), ...(ws.target.warning ? { warning: ws.target.warning } : {}) } } : {}),
@@ -6992,7 +7002,7 @@ export class Session {
         this.#noteProjectMcpNames(); // what this backend may load (readonly trust)
         const run = this.#provider.runTurn({
           ...(this.#maxBudgetUsd !== undefined ? { maxBudgetUsd: this.#maxBudgetUsd } : {}),
-          history: this.#accumulator.history,
+          history: this.#historyForTurn(prompt),
           userMessage: prompt,
           model: this.#model ?? undefined,
           effort: this.#turnEffort() ?? undefined,
@@ -10081,9 +10091,12 @@ export class Session {
    * broadcast the new state so an approval prompt shows what will ACTUALLY
    * run, not the pre-mutation input.
    */
-  #applyHookInputMutation(approvalId: string, input: Record<string, unknown>): void {
+  #applyHookInputMutation(approvalId: string, raw: Record<string, unknown>): void {
     const msgId = this.#approvalIdToMessageId.get(approvalId);
     if (!msgId) return;
+    // Recorded as any input is: a hook may add a credential (an Authorization header) the call needs.
+    const toolUseId = this.#messageIdToToolUseId.get(msgId);
+    const input = this.#secrets ? this.#recordedToolInput((toolUseId && this.#toolVerdicts.get(toolUseId)) || "keep", raw) : raw;
     const updateTool = (sm: SessionMessage): void => {
       if (!sm.tool) return;
       sm.tool.input = input;
@@ -10281,7 +10294,7 @@ export class Session {
       const emsg = err instanceof Error ? err.message : String(err);
       console.error(`[codeoid/session ${this.id}] provider event consumer failed:`, err);
       // Before the status change: it wakes a pipeline phase waiter that reads it.
-      this.#lastTurnError = emsg;
+      this.#lastTurnError = this.#scrubText(emsg);
       this.#recordTurnFailure([err]);
       this.#setStatus("error");
       const errorMsg = this.#makeMessage("system", `Error: ${emsg}`, SYSTEM_IDENTITY, undefined, undefined, { event: "agent_error", errorCode: "agent_error" });
@@ -10592,6 +10605,15 @@ export class Session {
       }
 
       case "tool_start": {
+        // The reply so far is whole: what the stream scrubber held of it goes out before the call
+        // (a stateless backend's next text may come only after a long tool loop).
+        if (this.#textStream && this.#activeAssistantMsg) {
+          const rest = this.#textStream.flush();
+          if (rest) {
+            this.#activeAssistantMsg.content += rest;
+            this.#broadcastRaw({ type: "session.message.delta", sessionId: this.id, messageId: this.#activeAssistantMsg.messageId, contentAppend: rest, timestamp: new Date().toISOString() });
+          }
+        }
         // What of this call is stored (docs/secrets-and-memory-design.md §2.4): judged on what it really runs.
         // The canonical history keeps what the transcript keeps.
         const verdict = this.#secrets ? this.#secrets.verdict(event.name, event.input, event.shellCwd ?? this.workdir) : "keep";
@@ -10754,6 +10776,8 @@ export class Session {
         // same — so it doesn't mark the backing session the way a hook's change does.
         const verdict = this.#toolVerdicts.get(event.sdkToolUseId) ?? "keep";
         this.#toolVerdicts.delete(event.sdkToolUseId);
+        // A withheld output's raw copy (the compressor's spill file) goes too: nothing reads it back now.
+        if ((verdict === "withhold-output" || verdict === "drop") && typeof event.output === "string") takeSpill(event.output, defaultSpillDir());
         const stored =
           verdict === "drop" ? NOT_STORED : verdict === "withhold-output" ? OUTPUT_WITHHELD : typeof event.output === "string" ? this.#scrubText(event.output) : event.output;
         let output = stored;
@@ -10988,7 +11012,7 @@ export class Session {
             this.#seedOverflowRetry = true;
             break;
           }
-          this.#lastTurnError = errText;
+          this.#lastTurnError = this.#scrubText(errText);
           // Before the status change below, like lastTurnError: an error
           // waiter reads it. The CLI puts a limit notice in the result text
           // or the turn's own assistant text (only if THIS turn committed it,
@@ -11045,7 +11069,7 @@ export class Session {
 
       case "error": {
         console.error(`[codeoid/session ${this.id}] provider error:`, event.message);
-        this.#lastTurnError = event.message; // before the status change (see above)
+        this.#lastTurnError = this.#scrubText(event.message); // before the status change (see above)
         // The structured detail (codex's error info + reset) rides with the text.
         this.#recordTurnFailure([event.detail ? { message: event.message, error: event.detail } : event.message]);
         this.#setStatus("error");
@@ -11365,7 +11389,8 @@ export class Session {
    * context rotation (which resets that history) doesn't erase the list.
    */
   #indexTurn(turnId: string, kind: TurnIndexEntry["kind"], text: string, at: string): void {
-    const firstLine = text.trim().split("\n", 1)[0] ?? "";
+    // Scrubbed before it is cut: a cut could split a secret into two halves no rule knows.
+    const firstLine = this.#scrubText(text.trim().split("\n", 1)[0] ?? "");
     const entry: TurnIndexEntry = {
       turnId,
       kind,
@@ -12293,6 +12318,27 @@ export class Session {
       );
     });
     this.#chunker?.onMessage(msg);
+  }
+
+  /**
+   * The history a turn runs with: the canonical history (scrubbed, as stored), its last user turn
+   * — this turn's prompt — as the user wrote it. A stateless backend sends that turn to the model,
+   * and the prompt is what the user asked: a value in it is meant for the model (§2.7 of
+   * secrets-and-memory-design.md). Earlier turns stay scrubbed.
+   */
+  #historyForTurn(prompt: string): readonly CanonicalTurn[] {
+    const history = this.#accumulator.history;
+    const last = history.at(-1);
+    if (!this.#secrets || last?.role !== "user" || last.content === prompt) return history;
+    return [...history.slice(0, -1), { ...last, content: prompt }];
+  }
+
+  /** A pending approval's input as its card records it (secrets/verdict.ts): scrubbed, a credential file's content withheld. */
+  #approvalShown(approvalId: string, input: unknown): unknown {
+    if (!this.#secrets || !input || typeof input !== "object") return this.#scrubValue(input);
+    const msgId = this.#approvalIdToMessageId.get(approvalId);
+    const toolUseId = msgId ? this.#messageIdToToolUseId.get(msgId) : undefined;
+    return this.#recordedToolInput((toolUseId && this.#toolVerdicts.get(toolUseId)) || "keep", input as Record<string, unknown>);
   }
 
   /** Who and where a scrub is for: a kept secret lands in this tenant and home workstream. */

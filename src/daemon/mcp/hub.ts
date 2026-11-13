@@ -127,6 +127,33 @@ export class McpHub {
     this.#scrubResult = fn;
   }
 
+  /**
+   * A relayed result (mcp/proxy.ts: CLI backends' own MCP clients), scrubbed as
+   * a hub result is: every text part of a tool call's content, every text of a
+   * read resource. Returned as given when no scrub is set.
+   */
+  scrubRelayed<T>(method: string, result: T): T {
+    const scrub = this.#scrubResult;
+    if (!scrub || !result || typeof result !== "object") return result;
+    const r = result as { content?: unknown; contents?: unknown; structuredContent?: unknown };
+    const texts = (list: unknown) =>
+      Array.isArray(list) ? list.map((c) => (c && typeof c === "object" && typeof (c as { text?: unknown }).text === "string" ? { ...c, text: scrub((c as { text: string }).text) } : c)) : list;
+    if (method === "tools/call") {
+      const out: Record<string, unknown> = { ...(r as Record<string, unknown>), content: texts(r.content) };
+      // Structured output is text too, as JSON: scrubbed whole, kept only if it still parses.
+      if (r.structuredContent !== undefined) {
+        try {
+          out.structuredContent = JSON.parse(scrub(JSON.stringify(r.structuredContent)));
+        } catch {
+          delete out.structuredContent;
+        }
+      }
+      return out as T;
+    }
+    if (method === "resources/read") return { ...(r as Record<string, unknown>), contents: texts(r.contents) } as T;
+    return result;
+  }
+
   #refusal(spec: McpServerSpec, scope: McpCallScope | undefined): string | undefined {
     return scope?.sessionId && !spec.builtin ? this.#permit?.(scope.sessionId, spec) : undefined;
   }

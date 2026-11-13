@@ -46,12 +46,21 @@ export function secretRef(kind: string, fingerprint: string): string {
 
 export interface ScrubberOptions {
   known: KnownSecrets;
-  /** Where a value found by shape is remembered, so it is matched exactly from then on. */
-  learned?: LearnedSecrets;
+  /**
+   * Where a value found by a distinct format is remembered, so it is matched exactly from then
+   * on: per tenant (one tenant's text never tells another's what was seen). None: nothing kept.
+   */
+  learnedFor?: (ctx: ScrubContext) => LearnedSecrets | undefined;
   fingerprint: Fingerprinter;
   /** A detected secret, with its value: the vault keeps it where the workstream says so. */
   onDetected?: (secret: DetectedSecret, ctx: ScrubContext) => void;
   budgetMs?: number;
+  /**
+   * A text that can't be checked (too large, or over budget) is kept as it is and reported here,
+   * instead of being replaced by a "not stored" note: for a rewrite of stored data, where the
+   * note would destroy what is there for good. Unset: replaced.
+   */
+  onUnchecked?: (text: string) => void;
 }
 
 export class Scrubber {
@@ -65,39 +74,56 @@ export class Scrubber {
     return this.#opts.known;
   }
 
+  /** The longest value matched exactly (known or learned) for `ctx`: what a stream must hold back. */
+  longestKnown(ctx: ScrubContext = {}): number {
+    return Math.max(this.#opts.known.longest, this.#opts.learnedFor?.(ctx)?.longest ?? 0);
+  }
+
   /** `text` with no secret's value in it. */
   scrub(text: string, ctx: ScrubContext = {}): ScrubResult {
     if (!text) return { text, changed: false };
-    if (text.length > MAX_SCRUB_BYTES) return { text: TOO_LARGE, changed: true };
+    if (text.length > MAX_SCRUB_BYTES) return this.#unchecked(text, TOO_LARGE);
     const deadline = performance.now() + (this.#opts.budgetMs ?? SCRUB_BUDGET_MS);
+    const learned = this.#opts.learnedFor?.(ctx);
     const known = this.#opts.known.replace(text);
     let out = known.text;
-    // A learned value matched exactly is still a detected secret: the vault keeps it where it is kept.
-    if (this.#opts.learned && this.#opts.onDetected) {
-      for (const ref of known.refs) {
+    let changed = known.labels.length > 0;
+    if (learned) {
+      const r = learned.replace(out);
+      out = r.text;
+      // A learned value matched exactly is still a detected secret: the vault keeps it where it is kept.
+      for (const ref of r.refs) {
+        changed = true;
         const m = /^‹secret:([a-z0-9-]+):([0-9a-f]{8})›$/.exec(ref);
-        const value = m ? this.#opts.learned.valueOf(ref) : undefined;
+        const value = learned.valueOf(ref);
         if (m && value !== undefined) this.#detected({ kind: m[1]!, fingerprint: m[2]!, value }, ctx);
       }
     }
     const spans = findSecrets(out, deadline);
-    if (spans === null) return { text: NOT_CHECKED, changed: true };
-    if (spans.length === 0) return { text: out, changed: known.labels.length > 0 };
+    if (spans === null) return this.#unchecked(text, NOT_CHECKED);
+    if (spans.length === 0) return { text: out, changed };
     let result = "";
     let at = 0;
     let learnedAny = false;
     for (const s of spans) {
       const value = out.slice(s.start, s.end);
       const fp = this.#opts.fingerprint.of(value);
-      if (this.#opts.learned?.learn(value, secretRef(s.kind, fp))) learnedAny = true;
+      // Only a distinct format is remembered: a word found under a name (`password: …`) is often ordinary elsewhere.
+      if (s.distinct && learned?.learn(value, secretRef(s.kind, fp))) learnedAny = true;
       this.#detected({ kind: s.kind, fingerprint: fp, value }, ctx);
       result += out.slice(at, s.start) + secretRef(s.kind, fp);
       at = s.end;
     }
     out = result + out.slice(at);
     // A value just learned may appear again in this text, bare: replaced too.
-    if (learnedAny) out = this.#opts.known.replace(out).text;
+    if (learnedAny && learned) out = learned.replace(out).text;
     return { text: out, changed: true };
+  }
+
+  #unchecked(text: string, note: string): ScrubResult {
+    if (!this.#opts.onUnchecked) return { text: note, changed: true };
+    this.#opts.onUnchecked(text);
+    return { text, changed: false };
   }
 
   #detected(secret: DetectedSecret, ctx: ScrubContext): void {
@@ -118,7 +144,12 @@ export class Scrubber {
         if (r.changed) changed = true;
         return r.text;
       }
-      if (depth > 32 || v === null || typeof v !== "object") return v;
+      if (v === null || typeof v !== "object") return v;
+      // Too deep to walk: not stored as it is, rather than stored unchecked.
+      if (depth > 32) {
+        changed = true;
+        return NOT_CHECKED;
+      }
       if (Array.isArray(v)) return v.map((x) => walk(x, depth + 1));
       const out: Record<string, unknown> = {};
       for (const [k, x] of Object.entries(v as Record<string, unknown>)) out[k] = walk(x, depth + 1);
@@ -129,11 +160,17 @@ export class Scrubber {
   }
 }
 
-/** A line that may be naming a credential: held whole until it ends, so a pattern spanning spaces is matched whole. */
-const TRIGGER = /secret|token|passw|pwd|api[_-]?key|private|auth|bearer|credential|:\/\/|-----BEGIN|\bcurl\b|--user\b/i;
+/**
+ * Where a credential may start on a line, as the detector's own names read it: a secret-named key
+ * with its separator (`DB_PASSWORD=`, `"api_key":`, `passphrase:`), `Bearer`, `Authorization`, a
+ * URL's userinfo, a password flag, a JWT, a .netrc entry. From there to the line's end is held,
+ * so a value spanning spaces is matched whole; prose that only mentions "authentication" streams.
+ */
+const TRIGGER =
+  /[A-Za-z0-9_.-]*(?:passw|passphrase|pwd|secret|api[_-]?key|private[_-]?key|access[_-]?key|token|credential|auth)[A-Za-z0-9_.-]*["'\]]?[ \t]*(?::=|=>|\?=|[=:])|\bbearer\b|\bauthorization\b|[a-z][a-z0-9+.-]{0,31}:\/\/[^\s/@]*:|(?:^|[ \t])(?:-u|--user|--passw(?:or)?d)\b|eyJ|(?:^|\s)machine\s|^[ \t]*password[ \t]/im;
 /** The most held of one line (or one PEM block) before it is sent anyway, scrubbed as far as it has come. */
 const MAX_LINE_HOLD = 4096;
-const MAX_BLOCK_HOLD = 20_000;
+const MAX_BLOCK_HOLD = 64_000;
 
 /**
  * Scrubs text that arrives in pieces (an assistant's reply as it streams), so
@@ -152,6 +189,8 @@ export class StreamScrubber {
   readonly #scrubber: Scrubber;
   readonly #ctx: ScrubContext;
   #held = "";
+  /** What was already sent of the current line, as it came: the context a later piece is judged in. */
+  #sentLine = "";
 
   constructor(scrubber: Scrubber, ctx: ScrubContext = {}) {
     this.#scrubber = scrubber;
@@ -163,14 +202,33 @@ export class StreamScrubber {
     const text = this.#held + piece;
     const cut = this.#safeEnd(text);
     this.#held = text.slice(cut);
-    return cut > 0 ? this.#scrubber.scrub(text.slice(0, cut), this.#ctx).text : "";
+    return cut > 0 ? this.#send(text.slice(0, cut)) : "";
   }
 
   /** The rest, at the message's end. */
   flush(): string {
     const rest = this.#held;
     this.#held = "";
-    return rest ? this.#scrubber.scrub(rest, this.#ctx).text : "";
+    const out = rest ? this.#send(rest) : "";
+    this.#sentLine = "";
+    return out;
+  }
+
+  /**
+   * `chunk` scrubbed in the context of its line so far: a value whose name was sent in an
+   * earlier piece (`AWS_ACCESS_KEY ` then `= …`) is still found. When the context's own
+   * scrubbing doesn't come out the same, the chunk is scrubbed alone.
+   */
+  #send(chunk: string): string {
+    let out: string;
+    if (this.#sentLine) {
+      const prefix = this.#scrubber.scrub(this.#sentLine, this.#ctx).text;
+      const whole = this.#scrubber.scrub(this.#sentLine + chunk, this.#ctx).text;
+      out = whole.startsWith(prefix) ? whole.slice(prefix.length) : this.#scrubber.scrub(chunk, this.#ctx).text;
+    } else out = this.#scrubber.scrub(chunk, this.#ctx).text;
+    const nl = chunk.lastIndexOf("\n");
+    this.#sentLine = (nl >= 0 ? chunk.slice(nl + 1) : this.#sentLine + chunk).slice(-MAX_LINE_HOLD);
+    return out;
   }
 
   /** How much of `text` can be sent now. */
@@ -180,12 +238,36 @@ export class StreamScrubber {
     if (begin >= 0 && text.indexOf("-----END", begin) < 0 && text.length - begin <= MAX_BLOCK_HOLD) {
       return this.#lineStart(text, begin);
     }
-    // The last line, unfinished: held whole when it may name a credential.
+    // The last line, unfinished: held from where a credential may start — judged with what was
+    // already sent of it, so a name sent in an earlier piece still holds its value.
     const lineStart = text.lastIndexOf("\n") + 1;
-    const line = text.slice(lineStart);
-    if (TRIGGER.test(line) && line.length <= MAX_LINE_HOLD) return lineStart;
-    // Otherwise up to the last space, the run after it held (bounded by the longest known value).
-    const hold = Math.min(Math.max(512, this.#scrubber.known.longest), MAX_LINE_HOLD);
+    const sent = lineStart === 0 ? this.#sentLine : "";
+    const line = sent + text.slice(lineStart);
+    const trigger = TRIGGER.exec(line);
+    if (trigger && line.length - trigger.index <= MAX_LINE_HOLD) {
+      let at = lineStart + Math.max(0, trigger.index - sent.length);
+      // From the word it is in (a quote or `export ` before a name stays with what was sent).
+      while (at > lineStart && /[A-Za-z0-9_.$"'-]/.test(text[at - 1]!)) at--;
+      return at;
+    }
+    // A known value with spaces in it is never cut inside: one begun at the end is held from its
+    // start, and one already whole goes out whole.
+    let cut = this.#plainCut(text);
+    for (const v of this.#scrubber.known.spaced) {
+      for (let i = text.indexOf(v); i >= 0; i = text.indexOf(v, i + 1)) if (i < cut && cut < i + v.length) cut = i + v.length;
+      for (let k = Math.min(v.length - 1, text.length); k > 0; k--) {
+        if (text.endsWith(v.slice(0, k))) {
+          cut = Math.min(cut, text.length - k);
+          break;
+        }
+      }
+    }
+    return cut;
+  }
+
+  /** Up to the last space, the run after it held (bounded by the longest known value). */
+  #plainCut(text: string): number {
+    const hold = Math.min(Math.max(512, this.#scrubber.longestKnown(this.#ctx)), MAX_LINE_HOLD);
     const lastSpace = Math.max(text.lastIndexOf(" "), text.lastIndexOf("\n"), text.lastIndexOf("\t"));
     let cut = lastSpace + 1;
     if (text.length - cut > hold) cut = text.length - hold;

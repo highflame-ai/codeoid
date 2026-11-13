@@ -1,6 +1,8 @@
 /**
  * Files whose contents are credentials (`.env`, `~/.ssh/id_ed25519`,
- * `~/.aws/credentials`, an agent's own login), after atuin's
+ * `~/.aws/credentials`, an agent's own login), after atuin's (less `*.pem`:
+ * most are public certificates, and a private key in one is found by its
+ * armour when it is read out, detect.ts),
  * `atuin-common/src/secrets/files.rs` (MIT). What reads one out, or writes
  * one, isn't stored (verdict.ts): such a file holds nothing else, in
  * whatever format, so scrubbing by shape would miss whatever it can't name.
@@ -12,7 +14,7 @@ import { basename, isAbsolute, join, normalize, resolve } from "node:path";
 /** Names that say a file holds credentials, wherever it is (`*` within the name). */
 const NAMES = [
   ".env", ".env.*", "*.env", ".envrc", "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ecdsa_sk", "id_ed25519_sk",
-  "*.pem", "*.key", "*.p12", "*.pfx", "*.jks", "*.keystore", "*.tfstate", "*.tfstate.backup", "*.tfvars",
+  "*.key", "*.p12", "*.pfx", "*.jks", "*.keystore", "*.tfstate", "*.tfstate.backup", "*.tfvars",
   ".netrc", "_netrc", ".pgpass", ".git-credentials", ".npmrc", ".pypirc", ".htpasswd", ".vault-token",
 ];
 

@@ -54,13 +54,17 @@ agent echoed, an MCP server's bearer token in an error, the backend key. Codeoid
 exactly, so they are replaced by exact match, with no guessing and no false positives. `KnownSecrets`
 (new, `secrets/known.ts`) gathers them from every source, each under a label:
 
-| Source | Label |
+| Source | Reference |
 | --- | --- |
-| `credentials[]` values in the secret store (W1) | `credential:<id>` |
-| MCP OAuth access and refresh tokens (`mcp/oauth.ts`) | `credential:oauth:<server>` |
-| Backend accounts' keys (`accounts.ts`, `claude-accounts.ts`, `oai:` endpoints) | `credential:account:<name>` |
-| The daemon's own keys (`CODEOID_API_KEY`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, …) | `credential:daemon:<name>` |
-| Agent identity tokens codeoid mints (ZeroID, `agent-identity.ts`) | `credential:agent-token` |
+| `credentials[]` values in the secret store (W1) | `‹credential:<id>›` |
+| MCP OAuth access and refresh tokens, client secrets (`mcp_oauth_credentials`) | `‹credential:oauth:<credential or server>›` |
+| Backend accounts' tokens, headers and env (`accounts.ts`) | `‹credential:account:<backend>:<name>›` |
+| OpenAI-compatible endpoints' keys and headers (`openai-endpoints.ts`) | `‹credential:endpoint:<name>›` |
+| The daemon's own keys in its environment (`CODEOID_*`, `*_API_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, …) | `‹credential:daemon:<name>›` |
+| The conductor's key (`conductor_identity`), the MCP relay's live per-session tokens | `‹credential:daemon:…›` |
+
+ZeroID tokens minted for agents are JWTs, and codeoid's own MCP tokens (`bbt_`, `mmt_`, `sbt_`,
+`rt_`) have formats of their own: both are found by shape (§2.3).
 
 Each value is matched as written, URL-encoded, and base64 as `user:value` (Basic auth). Values shorter
 than 8 characters aren't matched (they would match ordinary text). The set is rebuilt when a source
@@ -78,7 +82,7 @@ to secret-named keys, never "looks random", so hashes and ids survive. The name 
 only the value replaced (`DB_PASSWORD=‹secret:password:9c2e41aa›`).
 
 The fingerprint is HMAC-SHA256 of the value under a key made once per daemon
-(`<config dir>/secret-fingerprint.key`, 0600, hidden from every sandbox), truncated to 8 hex
+(`<config dir>/secrets/fingerprint.key`, 0600, hidden from every sandbox), truncated to 8 hex
 characters. Without the key a fingerprint can't be checked against a guess.
 
 Scanning has a time budget (atuin's: 250 ms). Text that can't be scanned within it isn't stored; a
@@ -136,18 +140,31 @@ embedders get none) at every place codeoid stores or sends on a conversation:
 | Tool output, in the `tool_complete` seam (`session.ts`) | before the `tool_result` hooks run, so canonical history, scrollback and transcript all get the scrubbed text. Not marked `redacted` as a hook's change is: the backend saw the same, so forking its own session adds no exposure, and marking it would cost every session that ever printed a secret its native forks |
 | Tool input, at `tool_start` | the recorded copy only; the call runs as the backend made it |
 | User prompts and assistant and thinking text | at the message's commit (`#commitStreamed`, `#persistAndBuffer`) |
-| Live deltas to attached clients | a streaming scrubber holds back the trailing run of non-space characters (at most 512) until the next space or the message's end, so a token is never split across two deltas and sent unscrubbed |
+| Live deltas to attached clients | `StreamScrubber`: a line is held from where a credential may start (a secret-named key and its separator, `Bearer`, a URL's userinfo, a JWT, a private key's armour) to its end, judged with what was already sent of the line; otherwise the trailing run of non-space characters, and never inside a known value with spaces; everything held goes out before a tool call. The committed message is scrubbed whole and replaces what streamed |
 | Every message the session buffers, writes or sends (`#persistAndBuffer`, `#commitStreamed`, a fork's copy of its parent's rows, a settled approval's input) | `Session#scrubMessage`: text, parts, tool input and state, metadata |
 | The canonical history | `CanonicalHistoryAccumulator.scrubTurn` on each turn as it is committed, so no backend is seeded with a value codeoid wouldn't store |
 | `MemoryEngine.ingest` | so anything that ingests (S4's imports included) is scrubbed |
 | `share/pack.ts` | transcripts written before S1 are scrubbed as they are packed |
-| Dispatch digests, routine and loop results, push and Telegram texts | built from scrubbed messages; the push text is scrubbed again |
+| Dispatch digests, routine and loop results | built from scrubbed messages; a settled dispatch task's prompt, digest and error are scrubbed in the database (`Store.scrubText`; until it settles the prompt is what its worker is sent), a routine run's check output, summary and reason as they are written (not its payload, which the run reads back as its data); a session's last error is scrubbed when set |
+| The turn index (`<id>.turns.jsonl`) | the prompt's first line, scrubbed before it is cut |
+| MCP results through the relay (CLI backends' own MCP clients) | `McpHub.scrubRelayed`, as through the hub |
+| Push notifications | carry ids only, no text |
 
 A one-time `codeoid secret scrub [--dry-run]` rewrites what was stored before S1 (transcripts, canonical
 histories, episodes, their FTS rows) with known values and detected secrets, and reports what it changed.
 It is a command, not automatic: it rewrites history, so you run it when you choose.
 
 ### 2.7 What S1 doesn't fix
+
+A stateless backend (OpenAI-compatible, Gemini, llama.cpp) is sent its working context from the
+canonical history on every turn, and that history is scrubbed: from the next turn on, such a model
+sees a secret it read earlier as its reference. The prompt of the turn it is answering goes as the
+user wrote it (`Session#historyForTurn`).
+
+A value found only by the name it sits under (`DB_PASSWORD=…`, `password: …`) is replaced there but
+not remembered: the same word is too often ordinary text elsewhere. A value of a distinct format (a
+vendor's token, a JWT, a bearer token, a key) is remembered for the rest of the daemon's run, per
+tenant, and replaced bare wherever it shows up again.
 
 The backend has already seen the value by the time codeoid stores the result, and so has the model. A
 CLI backend keeps its own copy (Claude Code's `~/.claude/projects/…/*.jsonl`, Codex's rollout files).
@@ -176,8 +193,14 @@ still gets through. The detector reduces this; it can't end it.
 - Known values: declared credentials, the daemon's environment (`CODEOID_*` and secret-named
   variables), every backend's accounts, OpenAI-compatible endpoints, MCP OAuth tokens and client
   secrets, the conductor's key. Rebuilt on a change, and at least every minute (a token refresh).
-- Streaming: a line that may name a credential is held until it ends, a private key until its end
-  line, otherwise the trailing run of non-space characters; the committed message replaces it.
+- Matching: known and remembered values in one pass (Aho-Corasick), never inside a reference
+  already written; remembered ones as whole tokens. Detection is linear: private keys and curl's
+  `-u` are found in code, the time budget is checked inside each pattern's matches too.
+- Streaming: see §2.6.
+- `codeoid secret scrub` takes no time budget, remembers nothing across texts, leaves a text it
+  can't check as it is (and says how many), includes rotated transcript segments, and rebuilds
+  each database it changed (FTS optimize, WAL checkpoint, VACUUM) so replaced text is gone from
+  disk.
 - Protocol: `secret.list` (settings:read), `secret.reveal`, `secret.forget` (settings:write, the
   caller's own token, audited without the value). CLI: `codeoid secret ls | reveal | forget | promote |
   scrub [--dry-run]`; `promote` reveals, declares an env credential, sets its value and forgets the

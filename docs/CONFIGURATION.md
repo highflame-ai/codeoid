@@ -546,6 +546,10 @@ Settings, under `secrets`:
 | `dropCommands` | `[]` | Commands whose calls aren't stored at all (`"my-vault dump"`). |
 | `credentialFiles` | `[]` | More files whose contents are credentials (globs, by name or path). |
 
+A value found only by the name it sits under (`DB_PASSWORD=…`) is replaced there, but not remembered: repeated bare later, it isn't recognised. A token of a distinct format (a vendor's token, a JWT, a bearer token) is, for the rest of the daemon's run.
+
+An OpenAI-compatible, Gemini or llama.cpp session is sent its earlier turns from codeoid's stored history: from the next turn on, its model sees a secret it read earlier as the reference.
+
 Limits. The backend has already seen a value by the time codeoid stores the result, and a CLI backend keeps its own copy (Claude Code's `~/.claude/projects`, Codex's sessions), which codeoid doesn't change. A secret with no known shape, that codeoid doesn't know, in a command not on the list, still gets through. Design: [secrets-and-memory-design.md](secrets-and-memory-design.md).
 
 ## Signing a backend in, instead of pasting a key

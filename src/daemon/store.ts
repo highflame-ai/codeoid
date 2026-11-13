@@ -1329,6 +1329,29 @@ export class Store {
    * running, finishing late — overwrote whatever its successor had recorded,
    * or resurrected a task that had already gone terminal.
    */
+  /**
+   * Applied to a dispatch task's prompt, result digest and error once it is
+   * settled (docs/secrets-and-memory-design.md §2.6): until then the prompt is
+   * what its worker is sent, as the conductor wrote it.
+   */
+  scrubText: ((text: string) => string) | undefined;
+
+  /** A settled task's texts, scrubbed in place. */
+  #scrubSettledTask(id: string): void {
+    const scrub = this.scrubText;
+    if (!scrub) return;
+    const row = this.#db.prepare("SELECT prompt, result_digest, error, status FROM dispatch_tasks WHERE id = ?").get(id) as
+      | { prompt: string; result_digest: string | null; error: string | null; status: string }
+      | null;
+    if (!row || !["done", "failed", "cancelled", "blocked"].includes(row.status)) return;
+    const prompt = scrub(row.prompt);
+    const digest = row.result_digest ? scrub(row.result_digest) : row.result_digest;
+    const error = row.error ? scrub(row.error) : row.error;
+    if (prompt !== row.prompt || digest !== row.result_digest || error !== row.error) {
+      this.#db.prepare("UPDATE dispatch_tasks SET prompt = ?, result_digest = ?, error = ? WHERE id = ?").run(prompt, digest, error, id);
+    }
+  }
+
   dispatchComplete(id: string, generation: number, digest: string, now: number): boolean {
     const res = this.#db
       .prepare(
@@ -1337,6 +1360,7 @@ export class Store {
          WHERE id = ? AND generation = ? AND status IN ('claimed', 'running')`,
       )
       .run(digest, now, id, generation);
+    if (res.changes > 0) this.#scrubSettledTask(id);
     return res.changes > 0;
   }
 
@@ -1380,6 +1404,7 @@ export class Store {
           ? [opts.notBefore ?? null, error, now, id, generation]
           : [error, now, id, generation]),
       ) as { status: "queued" | "blocked" | "failed" } | null;
+    if (row && row.status !== "queued") this.#scrubSettledTask(id);
     return row?.status ?? null;
   }
 
@@ -1466,6 +1491,7 @@ export class Store {
          RETURNING *`,
       )
       .get(error, now, id, generation, ownerDaemon ?? null) as RawDispatchRow | null;
+    if (row) this.#scrubSettledTask(id);
     return row ? rowToDispatchTask(row) : null;
   }
 
@@ -1494,6 +1520,7 @@ export class Store {
          RETURNING *`,
       )
       .get(reason, now, id, ownerDaemon ?? null) as RawDispatchRow | null;
+    if (row) this.#scrubSettledTask(id);
     return row ? rowToDispatchTask(row) : null;
   }
 

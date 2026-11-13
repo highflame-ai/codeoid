@@ -860,7 +860,10 @@ export class SessionManager {
     // Routines share the daemon DB. Built only when enabled, so the kill
     // switch leaves every routine in place but nothing fires.
     if (opts?.config?.routines?.enabled ?? true) {
-      this.#routines = new RoutineService(new RoutineStore(store.database), this.#makeRoutineHost(), opts?.config?.routines ?? {});
+      const routineStore = new RoutineStore(store.database);
+      const secretService = opts?.secretService;
+      if (secretService) routineStore.scrubText = (text) => secretService.scrub(text).text;
+      this.#routines = new RoutineService(routineStore, this.#makeRoutineHost(), opts?.config?.routines ?? {});
     }
     // Pack curation surface (docs/pack-loading.md) — always constructed (cheap:
     // no DB / runner). Reads the boot pack config; each mutation persists to
@@ -2386,6 +2389,8 @@ mcpHub: this.#mcpHub,
    */
   #wireSecretService(secrets: SecretService): void {
     registerSecretPaths({ dirs: [secretMaterialDir(getConfigDir())] });
+    // Settled dispatch tasks and routine runs keep no secret either (§2.6).
+    this.#store.scrubText = (text) => secrets.scrub(text).text;
     secrets.setCapturePolicy((ws) => (ws ? (this.#workstreams.get(ws)?.captureSecrets ?? "drop") : (this.#config?.secrets?.captureSecrets ?? "drop")));
     addDaemonKnownSources(secrets, {
       credentials: () => this.#config?.credentials ?? [],

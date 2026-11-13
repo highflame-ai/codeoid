@@ -156,10 +156,14 @@ export class McpProxy implements McpProxyMount {
     return `${this.#baseUrl().replace(/\/+$/, "")}${MCP_PROXY_PATH_PREFIX}${encodeURIComponent(server)}`;
   }
 
+  /** Told of every token minted and revoked: the daemon's secret handling matches live ones (docs/secrets-and-memory-design.md §2.2). */
+  tokenListener: { minted(token: string): void; revoked(token: string): void } | undefined;
+
   mint(binding: McpProxyBinding): { token: string; servers: string[] } {
     const servers = (binding.view ?? this.#registry).relayFor(binding.backendId).map((s) => s.name);
     const token = randomBytes(32).toString("base64url");
     this.#tokens.set(hashOf(token), { binding, servers: new Set(servers), relays: new Map(), starting: new Map(), calls: 0, initializes: [] });
+    this.tokenListener?.minted(token);
     return { token, servers };
   }
 
@@ -167,6 +171,7 @@ export class McpProxy implements McpProxyMount {
     const key = hashOf(token);
     const record = this.#tokens.get(key);
     if (!record) return;
+    this.tokenListener?.revoked(token);
     this.#tokens.delete(key);
     for (const relay of record.relays.values()) void relay.close();
   }
@@ -605,7 +610,8 @@ class Relay {
         if (request.method === "resources/unsubscribe") this.#subscriptions.delete(uri);
       }
       if (request.method === "tools/list") return this.#listed(result, params?.cursor !== undefined);
-      return result;
+      // What goes back to the model holds no secret's value, as through the hub (docs/secrets-and-memory-design.md §2.7).
+      return this.#init.hub ? this.#init.hub.scrubRelayed(request.method, result) : result;
     } catch (e) {
       if (e instanceof McpSignInRequired) {
         // Not signed in, or the credential was lost mid-session (a refused
