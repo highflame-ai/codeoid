@@ -9891,28 +9891,34 @@ mcpHub: this.#mcpHub,
     // (`opus` → "Opus"), or a full claude-* id. An unknown value is rejected
     // here with the set of valid choices, so `/model o` gets actionable
     // feedback.
-    const { models } = await this.#pickableModels(session.providerId);
-    // An endpoint's server is the validator for an id it isn't configured with
-    // (the picker's "custom model id"); a Claude-shaped id is still refused there.
-    const onEndpoint = endpointNameOf(session.providerId) !== null;
-    // resolveAgainstList passes any full claude-* id through (Claude's catalog lags its releases), so on an
-    // endpoint a Claude-shaped id is refused first.
-    const resolve = (id: string) =>
-      onEndpoint
-        ? resolveModelIdForProvider(id, session.providerId) === null
-          ? null
-          : (resolveAgainstList(id, models) ?? resolveModelIdForProvider(id, session.providerId))
-        : resolveAgainstList(id, models);
+    const providerId = session.providerId;
+    const endpoint = endpointNameOf(providerId);
+    if (endpoint !== null && !this.#safeEndpoint(endpoint)) {
+      return { type: "response.error", requestId: msg.id, error: `The endpoint "${endpoint}" no longer exists: switch the session to another backend.`, code: "invalid_request" };
+    }
+    const { models } = await this.#pickableModels(providerId);
+    // The backend changed while the list was fetched: a pick checked against the old one isn't the new one's.
+    if (session.providerId !== providerId) {
+      return { type: "response.error", requestId: msg.id, error: "The session's backend changed while the model was being checked: pick again.", code: "invalid_request" };
+    }
+    // On an endpoint: a model it lists (by id or display name) is taken as is, Claude-shaped or not (a
+    // gateway may serve Claude models); a Claude-shaped id it doesn't list is refused; any other id is
+    // passed to its server, which judges it (the picker's custom model id). The id follows the endpoint
+    // store's own rule. Elsewhere the list decides.
+    const resolve = (id: string) => (endpoint !== null ? resolveOnEndpoint(id, models, providerId) : resolveAgainstList(id, models));
     const resolvedModel = resolve(msg.model);
     if (!resolvedModel) {
       const listed = models.map((m) => m.value).join(", ");
+      const invalid = endpoint !== null && !isEndpointModelId(msg.model.trim());
       return {
         type: "response.error",
         requestId: msg.id,
-        // On an endpoint only a Claude-shaped id is refused: say so, rather than an empty "Available:".
-        error: onEndpoint
-          ? `"${msg.model}" is a Claude model, not one this endpoint serves. ${listed ? `Configured: ${listed}. ` : ""}Any other model id is passed to the server.`
-          : `Unknown model "${msg.model}". Available: ${listed}`,
+        error:
+          endpoint === null
+            ? `Unknown model "${msg.model}". Available: ${listed}`
+            : invalid
+              ? `${JSON.stringify(msg.model)} isn't a model id: one line, at most 256 characters, no control characters.`
+              : `"${msg.model}" is a Claude model, not one this endpoint serves. ${listed ? `Configured: ${listed}. ` : ""}Any other model id is passed to the server.`,
         code: "invalid_request",
       };
     }
@@ -10940,4 +10946,23 @@ function referenceFolder(p: string): string {
   } catch {
     return abs;
   }
+}
+
+/** A model id an endpoint may be sent: the endpoint store's own rule (openai-endpoints.ts validateModels). */
+function isEndpointModelId(id: string): boolean {
+  return id.length > 0 && id.length <= 256 && !/[\x00-\x1f\x7f]/.test(id);
+}
+
+/** Claude's ids in every form a gateway may name them: the catalog's, `claude-*`, Bedrock's `[region.]anthropic.claude-*`. */
+function isClaudeShaped(id: string, providerId: string): boolean {
+  return resolveModelIdForProvider(id, providerId) === null || /^(?:[a-z0-9-]+\.)*anthropic\.claude/i.test(id);
+}
+
+/** How a model pick resolves on an endpoint (see SessionManager's set_model). */
+export function resolveOnEndpoint(raw: string, models: ReadonlyArray<ModelInfo>, providerId: string): string | null {
+  const id = raw.trim();
+  if (!isEndpointModelId(id)) return null;
+  const listed = models.find((m) => m.value === id) ?? models.find((m) => m.displayName.toLowerCase() === id.toLowerCase());
+  if (listed) return listed.value;
+  return isClaudeShaped(id, providerId) ? null : id;
 }

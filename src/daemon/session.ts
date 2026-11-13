@@ -12585,6 +12585,8 @@ function isNativeRef(ref: unknown): ref is NativeTurnRef {
  * "Codex"), an endpoint's own name, else its id.
  */
 export function backendLabel(provider: { displayName?: string; id: string }): string {
+  // An endpoint's display name is the user's own words: used as is.
+  if (provider.id.startsWith("oai:")) return provider.displayName?.trim() || provider.id.slice("oai:".length);
   const name = (provider.displayName ?? "").replace(/\s+\([^()]*\)\s*$/, "").trim();
   return name || provider.id;
 }
