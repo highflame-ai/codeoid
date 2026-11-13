@@ -1296,11 +1296,13 @@ export class CodexProvider implements SessionProvider {
             break;
           }
           const output = extractItemOutput(item);
+          const exitCode = typeof item.exitCode === "number" ? item.exitCode : typeof (item as { exit_code?: unknown }).exit_code === "number" ? (item as { exit_code: number }).exit_code : undefined;
           this.#push({
             type: "tool_complete",
             sdkToolUseId: itemId,
             output: output || (status === "declined" ? "Declined — not run." : output),
             success: status === "completed",
+            ...(exitCode !== undefined ? { exitCode } : {}),
           });
           this.#announcedItems.delete(itemId);
         }

@@ -241,11 +241,12 @@ PreToolUse rewrite, the tool loops codeoid runs, opencode's shell shim), so it c
   loops codeoid runs; else the `Exit code N` line Claude's Bash result carries; null when unknown),
   working directory (the `shellCwd` the gate already has), and duration (`tool_start` to
   `tool_complete`).
-- **On every episode:** backend, model, and the turn's origin (`user`, `agent`, `delegated`, from
-  `turn-origin.ts`; plus `routine`, `loop` and `dispatch` for unattended runs).
+- **On every episode:** backend, model, and the turn's origin (`user`, `delegated`, `agent` from
+  `turn-origin.ts` — `agent` also for background work outside a turn — and `dispatch` for a
+  dispatched worker, loop attempts included), as they were when the call opened.
 - **Recall filters:** `only_failed`, `backend`, `origin`, `cwd` (a repo root or folder), next to the
-  existing `tool`, `filePaths`, `before`/`after`. On `recall`, `timeline` and the conductor's
-  `fleet_recall`.
+  existing `tool`, `filePaths`, `before`/`after`. On `recall` and the conductor's `fleet_recall`
+  (`only_failed`, `backend`, `origin`); `timeline` stays a plain newest-first list.
 - **Tail first:** `get_episode` takes `lines: [[start, end], …]`, negative counting from the end, and
   returns numbered lines with a `[… N lines skipped …]` marker and the total line count. The tool
   description says to ask for `[[-80, -1]]` first.

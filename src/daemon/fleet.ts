@@ -325,7 +325,9 @@ export function createFleetHandlers(deps: FleetDeps) {
       const sessionNames = new Map(deps.listSessions().map((s) => [s.id, s.name]));
       const limit = Math.min(args.limit ?? 6, MAX_LIMIT);
       // Asked for more than shown: a closed workstream's episodes are dropped, never shown (§10).
-      const all = await deps.memory.recallGlobal({ query: args.query, tenant: deps.tenant, limit: limit * 3 });
+      const filtered = args.only_failed === true || args.backend !== undefined || args.origin !== undefined;
+      // Filtered by facts after a text search: asked for many more, so the filter has something to keep.
+      const all = await deps.memory.recallGlobal({ query: args.query, tenant: deps.tenant, limit: filtered ? limit * 20 : limit * 3, ...(filtered ? { candidateK: 600 } : {}) });
       const facts = { ...(args.only_failed ? { onlyFailed: true } : {}), ...(args.backend ? { backend: args.backend } : {}), ...(args.origin ? { origin: args.origin } : {}) };
       const inScope = all.filter((h) => (!args.workstream || h.episode.workstreamId === args.workstream) && matchesFacts(h.episode, facts));
       // Dropped before anything is counted or said: even "N more were withheld" would answer the query.

@@ -136,7 +136,7 @@ export function memoryToolDefs(): MemoryToolDef[] {
       });
       const out = formatHits(hits, ctx.sessionId, includeCurrent);
       // Nothing, with filters: say which to loosen, rather than leave the agent to guess.
-      const used = [args.only_failed === true ? "only_failed" : "", facts.backend ? "backend" : "", facts.origin ? "origin" : "", facts.cwd ? "cwd" : "", str(args.tool_name) ? "tool_name" : "", includeCurrent ? "" : "include_current_session (now false)"].filter(Boolean);
+      const used = [args.only_failed === true ? "only_failed" : "", facts.backend ? "backend" : "", facts.origin ? "origin" : "", facts.cwd ? "cwd" : "", str(args.tool_name) ? "tool_name" : ""].filter(Boolean);
       return hits.length === 0 && used.length > 0 ? `${out} Try loosening: ${used.join(", ")}.` : out;
     },
   };
@@ -362,7 +362,7 @@ const ORIGINS = new Set(["user", "delegated", "agent", "dispatch"]);
 /** An episode's facts as one line: exit code, directory, how long, who and what (§3 of secrets-and-memory-design.md). */
 function factLine(ep: Episode): string[] {
   const parts = [
-    ep.exitCode !== undefined ? `exit ${ep.exitCode}` : "",
+    ep.exitCode !== undefined ? (ep.exitCode === -1 ? "failed" : `exit ${ep.exitCode}`) : "",
     ep.cwd ? `in ${ep.cwd}` : "",
     ep.durationMs !== undefined ? `took ${ep.durationMs < 1000 ? `${ep.durationMs} ms` : `${(ep.durationMs / 1000).toFixed(1)} s`}` : "",
     ep.backend ? `by ${ep.backend}${ep.model ? `/${ep.model}` : ""}` : "",
@@ -407,17 +407,28 @@ export function formatEpisodeLines(ep: Episode, currentSessionId: string, ranges
   const width = String(total).length;
   const body: string[] = [];
   let shown = 0;
+  let chars = 0;
   let prevEnd = 0;
+  let stopped = false;
   for (const [a, b] of merged) {
     if (a > prevEnd + 1) body.push(`[… ${a - prevEnd - 1} lines skipped …]`);
-    for (let n = a; n <= b && shown < MAX_LINES; n++, shown++) body.push(`${String(n).padStart(width)}  ${lines[n - 1]}`);
-    prevEnd = b;
-    if (shown >= MAX_LINES) {
-      body.push(`[… stopped at ${MAX_LINES} lines: ask a narrower range …]`);
-      break;
+    for (let n = a; n <= b; n++) {
+      if (shown >= MAX_LINES || chars >= GET_EPISODE_MAX_PAGE) {
+        body.push(`[… stopped at line ${n - 1}: ${shown >= MAX_LINES ? `${MAX_LINES} lines` : `${GET_EPISODE_MAX_PAGE} characters`} is the most one call returns; ask a narrower range …]`);
+        stopped = true;
+        break;
+      }
+      let line = lines[n - 1] ?? "";
+      // One very long line (minified JSON, a one-line log) is cut, and says so.
+      if (chars + line.length > GET_EPISODE_MAX_PAGE) line = `${line.slice(0, Math.max(0, GET_EPISODE_MAX_PAGE - chars))}…[line cut: read it with offset]`;
+      body.push(`${String(n).padStart(width)}  ${line}`);
+      chars += line.length;
+      shown++;
     }
+    prevEnd = b;
+    if (stopped) break;
   }
-  if (prevEnd < total && shown < MAX_LINES) body.push(`[… ${total - prevEnd} lines skipped …]`);
+  if (prevEnd < total && !stopped) body.push(`[… ${total - prevEnd} lines skipped …]`);
   const label = ep.sessionId === currentSessionId ? "current session" : "a prior session";
   return [
     `### ${ep.summary} — ${label}`,

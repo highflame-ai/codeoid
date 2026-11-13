@@ -285,7 +285,7 @@ export class MemoryEngine {
     const factIds = hasFactFilter(q) ? this.#store.recentMatching(q.workspaceId, q, 200) : [];
     // A query for exact text (quoted, a command, an identifier): what holds it comes first.
     const exactText = exactQueryText(q.query);
-    const exactIds = exactText ? this.#store.containing(q.workspaceId, exactText, Math.max(limit, 10)) : [];
+    const exactIds = exactText ? this.#store.containing(q.workspaceId, exactText, Math.max(limit, 10), q) : [];
 
     // Union candidates.
     const candidateIds = [...new Set([...exactIds, ...ftsHits.keys(), ...vectorIds, ...factIds])];
@@ -705,7 +705,16 @@ export function exactQueryText(query: string): string | null {
   const quoted = /^(["'`])(.+)\1$/.exec(q);
   if (quoted && quoted[2]!.trim().length >= 2) return quoted[2]!.trim();
   if (q.length < 3 || q.length > 200) return null;
-  if (!/\s/.test(q) && /[./_=:@-]|[a-z][A-Z]|^[A-Z0-9_]{4,}$/.test(q)) return q;
-  if (/(?:^|\s)--?[A-Za-z]/.test(q) && q.split(/\s+/).length <= 8) return q;
+  if (!/\s/.test(q)) {
+    // A path (`src/x.ts`, `./run.sh`), a file name with an extension, a flag, an assignment, an
+    // identifier with `_` or camelCase, a `CONSTANT_NAME`: not a hyphenated word (`rate-limiting`),
+    // an abbreviation (`e.g.`) or a plain capitalised word (`TODO`).
+    if (/\//.test(q) || /^--?[A-Za-z]/.test(q) || /=/.test(q)) return q;
+    if (/^[\w-]{2,}\.[A-Za-z0-9]{1,8}$/.test(q) && !/^[a-z]\.[a-z]\.?$/i.test(q)) return q;
+    if (/^[A-Za-z_$][\w$]*$/.test(q) && (/_/.test(q) || /[a-z][A-Z]/.test(q))) return q;
+    return null;
+  }
+  // A command: words with a flag, and not a question (`what does -v do`).
+  if (/(?:^|\s)--?[A-Za-z]/.test(q) && q.split(/\s+/).length <= 8 && !/\?|^(?:what|how|why|when|where|which|who|does|do|is|are|can|should)\b/i.test(q)) return q;
   return null;
 }

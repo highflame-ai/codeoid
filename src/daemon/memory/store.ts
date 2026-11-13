@@ -1337,7 +1337,6 @@ export class SqliteEpisodeStore {
     };
   }
 
-  /** Apply post-retrieval filters from RecallQuery. */
   /**
    * The newest episodes matching a query's fact filters (failed calls, a backend, an origin, a
    * directory), by the columns themselves: recall's candidates for "what failed here", which
@@ -1346,6 +1345,7 @@ export class SqliteEpisodeStore {
   recentMatching(workspaceId: string, q: RecallQuery, limit: number): string[] {
     const where = ["workspace_id = ?"];
     const args: Array<string | number> = [workspaceId];
+    scopeSql(q, where, args);
     if (q.onlyFailed) where.push("(kind = 'error' OR (exit_code IS NOT NULL AND exit_code != 0))");
     if (q.backend) {
       where.push("backend = ?");
@@ -1364,18 +1364,25 @@ export class SqliteEpisodeStore {
     return rows.map((r) => r.id);
   }
 
-  /** The newest episodes in a workspace whose text holds `text` exactly (a phrase search, then checked). */
-  containing(workspaceId: string, text: string, limit: number): string[] {
+  /**
+   * The newest episodes in a workspace whose text holds `text` exactly (a phrase search, then
+   * checked), scoped as the query is (its workstreams and sessions) before any is picked: what the
+   * caller can't read never takes a slot.
+   */
+  containing(workspaceId: string, text: string, limit: number, scope: RecallQuery): string[] {
     const phrase = `"${text.replace(/"/g, '""')}"`;
+    const where = ["episodes_fts MATCH ?", "workspace_id = ?"];
+    const args: Array<string | number> = [phrase, workspaceId];
+    scopeSql(scope, where, args, "e.");
     let ids: string[];
     try {
       ids = (
         this.#db
           .prepare(
             `SELECT e.id FROM episodes_fts f JOIN episodes e ON e.rowid = f.rowid
-             WHERE episodes_fts MATCH ? AND e.workspace_id = ? ORDER BY e.created_at DESC LIMIT ?`,
+             WHERE ${where.map((w, i) => (i === 1 ? `e.${w}` : w)).join(" AND ")} ORDER BY e.created_at DESC LIMIT ?`,
           )
-          .all(phrase, workspaceId, limit * 4) as { id: string }[]
+          .all(...args, limit * 4) as { id: string }[]
       ).map((r) => r.id);
     } catch {
       return [];
@@ -1387,6 +1394,7 @@ export class SqliteEpisodeStore {
     return ids.filter((id) => holds.has(id)).slice(0, limit);
   }
 
+  /** Apply post-retrieval filters from RecallQuery. */
   filter(ids: string[], query: RecallQuery): Episode[] {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(",");
@@ -1744,6 +1752,23 @@ function matchesQuery(ep: Episode, q: RecallQuery): boolean {
   if (q.origin && ep.origin !== q.origin) return false;
   if (q.cwd && !(ep.cwd === q.cwd || ep.cwd?.startsWith(q.cwd.endsWith("/") ? q.cwd : `${q.cwd}/`))) return false;
   return true;
+}
+
+/** A query's scoping as SQL (its workstreams, its session or the one it leaves out), so a candidate query never picks what the caller can't read. */
+function scopeSql(q: RecallQuery, where: string[], args: Array<string | number>, prefix = ""): void {
+  if (q.workstreams !== undefined) {
+    const marks = q.workstreams.map(() => "?").join(",");
+    where.push(q.workstreams.length > 0 ? `(${prefix}workstream_id IS NULL OR ${prefix}workstream_id IN (${marks}))` : `${prefix}workstream_id IS NULL`);
+    args.push(...q.workstreams);
+  }
+  if (q.sessionId) {
+    where.push(`${prefix}session_id = ?`);
+    args.push(q.sessionId);
+  }
+  if (q.excludeSessionId) {
+    where.push(`${prefix}session_id != ?`);
+    args.push(q.excludeSessionId);
+  }
 }
 
 /** Whether an episode meets a query's fact filters alone (failed, backend, origin, directory). */

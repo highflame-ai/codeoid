@@ -57,15 +57,55 @@ describe("chunker", () => {
     expect(out.find((e) => e.kind === "user_turn")?.content).toContain("One failed.");
   });
 
-  test("a call that never got its result closes at the turn's end, and the reply while it ran is kept", () => {
+  test("a call still running at the turn's end (background work) closes when its result comes; the reply while it ran is kept", () => {
     const out: Array<Omit<Episode, "id">> = [];
     const c = new EpisodeChunker({ workspaceId: "w", sessionId: "s", createdBy: "u" }, (ep) => out.push(ep));
     c.onMessage(user("m1", "go"));
     c.onMessage(tool("t1", "Bash", { phase: "executing", input: { command: "sleep 9" } }, { command: "sleep 9" }));
     c.onMessage(assistant("m2", "Started it in the background."));
     c.onTurnEnd();
-    expect(out.map((e) => e.kind).sort()).toEqual(["assistant_turn", "tool_call"]);
-    expect(out.find((e) => e.kind === "tool_call")?.content).toContain("unfinished");
+    expect(out.map((e) => e.kind)).toEqual(["user_turn"]);
+    c.onMessage(tool("t1", "Bash", { phase: "completed", success: true, output: "slept" }));
+    expect(out.find((e) => e.kind === "tool_call")?.content).toContain("slept");
+  });
+
+  test("a plain question while an earlier turn's call is still open is its own episode, with its prompt", () => {
+    const out: Array<Omit<Episode, "id">> = [];
+    const c = new EpisodeChunker({ workspaceId: "w", sessionId: "s", createdBy: "u" }, (ep) => out.push(ep));
+    c.onMessage(user("m1", "start the server"));
+    c.onMessage(tool("t1", "Bash", { phase: "executing", input: { command: "serve" } }, { command: "serve" }));
+    c.onTurnEnd();
+    c.onMessage(user("m2", "what is 2+2"));
+    c.onMessage(assistant("m3", "4"));
+    expect(out.find((e) => e.content.includes("what is 2+2"))?.content).toContain("4");
+  });
+
+  test("reasoning before a call stays with it; the answer after the calls is the turn's, with its prompt", () => {
+    const out: Array<Omit<Episode, "id">> = [];
+    const c = new EpisodeChunker({ workspaceId: "w", sessionId: "s", createdBy: "u" }, (ep) => out.push(ep));
+    c.onMessage(user("m1", "fix the tests"));
+    c.onMessage(tool("t1", "Bash", { phase: "executing", input: { command: "npm test" } }, { command: "npm test" }));
+    c.onMessage(tool("t1", "Bash", { phase: "completed", success: false, output: "1 failed" }));
+    c.onMessage(assistant("m2", "Let me read the failing file."));
+    c.onMessage(tool("t2", "Read", { phase: "executing", input: { file_path: "a.ts" } }, { file_path: "a.ts" }));
+    c.onMessage(tool("t2", "Read", { phase: "completed", success: true, output: "code" }));
+    c.onMessage(assistant("m3", "Fixed it."));
+    c.onTurnEnd();
+    expect(out.find((e) => e.toolName === "Read")?.content).toContain("Let me read the failing file.");
+    expect(out.filter((e) => e.content.includes("Let me read the failing file."))).toHaveLength(1);
+    const answer = out.find((e) => e.kind === "user_turn");
+    expect(answer?.content).toContain("fix the tests");
+    expect(answer?.content).toContain("Fixed it.");
+  });
+
+  test("a call's origin and workstream are as they were when it opened", () => {
+    const out: Array<Omit<Episode, "id">> = [];
+    let facts: { origin: "user" | "delegated"; workstream: string } = { origin: "user", workstream: "a" };
+    const c = new EpisodeChunker({ workspaceId: "w", sessionId: "s", createdBy: "u", turnFacts: () => facts }, (ep) => out.push(ep));
+    c.onMessage(tool("t1", "Bash", { phase: "executing", input: { command: "x" } }, { command: "x" }));
+    facts = { origin: "delegated", workstream: "b" };
+    c.onMessage(tool("t1", "Bash", { phase: "completed", success: true, output: "done" }));
+    expect(out[0]).toMatchObject({ origin: "user", workstreamId: "a" });
   });
 });
 
@@ -75,9 +115,20 @@ describe("exit codes", () => {
     ["ok\nExit code: 0", true, 0],
     ["…\nProcess exited with code 137", false, 137],
     ["all good", true, 0],
-    ["broke", false, undefined],
+    // A success is 0 whatever its output prints (a log naming another process's status).
+    ["--- FAIL: x\nexit status 1\nok", true, 0],
+    // A failure is never 0, and failed with no code is -1.
+    ["Exit status: 0", false, -1],
+    ["broke", false, -1],
+    // pi's wording.
+    ["npm ERR!\n\nCommand exited with code 7", false, 7],
+    ["nothing said", undefined, undefined],
   ] as const)("%j", (output, success, code) => {
     expect(exitCodeOf(output, success)).toBe(code);
+  });
+
+  test("a code the backend reports as a field wins", () => {
+    expect(exitCodeOf("Exit code 1", false, 3)).toBe(3);
   });
 });
 
@@ -144,6 +195,12 @@ describe("recall", () => {
     ["MAX_TOKENS", "MAX_TOKENS"],
     ["git rebase --onto main", "git rebase --onto main"],
     ["what did we do about the flaky test", null],
+    ["rate-limiting", null],
+    ["e.g.", null],
+    ["TODO", null],
+    ["what does -v do", null],
+    ["package.json", "package.json"],
+    ["camelCaseThing", "camelCaseThing"],
   ])("exact text of %s", (q, exact) => {
     expect(exactQueryText(q)).toBe(exact);
   });
@@ -158,6 +215,13 @@ describe("get_episode lines", () => {
     expect(out).toContain("[… 297 lines skipped …]");
     expect(out).toContain("300  line 300");
     expect(out).toContain("- facts: exit 2");
+  });
+
+  test("a very long line is cut at the page size, and says so", () => {
+    const big = { ...ep, content: `${"x".repeat(300_000)}\nend` };
+    const out = formatEpisodeLines(big, "s", [[1, -1]]);
+    expect(out.length).toBeLessThan(270_000);
+    expect(out).toContain("[line cut: read it with offset]");
   });
 
   test("ranges merged and in order", () => {

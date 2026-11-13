@@ -27,7 +27,7 @@ export interface ChunkerContext {
   /** What the session knows of a tool call (docs/secrets-and-memory-design.md §3): where it ran, its exit code, how long it ran. */
   toolFacts?: (messageId: string) => { cwd?: string; exitCode?: number; durationMs?: number } | undefined;
   /** Who and what produced the episodes of the turn running now. */
-  turnFacts?: () => { backend?: string; model?: string; origin?: EpisodeOrigin };
+  turnFacts?: () => { backend?: string; model?: string; origin?: EpisodeOrigin; workstream?: string };
 }
 
 /** Paths seen in a tool input — used for path-overlap ranking. */
@@ -78,6 +78,8 @@ interface OpenToolCall {
   userPrompt: string | null;
   priorAssistantText: string;
   createdBy: string;
+  /** Who and what, and in which workstream, as they were when the call opened (it may complete after a later turn began). */
+  facts: { backend?: string; model?: string; origin?: EpisodeOrigin; workstream?: string };
 }
 
 export class EpisodeChunker {
@@ -91,6 +93,8 @@ export class EpisodeChunker {
   /** Tool calls awaiting their result, by message id: a turn can run several at once. */
   #openToolCalls = new Map<string, OpenToolCall>();
   #lastAssistantBy: string | null = null;
+  /** A call was opened since the last prompt: text now is reasoning for the next call, or the turn's answer. */
+  #callsThisTurn = false;
 
   constructor(ctx: ChunkerContext, onEpisode: (ep: Omit<Episode, "id">) => void) {
     this.#ctx = ctx;
@@ -102,14 +106,18 @@ export class EpisodeChunker {
     switch (msg.role) {
       case "user":
         this.#closeStandaloneAssistantTurnIfAny();
+        // What the previous turn left unsaid (a reply after its calls) is its own episode.
+        this.#flushReply();
         this.#pendingUserPrompt = msg.content;
         this.#pendingAssistantText = [];
+        this.#callsThisTurn = false;
         break;
 
       case "assistant":
-        if (this.#openToolCalls.size > 0) {
-          // Assistant text while a call runs: reasoning for the next call (or, if none follows, the
-          // turn's answer, emitted at the turn's end).
+        if (this.#callsThisTurn) {
+          // Text in a turn that has made calls: reasoning for the next call, or, if none follows,
+          // the turn's answer (emitted with the prompt at the turn's end). A call still open from an
+          // earlier turn (background work) doesn't make this turn's reply reasoning.
           this.#pendingAssistantText.push(msg.content);
           this.#lastAssistantBy = msg.identity.sub;
         } else {
@@ -128,6 +136,7 @@ export class EpisodeChunker {
           if (this.#openToolCalls.has(msg.messageId)) break;
           const input =
             "input" in msg.tool.state ? (msg.tool.state.input as unknown) : {};
+          this.#callsThisTurn = true;
           this.#openToolCalls.set(msg.messageId, {
             messageId: msg.messageId,
             toolName: msg.tool.name,
@@ -135,6 +144,7 @@ export class EpisodeChunker {
             filePaths: extractFilePaths(msg.tool.name, input),
             startedAt: Date.parse(msg.timestamp),
             createdBy: msg.identity.sub,
+            facts: this.#ctx.turnFacts?.() ?? {},
             userPrompt: this.#pendingUserPrompt,
             priorAssistantText: this.#pendingAssistantText.join("\n\n"),
           });
@@ -178,12 +188,22 @@ export class EpisodeChunker {
    * answer, and becomes its episode.
    */
   onTurnEnd(): void {
-    for (const id of [...this.#openToolCalls.keys()]) this.#emitOpenToolCall(id, "unfinished", new Date().toISOString(), this.#openToolCalls.get(id)!.createdBy);
-    if (this.#pendingAssistantText.length > 0) {
-      this.#emitTurnEpisode(this.#pendingAssistantText.join("\n\n"), new Date().toISOString(), this.#lastAssistantBy ?? this.#ctx.createdBy, true);
-      this.#pendingAssistantText = [];
+    // A call still open may be background work that completes later: it stays open, its episode
+    // closing with its result. Bounded: past an hour, or past 64 open, the oldest close unfinished.
+    const now = Date.now();
+    for (const [id, tc] of [...this.#openToolCalls]) {
+      if (now - tc.startedAt > 3_600_000 || this.#openToolCalls.size > 64) this.#emitOpenToolCall(id, "unfinished", new Date().toISOString(), tc.createdBy);
     }
+    this.#flushReply();
     this.#closeStandaloneAssistantTurnIfAny();
+  }
+
+  /** A turn's answer that came after its calls: one episode, with its prompt. */
+  #flushReply(): void {
+    if (this.#pendingAssistantText.length === 0) return;
+    this.#emitTurnEpisode(this.#pendingAssistantText.join("\n\n"), new Date().toISOString(), this.#lastAssistantBy ?? this.#ctx.createdBy);
+    this.#pendingAssistantText = [];
+    this.#pendingUserPrompt = null;
   }
 
   // ── Episode emission ──────────────────────────────────────────────────
@@ -223,7 +243,8 @@ export class EpisodeChunker {
       tokenEstimate: estimateTokens(content),
       createdAt: Date.parse(timestamp) || Date.now(),
       createdBy,
-      ...this.#turnFacts(),
+      ...this.#turnFacts(tc.facts),
+      ...(tc.facts.workstream ? { workstreamId: tc.facts.workstream } : {}),
       ...(facts?.cwd ? { cwd: facts.cwd } : {}),
       ...(facts?.exitCode !== undefined ? { exitCode: facts.exitCode } : {}),
       ...(facts?.durationMs !== undefined ? { durationMs: facts.durationMs } : {}),
@@ -232,9 +253,8 @@ export class EpisodeChunker {
     // Leave pendingUserPrompt in place — later tool calls in the same turn share it.
   }
 
-  #emitTurnEpisode(assistantText: string, timestamp: string, createdBy: string, afterTools = false): void {
-    // After tool calls the prompt is with them already: the reply stands alone.
-    const userPrompt = afterTools ? null : this.#pendingUserPrompt;
+  #emitTurnEpisode(assistantText: string, timestamp: string, createdBy: string): void {
+    const userPrompt = this.#pendingUserPrompt;
     if (!userPrompt && !assistantText) return;
 
     const content = [
@@ -277,8 +297,8 @@ export class EpisodeChunker {
     });
   }
 
-  #turnFacts(): { backend?: string; model?: string; origin?: EpisodeOrigin } {
-    const f = this.#ctx.turnFacts?.();
+  #turnFacts(at?: OpenToolCall["facts"]): { backend?: string; model?: string; origin?: EpisodeOrigin } {
+    const f = at ?? this.#ctx.turnFacts?.();
     if (!f) return {};
     return { ...(f.backend ? { backend: f.backend } : {}), ...(f.model ? { model: f.model } : {}), ...(f.origin ? { origin: f.origin } : {}) };
   }

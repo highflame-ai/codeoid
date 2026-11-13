@@ -2153,8 +2153,10 @@ export class Session {
           },
           turnFacts: () => ({
             backend: this.#provider.id,
-            ...(this.#model ? { model: this.#model } : {}),
-            origin: this.role === "worker" ? "dispatch" : this.#lastTurnOrigin,
+            // The model the backend runs (its default when none was chosen).
+            ...((this.#model ?? this.#provider.runningModel) ? { model: (this.#model ?? this.#provider.runningModel)! } : {}),
+            origin: this.role === "worker" ? "dispatch" : this.#turnActive() ? this.#lastTurnOrigin : "agent",
+            ...(this.#workstream?.id ? { workstream: this.#workstream.id } : {}),
           }),
         },
         (episode) => {
@@ -2163,8 +2165,13 @@ export class Session {
             // succeeds the workspace is invisible to cross-workspace search.
             if (!this.#workspaceRegistered) this.#registerWorkspace();
             // Tagged with the home as it is now (workstreams §6.4): a session moved since writes into its new one.
-            const home = this.#workstream?.id;
-            memory.ingest(home ? { ...episode, workstreamId: home } : episode);
+            // The workstream the call ran in (taken when it opened), else the home as it is now: a
+            // session moved since writes into its new one.
+            const home = episode.workstreamId ?? this.#workstream?.id;
+            // Scrubbed as the session scrubs (its tenant's remembered values, its vault), the raw
+            // output a spill brought back included; memory scrubs again at ingest.
+            const scrubbed = this.#secrets ? { ...episode, summary: this.#scrubText(episode.summary), content: this.#scrubText(episode.content) } : episode;
+            memory.ingest(home ? { ...scrubbed, workstreamId: home } : scrubbed);
             scheduler.onEpisode();
           } catch (err) {
             console.error(
@@ -10748,10 +10755,12 @@ export class Session {
         this.#toolCallMessages.set(toolMsg.messageId, toolMsg);
         // What memory keeps of it (docs/secrets-and-memory-design.md §3): where a shell call runs, and from when.
         {
-          const shell = shellCallOf(event.name, event.input) !== null;
+          const call = shellCallOf(event.name, event.input);
+          const shell = call !== null;
           this.#toolFacts.set(toolMsg.messageId, {
             shell,
-            ...(shell ? { cwd: event.shellCwd ?? this.workdir } : {}),
+            // Where it runs: the backend's report, else the directory its input names (Codex's `cwd`), else the workdir.
+            ...(shell ? { cwd: event.shellCwd ?? (call.cwd && isAbsolute(call.cwd) ? call.cwd : call.cwd ? join(this.workdir, call.cwd) : this.workdir) } : {}),
             ...(autoApprove ? { startedAt: Date.now() } : {}),
           });
         }
@@ -10829,6 +10838,8 @@ export class Session {
         if (hooked) {
           this.#turnRedacted = true;
           this.#noteRedactedBacking(this.#provider.backingSessionId);
+          // The raw copy (the compressor's spill file) never had the hook's change: memory mustn't take it back.
+          if (typeof event.output === "string") takeSpill(event.output, defaultSpillDir());
         }
         this.#accumulator.handleEvent(output === event.output ? event : { ...event, output, ...(hooked ? { redacted: true } : {}) });
         if (msgId) {
@@ -10862,7 +10873,7 @@ export class Session {
             if (facts) {
               if (facts.startedAt !== undefined) facts.durationMs = Date.now() - facts.startedAt;
               if (facts.shell && typeof event.output === "string") {
-                const code = exitCodeOf(event.output, event.success);
+                const code = exitCodeOf(event.output, event.success, event.exitCode);
                 if (code !== undefined) facts.exitCode = code;
               }
             }
@@ -11357,6 +11368,7 @@ export class Session {
       this.#transcriptStore.append(this.id, sm, this.#seq++).catch(() => {});
       // Feed the chunker so the episode closes even when we never saw a tool_result.
       this.#chunker?.onMessage(sm);
+      this.#toolFacts.delete(msgId);
     }
 
     this.#broadcastRaw({
