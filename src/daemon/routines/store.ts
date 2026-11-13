@@ -77,6 +77,16 @@ export function hashToken(token: string): string {
 
 export class RoutineStore {
   readonly #db: Database;
+  /**
+   * Applied to a run's check output, summary and reason as they are written
+   * (docs/secrets-and-memory-design.md §2.6). Not the payload: the run reads it
+   * back as its data, and it is what whoever fired the routine sent.
+   */
+  scrubText: ((text: string) => string) | undefined;
+
+  #scrub(v: string | null): string | null {
+    return v && this.scrubText ? this.scrubText(v) : v;
+  }
 
   constructor(db: Database | string) {
     this.#db = typeof db === "string" ? new Database(db, { create: true }) : db;
@@ -324,9 +334,9 @@ export class RoutineStore {
         run.costUsd,
         run.inputTokens,
         run.outputTokens,
-        run.summary,
-        run.reason,
-        run.checkOutput,
+        this.#scrub(run.summary),
+        this.#scrub(run.reason),
+        this.#scrub(run.checkOutput),
         run.payload,
         run.loopRunId,
         run.loopStatus,
@@ -358,7 +368,8 @@ export class RoutineStore {
       const col = cols[k];
       if (!col || v === undefined) continue;
       sets.push(`${col} = ?`);
-      vals.push(typeof v === "boolean" ? (v ? 1 : 0) : (v as string | number | null));
+      const scrubbed = (k === "summary" || k === "reason" || k === "checkOutput") && typeof v === "string" ? this.#scrub(v) : v;
+      vals.push(typeof scrubbed === "boolean" ? (scrubbed ? 1 : 0) : (scrubbed as string | number | null));
     }
     if (sets.length === 0) return;
     this.#db.prepare(`UPDATE routine_runs SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);

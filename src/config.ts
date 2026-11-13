@@ -345,6 +345,31 @@ const SandboxSchema = z
   })
   .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], projectRoots: [PROJECT_ROOT_PARENT], docker: { image: "node:22-bookworm-slim", socket: false } });
 
+/** Secrets in what codeoid stores (docs/secrets-and-memory-design.md §2). */
+const SecretsSchema = z
+  .object({
+    /** Scrub stored conversations: off only to debug. */
+    enabled: z.boolean().default(true),
+    /**
+     * Also scrub what goes back to the model where codeoid hands it over (MCP
+     * results through the hub, the tool loops codeoid runs): the model gets a
+     * secret as a reference. Off: only what is stored is scrubbed.
+     */
+    beforeModel: z.boolean().default(true),
+    /** For sessions with no workstream; a workstream's own `captureSecrets` decides for its sessions. */
+    captureSecrets: z.enum(["drop", "vault"]).default("drop"),
+    /** Kept secrets not seen for this many days are forgotten. */
+    vaultDays: z.number().int().min(1).max(3650).default(30),
+    /** Commands (a program, or an argv prefix) whose calls aren't stored at all. */
+    dropCommands: z.array(z.string().min(1).max(256)).max(256).default([]),
+    /** More files whose contents are credentials (globs, by name or by path; `~` is the home). */
+    credentialFiles: z.array(z.string().min(1).max(1024)).max(256).default([]),
+  })
+  .strict()
+  .default({ enabled: true, beforeModel: true, captureSecrets: "drop", vaultDays: 30, dropCommands: [], credentialFiles: [] });
+
+export type SecretsConfig = z.infer<typeof SecretsSchema>;
+
 const CompressSchema = z
   .object({
     enabled: z.boolean().default(false),
@@ -1367,6 +1392,7 @@ const RootSchema = z.object({
   memory: MemorySchema,
   workspaceIndex: WorkspaceIndexSchema,
   compress: CompressSchema,
+  secrets: SecretsSchema,
   approvals: ApprovalsSchema,
   sandbox: SandboxSchema,
   guard: GuardSchema,
@@ -1527,6 +1553,12 @@ export interface CodeoidConfig {
    * defaults (on, `auto`, network on).
    */
   sandbox?: SandboxConfig;
+  /**
+   * Secrets in what codeoid stores (docs/secrets-and-memory-design.md §2).
+   * Optional on the type so a hand-built config literal need not carry it;
+   * absent = the defaults (on, detected values dropped).
+   */
+  secrets?: SecretsConfig;
   /** Homegrown CLI output compressor (RTK-style). Disabled by default. */
   compress: {
     enabled: boolean;
@@ -2124,6 +2156,7 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     },
     workspaceIndex: parsed.workspaceIndex,
     compress: parsed.compress,
+    secrets: parsed.secrets,
     approvals: parsed.approvals,
     sandbox: parsed.sandbox,
     guard: parsed.guard,

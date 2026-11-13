@@ -50,6 +50,15 @@ export interface McpCallScope {
   tenant?: McpTenant;
 }
 
+/** Every string in a JSON-like value through `fn`, structure kept (deeper than 32 levels: dropped). */
+function deepStrings(v: unknown, fn: (s: string) => string, depth = 0): unknown {
+  if (typeof v === "string") return fn(v);
+  if (v === null || typeof v !== "object") return v;
+  if (depth > 32) return null;
+  if (Array.isArray(v)) return v.map((x) => deepStrings(x, fn, depth + 1));
+  return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, deepStrings(x, fn, depth + 1)]));
+}
+
 export interface McpCallResult {
   text: string;
   isError: boolean;
@@ -114,6 +123,38 @@ export class McpHub {
 
   setPermit(fn: (sessionId: string, spec: McpServerSpec) => string | undefined): void {
     this.#permit = fn;
+  }
+
+  /**
+   * Applied to every tool result before it goes back to the backend
+   * (docs/secrets-and-memory-design.md §2.7): through the hub, the model gets
+   * a secret as a reference, never its value. Unset: as the server sent it.
+   */
+  #scrubResult: ((text: string) => string) | null = null;
+
+  setResultScrub(fn: (text: string) => string): void {
+    this.#scrubResult = fn;
+  }
+
+  /**
+   * A relayed result (mcp/proxy.ts: CLI backends' own MCP clients), scrubbed as
+   * a hub result is: every text part of a tool call's content, every text of a
+   * read resource. Returned as given when no scrub is set.
+   */
+  scrubRelayed<T>(method: string, result: T): T {
+    const scrub = this.#scrubResult;
+    if (!scrub || !result || typeof result !== "object") return result;
+    const r = result as { content?: unknown; contents?: unknown; structuredContent?: unknown };
+    const texts = (list: unknown) =>
+      Array.isArray(list) ? list.map((c) => (c && typeof c === "object" && typeof (c as { text?: unknown }).text === "string" ? { ...c, text: scrub((c as { text: string }).text) } : c)) : list;
+    if (method === "tools/call") {
+      const out: Record<string, unknown> = { ...(r as Record<string, unknown>), content: texts(r.content) };
+      // Structured output: every string in it, as text (a line rule sees inside it as it would the text part).
+      if (r.structuredContent !== undefined) out.structuredContent = deepStrings(r.structuredContent, scrub);
+      return out as T;
+    }
+    if (method === "resources/read") return { ...(r as Record<string, unknown>), contents: texts(r.contents) } as T;
+    return result;
   }
 
   #refusal(spec: McpServerSpec, scope: McpCallScope | undefined): string | undefined {
@@ -183,7 +224,8 @@ export class McpHub {
       return { text: `mcp: ${spec.name} unavailable: ${cleanMcpError(errMsg(e))}`, isError: true };
     }
     try {
-      return await withTimeout(client.callTool(tool, args, scope), this.#timeoutMs, `${spec.name}/${tool}`);
+      const result = await withTimeout(client.callTool(tool, args, scope), this.#timeoutMs, `${spec.name}/${tool}`);
+      return this.#scrubResult && !spec.builtin ? { ...result, text: this.#scrubResult(result.text) } : result;
     } catch (e) {
       if (e instanceof McpServerWantsSignIn && spec.transport.kind === "http") {
         this.markNeedsSignIn(spec.transport.url, scope.tenant);

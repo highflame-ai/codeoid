@@ -221,6 +221,56 @@ export interface CredentialSetValueMsg {
   value: string | null;
 }
 
+/** A detected secret a workstream keeps (`captureSecrets: "vault"`; docs/secrets-and-memory-design.md §2.5). Never its value. */
+export interface KeptSecretInfo {
+  /** '' for sessions with no workstream. */
+  workstream: string;
+  /** What `‹secret:<kind>:<fingerprint>›` names. */
+  fingerprint: string;
+  kind: string;
+  sessionId: string | null;
+  firstSeen: number;
+  lastSeen: number;
+}
+
+/** The detected secrets kept in the vault, newest first; one workstream's when given. Owner-only. */
+export interface SecretListMsg {
+  type: "secret.list";
+  id: string;
+  workstream?: string;
+}
+
+export interface SecretListResultMsg {
+  type: "secret.list.result";
+  requestId: string;
+  /** Whether secret handling is on in this daemon at all. */
+  enabled: boolean;
+  secrets: KeptSecretInfo[];
+}
+
+/** A kept secret's value: the owner's own token only, audited. Replies `secret.reveal.result`. */
+export interface SecretRevealMsg {
+  type: "secret.reveal";
+  id: string;
+  workstream: string;
+  fingerprint: string;
+}
+
+export interface SecretRevealResultMsg {
+  type: "secret.reveal.result";
+  requestId: string;
+  kind: string;
+  value: string;
+}
+
+/** Forget a kept secret. Replies `response.ok`. */
+export interface SecretForgetMsg {
+  type: "secret.forget";
+  id: string;
+  workstream: string;
+  fingerprint: string;
+}
+
 export interface CredentialListResultMsg {
   type: "credential.list.result";
   requestId: string;

@@ -440,6 +440,23 @@ export class Store {
       -- How each folder last resolved to a workstream, per tenant
       -- (docs/workstreams-design.md §5.1): a repository rule that matches
       -- differently later (an edited origin) is refused, not a silent re-home.
+      -- Detected secrets a workstream keeps (captureSecrets: "vault";
+      -- docs/secrets-and-memory-design.md §2.5): the value encrypted under a
+      -- key outside the database (secrets/vault.ts), so a copy of this file
+      -- alone holds none. Per tenant and workstream ('' = no workstream).
+      CREATE TABLE IF NOT EXISTS captured_secrets (
+        account_id   TEXT NOT NULL,
+        project_id   TEXT NOT NULL,
+        workstream   TEXT NOT NULL,
+        fingerprint  TEXT NOT NULL,
+        kind         TEXT NOT NULL,
+        sealed       BLOB NOT NULL,
+        session_id   TEXT,
+        first_seen   INTEGER NOT NULL,
+        last_seen    INTEGER NOT NULL,
+        PRIMARY KEY (account_id, project_id, workstream, fingerprint)
+      );
+
       CREATE TABLE IF NOT EXISTS workstream_folders (
         account_id  TEXT NOT NULL,
         project_id  TEXT NOT NULL,
@@ -1312,6 +1329,29 @@ export class Store {
    * running, finishing late — overwrote whatever its successor had recorded,
    * or resurrected a task that had already gone terminal.
    */
+  /**
+   * Applied to a dispatch task's prompt, result digest and error once it is
+   * settled (docs/secrets-and-memory-design.md §2.6): until then the prompt is
+   * what its worker is sent, as the conductor wrote it.
+   */
+  scrubText: ((text: string) => string) | undefined;
+
+  /** A settled task's texts, scrubbed in place. */
+  #scrubSettledTask(id: string): void {
+    const scrub = this.scrubText;
+    if (!scrub) return;
+    const row = this.#db.prepare("SELECT prompt, result_digest, error, status FROM dispatch_tasks WHERE id = ?").get(id) as
+      | { prompt: string; result_digest: string | null; error: string | null; status: string }
+      | null;
+    if (!row || !["done", "failed", "cancelled", "blocked"].includes(row.status)) return;
+    const prompt = scrub(row.prompt);
+    const digest = row.result_digest ? scrub(row.result_digest) : row.result_digest;
+    const error = row.error ? scrub(row.error) : row.error;
+    if (prompt !== row.prompt || digest !== row.result_digest || error !== row.error) {
+      this.#db.prepare("UPDATE dispatch_tasks SET prompt = ?, result_digest = ?, error = ? WHERE id = ?").run(prompt, digest, error, id);
+    }
+  }
+
   dispatchComplete(id: string, generation: number, digest: string, now: number): boolean {
     const res = this.#db
       .prepare(
@@ -1320,6 +1360,7 @@ export class Store {
          WHERE id = ? AND generation = ? AND status IN ('claimed', 'running')`,
       )
       .run(digest, now, id, generation);
+    if (res.changes > 0) this.#scrubSettledTask(id);
     return res.changes > 0;
   }
 
@@ -1363,6 +1404,7 @@ export class Store {
           ? [opts.notBefore ?? null, error, now, id, generation]
           : [error, now, id, generation]),
       ) as { status: "queued" | "blocked" | "failed" } | null;
+    if (row && row.status !== "queued") this.#scrubSettledTask(id);
     return row?.status ?? null;
   }
 
@@ -1449,6 +1491,7 @@ export class Store {
          RETURNING *`,
       )
       .get(error, now, id, generation, ownerDaemon ?? null) as RawDispatchRow | null;
+    if (row) this.#scrubSettledTask(id);
     return row ? rowToDispatchTask(row) : null;
   }
 
@@ -1477,6 +1520,7 @@ export class Store {
          RETURNING *`,
       )
       .get(reason, now, id, ownerDaemon ?? null) as RawDispatchRow | null;
+    if (row) this.#scrubSettledTask(id);
     return row ? rowToDispatchTask(row) : null;
   }
 
@@ -1558,6 +1602,7 @@ export class Store {
         ownerDaemon ?? null,
         now,
       ) as RawDispatchRow[];
+    for (const r of rows) if (r.status !== "queued") this.#scrubSettledTask(r.id);
     return rows.map(rowToDispatchTask);
   }
 
@@ -1837,7 +1882,7 @@ export class Store {
         `INSERT INTO dispatch_events (account_id, project_id, task_id, type, digest, created_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(event.accountId, event.projectId, event.taskId, event.type, event.digest, event.now);
+      .run(event.accountId, event.projectId, event.taskId, event.type, this.scrubText ? this.scrubText(event.digest) : event.digest, event.now);
   }
 
   dispatchEventsPending(accountId: string, projectId: string): DispatchEventRow[] {
@@ -2001,6 +2046,84 @@ export class Store {
          VALUES (?, ?, ?, ?, ?, ?)`,
       )
       .run(scope.accountId, scope.projectId, scope.workdir, server, fingerprint, approvedBy);
+  }
+
+  /**
+   * Every credential value the database holds (docs/secrets-and-memory-design.md
+   * §2.2): MCP OAuth tokens and client secrets, and the conductor's API key —
+   * matched exactly wherever they show up, never stored again.
+   */
+  knownSecretValues(): Array<{ label: string; value: string }> {
+    const out: Array<{ label: string; value: string }> = [];
+    const oauth = this.#db.prepare("SELECT server, credential, client_json, tokens_json FROM mcp_oauth_credentials").all() as Array<{
+      server: string;
+      credential: string;
+      client_json: string | null;
+      tokens_json: string | null;
+    }>;
+    for (const r of oauth) {
+      const label = `oauth:${r.credential || r.server}`;
+      for (const json of [r.tokens_json, r.client_json]) {
+        if (!json) continue;
+        try {
+          const obj = JSON.parse(json) as Record<string, unknown>;
+          for (const k of ["access_token", "refresh_token", "id_token", "client_secret"]) {
+            const v = obj[k];
+            if (typeof v === "string") out.push({ label, value: v });
+          }
+        } catch {
+          // Unreadable: nothing to match.
+        }
+      }
+    }
+    const conductor = this.#db.prepare("SELECT api_key FROM conductor_identity").all() as Array<{ api_key: string }>;
+    for (const r of conductor) out.push({ label: "daemon:conductor-key", value: r.api_key });
+    return out;
+  }
+
+  /** Keep a detected secret (sealed by the caller), or note it was seen again. */
+  putCapturedSecret(row: { accountId: string; projectId: string; workstream: string; fingerprint: string; kind: string; sealed: Uint8Array; sessionId?: string; at: number }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO captured_secrets (account_id, project_id, workstream, fingerprint, kind, sealed, session_id, first_seen, last_seen)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (account_id, project_id, workstream, fingerprint) DO UPDATE SET last_seen = excluded.last_seen, session_id = excluded.session_id`,
+      )
+      .run(row.accountId, row.projectId, row.workstream, row.fingerprint, row.kind, row.sealed, row.sessionId ?? null, row.at, row.at);
+  }
+
+  /** A tenant's kept secrets, newest first, without their values; one workstream's when given. */
+  listCapturedSecrets(scope: { accountId: string; projectId: string; workstream?: string }): Array<{ workstream: string; fingerprint: string; kind: string; sessionId: string | null; firstSeen: number; lastSeen: number }> {
+    const rows = (
+      scope.workstream === undefined
+        ? this.#db.prepare("SELECT workstream, fingerprint, kind, session_id, first_seen, last_seen FROM captured_secrets WHERE account_id = ? AND project_id = ? ORDER BY last_seen DESC").all(scope.accountId, scope.projectId)
+        : this.#db
+            .prepare("SELECT workstream, fingerprint, kind, session_id, first_seen, last_seen FROM captured_secrets WHERE account_id = ? AND project_id = ? AND workstream = ? ORDER BY last_seen DESC")
+            .all(scope.accountId, scope.projectId, scope.workstream)
+    ) as Array<{ workstream: string; fingerprint: string; kind: string; session_id: string | null; first_seen: number; last_seen: number }>;
+    return rows.map((r) => ({ workstream: r.workstream, fingerprint: r.fingerprint, kind: r.kind, sessionId: r.session_id, firstSeen: r.first_seen, lastSeen: r.last_seen }));
+  }
+
+  /** A kept secret's sealed value, in one workstream. */
+  capturedSecret(scope: { accountId: string; projectId: string; workstream: string; fingerprint: string }): { kind: string; sealed: Uint8Array } | undefined {
+    const row = this.#db
+      .prepare("SELECT kind, sealed FROM captured_secrets WHERE account_id = ? AND project_id = ? AND workstream = ? AND fingerprint = ?")
+      .get(scope.accountId, scope.projectId, scope.workstream, scope.fingerprint) as { kind: string; sealed: Uint8Array } | null;
+    return row ?? undefined;
+  }
+
+  /** Forget a kept secret; true when there was one. */
+  deleteCapturedSecret(scope: { accountId: string; projectId: string; workstream: string; fingerprint: string }): boolean {
+    return (
+      this.#db
+        .prepare("DELETE FROM captured_secrets WHERE account_id = ? AND project_id = ? AND workstream = ? AND fingerprint = ?")
+        .run(scope.accountId, scope.projectId, scope.workstream, scope.fingerprint).changes > 0
+    );
+  }
+
+  /** Forget kept secrets not seen since `before` (ms); returns how many. */
+  expireCapturedSecrets(before: number): number {
+    return this.#db.prepare("DELETE FROM captured_secrets WHERE last_seen < ?").run(before).changes;
   }
 
   /** The workstream a folder last resolved to, for this tenant (workstreams §5.1). */
@@ -2190,7 +2313,7 @@ export class Store {
         .prepare(
           "INSERT INTO audit_log (subject, session_id, action, detail) VALUES (?, ?, ?, ?)",
         )
-        .run(subject, sessionId ?? null, action, detail ?? null);
+        .run(subject, sessionId ?? null, action, detail && this.scrubText ? this.scrubText(detail) : (detail ?? null));
     } catch {
       // Retry unlinked (FK can't fail) so the entry is still recorded; fold
       // the orphaned session id into the detail. Swallow anything further.

@@ -522,6 +522,48 @@ The conductor acts only through sessions homed where the work belongs. `fleet_sp
 
 `codeoid workstream import [--root <dir>]` proposes workstreams from your repositories' remotes and lists Claude's global MCP servers to assign. It writes nothing; isolation stays off until you turn it on.
 
+## Secrets in what codeoid stores
+
+What codeoid stores never holds a secret's value: the transcript, the history a backend is seeded from, the scrollback a client replays, memory, and a shared bundle. Where one appears it is replaced by a reference:
+
+- `‹credential:gh-highflame›` for a value codeoid already knows: a declared credential, a backend account's key, an MCP sign-in, the daemon's own keys. Its value stays where it lives.
+- `‹secret:github-token:3f9a2c1b›` for one found by its shape (a token format, a private key, a URL's password, a value assigned to a name like `DB_PASSWORD`). The last part is a fingerprint: the same secret has the same reference everywhere, and the value can't be worked out from it.
+
+A command that exists to print a credential (`gh auth token`, `printenv`, `op read`, `cat .env`, …) is stored without its output, and a file tool writing a credential file (`.env`, `~/.netrc`, a private key) without what it wrote.
+
+The value of a detected secret is dropped. A workstream can keep them instead, so you can get one back later:
+
+```jsonc
+{ "workstreams": { "items": [ { "id": "acme", "captureSecrets": "vault" } ] } }
+```
+
+Kept secrets are encrypted under a key outside the database, belong to the workstream that kept them, and are forgotten after `secrets.vaultDays` (30) unless promoted:
+
+```bash
+codeoid secret ls                                  # what is kept, never the values
+codeoid secret reveal acme:3f9a2c1b                # the value (your own token only; audited)
+codeoid secret promote acme:3f9a2c1b --as acme-gh  # make it a declared credential
+codeoid secret forget acme:3f9a2c1b
+codeoid secret scrub --dry-run                     # what was stored before this, scrubbed (stop the daemon first)
+```
+
+Settings, under `secrets`:
+
+| Setting | Default | |
+| --- | --- | --- |
+| `enabled` | `true` | Turn it off only to debug. |
+| `beforeModel` | `true` | Also scrub MCP results before they go back to the model (through codeoid's hub). |
+| `captureSecrets` | `"drop"` | For sessions with no workstream; a workstream's own setting decides for its sessions. |
+| `vaultDays` | `30` | Kept secrets not seen for this long are forgotten. |
+| `dropCommands` | `[]` | Commands whose calls aren't stored at all (`"my-vault dump"`). |
+| `credentialFiles` | `[]` | More files whose contents are credentials (globs, by name or path). |
+
+A value found only by the name it sits under (`DB_PASSWORD=…`) is replaced there, but not remembered: repeated bare later, it isn't recognised. A token of a distinct format (a vendor's token, a JWT, a bearer token) is, for the rest of the daemon's run.
+
+An OpenAI-compatible, Gemini or llama.cpp session is sent its earlier turns from codeoid's stored history: from the next turn on, its model sees a secret it read earlier as the reference.
+
+Limits. The backend has already seen a value by the time codeoid stores the result, and a CLI backend keeps its own copy (Claude Code's `~/.claude/projects`, Codex's sessions), which codeoid doesn't change. A secret with no known shape, that codeoid doesn't know, in a command not on the list, still gets through. Design: [secrets-and-memory-design.md](secrets-and-memory-design.md).
+
 ## Signing a backend in, instead of pasting a key
 
 Settings → **Claude** → **Sign in with Claude** runs the backend's own login

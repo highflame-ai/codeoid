@@ -256,6 +256,7 @@ codeoid new <n> <d> --workstream <id> [--override]  # a session's home workstrea
 codeoid mcp signin <server> --credential <id>        # a named OAuth slot: a second sign-in to one server (a workstream's own)
 codeoid new <n> <d> --ref <workstream>[:<dir>]       # another workstream it may read (its folders read-only, its memory), by that one's share policy
 codeoid workstream ref add|rm <session> <workstream>[:<dir>] | move <session> <workstream>  # references and moves (§5.3, §7)
+codeoid secret ls | reveal <ws>:<fp> | forget <ws>:<fp> | promote <ws>:<fp> --as <id> | scrub [--dry-run]  # kept secrets; scrub older data (docs/secrets-and-memory-design.md)
 ```
 
 `/mcp/control` (off by default, `mcpControl.*`) lets external agents drive
@@ -572,6 +573,21 @@ digest. `fleet_spawn.workstream` → `checkWorkstream` (`#fleetSpawnHome`) befor
 queueing, `dispatch_tasks.workstream` judged again at claim; send-class cards
 carry `targetWorkstream` (`#fleetCardWorkstream`). `workstreams/egress.ts` is
 the egress stub.
+
+Secrets (`src/daemon/secrets/`, docs/secrets-and-memory-design.md §2): what a
+session stores, shows and hands on never holds a secret's value. `SecretService`
+(made only by `codeoid start`, `DaemonConfig.secretsConfigDir`; tests and
+embedders get none) holds `KnownSecrets` (exact values from every place codeoid
+keeps one, `addDaemonKnownSources`) → `‹credential:<label>›`, and the detector
+(`detect.ts`) → `‹secret:<kind>:<hmac8>›`. Applied in Session at
+`#persistAndBuffer`/`#commitStreamed` (`#scrubMessage`), tool_start
+(`#recordedToolInput`, by `verdict.ts`'s keep / withhold-output /
+withhold-written / drop) and tool_complete (before hooks; not a `redacted`
+mark), live deltas (`StreamScrubber`), the canonical history
+(`CanonicalHistoryAccumulator.scrubTurn`), `MemoryEngine.scrubText`, share
+packs, and MCP results in the hub (`setResultScrub`, `secrets.beforeModel`).
+Detected values are dropped unless the workstream says `captureSecrets: "vault"`
+(`CapturedSecretVault`, `captured_secrets`); `secret.*` is owner-only and audited.
 
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
 or an API call. `RoutineService` owns the scheduler and runs; it reaches
