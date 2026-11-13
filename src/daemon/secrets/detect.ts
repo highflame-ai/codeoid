@@ -334,9 +334,15 @@ export function isPlaceholder(raw: string): boolean {
 }
 
 /** {@link isPlaceholder}, or, unquoted, a type or code: what a name's value in code is far more often than a credential. */
+/** A quoted value that is shell code, not a value: a command's quoted pattern (`='^KEY=' .env | cut …`). */
+function isQuotedCode(value: string): boolean {
+  return /^["']/.test(value) && /\s/.test(value) && /\s\|\s|\$\(|\s>|;\s|&&|\|\||\s-[A-Za-z]\b/.test(value);
+}
+
 function isWord(raw: string, identifiers = true): boolean {
   const value = raw.trim();
   if (isPlaceholder(value)) return true;
+  if (isQuotedCode(value)) return true;
   if (value.startsWith('"') || value.startsWith("'")) return false;
   // Code, not a value: another name — a dotted path or a call (`self.token`, `config.apiKey`,
   // `getToken()`), a snake_case or camelCase identifier (`api_key`, `idToken`). A plain word
