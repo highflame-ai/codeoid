@@ -2147,6 +2147,7 @@ export class Session {
           sessionId: this.id,
           createdBy: opts.auth.sub,
           spillDir: defaultSpillDir(),
+          // paths: `cwd` here is a recorded fact about a tool call, never opened or run in.
           toolFacts: (messageId) => {
             const f = this.#toolFacts.get(messageId);
             return f ? { ...(f.cwd ? { cwd: f.cwd } : {}), ...(f.exitCode !== undefined ? { exitCode: f.exitCode } : {}), ...(f.durationMs !== undefined ? { durationMs: f.durationMs } : {}) } : undefined;
@@ -10775,6 +10776,7 @@ export class Session {
           this.#toolFacts.set(toolMsg.messageId, {
             shell,
             // Where it runs: the backend's report, else the directory its input names (Codex's `cwd`), else the workdir.
+            // paths: recorded as a fact for memory, never opened or run in.
             ...(shell ? { cwd: event.shellCwd ?? (call.cwd && isAbsolute(call.cwd) ? call.cwd : call.cwd ? join(this.workdir, call.cwd) : this.workdir) } : {}),
             ...(autoApprove ? { startedAt: Date.now() } : {}),
           });
@@ -11054,6 +11056,9 @@ export class Session {
       case "turn_done": {
         this.#accumulator.handleEvent(this.#stampRedaction(event));
         this.#recordTurnFromResult(event.result);
+        // Memory stores the turn's answer now, before the session reads as idle (the turn's end
+        // runs again at the exit, harmlessly).
+        this.#chunker?.onTurnEnd();
         // No sweep here: a terminal turn_done breaks #consumeEvents, whose
         // finally reconciles sub-agents alongside tools. Sweeping here too would
         // just be a redundant pass a few statements earlier.
