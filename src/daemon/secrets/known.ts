@@ -98,19 +98,34 @@ class Matcher {
   }
 }
 
-/** `text` with matches replaced: leftmost-longest, none inside a reference, bounded ones only as whole tokens. */
-function replaceMatches(text: string, matcher: Matcher, bounded: boolean): { text: string; refs: Set<string>; labels: Set<string> } {
+/**
+ * `text` with matches replaced: leftmost-longest, as whole tokens, none inside a reference. Past
+ * `deadline`, null: the caller doesn't store what it couldn't check.
+ */
+function replaceMatches(text: string, matcher: Matcher, deadline: number): { text: string; refs: Set<string>; labels: Set<string> } | null {
   const refs = new Set<string>();
   const labels = new Set<string>();
   if (matcher.size === 0 || text.length < MIN_KNOWN_LENGTH) return { text, refs, labels };
+  // References in order: a match is checked against them by binary search.
   const own: Array<[number, number]> = [];
   for (const m of text.matchAll(OWN_REF)) own.push([m.index!, m.index! + m[0].length]);
-  const inOwn = (s: number, e: number) => own.some(([a, b]) => s < b && e > a);
+  const inOwn = (s: number, e: number): boolean => {
+    let lo = 0;
+    let hi = own.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (own[mid]![1] <= s) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo < own.length && own[lo]![0] < e;
+  };
   const found: Array<[number, number, Needle]> = [];
+  let n = 0;
   for (const m of matcher.matches(text)) {
+    if (++n % 4096 === 0 && performance.now() > deadline) return null;
     const [s, e] = m;
     if (own.length > 0 && inOwn(s, e)) continue;
-    if (bounded && ((s > 0 && TOKEN_CHAR.test(text[s - 1]!)) || (e < text.length && TOKEN_CHAR.test(text[e]!)))) continue;
+    if ((s > 0 && TOKEN_CHAR.test(text[s - 1]!)) || (e < text.length && TOKEN_CHAR.test(text[e]!))) continue;
     found.push(m);
   }
   if (found.length === 0) return { text, refs, labels };
@@ -195,10 +210,14 @@ export class KnownSecrets {
     return this.#current().longest;
   }
 
-  /** `text` with every known value replaced by its reference, and the labels and references found. */
-  replace(text: string): { text: string; labels: string[]; refs: string[] } {
-    const r = replaceMatches(text, this.#current(), false);
-    return { text: r.text, labels: [...r.labels], refs: [...r.refs] };
+  /**
+   * `text` with every known value replaced by its reference where it stands as a whole token (a
+   * dev default like `postgres` inside `postgresql://` is left), and the labels and references
+   * found. Null past `deadline`.
+   */
+  replace(text: string, deadline = Number.POSITIVE_INFINITY): { text: string; labels: string[]; refs: string[] } | null {
+    const r = replaceMatches(text, this.#current(), deadline);
+    return r ? { text: r.text, labels: [...r.labels], refs: [...r.refs] } : null;
   }
 }
 
@@ -236,20 +255,35 @@ const MIN_LEARNED_LENGTH = 12;
 export class LearnedSecrets {
   readonly #values = new Map<string, Needle>();
   readonly #byRef = new Map<string, string>();
-  #matcher: Matcher | null = null;
+  /** By their first characters: a value is matched where a token starts, so a lookup there finds it. */
+  readonly #byPrefix = new Map<string, Needle[]>();
+  #longest = 0;
 
-  /** Remember a value; true when it is new. */
+  /** Remember a value; true when it is new. Learning costs no rebuild. */
   learn(value: string, ref: string): boolean {
     if (value.length < MIN_LEARNED_LENGTH || this.#values.has(value)) return false;
-    this.#values.set(value, { text: value, label: "learned", ref });
+    const n: Needle = { text: value, label: "learned", ref };
+    this.#values.set(value, n);
     this.#byRef.set(ref, value);
-    while (this.#values.size > MAX_LEARNED) {
-      const [oldest, n] = this.#values.entries().next().value!;
-      this.#values.delete(oldest);
-      this.#byRef.delete(n.ref);
-    }
-    this.#matcher = null;
+    const key = value.slice(0, PREFIX);
+    const list = this.#byPrefix.get(key) ?? [];
+    list.push(n);
+    list.sort((x, y) => y.text.length - x.text.length);
+    this.#byPrefix.set(key, list);
+    this.#longest = Math.max(this.#longest, value.length);
+    while (this.#values.size > MAX_LEARNED) this.#forget(this.#values.keys().next().value!);
     return true;
+  }
+
+  #forget(value: string): void {
+    const n = this.#values.get(value);
+    if (!n) return;
+    this.#values.delete(value);
+    this.#byRef.delete(n.ref);
+    const key = value.slice(0, PREFIX);
+    const list = (this.#byPrefix.get(key) ?? []).filter((x) => x !== n);
+    if (list.length > 0) this.#byPrefix.set(key, list);
+    else this.#byPrefix.delete(key);
   }
 
   /** The value a learned reference stands for. */
@@ -258,16 +292,38 @@ export class LearnedSecrets {
   }
 
   get longest(): number {
-    return this.#current().longest;
+    return this.#longest;
   }
 
-  #current(): Matcher {
-    this.#matcher ??= new Matcher([...this.#values.values()]);
-    return this.#matcher;
-  }
-
-  replace(text: string): { text: string; refs: string[] } {
-    const r = replaceMatches(text, this.#current(), true);
-    return { text: r.text, refs: [...r.refs] };
+  /** Each remembered value replaced where it stands as a whole token, never inside a reference. Null past `deadline`. */
+  replace(text: string, deadline = Number.POSITIVE_INFINITY): { text: string; refs: string[] } | null {
+    const refs = new Set<string>();
+    if (this.#values.size === 0 || text.length < MIN_LEARNED_LENGTH) return { text, refs: [] };
+    const own: Array<[number, number]> = [];
+    for (const m of text.matchAll(OWN_REF)) own.push([m.index!, m.index! + m[0].length]);
+    let out = "";
+    let at = 0;
+    let o = 0;
+    for (let i = 0; i + MIN_LEARNED_LENGTH <= text.length; i++) {
+      if ((i & 0xffff) === 0 && i > 0 && performance.now() > deadline) return null;
+      if (i > 0 && TOKEN_CHAR.test(text[i - 1]!)) continue;
+      while (o < own.length && own[o]![1] <= i) o++;
+      if (o < own.length && own[o]![0] <= i) {
+        i = own[o]![1] - 1;
+        continue;
+      }
+      const list = this.#byPrefix.get(text.slice(i, i + PREFIX));
+      if (!list) continue;
+      const n = list.find((c) => text.startsWith(c.text, i) && !(i + c.text.length < text.length && TOKEN_CHAR.test(text[i + c.text.length]!)));
+      if (!n) continue;
+      out += text.slice(at, i) + n.ref;
+      at = i + n.text.length;
+      refs.add(n.ref);
+      i = at - 1;
+    }
+    return at === 0 ? { text, refs: [] } : { text: out + text.slice(at), refs: [...refs] };
   }
 }
+
+/** How many leading characters index a remembered value (each is at least MIN_LEARNED_LENGTH long). */
+const PREFIX = 8;

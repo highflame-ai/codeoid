@@ -385,3 +385,78 @@ describe("round-1 audit", () => {
     expect(JSON.stringify(r)).not.toContain(GHP);
   });
 });
+
+describe("round-2 audit", () => {
+  test.each([
+    ['curl -H "X-Api-Key: abcdef1234567890" x', "abcdef1234567890"],
+    ["password: hunter2 # prod", "hunter2"],
+    ["secret: dGVzdA==", "dGVzdA=="],
+    ["GET /x?api_key=abcdef123456&q=1", "abcdef123456"],
+    ["mysql -u root -pHunter2pw db", "Hunter2pw"],
+    ["sshpass -p s3cretpw ssh h", "s3cretpw"],
+    ["DB_PASSWORD=correct_horse_battery", "correct_horse_battery"],
+    ["DB_PASSWORD=violetMeadow", "violetMeadow"],
+  ])("finds the value in %s", (text, value) => {
+    expect((findSecrets(text) ?? []).map((s) => text.slice(s.start, s.end))).toEqual([value]);
+  });
+
+  test("a value stops at & and a literal \\n, so nothing after it is lost", () => {
+    const scrubber = new Scrubber({ known: new KnownSecrets(), fingerprint: fp });
+    expect(scrubber.scrub("password=hunter2&user=x").text).toEndWith("&user=x");
+    expect(scrubber.scrub('{"env":"API_KEY=abc123xyz\\nNEXT=1"}').text).toContain("\\nNEXT=1");
+  });
+
+  test.each(["export -p", "declare -x", "env -u X", "cat .env*", "docker exec c env", "kubectl exec p -- env", "ssh host cat .env", "echo $GITHUB_TOKEN"])(
+    "withholds the output of %s",
+    async (command) => {
+      await loadShellParser();
+      expect(toolVerdict("Bash", { command }, { cwd: "/w" })).toBe("withhold-output");
+    },
+  );
+
+  test("writes of a credential file by any backend's file tools", () => {
+    expect(toolVerdict("codex_file_change", { changes: [{ path: "/w/.env", kind: "add" }] }, { cwd: "/w" })).toBe("withhold-written");
+    expect(toolVerdict("apply_patch", { input: "*** Begin Patch\n*** Add File: .env\n+A=1\n*** End Patch" }, { cwd: "/w" })).toBe("withhold-written");
+  });
+
+  test("remembering many values, and scrubbing already-scrubbed text, stay fast", async () => {
+    const { LearnedSecrets } = await import("./known.js");
+    const learned = new LearnedSecrets();
+    const scrubber = new Scrubber({ known: new KnownSecrets(), learnedFor: () => learned, fingerprint: fp });
+    const jwt = (i: number) => `eyJ${"a".repeat(40)}${i}.eyJ${"b".repeat(600)}.${"c".repeat(43)}`;
+    let t0 = performance.now();
+    for (let i = 0; i < 2000; i++) scrubber.scrub(`got ${jwt(i)} ok`);
+    expect(performance.now() - t0).toBeLessThan(5_000);
+    const known = new KnownSecrets();
+    known.register("t", () => [{ label: "k", value: "knownvalue123" }]);
+    const s2 = new Scrubber({ known, fingerprint: fp });
+    t0 = performance.now();
+    const r = s2.scrub("‹secret:x:00000000› knownvalue123 ".repeat(40_000));
+    expect(performance.now() - t0).toBeLessThan(2_000);
+    expect(r.text).not.toContain("knownvalue123");
+  });
+
+  test("a dev default in the environment isn't a known value; a key-like one is", async () => {
+    const { environmentSecrets } = await import("./service.js");
+    const found = environmentSecrets({ POSTGRES_PASSWORD: "postgres", SESSION_SECRET: "development", STRIPE_API_KEY: "sk_test_abcDEF123456789" });
+    expect(found.map((k) => k.value)).toEqual(["sk_test_abcDEF123456789"]);
+  });
+
+  test("known values are matched only as whole tokens", () => {
+    const known = new KnownSecrets();
+    known.register("t", () => [{ label: "k", value: "postgres-pw-12" }]);
+    const s = new Scrubber({ known, fingerprint: fp });
+    expect(s.scrub("x postgres-pw-123 y").text).toBe("x postgres-pw-123 y");
+    expect(s.scrub("x postgres-pw-12 y").text).toBe("x ‹credential:k› y");
+  });
+
+  test("structured MCP output is scrubbed string by string", async () => {
+    const { McpHub } = await import("../mcp/hub.js");
+    const hub = new McpHub();
+    const scrubber = new Scrubber({ known: new KnownSecrets(), fingerprint: fp });
+    hub.setResultScrub((t) => scrubber.scrub(t).text);
+    const r = hub.scrubRelayed("tools/call", { content: [], structuredContent: { output: "db:\n  password: Violetmeadow\n", n: 3 } }) as { structuredContent: { output: string; n: number } };
+    expect(r.structuredContent.output).not.toContain("Violetmeadow");
+    expect(r.structuredContent.n).toBe(3);
+  });
+});

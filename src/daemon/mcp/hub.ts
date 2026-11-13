@@ -50,6 +50,15 @@ export interface McpCallScope {
   tenant?: McpTenant;
 }
 
+/** Every string in a JSON-like value through `fn`, structure kept (deeper than 32 levels: dropped). */
+function deepStrings(v: unknown, fn: (s: string) => string, depth = 0): unknown {
+  if (typeof v === "string") return fn(v);
+  if (v === null || typeof v !== "object") return v;
+  if (depth > 32) return null;
+  if (Array.isArray(v)) return v.map((x) => deepStrings(x, fn, depth + 1));
+  return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, x]) => [k, deepStrings(x, fn, depth + 1)]));
+}
+
 export interface McpCallResult {
   text: string;
   isError: boolean;
@@ -140,14 +149,8 @@ export class McpHub {
       Array.isArray(list) ? list.map((c) => (c && typeof c === "object" && typeof (c as { text?: unknown }).text === "string" ? { ...c, text: scrub((c as { text: string }).text) } : c)) : list;
     if (method === "tools/call") {
       const out: Record<string, unknown> = { ...(r as Record<string, unknown>), content: texts(r.content) };
-      // Structured output is text too, as JSON: scrubbed whole, kept only if it still parses.
-      if (r.structuredContent !== undefined) {
-        try {
-          out.structuredContent = JSON.parse(scrub(JSON.stringify(r.structuredContent)));
-        } catch {
-          delete out.structuredContent;
-        }
-      }
+      // Structured output: every string in it, as text (a line rule sees inside it as it would the text part).
+      if (r.structuredContent !== undefined) out.structuredContent = deepStrings(r.structuredContent, scrub);
       return out as T;
     }
     if (method === "resources/read") return { ...(r as Record<string, unknown>), contents: texts(r.contents) } as T;

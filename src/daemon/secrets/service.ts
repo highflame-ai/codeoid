@@ -130,11 +130,20 @@ export class SecretService {
  * from the env-file store among them) and anything whose name says it is a
  * secret (`*_API_KEY`, `*_TOKEN`, …).
  */
+/** At least 12 characters, and not a plain word: a digit, a symbol, or both cases. */
+export function looksLikeSecret(value: string): boolean {
+  if (value.length < 12) return false;
+  return /[0-9]/.test(value) || /[^A-Za-z]/.test(value) || (/[a-z]/.test(value) && /[A-Z]/.test(value));
+}
+
 export function environmentSecrets(env: Record<string, string | undefined> = process.env): KnownSecret[] {
   const out: KnownSecret[] = [];
   const NAME = /(?:^CODEOID_CRED_|_API_KEY$|_TOKEN$|_SECRET$|_PASSWORD$|_ACCESS_KEY$|_SECRET_KEY$|_PRIVATE_KEY$|^ANTHROPIC_AUTH_TOKEN$|^CODEOID_API_KEY$)/;
   for (const [name, value] of Object.entries(env)) {
     if (!value || !NAME.test(name)) continue;
+    // Named like a secret, but a dev default (`postgres`, `development`, `changeme`) is ordinary text
+    // everywhere else: a value from the environment is matched only when it looks like one.
+    if (!looksLikeSecret(value)) continue;
     out.push({ label: name.startsWith("CODEOID_CRED_") ? name.slice("CODEOID_CRED_".length).toLowerCase().replace(/_/g, "-") : `daemon:${name}`, value });
   }
   return out;

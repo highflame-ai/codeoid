@@ -147,7 +147,10 @@ export function scrubDispatchTasks(dbPath: string, scrub: ScrubFn, dryRun: boole
     const cols = new Set((db.prepare("PRAGMA table_info(dispatch_tasks)").all() as Array<{ name: string }>).map((c) => c.name));
     if (!cols.has("prompt")) return 0;
     const digest = cols.has("result_digest");
-    const rows = db.prepare(`SELECT id, prompt${digest ? ", result_digest" : ""} FROM dispatch_tasks`).all() as Array<{ id: string; prompt: string | null; result_digest?: string | null }>;
+    // Settled tasks only: a queued or running one's prompt is what its worker is sent, as written.
+    const rows = db
+      .prepare(`SELECT id, prompt${digest ? ", result_digest" : ""} FROM dispatch_tasks WHERE status IN ('done', 'failed', 'blocked', 'cancelled')`)
+      .all() as Array<{ id: string; prompt: string | null; result_digest?: string | null }>;
     const update = db.prepare(`UPDATE dispatch_tasks SET prompt = ?${digest ? ", result_digest = ?" : ""} WHERE id = ?`);
     const tx = db.transaction(() => {
       for (const r of rows) {

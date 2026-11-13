@@ -1602,6 +1602,7 @@ export class Store {
         ownerDaemon ?? null,
         now,
       ) as RawDispatchRow[];
+    for (const r of rows) if (r.status !== "queued") this.#scrubSettledTask(r.id);
     return rows.map(rowToDispatchTask);
   }
 
@@ -1881,7 +1882,7 @@ export class Store {
         `INSERT INTO dispatch_events (account_id, project_id, task_id, type, digest, created_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(event.accountId, event.projectId, event.taskId, event.type, event.digest, event.now);
+      .run(event.accountId, event.projectId, event.taskId, event.type, this.scrubText ? this.scrubText(event.digest) : event.digest, event.now);
   }
 
   dispatchEventsPending(accountId: string, projectId: string): DispatchEventRow[] {
@@ -2312,7 +2313,7 @@ export class Store {
         .prepare(
           "INSERT INTO audit_log (subject, session_id, action, detail) VALUES (?, ?, ?, ?)",
         )
-        .run(subject, sessionId ?? null, action, detail ?? null);
+        .run(subject, sessionId ?? null, action, detail && this.scrubText ? this.scrubText(detail) : (detail ?? null));
     } catch {
       // Retry unlinked (FK can't fail) so the entry is still recorded; fold
       // the orphaned session id into the detail. Swallow anything further.

@@ -21,6 +21,7 @@
 
 import { parseShellSync, type SimpleCommand } from "../shell/parse.js";
 import { shellCallOf } from "../shell/tool-call.js";
+import { writeTargets } from "../held-writes.js";
 import { toolReadPaths } from "../secret-paths.js";
 import { isCredentialFile } from "./files.js";
 
@@ -145,7 +146,16 @@ function printsCredentials(argv: string[]): boolean {
   // The environment, the shell's variables: alone, not running a command.
   if (ENV_PRINTERS.has(program)) {
     const opts = argv.slice(1);
-    if (program === "env" && opts.every((a) => a.startsWith("-"))) return true;
+    if (program === "env") {
+      // Options only (`-u X` and `-C DIR` take a value): it prints the environment.
+      let printsAll = true;
+      for (let i = 0; i < opts.length; i++) {
+        const a = opts[i]!;
+        if (a === "-u" || a === "--unset" || a === "-C" || a === "--chdir") i++;
+        else if (!a.startsWith("-")) printsAll = false;
+      }
+      if (printsAll) return true;
+    }
     if (program === "set" && opts.length === 0) return true;
     if ((program === "export" || program === "declare" || program === "typeset") && opts.length > 0 && opts.every((a) => /^-[a-zA-Z]*[px]/.test(a))) return true;
   }
@@ -176,6 +186,18 @@ export function toolVerdict(toolName: string, input: unknown, opts: VerdictOptio
     const obj = input && typeof input === "object" ? (input as Record<string, unknown>) : {};
     const shell = shellCallOf(toolName, obj);
     if (shell) return shellVerdict(shell.command, shell.cwd ?? opts.cwd, opts);
+    // Every backend's file tools, as the held-write gate reads them (a Codex change's paths, pi's `edit`).
+    const writes = writeTargets(toolName, obj);
+    if (writes) {
+      const named = writes.filter((p): p is string => typeof p === "string");
+      if (named.some((p) => isCredentialFile(p, opts.cwd, opts.credentialFiles))) return "withhold-written";
+    }
+    // A patch tool: every file it adds or changes (`*** Add File: .env`).
+    const patch = typeof obj.input === "string" ? obj.input : typeof obj.patch === "string" ? obj.patch : null;
+    if (patch && /^(?:apply_patch|patch)$/i.test(toolName)) {
+      const files = [...patch.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)].map((m) => m[1]!.trim());
+      if (files.some((p) => isCredentialFile(p, opts.cwd, opts.credentialFiles))) return "withhold-written";
+    }
     const paths = toolReadPaths(toolName, obj);
     if (paths.some((p) => isCredentialFile(p, opts.cwd, opts.credentialFiles))) {
       return writesFiles(toolName) ? "withhold-written" : "withhold-output";
@@ -186,7 +208,40 @@ export function toolVerdict(toolName: string, input: unknown, opts: VerdictOptio
   }
 }
 
-function shellVerdict(command: string, cwd: string, opts: VerdictOptions): ToolVerdict {
+/** A declaration builtin listing the shell's variables (`export -p`, `declare -x`, bare `export`): the parser gives no command for it. */
+const DECLARATION_PRINTS = /(?:^|[;&|(]\s*|\bthen\s+|\bdo\s+)(?:export|declare|typeset|readonly)(?:\s+-[a-zA-Z]*[pxr]?[a-zA-Z]*)*\s*(?=$|[;&|)\n])/m;
+/** A variable whose name says it holds a credential (`$GITHUB_TOKEN`, `${DB_PASSWORD}`). */
+const SECRET_VARIABLE = /\$\{?[A-Za-z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|_PWD|API_?KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|CREDENTIALS?)\b/i;
+/** Programs that print their arguments. */
+const ECHOES = new Set(["echo", "printf", "print"]);
+/** A word as a path it may name: globs and braces dropped (`.env*`, `.env{,.local}` name `.env`). */
+function pathLike(raw: string): string {
+  return raw.replace(/^["']|["']$/g, "").replace(/\{[^}]*\}/g, "").replace(/[*?]+$/, "").replace(/\[[^\]]*\]$/, "");
+}
+
+/** The command another program runs for it: `ssh host CMD…`, `docker exec C CMD…`, `kubectl exec P -- CMD…`. */
+function innerCommand(argv: string[]): string | null {
+  const program = programName(argv[0] ?? "");
+  const rest = argv.slice(1);
+  if (program === "ssh") {
+    let i = 0;
+    while (i < rest.length && rest[i]!.startsWith("-")) i += /^-[bcDEeFIiJLlmOopQRSWw]$/.test(rest[i]!) ? 2 : 1;
+    return rest.length > i + 1 ? rest.slice(i + 1).join(" ") : null;
+  }
+  if ((program === "docker" || program === "podman") && rest[0] === "exec") {
+    let i = 1;
+    while (i < rest.length && rest[i]!.startsWith("-")) i += /^-(?:e|u|w|-env|-user|-workdir)$/.test(rest[i]!) ? 2 : 1;
+    return rest.length > i + 1 ? rest.slice(i + 1).join(" ") : null;
+  }
+  if (program === "kubectl" && rest.includes("exec")) {
+    const dash = rest.indexOf("--");
+    return dash >= 0 && dash < rest.length - 1 ? rest.slice(dash + 1).join(" ") : null;
+  }
+  return null;
+}
+
+function shellVerdict(command: string, cwd: string, opts: VerdictOptions, depth = 0): ToolVerdict {
+  if (DECLARATION_PRINTS.test(command)) return "withhold-output";
   const parsed = parseShellSync(command);
   const drops = (opts.dropCommands ?? []).map((d) => d.trim().split(/\s+/).filter(Boolean)).filter((d) => d.length > 0);
   if (parsed.unreadable) {
@@ -202,6 +257,19 @@ function shellVerdict(command: string, cwd: string, opts: VerdictOptions): ToolV
     const argv = words(c);
     if (argv.length === 0 || argv[0] === null) continue;
     const program = programName(argv[0]);
+    // Printing a variable named for a credential: its value is the output.
+    if (ECHOES.has(program) && c.argv.slice(1).some((w) => SECRET_VARIABLE.test(w.raw))) verdict = "withhold-output";
+    // What runs elsewhere for it is judged too.
+    if (depth < 2 && argv.every((a) => a !== null)) {
+      const inner = innerCommand(argv as string[]);
+      if (inner) {
+        const v = shellVerdict(inner, cwd, opts, depth + 1);
+        if (v === "drop") return v;
+        if (v !== "keep") verdict = v;
+      }
+    }
+    // A word with a glob or braces naming a credential file (`cat .env*`): judged by the name it starts with.
+    if (FILE_PRINTERS.has(program) && c.argv.slice(1).some((w) => w.glob && isCredentialFile(pathLike(w.raw), cwd, opts.credentialFiles))) verdict = "withhold-output";
     if (drops.some((d) => d.every((w, i) => (i === 0 ? program === w : argv[i] === w)))) return "drop";
     // A word only known at run time can't be a subcommand that prints a credential; the rest still counts.
     if (argv.every((a) => a !== null) && printsCredentials(argv as string[])) verdict = "withhold-output";

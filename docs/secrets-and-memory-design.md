@@ -162,7 +162,19 @@ sees a secret it read earlier as its reference. The prompt of the turn it is ans
 user wrote it (`Session#historyForTurn`).
 
 A value found only by the name it sits under (`DB_PASSWORD=…`, `password: …`) is replaced there but
-not remembered: the same word is too often ordinary text elsewhere. A value of a distinct format (a
+not remembered: the same word is too often ordinary text elsewhere. In code (`name = value`, spaced)
+a value that is another name (`self.token`, `api_key`, `idToken`) is taken for code; in a `.env` or a
+shell (`NAME=value`) it is a password like any other.
+
+Known values are matched as whole tokens, and a value from the daemon's environment only when it
+looks like a secret (12 characters or more, not a plain word): a dev default (`postgres`,
+`development`) stays the ordinary word it is.
+
+Memory, the routine and dispatch stores, and the hub scrub without a tenant: values are replaced
+there as anywhere, but nothing is remembered or kept in the vault from them. A routine's output is
+cut to its limit before it is stored, so a token at the cut can lose its end. A command's raw
+output spill file (the compressor) is kept until it is taken into memory or pruned (a day), and is
+removed at once when the call's output is withheld. A value of a distinct format (a
 vendor's token, a JWT, a bearer token, a key) is remembered for the rest of the daemon's run, per
 tenant, and replaced bare wherever it shows up again.
 
@@ -196,7 +208,13 @@ still gets through. The detector reduces this; it can't end it.
 - Matching: known and remembered values in one pass (Aho-Corasick), never inside a reference
   already written; remembered ones as whole tokens. Detection is linear: private keys and curl's
   `-u` are found in code, the time budget is checked inside each pattern's matches too.
-- Streaming: see §2.6.
+- Streaming: see §2.6. A piece is judged with the last 512 characters of its line already sent.
+- Remembered values: indexed by their first characters, matched where a token starts: learning
+  one costs nothing, and 2,000 remembered values cost a scan no slower than none.
+- Verdicts also withhold: `export -p` / `declare -x` / a bare `export`, `env` with options only,
+  `echo $SOME_TOKEN`, `cat .env*`, `git show/diff/log` of a credential file, `dd if=`, and what
+  `ssh host …`, `docker exec … ` and `kubectl exec … --` run; and every backend's file tools'
+  writes of a credential file (`writeTargets`, a patch's `*** Add File:`).
 - `codeoid secret scrub` takes no time budget, remembers nothing across texts, leaves a text it
   can't check as it is (and says how many), includes rotated transcript segments, and rebuilds
   each database it changed (FTS optimize, WAL checkpoint, VACUUM) so replaced text is gone from

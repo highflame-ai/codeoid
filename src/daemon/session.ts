@@ -10061,7 +10061,7 @@ export class Session {
     const toolUseId = this.#messageIdToToolUseId.get(msgId);
     const resolvedState =
       this.#secrets && runs && typeof runs === "object"
-        ? ({ ...settled, input: this.#recordedToolInput((toolUseId && this.#toolVerdicts.get(toolUseId)) || "keep", runs as Record<string, unknown>) } as unknown as ToolState)
+        ? ({ ...settled, input: this.#recordedToolInput((toolUseId && this.#toolVerdicts.get(toolUseId)) || "keep", runs as Record<string, unknown>, this.#toolCallMessages.get(msgId)?.tool?.name) } as unknown as ToolState)
         : this.#scrubValue(settled);
     this.#scrollback.updateMessage(msgId, (m) => {
       const sm = m as SessionMessage;
@@ -10096,7 +10096,7 @@ export class Session {
     if (!msgId) return;
     // Recorded as any input is: a hook may add a credential (an Authorization header) the call needs.
     const toolUseId = this.#messageIdToToolUseId.get(msgId);
-    const input = this.#secrets ? this.#recordedToolInput((toolUseId && this.#toolVerdicts.get(toolUseId)) || "keep", raw) : raw;
+    const input = this.#secrets ? this.#recordedToolInput((toolUseId && this.#toolVerdicts.get(toolUseId)) || "keep", raw, this.#toolCallMessages.get(msgId)?.tool?.name) : raw;
     const updateTool = (sm: SessionMessage): void => {
       if (!sm.tool) return;
       sm.tool.input = input;
@@ -10618,7 +10618,7 @@ export class Session {
         // The canonical history keeps what the transcript keeps.
         const verdict = this.#secrets ? this.#secrets.verdict(event.name, event.input, event.shellCwd ?? this.workdir) : "keep";
         if (verdict !== "keep") this.#toolVerdicts.set(event.sdkToolUseId, verdict);
-        const recordedInput = this.#secrets ? this.#recordedToolInput(verdict, event.input) : event.input;
+        const recordedInput = this.#secrets ? this.#recordedToolInput(verdict, event.input, event.name) : event.input;
         this.#accumulator.handleEvent(recordedInput === event.input ? event : { ...event, input: recordedInput });
         // NOTE: do NOT call #completeActiveTools() here. It would cancel all
         // currently in-flight tools, which is correct for sequential calls but
@@ -12338,7 +12338,7 @@ export class Session {
     if (!this.#secrets || !input || typeof input !== "object") return this.#scrubValue(input);
     const msgId = this.#approvalIdToMessageId.get(approvalId);
     const toolUseId = msgId ? this.#messageIdToToolUseId.get(msgId) : undefined;
-    return this.#recordedToolInput((toolUseId && this.#toolVerdicts.get(toolUseId)) || "keep", input as Record<string, unknown>);
+    return this.#recordedToolInput((toolUseId && this.#toolVerdicts.get(toolUseId)) || "keep", input as Record<string, unknown>, msgId ? this.#toolCallMessages.get(msgId)?.tool?.name : undefined);
   }
 
   /** Who and where a scrub is for: a kept secret lands in this tenant and home workstream. */
@@ -12376,16 +12376,20 @@ export class Session {
    * What is recorded of a tool call's input: scrubbed, or, for a write of a
    * credential file, without what was written (secrets/verdict.ts).
    */
-  #recordedToolInput(verdict: ToolVerdict, input: Record<string, unknown>): Record<string, unknown> {
+  #recordedToolInput(verdict: ToolVerdict, input: Record<string, unknown>, toolName = ""): Record<string, unknown> {
+    const isShell = shellCallOf(toolName, input) !== null || typeof input.command === "string" || Array.isArray(input.command);
     if (verdict === "drop") {
-      // A call the user listed as never stored: nothing of what it was given is kept.
-      return Object.fromEntries(Object.entries(input).map(([k, v]) => [k, typeof v === "string" ? NOT_STORED : v]));
+      // A call the user listed as never stored: nothing of what it was given is kept (an argv too).
+      return Object.fromEntries(Object.entries(input).map(([k, v]) => [k, typeof v === "string" || Array.isArray(v) ? NOT_STORED : this.#scrubValue(v)]));
     }
     if (verdict === "withhold-written") {
-      // A file tool writing a credential file: the path stays, what it writes doesn't. A shell line
-      // writing one stays readable (it is on the approval card), scrubbed.
+      // A file tool writing a credential file: the path stays, what it writes doesn't — every
+      // backend's content keys (Codex's `changes`, pi's `newText`, a patch tool's `input`). A shell
+      // line writing one stays readable (it is on the approval card), scrubbed.
       const out: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(input)) out[k] = /^(?:content|new_string|old_string|edits|new_source|patch)$/.test(k) ? WRITTEN_WITHHELD : v;
+      for (const [k, v] of Object.entries(input)) {
+        out[k] = /^(?:content|new_string|old_string|edits|new_source|patch|newText|oldText|changes|files|text|diff|input)$/.test(k) && !isShell ? WRITTEN_WITHHELD : v;
+      }
       return this.#scrubValue(out);
     }
     return this.#scrubValue(input);

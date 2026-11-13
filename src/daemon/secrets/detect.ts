@@ -31,20 +31,32 @@ export interface SecretSpan {
 interface Pattern {
   kind: string;
   re: RegExp;
-  /** A structural or named value that is plainly not a credential is left as it is. */
-  check?: "placeholder" | "word";
+  /**
+   * A value that is plainly not a credential is left as it is: a placeholder; a "word" (a type,
+   * code: another name, a call); an "env" value (as a word, but a snake_case or camelCase value
+   * of an environment variable is a password like any other).
+   */
+  check?: "placeholder" | "word" | "env";
   /** See {@link SecretSpan.distinct}. */
   distinct?: boolean;
   /** Only where the match's line also matches this (checked after the match, so the pattern stays linear). */
   line?: RegExp;
+  /**
+   * What comes before the match, checked in code rather than by a leading lookbehind or class
+   * (which an engine tries at every position: twenty times slower on Bun 1.3): the match may
+   * reach back over up to `max` of `chars` (a name's start), and the character before that must
+   * match `before` (or be the text's start).
+   */
+  back?: { chars?: RegExp; max?: number; before: RegExp; escapes?: boolean };
 }
 
-/** Not inside a longer token: no letter, digit or `_` just before. */
-const B = "(?<![A-Za-z0-9_])";
+/** Not inside a longer token. */
+const WORD_BOUNDARY = { before: /[^A-Za-z0-9_]/ };
+
 /** Nor just after. */
 const E = "(?![A-Za-z0-9_])";
 
-const vendor = (kind: string, body: string): Pattern => ({ kind, re: new RegExp(`${B}(?<secret>${body})${E}`, "g"), distinct: true });
+const vendor = (kind: string, body: string): Pattern => ({ kind, re: new RegExp(`(?<secret>${body})${E}`, "g"), distinct: true, back: WORD_BOUNDARY });
 
 /** Formats with a prefix of their own: they can't be mistaken for anything else. */
 const VENDOR: Pattern[] = [
@@ -115,32 +127,56 @@ const VENDOR: Pattern[] = [
 
 /** Credentials recognised by where they sit. */
 const STRUCTURAL: Pattern[] = [
-  { kind: "jwt", re: new RegExp(`(?:${B}|(?<=\\\\[nrt]))(?<secret>eyJ[A-Za-z0-9_-]{10,4000}\\.eyJ[A-Za-z0-9_-]{10,8000}\\.[A-Za-z0-9_-]{10,2000})`, "g"), distinct: true },
-  { kind: "bearer-token", re: /(?<![A-Za-z0-9_])bearer[ \t]+(?<secret>[A-Za-z0-9._~+/-]{16,4000}=*)/gi, check: "placeholder", distinct: true },
-  { kind: "authorization", re: /(?<![A-Za-z0-9_])authorization["']?[ \t]*[:=][ \t]*["']?(?:basic|token)[ \t]+(?<secret>[A-Za-z0-9._~+/-]{8,4000}=*)/gi, check: "placeholder", distinct: true },
+  // After a non-word character, or an escaped newline or tab in JSON text (`\njwt…`: `n` is a letter).
+  { kind: "jwt", re: /(?<secret>eyJ[A-Za-z0-9_-]{10,4000}\.eyJ[A-Za-z0-9_-]{10,8000}\.[A-Za-z0-9_-]{10,2000})/g, distinct: true, back: { before: /[^A-Za-z0-9_]/, escapes: true } },
+  { kind: "bearer-token", re: /bearer[ \t]+(?<secret>[A-Za-z0-9._~+/-]{16,4000}=*)/gi, check: "placeholder", distinct: true, back: WORD_BOUNDARY },
+  { kind: "authorization", re: /authorization["']?[ \t]*[:=][ \t]*["']?(?:basic|token)[ \t]+(?<secret>[A-Za-z0-9._~+/-]{8,4000}=*)/gi, check: "placeholder", distinct: true, back: WORD_BOUNDARY },
   // curl's `-u user:password`: the line must run curl (checked in findSecrets: `line: /\bcurl\b/`).
   { kind: "password", re: /(?:^|[ \t])(?:-u|--user)(?:=|[ \t]+)["']?[^:\s"']{0,200}:(?<secret>[^\s"']{1,500})/gm, check: "placeholder", line: /\bcurl\b/ },
   // A .netrc entry's password.
   { kind: "password", re: /(?:^|\s)machine\s+\S{1,253}\s+(?:login\s+\S{1,200}\s+)?password\s+(?<secret>\S{1,500})/g, check: "placeholder" },
   { kind: "password", re: /^[ \t]*password[ \t]+(?<secret>\S{1,500})[ \t]*$/gm, check: "placeholder" },
-  { kind: "password", re: /(?<![A-Za-z0-9_])[a-z][a-z0-9+.-]{1,31}:\/\/[^\s/?#@"'`<>:]{0,200}:(?<secret>[^\s/?#@"'`<>]{1,500})@/gi, check: "placeholder" },
+  // A URL's userinfo password, found from its `://` (the scheme before it, whatever it is).
+  { kind: "password", re: /:\/\/[^\s/?#@"'`<>:]{0,200}:(?<secret>[^\s/?#@"'`<>]{1,500})@/g, check: "placeholder", back: { chars: /[a-z0-9+.-]/i, max: 32, before: /[^A-Za-z0-9_]/ } },
   { kind: "password", re: /(?:^|[?&;\s-])(?:password|pwd)=(?<secret>"[^"\n]{0,500}"|'[^'\n]{0,500}'|[^&;\s"'`]{0,500}[^&;\s"'`,])/gim, check: "placeholder" },
   { kind: "aws-secret", re: /aws_secret_access_key["']?(?:[ \t]*[:=][ \t]*|[ \t]+)["']?(?<secret>[A-Za-z0-9/+]{40,100})/gi, distinct: true },
-  { kind: "twilio-key", re: new RegExp(`${B}(?<secret>SK[0-9a-fA-F]{32})${E}`, "g"), distinct: true },
+  { kind: "twilio-key", re: new RegExp(`(?<secret>SK[0-9a-fA-F]{32})${E}`, "g"), distinct: true, back: WORD_BOUNDARY },
 ];
 
 /** The words an environment variable's name ends with when it holds a credential. */
-const ENV_NAME = "(?<![A-Za-z0-9_])[A-Z0-9_]{0,100}(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|_PWD|API_?KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|SECRET_KEY|CREDENTIALS?|AUTH)(?![A-Za-z0-9_])";
+/** The word an environment variable's name ends with; its start is found in code (`ENV_BACK`). */
+const ENV_NAME = "(?:SECRET|TOKEN|PASSWORD|PASSWD|PASSPHRASE|_PWD|API_?KEY|APIKEY|PRIVATE_KEY|ACCESS_KEY|SECRET_KEY|CREDENTIALS?|AUTH)(?![A-Za-z0-9_])";
+const ENV_BACK = { chars: /[A-Z0-9_]/, max: 100, before: /[^A-Za-z0-9_]/ };
+/** A code name's start: any word characters, dots and dashes, after something that isn't one (a quote, a space). */
+const CODE_BACK = { chars: /[A-Za-z0-9_.-]/, max: 100, before: /[^A-Za-z0-9_.-]/ };
 /** The same as code, JSON and config files spell them; not `auth` alone, nor `tokens` (`max_tokens`). */
-const CODE_NAME =
-  "[\\w.-]{0,100}?(?:passw(?:or)?d|passphrase|secret|api[_-]?key|private[_-]?key|access[_-]?key|(?:auth|access|refresh|bearer|id|session)[_-]?token|token)";
+const CODE_WORD = "(?:passw(?:or)?d|passphrase|secret|api[_-]?key|private[_-]?key|access[_-]?key|(?:auth|access|refresh|bearer|id|session)[_-]?token|token)";
+/** In a line-anchored pattern (tried only at line starts): the name's start written out. */
+const CODE_NAME = `[\\w.-]{0,100}?${CODE_WORD}`;
 const SEPARATOR = `["'\\]]?[ \\t]*(?::=|=>|\\?=|[=:])[ \\t]*`;
 const QUOTED = `"(?:[^"\\\\\\n]|\\\\.){6,1000}"|'[^'\\n]{6,1000}'`;
 
 /** Values assigned to a name a credential is kept under. */
 const NAMED: Pattern[] = [
-  { kind: "credential", re: new RegExp(`${ENV_NAME}${SEPARATOR}(?<secret>${QUOTED}|[^\\s"'\`,;)\\]}{(<>]{6,1000})`, "g"), check: "word" },
-  { kind: "credential", re: new RegExp(`(?:^|[^A-Za-z0-9_.-])["']?${CODE_NAME}${SEPARATOR}(?<secret>${QUOTED})`, "gi"), check: "word" },
+  // An environment variable's value: stops at `&` and a literal `\n` (a query string, JSON text).
+  { kind: "credential", re: new RegExp(`${ENV_NAME}${SEPARATOR}(?<secret>${QUOTED}|[^\\s"'\`,;)\\]}{(<>&\\\\]{6,1000})`, "g"), check: "env", back: ENV_BACK },
+  // An HTTP header named for a credential, unquoted (`-H "X-Api-Key: abc…"`, `api-key: …`).
+  {
+    kind: "credential",
+    re: /(?:api-?key|auth-?token|access-?token|secret|password|token)[ \t]*:[ \t]*(?<secret>[^\s"',;]{6,1000})/gi,
+    check: "word",
+    back: { chars: /[A-Za-z0-9-]/, max: 64, before: /[\s"']/ },
+  },
+  // A URL's query value named for a credential (`?api_key=…`, `&access_token=…`).
+  {
+    kind: "credential",
+    re: /[?&](?:api[_-]?key|apikey|access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|token|client[_-]?secret|secret|password|pwd|key|sig|signature)=(?<secret>[^&#\s"'<>]{6,1000})/gi,
+    check: "placeholder",
+  },
+  // A client's password flag glued to its value (`mysql -pHunter2`), or apart (`sshpass -p …`, `docker login -p …`).
+  { kind: "password", re: /(?:^|[ \t])-p(?<secret>[^\s"'-][^\s"']{0,200})/gm, check: "placeholder", line: /\b(?:mysql|mysqldump|mysqladmin|mariadb)\b/ },
+  { kind: "password", re: /(?:^|[ \t])-p[ \t]+(?<secret>[^\s"'-][^\s"']{0,200})/gm, check: "placeholder", line: /\b(?:sshpass|(?:docker|podman|nerdctl|helm)\s+(?:registry\s+)?login)\b/ },
+  { kind: "credential", re: new RegExp(`${CODE_WORD}${SEPARATOR}(?<secret>${QUOTED})`, "gi"), check: "word", back: CODE_BACK },
   {
     kind: "password",
     re: /(?:^|[ \t])--passw(?:or)?d[ \t]+(?<secret>"(?:[^"\\\n]|\\.){1,500}"|'[^'\n]{1,500}'|(?:[^\s"'\\<>[{()|&;`-][^\s"'\\|&;<>()`]{0,500}?)?[^A-Za-z\s"'\\.,:;()[\]{}<>|&`-][^\s"'\\|&;<>()`]{0,500})(?=[\s"';&|)\\]|$)/g,
@@ -149,14 +185,15 @@ const NAMED: Pattern[] = [
   // YAML-like `name: value`: the value runs to the end of the line (`password: correct horse`).
   {
     kind: "credential",
-    re: new RegExp(`^\\+?[ \\t]*(?:-[ \\t]+)?["']?${CODE_NAME}["']?[ \\t]*:[ \\t]*(?<secret>[^\\s"'#|>&*!{}\\[\\],=][^\\n#="]{0,1000})$`, "gim"),
+    // A trailing comment isn't part of it; `=` inside is (base64).
+    re: new RegExp(`^\\+?[ \\t]*(?:-[ \\t]+)?["']?${CODE_NAME}["']?[ \\t]*:[ \\t]*(?<secret>[^\\s"'#|>&*!{}\\[\\],=][^\\n#"]{0,1000})(?:#[^\\n]*)?$`, "gim"),
     check: "word",
   },
   // `.env`/INI-like `name=value`: up to the first space (`PGPASSWORD=x psql -h db` is a command).
   {
     kind: "credential",
-    re: new RegExp(`^\\+?[ \\t]*["']?${CODE_NAME}["']?[ \\t]*=[ \\t]*(?<secret>[^\\s"'#|>&*!{}\\[\\],=][^\\s#="]{0,1000})`, "gim"),
-    check: "word",
+    re: new RegExp(`^\\+?[ \\t]*["']?${CODE_NAME}["']?[ \\t]*=[ \\t]*(?<secret>[^\\s"'#|>&*!{}\\[\\],=][^\\s#"&\\\\]{0,1000})`, "gim"),
+    check: "env",
   },
 ];
 
@@ -224,7 +261,7 @@ export function isPlaceholder(raw: string): boolean {
 }
 
 /** {@link isPlaceholder}, or, unquoted, a type or code: what a name's value in code is far more often than a credential. */
-function isWord(raw: string): boolean {
+function isWord(raw: string, identifiers = true): boolean {
   const value = raw.trim();
   if (isPlaceholder(value)) return true;
   if (value.startsWith('"') || value.startsWith("'")) return false;
@@ -233,7 +270,7 @@ function isWord(raw: string): boolean {
   // (`Violetmeadow`, `postgres`) can be a password, and stays one.
   const bare = value.replace(/[,;)]+$/, "");
   if (/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+(?:\(\))?$/.test(bare) || /^[A-Za-z_$][\w$]*\(\)$/.test(bare)) return true;
-  if (/^[A-Za-z_$][\w$]*$/.test(bare) && (bare.includes("_") || /[a-z][A-Z]/.test(bare)) && !/[0-9]/.test(bare)) return true;
+  if (identifiers && /^[A-Za-z_$][\w$]*$/.test(bare) && (bare.includes("_") || /[a-z][A-Z]/.test(bare)) && !/[0-9]/.test(bare)) return true;
   if (/[0-9]/.test(value)) return false;
   return /[<>[\]&:(){},;]/.test(value) || TYPES.has(value.toLowerCase());
 }
@@ -260,6 +297,19 @@ export function findSecrets(text: string, deadline = Number.POSITIVE_INFINITY): 
       if (secret.length === 0) continue;
       if (p.check === "placeholder" && isPlaceholder(secret)) continue;
       if (p.check === "word" && isWord(secret)) continue;
+      // `NAME=value` (a .env file, a shell) holds a value whatever it looks like; `name = value`,
+      // spaced, is code, where another name is more likely than a password.
+      if (p.check === "env" && isWord(secret, /[ \t]/.test(text[at[0] - 1] ?? ""))) continue;
+      if (p.back) {
+        let i = m.index!;
+        for (let k = 0; p.back.chars && k < (p.back.max ?? 0) && i > 0 && p.back.chars.test(text[i - 1]!); k++) i--;
+        if (i > 0) {
+          const prev = text[i - 1]!;
+          // `escapes`: also after an escaped newline or tab in JSON text.
+          const escaped = p.back.escapes === true && i > 1 && text[i - 2] === "\\" && "nrt".includes(prev);
+          if (!escaped && !p.back.before.test(prev)) continue;
+        }
+      }
       if (p.line) {
         const lineStart = text.lastIndexOf("\n", at[0]) + 1;
         const lineEnd = text.indexOf("\n", at[0]);

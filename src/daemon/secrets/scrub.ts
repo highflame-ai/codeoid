@@ -85,11 +85,13 @@ export class Scrubber {
     if (text.length > MAX_SCRUB_BYTES) return this.#unchecked(text, TOO_LARGE);
     const deadline = performance.now() + (this.#opts.budgetMs ?? SCRUB_BUDGET_MS);
     const learned = this.#opts.learnedFor?.(ctx);
-    const known = this.#opts.known.replace(text);
+    const known = this.#opts.known.replace(text, deadline);
+    if (!known) return this.#unchecked(text, NOT_CHECKED);
     let out = known.text;
     let changed = known.labels.length > 0;
     if (learned) {
-      const r = learned.replace(out);
+      const r = learned.replace(out, deadline);
+      if (!r) return this.#unchecked(text, NOT_CHECKED);
       out = r.text;
       // A learned value matched exactly is still a detected secret: the vault keeps it where it is kept.
       for (const ref of r.refs) {
@@ -116,7 +118,11 @@ export class Scrubber {
     }
     out = result + out.slice(at);
     // A value just learned may appear again in this text, bare: replaced too.
-    if (learnedAny && learned) out = learned.replace(out).text;
+    if (learnedAny && learned) {
+      const again = learned.replace(out, deadline);
+      if (!again) return this.#unchecked(text, NOT_CHECKED);
+      out = again.text;
+    }
     return { text: out, changed: true };
   }
 
@@ -145,8 +151,12 @@ export class Scrubber {
         return r.text;
       }
       if (v === null || typeof v !== "object") return v;
-      // Too deep to walk: not stored as it is, rather than stored unchecked.
+      // Too deep to walk: not stored as it is, rather than stored unchecked (offline: kept, and said).
       if (depth > 32) {
+        if (this.#opts.onUnchecked) {
+          this.#opts.onUnchecked(JSON.stringify(v));
+          return v;
+        }
         changed = true;
         return NOT_CHECKED;
       }
@@ -171,6 +181,8 @@ const TRIGGER =
 /** The most held of one line (or one PEM block) before it is sent anyway, scrubbed as far as it has come. */
 const MAX_LINE_HOLD = 4096;
 const MAX_BLOCK_HOLD = 64_000;
+/** How much of a line already sent a piece is judged with. */
+const CONTEXT = 512;
 
 /**
  * Scrubs text that arrives in pieces (an assistant's reply as it streams), so
@@ -221,13 +233,14 @@ export class StreamScrubber {
    */
   #send(chunk: string): string {
     let out: string;
-    if (this.#sentLine) {
+    // Context only where it can matter: the line so far may name a credential, the chunk included.
+    if (this.#sentLine && TRIGGER.test(this.#sentLine + chunk.split("\n", 1)[0])) {
       const prefix = this.#scrubber.scrub(this.#sentLine, this.#ctx).text;
       const whole = this.#scrubber.scrub(this.#sentLine + chunk, this.#ctx).text;
       out = whole.startsWith(prefix) ? whole.slice(prefix.length) : this.#scrubber.scrub(chunk, this.#ctx).text;
     } else out = this.#scrubber.scrub(chunk, this.#ctx).text;
     const nl = chunk.lastIndexOf("\n");
-    this.#sentLine = (nl >= 0 ? chunk.slice(nl + 1) : this.#sentLine + chunk).slice(-MAX_LINE_HOLD);
+    this.#sentLine = (nl >= 0 ? chunk.slice(nl + 1) : this.#sentLine + chunk).slice(-CONTEXT);
     return out;
   }
 
@@ -241,7 +254,8 @@ export class StreamScrubber {
     // The last line, unfinished: held from where a credential may start — judged with what was
     // already sent of it, so a name sent in an earlier piece still holds its value.
     const lineStart = text.lastIndexOf("\n") + 1;
-    const sent = lineStart === 0 ? this.#sentLine : "";
+    // The last part of what was sent is enough: a credential's name sits just before its value.
+    const sent = lineStart === 0 ? this.#sentLine.slice(-CONTEXT) : "";
     const line = sent + text.slice(lineStart);
     const trigger = TRIGGER.exec(line);
     if (trigger && line.length - trigger.index <= MAX_LINE_HOLD) {
