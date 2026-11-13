@@ -15,7 +15,8 @@ codeoid start
   │       ├── TranscriptStore — JSONL persistence, survives daemon restart
   │       └── AgentIdentityManager — ZeroID identities for agents + sub-agents
   ├── Web UI frontend (SolidJS, served at /ui, also Telegram Mini App)
-  └── Telegram frontend (embedded, direct SessionManager access)
+  ├── Telegram frontend (embedded, direct SessionManager access)
+  └── Slack frontend (embedded, Socket Mode: src/frontends/slack/, docs/slack.md)
 ```
 
 ### Plugin Architecture
@@ -604,6 +605,7 @@ ZEROID_URL=highflame                 # issuer: preset (highflame | highflame-dev
 ZEROID_ISSUER=                       # override the expected `iss` claim (default: resolved ZEROID_URL)
 TELEGRAM_BOT_TOKEN=...              # Optional: enables Telegram frontend
 TELEGRAM_ALLOWED_USER_IDS=123,456   # Required with bot token
+SLACK_APP_TOKEN=xapp-...             # Optional, with SLACK_BOT_TOKEN and SLACK_ALLOWED_USER_IDS: the Slack frontend (docs/slack.md)
 CODEOID_MCP_CONTROL_ENABLED=false   # mount /mcp/control (docs/mcp-control.md)
 CODEOID_MCP_CONTROL_ACTIONS=false   # also allow create / send / interrupt / destroy there
 CODEOID_ROUTINES_ENABLED=true       # scheduler + routine commands (docs/routines.md)
