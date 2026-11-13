@@ -2466,28 +2466,33 @@ mcpHub: this.#mcpHub,
     return this.#persistedModelsCache.get(providerId) ?? null;
   }
 
+  /**
+   * The models a picker offers for a provider, and what a pick is checked
+   * against: one list, so the dropdown and the switch never disagree. An
+   * endpoint's are its configured models, else the server's own /models
+   * (briefly cached); it reports none through `onModels`, so its
+   * `#currentModels` would always be empty.
+   */
+  async #pickableModels(providerId: string): Promise<{ models: ModelInfo[]; live: boolean }> {
+    const endpoint = endpointNameOf(providerId);
+    if (endpoint === null) return this.#currentModels(providerId);
+    const { models, live } = await this.#endpointCatalog.models(endpoint);
+    return {
+      models: models.map((m) => ({
+        value: m.id,
+        displayName: m.displayName,
+        ...(m.contextWindow ? { contextWindow: m.contextWindow } : {}),
+      })),
+      live,
+    };
+  }
+
   async #modelsList(
     msg: Extract<ClientMessage, { type: "models.list" }>,
   ): Promise<DaemonMessage> {
     // No provider = the catalog of the backend a new session would land on.
     const provider = msg.provider ?? this.#providers.defaultId;
-    const endpoint = endpointNameOf(provider);
-    if (endpoint !== null) {
-      // Configured models, else the server's own /models (briefly cached).
-      const { models, live } = await this.#endpointCatalog.models(endpoint);
-      return {
-        type: "models.list.result",
-        requestId: msg.id,
-        models: models.map((m) => ({
-          value: m.id,
-          displayName: m.displayName,
-          ...(m.contextWindow ? { contextWindow: m.contextWindow } : {}),
-        })),
-        live,
-        provider,
-      };
-    }
-    const { models, live } = this.#currentModels(provider);
+    const { models, live } = await this.#pickableModels(provider);
     return { type: "models.list.result", requestId: msg.id, models, live, provider };
   }
 
@@ -9886,21 +9891,34 @@ mcpHub: this.#mcpHub,
     // (`opus` → "Opus"), or a full claude-* id. An unknown value is rejected
     // here with the set of valid choices, so `/model o` gets actionable
     // feedback.
-    const { models } = this.#currentModels(session.providerId);
-    const resolvedModel = resolveAgainstList(msg.model, models);
+    const { models } = await this.#pickableModels(session.providerId);
+    // An endpoint's server is the validator for an id it isn't configured with
+    // (the picker's "custom model id"); a Claude-shaped id is still refused there.
+    const onEndpoint = endpointNameOf(session.providerId) !== null;
+    // resolveAgainstList passes any full claude-* id through (Claude's catalog lags its releases), so on an
+    // endpoint a Claude-shaped id is refused first.
+    const resolve = (id: string) =>
+      onEndpoint
+        ? resolveModelIdForProvider(id, session.providerId) === null
+          ? null
+          : (resolveAgainstList(id, models) ?? resolveModelIdForProvider(id, session.providerId))
+        : resolveAgainstList(id, models);
+    const resolvedModel = resolve(msg.model);
     if (!resolvedModel) {
+      const listed = models.map((m) => m.value).join(", ");
       return {
         type: "response.error",
         requestId: msg.id,
-        error: `Unknown model "${msg.model}". Available: ${models
-          .map((m) => m.value)
-          .join(", ")}`,
+        // On an endpoint only a Claude-shaped id is refused: say so, rather than an empty "Available:".
+        error: onEndpoint
+          ? `"${msg.model}" is a Claude model, not one this endpoint serves. ${listed ? `Configured: ${listed}. ` : ""}Any other model id is passed to the server.`
+          : `Unknown model "${msg.model}". Available: ${listed}`,
         code: "invalid_request",
       };
     }
     let resolvedFallback = msg.fallbackModel;
     if (typeof msg.fallbackModel === "string") {
-      const rf = resolveAgainstList(msg.fallbackModel, models);
+      const rf = resolve(msg.fallbackModel);
       if (!rf) {
         return {
           type: "response.error",

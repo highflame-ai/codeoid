@@ -256,6 +256,11 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Switching models on an OpenAI-compatible endpoint (`oai:…`) works.**
+  The model dropdown listed the endpoint's models, but the switch checked the pick against a list that is always empty for endpoints, so every pick failed with "Available: " and nothing after it, and the session stayed on its default model. Both now read the same list. A model id the endpoint isn't configured with (the dropdown's custom id) is passed to the server, which judges it; a Claude model id is refused there, saying why.
+- **A session's replies name the backend they come from.**
+  Every session was labelled "(Claude)" whatever its backend; it now reads "(Codex)", "(Qwen Code)", the endpoint's name, and so on, and follows a backend switch. Claude sessions read as before.
+
 - **A monorepo package session can't plant its package's Claude settings, and going back a turn never follows a working directory swapped for a link** (#448).
   The working directory and every directory between it and the repository's top can't be moved aside from inside the sandbox any more, nor can a repository inside an added directory or any directory holding a path the sandbox keeps read-only. Before, a sandboxed command could move `packages/app` aside and make it again around a planted `.claude/settings.json`, whose hook a later Claude start there would run on the host. The working directory is pinned by its identity too, and the daemon's own work in it (the snapshots at each turn, going back a turn, a fork from a turn and its setup, a client's file read, the project's MCP config, the end-of-turn git looks) checks it before and after and refuses, says and audits a change; before, a working directory swapped for a link to the home had the home snapshotted, and going back a turn wrote and deleted files there.
   Every path a sandbox binds is pinned and bound as it was, never resolved again at a launch: before, a directory another session swapped for a link (one this session holds in place, or keeps read-only) was bound where the link led at this session's next command, writable, the daemon's private dir with every session's launchers included. An agent's own added directory is let go once another session works in it. See [docs/sandbox.md](docs/sandbox.md#pinned-paths).
