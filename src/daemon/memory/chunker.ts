@@ -93,8 +93,7 @@ export class EpisodeChunker {
   /** Tool calls awaiting their result, by message id: a turn can run several at once. */
   #openToolCalls = new Map<string, OpenToolCall>();
   #lastAssistantBy: string | null = null;
-  /** A call was opened since the last prompt: text now is reasoning for the next call, or the turn's answer. */
-  #callsThisTurn = false;
+  #lastAssistantAt: string | null = null;
 
   constructor(ctx: ChunkerContext, onEpisode: (ep: Omit<Episode, "id">) => void) {
     this.#ctx = ctx;
@@ -110,22 +109,14 @@ export class EpisodeChunker {
         this.#flushReply();
         this.#pendingUserPrompt = msg.content;
         this.#pendingAssistantText = [];
-        this.#callsThisTurn = false;
         break;
 
       case "assistant":
-        if (this.#callsThisTurn) {
-          // Text in a turn that has made calls: reasoning for the next call, or, if none follows,
-          // the turn's answer (emitted with the prompt at the turn's end). A call still open from an
-          // earlier turn (background work) doesn't make this turn's reply reasoning.
-          this.#pendingAssistantText.push(msg.content);
-          this.#lastAssistantBy = msg.identity.sub;
-        } else {
-          // Plain assistant turn with no tool use — emit user+assistant combined.
-          this.#emitTurnEpisode(msg.content, msg.timestamp, msg.identity.sub);
-          this.#pendingUserPrompt = null;
-          this.#pendingAssistantText = [];
-        }
+        // Held until it is known what it is: reasoning for the call that follows it (a call opens
+        // with it), or the turn's answer, stored with the prompt when the turn ends (#flushReply).
+        this.#pendingAssistantText.push(msg.content);
+        this.#lastAssistantBy = msg.identity.sub;
+        this.#lastAssistantAt = msg.timestamp;
         break;
 
       case "tool_call": {
@@ -136,13 +127,12 @@ export class EpisodeChunker {
           if (this.#openToolCalls.has(msg.messageId)) break;
           const input =
             "input" in msg.tool.state ? (msg.tool.state.input as unknown) : {};
-          this.#callsThisTurn = true;
           this.#openToolCalls.set(msg.messageId, {
             messageId: msg.messageId,
             toolName: msg.tool.name,
             input,
             filePaths: extractFilePaths(msg.tool.name, input),
-            startedAt: Date.parse(msg.timestamp),
+            startedAt: Date.parse(msg.timestamp) || Date.now(),
             createdBy: msg.identity.sub,
             facts: this.#ctx.turnFacts?.() ?? {},
             userPrompt: this.#pendingUserPrompt,
@@ -153,7 +143,13 @@ export class EpisodeChunker {
           if (this.#openToolCalls.has(msg.messageId)) {
             const state = msg.tool.state as { output?: unknown; message?: unknown };
             const output = phase === "completed" ? state.output : state.message;
-            this.#emitOpenToolCall(msg.messageId, typeof output === "string" ? output : "", msg.timestamp, msg.identity.sub);
+            const reason = (msg.tool.state as { reason?: unknown }).reason;
+            this.#emitOpenToolCall(
+              msg.messageId,
+              typeof output === "string" && output ? output : phase === "cancelled" ? (reason === "interrupted" ? "interrupted" : "cancelled") : "",
+              msg.timestamp,
+              msg.identity.sub,
+            );
           }
         }
         break;
@@ -192,18 +188,30 @@ export class EpisodeChunker {
     // closing with its result. Bounded: past an hour, or past 64 open, the oldest close unfinished.
     const now = Date.now();
     for (const [id, tc] of [...this.#openToolCalls]) {
-      if (now - tc.startedAt > 3_600_000 || this.#openToolCalls.size > 64) this.#emitOpenToolCall(id, "unfinished", new Date().toISOString(), tc.createdBy);
+      if (!(now - tc.startedAt <= 3_600_000) || this.#openToolCalls.size > 64) this.#emitOpenToolCall(id, "unfinished", new Date().toISOString(), tc.createdBy);
     }
     this.#flushReply();
     this.#closeStandaloneAssistantTurnIfAny();
   }
 
-  /** A turn's answer that came after its calls: one episode, with its prompt. */
+  /**
+   * The turn's answer: the text no call took as its reasoning, one episode with the prompt it
+   * answers. The prompt stays for the rest of the turn (a turn can end and go on: a mid-turn
+   * boundary), until the next prompt.
+   */
   #flushReply(): void {
     if (this.#pendingAssistantText.length === 0) return;
-    this.#emitTurnEpisode(this.#pendingAssistantText.join("\n\n"), new Date().toISOString(), this.#lastAssistantBy ?? this.#ctx.createdBy);
+    this.#emitTurnEpisode(this.#pendingAssistantText.join("\n\n"), this.#lastAssistantAt ?? new Date().toISOString(), this.#lastAssistantBy ?? this.#ctx.createdBy);
     this.#pendingAssistantText = [];
-    this.#pendingUserPrompt = null;
+  }
+
+  /**
+   * The session is ending (destroyed, the daemon stopping): every call still open is stored as
+   * unfinished, and what the turn said is stored, so nothing it did is lost.
+   */
+  flushAll(): void {
+    for (const [id, tc] of [...this.#openToolCalls]) this.#emitOpenToolCall(id, "unfinished", new Date().toISOString(), tc.createdBy);
+    this.#flushReply();
   }
 
   // ── Episode emission ──────────────────────────────────────────────────

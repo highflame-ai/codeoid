@@ -393,6 +393,13 @@ const MAX_LINES = 2000;
 export function formatEpisodeLines(ep: Episode, currentSessionId: string, ranges: Array<[number, number]>): string {
   const lines = ep.content.split("\n");
   const total = lines.length;
+  /** Where each line starts, as a character offset: what a cut line says to read it from. */
+  const starts: number[] = [];
+  for (let i = 0, at = 0; i < total; i++) {
+    starts.push(at);
+    at += lines[i]!.length + 1;
+  }
+  const shownRanges: Array<[number, number]> = [];
   const at = (n: number) => (n < 0 ? total + n + 1 : n);
   const spans = ranges
     .map(([a, b]) => [Math.max(1, Math.min(total, at(a))), Math.max(1, Math.min(total, at(b)))] as [number, number])
@@ -420,8 +427,14 @@ export function formatEpisodeLines(ep: Episode, currentSessionId: string, ranges
       }
       let line = lines[n - 1] ?? "";
       // One very long line (minified JSON, a one-line log) is cut, and says so.
-      if (chars + line.length > GET_EPISODE_MAX_PAGE) line = `${line.slice(0, Math.max(0, GET_EPISODE_MAX_PAGE - chars))}…[line cut: read it with offset]`;
+      if (chars + line.length > GET_EPISODE_MAX_PAGE) {
+        const keep = Math.max(0, GET_EPISODE_MAX_PAGE - chars);
+        line = `${line.slice(0, keep)}…[line cut: the rest with get_episode offset ${starts[n - 1]! + keep}]`;
+      }
       body.push(`${String(n).padStart(width)}  ${line}`);
+      const last = shownRanges[shownRanges.length - 1];
+      if (last && last[1] === n - 1) last[1] = n;
+      else shownRanges.push([n, n]);
       chars += line.length;
       shown++;
     }
@@ -435,7 +448,7 @@ export function formatEpisodeLines(ep: Episode, currentSessionId: string, ranges
     `- kind: ${ep.kind}${ep.toolName ? ` (${ep.toolName})` : ""}`,
     ...factLine(ep),
     `- episode_id: ${ep.id}`,
-    `- lines: ${merged.map(([a, b]) => `${a}–${b}`).join(", ")} of ${total} (${ep.content.length} chars)`,
+    `- lines: ${shownRanges.map(([a, b]) => `${a}–${b}`).join(", ") || "none"} of ${total} (${ep.content.length} chars)`,
     "",
     ...body,
   ].join("\n");

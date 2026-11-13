@@ -240,7 +240,7 @@ PreToolUse rewrite, the tool loops codeoid runs, opencode's shell shim), so it c
 - **On shell episodes:** exit code (from the backend when it reports one: Codex, opencode, the tool
   loops codeoid runs; else the `Exit code N` line Claude's Bash result carries; null when unknown),
   working directory (the `shellCwd` the gate already has), and duration (`tool_start` to
-  `tool_complete`).
+  `tool_complete`). Unknown is null; a failure with no code is -1.
 - **On every episode:** backend, model, and the turn's origin (`user`, `delegated`, `agent` from
   `turn-origin.ts` — `agent` also for background work outside a turn — and `dispatch` for a
   dispatched worker, loop attempts included), as they were when the call opened.
@@ -265,24 +265,39 @@ Old episodes keep null for the new fields; nothing is backfilled.
 - A completed tool call had not reached memory since its completion moved to its own write path
   (the chunker saw only its start, and stored it as "unfinished" when the next call began; the
   reply after a call never became an episode). The tool_complete seam now hands the completed
-  message to the chunker, which tracks every open call by its message id (parallel calls), closes
-  a denied one when it is refused, and at the turn's end closes what never got a result and keeps
-  the reply that came while a call ran.
-- Facts: `Session#toolFacts` records a shell call's cwd (the backend's `shellCwd`, else the
-  workdir) and when it started running (at tool_start when it runs unasked, else at its
-  approval); at completion its duration and exit code (`memory/facts.ts` `exitCodeOf`: the code a
-  result names near its start or end, else 0 when the backend says it succeeded). Every episode
-  takes the session's backend, model and the turn's origin (`turnOrigin`, `dispatch` for a
-  worker). Columns `exit_code`, `cwd`, `duration_ms`, `backend`, `model`, `origin` on `episodes`.
+  message to the chunker, which tracks every open call by its message id (parallel calls) and
+  closes a refused one when it is refused.
+- Text is held until it is known what it is: the reasoning of the call that opens after it, or
+  the turn's answer, stored with its prompt when the turn ends (or the next prompt comes). The
+  prompt goes with every call of its turn. A call still running when its turn ends (background
+  work) stays open until its result comes, bounded (an hour, 64 open); when the session is
+  destroyed or the daemon stops (`Session.flushMemory`), every open call is stored as
+  unfinished. An interrupted call says so.
+- Facts: `Session#toolFacts` records a shell call's directory (the backend's `shellCwd`, else the
+  `cwd` its input names, joined to the workdir, else the workdir) and when it started running (at
+  tool_start when it runs unasked, else at its approval); at completion its duration (the
+  backend's, Codex's `durationMs`, else measured) and exit code (`memory/facts.ts` `exitCodeOf`:
+  the backend's field (Codex, opencode); else 0 when the backend says it succeeded, whatever its
+  output prints; else the code its result names (Claude's `Exit code N`, pi's `Command exited
+  with code N`), never 0 for a failure; else -1, failed with no code, shown as "failed"). Every
+  episode takes the backend, the model (the session's, else the backend's `runningModel`; none
+  for Claude's default) and the turn's origin, and a call its workstream, as they were when it
+  opened. Columns `exit_code`, `cwd`, `duration_ms`, `backend`, `model`, `origin` on `episodes`.
 - Recall: `RecallQuery.onlyFailed` / `backend` / `origin` / `cwd`, applied in `matchesQuery`; a
-  query with one also takes `recentMatching` (the newest 200 by the columns) as candidates.
-  `exactQueryText` (quoted, or a token with a path, flag, dot or `CONST`, or words with a flag)
-  takes `containing` (an FTS phrase search, then checked) first, marked `exact`.
+  query with one also takes `recentMatching` (the newest 200 by the columns, scoped in SQL) as
+  candidates. `exactQueryText` (quoted; or a path, a file name, a flag, an assignment, a
+  snake_case or camelCase identifier; or a command with a flag that isn't a question) takes
+  `containing` (an FTS phrase search, scoped in SQL, then checked; over the indexed view of a huge
+  output, so a command deep in a long log isn't an exact match) first, marked `exact`.
+  `fleet_recall`'s filters apply to a larger text search (it has no fact channel of its own).
 - Tools: the recall tool's new arguments, a `facts:` line per hit, a divider after the exact ones,
   "Try loosening: …" when filters leave nothing; `get_episode` `lines` (1-based, negative from
-  the end, merged, `[… N lines skipped …]`, at most 2,000 lines); `MEMORY_INSTRUCTIONS` as the
-  memory MCP server's `instructions`, and two lines more in the sessions' memory prompt;
-  `fleet_recall` `only_failed` / `backend` / `origin`.
+  the end, merged, `[… N lines skipped …]`, at most 2,000 lines and the page size, a cut line
+  saying the offset to read it from); `MEMORY_INSTRUCTIONS` as the memory MCP server's
+  `instructions`, and two lines more in the sessions' memory prompt.
+- A raw output a spill brings back is scrubbed by the session (its tenant) before it is stored,
+  and taken away when a `tool_result` hook changed what the agent saw. Its exit code is read from
+  what the agent saw (a compressed output may have lost the line).
 
 ## 4. S3 — saved approvals
 

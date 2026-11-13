@@ -1297,12 +1297,14 @@ export class CodexProvider implements SessionProvider {
           }
           const output = extractItemOutput(item);
           const exitCode = typeof item.exitCode === "number" ? item.exitCode : typeof (item as { exit_code?: unknown }).exit_code === "number" ? (item as { exit_code: number }).exit_code : undefined;
+          const durationMs = typeof (item as { durationMs?: unknown }).durationMs === "number" ? (item as { durationMs: number }).durationMs : undefined;
           this.#push({
             type: "tool_complete",
             sdkToolUseId: itemId,
             output: output || (status === "declined" ? "Declined — not run." : output),
             success: status === "completed",
             ...(exitCode !== undefined ? { exitCode } : {}),
+            ...(durationMs !== undefined ? { durationMs } : {}),
           });
           this.#announcedItems.delete(itemId);
         }
@@ -1694,7 +1696,8 @@ function codexItemToTool(
   item: Record<string, unknown>,
 ): { name: string; input: Record<string, unknown> } {
   if (itemType === "commandExecution") {
-    return { name: "Bash", input: { command: String(item.command ?? "") } };
+    // Where it runs, as codex reports it: the gate's risk and memory read it (shellCallOf's `cwd`).
+    return { name: "Bash", input: { command: String(item.command ?? ""), ...(typeof item.cwd === "string" && item.cwd ? { cwd: item.cwd } : {}) } };
   }
   if (itemType === "fileChange") {
     return { name: "codex_file_change", input: { changes: item.changes ?? item.patch ?? null } };

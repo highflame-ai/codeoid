@@ -77,6 +77,7 @@ describe("chunker", () => {
     c.onTurnEnd();
     c.onMessage(user("m2", "what is 2+2"));
     c.onMessage(assistant("m3", "4"));
+    c.onTurnEnd();
     expect(out.find((e) => e.content.includes("what is 2+2"))?.content).toContain("4");
   });
 
@@ -96,6 +97,49 @@ describe("chunker", () => {
     const answer = out.find((e) => e.kind === "user_turn");
     expect(answer?.content).toContain("fix the tests");
     expect(answer?.content).toContain("Fixed it.");
+  });
+
+  test("text before the first call is its reasoning, and the prompt goes with the call and the answer", () => {
+    const out: Array<Omit<Episode, "id">> = [];
+    const c = new EpisodeChunker({ workspaceId: "w", sessionId: "s", createdBy: "u" }, (ep) => out.push(ep));
+    c.onMessage(user("m1", "run the tests"));
+    c.onMessage(assistant("m2", "Let me run the tests."));
+    c.onMessage(tool("t1", "Bash", { phase: "executing", input: { command: "npm test" } }, { command: "npm test" }));
+    c.onMessage(tool("t1", "Bash", { phase: "completed", success: false, output: "1 failed" }));
+    c.onMessage(assistant("m3", "One fails."));
+    c.onTurnEnd();
+    const call = out.find((e) => e.kind === "tool_call")!;
+    expect(call.content).toContain("# User intent\nrun the tests");
+    expect(call.content).toContain("Let me run the tests.");
+    const answer = out.find((e) => e.kind === "user_turn")!;
+    expect(answer.content).toContain("run the tests");
+    expect(answer.content).toContain("One fails.");
+    expect(answer.content).not.toContain("Let me run the tests.");
+  });
+
+  test("a plain turn is one episode, prompt and answer", () => {
+    const out: Array<Omit<Episode, "id">> = [];
+    const c = new EpisodeChunker({ workspaceId: "w", sessionId: "s", createdBy: "u" }, (ep) => out.push(ep));
+    c.onMessage(user("m1", "what is 2+2"));
+    c.onMessage(assistant("m2", "4"));
+    c.onTurnEnd();
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ kind: "user_turn" });
+    expect(out[0]!.content).toContain("what is 2+2");
+  });
+
+  test("at the session's end every open call is stored as unfinished; an interrupted one says so", () => {
+    const out: Array<Omit<Episode, "id">> = [];
+    const c = new EpisodeChunker({ workspaceId: "w", sessionId: "s", createdBy: "u" }, (ep) => out.push(ep));
+    c.onMessage(user("m1", "go"));
+    c.onMessage(tool("t1", "Bash", { phase: "executing", input: { command: "serve" } }, { command: "serve" }));
+    c.onMessage(tool("t2", "Bash", { phase: "executing", input: { command: "watch" } }, { command: "watch" }));
+    c.onMessage(tool("t2", "Bash", { phase: "cancelled", reason: "interrupted" }));
+    c.onTurnEnd();
+    c.flushAll();
+    const calls = out.filter((e) => e.kind === "tool_call");
+    expect(calls.find((e) => e.summary.includes("watch"))?.content).toContain("## Result\ninterrupted");
+    expect(calls.find((e) => e.summary.includes("serve"))?.content).toContain("## Result\nunfinished");
   });
 
   test("a call's origin and workstream are as they were when it opened", () => {
@@ -221,7 +265,7 @@ describe("get_episode lines", () => {
     const big = { ...ep, content: `${"x".repeat(300_000)}\nend` };
     const out = formatEpisodeLines(big, "s", [[1, -1]]);
     expect(out.length).toBeLessThan(270_000);
-    expect(out).toContain("[line cut: read it with offset]");
+    expect(out).toContain("…[line cut: the rest with get_episode offset");
   });
 
   test("ranges merged and in order", () => {

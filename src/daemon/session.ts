@@ -6672,10 +6672,21 @@ export class Session {
     });
   }
 
+  /** Store what memory still holds open: calls with no result yet (as unfinished), the turn's last words. */
+  flushMemory(): void {
+    try {
+      this.#chunker?.flushAll();
+    } catch (err) {
+      console.error(`[codeoid/memory] flush failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    this.#toolFacts.clear();
+  }
+
   async destroy(sender: AuthContext, opts: { deleteBranch?: boolean } = {}): Promise<void> {
     // Said to whoever is attached (and audited) before the session goes;
     // the commit look's git is bounded, and a destroy waits no longer.
     await Promise.race([this.#checkGitControl(sender.sub), new Promise<void>((r) => setTimeout(r, DESTROY_COMMIT_CHECK_MS).unref?.())]);
+    this.flushMemory();
     this.#destroyed = true;
     this.#unscopeMemory?.();
     // This session's own servers' clients in the hub: let go (the last user closes them).
@@ -10871,7 +10882,8 @@ export class Session {
             // Memory closes the call's episode with its result and facts (it had only its start).
             const facts = this.#toolFacts.get(msgId);
             if (facts) {
-              if (facts.startedAt !== undefined) facts.durationMs = Date.now() - facts.startedAt;
+              if (event.durationMs !== undefined) facts.durationMs = event.durationMs;
+              else if (facts.startedAt !== undefined) facts.durationMs = Date.now() - facts.startedAt;
               if (facts.shell && typeof event.output === "string") {
                 const code = exitCodeOf(event.output, event.success, event.exitCode);
                 if (code !== undefined) facts.exitCode = code;
@@ -11368,8 +11380,12 @@ export class Session {
       this.#transcriptStore.append(this.id, sm, this.#seq++).catch(() => {});
       // Feed the chunker so the episode closes even when we never saw a tool_result.
       this.#chunker?.onMessage(sm);
-      this.#toolFacts.delete(msgId);
+    } else {
+      // Gone from scrollback (evicted): memory still closes the call, from the live copy.
+      const live = this.#toolCallMessages.get(msgId);
+      if (live?.tool) this.#chunker?.onMessage({ ...live, tool: { ...live.tool, state: cancelledState } });
     }
+    this.#toolFacts.delete(msgId);
 
     this.#broadcastRaw({
       type: "session.message.delta",

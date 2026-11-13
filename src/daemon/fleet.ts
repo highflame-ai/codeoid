@@ -339,7 +339,7 @@ export function createFleetHandlers(deps: FleetDeps) {
       const lines = hits.map((h) => {
         const e = h.episode;
         const name = sessionNames.get(e.sessionId) ?? e.sessionId.slice(0, 8);
-        const f = [e.exitCode !== undefined && e.exitCode !== 0 ? `exit ${e.exitCode}` : "", e.backend ?? "", e.origin && e.origin !== "user" ? e.origin : ""].filter(Boolean).join(", ");
+        const f = [e.exitCode === -1 ? "failed" : e.exitCode !== undefined && e.exitCode !== 0 ? `exit ${e.exitCode}` : "", e.backend ?? "", e.origin && e.origin !== "user" ? e.origin : ""].filter(Boolean).join(", ");
         return `- [${name}${e.workstreamId ? ` · ${e.workstreamId}` : ""}] ${e.kind}${e.toolName ? `/${e.toolName}` : ""}: ${e.summary}${f ? ` (${f})` : ""}`;
       });
       return `Recalled ${hits.length} episode(s) across the fleet:\n${lines.join("\n")}${note}`;
