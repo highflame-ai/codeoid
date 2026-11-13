@@ -497,3 +497,12 @@ describe("verification pass", () => {
     expect(toolVerdict("Bash", { command }, { cwd: "/w" })).toBe("withhold-output");
   });
 });
+
+describe("real transcripts", () => {
+  test("a command's quoted pattern isn't a value", () => {
+    expect(kinds("CK=$(grep -E '^CLERK_SECRET_KEY=' config/.env | cut -d= -f2-)")).toEqual([]);
+    expect(kinds("export CLERK_SECRET_KEY='$(op read x) ; echo'")).toEqual([]);
+    // A quoted password with a space is still one.
+    expect(kinds('DB_PASSWORD="correct horse 9"')).toEqual(["credential:correct horse 9"]);
+  });
+});
