@@ -26,7 +26,7 @@
 import { afterAll, afterEach, beforeAll, describe, it, expect } from "bun:test";
 import { Bot } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
-import { TelegramFrontend } from "../frontends/telegram/index.js";
+import { CALL_SHOWN, TelegramFrontend } from "../frontends/telegram/index.js";
 import { ZeroIdVerifier } from "../daemon/auth.js";
 import type { FrontendContext } from "../frontends/types.js";
 import type { AttachedClient } from "../daemon/session.js";
@@ -542,6 +542,36 @@ describe("Telegram flows — attach, streaming turn, idle", () => {
       ),
     );
     expect(calls.some((c) => c.method === "answerCallbackQuery")).toBe(true);
+  });
+
+  it("an approval shows the call it asks about, not only its description, and says when it is cut", async () => {
+    const { drive, manager, texts } = await boot();
+    await drive("/attach alpha");
+    await until(() => texts().some((t) => t.startsWith("Attached to")));
+    const client = manager.attachClients.get("sess-a")!;
+    client.send(
+      toolCallMsg("sess-a", "tc-call-1", "Bash", {
+        phase: "waiting_confirmation",
+        input: { command: "git push --force origin main" },
+        description: "Bash(command)",
+        approvalId: "call0001-rest",
+      }),
+    );
+    client.send(
+      toolCallMsg("sess-a", "tc-call-2", "Write", {
+        phase: "waiting_confirmation",
+        input: { file_path: "/w/a.ts", content: `${"x".repeat(CALL_SHOWN)}TAIL` },
+        description: "Write(file_path, content)",
+        approvalId: "call0002-rest",
+      }),
+    );
+    await until(() => texts().filter((t) => t.startsWith("⚠️ Permission needed")).length >= 2);
+    const [bash, write] = texts().filter((t) => t.startsWith("⚠️ Permission needed"));
+    expect(bash).toContain("git push --force origin main");
+    expect(write).toContain("/w/a.ts");
+    expect(write).not.toContain("TAIL");
+    expect(write).toContain(`cut short at ${CALL_SHOWN} of ${CALL_SHOWN + 4} characters`);
+    expect(write!.length).toBeLessThan(4096);
   });
 });
 

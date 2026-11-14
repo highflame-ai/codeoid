@@ -41,6 +41,7 @@ import type {
 } from "../../protocol/types.js";
 import { CAPABILITIES, EFFORT_LEVELS, type EffortChangeResult, type EffortLevel } from "../../protocol/types.js";
 import type { AttachedClient } from "../../daemon/session.js";
+import { callParts, cutNote } from "../call.js";
 import {
   StreamRelay,
   escCode,
@@ -48,6 +49,19 @@ import {
   formatSessionLine,
   type RelayApi,
 } from "./stream.js";
+
+/**
+ * Most characters of a call a card shows. A Telegram message holds 4096; this
+ * leaves room for the description (cut at 800) and the other lines.
+ */
+export const CALL_SHOWN = 2_400;
+
+/** What a tool call would do (see callParts), as plain text, cut only with a note saying so. */
+export function callText(input: unknown): string {
+  const { head, body } = callParts(input);
+  const cut = body.length > CALL_SHOWN;
+  return `${head ? `${head}\n` : ""}${cut ? body.slice(0, CALL_SHOWN) : body}${cut ? `\n${cutNote(CALL_SHOWN, body.length)}` : ""}`;
+}
 
 /** One AskUserQuestion question as it arrives in the tool input. */
 interface AskQuestion {
@@ -1351,13 +1365,15 @@ export class TelegramFrontend implements Frontend {
     // Whether it runs in the session's OS sandbox (#448), as every surface says it.
     const sandboxText = tool.state.phase === "waiting_confirmation" ? approvalSandboxLine(tool.state) : null;
     const sandbox = sandboxText ? `\n${sandboxText}` : "";
+    // What runs, from its input: the description only names the tool and its arguments.
+    const call = callText(tool.state.input);
     const kb = new InlineKeyboard()
       .text("✅ Approve", `a:${short}:y`)
       .text("❌ Deny", `a:${short}:n`);
     this.#bot.api
       .sendMessage(
         chatId,
-        `⚠️ Permission needed — ${tool.name}\n${String(desc).slice(0, 800)}${workstream}${risk}${sandbox}${cost}`,
+        `⚠️ Permission needed — ${tool.name}\n${String(desc).slice(0, 800)}\n\n${call}${workstream}${risk}${sandbox}${cost}`,
         { reply_markup: kb } as Record<string, unknown>,
       )
       .catch(() => {});
