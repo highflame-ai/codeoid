@@ -223,6 +223,7 @@ import { type CodeoidConfig, getConfigDir } from "../config.js";
 import { type SecretPathVerdict, secretPathVerdict } from "./secret-paths.js";
 import type { CompressionRegistry } from "./compress/index.js";
 import { defaultSpillDir, takeSpill } from "./compress/spill.js";
+import { exitCodeOf } from "./memory/facts.js";
 import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
 import { type HeldPath, heldWriteOf, heldWriteReason, writeLandings, writeTargets } from "./held-writes.js";
 import { outsideEffects } from "./risk/effects.js";
@@ -270,7 +271,8 @@ const MEMORY_SYSTEM_PROMPT_APPEND = [
   "- Before reading a file, call recall_file(path) — if it was read recently and hasn't changed, reuse that content instead of issuing a fresh Read.",
   "- When the user references earlier work ('what we did yesterday', 'the bug we hit', 'that auth flow'), call recall(query) first. Don't guess from your own session history; it may be out of date.",
   "- At the start of a new session in a known workspace, consider calling timeline() to orient yourself on recent activity.",
-  "- recall and timeline results each carry an episode_id; pass it to get_episode(episode_id) to fetch that turn's exact stored bytes verbatim, with nothing summarized or dropped.",
+  "- recall and timeline results each carry an episode_id; pass it to get_episode(episode_id) to fetch that turn's exact stored bytes verbatim, with nothing summarized or dropped. For a long tool output, pass lines: [[-80, -1]] first: the end is where an error is.",
+  "- Before re-running a command to find out what failed, or what fixed it last time, call recall(query, only_failed: true): each tool call is stored with its full output, exit code and directory. Quote an exact command, path or identifier to get the episodes holding it first.",
   "",
   "Memory stores every tool call and assistant reply across all past sessions in this directory verbatim. It is the source of truth for history — the transcript in your context may be partial or truncated, so when a detail matters, page it in with these tools rather than relying on what you can see.",
 ].join("\n");
@@ -1475,6 +1477,8 @@ export class Session {
   /** The reply and the reasoning streaming now, scrubbed as they arrive (a secret split across deltas is never sent). */
   #textStream: StreamScrubber | null = null;
   #thinkingStream: StreamScrubber | null = null;
+  /** What memory keeps of each running tool call, by its message id (memory/chunker.ts toolFacts). */
+  #toolFacts = new Map<string, { shell: boolean; cwd?: string; startedAt?: number; durationMs?: number; exitCode?: number }>();
   /** Each running tool call's verdict (secrets/verdict.ts), by the backend's tool-use id. */
   #toolVerdicts = new Map<string, ToolVerdict>();
   #workerShape?: "ship" | "scout";
@@ -2143,6 +2147,18 @@ export class Session {
           sessionId: this.id,
           createdBy: opts.auth.sub,
           spillDir: defaultSpillDir(),
+          // paths: `cwd` here is a recorded fact about a tool call, never opened or run in.
+          toolFacts: (messageId) => {
+            const f = this.#toolFacts.get(messageId);
+            return f ? { ...(f.cwd ? { cwd: f.cwd } : {}), ...(f.exitCode !== undefined ? { exitCode: f.exitCode } : {}), ...(f.durationMs !== undefined ? { durationMs: f.durationMs } : {}) } : undefined;
+          },
+          turnFacts: () => ({
+            backend: this.#provider.id,
+            // The model the backend runs (its default when none was chosen).
+            ...((this.#model ?? this.#provider.runningModel) ? { model: (this.#model ?? this.#provider.runningModel)! } : {}),
+            origin: this.role === "worker" ? "dispatch" : this.#turnActive() ? this.#lastTurnOrigin : "agent",
+            ...(this.#workstream?.id ? { workstream: this.#workstream.id } : {}),
+          }),
         },
         (episode) => {
           try {
@@ -2150,8 +2166,13 @@ export class Session {
             // succeeds the workspace is invisible to cross-workspace search.
             if (!this.#workspaceRegistered) this.#registerWorkspace();
             // Tagged with the home as it is now (workstreams §6.4): a session moved since writes into its new one.
-            const home = this.#workstream?.id;
-            memory.ingest(home ? { ...episode, workstreamId: home } : episode);
+            // The workstream the call ran in (taken when it opened), else the home as it is now: a
+            // session moved since writes into its new one.
+            const home = episode.workstreamId ?? this.#workstream?.id;
+            // Scrubbed as the session scrubs (its tenant's remembered values, its vault), the raw
+            // output a spill brought back included; memory scrubs again at ingest.
+            const scrubbed = this.#secrets ? { ...episode, summary: this.#scrubText(episode.summary), content: this.#scrubText(episode.content) } : episode;
+            memory.ingest(home ? { ...scrubbed, workstreamId: home } : scrubbed);
             scheduler.onEpisode();
           } catch (err) {
             console.error(
@@ -6074,6 +6095,9 @@ export class Session {
       run.endTurn?.();
       return;
     }
+    // A turn the backend began itself (a background wake): no prompt of the user's, so memory
+    // doesn't carry the last one into it.
+    this.#chunker?.onAdoptedTurn();
     const systemAuth: AuthContext = {
       sub: "system:background",
       scopes: [],
@@ -6654,6 +6678,16 @@ export class Session {
     });
   }
 
+  /** Store what memory still holds open: calls with no result yet (as unfinished), the turn's last words. */
+  flushMemory(): void {
+    try {
+      this.#chunker?.flushAll();
+    } catch (err) {
+      console.error(`[codeoid/memory] flush failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    this.#toolFacts.clear();
+  }
+
   async destroy(sender: AuthContext, opts: { deleteBranch?: boolean } = {}): Promise<void> {
     // Said to whoever is attached (and audited) before the session goes;
     // the commit look's git is bounded, and a destroy waits no longer.
@@ -6682,6 +6716,8 @@ export class Session {
     // Tear down the streamInput loop cleanly before wiping storage so we
     // don't leave a zombie SDK subprocess alive holding the transcript file.
     await this.#teardownProvider();
+    // After the teardown has settled what was running (interrupted): every call still open is stored.
+    this.flushMemory();
     await this.#sandbox?.close();
     // What its backends kept across starts (their conversations, #448): gone with it.
     this.#sandbox?.removeState();
@@ -10080,6 +10116,13 @@ export class Session {
       toolMsg.tool.state = resolvedState;
       const resolvedMsg: SessionMessage = { ...toolMsg, tool: { ...toolMsg.tool, state: resolvedState }, timestamp: new Date().toISOString() };
       this.#transcriptStore.append(this.id, resolvedMsg, this.#seq++).catch(() => {});
+      // It runs from now (approved), or never (refused: its episode closes now).
+      const facts = this.#toolFacts.get(msgId);
+      if (facts && (resolvedState as { phase?: string }).phase === "executing") facts.startedAt = Date.now();
+      if ((resolvedState as { phase?: string }).phase === "cancelled") {
+        this.#chunker?.onMessage(resolvedMsg);
+        this.#toolFacts.delete(msgId);
+      }
       this.#broadcastRaw({
         type: "session.message.delta",
         sessionId: this.id,
@@ -10728,6 +10771,18 @@ export class Session {
         );
         this.#activeToolMsgIds.push(toolMsg.messageId);
         this.#toolCallMessages.set(toolMsg.messageId, toolMsg);
+        // What memory keeps of it (docs/secrets-and-memory-design.md §3): where a shell call runs, and from when.
+        {
+          const call = shellCallOf(event.name, event.input);
+          const shell = call !== null;
+          this.#toolFacts.set(toolMsg.messageId, {
+            shell,
+            // Where it runs: the backend's report, else the directory its input names (Codex's `cwd`), else the workdir.
+            // paths: recorded as a fact for memory, never opened or run in.
+            ...(shell ? { cwd: event.shellCwd ?? (call.cwd && isAbsolute(call.cwd) ? call.cwd : call.cwd ? join(this.workdir, call.cwd) : this.workdir) } : {}),
+            ...(autoApprove ? { startedAt: Date.now() } : {}),
+          });
+        }
         if (event.sdkAgentId || !this.#turnActive()) this.#backgroundToolMsgIds.add(toolMsg.messageId);
         this.#toolUseIdToMessageId.set(event.sdkToolUseId, toolMsg.messageId);
         this.#messageIdToToolUseId.set(toolMsg.messageId, event.sdkToolUseId);
@@ -10802,6 +10857,8 @@ export class Session {
         if (hooked) {
           this.#turnRedacted = true;
           this.#noteRedactedBacking(this.#provider.backingSessionId);
+          // The raw copy (the compressor's spill file) never had the hook's change: memory mustn't take it back.
+          if (typeof event.output === "string") takeSpill(event.output, defaultSpillDir());
         }
         this.#accumulator.handleEvent(output === event.output ? event : { ...event, output, ...(hooked ? { redacted: true } : {}) });
         if (msgId) {
@@ -10830,6 +10887,18 @@ export class Session {
               timestamp: new Date().toISOString(),
             };
             this.#transcriptStore.append(this.id, completedMsg, this.#seq++).catch(() => {});
+            // Memory closes the call's episode with its result and facts (it had only its start).
+            const facts = this.#toolFacts.get(msgId);
+            if (facts) {
+              if (event.durationMs !== undefined) facts.durationMs = event.durationMs;
+              else if (facts.startedAt !== undefined) facts.durationMs = Date.now() - facts.startedAt;
+              if (facts.shell && typeof event.output === "string") {
+                const code = exitCodeOf(event.output, event.success, event.exitCode);
+                if (code !== undefined) facts.exitCode = code;
+              }
+            }
+            this.#chunker?.onMessage(completedMsg);
+            this.#toolFacts.delete(msgId);
             this.#broadcastRaw({
               type: "session.message.delta",
               sessionId: this.id,
@@ -10989,6 +11058,9 @@ export class Session {
       case "turn_done": {
         this.#accumulator.handleEvent(this.#stampRedaction(event));
         this.#recordTurnFromResult(event.result);
+        // Memory stores the turn's answer now, before the session reads as idle (the turn's end
+        // runs again at the exit, harmlessly).
+        this.#chunker?.onTurnEnd();
         // No sweep here: a terminal turn_done breaks #consumeEvents, whose
         // finally reconciles sub-agents alongside tools. Sweeping here too would
         // just be a redundant pass a few statements earlier.
@@ -11319,7 +11391,12 @@ export class Session {
       this.#transcriptStore.append(this.id, sm, this.#seq++).catch(() => {});
       // Feed the chunker so the episode closes even when we never saw a tool_result.
       this.#chunker?.onMessage(sm);
+    } else {
+      // Gone from scrollback (evicted): memory still closes the call, from the live copy.
+      const live = this.#toolCallMessages.get(msgId);
+      if (live?.tool) this.#chunker?.onMessage({ ...live, tool: { ...live.tool, state: cancelledState } });
     }
+    this.#toolFacts.delete(msgId);
 
     this.#broadcastRaw({
       type: "session.message.delta",

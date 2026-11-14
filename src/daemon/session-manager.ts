@@ -4728,6 +4728,8 @@ mcpHub: this.#mcpHub,
       pollMs = Math.min(pollMs * 2, 50);
     }
     await this.#settleTurnEnds(Math.min(remaining(), TURN_END_SETTLE_MS));
+    // What memory still holds open (background calls, a turn's last words) is stored before the daemon goes.
+    for (const s of this.#sessions.values()) s.flushMemory();
     await this.#flushTranscripts(deadline);
   }
 

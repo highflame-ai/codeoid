@@ -36,12 +36,31 @@ export interface Episode {
   createdBy: string;
   /** The home workstream of the session that wrote it (workstreams §6.4); absent before workstreams, or with none. */
   workstreamId?: string;
+  /**
+   * Facts about the episode (docs/secrets-and-memory-design.md §3), absent on
+   * episodes from before them, and where the backend didn't say.
+   * A shell call's exit code, where the backend reports one or prints it.
+   */
+  exitCode?: number;
+  /** The directory a shell call ran in. */
+  cwd?: string;
+  /** How long a tool call took, tool start to result. */
+  durationMs?: number;
+  /** The backend and model that produced it. */
+  backend?: string;
+  model?: string;
+  /** Whose turn it was: the owner's, another person's, the agent's own (background work), or an unattended run. */
+  origin?: EpisodeOrigin;
 }
+
+export type EpisodeOrigin = "user" | "delegated" | "agent" | "dispatch";
 
 /** Result of a recall query. */
 export interface RecallHit {
   episode: Episode;
   score: number;
+  /** It holds the query's text exactly (a quoted query, a command, an identifier): ranked first. */
+  exact?: boolean;
   /** Sub-scores for debugging / future tuning. */
   components: {
     vector: number;
@@ -75,6 +94,14 @@ export interface RecallQuery {
    * one with none (from before workstreams) stays. Absent: no filter.
    */
   workstreams?: readonly string[];
+  /** Only calls that failed (a non-zero exit code) and error episodes (§3 of secrets-and-memory-design.md). */
+  onlyFailed?: boolean;
+  /** Only episodes a backend produced (`claude`, `codex`, …). */
+  backend?: string;
+  /** Only episodes of turns of this origin. */
+  origin?: EpisodeOrigin;
+  /** Only shell calls run in this directory or below it. */
+  cwd?: string;
 }
 
 /** File read cache entry — enables silent reuse across sessions in a workspace. */

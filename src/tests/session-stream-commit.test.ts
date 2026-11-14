@@ -420,6 +420,8 @@ describe("C6 – one commit-time assistant message → one combined episode", ()
     // streamed message, at commit time, with final content.
     chunker.onMessage(sm("user", "write me a haiku"));
     chunker.onMessage(sm("assistant", "an old silent pond"));
+    // The answer is stored when the turn ends (it could have been reasoning for a call).
+    chunker.onTurnEnd();
 
     expect(episodes).toHaveLength(1);
     expect(episodes[0]!.kind).toBe("user_turn");
@@ -457,10 +459,10 @@ describe("C6 – one commit-time assistant message → one combined episode", ()
     memStore.close();
   });
 
-  it("documents the pre-fix fragmentation: an empty stream-start assistant splits the turn", () => {
-    // This is what the session used to emit (push at stream start with empty
-    // content, push again at finalize) and why #commitStreamed must be the
-    // only chunker feed for streamed messages.
+  it("an empty stream-start push no longer splits the turn: text is held until the turn ends", () => {
+    // What the session used to emit (a push at stream start with empty content, again at
+    // finalize) split the turn into a prompt-only and a promptless episode. The chunker now
+    // holds assistant text until the turn ends, so even that sequence stores one episode.
     const episodes: Omit<Episode, "id">[] = [];
     const chunker = new EpisodeChunker(
       { workspaceId: "w1", sessionId: "s1", createdBy: TEST_AUTH.sub },
@@ -469,10 +471,11 @@ describe("C6 – one commit-time assistant message → one combined episode", ()
     chunker.onMessage(sm("user", "write me a haiku"));
     chunker.onMessage(sm("assistant", "")); // stream-start push (pre-fix)
     chunker.onMessage(sm("assistant", "an old silent pond")); // finalize push
+    chunker.onTurnEnd();
 
-    expect(episodes).toHaveLength(2);
-    expect(episodes[0]!.content).not.toContain("an old silent pond");
-    expect(episodes[1]!.kind).toBe("assistant_turn"); // promptless half-episode
+    expect(episodes).toHaveLength(1);
+    expect(episodes[0]!.kind).toBe("user_turn");
+    expect(episodes[0]!.content).toContain("an old silent pond");
   });
 });
 
