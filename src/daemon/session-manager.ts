@@ -16,6 +16,8 @@ import { OverrideTokens } from "./workstreams/override.js";
 import { withSlot } from "./mcp/oauth.js";
 import type { FolderReader } from "./workstreams/folder.js";
 import { createSecretStore, credentialEnvName, type SecretStore } from "./credentials/store.js";
+import { secretMaterialDir } from "./secrets/fingerprint.js";
+import { addDaemonKnownSources, type SecretService } from "./secrets/service.js";
 import { credentialsSchema } from "./credentials/schema.js";
 import { workstreamsSchema } from "./workstreams/schema.js";
 import { registerSecretPaths } from "./secret-paths.js";
@@ -546,6 +548,8 @@ export class SessionManager {
   #mcpRegistry?: McpRegistry;
   #mcpHub?: McpHub;
   #mcpOAuth?: McpOAuth;
+  /** Secret handling for what sessions store (docs/secrets-and-memory-design.md §2). */
+  #secretService?: SecretService;
   /** In-flight interactive backend sign-ins. Daemon-wide, and at most one per
    *  backend — two live logins would race to write the same credential. */
   readonly #backendLogin: BackendLoginBroker;
@@ -767,6 +771,8 @@ export class SessionManager {
       _testFolderReader?: FolderReader;
       /** Test-only: where credential values come from. */
       _testSecrets?: SecretStore;
+      /** Secret handling for what sessions store (docs/secrets-and-memory-design.md §2). Absent: stored as it came. */
+      secretService?: SecretService;
     },
   ) {
     this.#store = store;
@@ -787,6 +793,7 @@ export class SessionManager {
     // secrets are (secret-paths.ts).
     if (opts?.config?.credentialStore?.kind === "dir") registerSecretPaths({ dirs: [opts.config.credentialStore.path] });
     this.#sandboxRegistry = opts?.sandboxRegistry;
+    this.#secretService = opts?.secretService;
     if (opts?.config?.worktree?.setup) this.#worktreeSetupPolicy = opts.config.worktree.setup;
     this.#compressionRegistry = opts?.compressionRegistry;
     this.#endpoints = opts?.endpoints ?? new EndpointStore();
@@ -816,6 +823,7 @@ export class SessionManager {
       this.#pushToProviderSubscribers({ type: "accounts.changed", backend });
     });
     this.#hooks = opts?.hooks;
+    if (this.#secretService) this.#wireSecretService(this.#secretService);
     this.#testProviderFactory = opts?._testProviderFactory;
     this.#backendLogin = opts?._testBackendLogin ?? new BackendLoginBroker();
     this.#dispatcher = new Dispatcher(store, this.#makeDispatcherHost(), {
@@ -881,7 +889,10 @@ export class SessionManager {
     // Routines share the daemon DB. Built only when enabled, so the kill
     // switch leaves every routine in place but nothing fires.
     if (opts?.config?.routines?.enabled ?? true) {
-      this.#routines = new RoutineService(new RoutineStore(store.database), this.#makeRoutineHost(), opts?.config?.routines ?? {});
+      const routineStore = new RoutineStore(store.database);
+      const secretService = opts?.secretService;
+      if (secretService) routineStore.scrubText = (text) => secretService.scrub(text).text;
+      this.#routines = new RoutineService(routineStore, this.#makeRoutineHost(), opts?.config?.routines ?? {});
     }
     // Pack curation surface (docs/pack-loading.md) — always constructed (cheap:
     // no DB / runner). Reads the boot pack config; each mutation persists to
@@ -1715,6 +1726,10 @@ mcpHub: this.#mcpHub,
       case "credential.delete":
       case "credential.set_value":
         return this.#credentialEdit(msg, auth);
+      case "secret.list":
+      case "secret.reveal":
+      case "secret.forget":
+        return this.#secretHandle(msg, auth);
       case "mcp.oauth.begin":
         return this.#mcpOAuthBegin(msg, auth);
       case "mcp.oauth.complete":
@@ -1894,6 +1909,7 @@ mcpHub: this.#mcpHub,
           // Bind the exporter's tenant so the derived workspace id matches the
           // tenant-scoped ids episodes were written under.
           workspaceIdFor: (wd: string) => workspaceIdFromPath(wd, auth),
+          ...(this.#secretService ? { scrub: <T,>(v: T): T => this.#secretService!.scrubValue(v).value } : {}),
         },
       );
 
@@ -2374,6 +2390,7 @@ mcpHub: this.#mcpHub,
     workstreamEnv?: (b: WorkstreamBinding | undefined) => Readonly<Record<string, string>>;
     mcpGrant: (b: WorkstreamBinding | undefined) => McpGrant | undefined;
     workstreamFence: (b: WorkstreamBinding | undefined, own: readonly string[]) => WorkstreamFence | undefined;
+    secrets?: SecretService;
   } {
     const { missing } = this.#workstreams.envFor(binding, this.#secrets);
     if (missing.length > 0) {
@@ -2389,7 +2406,34 @@ mcpHub: this.#mcpHub,
       // The grant follows the config as it is at each listing.
       mcpGrant: (b) => this.#workstreams.grantFor(b),
       workstreamFence: (b, own) => this.#workstreamFence(b, own),
+      ...(this.#secretService ? { secrets: this.#secretService } : {}),
     };
+  }
+
+  /**
+   * Tell the secret service what codeoid knows (§2.2 of
+   * secrets-and-memory-design.md): every value it holds, from every place it
+   * holds them, matched exactly wherever they show up. And whose workstream
+   * keeps detected secrets.
+   */
+  #wireSecretService(secrets: SecretService): void {
+    registerSecretPaths({ dirs: [secretMaterialDir(getConfigDir())] });
+    // Settled dispatch tasks and routine runs keep no secret either (§2.6).
+    this.#store.scrubText = (text) => secrets.scrub(text).text;
+    secrets.setCapturePolicy((ws) => (ws ? (this.#workstreams.get(ws)?.captureSecrets ?? "drop") : (this.#config?.secrets?.captureSecrets ?? "drop")));
+    addDaemonKnownSources(secrets, {
+      credentials: () => this.#config?.credentials ?? [],
+      secretStore: this.#secrets,
+      accounts: this.#accounts,
+      endpoints: this.#endpoints,
+      store: this.#store,
+    });
+    try {
+      const n = secrets.expireVault();
+      if (n > 0) console.log(`[codeoid] secrets: forgot ${n} kept secret(s) not seen in ${secrets.config.vaultDays} days`);
+    } catch (err) {
+      console.error(`[codeoid] secrets: expiring kept secrets failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /** Fences by binding and config revision, briefly: the gate reads one on every file tool call. */
@@ -3538,6 +3582,7 @@ mcpHub: this.#mcpHub,
     const workstreams = workstreamsSchema.parse(config.workstreams);
     const credentials = credentialsSchema.parse(config.credentials);
     if (this.#config) this.#config = { ...this.#config, workstreams, credentials };
+    this.#secretService?.known.invalidate();
     this.#workstreams.update(workstreams, credentials);
     this.#pushToProviderSubscribers({ type: "workstreams.changed", revision: this.#workstreams.revision });
   }
@@ -3570,6 +3615,47 @@ mcpHub: this.#mcpHub,
     this.#applyWorkstreamConfig(written.config);
     // The edit's own reply needs no settings:read: it is what the caller just wrote.
     return this.#workstreamList({ type: "workstream.list", id: msg.id }, { ...auth, scopes: [...auth.scopes, SCOPES.SETTINGS_READ] as AuthContext["scopes"] });
+  }
+
+  /**
+   * The detected secrets workstreams keep (docs/secrets-and-memory-design.md
+   * §2.5): listed with settings:read, revealed and forgotten only with the
+   * caller's own token (settings:write, undelegated), each audited. A kept
+   * secret is the tenant's: the caller's account and project only.
+   */
+  #secretHandle(msg: Extract<ClientMessage, { type: "secret.list" | "secret.reveal" | "secret.forget" }>, auth: AuthContext): DaemonMessage {
+    const tenant = { accountId: auth.accountId, projectId: auth.projectId };
+    const vault = this.#secretService?.vault;
+    if (msg.type === "secret.list") {
+      if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_READ)) {
+        return { type: "response.error", requestId: msg.id, error: "Missing scope: settings:read", code: "forbidden" };
+      }
+      return {
+        type: "secret.list.result",
+        requestId: msg.id,
+        enabled: this.#secretService?.enabled ?? false,
+        secrets: vault ? vault.list({ ...tenant, ...(msg.workstream !== undefined ? { workstream: msg.workstream } : {}) }) : [],
+      };
+    }
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: settings:write", code: "forbidden" };
+    }
+    if (auth.delegationDepth > 0) {
+      return { type: "response.error", requestId: msg.id, error: "A delegated token can't reveal or forget kept secrets", code: "forbidden" };
+    }
+    if (!vault) return { type: "response.error", requestId: msg.id, error: "This daemon keeps no secrets", code: "not_found" };
+    const scope = { ...tenant, workstream: msg.workstream };
+    if (msg.type === "secret.forget") {
+      if (!vault.forget(scope, msg.fingerprint)) return { type: "response.error", requestId: msg.id, error: "No such kept secret", code: "not_found" };
+      this.#store.audit(auth.sub, "secret.forget", "", `workstream=${msg.workstream || "-"} fingerprint=${msg.fingerprint}`);
+      return { type: "response.ok", requestId: msg.id };
+    }
+    const kept = vault.list(scope).find((k) => k.fingerprint === msg.fingerprint);
+    const value = kept ? vault.reveal(scope, msg.fingerprint) : undefined;
+    if (!kept || value === undefined) return { type: "response.error", requestId: msg.id, error: "No such kept secret", code: "not_found" };
+    // The value never goes to the audit, only who saw which one.
+    this.#store.audit(auth.sub, "secret.reveal", "", `workstream=${msg.workstream || "-"} fingerprint=${msg.fingerprint} kind=${kept.kind}`);
+    return { type: "secret.reveal.result", requestId: msg.id, kind: kept.kind, value };
   }
 
   #credentialList(msg: { id: string }, auth: AuthContext): DaemonMessage {
@@ -3626,6 +3712,7 @@ mcpHub: this.#mcpHub,
       if (!w.ok) return err(w.error);
       // The value never goes to the audit, only that it changed.
       this.#store.audit(auth.sub, "credential.set_value", "", `id=${decl.id} ${msg.value === null ? "cleared" : "set"}`);
+      this.#secretService?.known.invalidate();
     } else {
       const id = msg.type === "credential.upsert" ? String(msg.item.id ?? "") : msg.credential;
       const existing = declared.find((c) => c.id === id);
@@ -4408,6 +4495,8 @@ mcpHub: this.#mcpHub,
   /** Inject the MemoryEngine after construction (embedder init is async). */
   setMemory(memory: MemoryEngine): void {
     this.#memory = memory;
+    const secrets = this.#secretService;
+    if (secrets) memory.scrubText = (text, ctx) => secrets.scrub(text, ctx).text;
   }
 
   /** Inject the shared memory MCP endpoint + URL (daemon-wide, built after the

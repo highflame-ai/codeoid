@@ -10,7 +10,7 @@
  *  - maps (env, accounts) and scalars (defaults, git fields) are overridden by
  *    the most specific setting;
  *  - `exclude` is applied after the merge;
- *  - `match`, `claim`, `share` and `allowOverride` are never inherited: they
+ *  - `match`, `claim`, `share`, `captureSecrets` and `allowOverride` are never inherited: they
  *    describe this workstream's own folders.
  *
  * The config was validated (no cycles, every base exists) before this runs;
@@ -36,6 +36,8 @@ export interface EffectiveWorkstream {
   claim: "exclusive" | "suggest";
   allowOverride: boolean;
   share: "open" | "ask" | "closed";
+  /** Not inherited either: whether this workstream keeps detected secrets (§2.5 of secrets-and-memory-design.md). */
+  captureSecrets: "drop" | "vault";
   match: { paths: string[]; remotes: string[] };
   servers: EffectiveServer[];
   accounts: Record<string, string>;
@@ -104,6 +106,7 @@ export function effectiveWorkstreams(items: readonly WorkstreamItemConfig[]): Ma
       claim: item.claim,
       allowOverride: item.allowOverride,
       share: item.share,
+      captureSecrets: item.captureSecrets,
       match: { paths: [...item.match.paths], remotes: [...item.match.remotes] },
       servers: [...servers.values()].filter((s) => !excluded.has(s.server)),
       accounts,

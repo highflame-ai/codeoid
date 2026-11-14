@@ -50,6 +50,11 @@ import type {
   CredentialListResultMsg,
   CredentialSetValueMsg,
   CredentialUpsertMsg,
+  SecretForgetMsg,
+  SecretListMsg,
+  SecretListResultMsg,
+  SecretRevealMsg,
+  SecretRevealResultMsg,
   SessionWorkstreamInfo,
   WorkstreamDeleteMsg,
   WorkstreamListMsg,
@@ -1384,6 +1389,9 @@ export type ClientMessage =
   | CredentialUpsertMsg
   | CredentialDeleteMsg
   | CredentialSetValueMsg
+  | SecretListMsg
+  | SecretRevealMsg
+  | SecretForgetMsg
   | SessionTurnsMsg
   | SessionApprovalsMsg
   | ClaudeAccountsListMsg
@@ -3356,6 +3364,8 @@ export type DaemonMessage =
   | WorkstreamResolveResultMsg
   | WorkstreamsChangedMsg
   | CredentialListResultMsg
+  | SecretListResultMsg
+  | SecretRevealResultMsg
   | SessionTurnsResultMsg
   | SessionApprovalsResultMsg
   | ClaudeAccountsResultMsg

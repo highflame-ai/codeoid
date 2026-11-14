@@ -200,7 +200,16 @@ export class MemoryEngine {
    * the full body is kept verbatim, and only a bounded view of it is
    * full-text indexed and embedded (lossless.ts explains the split).
    */
-  ingest(episode: Omit<Episode, "id">): Episode {
+  /**
+   * Applied to an episode's text before it is stored (docs/secrets-and-memory-design.md §2.6):
+   * the daemon's secret scrubbing, so nothing that ingests — a session, a raw-output spill,
+   * an import — stores a secret's value. Unset: stored as given.
+   */
+  scrubText: ((text: string, ctx: { workstream?: string; sessionId?: string }) => string) | undefined;
+
+  ingest(raw: Omit<Episode, "id">): Episode {
+    const ctx = { ...(raw.workstreamId ? { workstream: raw.workstreamId } : {}), sessionId: raw.sessionId };
+    const episode = this.scrubText ? { ...raw, summary: this.scrubText(raw.summary, ctx), content: this.scrubText(raw.content, ctx) } : raw;
     const view = indexView(episode.content);
     const saved = this.#store.insert(
       view === episode.content ? episode : { ...episode, content: view, fullContent: episode.content },

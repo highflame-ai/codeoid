@@ -21,6 +21,7 @@ import type {
 } from "../../protocol/types.js";
 
 import { resolveSafe } from "../fs.js";
+import { isCredentialFile } from "../secrets/files.js";
 import { resolveWorkdirAlias } from "./git-alias.js";
 import {
   SHARE_FORMAT_VERSION,
@@ -66,6 +67,12 @@ export interface PackDependencies {
   memory: MemoryEngine | null;
   /** Workspace id resolver (for memory episode lookups). */
   workspaceIdFor: (workdir: string) => string;
+  /**
+   * The daemon's secret scrubbing (docs/secrets-and-memory-design.md §2.6):
+   * a transcript or episode written before it, and a pinned file, go into a
+   * bundle scrubbed. Absent: packed as stored.
+   */
+  scrub?: <T>(value: T) => T;
 }
 
 export async function packSession(
@@ -83,7 +90,7 @@ export async function packSession(
     const msg = entry.message as unknown as SessionMessage;
     if (!msg || typeof msg !== "object") continue;
     if (!("messageId" in msg) || !msg.messageId) continue;
-    transcript.push(rewriteMessage(msg, workdir, alias));
+    transcript.push(rewriteMessage(deps.scrub ? deps.scrub(msg) : msg, workdir, alias));
   }
 
   // ---------- Memory episodes (per-session slice) ----------
@@ -95,8 +102,8 @@ export async function packSession(
         id: ep.id,
         kind: ep.kind,
         ...(ep.toolName ? { toolName: ep.toolName } : {}),
-        summary: rewriteTextPaths(ep.summary, workdir, alias),
-        content: rewriteTextPaths(ep.content, workdir, alias),
+        summary: rewriteTextPaths(deps.scrub ? deps.scrub(ep.summary) : ep.summary, workdir, alias),
+        content: rewriteTextPaths(deps.scrub ? deps.scrub(ep.content) : ep.content, workdir, alias),
         filePaths: encodePathArray(ep.filePaths, workdir, alias),
         tokenEstimate: ep.tokenEstimate,
         createdAt: ep.createdAt,
@@ -130,7 +137,16 @@ export async function packSession(
       } catch {
         continue;
       }
-      const snap = await capturePinnedFile(abs, cap);
+      const captured = await capturePinnedFile(abs, cap);
+      // A credential file (`.env`, a key) isn't packed at all: it holds nothing else (secrets/files.ts).
+      // Text otherwise scrubbed; a binary file's base64 isn't text a secret could be found in.
+      const snap = !captured || !deps.scrub
+        ? captured
+        : isCredentialFile(abs, workdir)
+          ? { ...captured, content: "‹content withheld: a credential file›", encoding: "utf-8" as const }
+          : captured.encoding === "utf-8"
+            ? { ...captured, content: deps.scrub(captured.content) }
+            : captured;
       if (snap) {
         const key = encodePath(abs, workdir, alias);
         pinnedFiles[key] = snap;
