@@ -69,7 +69,7 @@ export function shellCallOf(toolName: string, input: Record<string, unknown>): {
 }
 
 /** One argv element as a shell word. */
-function quote(s: string): string {
+export function quote(s: string): string {
   if (/^[A-Za-z0-9_./@:+=,%-]+$/.test(s)) return s;
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
