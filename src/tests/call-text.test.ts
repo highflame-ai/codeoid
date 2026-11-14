@@ -36,6 +36,32 @@ describe("callParts — what an approval card shows of a call", () => {
   });
 });
 
+describe("callParts — never shows less than the call", () => {
+  it("shows every input the body and head don't, whichever branch matched", () => {
+    expect(callParts({ command: "echo hi", cmd: "rm -rf ~" }).rest).toContain("rm -rf ~");
+    expect(callParts({ script: "rm -rf /", command: "ls" }).rest).toContain("rm -rf /");
+    expect(callParts({ command: "echo hi", file_path: "/etc/passwd", content: "payload" })).toMatchObject({ head: "/etc/passwd", body: "payload" });
+    expect(callParts({ command: "echo hi", file_path: "/etc/passwd", content: "payload" }).rest).toContain("echo hi");
+    expect(callParts({ plan: "p", other: "/x" }).rest).toContain("/x");
+    expect(callParts({ file_path: "/a", path: "/b", content: "c" }).rest).toContain("/b");
+    expect(callParts({ file_path: "/a", content: "c", old_string: "zzz", new_string: "y" }).rest).toContain("zzz");
+  });
+
+  it("shows the text editor tool's create and str_replace with their path", () => {
+    const create = callParts({ command: "create", path: "/etc/cron.d/x", file_text: "* * * * * evil" });
+    expect(create).toMatchObject({ head: "/etc/cron.d/x", body: "* * * * * evil" });
+    expect(create.rest).toContain("create");
+    const replace = callParts({ command: "str_replace", path: "/home/u/.bashrc", old_str: "a", new_str: "b" });
+    expect(replace).toMatchObject({ head: "/home/u/.bashrc", body: "a\n→\nb" });
+  });
+
+  it("quotes an argv back into the line it runs, and sees through codeoid's own wrapper as the risk check does", () => {
+    expect(callParts({ command: ["sh", "-c", "rm -rf / ; echo a b"] }).body).toBe("sh -c 'rm -rf / ; echo a b'");
+    expect(callParts({ command: ["rm", "-rf", 1], cmd: "ls" })).toMatchObject({ body: "ls" });
+    expect(callParts({ command: ["rm", "-rf", 1], cmd: "ls" }).rest).toContain("rm");
+  });
+});
+
 describe("safeSlice and cut", () => {
   it("never ends on half of a character", () => {
     const s = `${"a".repeat(9)}😀b`;

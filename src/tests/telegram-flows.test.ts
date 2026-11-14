@@ -545,7 +545,7 @@ describe("Telegram flows — attach, streaming turn, idle", () => {
   });
 
   it("an approval shows the call it asks about, not only its description, and says when it is cut", async () => {
-    const { drive, manager, texts } = await boot();
+    const { drive, manager, calls, texts } = await boot();
     await drive("/attach alpha");
     await until(() => texts().some((t) => t.startsWith("Attached to")));
     const client = manager.attachClients.get("sess-a")!;
@@ -568,6 +568,10 @@ describe("Telegram flows — attach, streaming turn, idle", () => {
     await until(() => texts().filter((t) => t.startsWith("⚠️ Permission needed")).length >= 2);
     const [bash, write] = texts().filter((t) => t.startsWith("⚠️ Permission needed"));
     expect(bash).toContain("git push --force origin main");
+    const bashCall = calls.find((c) => c.method === "sendMessage" && String(c.payload.text) === bash)!;
+    const [pre] = bashCall.payload.entities;
+    expect(pre.type).toBe("pre");
+    expect(bash!.slice(pre.offset, pre.offset + pre.length)).toBe("git push --force origin main");
     expect(write).toContain("/w/a.ts");
     expect(write).not.toContain("TAIL");
     expect(write).toContain(`cut short at ${CALL_SHOWN} of ${CALL_SHOWN + 4} characters`);
@@ -593,6 +597,7 @@ describe("Telegram flows — attach, streaming turn, idle", () => {
     expect(card).toContain("⌂ workstream acme");
     expect(card).toContain("w".repeat(600));
     expect(card).toContain('also: {"mode":"0755"}');
+    expect(card.split("\n")[1]).toBe("d".repeat(800));
   });
 
   it("a card Telegram refuses leaves a notice naming the pending approval, without buttons", async () => {

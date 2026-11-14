@@ -663,12 +663,12 @@ export function looksLikeSecret(text: string): boolean {
 export const CALL_SHOWN = 2_400;
 
 /** What a tool call would do (see callParts), escaped for Slack, and cut only with a note saying so. */
-export function callText(_toolName: string, input: unknown): string {
-  const { head, body, rest } = callParts(input);
+export function callText(toolName: string, input: unknown): string {
+  const { head, body, rest } = callParts(input, toolName);
   const cut = body.length > CALL_SHOWN;
   const shown = esc(safeSlice(body, CALL_SHOWN)).replace(/```/g, "ˋˋˋ");
   const also = rest ? `also: \`${esc(rest).replace(/`/g, "ˋ")}\`\n` : "";
-  return `${head ? `\`${esc(head)}\`\n` : ""}${also}\`\`\`${shown}\`\`\`${cut ? `\n_${cutNote(CALL_SHOWN, body.length)}_` : ""}`;
+  return `${head ? `\`${esc(head).replace(/`/g, "ˋ")}\`\n` : ""}${also}\`\`\`${shown}\`\`\`${cut ? `\n_${cutNote(CALL_SHOWN, body.length)}_` : ""}`;
 }
 
 /** Text as mrkdwn section blocks of at most CHUNK characters each, split at line ends where it can. */
