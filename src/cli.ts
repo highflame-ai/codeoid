@@ -94,6 +94,7 @@ program
   .option("-p, --port <port>", "Port to listen on", "7400")
   .option("--host <host>", "Host to bind to", "127.0.0.1")
   .option("--no-telegram", "Disable Telegram bot")
+  .option("--no-slack", "Disable the Slack frontend")
   .option("--no-web", "Disable Web UI")
   .option(
     "--local",
@@ -241,6 +242,26 @@ program
         daemon.use(new TelegramFrontend(botToken, allowedIds));
       } else if (botToken) {
         console.log("[codeoid] TELEGRAM_BOT_TOKEN set but TELEGRAM_ALLOWED_USER_IDS missing — skipping Telegram");
+      }
+    }
+
+    // Slack (enabled when CODEOID_SLACK_APP_TOKEN and CODEOID_SLACK_BOT_TOKEN are set; docs/slack.md)
+    if (opts.slack !== false) {
+      const appToken = process.env.CODEOID_SLACK_APP_TOKEN;
+      const botToken = process.env.CODEOID_SLACK_BOT_TOKEN;
+      const allowed = (process.env.CODEOID_SLACK_ALLOWED_USER_IDS ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if ((appToken || botToken) && localMode) {
+        // Reached through Slack's servers: a remote surface, which local mode's trust model doesn't cover.
+        console.warn("[codeoid] local mode: Slack frontend NOT started (it needs ZeroID identities). Run `codeoid login` and start without --local to use it.");
+      } else if (appToken && botToken && allowed.length > 0) {
+        const { SlackFrontend } = await import("./frontends/slack/index.js");
+        const teamId = process.env.CODEOID_SLACK_TEAM_ID?.trim();
+        daemon.use(new SlackFrontend(appToken, botToken, allowed, teamId ? { teamId } : {}));
+      } else if (appToken || botToken) {
+        console.log("[codeoid] Slack needs CODEOID_SLACK_APP_TOKEN, CODEOID_SLACK_BOT_TOKEN and CODEOID_SLACK_ALLOWED_USER_IDS — skipping Slack");
       }
     }
 

@@ -6584,8 +6584,10 @@ export class Session {
       if (!gated) continue;
       const risk = this.#shellRisk(gated.toolName, gated.input as Record<string, unknown>, gated.shellCwd);
       const ws = this.#approvalWorkstreams.get(approvalId);
+      const messageId = this.#approvalIdToMessageId.get(approvalId);
       out.push({
         approvalId,
+        ...(messageId ? { messageId } : {}),
         toolName: gated.toolName,
         // Shown as the card shows it: as recorded (the call still runs with what the backend made).
         input: this.#approvalShown(approvalId, gated.input),

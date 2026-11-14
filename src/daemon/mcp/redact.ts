@@ -32,6 +32,10 @@ const URL_CHARS = 65_536;
  * and — as a backstop for what those don't know — a long run of token
  * characters mixing letters and digits. Bounded.
  */
+/** Well-known credential formats (codeoid's own ZeroID keys first), as a regex alternation: redacted here, refused where a key must never be sent on (the Slack DM). */
+export const KNOWN_KEY_FORMATS =
+  "zid_sk_\\w{8,}|hf_(?:sk_)?\\w{8,}|sk-[\\w-]{8,}|sk_[a-z]+_\\w{8,}|gh[pousr]_\\w{8,}|github_pat_\\w{8,}|glpat-[\\w-]{16,}|npm_\\w{30,}|xox[abprs]-[\\w-]{8,}|xapp-[\\w-]{8,}|AKIA[0-9A-Z]{16}|AIza[\\w-]{20,}";
+
 export function redactSecretText(text: string): string {
   const cut = text.length > SCAN_CHARS;
   const s = (cut ? text.slice(0, SCAN_CHARS) : text)
@@ -58,10 +62,7 @@ export function redactSecretText(text: string): string {
       "$1$2$3…",
     )
     // well-known key formats (codeoid's own ZeroID keys first)
-    .replace(
-      /\b(?:zid_sk_\w{8,}|hf_(?:sk_)?\w{8,}|sk-[\w-]{8,}|sk_[a-z]+_\w{8,}|gh[pousr]_\w{8,}|github_pat_\w{8,}|glpat-[\w-]{16,}|npm_\w{30,}|xox[abprs]-[\w-]{8,}|AKIA[0-9A-Z]{16}|AIza[\w-]{20,})/g,
-      "…",
-    )
+    .replace(new RegExp(`\\b(?:${KNOWN_KEY_FORMATS})`, "g"), "…")
     // long token-like path segments, then query strings and fragments
     .replace(/(?<![/:])\/[A-Za-z0-9_.~+%-]{24,}(?=[/\s?#"'),;\]>:]|$)/g, "/…")
     .replace(/(\b[a-z][a-z0-9+.-]*:\/\/[^\s?#"']+)[?#][^\s"'),;\]>]*/gi, "$1?…")
