@@ -573,6 +573,47 @@ describe("Telegram flows — attach, streaming turn, idle", () => {
     expect(write).toContain(`cut short at ${CALL_SHOWN} of ${CALL_SHOWN + 4} characters`);
     expect(write!.length).toBeLessThan(4096);
   });
+
+  it("a card stays under Telegram's limit with a long path and long lines, the lines under the call kept", async () => {
+    const { drive, manager, texts } = await boot();
+    await drive("/attach alpha");
+    await until(() => texts().some((t) => t.startsWith("Attached to")));
+    manager.attachClients.get("sess-a")!.send(
+      toolCallMsg("sess-a", "tc-call-3", "Write", {
+        phase: "waiting_confirmation",
+        input: { file_path: `/${"d/".repeat(900)}f`, content: "x".repeat(5000), mode: "0755" },
+        description: "d".repeat(2000),
+        approvalId: "call0003-rest",
+        targetWorkstream: { workstream: "acme", warning: "w".repeat(600) },
+      }),
+    );
+    await until(() => texts().some((t) => t.startsWith("⚠️ Permission needed")));
+    const card = texts().find((t) => t.startsWith("⚠️ Permission needed"))!;
+    expect(card.length).toBeLessThanOrEqual(4096);
+    expect(card).toContain("⌂ workstream acme");
+    expect(card).toContain("w".repeat(600));
+    expect(card).toContain('also: {"mode":"0755"}');
+  });
+
+  it("a card Telegram refuses leaves a notice naming the pending approval, without buttons", async () => {
+    const { drive, manager, calls, texts } = await boot({
+      failWhen: (method, payload) => method === "sendMessage" && String(payload.text).startsWith("⚠️ Permission needed"),
+    });
+    await drive("/attach alpha");
+    await until(() => texts().some((t) => t.startsWith("Attached to")));
+    manager.attachClients.get("sess-a")!.send(
+      toolCallMsg("sess-a", "tc-call-4", "Bash", {
+        phase: "waiting_confirmation",
+        input: { command: "make" },
+        description: "Bash(command)",
+        approvalId: "call0004-rest",
+      }),
+    );
+    await until(() => texts().some((t) => t.startsWith("⚠️ Approval prompt failed to render")));
+    const notice = calls.find((c) => c.method === "sendMessage" && String(c.payload.text).startsWith("⚠️ Approval prompt failed"))!;
+    expect(String(notice.payload.text)).toContain("call0004");
+    expect(notice.payload.reply_markup).toBeUndefined();
+  });
 });
 
 describe("Telegram flows — the OS sandbox on approvals (#448)", () => {

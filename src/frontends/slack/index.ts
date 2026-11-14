@@ -30,7 +30,7 @@ import type { SessionManager } from "../../daemon/session-manager.js";
 import type { Store } from "../../daemon/store.js";
 import type { TokenVerifier } from "../../daemon/verifier.js";
 import type { Frontend, FrontendContext } from "../types.js";
-import { callParts, cutNote } from "../call.js";
+import { callParts, cutNote, safeSlice } from "../call.js";
 import { KNOWN_KEY_FORMATS } from "../../daemon/mcp/redact.js";
 import { defaultTransport, type SlackEnvelope, SlackSocket, type SlackTransport, slackApi } from "./socket.js";
 
@@ -664,10 +664,11 @@ export const CALL_SHOWN = 2_400;
 
 /** What a tool call would do (see callParts), escaped for Slack, and cut only with a note saying so. */
 export function callText(_toolName: string, input: unknown): string {
-  const { head, body } = callParts(input);
+  const { head, body, rest } = callParts(input);
   const cut = body.length > CALL_SHOWN;
-  const shown = esc(cut ? body.slice(0, CALL_SHOWN) : body).replace(/```/g, "ˋˋˋ");
-  return `${head ? `\`${esc(head)}\`\n` : ""}\`\`\`${shown}\`\`\`${cut ? `\n_${cutNote(CALL_SHOWN, body.length)}_` : ""}`;
+  const shown = esc(safeSlice(body, CALL_SHOWN)).replace(/```/g, "ˋˋˋ");
+  const also = rest ? `also: \`${esc(rest).replace(/`/g, "ˋ")}\`\n` : "";
+  return `${head ? `\`${esc(head)}\`\n` : ""}${also}\`\`\`${shown}\`\`\`${cut ? `\n_${cutNote(CALL_SHOWN, body.length)}_` : ""}`;
 }
 
 /** Text as mrkdwn section blocks of at most CHUNK characters each, split at line ends where it can. */
