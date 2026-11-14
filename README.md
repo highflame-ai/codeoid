@@ -436,7 +436,7 @@ Full detail — keybindings, slash commands, ranking weights, rotation threshold
 
 ### Interfaces
 
-One daemon, one source of truth, three ways in: the [terminal cockpit](docs/FEATURES.md#terminal-client) (shown at the top), a browser, and Telegram.
+One daemon, one source of truth, four ways in: the [terminal cockpit](docs/FEATURES.md#terminal-client) (shown at the top), a browser, Telegram, and [Slack](docs/slack.md).
 [Device handoff](docs/FEATURES.md#device-handoff) lets you start on one and pick the session up on another — scrollback replays.
 
 <p align="center">

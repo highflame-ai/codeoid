@@ -205,7 +205,7 @@ describe("session.approvals", () => {
       { type: "session.approvals.result" }
     >;
     expect(res.approvals).toEqual([
-      { approvalId: "approval-1", toolName: "Bash", input: { command: "rm -rf build" }, risk: { level: "medium", reasons: [expect.stringContaining("rm deletes")] } },
+      { approvalId: "approval-1", messageId: expect.any(String), toolName: "Bash", input: { command: "rm -rf build" }, risk: { level: "medium", reasons: [expect.stringContaining("rm deletes")] } },
     ]);
 
     const session = manager._sessionForTest(id)!;

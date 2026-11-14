@@ -642,6 +642,20 @@ export class SessionManager {
    *  pipeline run drives phases on a live session; the phase resolves when that
    *  session next reaches a resting status (see #statusObserver). */
   #phaseWaiters = new Map<string, (status: PhaseTurnResult["finalStatus"]) => void>();
+  #needsOwnerListeners = new Set<(sessionId: string, name: string, owner: { sub: string; accountId: string; projectId: string }) => void>();
+
+  /**
+   * Hear when a session starts waiting on its owner (an approval): its id,
+   * name and owner. For a frontend that tells the owner where they're needed;
+   * it reads the rest through the owner's own token. Returns the unsubscribe.
+   */
+  onNeedsOwner(listener: (sessionId: string, name: string, owner: { sub: string; accountId: string; projectId: string }) => void): () => void {
+    this.#needsOwnerListeners.add(listener);
+    return () => {
+      this.#needsOwnerListeners.delete(listener);
+    };
+  }
+
   /** Stable observer identity — every Session reports status transitions here. */
   #statusObserver = (sessionId: string, status: SessionInfo["status"], opts?: { settled: true }): void => {
     // A turn settled without a status change: only what waits on spend cares (#430).
@@ -656,6 +670,21 @@ export class SessionManager {
     // owner's registered devices off-LAN. Fire-and-forget — a push hiccup must
     // never touch the status path (the emit itself only ever sees an opaque
     // session id, never the tool's args/description).
+    // Frontends that tell an owner a session waits on them (Slack's "needs you"): told the same moment, by id
+    // and owner only; what the session waits on is theirs to read through the owner's own token.
+    if (status === "waiting_approval" && this.#needsOwnerListeners.size > 0) {
+      const session = this.#sessions.get(sessionId);
+      if (session) {
+        const owner = { sub: session.createdBy, accountId: session.accountId, projectId: session.projectId };
+        for (const listener of this.#needsOwnerListeners) {
+          try {
+            listener(sessionId, session.name, owner);
+          } catch (err) {
+            console.error("[codeoid] needs-owner listener failed:", err);
+          }
+        }
+      }
+    }
     if (status === "waiting_approval" && this.#pushService.enabled) {
       const session = this.#sessions.get(sessionId);
       if (session) {

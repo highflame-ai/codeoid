@@ -42,6 +42,8 @@ export interface PendingToolApproval {
   sandboxNote?: string;
   /** The sandbox lets commands reach the container runtime (Docker access). */
   sandboxDocker?: boolean;
+  /** The tool call's message: its later state updates (answered, cancelled) reference it. */
+  messageId?: string;
   /** A send-class fleet call's workstream, and what approving it confirms (workstreams §10; as on the card). */
   targetWorkstream?: { workstream?: string; warning?: string };
 }
