@@ -11,7 +11,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:te
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { CodeoidConfig } from "../config.js";
+import { type CodeoidConfig, getConfigDir } from "../config.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
 import { McpHub } from "../daemon/mcp/hub.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
@@ -243,8 +243,9 @@ describe("what rules never run", () => {
   });
 
   test("a credential read is refused in every mode, rules or not", async () => {
-    await add("Bash(cat:*)", "everywhere");
-    const r = await run("Bash", { command: "cat ~/.codeoid/config.json" });
+    expect((await add("Bash(cat config.json:*)", "everywhere")).type).toBe("approval_rules.add.result");
+    // codeoid's own config file, wherever this machine keeps it.
+    const r = await run("Bash", { command: `cat ${join(getConfigDir(), "config.json")}` });
     expect(result(r)?.behavior).toBe("deny");
     await finish(r);
   });
