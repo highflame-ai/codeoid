@@ -26,7 +26,7 @@
 import { afterAll, afterEach, beforeAll, describe, it, expect } from "bun:test";
 import { Bot } from "grammy";
 import type { UserFromGetMe } from "grammy/types";
-import { TelegramFrontend } from "../frontends/telegram/index.js";
+import { CALL_SHOWN, TelegramFrontend } from "../frontends/telegram/index.js";
 import { ZeroIdVerifier } from "../daemon/auth.js";
 import type { FrontendContext } from "../frontends/types.js";
 import type { AttachedClient } from "../daemon/session.js";
@@ -542,6 +542,82 @@ describe("Telegram flows — attach, streaming turn, idle", () => {
       ),
     );
     expect(calls.some((c) => c.method === "answerCallbackQuery")).toBe(true);
+  });
+
+  it("an approval shows the call it asks about, not only its description, and says when it is cut", async () => {
+    const { drive, manager, calls, texts } = await boot();
+    await drive("/attach alpha");
+    await until(() => texts().some((t) => t.startsWith("Attached to")));
+    const client = manager.attachClients.get("sess-a")!;
+    client.send(
+      toolCallMsg("sess-a", "tc-call-1", "Bash", {
+        phase: "waiting_confirmation",
+        input: { command: "git push --force origin main" },
+        description: "Bash(command)",
+        approvalId: "call0001-rest",
+      }),
+    );
+    client.send(
+      toolCallMsg("sess-a", "tc-call-2", "Write", {
+        phase: "waiting_confirmation",
+        input: { file_path: "/w/a.ts", content: `${"x".repeat(CALL_SHOWN)}TAIL` },
+        description: "Write(file_path, content)",
+        approvalId: "call0002-rest",
+      }),
+    );
+    await until(() => texts().filter((t) => t.startsWith("⚠️ Permission needed")).length >= 2);
+    const [bash, write] = texts().filter((t) => t.startsWith("⚠️ Permission needed"));
+    expect(bash).toContain("git push --force origin main");
+    const bashCall = calls.find((c) => c.method === "sendMessage" && String(c.payload.text) === bash)!;
+    const [pre] = bashCall.payload.entities;
+    expect(pre.type).toBe("pre");
+    expect(bash!.slice(pre.offset, pre.offset + pre.length)).toBe("git push --force origin main");
+    expect(write).toContain("/w/a.ts");
+    expect(write).not.toContain("TAIL");
+    expect(write).toContain(`cut short at ${CALL_SHOWN} of ${CALL_SHOWN + 4} characters`);
+    expect(write!.length).toBeLessThan(4096);
+  });
+
+  it("a card stays under Telegram's limit with a long path and long lines, the lines under the call kept", async () => {
+    const { drive, manager, texts } = await boot();
+    await drive("/attach alpha");
+    await until(() => texts().some((t) => t.startsWith("Attached to")));
+    manager.attachClients.get("sess-a")!.send(
+      toolCallMsg("sess-a", "tc-call-3", "Write", {
+        phase: "waiting_confirmation",
+        input: { file_path: `/${"d/".repeat(900)}f`, content: "x".repeat(5000), mode: "0755" },
+        description: "d".repeat(2000),
+        approvalId: "call0003-rest",
+        targetWorkstream: { workstream: "acme", warning: "w".repeat(600) },
+      }),
+    );
+    await until(() => texts().some((t) => t.startsWith("⚠️ Permission needed")));
+    const card = texts().find((t) => t.startsWith("⚠️ Permission needed"))!;
+    expect(card.length).toBeLessThanOrEqual(4096);
+    expect(card).toContain("⌂ workstream acme");
+    expect(card).toContain("w".repeat(600));
+    expect(card).toContain('also: {"mode":"0755"}');
+    expect(card.split("\n")[1]).toBe("d".repeat(800));
+  });
+
+  it("a card Telegram refuses leaves a notice naming the pending approval, without buttons", async () => {
+    const { drive, manager, calls, texts } = await boot({
+      failWhen: (method, payload) => method === "sendMessage" && String(payload.text).startsWith("⚠️ Permission needed"),
+    });
+    await drive("/attach alpha");
+    await until(() => texts().some((t) => t.startsWith("Attached to")));
+    manager.attachClients.get("sess-a")!.send(
+      toolCallMsg("sess-a", "tc-call-4", "Bash", {
+        phase: "waiting_confirmation",
+        input: { command: "make" },
+        description: "Bash(command)",
+        approvalId: "call0004-rest",
+      }),
+    );
+    await until(() => texts().some((t) => t.startsWith("⚠️ Approval prompt failed to render")));
+    const notice = calls.find((c) => c.method === "sendMessage" && String(c.payload.text).startsWith("⚠️ Approval prompt failed"))!;
+    expect(String(notice.payload.text)).toContain("call0004");
+    expect(notice.payload.reply_markup).toBeUndefined();
   });
 });
 

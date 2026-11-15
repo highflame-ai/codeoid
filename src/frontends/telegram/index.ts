@@ -41,6 +41,7 @@ import type {
 } from "../../protocol/types.js";
 import { CAPABILITIES, EFFORT_LEVELS, type EffortChangeResult, type EffortLevel } from "../../protocol/types.js";
 import type { AttachedClient } from "../../daemon/session.js";
+import { callParts, cutNote, safeSlice } from "../call.js";
 import {
   StreamRelay,
   escCode,
@@ -48,6 +49,30 @@ import {
   formatSessionLine,
   type RelayApi,
 } from "./stream.js";
+
+/**
+ * Most characters of a call a card shows. A Telegram message holds 4096; this
+ * leaves room for the description (cut at 800) and the other lines.
+ */
+export const CALL_SHOWN = 2_400;
+
+/** What a tool call would do (see callParts), as plain text, cut only with a note saying so. */
+export function callText(input: unknown, toolName = ""): string {
+  const { head, body, rest } = callParts(input, toolName);
+  const cut = body.length > CALL_SHOWN;
+  // The other inputs come before the body, so cutting a long card never drops them.
+  return `${head ? `${head}\n` : ""}${rest ? `also: ${rest}\n` : ""}${safeSlice(body, CALL_SHOWN)}${cut ? `\n${cutNote(CALL_SHOWN, body.length)}` : ""}`;
+}
+
+/** Longest approval card sent; a Telegram message holds 4096. */
+const CARD_MAX = 4_000;
+/** Most characters of the daemon's own lines under a card's call. */
+const CARD_TAIL_MAX = 1_500;
+
+/** `s` on one line: a model-authored name or description can't pass for a card's own lines. */
+function oneLine(s: string): string {
+  return s.replace(/[\r\n\u2028\u2029]+/g, " ");
+}
 
 /** One AskUserQuestion question as it arrives in the tool input. */
 interface AskQuestion {
@@ -1351,16 +1376,31 @@ export class TelegramFrontend implements Frontend {
     // Whether it runs in the session's OS sandbox (#448), as every surface says it.
     const sandboxText = tool.state.phase === "waiting_confirmation" ? approvalSandboxLine(tool.state) : null;
     const sandbox = sandboxText ? `\n${sandboxText}` : "";
+    // What runs, from its input: the description only names the tool and its arguments.
+    const call = callText(tool.state.input, tool.name);
     const kb = new InlineKeyboard()
       .text("✅ Approve", `a:${short}:y`)
       .text("❌ Deny", `a:${short}:n`);
+    // The lines under the call are what the approval is judged by, so the call gives way when the card is too long.
+    const tail = safeSlice(`${workstream}${risk}${sandbox}${cost}`, CARD_TAIL_MAX);
+    const top = `⚠️ Permission needed — ${oneLine(safeSlice(tool.name, 200))}\n${oneLine(safeSlice(String(desc), 800))}\n\n`;
+    const room = CARD_MAX - top.length - tail.length;
+    const shownCall = call.length > room ? `${safeSlice(call, room - 60)}\n(cut short: see the whole call in the web UI)` : call;
+    // The call is a code block (an entity, so no markup to escape): what the
+    // model wrote can't pass for the daemon's own lines around it.
+    const entities = [{ type: "pre", offset: top.length, length: shownCall.length }];
     this.#bot.api
-      .sendMessage(
-        chatId,
-        `⚠️ Permission needed — ${tool.name}\n${String(desc).slice(0, 800)}${workstream}${risk}${sandbox}${cost}`,
-        { reply_markup: kb } as Record<string, unknown>,
-      )
-      .catch(() => {});
+      .sendMessage(chatId, `${top}${shownCall}${tail}`, { reply_markup: kb, entities } as Record<string, unknown>)
+      .catch(() =>
+        // Never leave the turn waiting on a card nobody can see. No buttons:
+        // what would be approved isn't shown here.
+        this.#bot.api
+          .sendMessage(
+            chatId,
+            `⚠️ Approval prompt failed to render — approval ${short} is pending (${safeSlice(tool.name, 200)}); answer it in the web UI or with codeoid approve, or reply /interrupt to abort`,
+          )
+          .catch(() => {}),
+      );
   }
 
   /** Handle an inline-keyboard tap (approval decision / question answer). */
