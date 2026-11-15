@@ -136,13 +136,15 @@ These never run on a rule:
   `make test -C..`), links followed;
 - a command with a word only known when it runs (`npm test -- $FILE`, `$(…)`, `{a,b}`);
 - a command fed input by a pipe, here-document or `<` (`make test -f - <<< '…'`);
-- a build or test tool given an option that runs code it's handed, or reads its instructions from elsewhere:
-  - `make --eval`, `-f`, `-C`, or a `VAR=value`;
-  - `go test -exec`, `-toolexec`;
+- a build or test tool given an option that runs code it's handed, or reads its instructions from elsewhere,
+  written in full, shortened (`--ev`) or with any number of dashes where the tool accepts that:
+  - `make --eval` or a `VAR=value`;
+  - `go test -exec`, `-toolexec`, `-vettool`;
   - `cargo --config`;
   - `npm --node-options`, `--script-shell`, `--prefix`, `-w`;
-  - `deno test https://…`;
-  - `docker build --output`;
+  - `mvn` `-D` other than `-Dtest=…`, `-DskipTests`, `-DskipITs`, and the like;
+  - `docker build --output`, `--network`, `--allow`;
+- a command naming something to fetch (`deno test https://…`, `npm:x`, `docker build github.com/…`, `git@host:…`);
 - a command after a `cd` that may not run or not stay (in a subshell, behind `&&`), or to a folder that doesn't
   exist;
 - a command whose shell may have moved without the backend saying where.
@@ -174,8 +176,9 @@ children are made with your own token, so your rules apply to them.
 Deny rules refuse what they match in every mode. You add them in Settings or with the CLI, not on a card. A deny
 rule may name any program.
 
-A deny rule matches its words in order, with anything between or after them. The match ignores case and goes
-through wrappers, runners and their `run`/`exec` subcommands. `Bash(npm publish:*)` refuses all of these, and so
+A deny rule matches its words in order, with anything between or after them. The program's name is matched ignoring case. The
+match goes through wrappers, runners and their `run`/`exec` subcommands, past the runner's own options
+(`pnpm --filter x exec git push`). `Bash(npm publish:*)` refuses all of these, and so
 does `Bash(npm publish)`:
 
 - `npm publish`
@@ -194,7 +197,8 @@ not refused:
 - an alias (`npm pub`);
 - a variable (`$(which npm) publish`);
 - flags in another order (`rm -fr` for `Bash(rm -rf:*)`);
-- a path spelled differently (`./build` for `Bash(rm -rf build)`).
+- a path spelled differently (`./build` for `Bash(rm -rf build)`);
+- a tool's own aliases (`git -c alias.p=push p`, `npm publ`).
 
 A `WebFetch` deny rule covers a fetch tool named `WebFetch` (Qwen's `web_fetch` isn't). It doesn't stop a
 sandboxed command such as `curl` reaching the host: that is the session's sandbox network setting.

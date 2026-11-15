@@ -346,7 +346,8 @@ A rule belongs to the user who saved it, in their tenant, and applies only to th
 - Allow rules run only in sessions a person made with their own token. A session a delegated or automation
   token made gets none, and neither does a dispatched worker, which the conductor's identity makes.
 - Those sessions' cards offer no save.
-- This is kept in the meta (`TranscriptMeta.madeByAgent`), since a resumed session's auth doesn't carry it.
+- This is kept in the meta (`TranscriptMeta.madeByAgent`, written true or false), since a resumed session's
+  auth doesn't carry it. A meta from before it counts as a person's, unless its owner is the conductor's identity.
 - Deny rules apply to every session made with the owner's identity.
 
 The scope is one of:
@@ -375,8 +376,13 @@ The scope is one of:
     - every path its words name inside the workspace, links followed: an option's value (`-C..`, `--x=y`), each
       part of `a=b,c`, an `@file`. A URL or a `file:`, `data:` or `npm:` specifier counts as outside;
     - no option that makes a build or test tool run code it is handed, or read instructions from elsewhere
-      (`CODE_OPTIONS`: `make --eval/-f/-C`, `VAR=value`, `go -exec/-toolexec`, `cargo --config`,
-      `npm --node-options/--script-shell/--prefix`, `docker --output`, …);
+      (`CODE_OPTIONS`: `make --eval`, `VAR=value`, `go -exec/-toolexec` with one or two dashes, `cargo --config`,
+      `npm --node-options/--script-shell/--prefix`, `docker --output/--network/--allow`, …). A long option is
+      also refused shortened, where the tool accepts that (make, npm, pnpm, yarn). A `-f`/`-C` to a file or folder
+      inside the workspace is fine: the outside-path check covers the rest;
+    - no word naming something to fetch (a URL, `npm:`/`jsr:`/`file:`, `github.com/…`, `git@host:…`);
+    - every word that names something existing where it runs (a bare `out`), and every path read with `<`,
+      judged as a path; `..` read both as text and as the kernel reads it;
     - the rule's words literal and equal to its own (an exact rule also needs the same number of words).
 - A `cd` is followed only when it is certain: one in a subshell, `$(…)` or behind `&&`/`||`, or to a folder
   that doesn't exist, leaves every later command in no known place.

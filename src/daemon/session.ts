@@ -2232,7 +2232,7 @@ export class Session {
         collaboration: this.collaboration,
         collaborationRole: this.collaborationRole,
         ...(this.workstreamAhead ? { workstream: this.workstreamAhead } : {}),
-        ...(this.#ownerIsPerson ? {} : { madeByAgent: true as const }),
+        madeByAgent: !this.#ownerIsPerson,
         // Fire-and-forget: saveMeta's write chain owns the failure log; an
         // unconsumed rejection here would be an unhandled-rejection crash.
       }).catch(() => {});
@@ -12954,7 +12954,7 @@ export class Session {
       collaborationRole: this.collaborationRole,
       // Both meta writes, for the same reason as the collaboration above.
       ...(this.workstreamAhead ? { workstream: this.workstreamAhead } : {}),
-      ...(this.#ownerIsPerson ? {} : { madeByAgent: true as const }),
+      madeByAgent: !this.#ownerIsPerson,
     }).catch(() => {});
   }
 }

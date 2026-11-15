@@ -347,11 +347,9 @@ describe("round 2: nothing an allow rule's words can be made to run", () => {
     ["make test -E 'x: ; id'"],
     ["make test -f - <<< 'test: ; id'"],
     ["echo 'test: ; id' | make test -f -"],
-    ["make test -f evil.mk"],
     ["make test SHELL=/tmp/x"],
     ["make test -C.."],
     ["make test -I.."],
-    ["make test -kf x.mk"],
     ["go test -exec='sh -c' ./..."],
     ["go test -toolexec=/tmp/x ./..."],
     ["go test -vettool=x ./..."],
@@ -378,7 +376,16 @@ describe("round 2: nothing an allow rule's words can be made to run", () => {
     expect(verdict(line, rules).kind).toBe("none");
   });
 
-  test.each([["make test"], ["make test -j4"], ["go test ./..."], ["cargo test --release"], ["npm test -- --watch=false"], ["cd sub && npm test"], ["docker build ."]])(
+  test.each([
+    ["make test"],
+    ["make test -j4"],
+    ["make test -f other.mk"],
+    ["go test ./..."],
+    ["cargo test --release"],
+    ["npm test -- --watch=false"],
+    ["cd sub && npm test"],
+    ["docker build ."],
+  ])(
     "%s still does",
     (line) => {
       expect(verdict(line, rules).kind).toBe("allow");
@@ -413,5 +420,53 @@ describe("round 2: deny rules through runner subcommands, extra words and case",
   });
   test("a runner running something else isn't", () => {
     expect(verdict("uv run pytest", rules).kind).not.toBe("deny");
+  });
+});
+
+describe("verification: the last of the same classes", () => {
+  const rules = [rule("Bash(make test:*)"), rule("Bash(go test:*)"), rule("Bash(npm test:*)"), rule("Bash(docker build:*)"), rule("Bash(mvn test:*)"), rule("Bash(gradle test:*)"), rule("Bash(./gradlew test:*)"), rule("Bash(pytest -q:*)"), rule("Bash(pnpm test:*)"), rule("Bash(deno test:*)")];
+
+  test.each([
+    ["go test '--exec=bash -c x' ."],
+    ["go test --toolexec=x"],
+    ["go test --vettool=x"],
+    ["make test --ev='$(info x)'"],
+    ["npm test --node-o=--inspect=0.0.0.0:9229"],
+    ["docker build github.com/evil/repo"],
+    ["docker build git@github.com:evil/repo.git"],
+    ["docker build --network=host ."],
+    ["docker build --allow security.insecure ."],
+    ["./gradlew test --init-script=init.gradle"],
+    ["mvn test -Dmaven.ext.class.path=x"],
+  ])("%s doesn't run on a rule", (line) => {
+    expect(verdict(line, rules).kind).toBe("none");
+  });
+
+  test.each([["mvn test -Dtest=FooTest"], ["mvn test -DskipITs -Pci"], ["gradle test -PskipLint=true"], ["pnpm test -r"], ["deno test -A"], ["pytest -q -p no:cacheprovider"], ["docker build -f Dockerfile ."]])(
+    "%s runs on its rule",
+    (line) => {
+      expect(verdict(line, rules).kind).toBe("allow");
+    },
+  );
+
+  test("a link named as a bare word, or by .., is followed", () => {
+    symlinkSync("/etc", join(WS, "out"));
+    symlinkSync("/etc/ssl", join(WS, "outdeep"));
+    for (const line of ["go test -coverprofile=out .", "go test -o out", "npm test out", "npm test --x=out", "docker build out", "npm test outdeep/..", "npm test outdeep/../passwd"]) {
+      expect(verdict(line, rules).kind).toBe("none");
+    }
+  });
+
+  test("a plain read through a link out isn't a plain read", () => {
+    symlinkSync(homedir(), join(WS, "k"));
+    expect(verdict("npm test; cat k/.bashrc", rules).kind).toBe("none");
+    expect(verdict("npm test < k/.bashrc", rules).kind).toBe("none");
+  });
+
+  test("deny through a runner's options before its subcommand", () => {
+    const deny = [rule("Bash(git push:*)", "deny"), rule("Bash(npm publish:*)", "deny")];
+    for (const line of ["pnpm --filter x exec git push", "pnpm -C x exec git push", "pnpm --dir x dlx npm publish", "uv --directory x run git push", "poetry --directory x run git push", "yarn workspace x exec git push"]) {
+      expect(verdict(line, deny).kind).toBe("deny");
+    }
   });
 });

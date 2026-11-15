@@ -243,9 +243,10 @@ export interface TranscriptMeta {
   /**
    * Made by an agent (a dispatched worker, an automation or delegated token),
    * not a person: its cards offer no saved approval rule and allow rules don't
-   * run it (docs/secrets-and-memory-design.md §4.1). Written in BOTH saveMeta calls.
+   * run it (docs/secrets-and-memory-design.md §4.1). Written in BOTH saveMeta
+   * calls, false too; absent only in a meta from before it.
    */
-  madeByAgent?: true;
+  madeByAgent?: boolean;
 }
 
 /** Types we persist. Skip ephemeral events like heartbeats. */

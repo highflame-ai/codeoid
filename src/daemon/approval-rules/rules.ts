@@ -79,38 +79,66 @@ const RUN_SUBCOMMANDS: Record<string, ReadonlySet<string>> = {
  * Options that make a build or test tool run code it is handed, or read its
  * instructions from elsewhere: a command on an allow rule holding one is not
  * covered (`make test --eval=…`, `go test -exec=sh`, `npm test --node-options=…`).
- * Long ones match as written or with `=value`; short ones anywhere in a cluster.
+ * Long ones match as written or with `=value`, shortened where the tool takes
+ * that (`abbrev`), with any number of dashes for go (`dashes`); short ones
+ * anywhere in a cluster. A `-f`/`-C` inside the workspace isn't here: the
+ * outside-path check covers the rest, and a workspace Makefile is as writable.
  */
-const CODE_OPTIONS: Record<string, { long: readonly string[]; short?: string }> = {
-  make: { long: ["--eval", "--file", "--makefile", "--directory", "--include-dir"], short: "EfCI" },
-  gmake: { long: ["--eval", "--file", "--makefile", "--directory", "--include-dir"], short: "EfCI" },
-  go: { long: ["-exec", "-toolexec", "-vettool", "-overlay", "-modfile", "-C", "-pgo", "-exec=", "-toolexec="] },
-  cargo: { long: ["--config", "--manifest-path", "-Z"], short: "ZC" },
-  npm: { long: ["--node-options", "--script-shell", "--prefix", "--workspace", "--workspaces", "--userconfig", "--globalconfig", "--config", "--require", "--import", "--eval"], short: "wCcre" },
-  pnpm: { long: ["--node-options", "--script-shell", "--prefix", "--dir", "--filter", "--workspace-root", "--config", "--require", "--eval"], short: "wCcre" },
-  yarn: { long: ["--cwd", "--use-yarnrc", "--require", "--eval", "--config"], short: "re" },
+const CODE_OPTIONS: Record<string, { long: readonly string[]; short?: string; abbrev?: true; dashes?: "any" }> = {
+  make: { long: ["--eval"], short: "E", abbrev: true },
+  go: { long: ["exec", "toolexec", "vettool", "overlay", "modfile", "C", "pgo"], dashes: "any" },
+  cargo: { long: ["--config", "--manifest-path", "-Z"], short: "Z" },
+  npm: { long: ["--node-options", "--script-shell", "--prefix", "--workspace", "--workspaces", "--userconfig", "--globalconfig", "--call"], short: "wCc", abbrev: true },
+  pnpm: { long: ["--node-options", "--script-shell", "--dir", "--filter", "--workspace-root", "--shell-mode"], short: "Cc", abbrev: true },
+  yarn: { long: ["--cwd", "--use-yarnrc", "--require"], abbrev: true },
   bun: { long: ["--preload", "--require", "--cwd", "--config", "--eval", "--print", "--import"], short: "rce" },
-  deno: { long: ["--config", "--import-map", "--preload", "--eval", "--allow-run"], short: "cAe" },
-  pytest: { long: ["--rootdir", "--confcutdir", "--override-ini", "--pyargs", "-p"], short: "pco" },
+  deno: { long: ["--config", "--import-map", "--preload", "--eval"], short: "ce" },
+  pytest: { long: ["--rootdir", "--confcutdir", "--override-ini", "--pyargs"], short: "co" },
   tox: { long: ["--conf", "--root"], short: "c" },
-  docker: { long: ["--output", "--secret", "--ssh", "--build-context", "--file", "--config", "--context", "--host"], short: "ofHc" },
+  docker: { long: ["--output", "--secret", "--ssh", "--build-context", "--config", "--context", "--host", "--allow", "--network"], short: "oHc" },
   gradle: { long: ["--init-script", "--settings-file", "--build-file", "--project-dir", "--include-build"], short: "Icbp" },
   mvn: { long: ["--file", "--settings", "--global-settings", "--toolchains"], short: "fsgt" },
   dotnet: { long: ["--project", "--configfile", "--source"] },
   swift: { long: ["--package-path", "--scratch-path", "-Xswiftc", "-Xcc", "-Xlinker"] },
 };
+/** A project's own wrapper runs as the tool does. */
+const TOOL_ALIASES: Record<string, string> = { gmake: "make", gradlew: "gradle", mvnw: "mvn" };
+
+/** Options with values a build or test tool takes plainly, never code: `mvn -Dtest=FooTest`, `gradle -Pci`, `pytest -p no:cacheprovider`. */
+function plainOption(prog: string, w: string): boolean {
+  if (prog === "mvn") return /^-D(test|skipTests|skipITs|maven\.test\.skip|it\.test|groups|excludedGroups)(=[^=]*)?$/.test(w) || /^-P[\w,!-]+$/.test(w);
+  if (prog === "gradle") return /^-P[\w.-]+(=[^=]*)?$/.test(w);
+  if (prog === "pytest") return /^-pno:[\w.-]+$/.test(w);
+  return false;
+}
 
 /** An option among `words` (after the program) that runs code or reads instructions from elsewhere, or null. */
-function codeOption(prog: string, words: readonly string[]): string | null {
+function codeOption(program: string, words: readonly string[]): string | null {
+  const prog = TOOL_ALIASES[program] ?? program;
   const o = CODE_OPTIONS[prog];
   // `make VAR=value` sets a make variable to text it may run (`$(shell …)`).
-  if ((prog === "make" || prog === "gmake") && words.some((w) => /^[A-Za-z_][A-Za-z0-9_.]*\s*[:+?!]?=/.test(w))) return "a make variable";
+  if (prog === "make" && words.some((w) => /^[A-Za-z_][A-Za-z0-9_.]*\s*[:+?!]?=/.test(w))) return "a make variable";
   if (!o) return null;
-  for (const w of words) {
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i]!;
     if (w === "--") return null;
     if (!w.startsWith("-")) continue;
-    if (o.long.some((l) => w === l || w.startsWith(`${l}=`) || (l.startsWith("--") && w.startsWith(l) && w.length > l.length && !/[a-z]/i.test(w[l.length]!)))) return w;
-    if (o.short && /^-[A-Za-z0-9]+/.test(w) && !w.startsWith("--") && [...(w.slice(1).split("=")[0] ?? "")].some((c) => o.short!.includes(c))) return w;
+    // pytest's `-p no:x` is two words.
+    if (prog === "pytest" && w === "-p" && /^no:[\w.-]+$/.test(words[i + 1] ?? "")) {
+      i++;
+      continue;
+    }
+    if (plainOption(prog, w)) continue;
+    const name = w.split("=")[0]!;
+    if (o.dashes === "any") {
+      // go reads `-exec` and `--exec` alike.
+      if (o.long.includes(name.replace(/^-+/, ""))) return w;
+      continue;
+    }
+    if (o.long.includes(name)) return w;
+    // GNU make, npm, pnpm and yarn take any unambiguous start of a long option (`--ev`, `--node-o`).
+    if (o.abbrev && name.startsWith("--") && name.length > 2 && o.long.some((l) => l.startsWith(name))) return w;
+    if (o.short && /^-[A-Za-z0-9]/.test(w) && !w.startsWith("--") && [...name.slice(1)].some((c) => o.short!.includes(c))) return w;
   }
   return null;
 }
@@ -224,7 +252,8 @@ function denyMatches(cmd: SimpleCommand, p: ShellPattern): boolean {
   const first = words[0];
   if (first === null || first === undefined) return false;
   // Past the program, only a runner's, a wrapper's or a runner subcommand's words may name the one it runs (`uv run git push`).
-  const runs = isRunner(name(first)) || isNever(name(first)) || RUN_SUBCOMMANDS[name(first)]?.has(words[1] ?? "") === true;
+  const subs = RUN_SUBCOMMANDS[name(first)];
+  const runs = isRunner(name(first)) || isNever(name(first)) || (subs !== undefined && words.some((w) => w !== null && subs.has(w))) || name(first) === "yarn";
   for (let at = 0; at < words.length; at++) {
     const w = words[at];
     if (w === null || w === undefined) continue;

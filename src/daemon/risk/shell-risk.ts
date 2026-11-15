@@ -24,7 +24,7 @@
  * tools are.
  */
 import { homedir, userInfo } from "node:os";
-import { realpathSync, statSync } from "node:fs";
+import { lstatSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { isProcSecretPath, kernelPath, secretDirsOf, secretPathVerdict } from "../secret-paths.js";
 import {
@@ -121,7 +121,7 @@ export interface CommandCoverage {
 }
 
 /** Specifiers that load from somewhere other than the workspace: `https://…`, `file:`, `data:`, `npm:`, `jsr:`, … */
-const SPECIFIER = /^(?:[a-z][a-z0-9+.-]*:\/\/|(?:file|data|npm|jsr|node|git|git\+[a-z]+|ssh|http|https|javascript|blob):)/i;
+const SPECIFIER = /^(?:[a-z][a-z0-9+.-]*:\/\/|(?:file|data|npm|jsr|node|git|git\+[a-z]+|ssh|http|https|javascript|blob):|[\w.-]+@[\w.-]+:|(?:github\.com|gitlab\.com|bitbucket\.org)\/)/i;
 
 /** The parts of a rule-matched command's word that may be a path (wider than pathCandidates: a rule runs unasked). */
 function ruleCandidates(v: string): string[] {
@@ -154,20 +154,53 @@ function realOf(abs: string): string {
   return abs;
 }
 
-/** `abs` is inside the workspace, links followed, and no credential file. */
-function realInside(abs: string, ctx: Ctx): boolean {
-  if (isCredentialPath(abs, ctx)) return false;
-  const real = realOf(abs);
-  return where(abs, ctx) === "workspace" && insideOf(real, realOf(ctx.workdir)) && !isCredentialPath(real, ctx);
+/** The workspace's own real path, found once per directory. */
+const realWorkdirs = new Map<string, string>();
+function realWorkdir(workdir: string): string {
+  let real = realWorkdirs.get(workdir);
+  if (real === undefined) {
+    real = realOf(workdir);
+    if (realWorkdirs.size > 256) realWorkdirs.clear();
+    realWorkdirs.set(workdir, real);
+  }
+  return real;
 }
 
-/** Every path a literal word names is inside the workspace (ruleCandidates). */
+/**
+ * `abs` is inside the workspace, links followed, and no credential file. The
+ * text is judged first (the workspace as given or as it really is), so a path
+ * plainly elsewhere never touches the filesystem (an automounted `/net/…`).
+ */
+function realInside(abs: string, ctx: Ctx): boolean {
+  if (isCredentialPath(abs, ctx)) return false;
+  const ws = realWorkdir(ctx.workdir);
+  if (!insideOf(abs, ctx.workdir) && !insideOf(abs, ws)) return false;
+  const real = realOf(abs);
+  return insideOf(real, ws) && !isCredentialPath(real, ctx);
+}
+
+/** A bare name that is something where the command runs (a link named `out`, `-o out`): judged as a path. */
+function existsHere(c: string, ctx: Ctx): boolean {
+  if (c.length > 255 || c.includes("\0")) return false;
+  try {
+    // paths: whether a word names something in the workspace, for judging a rule; nothing opened
+    lstatSync(join(ctx.cwd, c));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Every path a literal word names is inside the workspace (ruleCandidates): `..` read both as text and as the kernel reads it. */
 function wordInside(v: string, ctx: Ctx): boolean {
   for (const c of ruleCandidates(v)) {
     if (SPECIFIER.test(c)) return false;
-    if (!(c === "." || c === ".." || /^[.~/]/.test(c) || c.includes("/"))) continue;
+    if (!(c === "." || c === ".." || /^[.~/]/.test(c) || c.includes("/") || existsHere(c, ctx))) continue;
     const abs = c === "~" || c.startsWith("~/") ? join(ctx.home, c.slice(1)) : c.startsWith("~") ? null : resolve(ctx.cwd, c);
     if (abs === null || !realInside(abs, ctx)) return false;
+    // Not join(): it would collapse the `..` by text before the kernel's reading sees it.
+    const physical = c.startsWith("~") ? abs : kernelPath(isAbsolute(c) ? c : `${ctx.cwd}/${c}`, ctx.cwd);
+    if (physical !== abs && (physical === null || !realInside(physical, ctx))) return false;
   }
   return true;
 }
@@ -191,7 +224,10 @@ export function commandCoverage(command: string, parsed: ParsedShell, ctx: RiskC
   parsed.commands.forEach((cmd, index) => {
     const here: Ctx = { ...full, cwd: cwd ?? full.cwd };
     const inWorkspace = cwd !== null && realInside(cwd, full);
-    const plainRedirects = cmd.redirects.every((r) => notLowRedirect(r, here) === null);
+    // A file it reads by `<` is judged as a path word is (links followed).
+    const plainRedirects = cmd.redirects.every(
+      (r) => notLowRedirect(r, here) === null && (r.op !== "<" || !r.target || (literalWord(r.target) && wordInside(r.target.value!.includes("/") ? r.target.value! : `./${r.target.value}`, here))),
+    );
     const words = [...cmd.argv.slice(1), ...(cmd.wrapped ?? [])];
     const allLiteral = cmd.argv.every(literalWord) && (cmd.wrapped ?? []).every(literalWord);
     const pathsInside = words.every((w) => !literalWord(w) || wordInside(w.value!, here));
@@ -203,8 +239,8 @@ export function commandCoverage(command: string, parsed: ParsedShell, ctx: RiskC
       const certain = !cmd.subshell && !cmd.conditional && cmd.substitution === null && cmd.via.length === 0 && allLiteral;
       let exists = false;
       try {
-        // paths: whether the directory a cd names exists, for judging a rule; nothing opened
-        exists = to !== null && statSync(to).isDirectory();
+        // paths: whether the directory a cd names exists, for judging a rule (only one in the workspace); nothing opened
+        exists = to !== null && (insideOf(to, full.workdir) || insideOf(to, realWorkdir(full.workdir))) && statSync(to).isDirectory();
       } catch {}
       const lands = certain && exists ? to : null;
       out.push({ index, plainRead: false, cd: { inside: lands !== null && realInside(lands, full) }, ...facts });
@@ -213,7 +249,8 @@ export function commandCoverage(command: string, parsed: ParsedShell, ctx: RiskC
     }
     // A plain read inside `$(…)` only hands words to the command around it, which must be covered itself.
     const alone: SimpleCommand = cmd.substitution === "command" ? { ...cmd, substitution: null } : cmd;
-    out.push({ index, plainRead: inWorkspace && notLowCommand(alone, here) === null, ...facts });
+    // A plain read's paths are judged through links too: `cat k/id_rsa` with `k` a link out is no plain read.
+    out.push({ index, plainRead: inWorkspace && allLiteral && pathsInside && plainRedirects && notLowCommand(alone, here) === null, ...facts });
   });
   return out;
 }
