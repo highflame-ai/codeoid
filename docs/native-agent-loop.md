@@ -90,20 +90,22 @@ Session ──▶ NativeProvider (AgentProvider, wrapped by StatelessSessionProv
               └── Compactor       structured checkpoint + ledger   (§8)
 ```
 
-- **Id `native`, one more entry in the backend picker that already exists.** Nothing new is
-  added to choose it:
+- **Id and label `codeoid`, one more entry in the backend picker that already exists.** Users
+  see it as "codeoid" in the dropdown, in `codeoid ls`, and in the reply label ("(codeoid)",
+  `backendLabel`). This doc says "the native loop" for the design. Nothing new is added to
+  choose it:
   - **Choosing it.** The web UI's backend dropdown (`ProviderPicker` in
-    `SessionControls.tsx`, `session.set_provider`) lists `native` next to `claude`, `codex`
+    `SessionControls.tsx`, `session.set_provider`) lists `codeoid` next to `claude`, `codex`
     and `oai:<endpoint>`.
-  - **The model dropdown names the source.** It lists every model `native` can reach, grouped
+  - **The model dropdown names the source.** It lists every model the `codeoid` harness can reach, grouped
     by source, and the model id carries the source: `anthropic/claude-…`, `bedrock/…`,
     `openai/gpt-…`, `oai:<endpoint>/<model>`, `llamacpp/<model>`, `gemini/…`. These sources
     are the accounts and endpoints codeoid already stores
     (`docs/backend-accounts-design.md`).
   - **The terminal has the same verbs:**
-    - `codeoid new <s> <dir> --provider native --model oai:rakuten/glm-5.2`;
-    - `/provider native` and `/model <source>/<id>` in `codeoid attach` and the TUI;
-    - `codeoid fork <s> --backend native`;
+    - `codeoid new <s> <dir> --provider codeoid --model oai:rakuten/glm-5.2`;
+    - `/provider codeoid` and `/model <source>/<id>` in `codeoid attach` and the TUI;
+    - `codeoid fork <s> --backend codeoid`;
     - `codeoid account …` and `codeoid endpoint …` for the sources.
 - **The plain chat backends stay as they are.** `openai`, `oai:*`, `llamacpp` and `gemini` keep
   working, so nothing that depends on them breaks. Once the evals show the native loop is
@@ -115,7 +117,7 @@ Session ──▶ NativeProvider (AgentProvider, wrapped by StatelessSessionProv
   - `appliesToolInputRewrite: true`;
   - `enforcesToolBudget: true`, because every call reaches `canUseTool`;
   - `free` for local models.
-- **Sandbox plan.** `confinementFor("native")` returns `{ kind: "command", fileTools: false }`:
+- **Sandbox plan.** `confinementFor("codeoid")` returns `{ kind: "command", fileTools: false }`:
   - **Shell:** each command is wrapped. This is the mechanism opencode uses today.
   - **File tools:** they run in the daemon and are judged by `hostFileToolBreach` against the
     sandbox's spec, as opencode's are.
@@ -247,7 +249,7 @@ same view.
 - **`Task` starts a child codeoid session.** It is not an in-process agent.
   - The child is a fork with `forkIsolation` and an attenuated ZeroID identity (scopes are a
     subset of the parent's).
-  - It is visible on the fleet board, and it can run on any backend: a `native` parent can
+  - It is visible on the fleet board, and it can run on any backend: a `codeoid` parent can
     hand a review to Claude.
   - It runs in the background by default. The parent gets a `<subagent>` message when the
     child goes idle, and may send it more work (opencode).
@@ -334,7 +336,7 @@ dataset repo, so `codeoid eval push` can publish it unchanged to
 decide otherwise. The schema (tasks, runs, trajectories, reports) is in that directory's
 `README.md`. Rows are append-only.
 
-### 9.3 Runner (`codeoid eval run <suite> --targets claude:opus,native:oai:x/model,...`)
+### 9.3 Runner (`codeoid eval run <suite> --targets claude:opus,codeoid:oai:x/model,...`)
 
 - **One isolated daemon per run.** It has a throwaway HOME, XDG and transcript dir, and a
   port of its own: the `e2e/harness.ts` pattern.
@@ -423,16 +425,16 @@ Following LongCapHarness, a strong model designs and a cheap model executes.
 | Phase | Delivers | Done when |
 |---|---|---|
 | 0. Evals | Task schema, `codeoid eval run` (headless compare, evidence graders, `eval` owner kind), the `/data/codeoid-evals` writer, `codeoid-core` v0, and a baseline on today's backends with 2–3 models, one of them local. | A reproducible report. A rerun of the same protocol matches within noise. |
-| 1. Minimal native loop | `native` id and model sources (Anthropic Messages, OpenAI Chat). Read, Write, Edit, MultiEdit, Bash, Glob, Grep, ask_user, request_directory, memory, MCP. `confinementFor` case and per-command sandbox. Budgets on turns, cost and wall time. Max steps ends with `toolChoice: none` and a summary prompt. Steer and queue mapped to `pushMidTurn`. Settles stale tool calls on resume. | Conformance green, including "autonomous Bash never runs unsandboxed". On `codeoid-core` it is at least as good as opencode on the same endpoint model. |
+| 1. Minimal native loop | `codeoid` id and model sources (Anthropic Messages, OpenAI Chat). Read, Write, Edit, MultiEdit, Bash, Glob, Grep, ask_user, request_directory, memory, MCP. `confinementFor` case and per-command sandbox. Budgets on turns, cost and wall time. Max steps ends with `toolChoice: none` and a summary prompt. Steer and queue mapped to `pushMidTurn`. Settles stale tool calls on resume. | Conformance green, including "autonomous Bash never runs unsandboxed". On `codeoid-core` it is at least as good as opencode on the same endpoint model. |
 | 2. Long sessions | Compaction and checkpoint, the Session-level work ledger for all backends, prompt caching, background Bash, Task as a child session, project instructions and skills index for all backends, the per-turn badge for all backends, `/compact` everywhere, Gemini, and `apply_patch` for patch-format models. | Long-task evals don't regress against phase 1. If the native loop beats the plain chat backends, it becomes their default. |
 | 3. Workers | The native loop as the default worker for non-Claude models in loops, routines and the conductor. An independent diff reviewer as a loop stage (any backend). Lessons with an approval queue. | Loop pass rate on heldout tasks doesn't drop compared with vendor-harness workers. |
 | 4. Harness improvement | §10, gated on heldout evals. | An accepted improvement on heldout that also holds on a second model. |
 
 ## 12. Open decisions
 
-1. **Model ids carry their source** (`oai:rakuten/glm-5.2`), and `native` is one entry in the
+1. **Model ids carry their source** (`oai:rakuten/glm-5.2`), and `codeoid` is one entry in the
    existing backend dropdown (§3). The alternative is one backend id per source
-   (`native:oai:rakuten`). That would make the dropdown longer, but each entry's model list
+   (`codeoid:oai:rakuten`). That would make the dropdown longer, but each entry's model list
    would be shorter.
 2. **Build vs depend on pi's `ai` package** (§4). Proposal: build three protocols and revisit
    past five.
