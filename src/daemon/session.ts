@@ -109,7 +109,7 @@ import { repositoryTopOf } from "./workstreams/folders.js";
 import type { McpGrant } from "./workstreams/grant.js";
 import { LIMITS } from "../protocol/types.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
-import type { PendingToolApproval, SessionApproveOutcome, SessionSandboxInfo, SessionSandboxSetting } from "../protocol/types.js";
+import type { ApprovalRuleOffer, ApprovalSaveScope, PendingToolApproval, SessionApproveOutcome, SessionSandboxInfo, SessionSandboxSetting } from "../protocol/types.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -227,8 +227,10 @@ import { exitCodeOf } from "./memory/facts.js";
 import { type TurnOrigin, turnOrigin } from "./turn-origin.js";
 import { type HeldPath, heldWriteOf, heldWriteReason, writeLandings, writeTargets } from "./held-writes.js";
 import { outsideEffects } from "./risk/effects.js";
-import { assessShellCommandSync, type ShellRisk, UNREADABLE_SHELL_CALL } from "./risk/shell-risk.js";
-import { loadShellParser, shellParserReady } from "./shell/parse.js";
+import { assessShellCommandSync, commandCoverage, type ShellRisk, UNREADABLE_SHELL_CALL } from "./risk/shell-risk.js";
+import { loadShellParser, parseShellSync, shellParserReady } from "./shell/parse.js";
+import type { ApprovalRuleService, RuleSubject, StoredRule } from "./approval-rules/service.js";
+import { formatRule, proposeShellRules, proposeToolRule, type RulePattern, shellLineVerdict, toolRuleMatch } from "./approval-rules/rules.js";
 import { isShellTool, runsNoCommand, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import { asksOutsideSandbox } from "./sandbox/confinement.js";
@@ -238,7 +240,7 @@ import { CLAUDE_ALL_SOCKETS_NOTE, describeSandbox, resolveSandbox, SandboxRequir
 import { type WorktreeEntryFinding, worktreeEntryLine, worktreeEntryWarning } from "./sandbox/worktree-entries.js";
 import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
 import { worktreeFolderNote } from "./sandbox/worktrees.js";
-import { hiddenPathsFor, protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
+import { hiddenPathsFor, protectedWriteTargets, sandboxWorkspaceOf, userHiddenPaths } from "./sandbox/policy.js";
 import { addedDirProblem, addedDirReal, autonomousGrantProblem, checkoutOverlap, inAnyDir, nestedControl, normalizeSandboxDir, type OtherCheckout } from "./sandbox/project-roots.js";
 import { sandboxRootIfMade } from "./sandbox/root.js";
 import type { SecretService } from "./secrets/service.js";
@@ -602,6 +604,8 @@ export interface SessionCreateOptions {
    * workstream's. Undefined result = no fence.
    */
   workstreamFence?: (binding: WorkstreamBinding | undefined, own: readonly string[]) => WorkstreamFence | undefined;
+  /** The owner's saved approval rules (docs/secrets-and-memory-design.md §4.1); none without it. */
+  approvalRules?: ApprovalRuleService;
   /**
    * Role-scoped goal-blackboard mount for a collaboration child: the endpoint
    * URL plus a bearer token that IS the scope (one goal, this role's read/write
@@ -1502,6 +1506,10 @@ export class Session {
   #workstreamEnv: (() => Readonly<Record<string, string>>) | undefined;
   /** The session's read fence (SessionCreateOptions.workstreamFence), for its binding as it is now. */
   #workstreamFence: (() => WorkstreamFence | undefined) | undefined;
+  /** Saved approval rules (SessionCreateOptions.approvalRules). */
+  #approvalRules: ApprovalRuleService | undefined;
+  /** The repository's folder, as a card's "in this repository" names it: found once. */
+  #repositoryLabel: string | undefined;
   /** What a backend gets as extra env: a live view over both (see #liveExtraEnv). */
   #extraEnv: Readonly<Record<string, string>> | undefined;
   /** The extra env the current backend was built with, to rebuild it when the workstream's changes. */
@@ -1929,6 +1937,7 @@ export class Session {
     // workdir and the repository holding it (the sandbox's workspace in a monorepo).
     const own = [...new Set([opts.workdir, repositoryTopOf(opts.workdir, homedir())])];
     this.#workstreamFence = fenceOf ? () => fenceOf(this.#workstream, own) : undefined;
+    this.#approvalRules = opts.approvalRules;
     const extra = opts.extraEnv;
     if (extra) {
       // Before any side effect: a refused key must fail the create, not run a
@@ -6593,10 +6602,62 @@ export class Session {
         input: this.#approvalShown(approvalId, gated.input),
         ...this.#cardRisk(risk, this.#heldWrite(gated.toolName, gated.input)),
         ...this.#cardSandbox(gated.toolName, gated.input, gated.shellCwd),
+        ...this.#pendingRuleOffer(gated, risk),
         ...(ws ? { targetWorkstream: { ...(ws.target.workstream ? { workstream: ws.target.workstream } : {}), ...(ws.target.warning ? { warning: ws.target.warning } : {}) } } : {}),
       });
     }
     return out;
+  }
+
+  /** A waiting call's offer, as its card showed it: nothing when something else about it always asks. */
+  #pendingRuleOffer(gated: { toolName: string; input: unknown; shellCwd?: string | null }, risk: ShellRisk | null): { ruleOffer?: ApprovalRuleOffer } {
+    const input = gated.input as Record<string, unknown>;
+    if (this.#alwaysAsks(gated.toolName, input, risk, gated.shellCwd)) return {};
+    const offer = this.#ruleOffer(gated.toolName, input, risk, gated.shellCwd);
+    return offer ? { ruleOffer: offer } : {};
+  }
+
+  /** What asks whatever rules exist: an unsandboxed request, a credential path, a risky command, a held or Claude-settings write. */
+  #alwaysAsks(toolName: string, input: Record<string, unknown>, risk: ShellRisk | null, shellCwd: string | null | undefined): boolean {
+    // paths: judging a tool call's input (secretPathVerdict): no use of the path
+    const secret = secretPathVerdict(toolName, input, { workdir: this.workdir, configDir: getConfigDir(), cwd: shellCwd });
+    return (
+      this.#unsandboxedRequest(toolName, input) ||
+      secret !== null ||
+      !!risk?.secret ||
+      this.#riskAsks(risk) ||
+      this.#heldWrite(toolName, input) !== null ||
+      this.#writesClaudeSettingsOnNamedAccount(toolName, input)
+    );
+  }
+
+  /**
+   * Save the rules a waiting call's card offers, for this session or its
+   * repository (docs/secrets-and-memory-design.md §4.1), before it is
+   * approved. Only the owner's own token saves; the rules are worked out
+   * again from the input the gate holds, never taken from the client. An
+   * error leaves the call waiting.
+   */
+  saveApprovalRules(approvalId: string, scope: ApprovalSaveScope, sender: AuthContext): { ok: true; rules: string[] } | { ok: false; error: string } {
+    if (!this.#approvalRules) return { ok: false, error: "This daemon doesn't keep approval rules" };
+    if (!this.#isOwnApproval(sender)) return { ok: false, error: "Only the session's owner, with their own token, can save a rule; allow it once instead" };
+    const gated = this.#approvalInputs.get(approvalId);
+    if (!gated || !this.#pendingApprovals.has(approvalId)) return { ok: false, error: "That call isn't waiting for an answer" };
+    const input = gated.input as Record<string, unknown>;
+    const risk = this.#shellRisk(gated.toolName, input, gated.shellCwd);
+    const patterns = this.#alwaysAsks(gated.toolName, input, risk, gated.shellCwd) ? null : this.#offeredPatterns(gated.toolName, input, risk, gated.shellCwd);
+    if (!patterns) return { ok: false, error: "No rule can run this call; allow it once instead" };
+    // paths: the repository's folder, recorded as the rule's label; nothing opened in it
+    this.#repositoryLabel ??= sandboxWorkspaceOf(this.workdir);
+    const where = scope === "session" ? { key: this.id, label: this.name } : { key: this.#workspaceId, label: this.#repositoryLabel };
+    const owner = { accountId: this.accountId, projectId: this.projectId, owner: this.createdBy };
+    const saved: string[] = [];
+    for (const pattern of patterns) {
+      const info = this.#approvalRules.add(owner, { pattern, effect: "allow", scope, ...where });
+      this.#store.audit(sender.sub, "approval_rule.add", this.id, `rule=${info.id} scope=${scope} pattern=${info.rule} from=card`);
+      saved.push(info.rule);
+    }
+    return { ok: true, rules: saved };
   }
 
   /**
@@ -6694,6 +6755,12 @@ export class Session {
     await Promise.race([this.#checkGitControl(sender.sub), new Promise<void>((r) => setTimeout(r, DESTROY_COMMIT_CHECK_MS).unref?.())]);
     this.#destroyed = true;
     this.#unscopeMemory?.();
+    // A session's own saved approval rules end with it (§4.1).
+    try {
+      this.#approvalRules?.endSession(this.id);
+    } catch (e) {
+      console.error(`[codeoid/session ${this.id}] approval rules: ${e instanceof Error ? e.message : String(e)}`);
+    }
     // This session's own servers' clients in the hub: let go (the last user closes them).
     for (const spec of [...this.#mcpRetained.values(), ...this.#mcpToRelease.values()]) this.#mcpHub?.release(spec, this.#mcpTenant());
     this.#mcpRetained.clear();
@@ -9692,6 +9759,115 @@ export class Session {
     return risk?.level === "low" && !risk.secret && this.#mode === "guarded" && (this.#config?.approvals?.autoAllowLowRisk ?? false);
   }
 
+  /** Whose saved approval rules apply to this session's calls, and where it is (docs/secrets-and-memory-design.md §4.1). */
+  #ruleSubject(): RuleSubject {
+    const ws = this.#workstream?.id;
+    return { accountId: this.accountId, projectId: this.projectId, owner: this.createdBy, sessionId: this.id, workspaceId: this.#workspaceId, ...(ws ? { workstreamId: ws } : {}) };
+  }
+
+  /** The rules that apply here; none when they can't be read (logged), so nothing runs on one. */
+  #savedRules(): StoredRule[] {
+    if (!this.#approvalRules) return [];
+    try {
+      return this.#approvalRules.rulesFor(this.#ruleSubject());
+    } catch (e) {
+      console.error(`[codeoid/session ${this.id}] approval rules: ${e instanceof Error ? e.message : String(e)}`);
+      return [];
+    }
+  }
+
+  /** A tool the gate always decides itself (a fleet dispatch, a question, an unresolved path, a directory request): no rule runs or refuses it. */
+  #ruleExempt(toolName: string): boolean {
+    return isFleetSendTool(toolName) || isElicitationTool(toolName) || isUnresolvedPathTool(toolName) || isRequestDirectoryTool(toolName);
+  }
+
+  /** MCP allow rules hold only where no project file may declare a server named like the rule's (#395), as readonly trust. */
+  #mcpRulesHold(toolName: string): boolean {
+    if (!toolName.startsWith("mcp__") || !this.#mcpView) return true;
+    return this.#noteProjectMcpNames() && this.#mcpProjectNames.size === 0;
+  }
+
+  /** A shell line, read for rules: where it runs, as #shellRisk judges it. */
+  #ruleLine(call: { command: string; cwd: string | null }, shellCwd: string | null | undefined) {
+    const base = typeof shellCwd === "string" && isAbsolute(shellCwd) ? shellCwd : this.workdir;
+    const cwd = call.cwd ? resolvePath(base, call.cwd) : base;
+    const parsed = parseShellSync(call.command);
+    return { parsed, coverage: commandCoverage(call.command, parsed, { cwd, workdir: this.workdir, configDir: getConfigDir() }) };
+  }
+
+  /**
+   * What the saved rules make of a call (§4.1): a deny rule refuses it in
+   * every mode; allow rules run it in guarded mode only, and a shell line
+   * only when it is low or medium and names no credential file. Side-effect
+   * free, so the gate and its card read the same verdict.
+   */
+  #ruleVerdict(
+    toolName: string,
+    input: Record<string, unknown>,
+    risk: ShellRisk | null,
+    shellCwd: string | null | undefined,
+  ): { kind: "deny"; rule: StoredRule } | { kind: "allow"; rules: StoredRule[] } | null {
+    if (!this.#approvalRules || this.#ruleExempt(toolName)) return null;
+    const rules = this.#savedRules();
+    if (rules.length === 0) return null;
+    const call = shellCallOf(toolName, input);
+    if (call) {
+      const line = this.#ruleLine(call, shellCwd);
+      const v = shellLineVerdict(line.parsed, line.coverage, rules);
+      if (v.kind === "deny") return { kind: "deny", rule: v.rule as StoredRule };
+      const plain = risk !== null && (risk.level === "low" || risk.level === "medium") && !risk.secret && !risk.unreadable;
+      return v.kind === "allow" && this.#mode === "guarded" && plain ? { kind: "allow", rules: v.rules as StoredRule[] } : null;
+    }
+    if (isShellTool(toolName)) return null;
+    const m = toolRuleMatch(toolName, input, rules) as StoredRule | null;
+    if (!m) return null;
+    if (m.effect === "deny") return { kind: "deny", rule: m };
+    return this.#mode === "guarded" && this.#mcpRulesHold(toolName) ? { kind: "allow", rules: [m] } : null;
+  }
+
+  /**
+   * The rules a card offers to save for a call (§4.1), or undefined: only in
+   * guarded mode, on a call a rule could run (low or medium, no credential
+   * file, nothing else that always asks).
+   */
+  #ruleOffer(toolName: string, input: Record<string, unknown>, risk: ShellRisk | null, shellCwd: string | null | undefined): ApprovalRuleOffer | undefined {
+    const patterns = this.#offeredPatterns(toolName, input, risk, shellCwd);
+    if (!patterns) return undefined;
+    // paths: the repository's folder, named on the card's button; nothing opened in it
+    this.#repositoryLabel ??= sandboxWorkspaceOf(this.workdir);
+    return { rules: patterns.map(formatRule), scopes: ["session", "repository"], repository: this.#repositoryLabel };
+  }
+
+  #offeredPatterns(toolName: string, input: Record<string, unknown>, risk: ShellRisk | null, shellCwd: string | null | undefined): RulePattern[] | null {
+    if (!this.#approvalRules || this.#mode !== "guarded" || this.#ruleExempt(toolName)) return null;
+    const call = shellCallOf(toolName, input);
+    if (call) {
+      if (!risk || (risk.level !== "low" && risk.level !== "medium") || risk.secret || risk.unreadable) return null;
+      const line = this.#ruleLine(call, shellCwd);
+      return proposeShellRules(line.parsed, line.coverage, this.#savedRules());
+    }
+    if (isShellTool(toolName) || !this.#mcpRulesHold(toolName)) return null;
+    const p = proposeToolRule(toolName, input);
+    return p ? [p] : null;
+  }
+
+  /** Refuse a call a deny rule matches, in every mode: its card, the audit, and an info line. */
+  #refuseByRule(approvalId: string, toolName: string, rule: StoredRule, sender: AuthContext): { behavior: "deny"; message: string } {
+    const reason = `Refused by your saved rule ${rule.text} (${rule.scope}); remove it in Settings → Approvals to allow this`;
+    this.#approvalPatchKeys.delete(approvalId);
+    this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: reason });
+    this.#store.audit(sender.sub, "session.rule_deny", this.id, `rule=${rule.id} scope=${rule.scope} tool=${toolName}`);
+    this.#approvalRules?.noteUse(this.#ruleSubject(), rule.id);
+    const infoMsg = this.#makeMessage("info", `⛔ Refused ${toolName}: your rule ${rule.text}`, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "approval_rule.denied",
+      tool: toolName,
+      rule: rule.text,
+    });
+    this.#persistAndBuffer(infoMsg);
+    this.#broadcastRaw(infoMsg);
+    return { behavior: "deny", message: reason };
+  }
+
   /**
    * In autonomous mode, a call that would have asked and that the OS sandbox
    * can't be left to contain (#448): refused at once, never asked, since
@@ -10000,6 +10176,9 @@ export class Session {
       // OS sandbox can't be left to contain is refused at once, with its reason.
       const refusal = this.#autonomousRefusal(toolName, effectiveInput, risk, secret, held);
       if (refusal) return this.#refuseAutonomous(approvalId, toolName, refusal, sender);
+      // Saved rules (§4.1): a deny rule refuses in every mode; allow rules run it in guarded mode only.
+      const ruled = this.#ruleVerdict(toolName, effectiveInput, risk, shellCwd);
+      if (ruled?.kind === "deny") return this.#refuseByRule(approvalId, toolName, ruled.rule, sender);
       if (held) {
         this.#store.audit(sender.sub, held.what === "git" ? "session.git_structure_write_ask" : "session.project_settings_write_ask", this.id, `tool=${toolName} path=${held.path}`);
       }
@@ -10013,14 +10192,22 @@ export class Session {
         !riskAsks &&
         secret?.action !== "ask" &&
         !settingsWrite &&
-        (this.#riskAllows(toolName, risk) || this.#shouldAutoApprove(toolName));
+        (this.#riskAllows(toolName, risk) || ruled?.kind === "allow" || this.#shouldAutoApprove(toolName));
 
       if (autoApprove) {
         this.#approvalIdToMessageId.delete(approvalId); // clean up — no manual approval will reference this
         this.#approvalPatchKeys.delete(approvalId);
         // A risky command autonomous mode ran (the sandbox holds it, #448) says so in the audit.
         const level = risk && (risk.level === "high" || risk.level === "unknown" || risk.unreadable) ? ` risk=${risk.unreadable ? "unreadable" : risk.level}` : "";
-        this.#store.audit(sender.sub, "session.auto_approve", this.id, `tool=${toolName} mode=${this.#mode}${level}`);
+        if (ruled?.kind === "allow" && !this.#riskAllows(toolName, risk)) {
+          // What ran it, rule by rule: the settings list says when and how often each was used.
+          for (const r of ruled.rules) {
+            this.#store.audit(sender.sub, "session.rule_allow", this.id, `rule=${r.id} scope=${r.scope} tool=${toolName}`);
+            this.#approvalRules?.noteUse(this.#ruleSubject(), r.id);
+          }
+        } else {
+          this.#store.audit(sender.sub, "session.auto_approve", this.id, `tool=${toolName} mode=${this.#mode}${level}`);
+        }
         // Turn status only. A background agent's call between turns must not
         // move an idle session to tool_running: nothing would ever move it
         // back, and the background wake (gated on idle) would never fire.
@@ -10714,15 +10901,18 @@ export class Session {
         const secret = secretPathVerdict(event.name, event.input, { workdir: this.workdir, configDir: getConfigDir(), cwd: event.shellCwd });
         // Claude's sandbox asking for a host: decided by the session's network alone (#448).
         const networkAsk = event.name === SANDBOX_NETWORK_TOOL && this.#sandbox?.info?.state === "on";
+        // Saved rules (§4.1), as the gate reads them.
+        const ruled = networkAsk ? null : this.#ruleVerdict(event.name, event.input, risk, event.shellCwd);
+        const asksAnyway =
+          this.#unsandboxedRequest(event.name, event.input) ||
+          secret !== null ||
+          !!risk?.secret ||
+          this.#riskAsks(risk) ||
+          !!held ||
+          this.#writesClaudeSettingsOnNamedAccount(event.name, event.input);
         const autoApprove = networkAsk
           ? this.#sandbox?.info?.network === "on"
-          : !this.#unsandboxedRequest(event.name, event.input) &&
-          secret === null &&
-          !risk?.secret &&
-          !this.#riskAsks(risk) &&
-          !held &&
-          !this.#writesClaudeSettingsOnNamedAccount(event.name, event.input) &&
-          (this.#riskAllows(event.name, risk) || this.#peekAutoApprove(event.name));
+          : !asksAnyway && (this.#riskAllows(event.name, risk) || ruled?.kind === "allow" || this.#peekAutoApprove(event.name));
         // end_attempt: the gate will refuse this call outright — no approval card.
         const budgetDenied = this.#budgetExhausted || this.#budgetSpentFor(event.name);
         // Autonomous mode refuses it outright (#autonomousRefusal): no approval card either.
@@ -10741,7 +10931,9 @@ export class Session {
               ? { reason: fenceRefusalText(fenced) }
               : outside
                 ? { reason: hostFileBreachReason(outside) }
-                : this.#autonomousRefusal(event.name, event.input, risk, secret, held);
+                : (this.#autonomousRefusal(event.name, event.input, risk, secret, held) ??
+                  (ruled?.kind === "deny" ? { reason: `Refused by your saved rule ${ruled.rule.text} (${ruled.rule.scope})` } : null));
+        const ruleOffer = refused || autoApprove || asksAnyway || networkAsk ? undefined : this.#ruleOffer(event.name, event.input, risk, event.shellCwd);
         const toolMsg = this.#makeMessage(
           "tool_call",
           `${event.name}(${Object.keys(event.input).join(", ")})`,
@@ -10766,6 +10958,7 @@ export class Session {
                   ...this.#targetWorkstreamFor(event.name, event.input, event.approvalId),
                   ...this.#cardRisk(risk, held),
                   ...this.#cardSandbox(event.name, event.input, event.shellCwd),
+                  ...(ruleOffer ? { ruleOffer } : {}),
                 } as unknown as ToolState),
           },
         );

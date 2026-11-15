@@ -1354,10 +1354,17 @@ export class TelegramFrontend implements Frontend {
     const kb = new InlineKeyboard()
       .text("✅ Approve", `a:${short}:y`)
       .text("❌ Deny", `a:${short}:n`);
+    // Approve and keep the answer (docs/secrets-and-memory-design.md §4.1): the rules it saves, a button per scope.
+    const offer = tool.state.phase === "waiting_confirmation" ? tool.state.ruleOffer : undefined;
+    if (offer) {
+      kb.row();
+      for (const scope of offer.scopes) kb.text(scope === "session" ? "✅ For this session" : "✅ In this repo", `a:${short}:${scope === "session" ? "s" : "r"}`);
+    }
+    const saves = offer ? `\n⟲ saves ${offer.rules.join(", ")}` : "";
     this.#bot.api
       .sendMessage(
         chatId,
-        `⚠️ Permission needed — ${tool.name}\n${String(desc).slice(0, 800)}${workstream}${risk}${sandbox}${cost}`,
+        `⚠️ Permission needed — ${tool.name}\n${String(desc).slice(0, 800)}${workstream}${risk}${sandbox}${cost}${saves}`,
         { reply_markup: kb } as Record<string, unknown>,
       )
       .catch(() => {});
@@ -1519,21 +1526,29 @@ export class TelegramFrontend implements Frontend {
     };
 
     if (kind === "a") {
-      const approved = rest[0] === "y";
-      this.#approvals.delete(key);
-      await this.#manager.handle(
+      const save = rest[0] === "s" ? "session" : rest[0] === "r" ? "repository" : undefined;
+      const approved = rest[0] === "y" || save !== undefined;
+      const res = await this.#manager.handle(
         {
           type: "session.approve",
           id: randomUUID(),
           sessionId: pending.sessionId,
           approvalId: pending.approvalId,
           approved,
+          ...(save ? { save } : {}),
         },
         state.auth,
         client,
       );
+      // A refused save leaves the call waiting: the buttons stay, and the reason is shown.
+      if (res?.type === "response.error") {
+        await ctx.answerCallbackQuery({ text: res.error.slice(0, 190), show_alert: true }).catch(() => {});
+        return;
+      }
+      this.#approvals.delete(key);
+      const done = save ? `✅ Approved, and allowed ${save === "session" ? "for this session" : "in this repository"}` : approved ? "✅ Approved" : "❌ Denied";
       await ctx.answerCallbackQuery({ text: approved ? "Approved" : "Denied" }).catch(() => {});
-      await ctx.editMessageText(approved ? "✅ Approved" : "❌ Denied").catch(() => {});
+      await ctx.editMessageText(done).catch(() => {});
       return;
     }
 

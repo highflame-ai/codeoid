@@ -56,7 +56,7 @@ Within what it recognises, the reader over-states rather than under-states:
 
 ## What each level does
 
-- **Guarded mode** asks about every shell command, and says its level and why on the card. **Low** runs without asking there if you set `approvals.autoAllowLowRisk` to `true` (off by default). On Claude a `permissions.allow` rule in your Claude settings runs a medium one unasked; a high or not-understood one (or one nothing could be read of: the parser isn't loaded, the line is over 100,000 characters, the tool call holds no command) never runs on such a rule, it is handed to codeoid's gate.
+- **Guarded mode** asks about every shell command, and says its level and why on the card. **Low** runs without asking there if you set `approvals.autoAllowLowRisk` to `true` (off by default). A low or medium one also runs without asking when your [saved rules](#saved-rules) cover it. On Claude a `permissions.allow` rule in your Claude settings runs a medium one unasked; a high or not-understood one (or one nothing could be read of: the parser isn't loaded, the line is over 100,000 characters, the tool call holds no command) never runs on such a rule, it is handed to codeoid's gate.
 - **Interactive mode** asks about every call.
 - **Autonomous mode** runs every shell command, whatever its level, high and not understood included, within its tool budget (below). The level stays on the card and in the audit log (`session.auto_approve … risk=high`).
 - `approvals.askOnUnknown` has no effect any more: guarded mode asks about every command that isn't low, and autonomous mode asks about none. It is still accepted, so a config that sets it loads.
@@ -82,12 +82,77 @@ The approval prompt says the level and why, in the web UI, the terminal UI, Tele
 ```json
 {
   "approvals": {
-    "autoAllowLowRisk": false
+    "autoAllowLowRisk": false,
+    "sessionGrantHours": 8
   }
 }
 ```
 
 Rewinding uses the same reading of a command for its "not undone by going back" list: it lists commands with effects outside the workspace's files (a push, an install, a write outside the workspace, `sudo`), not every command whose text mentions one. A command is read in the directory it ran in, as the gate read it: one opencode ran with a `workdir` outside the workspace is listed when it writes there, and one in a directory opencode couldn't resolve for certain is judged in each place it may have run.
+
+## Saved rules
+
+In guarded mode you can answer a card once for more than the one call. The card offers the rule it would save:
+
+- **Allow for this session.** The rule lasts `approvals.sessionGrantHours` (8 by default), or until the session
+  is destroyed.
+- **Allow in this repository.** The rule applies to all your sessions in the repository, its worktrees included.
+
+The web UI, Telegram and Slack show these as buttons. In the terminal, run
+`codeoid approve <session> --save session|repository`.
+
+A rule is one of:
+
+| Rule | Matches |
+| --- | --- |
+| `Bash(npm test)` | exactly `npm test` |
+| `Bash(npm test:*)` | `npm test`, and `npm test` with more words after it |
+| `mcp__linear__list_issues` | that MCP tool |
+| `WebFetch(domain:docs.rs)` | a fetch of exactly that host |
+
+For a command, the card proposes `program subcommand:*` (`npm test:*`, `cargo build:*`) when the second word
+reads as a subcommand. Otherwise it proposes the exact command.
+
+A command line runs on rules only when every command in it is covered. A command is covered when it is a plain
+read (`tail -50` in `npm test 2>&1 | tail -50`), a `cd` into the workspace, or a match for one of your rules.
+These never run on a rule:
+
+- a command rated high or not understood, or one naming a credential file;
+- a line that sets a variable (`CI=1 npm test`), or uses a loop or arithmetic;
+- a command run through a wrapper (`sudo`, `env`, `timeout`, `xargs`, `bash -c`);
+- a command that writes with a redirect (`> out.txt`; `> /dev/null` is fine);
+- a command that runs outside the workspace.
+
+There are no rules for shells, `eval` or wrappers. An interpreter or package runner needs what it runs named:
+`Bash(python3 manage.py test:*)`, not `Bash(python3:*)`.
+
+Only the session's owner, with their own token, can save a rule. Anyone else can still allow the call once.
+
+Interactive mode ignores allow rules. Autonomous mode doesn't need them.
+
+**Deny rules** refuse what they match in every mode. You add them in settings or the CLI, not on a card. A deny
+rule matches a command however it is run: `Bash(npm publish:*)` also refuses `sudo npm publish`.
+
+Rules are listed, added and removed in **Settings → Approvals**, or with these commands:
+
+```bash
+codeoid approvals ls
+codeoid approvals add 'Bash(make lint)' --repository .
+codeoid approvals add 'WebFetch(domain:docs.rs)' --everywhere
+codeoid approvals add 'Bash(npm publish:*)' --deny --everywhere
+codeoid approvals rm <id>
+```
+
+The list shows where each rule applies, when it last ran a call, and how many times it has. A rule can apply to a
+session, a repository, a workstream, or everywhere.
+
+Each rule is yours alone and applies only to your own sessions. Each use is audited:
+
+- `session.rule_allow` when a rule runs a call;
+- `session.rule_deny` when a rule refuses one;
+- `approval_rule.add` and `approval_rule.remove` when a rule is added or removed.
+
+Codex names only the server when it asks about an MCP call, so MCP rules don't apply to Codex's MCP calls.
 
 ## Autonomous mode
 

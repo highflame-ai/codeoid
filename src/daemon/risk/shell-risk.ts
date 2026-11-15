@@ -95,6 +95,49 @@ export function assessShellCommandSync(command: string, ctx: RiskContext): Shell
 
 type Ctx = Required<RiskContext> & { /** `$HOME` can't have been changed by the line (see assessShellCommandSync). */ homeFixed?: boolean };
 
+/** What saved approval rules need to know of one simple command of a line (docs/secrets-and-memory-design.md §4.1). */
+export interface CommandCoverage {
+  /** Its place in `parsed.commands`. */
+  index: number;
+  /** A plain read on low's allow-list, judged on its own where it runs. */
+  plainRead: boolean;
+  /** A `cd` / `pushd` / `popd`: whether it lands on a known directory inside the workspace. */
+  cd?: { inside: boolean };
+  /** It runs inside the workspace, after any `cd` before it. */
+  inWorkspace: boolean;
+  /** Its redirects only read inside the workspace, duplicate a descriptor or write /dev/null. */
+  plainRedirects: boolean;
+}
+
+/**
+ * Each simple command of a line, as saved approval rules judge it. A `cd` is
+ * followed as judgeLine follows one, and a `cd` to somewhere not known leaves
+ * every command after it outside the workspace. The line's own conditions (understood, no
+ * assignment or construct) are the caller's to check.
+ */
+export function commandCoverage(command: string, parsed: ParsedShell, ctx: RiskContext): CommandCoverage[] {
+  const full: Ctx = { ...ctx, home: ctx.home ?? homedir(), homeFixed: !/(^|[^$\w{])HOME\b/.test(command) };
+  const out: CommandCoverage[] = [];
+  let cwd: string | null = full.cwd;
+  parsed.commands.forEach((cmd, index) => {
+    const here: Ctx = { ...full, cwd: cwd ?? full.cwd };
+    const inWorkspace = cwd !== null && where(cwd, full) === "workspace";
+    const plainRedirects = cmd.redirects.every((r) => notLowRedirect(r, here) === null);
+    const prog = programOf(cmd);
+    if (cmd.argv[0]?.value === prog && (prog === "cd" || prog === "pushd" || prog === "popd")) {
+      const to = cdTarget(cmd, prog, cwd, full);
+      const inside = to !== null && cmd.argv.slice(1).every((w) => w.value !== null && !w.glob && !w.input) && where(to, full) === "workspace";
+      out.push({ index, plainRead: false, cd: { inside }, inWorkspace, plainRedirects });
+      cwd = to;
+      return;
+    }
+    // A plain read inside `$(…)` only hands words to the command around it, which must be covered itself.
+    const alone: SimpleCommand = cmd.substitution === "command" ? { ...cmd, substitution: null } : cmd;
+    out.push({ index, plainRead: inWorkspace && notLowCommand(alone, here) === null, inWorkspace, plainRedirects });
+  });
+  return out;
+}
+
 class Verdict {
   level: RiskLevel = "low";
   readonly reasons: Array<{ level: RiskLevel; text: string }> = [];

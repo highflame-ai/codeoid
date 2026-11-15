@@ -330,6 +330,87 @@ The rules that keep it safe:
 Claude's own `permissions.allow` rules keep working on Claude as today. Codeoid's rules work on every
 backend.
 
+### 4.1 S3 in detail
+
+**A rule** has a tool, a pattern, an effect (allow or deny), a scope and an owner:
+
+| Form | Matches |
+| --- | --- |
+| `Bash(npm test)` | exactly `npm test` |
+| `Bash(npm test:*)` | `npm test`, and `npm test` followed by any words |
+| `mcp__linear__list_issues` | that MCP tool |
+| `WebFetch(domain:docs.rs)` | an http(s) fetch of exactly that host (no subdomains) |
+
+A rule belongs to the user who saved it, in their tenant, and applies only to that user's sessions. The scope is one of:
+
+- `session`: that session, until `approvals.sessionGrantHours` (8) have passed, or the session is destroyed.
+- `repository`: every session of that user in the repository, its worktrees included. The key is the session's
+  `workspaceId`, the same one memory uses: a hash of git's common dir, or of the folder outside a repository.
+- `workstream`: every session homed in that workstream.
+- `everywhere`.
+
+**A shell line runs on allow rules** only in guarded mode, and only when all of these hold:
+
+- The line is fully understood (no problems, not unreadable). It has no loop, `case`, function, `declare`,
+  `[[ … ]]` or `(( … ))`, no variable assignment (`X=1 npm test` sets the program's environment) and no
+  arithmetic. Its level is low or medium, and it names no credential file.
+- No deny rule matches any of its simple commands.
+- Every simple command is covered, by being one of these:
+  - a plain read, as low's allow-list judges one command (`tail -50` after `npm test 2>&1 |`);
+  - a `cd` / `pushd` / `popd` to a literal directory inside the workspace;
+  - a match for an allow rule. That means:
+    - The program is a literal word, equal to the rule's.
+    - It isn't run through a wrapper (`sudo`, `env`, `timeout`, `xargs`, `bash -c`, `find -exec`).
+    - It doesn't run its input as a script.
+    - Its words are literal and equal to the rule's for the rule's words. An exact rule also needs the same
+      number of words.
+    - A redirect only reads, duplicates a descriptor, or writes to `/dev/null`.
+    - It runs in the workspace, after any `cd`.
+- A command inside `$(…)` is a simple command of its own, so it must be covered too.
+
+**What can't be a rule:**
+
+- A rule for a shell (`bash`, `sh`, `zsh`, …), `eval`, `exec`, `source`, `.`, or a privilege or wrapper
+  program (`sudo`, `doas`, `su`, `env`, `xargs`, `nohup`, `nice`, `timeout`, `time`, `watch`, `flock`,
+  `script`, `setsid`, `command`, `builtin`) is refused.
+- So is a program-only wildcard (`Bash(python3:*)`) for interpreters and package runners (`python*`, `node`,
+  `deno`, `bun`, `perl`, `ruby`, `php`, `lua`, `awk`, `npx`, `bunx`, `pnpx`, `uvx`, `pipx`, `pwsh`, …).
+  These need a first word that isn't an option, such as `Bash(python3 manage.py test:*)`.
+- No rule is bare `Bash` or `Bash(*)`.
+
+**The card offers** "Allow once", "Allow for this session" and "Allow in this repository":
+
+- The two save buttons appear only in guarded mode, when the call is one a rule could run.
+- The card names the rules a save would add. For each simple command not already covered, the daemon proposes
+  `program subcommand:*` when the second word is subcommand-like (`npm test:*`, `cargo build:*`). Otherwise it
+  proposes the exact command.
+- The daemon works out the rules again from the call's own input when the answer arrives. A client never sends
+  rule text.
+- Saving needs the session owner's own, undelegated token. Any other approver's save is refused and the card stays
+  open. A delegated approver can still allow once.
+
+**Settings → Approvals and `codeoid approvals ls | add | rm`** list a user's rules:
+
+- Each row shows its scope, when it was last used and how many times.
+- The user adds rules there for any scope, and deny rules too.
+- The user removes them there.
+- Adding needs `settings:write` and an undelegated token. Listing and removing cover only the user's own rules.
+
+**Where rules apply:** in the session's gate, on every backend. They apply after every refusal (credential paths,
+the workstream fence, pinned paths, held writes), and never to a call that always asks (high, not understood,
+a credential search, an unsandboxed request, an elicitation tool, a fleet dispatch, an unresolved path).
+
+- **Deny rules** refuse in every mode, the card saying which rule.
+- **Interactive mode** ignores allow rules.
+- **Autonomous mode** doesn't need allow rules.
+- **Codex** names only the server in its MCP approval, so MCP rules don't apply to Codex's MCP calls.
+
+**Audit:**
+
+- `approval_rule.add` and `approval_rule.remove` record changes to the rules.
+- `session.rule_allow rule=<id> scope=<kind> tool=…` records each call a rule ran.
+- `session.rule_deny` records each call a rule refused.
+
 ## 5. S4 — atuin as a source
 
 Atuin already captures the user's own shell history, command output, and every coding agent's

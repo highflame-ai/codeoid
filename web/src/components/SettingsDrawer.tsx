@@ -43,6 +43,7 @@ import { AccountsPanel, focusAccountsBackend } from "./AccountsPanel";
 import { EndpointsPanel } from "./EndpointsPanel";
 import { WorkstreamsPanel } from "./WorkstreamsPanel";
 import { CredentialsPanel } from "./CredentialsPanel";
+import { ApprovalRulesPanel } from "./ApprovalRulesPanel";
 
 /**
  * A backend tab whose id names a backend whose OWN (daemon-wide) login codeoid
@@ -70,6 +71,7 @@ const SYNTHETIC_TABS = [
   { id: "accounts", icon: "⚿", title: "Accounts" },
   { id: "workstreams", icon: "◈", title: "Workstreams" },
   { id: "credentials", icon: "⚷", title: "Credentials" },
+  { id: "approvals", icon: "✓", title: "Approvals" },
   { id: "endpoints", icon: "⇄", title: "OpenAI endpoints" },
 ] as const;
 const isSyntheticTab = (id: string) => SYNTHETIC_TABS.some((t) => t.id === id);
@@ -246,6 +248,9 @@ const SettingsDrawer: Component = () => {
               </Show>
               <Show when={activeTab() === "credentials"}>
                 <CredentialsPanel />
+              </Show>
+              <Show when={activeTab() === "approvals"}>
+                <ApprovalRulesPanel />
               </Show>
               <Show when={activeTab() === "endpoints"}>
                 <EndpointsPanel />

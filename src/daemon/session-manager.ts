@@ -24,7 +24,7 @@ import { registerSecretPaths } from "./secret-paths.js";
 import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { type FleetCardTarget, type ForkPoint, RewindError, type SendHold, SendStoppedError, SHUTDOWN_AUTH, Session, type AttachedClient, type WindowScope } from "./session.js";
 import type { CanonicalTurn } from "./providers/canonical.js";
 import { sweepCheckpoints } from "./checkpoints.js";
@@ -154,7 +154,10 @@ import type { SandboxRegistry } from "./sandbox/registry.js";
 import { canonicalAddedDirs, effectiveSetting, openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import { checkPinned, type PinnedDir, PinnedPathError } from "./sandbox/pinned.js";
 import { sandboxRootIfMade } from "./sandbox/root.js";
-import { hiddenPathsFor, sandboxConfigOf } from "./sandbox/policy.js";
+import { hiddenPathsFor, sandboxConfigOf, sandboxWorkspaceOf } from "./sandbox/policy.js";
+import { ApprovalRuleService } from "./approval-rules/service.js";
+import { turnOrigin } from "./turn-origin.js";
+import { parseRule } from "./approval-rules/rules.js";
 import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
@@ -588,6 +591,8 @@ export class SessionManager {
    */
   #modelLimits = new Map<string, number>();
   #config?: CodeoidConfig;
+  /** Saved approval rules (docs/secrets-and-memory-design.md §4.1). */
+  #approvalRules: ApprovalRuleService;
   /** Workstreams (docs/workstreams-design.md): decides a session's home; the session keeps it. */
   #workstreams: WorkstreamService;
   /** Where credential values live (workstreams G2): read when used, never cached. */
@@ -794,6 +799,7 @@ export class SessionManager {
     if (opts?.config?.credentialStore?.kind === "dir") registerSecretPaths({ dirs: [opts.config.credentialStore.path] });
     this.#sandboxRegistry = opts?.sandboxRegistry;
     this.#secretService = opts?.secretService;
+    this.#approvalRules = new ApprovalRuleService(store, { sessionGrantHours: () => this.#config?.approvals?.sessionGrantHours });
     if (opts?.config?.worktree?.setup) this.#worktreeSetupPolicy = opts.config.worktree.setup;
     this.#compressionRegistry = opts?.compressionRegistry;
     this.#endpoints = opts?.endpoints ?? new EndpointStore();
@@ -1730,6 +1736,10 @@ mcpHub: this.#mcpHub,
       case "secret.reveal":
       case "secret.forget":
         return this.#secretHandle(msg, auth);
+      case "approval_rules.list":
+      case "approval_rules.add":
+      case "approval_rules.remove":
+        return this.#approvalRulesHandle(msg, auth);
       case "mcp.oauth.begin":
         return this.#mcpOAuthBegin(msg, auth);
       case "mcp.oauth.complete":
@@ -2391,6 +2401,7 @@ mcpHub: this.#mcpHub,
     mcpGrant: (b: WorkstreamBinding | undefined) => McpGrant | undefined;
     workstreamFence: (b: WorkstreamBinding | undefined, own: readonly string[]) => WorkstreamFence | undefined;
     secrets?: SecretService;
+    approvalRules: ApprovalRuleService;
   } {
     const { missing } = this.#workstreams.envFor(binding, this.#secrets);
     if (missing.length > 0) {
@@ -2407,6 +2418,7 @@ mcpHub: this.#mcpHub,
       mcpGrant: (b) => this.#workstreams.grantFor(b),
       workstreamFence: (b, own) => this.#workstreamFence(b, own),
       ...(this.#secretService ? { secrets: this.#secretService } : {}),
+      approvalRules: this.#approvalRules,
     };
   }
 
@@ -3656,6 +3668,63 @@ mcpHub: this.#mcpHub,
     // The value never goes to the audit, only who saw which one.
     this.#store.audit(auth.sub, "secret.reveal", "", `workstream=${msg.workstream || "-"} fingerprint=${msg.fingerprint} kind=${kept.kind}`);
     return { type: "secret.reveal.result", requestId: msg.id, kind: kept.kind, value };
+  }
+
+  /**
+   * Saved approval rules (docs/secrets-and-memory-design.md §4.1): a caller's
+   * own, listed with settings:read; added and removed with settings:write and
+   * an undelegated token, each audited. A scope is named by one of the
+   * caller's sessions, a folder, a configured workstream, or nothing.
+   */
+  #approvalRulesHandle(msg: Extract<ClientMessage, { type: "approval_rules.list" | "approval_rules.add" | "approval_rules.remove" }>, auth: AuthContext): DaemonMessage {
+    const owner = { accountId: auth.accountId, projectId: auth.projectId, owner: auth.sub };
+    if (msg.type === "approval_rules.list") {
+      if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_READ)) {
+        return { type: "response.error", requestId: msg.id, error: "Missing scope: settings:read", code: "forbidden" };
+      }
+      return { type: "approval_rules.list.result", requestId: msg.id, rules: this.#approvalRules.list(owner) };
+    }
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) {
+      return { type: "response.error", requestId: msg.id, error: "Missing scope: settings:write", code: "forbidden" };
+    }
+    if (turnOrigin(auth) !== "user") {
+      return { type: "response.error", requestId: msg.id, error: "Only your own token can change approval rules, not a delegated one", code: "forbidden" };
+    }
+    if (msg.type === "approval_rules.remove") {
+      if (!this.#approvalRules.remove(owner, msg.ruleId)) return { type: "response.error", requestId: msg.id, error: "No such rule of yours", code: "not_found" };
+      this.#store.audit(auth.sub, "approval_rule.remove", "", `rule=${msg.ruleId}`);
+      return { type: "response.ok", requestId: msg.id };
+    }
+    const parsed = parseRule(msg.rule);
+    if (!parsed.ok) return { type: "response.error", requestId: msg.id, error: parsed.error, code: "invalid_request" };
+    const where = this.#ruleScope(msg, auth);
+    if ("error" in where) return { type: "response.error", requestId: msg.id, error: where.error, code: where.code };
+    const info = this.#approvalRules.add(owner, { pattern: parsed.pattern, effect: msg.effect, scope: msg.scope, ...where });
+    this.#store.audit(auth.sub, "approval_rule.add", msg.sessionId ?? "", `rule=${info.id} scope=${msg.scope} effect=${msg.effect} pattern=${info.rule}`);
+    return { type: "approval_rules.add.result", requestId: msg.id, rule: info };
+  }
+
+  /** The key and label of a rule's scope, from what the caller names; an error when it names nothing of theirs. */
+  #ruleScope(
+    msg: Extract<ClientMessage, { type: "approval_rules.add" }>,
+    auth: AuthContext,
+  ): { key: string; label: string } | { error: string; code: "invalid_request" | "not_found" } {
+    if (msg.scope === "everywhere") return { key: "", label: "everywhere" };
+    if (msg.scope === "workstream") {
+      if (!msg.workstream) return { error: "Name the workstream", code: "invalid_request" };
+      if (!this.#workstreams.get(msg.workstream)) return { error: `No workstream "${msg.workstream}"`, code: "not_found" };
+      return { key: msg.workstream, label: msg.workstream };
+    }
+    if (msg.sessionId !== undefined) {
+      const session = this.#getOwnedSession(msg.sessionId, auth);
+      // A rule is its owner's: only for a session of the caller's own.
+      if (!session || session.createdBy !== auth.sub) return { error: "Session not found", code: "not_found" };
+      return msg.scope === "session" ? { key: session.id, label: session.name } : { key: session.workspaceId, label: sandboxWorkspaceOf(session.workdir) };
+    }
+    if (msg.scope === "session") return { error: "Name the session", code: "invalid_request" };
+    if (!msg.workdir || !isAbsolute(msg.workdir)) return { error: "Name the repository by a session or an absolute folder", code: "invalid_request" };
+    const folder = resolve(msg.workdir);
+    return { key: workspaceIdFromPath(folder, { accountId: auth.accountId, projectId: auth.projectId }), label: sandboxWorkspaceOf(folder) };
   }
 
   #credentialList(msg: { id: string }, auth: AuthContext): DaemonMessage {
@@ -10156,8 +10225,19 @@ mcpHub: this.#mcpHub,
     }
     // Still `response.ok` for a stale id — the web ApprovalBar sends one to
     // dismiss a leftover prompt — but say so, for callers that report it.
+    // Allow and save the card's rules (docs/secrets-and-memory-design.md §4.1): saved first, so a refused save leaves the card open.
+    let saved: string[] | undefined;
+    if (msg.save !== undefined) {
+      if (!msg.approved) return { type: "response.error", requestId: msg.id, error: "A rule is saved with an approval, not a denial", code: "invalid_request" };
+      const r = session.saveApprovalRules(msg.approvalId, msg.save, auth);
+      if (!r.ok) {
+        this.#store.audit(auth.sub, "approval_rule.save_refused", session.id, `approvalId=${msg.approvalId} scope=${msg.save}`);
+        return { type: "response.error", requestId: msg.id, error: r.error, code: "forbidden" };
+      }
+      saved = r.rules;
+    }
     const outcome = session.approve(msg.approvalId, msg.approved, auth, msg.updatedInput);
-    return { type: "response.ok", requestId: msg.id, data: { outcome } };
+    return { type: "response.ok", requestId: msg.id, data: { outcome, ...(saved ? { savedRules: saved } : {}) } };
   }
 
   #uiResponse(

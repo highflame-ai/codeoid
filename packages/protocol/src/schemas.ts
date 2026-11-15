@@ -228,6 +228,7 @@ export const sessionApproveSchema = z.object({
   approvalId: z.string().min(1).max(LIMITS.ID_MAX),
   approved: z.boolean(),
   updatedInput: z.record(z.string(), z.unknown()).optional(),
+  save: z.enum(["session", "repository"]).optional(),
 });
 
 const pushTokenField = z.string().min(1).max(LIMITS.PUSH_TOKEN_MAX);
@@ -1164,6 +1165,21 @@ export const secretListSchema = z.object({ ...base, type: z.literal("secret.list
 export const secretRevealSchema = z.object({ ...base, type: z.literal("secret.reveal"), workstream: keptWorkstreamField, fingerprint: fingerprintField });
 export const secretForgetSchema = z.object({ ...base, type: z.literal("secret.forget"), workstream: keptWorkstreamField, fingerprint: fingerprintField });
 
+// Saved approval rules (docs/secrets-and-memory-design.md §4.1). A rule's text is read by the daemon (approval-rules/rules.ts).
+const approvalRuleScopeField = z.enum(["session", "repository", "workstream", "everywhere"]);
+export const approvalRulesListSchema = z.object({ ...base, type: z.literal("approval_rules.list") });
+export const approvalRulesAddSchema = z.object({
+  ...base,
+  type: z.literal("approval_rules.add"),
+  rule: z.string().min(1).max(1000),
+  effect: z.enum(["allow", "deny"]),
+  scope: approvalRuleScopeField,
+  sessionId: sessionIdField.optional(),
+  workdir: pathField.min(1).optional(),
+  workstream: workstreamIdField.optional(),
+});
+export const approvalRulesRemoveSchema = z.object({ ...base, type: z.literal("approval_rules.remove"), ruleId: z.string().min(1).max(LIMITS.ID_MAX) });
+
 export const skillGrantSchema = z.object({
   ...base,
   type: z.literal("skill.grant"),
@@ -1412,6 +1428,9 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   secretListSchema,
   secretRevealSchema,
   secretForgetSchema,
+  approvalRulesListSchema,
+  approvalRulesAddSchema,
+  approvalRulesRemoveSchema,
   sessionTurnsSchema,
   sessionApprovalsSchema,
   claudeAccountsListSchema,

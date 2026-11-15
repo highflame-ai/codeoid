@@ -64,6 +64,8 @@ interface UserState {
 
 const APPROVAL_TTL_MS = 60 * 60 * 1000;
 const MAX_PENDING_APPROVALS = 200;
+/** A card's buttons: approve, approve and save for a scope (secrets-and-memory-design.md §4.1), deny. */
+const APPROVAL_ACTIONS: ReadonlySet<string> = new Set(["approve", "approve_session", "approve_repository", "deny"]);
 /** Slack's section text limit is 3000; a message's 40 000. Replies are split below the first. */
 const CHUNK = 2_900;
 
@@ -466,6 +468,9 @@ export class SlackFrontend implements Frontend {
     const sandbox = approvalSandboxLine(st);
     if (sandbox) lines.push(esc(sandbox));
     if (st.collaborationCost) lines.push(`◇ ${esc(formatCollaborationCost(st.collaborationCost))}`);
+    // Approve and keep the answer (docs/secrets-and-memory-design.md §4.1): the rules it saves, a button per scope.
+    const offer = st.ruleOffer;
+    if (offer) lines.push(`⟲ saves \`${esc(offer.rules.join(", "))}\``);
     const text = lines.join("\n");
     try {
       const res = await slackApi<{ ts: string }>(this.#transportOrDefault(), this.#botToken, "chat.postMessage", {
@@ -481,6 +486,12 @@ export class SlackFrontend implements Frontend {
             block_id: "codeoid_approval",
             elements: [
               { type: "button", style: "primary", text: { type: "plain_text", text: "Approve" }, action_id: "approve", value: st.approvalId },
+              ...(offer?.scopes ?? []).map((scope) => ({
+                type: "button",
+                text: { type: "plain_text", text: scope === "session" ? "Allow for this session" : "Allow in this repo" },
+                action_id: scope === "session" ? "approve_session" : "approve_repository",
+                value: st.approvalId,
+              })),
               { type: "button", style: "danger", text: { type: "plain_text", text: "Deny" }, action_id: "deny", value: st.approvalId },
             ],
           },
@@ -497,7 +508,7 @@ export class SlackFrontend implements Frontend {
     if (p.type !== "block_actions") return;
     const userId = String((p.user as { id?: unknown } | undefined)?.id ?? "");
     const action = ((p.actions as Array<{ action_id?: string; value?: string }> | undefined) ?? [])[0];
-    if (!action || (action.action_id !== "approve" && action.action_id !== "deny")) return;
+    if (!action || !APPROVAL_ACTIONS.has(action.action_id ?? "")) return;
     const channel = String((p.channel as { id?: unknown } | undefined)?.id ?? (p.container as { channel_id?: unknown } | undefined)?.channel_id ?? "");
     const ts = String((p.message as { ts?: unknown } | undefined)?.ts ?? (p.container as { message_ts?: unknown } | undefined)?.message_ts ?? "");
     const say = (text: string) => (channel && ts ? this.#update(channel, ts, text) : Promise.resolve());
@@ -524,14 +535,23 @@ export class SlackFrontend implements Frontend {
       await say(state);
       return;
     }
-    const approved = action.action_id === "approve";
+    const save = action.action_id === "approve_session" ? "session" : action.action_id === "approve_repository" ? "repository" : undefined;
+    const approved = action.action_id !== "deny";
     const resp = await this.#manager.handle(
-      { type: "session.approve", id: randomUUID(), sessionId: pending.sessionId, approvalId: pending.approvalId, approved },
+      { type: "session.approve", id: randomUUID(), sessionId: pending.sessionId, approvalId: pending.approvalId, approved, ...(save ? { save } : {}) },
       state.auth!,
       this.#client(userId, state),
     );
+    if (resp.type === "response.error" && save) {
+      // A refused save leaves the call waiting: the card stays, the reason beside it.
+      this.#justAnswered.delete(key);
+      this.#approvals.set(key, pending);
+      if (pending.messageId) this.#cardOfMessage.set(pending.messageId, (this.#cardOfMessage.get(pending.messageId) ?? new Set<string>()).add(key));
+      await this.#post(channel || pending.channel, `⚠️ ${resp.error}`);
+      return;
+    }
     if (resp.type === "response.error") await say(`⚠️ ${resp.error}`);
-    else await say(approved ? "✅ Approved" : "❌ Denied");
+    else await say(save ? `✅ Approved, and allowed ${save === "session" ? "for this session" : "in this repository"}` : approved ? "✅ Approved" : "❌ Denied");
   }
 
   #prune(): void {

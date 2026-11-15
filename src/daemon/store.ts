@@ -247,6 +247,21 @@ function enableWalWithRetry(db: Database, dbPath: string): void {
 }
 
 /** Which stored OAuth credential: a server at a URL, and a slot ('' / absent = its default sign-in). */
+/** A saved approval rule as stored (docs/secrets-and-memory-design.md §4.1). */
+export interface ApprovalRuleRow {
+  id: string;
+  owner: string;
+  scopeKind: string;
+  scopeKey: string;
+  scopeLabel: string;
+  rule: string;
+  effect: string;
+  createdAt: number;
+  expiresAt: number | null;
+  lastUsedAt: number | null;
+  useCount: number;
+}
+
 export interface McpOAuthServerKey {
   name: string;
   url: string;
@@ -535,6 +550,29 @@ export class Store {
         decided_at   TEXT NOT NULL DEFAULT (datetime('now')),
         PRIMARY KEY (workspace_id, command)
       );
+
+      -- Saved approval rules (docs/secrets-and-memory-design.md §4.1): an
+      -- owner's answer to a card for a scope. A rule is the owner's own, in
+      -- their tenant; scope_key is the session id, the repository's
+      -- workspace id or the workstream id (empty for everywhere). Removed
+      -- rules stay, inactive, for the audit trail.
+      CREATE TABLE IF NOT EXISTS approval_rules (
+        id           TEXT PRIMARY KEY,
+        account_id   TEXT NOT NULL,
+        project_id   TEXT NOT NULL,
+        owner        TEXT NOT NULL,
+        scope_kind   TEXT NOT NULL,
+        scope_key    TEXT NOT NULL,
+        scope_label  TEXT NOT NULL DEFAULT '',
+        rule         TEXT NOT NULL,
+        effect       TEXT NOT NULL,
+        created_at   INTEGER NOT NULL,
+        expires_at   INTEGER,
+        last_used_at INTEGER,
+        use_count    INTEGER NOT NULL DEFAULT 0,
+        is_active    INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE INDEX IF NOT EXISTS approval_rules_owner ON approval_rules (account_id, project_id, owner, is_active);
 
       -- Durable dispatch work queue (P4, hermes-Kanban pattern). Tasks are
       -- the source of truth for send-class fleet actions: the queue — not
@@ -1153,6 +1191,64 @@ export class Store {
          DO UPDATE SET allowed = excluded.allowed, decided_at = datetime('now')`,
       )
       .run(workspaceId, command, allowed ? 1 : 0);
+  }
+
+  /** An owner's active saved approval rules (§4.1), expired ones left out. */
+  listApprovalRules(scope: { accountId: string; projectId: string; owner: string }, now: number = Date.now()): ApprovalRuleRow[] {
+    return this.#db
+      .prepare(
+        `SELECT id, owner, scope_kind AS scopeKind, scope_key AS scopeKey, scope_label AS scopeLabel, rule, effect,
+                created_at AS createdAt, expires_at AS expiresAt, last_used_at AS lastUsedAt, use_count AS useCount
+           FROM approval_rules
+          WHERE account_id = ? AND project_id = ? AND owner = ? AND is_active = 1 AND (expires_at IS NULL OR expires_at > ?)
+          ORDER BY created_at`,
+      )
+      .all(scope.accountId, scope.projectId, scope.owner, now) as ApprovalRuleRow[];
+  }
+
+  /** Save a rule; an active one with the same scope, rule and effect is kept instead (its expiry moved on). */
+  addApprovalRule(
+    scope: { accountId: string; projectId: string; owner: string },
+    rule: { id: string; scopeKind: string; scopeKey: string; scopeLabel: string; rule: string; effect: string; expiresAt: number | null },
+    now: number = Date.now(),
+  ): { id: string; created: boolean } {
+    return this.#db.transaction(() => {
+      const existing = this.#db
+        .prepare(
+          `SELECT id FROM approval_rules WHERE account_id = ? AND project_id = ? AND owner = ? AND scope_kind = ? AND scope_key = ? AND rule = ? AND effect = ?
+              AND is_active = 1 AND (expires_at IS NULL OR expires_at > ?)`,
+        )
+        .get(scope.accountId, scope.projectId, scope.owner, rule.scopeKind, rule.scopeKey, rule.rule, rule.effect, now) as { id: string } | null;
+      if (existing) {
+        if (rule.expiresAt !== null) this.#db.prepare("UPDATE approval_rules SET expires_at = MAX(COALESCE(expires_at, 0), ?) WHERE id = ? AND expires_at IS NOT NULL").run(rule.expiresAt, existing.id);
+        return { id: existing.id, created: false };
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO approval_rules (id, account_id, project_id, owner, scope_kind, scope_key, scope_label, rule, effect, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(rule.id, scope.accountId, scope.projectId, scope.owner, rule.scopeKind, rule.scopeKey, rule.scopeLabel, rule.rule, rule.effect, now, rule.expiresAt);
+      return { id: rule.id, created: true };
+    })();
+  }
+
+  /** Mark an owner's rule removed; false when there is no such active rule of theirs. */
+  removeApprovalRule(scope: { accountId: string; projectId: string; owner: string }, id: string): boolean {
+    const r = this.#db
+      .prepare("UPDATE approval_rules SET is_active = 0 WHERE id = ? AND account_id = ? AND project_id = ? AND owner = ? AND is_active = 1")
+      .run(id, scope.accountId, scope.projectId, scope.owner);
+    return r.changes > 0;
+  }
+
+  /** A session's own rules end with it. */
+  removeSessionApprovalRules(sessionId: string): void {
+    this.#db.prepare("UPDATE approval_rules SET is_active = 0 WHERE scope_kind = 'session' AND scope_key = ? AND is_active = 1").run(sessionId);
+  }
+
+  /** A rule ran a call: when, and how many times. */
+  noteApprovalRuleUse(id: string, now: number = Date.now()): void {
+    this.#db.prepare("UPDATE approval_rules SET last_used_at = ?, use_count = use_count + 1 WHERE id = ?").run(now, id);
   }
 
   deleteConductorIdentity(accountId: string, projectId: string): void {
