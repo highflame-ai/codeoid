@@ -78,6 +78,163 @@ compaction), the work ledger (`codeoid ledger <s>`), `/compact`, and evals (`cod
 run|ls|show|report|push`). The conformance suite checks it: each setting has a test that sets
 it from the CLI.
 
+## 2a. Better than opencode and pi, by design
+
+opencode and pi are where this design starts. They are not the bar. Each is one process
+driving one conversation. codeoid already has more around the loop:
+- a daemon that owns many sessions;
+- canonical history across backends;
+- a checkpoint every turn;
+- lossless memory, where every tool call is a fact with its result and exit code (#471);
+- the OS sandbox;
+- ZeroID identities;
+- the daemon's own evidence runner;
+- accounts and endpoints;
+- compare.
+
+The native loop is designed around those.
+
+Every item below ships with a `codeoid-core` eval task that shows it working (§9). An
+advantage nobody measures is only a claim. "Ours" is what codeoid adds. "Theirs" is what we
+read in opencode v2 (`d432a06`) and pi (`7cc21c2`).
+
+### Loop
+
+- **Done means verified.**
+  - Theirs: a turn ends when the model stops calling tools.
+  - Ours: when a session has checks (a pack gate, a loop's checks, or the repo's test command
+    the owner confirmed once), the end of a turn runs them through the evidence runner in the
+    sandbox.
+    - A failure goes back to the model as the next step's input, with the check's excerpt and
+      evidence id. This is bounded by the turn's budget.
+    - Only a pass, or the budget running out, ends the turn.
+  - The agent's "I'm done" is a request to verify, as a loop's `loop_report` already is.
+- **Backtracking is a tool.**
+  - Ours: the checkpoint store snapshots **each step**, not just each turn, so the shadow git
+    has a ref per step.
+  - `Revert { to: step | "last" }` lets the model undo its own bad path in one call, instead of
+    hand-editing it back.
+  - The canonical history keeps the abandoned branch, and recall can still read it.
+  - Theirs: opencode's revert is user-facing; pi has none on files.
+- **Repeated failures are detected from facts, not guessed.** opencode v2 dropped its
+  doom-loop detector.
+  - Ours: the memory facts already record every call's tool, input digest and exit code. An
+    identical failing call (same command, same exit code, or the same edit miss) repeated N
+    times is a fact.
+  - What happens next is a ladder:
+    1. a recovery hint naming the repeat;
+    2. a **second opinion**: one `Consult` call to a stronger model on *any* backend the owner
+       has, handed the canonical history;
+    3. a stop, with the reason on the session card.
+  - This is the LongCapHarness split at run time: the cheap model executes, the strong one is
+    consulted only when needed.
+- **Budgets the daemon enforces.** Turns, tool calls, cost and wall time are checked in the
+  gate, which every call passes through. They are not left to the loop's good behaviour, since
+  pi has no limit and opencode counts steps. At the limit the turn ends with a summary step
+  (tools kept for the cache, `toolChoice: none`) and the ledger saved.
+
+### Edit
+
+- **No edit against a stale read.**
+  - Ours: the loop records the content hash of each file it read, and an edit to a file that
+    has changed since then is refused.
+  - The refusal carries a diff of what changed, taken from the checkpoint. It also names who
+    changed it: the user, a formatter, or **another session sharing the folder**. Only a
+    daemon that sees every session can say the last one.
+- **Each edit is checked at once.**
+  - Ours: after an edit, a fast check for that language runs in the sandbox, and its result
+    is attached to the edit's result. Examples: `tsc --noEmit` on the project, `bun build
+    --no-bundle`, `python -m py_compile`, `gofmt -e`, `cargo check` when cheap.
+  - When an LSP server is configured, its diagnostics take the check's place.
+  - The model hears about a syntax error in the same step it made it, not three steps later.
+  - Theirs: opencode v2 has this as a TODO; pi has none.
+- **Edit formats chosen from evidence.**
+  - Theirs: opencode picks `apply_patch` when the model id contains `gpt-`.
+  - Ours: the eval store records the edit success rate per model and format (exact-hit rate,
+    fuzzy rescues, misses). The `patchFormat` flag for a model is set from that data and
+    published with it.
+- **A miss that can be fixed safely is fixed.**
+  - When the fuzzy tiers find exactly one candidate, it is applied, and the result tells the
+    model what was normalized.
+  - Two or more candidates are a miss, with the closest lines shown. Never a guess.
+
+### Retry and failure
+
+- **Rate limits are coordinated across the daemon.**
+  - Ours: backoff is held per endpoint and account, shared by every session. When one session
+    gets a 429, the other sessions on that key wait the same `retry-after` instead of each
+    finding out separately. A circuit breaker opens on repeated failures.
+  - Theirs: each request backs off on its own.
+- **Failover across sources and backends**, not only to a fallback model on the same
+  provider.
+  - On a `usage_limit` or an outage (`providers/usage-limit.ts` already tells the two kinds
+    apart), the turn can continue on the next source in a list the owner set: another
+    account, a gateway, or a local model.
+  - The full history goes with it, because canonical history is ours.
+  - The switch is shown on the turn's badge.
+- **Resuming after a crash is decided from facts.** When the daemon dies mid-tool-call, the
+  checkpoint shows whether the files changed since the call began.
+  - A read-only call, or one whose files didn't change, is replayed.
+  - Anything else is reported as interrupted, with the diff it left (pi's `replay: "safe"`,
+    decided from evidence instead of a declaration).
+
+### Context
+
+- **Compaction moves things out of the window and loses nothing.**
+  - Theirs: both summarize and drop.
+  - Ours: everything is already stored verbatim (lossless episodes, #471). A compacted
+    checkpoint carries the episode ids of what it dropped, and the model can read any of it
+    back exactly with `get_episode`.
+- **The checkpoint's facts are computed, not written by the model.**
+  - Computed from canonical history and the memory facts: files read and modified, commands
+    run with their exit codes, failing checks, the last error.
+  - The model summarizes only intent, decisions and next steps. That makes the summary
+    cheaper and the facts exact, following the LongCapHarness rule: code where the rules are
+    explicit.
+- **Compaction is measured.** A `codeoid-core` probe asks questions that were answerable
+  before a compaction, and they must still be answerable after it. A change to the compactor
+  is accepted on that score.
+- **Large outputs spill into memory, not a temp file.**
+  - Bash and Read past their cap are stored as an episode. The model gets its id and the
+    view, and `get_episode` pages the rest.
+  - It survives a restart, a fork and a backend switch, and the same output is visible to
+    every frontend. A temp path survives none of those.
+- **A cheaper model can do the compaction.** It runs on any source the owner picks, such as a
+  local model, because the request is built from canonical history.
+
+### Sub-agents and safety
+
+- **Sub-agents are real sessions.** Each one has:
+  - its own ZeroID identity with narrowed scopes;
+  - its own sandbox and audit trail;
+  - a place on the fleet board;
+  - any backend;
+  - a person who can steer it from any device.
+
+  Theirs: a child conversation inside the same process with the same rights.
+- **The OS sandbox is the boundary, per command.**
+  - Every call is attributed and audited. Every approval card says whether the sandbox will
+    contain the command.
+  - Theirs: pi has no gate and relies on running inside a container. opencode's rules gate
+    commands but don't confine what an allowed command can reach.
+
+### The same advantages on every backend (§2)
+
+Most of these live at the Session seam, so the vendor harnesses get them too. What a vendor
+harness can't take is declared.
+
+| Advantage | codeoid (native) | Vendor harnesses (Claude, Codex, opencode, pi, Qwen Code, Gemini CLI) |
+|---|---|---|
+| Done means verified | Inside the turn | At Session level. The failed check is the next input: pushed mid-turn where the backend supports it (Claude), the next prompt elsewhere. |
+| Revert tool, per-step checkpoints | Native tool | `Revert` is served over codeoid's MCP mount to every backend that mounts MCP. Steps are the tool batches Session sees in each backend's events. |
+| Repeated-failure ladder, `Consult` | Native | Detected at Session level from the same facts. Hint as above. `Consult` over MCP. |
+| No edit against a stale read | Refused in the tool | Refused in the gate for every backend whose file tools reach `canUseTool` (Claude, opencode, Qwen Code, Gemini CLI). Codex applies patches itself: declared, warned after the fact. |
+| Each edit checked at once | In the edit's result | Run after the call. Delivered through Claude's PostToolUse context, otherwise as the next input. |
+| Daemon-wide rate limiting | Every model call | Only the in-daemon backends. A CLI makes its own calls (declared). |
+| Failover across sources | Mid-turn | At the turn boundary, as a backend or account switch with the full history. |
+| Lossless compaction and spill | Native | The CLI compacts itself. Recall tools over MCP and the ledger in the next prompt make up the difference. |
+| Sub-agents as sessions, per-command sandbox | Native | Sub-agents via the conductor's `Task` over MCP. Sandbox per process or natively (`docs/sandbox.md`). |
+
 ## 3. Shape
 
 ```
@@ -191,7 +348,7 @@ The tool names and input shapes are **Claude Code's**: `Read`, `Write`, `Edit`, 
 | `Edit` | `file_path`, `old_string`, `new_string`, `replace_all?`. The match order is exact, then with typographic quotes, dashes and spaces normalized, then line by line ignoring trailing whitespace (opencode's three tiers). CRLF and mixed line endings are kept region by region. `old_string` must be unique unless `replace_all` is set. A miss returns the closest lines, numbered, but only when Read would be allowed on the file. |
 | `MultiEdit` | `file_path`, `edits[]`. Every edit matches the original text, and no two may overlap (pi). |
 | `apply_patch` | The `*** Begin Patch` format. It is offered **instead of** Edit, Write and MultiEdit when the model's `patchFormat` flag says so (the GPT family). |
-| `Bash` | `command`, `timeout?` (default 120 s), `run_in_background?`. Runs in the session's sandbox (§6). Output is capped from the tail. The full output goes to a file in the session's state dir, and the result gives its path. On timeout the command moves to the background instead of being killed, and the model is told not to poll. Results include the exit code and wall time. |
+| `Bash` | `command`, `timeout?` (default 120 s), `run_in_background?`. Runs in the session's sandbox (§6). Output is capped from the tail. The full output is kept as a memory episode, and the result gives its id (§2a). On timeout the command moves to the background instead of being killed, and the model is told not to poll. Results include the exit code and wall time. |
 | `Glob` / `Grep` | ripgrep, at most 100 matches or 1000 paths, inside 50 KB. |
 | `WebFetch` | `url`, `format?`. 30 s timeout by default, at most 10 redirects, HTML converted to markdown, size capped. Uses the session's network policy. |
 | `TodoWrite` | The whole list each time. It feeds the work ledger (§8). |
@@ -221,7 +378,8 @@ Aliases (`bash`→`Bash`, `read_file`→`Read`) run and tell the model the real 
   issue it again in smaller pieces"). Salvaged arguments are never run.
 
 Output limits come from one shared bound: 2000 lines or 50 KB. Above it, the full text is
-spilled to the state dir and the model is told the path. The cap is *also* what
+stored as a lossless memory episode, and the model gets its id and `get_episode` (§2a). When
+memory is off, the fallback is a file in the session's state dir. The cap is *also* what
 `limitToolOutput` uses when history is rebuilt for another backend, so a switch carries the
 same view.
 
@@ -293,6 +451,9 @@ same view.
   output, the loop compacts once and retries.
 - **The checkpoint** has fixed headings: Objective, Constraints, Decisions, Work state (done,
   active, blocked), Next, Files read, Files modified (up to 15), Exact errors.
+  - Files read and modified, commands with their exit codes, failing checks, and the last
+    error are computed from canonical history and the memory facts. The model writes only
+    objective, decisions and next steps (§2a).
   - Paths, commands and error text are kept verbatim.
   - A later compaction *updates* the previous checkpoint instead of starting over.
   - It never cuts between a tool call and its result.
@@ -425,8 +586,8 @@ Following LongCapHarness, a strong model designs and a cheap model executes.
 | Phase | Delivers | Done when |
 |---|---|---|
 | 0. Evals | Task schema, `codeoid eval run` (headless compare, evidence graders, `eval` owner kind), the `/data/codeoid-evals` writer, `codeoid-core` v0, and a baseline on today's backends with 2–3 models, one of them local. | A reproducible report. A rerun of the same protocol matches within noise. |
-| 1. Minimal native loop | `codeoid` id and model sources (Anthropic Messages, OpenAI Chat). Read, Write, Edit, MultiEdit, Bash, Glob, Grep, ask_user, request_directory, memory, MCP. `confinementFor` case and per-command sandbox. Budgets on turns, cost and wall time. Max steps ends with `toolChoice: none` and a summary prompt. Steer and queue mapped to `pushMidTurn`. Settles stale tool calls on resume. | Conformance green, including "autonomous Bash never runs unsandboxed". On `codeoid-core` it is at least as good as opencode on the same endpoint model. |
-| 2. Long sessions | Compaction and checkpoint, the Session-level work ledger for all backends, prompt caching, background Bash, Task as a child session, project instructions and skills index for all backends, the per-turn badge for all backends, `/compact` everywhere, Gemini, and `apply_patch` for patch-format models. | Long-task evals don't regress against phase 1. If the native loop beats the plain chat backends, it becomes their default. |
+| 1. Minimal native loop | `codeoid` id and model sources (Anthropic Messages, OpenAI Chat). Read, Write, Edit, MultiEdit, Bash, Glob, Grep, ask_user, request_directory, memory, MCP. `confinementFor` case and per-command sandbox. Budgets on turns, cost and wall time. Max steps ends with `toolChoice: none` and a summary prompt. Steer and queue mapped to `pushMidTurn`. Settles stale tool calls on resume. From §2a: done means verified, budgets enforced in the gate, per-step checkpoints with `Revert`, refusing an edit against a stale read, the repeated-failure hint and stop, and output spilled into memory. | Conformance green, including "autonomous Bash never runs unsandboxed". Each §2a item has its eval task. On `codeoid-core` it **beats** opencode and pi on the same endpoint model, not just matches them. |
+| 2. Long sessions | Compaction and checkpoint, the Session-level work ledger for all backends, prompt caching, background Bash, Task as a child session, project instructions and skills index for all backends, the per-turn badge for all backends, `/compact` everywhere, Gemini, and `apply_patch` for patch-format models. From §2a: checking each edit at once, daemon-wide rate limiting, failover across sources, compaction from facts that loses nothing (with its probe eval), `Consult`, and edit formats chosen from eval data. Each Session-level item lands on the vendor harnesses in the same PR (§2a table). | Long-task evals don't regress against phase 1. If the native loop beats the plain chat backends, it becomes their default. |
 | 3. Workers | The native loop as the default worker for non-Claude models in loops, routines and the conductor. An independent diff reviewer as a loop stage (any backend). Lessons with an approval queue. | Loop pass rate on heldout tasks doesn't drop compared with vendor-harness workers. |
 | 4. Harness improvement | §10, gated on heldout evals. | An accepted improvement on heldout that also holds on a second model. |
 
