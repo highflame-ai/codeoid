@@ -205,7 +205,9 @@ describe("session.approvals", () => {
       { type: "session.approvals.result" }
     >;
     expect(res.approvals).toEqual([
-      { approvalId: "approval-1", messageId: expect.any(String), toolName: "Bash", input: { command: "rm -rf build" }, risk: { level: "medium", reasons: [expect.stringContaining("rm deletes")] } },
+      { approvalId: "approval-1", messageId: expect.any(String), toolName: "Bash", input: { command: "rm -rf build" }, risk: { level: "medium", reasons: [expect.stringContaining("rm deletes")] },
+        // What --save would keep (docs/secrets-and-memory-design.md §4.1).
+        ruleOffer: { rules: ["Bash(rm -rf build)"], scopes: ["session", "repository"], repository: expect.any(String) } },
     ]);
 
     const session = manager._sessionForTest(id)!;
