@@ -382,6 +382,10 @@ export type ProviderEvent =
       declinedByBackend?: boolean;
       /** A tool_result hook replaced `output`: the backend's own record still holds the original. */
       redacted?: boolean;
+      /** A shell call's exit code, where the backend reports it as a field (Codex, opencode). */
+      exitCode?: number;
+      /** How long it ran, where the backend reports it (Codex): a call it ran unasked is announced only once done. */
+      durationMs?: number;
     }
   | { type: "subagent_start"; agentId: string; agentType: string }
   | { type: "subagent_stop"; agentId: string }

@@ -34,7 +34,7 @@ import {
   type JsonRpcResponse,
 } from "../mcp/jsonrpc-http.js";
 import type { MemoryEngine } from "./engine.js";
-import { memoryToolDefs, type MemoryToolContext, type MemoryToolDef } from "./tools.js";
+import { MEMORY_INSTRUCTIONS, memoryToolDefs, type MemoryToolContext, type MemoryToolDef } from "./tools.js";
 
 /** Path the endpoint is mounted at on the daemon's HTTP server. */
 export const MEMORY_MCP_PATH = "/mcp/memory";
@@ -168,6 +168,8 @@ export class MemoryMcpHttp {
           protocolVersion: typeof requested === "string" ? requested : DEFAULT_MCP_PROTOCOL_VERSION,
           capabilities: { tools: {} },
           serverInfo: SERVER_INFO,
+          // When to use these tools: what a Claude session's system prompt says, for every other client.
+          instructions: MEMORY_INSTRUCTIONS,
         });
       }
       case "ping":

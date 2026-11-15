@@ -25,6 +25,8 @@ import {
   type McpSdkServerConfigWithInstance,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { MemoryEngine, WorkspaceTenant } from "./memory/index.js";
+import { matchesFacts } from "./memory/store.js";
+import type { EpisodeOrigin } from "./memory/types.js";
 import {
   FLEET_READ_TOOLS,
   FLEET_SEND_TOOLS,
@@ -315,7 +317,7 @@ export function createFleetHandlers(deps: FleetDeps) {
       return `${head}\n\nRecent activity (${episodes.length} episode(s), newest first):\n${lines.join("\n")}`;
     },
 
-    async fleet_recall(args: { query: string; limit?: number; workstream?: string }): Promise<string> {
+    async fleet_recall(args: { query: string; limit?: number; workstream?: string; only_failed?: boolean; backend?: string; origin?: EpisodeOrigin }): Promise<string> {
       deps.audit("fleet.recall", `query=${args.query.slice(0, 200)}`);
       if (!deps.memory) {
         return "Memory is disabled on this daemon — fleet_recall needs the memory engine.";
@@ -323,8 +325,11 @@ export function createFleetHandlers(deps: FleetDeps) {
       const sessionNames = new Map(deps.listSessions().map((s) => [s.id, s.name]));
       const limit = Math.min(args.limit ?? 6, MAX_LIMIT);
       // Asked for more than shown: a closed workstream's episodes are dropped, never shown (§10).
-      const all = await deps.memory.recallGlobal({ query: args.query, tenant: deps.tenant, limit: limit * 3 });
-      const inScope = all.filter((h) => !args.workstream || h.episode.workstreamId === args.workstream);
+      const filtered = args.only_failed === true || args.backend !== undefined || args.origin !== undefined;
+      // Filtered by facts after a text search: asked for many more, so the filter has something to keep.
+      const all = await deps.memory.recallGlobal({ query: args.query, tenant: deps.tenant, limit: filtered ? limit * 20 : limit * 3, ...(filtered ? { candidateK: 600 } : {}) });
+      const facts = { ...(args.only_failed ? { onlyFailed: true } : {}), ...(args.backend ? { backend: args.backend } : {}), ...(args.origin ? { origin: args.origin } : {}) };
+      const inScope = all.filter((h) => (!args.workstream || h.episode.workstreamId === args.workstream) && matchesFacts(h.episode, facts));
       // Dropped before anything is counted or said: even "N more were withheld" would answer the query.
       const hits = inScope
         .filter((h) => !deps.textWithheld?.({ sessionId: h.episode.sessionId, ...(h.episode.workstreamId ? { workstream: h.episode.workstreamId } : {}) }))
@@ -334,7 +339,8 @@ export function createFleetHandlers(deps: FleetDeps) {
       const lines = hits.map((h) => {
         const e = h.episode;
         const name = sessionNames.get(e.sessionId) ?? e.sessionId.slice(0, 8);
-        return `- [${name}${e.workstreamId ? ` · ${e.workstreamId}` : ""}] ${e.kind}${e.toolName ? `/${e.toolName}` : ""}: ${e.summary}`;
+        const f = [e.exitCode === -1 ? "failed" : e.exitCode !== undefined && e.exitCode !== 0 ? `exit ${e.exitCode}` : "", e.backend ?? "", e.origin && e.origin !== "user" ? e.origin : ""].filter(Boolean).join(", ");
+        return `- [${name}${e.workstreamId ? ` · ${e.workstreamId}` : ""}] ${e.kind}${e.toolName ? `/${e.toolName}` : ""}: ${e.summary}${f ? ` (${f})` : ""}`;
       });
       return `Recalled ${hits.length} episode(s) across the fleet:\n${lines.join("\n")}${note}`;
     },
@@ -649,8 +655,12 @@ export function buildFleetMcpServer(
           query: z.string().describe("What to recall"),
           limit: z.number().int().min(1).max(MAX_LIMIT).optional().describe("Max episodes (default 6)"),
           workstream: z.string().max(64).optional().describe("Only this workstream's episodes. A closed workstream's are never returned"),
+          only_failed: z.boolean().optional().describe("Only calls that failed (a non-zero exit code) and errors"),
+          backend: z.string().max(64).optional().describe("Only what one backend did (e.g. 'claude', 'codex')"),
+          origin: z.enum(["user", "delegated", "agent", "dispatch"]).optional().describe("Only turns of this origin: a person's, the agent's own background work, a dispatched worker's"),
         },
-        async ({ query, limit, workstream }) => text(await handlers.fleet_recall({ query, limit, ...(workstream ? { workstream } : {}) })),
+        async ({ query, limit, workstream, only_failed, backend, origin }) =>
+          text(await handlers.fleet_recall({ query, limit, ...(workstream ? { workstream } : {}), ...(only_failed ? { only_failed } : {}), ...(backend ? { backend } : {}), ...(origin ? { origin } : {}) })),
       ),
       tool(
         "machine_map",

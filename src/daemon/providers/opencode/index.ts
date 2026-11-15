@@ -2498,11 +2498,13 @@ export class OpencodeProvider implements SessionProvider {
         this.#emitBackgroundLevel();
       });
     }
+    const exit = metadata?.exit ?? metadata?.exitCode;
     this.#emit({
       type: "tool_complete",
       sdkToolUseId: id,
       output: toolOutputText(d.content, success ? undefined : (d.error as OcError)),
       success,
+      ...(typeof exit === "number" ? { exitCode: exit } : {}),
     });
     if (unasked && success && !ownRule) this.#ranUnasked(call!.name);
   }
