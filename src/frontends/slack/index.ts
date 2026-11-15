@@ -553,7 +553,7 @@ export class SlackFrontend implements Frontend {
       this.#client(userId, state),
     );
     // A refused save leaves the call waiting: the card stays, the reason beside it (unless it was answered elsewhere meanwhile).
-    if (resp.type === "response.error" && save && !(pending.messageId && this.#answered.has(pending.messageId))) {
+    if (resp.type === "response.error" && save && pending.messageId && !this.#answered.has(pending.messageId)) {
       this.#justAnswered.delete(key);
       this.#approvals.set(key, pending);
       if (pending.messageId) this.#cardOfMessage.set(pending.messageId, (this.#cardOfMessage.get(pending.messageId) ?? new Set<string>()).add(key));

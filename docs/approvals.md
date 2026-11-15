@@ -132,7 +132,19 @@ These never run on a rule:
 - a line that sets a variable (`CI=1 npm test`), or uses a loop or arithmetic;
 - a command run through a wrapper (`sudo`, `env`, `timeout`, `xargs`, `bash -c`);
 - a command that writes with a redirect (`> out.txt`; `> /dev/null` is fine);
-- a command that runs outside the workspace, or names a path outside it (`git -C /tmp …`, `--output=~/.bashrc`);
+- a command that runs outside the workspace, or names a path outside it (`git -C /tmp …`, `--output=~/.bashrc`,
+  `make test -C..`), links followed;
+- a command with a word only known when it runs (`npm test -- $FILE`, `$(…)`, `{a,b}`);
+- a command fed input by a pipe, here-document or `<` (`make test -f - <<< '…'`);
+- a build or test tool given an option that runs code it's handed, or reads its instructions from elsewhere:
+  - `make --eval`, `-f`, `-C`, or a `VAR=value`;
+  - `go test -exec`, `-toolexec`;
+  - `cargo --config`;
+  - `npm --node-options`, `--script-shell`, `--prefix`, `-w`;
+  - `deno test https://…`;
+  - `docker build --output`;
+- a command after a `cd` that may not run or not stay (in a subshell, behind `&&`), or to a folder that doesn't
+  exist;
 - a command whose shell may have moved without the backend saying where.
 
 **Rules that can't be allow rules:**
@@ -144,9 +156,16 @@ These never run on a rule:
   runs, as in `Bash(bun run test:*)`.
 - A fetch of a local or IP address (`localhost`, `127.0.0.1`, a name without a dot).
 
-Only the session's owner, with their own token, can save a rule. Anyone else can still allow the call once. A
-session an agent made (a dispatched worker, a conductor's child) is the agent's, not yours. Your rules don't
-apply to it, and its cards don't offer a save.
+Only the session's owner, with their own token, can save a rule. Anyone else can still allow the call once.
+
+Allow rules run only in sessions you made yourself. These sessions get no allow rules and their cards offer no
+save:
+
+- a session a delegated or automation token made (MCP control);
+- a dispatched worker, which the conductor's identity makes;
+
+This survives a restart. Your deny rules still apply to every session made with your identity. A collaboration's
+children are made with your own token, so your rules apply to them.
 
 **Modes.** Interactive mode ignores allow rules. Autonomous mode doesn't need them.
 
@@ -155,13 +174,15 @@ apply to it, and its cards don't offer a save.
 Deny rules refuse what they match in every mode. You add them in Settings or with the CLI, not on a card. A deny
 rule may name any program.
 
-A deny rule matches its words in order past options and through wrappers and runners. `Bash(npm publish:*)`
-refuses all of these:
+A deny rule matches its words in order, with anything between or after them. The match ignores case and goes
+through wrappers, runners and their `run`/`exec` subcommands. `Bash(npm publish:*)` refuses all of these, and so
+does `Bash(npm publish)`:
 
 - `npm publish`
 - `npm --yes publish`
 - `sudo npm publish`
 - `npx npm publish`
+- `uv run npm publish`
 
 A line codeoid can't read in full (a script piped to a shell, a line too long to read) is refused when its text
 names the rule's words in order. A WebFetch deny rule also covers the host's subdomains. While any WebFetch deny
@@ -172,7 +193,13 @@ not refused:
 
 - an alias (`npm pub`);
 - a variable (`$(which npm) publish`);
-- flags in another order (`rm -fr` for `Bash(rm -rf:*)`).
+- flags in another order (`rm -fr` for `Bash(rm -rf:*)`);
+- a path spelled differently (`./build` for `Bash(rm -rf build)`).
+
+A `WebFetch` deny rule covers a fetch tool named `WebFetch` (Qwen's `web_fetch` isn't). It doesn't stop a
+sandboxed command such as `curl` reaching the host: that is the session's sandbox network setting.
+
+If your saved rules can't be read, every command, fetch and MCP call is refused until they can be.
 
 The OS sandbox is the boundary. On Claude, deny rules are checked in its PreToolUse hook too, before any allow rule
 in your or the repository's Claude settings.
@@ -180,6 +207,7 @@ in your or the repository's Claude settings.
 **Calls that never reach codeoid**, so no rule can refuse them:
 
 - **Codex in autonomous mode** asks codeoid about nothing.
+- **Codex in guarded mode** runs commands it judges safe without asking.
 - **Qwen Code's read-only shell commands** run without asking (see Limits).
 
 ### Managing rules

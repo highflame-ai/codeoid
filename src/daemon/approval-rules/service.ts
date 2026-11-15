@@ -108,7 +108,10 @@ export class ApprovalRuleService {
         // An allow rule that can't be one any more (the rules got stricter) is left out, never read loosely;
         // a deny rule is read as a deny rule may be written, so a stricter allow-list never drops a refusal.
         const parsed = parseRule(row.rule, row.effect);
-        if (!parsed.ok) continue;
+        if (!parsed.ok) {
+          if (row.effect === "deny") console.warn(`[codeoid] approval rules: deny rule ${row.id} (${JSON.stringify(row.rule)}) can't be read any more and isn't applied: ${parsed.error}`);
+          continue;
+        }
         rows.push({
           row,
           rule: { id: row.id, pattern: parsed.pattern, effect: row.effect, scope: row.scopeKind as ApprovalRuleScopeKind, text: row.rule, scopeKey: row.scopeKey },

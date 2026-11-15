@@ -8,7 +8,7 @@
  * the settings scopes; a session's own rules end with it.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
@@ -162,7 +162,7 @@ describe("a card offers its call as a rule, and the owner saves it", () => {
     expect(first.asked).toBe(true);
     expect(first.pending[0]!.ruleOffer).toMatchObject({ rules: ["Bash(npm test:*)"], scopes: ["session", "repository"], repository: repo });
     const res = await manager.handle(
-      { type: "session.approve", id: "ap", sessionId: first.session.id, approvalId: first.pending[0]!.approvalId, approved: true, save: "repository" } as never,
+      { type: "session.approve", id: "ap", sessionId: first.session.id, approvalId: first.pending[0]!.approvalId, approved: true, save: "repository", rules: first.pending[0]!.ruleOffer!.rules } as never,
       AUTH,
       CLIENT,
     );
@@ -184,7 +184,7 @@ describe("a card offers its call as a rule, and the owner saves it", () => {
   test("allow for this session: another session still asks, and the rule ends with the session", async () => {
     const first = await run("Bash", { command: "make lint" });
     const approvalId = first.pending[0]!.approvalId;
-    await manager.handle({ type: "session.approve", id: "ap", sessionId: first.session.id, approvalId, approved: true, save: "session" } as never, AUTH, CLIENT);
+    await manager.handle({ type: "session.approve", id: "ap", sessionId: first.session.id, approvalId, approved: true, save: "session", rules: first.pending[0]!.ruleOffer!.rules } as never, AUTH, CLIENT);
     await first.sending;
     const [saved] = await rules();
     expect(saved).toMatchObject({ rule: "Bash(make lint:*)", scope: { kind: "session", key: first.session.id } });
@@ -208,7 +208,7 @@ describe("a card offers its call as a rule, and the owner saves it", () => {
     const r = await run("Bash", { command: "npm test" });
     const approvalId = r.pending[0]!.approvalId;
     const refused = await manager.handle(
-      { type: "session.approve", id: "ap", sessionId: r.session.id, approvalId, approved: true, save: "repository" } as never,
+      { type: "session.approve", id: "ap", sessionId: r.session.id, approvalId, approved: true, save: "repository", rules: ["Bash(npm test:*)"] } as never,
       DELEGATED,
       CLIENT,
     );
@@ -356,6 +356,27 @@ describe("round 1: what else keeps a rule from running or saving", () => {
     await finish(r);
   });
 
+  test("a session made by an automation token: allow rules don't run its calls, deny rules still refuse", async () => {
+    await add("Bash(npm test:*)", "everywhere");
+    await add("Bash(npm publish:*)", "everywhere", {}, "deny");
+    const automation = { ...AUTH, automation: true } as AuthContext;
+    const r = await run("Bash", { command: "npm test" }, { auth: automation });
+    expect(r.asked).toBe(true);
+    await finish(r);
+    const d = await run("Bash", { command: "npm publish" }, { auth: automation, mode: "autonomous" });
+    expect(result(d)).toMatchObject({ behavior: "deny" });
+    await d.sending;
+  });
+
+  test("a resumed session keeps who made it", async () => {
+    const r = await run("Bash", { command: "npm test" }, { auth: DELEGATED });
+    await finish(r);
+    await manager.drain(3000);
+    await transcript.flush();
+    const meta = JSON.parse(readFileSync(transcript.metaPath(r.session.id), "utf8"));
+    expect(meta.madeByAgent).toBe(true);
+  });
+
   test("a save whose rules differ from what the card showed is refused, and the card stays", async () => {
     const r = await run("Bash", { command: "npm test" });
     const approvalId = r.pending[0]!.approvalId;
@@ -374,7 +395,7 @@ describe("round 1: what else keeps a rule from running or saving", () => {
     const r = await run("Bash", { command: "npm test" });
     await add("Bash(npm test:*)", "everywhere");
     const res = await manager.handle(
-      { type: "session.approve", id: "ap", sessionId: r.session.id, approvalId: r.pending[0]!.approvalId, approved: true, save: "session" } as never,
+      { type: "session.approve", id: "ap", sessionId: r.session.id, approvalId: r.pending[0]!.approvalId, approved: true, save: "session", rules: r.pending[0]!.ruleOffer!.rules } as never,
       AUTH,
       CLIENT,
     );

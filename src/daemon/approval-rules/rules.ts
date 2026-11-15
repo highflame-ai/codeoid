@@ -75,6 +75,46 @@ const RUN_SUBCOMMANDS: Record<string, ReadonlySet<string>> = {
   cargo: new Set(["run", "install"]),
 };
 
+/**
+ * Options that make a build or test tool run code it is handed, or read its
+ * instructions from elsewhere: a command on an allow rule holding one is not
+ * covered (`make test --eval=…`, `go test -exec=sh`, `npm test --node-options=…`).
+ * Long ones match as written or with `=value`; short ones anywhere in a cluster.
+ */
+const CODE_OPTIONS: Record<string, { long: readonly string[]; short?: string }> = {
+  make: { long: ["--eval", "--file", "--makefile", "--directory", "--include-dir"], short: "EfCI" },
+  gmake: { long: ["--eval", "--file", "--makefile", "--directory", "--include-dir"], short: "EfCI" },
+  go: { long: ["-exec", "-toolexec", "-vettool", "-overlay", "-modfile", "-C", "-pgo", "-exec=", "-toolexec="] },
+  cargo: { long: ["--config", "--manifest-path", "-Z"], short: "ZC" },
+  npm: { long: ["--node-options", "--script-shell", "--prefix", "--workspace", "--workspaces", "--userconfig", "--globalconfig", "--config", "--require", "--import", "--eval"], short: "wCcre" },
+  pnpm: { long: ["--node-options", "--script-shell", "--prefix", "--dir", "--filter", "--workspace-root", "--config", "--require", "--eval"], short: "wCcre" },
+  yarn: { long: ["--cwd", "--use-yarnrc", "--require", "--eval", "--config"], short: "re" },
+  bun: { long: ["--preload", "--require", "--cwd", "--config", "--eval", "--print", "--import"], short: "rce" },
+  deno: { long: ["--config", "--import-map", "--preload", "--eval", "--allow-run"], short: "cAe" },
+  pytest: { long: ["--rootdir", "--confcutdir", "--override-ini", "--pyargs", "-p"], short: "pco" },
+  tox: { long: ["--conf", "--root"], short: "c" },
+  docker: { long: ["--output", "--secret", "--ssh", "--build-context", "--file", "--config", "--context", "--host"], short: "ofHc" },
+  gradle: { long: ["--init-script", "--settings-file", "--build-file", "--project-dir", "--include-build"], short: "Icbp" },
+  mvn: { long: ["--file", "--settings", "--global-settings", "--toolchains"], short: "fsgt" },
+  dotnet: { long: ["--project", "--configfile", "--source"] },
+  swift: { long: ["--package-path", "--scratch-path", "-Xswiftc", "-Xcc", "-Xlinker"] },
+};
+
+/** An option among `words` (after the program) that runs code or reads instructions from elsewhere, or null. */
+function codeOption(prog: string, words: readonly string[]): string | null {
+  const o = CODE_OPTIONS[prog];
+  // `make VAR=value` sets a make variable to text it may run (`$(shell …)`).
+  if ((prog === "make" || prog === "gmake") && words.some((w) => /^[A-Za-z_][A-Za-z0-9_.]*\s*[:+?!]?=/.test(w))) return "a make variable";
+  if (!o) return null;
+  for (const w of words) {
+    if (w === "--") return null;
+    if (!w.startsWith("-")) continue;
+    if (o.long.some((l) => w === l || w.startsWith(`${l}=`) || (l.startsWith("--") && w.startsWith(l) && w.length > l.length && !/[a-z]/i.test(w[l.length]!)))) return w;
+    if (o.short && /^-[A-Za-z0-9]+/.test(w) && !w.startsWith("--") && [...(w.slice(1).split("=")[0] ?? "")].some((c) => o.short!.includes(c))) return w;
+  }
+  return null;
+}
+
 /** Second words a card offers as `program verb:*`: building and checking the project. */
 const PREFIX_VERBS = new Set(["test", "build", "lint", "check", "typecheck", "type-check", "fmt", "format", "clippy", "vet", "bench", "compile"]);
 
@@ -148,9 +188,15 @@ function plainCommand(cmd: SimpleCommand): boolean {
   return cmd.via.length === 0 && !cmd.delegates && !cmd.stdinScript && cmd.inputFrom === undefined && (cmd.wrapped?.length ?? 0) === 0;
 }
 
-/** Where a command can run on an allow rule: in the workspace, writing nothing by redirect, naming no path outside it. */
+/**
+ * Where a command can run on an allow rule: in the workspace, every word
+ * known, writing nothing by redirect, naming no path outside it, fed nothing
+ * on its input, and no option that runs code it is handed.
+ */
 function coverable(cov: CommandCoverage, cmd: SimpleCommand): boolean {
-  return !cov.cd && cov.inWorkspace && cov.plainRedirects && cov.pathsInside && plainCommand(cmd);
+  if (cov.cd || !cov.inWorkspace || !cov.plainRedirects || !cov.allLiteral || !cov.pathsInside || cov.stdinFed || !plainCommand(cmd)) return false;
+  const words = cmd.argv.map((w) => w.value ?? "");
+  return codeOption(basename(words[0] ?? ""), words.slice(1)) === null;
 }
 
 function wordsMatch(cmd: SimpleCommand, p: ShellPattern): boolean {
@@ -172,20 +218,19 @@ function inOrder(words: readonly string[], seq: readonly string[]): boolean {
  * the words after it, options and their values skipped (`npm --yes publish`).
  */
 function denyMatches(cmd: SimpleCommand, p: ShellPattern): boolean {
-  const prog = basename(p.words[0]!);
+  const name = (w: string) => basename(w).toLowerCase();
+  const prog = name(p.words[0]!);
   const words = cmd.argv.map((w) => (literal(w) ? w.value : null));
+  const first = words[0];
+  if (first === null || first === undefined) return false;
+  // Past the program, only a runner's, a wrapper's or a runner subcommand's words may name the one it runs (`uv run git push`).
+  const runs = isRunner(name(first)) || isNever(name(first)) || RUN_SUBCOMMANDS[name(first)]?.has(words[1] ?? "") === true;
   for (let at = 0; at < words.length; at++) {
     const w = words[at];
-    if (w === null || w === undefined) {
-      if (at === 0) return false;
-      continue;
-    }
-    if (basename(w) === prog) {
-      const rest = words.slice(at + 1).filter((x): x is string => x !== null);
-      return p.prefix ? inOrder(p.words.slice(1), rest) : inOrder(p.words.slice(1), rest) && rest.length === p.words.length - 1;
-    }
-    // Past the program, only a runner's or wrapper's words may name the one it runs.
-    if (at === 0 && !isRunner(basename(w)) && !isNever(basename(w))) return false;
+    if (w === null || w === undefined) continue;
+    // A deny rule's words, in order, with anything between or after: `Bash(npm unpublish)` refuses `npm unpublish --force` too.
+    if (name(w) === prog) return inOrder(p.words.slice(1), words.slice(at + 1).filter((x): x is string => x !== null));
+    if (at === 0 && !runs) return false;
   }
   return false;
 }
@@ -234,8 +279,8 @@ export function shellLineVerdict(parsed: ParsedShell, coverage: readonly Command
     if (deny) return { kind: "deny", rule: deny };
   }
   if (denies.length > 0 && partlyUnread(parsed)) {
-    const tokens = text.split(/[\s;&|()<>`'"$={}]+/).filter(Boolean).map((t) => basename(t));
-    const named = denies.find((r) => inOrder([basename(r.pattern.words[0]!), ...r.pattern.words.slice(1)], tokens));
+    const tokens = text.split(/[\s;&|()<>`'"$={}]+/).filter(Boolean).map((t) => basename(t).toLowerCase());
+    const named = denies.find((r) => inOrder([basename(r.pattern.words[0]!).toLowerCase(), ...r.pattern.words.slice(1)], tokens));
     if (named) return { kind: "deny", rule: named, uncertain: true };
   }
   if (!lineRunsOnRules(parsed) || parsed.commands.length === 0) return { kind: "none" };
@@ -288,8 +333,12 @@ export function proposeShellRules(parsed: ParsedShell, coverage: readonly Comman
       out.push(pattern);
     }
   }
-  return out;
+  // A card offers a handful at most; more is no rule anyone reads (and past what a save may carry).
+  return out.length <= MAX_OFFERED && out.every((p) => formatRule(p).length <= 1000) ? out : null;
 }
+
+/** The most rules one card offers to save. */
+export const MAX_OFFERED = 20;
 
 /** A host a rule never allows fetching: loopback, a local name, or an IP address. */
 function localHost(host: string): boolean {

@@ -109,6 +109,8 @@ test("from the CLI: a deny rule refuses in every mode, and approve --save keeps 
   await send(page, "publish");
   await expect(messages(page).filter({ hasText: "your rule Bash(npm publish:*)" }).first()).toBeVisible();
   await waitIdle(page);
+  // Refused, so it never ran: no output of it.
+  await expect(messages(page).filter({ hasText: "tests passed" })).toHaveCount(0);
 
   await setMode(page, "guarded");
   await send(page, "lint");

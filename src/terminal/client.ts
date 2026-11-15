@@ -1335,10 +1335,6 @@ export class TerminalClient {
     if (pending.targetWorkstream?.warning) console.log(`⚠ ${oneLine(pending.targetWorkstream.warning)}`);
     // What --save would keep (docs/secrets-and-memory-design.md §4.1).
     if (pending.ruleOffer) console.log(`⟲ --save session|repository keeps ${oneLine(pending.ruleOffer.rules.join(", "))}`);
-    if (opts.save && !pending.ruleOffer) {
-      fail("No rule can run this call (it's high risk, not understood, or asks for another reason); approve it once instead.");
-      return;
-    }
     const shown = plainText(pending.input === undefined ? "" : JSON.stringify(pending.input, null, 2) ?? "");
     const cut = shown.length > APPROVE_SHOW_MAX;
     console.log(cut ? shown.slice(0, APPROVE_SHOW_MAX) : shown);
@@ -1375,7 +1371,15 @@ export class TerminalClient {
       return;
     }
     const saved = (resp.data as { savedRules?: string[] } | undefined)?.savedRules;
-    console.log(approved ? (saved ? `Approved, and saved ${saved.join(", ")} for this ${opts.save}.` : "Approved.") : "Denied.");
+    console.log(
+      approved
+        ? saved?.length
+          ? `Approved, and saved ${saved.join(", ")} for this ${opts.save}.`
+          : saved
+            ? "Approved; a saved rule covers it already, so nothing more was saved."
+            : "Approved."
+        : "Denied.",
+    );
   }
 
   /**

@@ -606,6 +606,8 @@ export interface SessionCreateOptions {
   workstreamFence?: (binding: WorkstreamBinding | undefined, own: readonly string[]) => WorkstreamFence | undefined;
   /** The owner's saved approval rules (docs/secrets-and-memory-design.md §4.1); none without it. */
   approvalRules?: ApprovalRuleService;
+  /** Resume: the meta says an agent made it (TranscriptMeta.madeByAgent). */
+  madeByAgent?: boolean;
   /**
    * Role-scoped goal-blackboard mount for a collaboration child: the endpoint
    * URL plus a bearer token that IS the scope (one goal, this role's read/write
@@ -1973,8 +1975,9 @@ export class Session {
         opts.initialMode.mode === "autonomous" ? opts.initialMode.maxTurns : undefined;
     }
     this.createdBy = opts.auth.sub;
-    // Made by a person, not an agent (a dispatched worker, a conductor's child): only a person's cards can save rules.
-    this.#ownerIsPerson = turnOrigin(opts.auth) === "user";
+    // Made by a person, not an agent (a dispatched worker, an automation or delegated token): only then do allow
+    // rules run its calls and its cards offer a save. Kept in the meta: a resumed session's auth says nothing of it.
+    this.#ownerIsPerson = opts.madeByAgent !== true && turnOrigin(opts.auth) === "user";
     // Restored from TranscriptMeta on resume, stamped fresh only for a new
     // session. Both were previously unconditional `now`, which meant every
     // daemon restart re-dated every session: `createdAt` became the restart
@@ -2229,6 +2232,7 @@ export class Session {
         collaboration: this.collaboration,
         collaborationRole: this.collaborationRole,
         ...(this.workstreamAhead ? { workstream: this.workstreamAhead } : {}),
+        ...(this.#ownerIsPerson ? {} : { madeByAgent: true as const }),
         // Fire-and-forget: saveMeta's write chain owns the failure log; an
         // unconsumed rejection here would be an unhandled-rejection crash.
       }).catch(() => {});
@@ -6658,10 +6662,12 @@ export class Session {
     const risk = this.#shellRisk(gated.toolName, input, gated.shellCwd);
     const patterns = this.#alwaysAsks(gated.toolName, input, risk, gated.shellCwd) ? null : this.#offeredPatterns(gated.toolName, input, risk, gated.shellCwd);
     if (!patterns) return { ok: false, error: "No rule can run this call; allow it once instead", code: "invalid_request" };
-    // What the card showed must be what is saved: a rule removed meanwhile, or a hook's rewrite, changes it.
+    // Nothing is saved that the card didn't show: a rule removed meanwhile, or a hook's rewrite, can change it.
+    // Fewer (another card's save covers part of it now, or all: nothing to add) is what was shown, and stands.
     const texts = patterns.map(formatRule);
-    if (shown && (shown.length !== texts.length || texts.some((t, i) => t !== shown[i]))) {
-      return { ok: false, error: `The rule to save is now ${texts.join(", ") || "nothing (already covered)"}; look again before saving`, code: "invalid_request" };
+    const unseen = texts.filter((t) => !(shown ?? []).includes(t));
+    if (unseen.length > 0) {
+      return { ok: false, error: `Saving now would keep ${unseen.join(", ")}, which the card didn't show; look again before saving`, code: "invalid_request" };
     }
     // paths: the repository's folder, recorded as the rule's label; nothing opened in it
     this.#repositoryLabel ??= sandboxWorkspaceOf(this.workdir);
@@ -9781,14 +9787,18 @@ export class Session {
     return { accountId: this.accountId, projectId: this.projectId, owner: this.createdBy, sessionId: this.id, workspaceId: this.#workspaceId, ...(ws ? { workstreamId: ws } : {}) };
   }
 
-  /** The rules that apply here; none when they can't be read (logged), so nothing runs on one. */
+  /**
+   * The rules that apply here. When they can't be read (logged), a deny rule
+   * may be among them: one stand-in refusal, so nothing runs on a rule and
+   * nothing a deny rule would refuse runs either (fail closed).
+   */
   #savedRules(): StoredRule[] {
     if (!this.#approvalRules) return [];
     try {
       return this.#approvalRules.rulesFor(this.#ruleSubject());
     } catch (e) {
       console.error(`[codeoid/session ${this.id}] approval rules: ${e instanceof Error ? e.message : String(e)}`);
-      return [];
+      return [UNREADABLE_RULES];
     }
   }
 
@@ -9841,6 +9851,11 @@ export class Session {
     if (!this.#approvalRules || this.#ruleExempt(toolName)) return null;
     const rules = this.#savedRules();
     if (rules.length === 0) return null;
+    if (rules[0] === UNREADABLE_RULES) {
+      // Only what a rule could name: a shell command, a fetch, an MCP tool.
+      const ruleable = isShellTool(toolName) || toolName === "WebFetch" || toolName.startsWith("mcp__");
+      return ruleable ? { kind: "deny", rule: UNREADABLE_RULES } : null;
+    }
     const call = shellCallOf(toolName, input);
     if (call) {
       const line = this.#ruleLine(call, shellCwd);
@@ -9850,13 +9865,13 @@ export class Session {
       if (v.kind === "deny") return { kind: "deny", rule: v.rule as StoredRule };
       // Where the backend's shell is isn't known (it may have moved and didn't say): nothing runs on a rule.
       const plain = risk !== null && (risk.level === "low" || risk.level === "medium") && !risk.secret && !risk.unreadable && shellCwd !== null;
-      return v.kind === "allow" && this.#mode === "guarded" && plain ? { kind: "allow", rules: v.rules as StoredRule[] } : null;
+      return v.kind === "allow" && this.#mode === "guarded" && plain && this.#ownerIsPerson ? { kind: "allow", rules: v.rules as StoredRule[] } : null;
     }
     if (isShellTool(toolName)) return null;
     const m = toolRuleMatch(toolName, input, rules) as StoredRule | null;
     if (!m) return null;
     if (m.effect === "deny") return { kind: "deny", rule: m };
-    return this.#mode === "guarded" && this.#mcpRulesHold(toolName) ? { kind: "allow", rules: [m] } : null;
+    return this.#mode === "guarded" && this.#ownerIsPerson && this.#mcpRulesHold(toolName) ? { kind: "allow", rules: [m] } : null;
   }
 
   /**
@@ -9889,8 +9904,10 @@ export class Session {
   /** A deny rule's refusal of a call, for Claude's PreToolUse hook: audited and said, as at the gate. */
   #hookRuleRefusal(toolName: string, input: unknown, cwd: string | null | undefined): string | null {
     if (!input || typeof input !== "object") return null;
+    // Only a deny rule refuses here: with none, nothing to read (and no risk to judge: deny matching needs none).
+    if (!this.#savedRules().some((r) => r.effect === "deny")) return null;
     const call = input as Record<string, unknown>;
-    const ruled = this.#ruleVerdict(toolName, call, this.#shellRisk(toolName, call, cwd), cwd);
+    const ruled = this.#ruleVerdict(toolName, call, null, cwd);
     if (ruled?.kind !== "deny") return null;
     const rule = ruled.rule;
     this.#store.audit(SYSTEM_IDENTITY.sub, "session.rule_deny", this.id, `rule=${rule.id} scope=${rule.scope} tool=${toolName} at=hook`);
@@ -12937,6 +12954,7 @@ export class Session {
       collaborationRole: this.collaborationRole,
       // Both meta writes, for the same reason as the collaboration above.
       ...(this.workstreamAhead ? { workstream: this.workstreamAhead } : {}),
+      ...(this.#ownerIsPerson ? {} : { madeByAgent: true as const }),
     }).catch(() => {});
   }
 }
@@ -13077,6 +13095,16 @@ function isNativeRef(ref: unknown): ref is NativeTurnRef {
  * its display name without the vendor in parentheses ("Codex (OpenAI)" →
  * "Codex"), an endpoint's own name, else its id.
  */
+/** Stands in for the rules when they can't be read: refuses, as a deny rule would. */
+const UNREADABLE_RULES: StoredRule = {
+  id: "unreadable",
+  pattern: { tool: "Bash", words: ["*"], prefix: true },
+  effect: "deny",
+  scope: "everywhere",
+  text: "(your saved rules couldn't be read)",
+  scopeKey: "",
+};
+
 /** What a deny rule's refusal tells the agent and the card. */
 function ruleRefusalText(rule: StoredRule): string {
   return `Refused by your saved rule ${rule.text} (${rule.scope}); remove it in Settings → Approvals to allow this`;

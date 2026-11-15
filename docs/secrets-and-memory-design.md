@@ -341,9 +341,15 @@ backend.
 | `mcp__linear__list_issues` | that MCP tool |
 | `WebFetch(domain:docs.rs)` | allow: an http(s) fetch of exactly that host on its default port; deny: the host and its subdomains |
 
-A rule belongs to the user who saved it, in their tenant, and applies only to that user's sessions. A session
-that a person didn't make is the agent's: a dispatched worker or a conductor's child is created by the
-conductor's identity, so none of its owner's rules apply and its cards offer no save. The scope is one of:
+A rule belongs to the user who saved it, in their tenant, and applies only to that user's sessions.
+
+- Allow rules run only in sessions a person made with their own token. A session a delegated or automation
+  token made gets none, and neither does a dispatched worker, which the conductor's identity makes.
+- Those sessions' cards offer no save.
+- This is kept in the meta (`TranscriptMeta.madeByAgent`), since a resumed session's auth doesn't carry it.
+- Deny rules apply to every session made with the owner's identity.
+
+The scope is one of:
 
 - `session`: that session, until `approvals.sessionGrantHours` (8) have passed, or the session is destroyed.
 - `repository`: every session of that user in the repository, its worktrees included. The key is the session's
@@ -362,11 +368,18 @@ conductor's identity, so none of its owner's rules apply and its cards offer no 
   - a plain read, as low's allow-list judges one command (`tail -50` after `npm test 2>&1 |`, a read in `$(…)`);
   - a `cd` / `pushd` / `popd` to a literal directory inside the workspace;
   - a match for an allow rule, run plainly:
-    - no wrapper, script or input it runs for others;
+    - no wrapper, script or input it runs for others, and nothing fed on its input (a pipe, here-document, `<`);
     - only reading redirects;
-    - in the workspace;
-    - every path its words name, an option's value included, inside the workspace;
+    - in the workspace, links followed;
+    - every word known before it runs (no variable, substitution, glob or brace expansion);
+    - every path its words name inside the workspace, links followed: an option's value (`-C..`, `--x=y`), each
+      part of `a=b,c`, an `@file`. A URL or a `file:`, `data:` or `npm:` specifier counts as outside;
+    - no option that makes a build or test tool run code it is handed, or read instructions from elsewhere
+      (`CODE_OPTIONS`: `make --eval/-f/-C`, `VAR=value`, `go -exec/-toolexec`, `cargo --config`,
+      `npm --node-options/--script-shell/--prefix`, `docker --output`, …);
     - the rule's words literal and equal to its own (an exact rule also needs the same number of words).
+- A `cd` is followed only when it is certain: one in a subshell, `$(…)` or behind `&&`/`||`, or to a folder
+  that doesn't exist, leaves every later command in no known place.
 - A command inside `$(…)` is a simple command of its own, so it must be covered too.
 - On Codex, which hands commands over as `bash -lc '<script>'`, the script is what allow rules read; deny rules
   read both.
@@ -385,8 +398,10 @@ No rule word may hold a space, quote, shell character, control or invisible char
 program.** A stored allow rule that the rules have since come to refuse is dropped when read; a deny rule never
 is.
 
-**Deny rules** match a command's program by name, however it is run (`sudo /bin/npm`), or named after a runner or
-wrapper (`npx npm …`). The rule's other words must appear in order after it, past options (`npm --yes publish`).
+**Deny rules** match a command's program by name, ignoring case, however it is run (`sudo /bin/npm`). They also
+match it named after a runner, a wrapper or a runner's `run`/`exec` (`npx npm …`, `uv run git push`). The rule's
+other words must appear in order after it, with anything between or after: an exact deny rule matches as a
+prefix one does.
 
 - A line that can't be read in full (a script piped to a shell, problems, too long to read) is refused when its
   text names the rule's words in order.
@@ -395,7 +410,11 @@ wrapper (`npx npm …`). The rule's other words must appear in order after it, p
   sandbox is the boundary.
 - They are checked at the gate in every mode, and in Claude's PreToolUse hook before the CLI's own allow rules
   (`ProviderSessionInit.approvalRuleRefusal`).
-- Calls a backend runs without asking can't be refused: Codex in autonomous mode, Qwen's read-only commands.
+- Calls a backend runs without asking can't be refused: Codex in autonomous mode and its own safe commands in
+  guarded mode, Qwen's read-only commands.
+- A fetch deny rule covers a tool named `WebFetch`. A sandboxed `curl` to the host is the sandbox network's to
+  stop.
+- When the saved rules can't be read, every command, fetch and MCP call is refused (fail closed).
 
 **The card offers** "Allow once", "Allow for this session" and "Allow in this repository":
 
@@ -404,9 +423,11 @@ wrapper (`npx npm …`). The rule's other words must appear in order after it, p
   - `program verb:*` for building and checking (`test`, `build`, `lint`, `check`, `typecheck`, `fmt`, `format`,
     `clippy`, `vet`, `bench`, `compile`);
   - `runner run verb:*` for such a package script (`npm run lint:*`);
-  - otherwise the exact command, so approving a read never saves a rule that writes.
-- The daemon works the rules out again from the call's own input when the answer arrives. The client sends back
-  the rules its card showed (`session.approve` `rules`), and a save that would now keep others is refused.
+  - otherwise the exact command, so approving a read never saves a rule that writes;
+  - nothing when more than 20 rules would be offered.
+- The daemon works the rules out again from the call's own input when the answer arrives.
+- The client must send back the rules its card showed (`session.approve` `rules`). A save that would now keep a
+  rule the card didn't show is refused. Fewer than it showed (another save covers part of it now) stands.
 - Saving needs the session owner's own, undelegated token. Any other approver's save is refused and the card stays
   open; a delegated approver can still allow once.
 - A call that a rule saved since already covers saves nothing and is approved.

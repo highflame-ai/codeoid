@@ -24,7 +24,8 @@
  * tools are.
  */
 import { homedir, userInfo } from "node:os";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { isProcSecretPath, kernelPath, secretDirsOf, secretPathVerdict } from "../secret-paths.js";
 import {
   loadShellParser,
@@ -101,21 +102,87 @@ export interface CommandCoverage {
   index: number;
   /** A plain read on low's allow-list, judged on its own where it runs. */
   plainRead: boolean;
-  /** A `cd` / `pushd` / `popd`: whether it lands on a known directory inside the workspace. */
+  /** A `cd` / `pushd` / `popd`: whether it lands, for certain, on an existing directory inside the workspace. */
   cd?: { inside: boolean };
-  /** It runs inside the workspace, after any `cd` before it. */
+  /** It runs inside the workspace, after any `cd` before it, links followed. */
   inWorkspace: boolean;
   /** Its redirects only read inside the workspace, duplicate a descriptor or write /dev/null. */
   plainRedirects: boolean;
-  /** Every path its words name (an option's value too: `--output=x`, `-C dir`) is inside the workspace and no credential file. */
+  /** Every word is known before the line runs: no variable, substitution, glob or brace expansion. */
+  allLiteral: boolean;
+  /**
+   * Every path its words name is inside the workspace, links followed, and no
+   * credential file: an option's value too (`--output=x`, `-C..`, `-fx`), each
+   * part of `a=b,c`, an `@file`; a URL or a `file:`/`data:`/`npm:`… specifier is outside.
+   */
   pathsInside: boolean;
+  /** It reads input a pipe, here-document, here-string or `<` hands it (a script it may run). */
+  stdinFed: boolean;
+}
+
+/** Specifiers that load from somewhere other than the workspace: `https://…`, `file:`, `data:`, `npm:`, `jsr:`, … */
+const SPECIFIER = /^(?:[a-z][a-z0-9+.-]*:\/\/|(?:file|data|npm|jsr|node|git|git\+[a-z]+|ssh|http|https|javascript|blob):)/i;
+
+/** The parts of a rule-matched command's word that may be a path (wider than pathCandidates: a rule runs unasked). */
+function ruleCandidates(v: string): string[] {
+  const out = new Set<string>();
+  let body = v;
+  if (v.startsWith("-")) {
+    const eq = v.indexOf("=");
+    const short = /^-[A-Za-z](.+)$/.exec(v);
+    if (eq >= 0) body = v.slice(eq + 1);
+    else if (short && !v.startsWith("--")) body = short[1]!;
+    else return [];
+  }
+  out.add(body.replace(/^@/, ""));
+  for (const part of body.split(/[,=]/)) if (part) out.add(part.replace(/^@/, ""));
+  return [...out];
+}
+
+/** The real path of `abs` as far as it exists, the rest appended: a link inside the workspace leading out is out. */
+function realOf(abs: string): string {
+  let head = abs;
+  let tail = "";
+  while (head !== dirname(head)) {
+    try {
+      return join(realpathSync(head), tail);
+    } catch {
+      tail = tail ? join(basename(head), tail) : basename(head);
+      head = dirname(head);
+    }
+  }
+  return abs;
+}
+
+/** `abs` is inside the workspace, links followed, and no credential file. */
+function realInside(abs: string, ctx: Ctx): boolean {
+  if (isCredentialPath(abs, ctx)) return false;
+  const real = realOf(abs);
+  return where(abs, ctx) === "workspace" && insideOf(real, realOf(ctx.workdir)) && !isCredentialPath(real, ctx);
+}
+
+/** Every path a literal word names is inside the workspace (ruleCandidates). */
+function wordInside(v: string, ctx: Ctx): boolean {
+  for (const c of ruleCandidates(v)) {
+    if (SPECIFIER.test(c)) return false;
+    if (!(c === "." || c === ".." || /^[.~/]/.test(c) || c.includes("/"))) continue;
+    const abs = c === "~" || c.startsWith("~/") ? join(ctx.home, c.slice(1)) : c.startsWith("~") ? null : resolve(ctx.cwd, c);
+    if (abs === null || !realInside(abs, ctx)) return false;
+  }
+  return true;
+}
+
+/** A word known before the line runs, with nothing to expand: no variable, substitution, glob, input, or unquoted brace. */
+function literalWord(w: ShellWord): boolean {
+  return w.value !== null && !w.glob && !w.input && w.home === undefined && !/^[^'"]*\{[^}]*,/.test(w.raw);
 }
 
 /**
  * Each simple command of a line, as saved approval rules judge it. A `cd` is
- * followed as judgeLine follows one, and a `cd` to somewhere not known leaves
- * every command after it outside the workspace. The line's own conditions (understood, no
- * assignment or construct) are the caller's to check.
+ * followed only when it is certain: one that may not run or not stay (in a
+ * subshell, `$(…)`, behind `&&`/`||`), or to a directory that doesn't exist,
+ * leaves every command after it in no known place. The line's own conditions
+ * (understood, no assignment or construct) are the caller's to check.
  */
 export function commandCoverage(command: string, parsed: ParsedShell, ctx: RiskContext): CommandCoverage[] {
   const full: Ctx = { ...ctx, home: ctx.home ?? homedir(), homeFixed: !/(^|[^$\w{])HOME\b/.test(command) };
@@ -123,21 +190,30 @@ export function commandCoverage(command: string, parsed: ParsedShell, ctx: RiskC
   let cwd: string | null = full.cwd;
   parsed.commands.forEach((cmd, index) => {
     const here: Ctx = { ...full, cwd: cwd ?? full.cwd };
-    const inWorkspace = cwd !== null && where(cwd, full) === "workspace";
+    const inWorkspace = cwd !== null && realInside(cwd, full);
     const plainRedirects = cmd.redirects.every((r) => notLowRedirect(r, here) === null);
-    const words = [...cmd.argv.slice(1), ...(cmd.wrapped ?? [])].filter((w) => w.value !== null && !w.input);
-    const pathsInside = words.every((w) => pathCandidates(w.value!).every((p) => outsideWorkspace({ ...w, value: p }, here) === null));
+    const words = [...cmd.argv.slice(1), ...(cmd.wrapped ?? [])];
+    const allLiteral = cmd.argv.every(literalWord) && (cmd.wrapped ?? []).every(literalWord);
+    const pathsInside = words.every((w) => !literalWord(w) || wordInside(w.value!, here));
+    const stdinFed = cmd.heredoc || cmd.stage > 0 || cmd.redirects.some((r) => r.op === "<" || r.op === "<<" || r.op === "<<-" || r.op === "<<<");
+    const facts = { inWorkspace, plainRedirects, allLiteral, pathsInside, stdinFed };
     const prog = programOf(cmd);
     if (cmd.argv[0]?.value === prog && (prog === "cd" || prog === "pushd" || prog === "popd")) {
       const to = cdTarget(cmd, prog, cwd, full);
-      const inside = to !== null && cmd.argv.slice(1).every((w) => w.value !== null && !w.glob && !w.input) && where(to, full) === "workspace";
-      out.push({ index, plainRead: false, cd: { inside }, inWorkspace, plainRedirects, pathsInside });
-      cwd = to;
+      const certain = !cmd.subshell && !cmd.conditional && cmd.substitution === null && cmd.via.length === 0 && allLiteral;
+      let exists = false;
+      try {
+        // paths: whether the directory a cd names exists, for judging a rule; nothing opened
+        exists = to !== null && statSync(to).isDirectory();
+      } catch {}
+      const lands = certain && exists ? to : null;
+      out.push({ index, plainRead: false, cd: { inside: lands !== null && realInside(lands, full) }, ...facts });
+      cwd = lands;
       return;
     }
     // A plain read inside `$(…)` only hands words to the command around it, which must be covered itself.
     const alone: SimpleCommand = cmd.substitution === "command" ? { ...cmd, substitution: null } : cmd;
-    out.push({ index, plainRead: inWorkspace && notLowCommand(alone, here) === null, inWorkspace, plainRedirects, pathsInside });
+    out.push({ index, plainRead: inWorkspace && notLowCommand(alone, here) === null, ...facts });
   });
   return out;
 }

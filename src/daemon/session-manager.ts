@@ -1185,6 +1185,8 @@ export class SessionManager {
             accountId: meta.accountId,
             projectId: meta.projectId,
           },
+          // Who made it (§4.1): the meta's word, or, for a session from before it, an agent's identity as owner.
+          madeByAgent: meta.madeByAgent === true || meta.createdBy.startsWith("conductor:") || meta.createdBy.includes("://"),
           store: this.#store,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
@@ -10229,6 +10231,7 @@ mcpHub: this.#mcpHub,
     let saved: string[] | undefined;
     if (msg.save !== undefined) {
       if (!msg.approved) return { type: "response.error", requestId: msg.id, error: "A rule is saved with an approval, not a denial", code: "invalid_request" };
+      if (!msg.rules) return { type: "response.error", requestId: msg.id, error: "Send the rules the card showed with a save", code: "invalid_request" };
       const r = session.saveApprovalRules(msg.approvalId, msg.save, auth, msg.rules);
       if (!r.ok) {
         this.#store.audit(auth.sub, "approval_rule.save_refused", session.id, `approvalId=${JSON.stringify(msg.approvalId)} scope=${msg.save}`);
