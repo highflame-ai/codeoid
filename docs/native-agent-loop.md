@@ -34,8 +34,8 @@ That costs three things.
    - The fork-isolation rules in CLAUDE.md are long because the Claude CLI owns background tasks
      that we have to fence off from outside.
    - Every vendor upgrade can break the translation layer.
-3. **Features have nowhere to live but per backend.** A work ledger that survives compaction, a
-   model and cost badge on every turn, manual compaction, and skills on every backend each have
+3. **Features have nowhere to live but per backend.** A work ledger that survives context rotation, a
+   model and cost badge on every turn, manual rotation, and skills on every backend each have
    to be built once per harness today.
 
 The native loop is codeoid's own harness:
@@ -59,7 +59,7 @@ feature costs the least to build. The rule is enforced three ways.
    backend's capability record says so, the UI shows it, and a test pins it.
    - Example: Codex is sandboxed as one process, while the native loop is sandboxed per
      command.
-   - Example: a CLI that compacts on its own still gets the ledger, but only through its next
+   - Example: a CLI that compacts on its own (codeoid never does) still gets the ledger, but only through its next
      prompt.
 3. **A conformance suite** (§9) runs one test per feature against every backend:
    - in CI with the scripted backend standing in for each harness's event shapes;
@@ -74,7 +74,7 @@ from the terminal as well as the web UI:**
 - by the same protocol message the web uses, so the two can't drift.
 
 That covers the backend and model, the native loop's settings (budgets, Bash timeout,
-compaction), the work ledger (`codeoid ledger <s>`), `/compact`, and evals (`codeoid eval
+rotation), the work ledger (`codeoid ledger <s>`), `/rotate`, and evals (`codeoid eval
 run|ls|show|report|push`). The conformance suite checks it: each setting has a test that sets
 it from the CLI.
 
@@ -180,27 +180,32 @@ read in opencode v2 (`d432a06`) and pi (`7cc21c2`).
 
 ### Context
 
-- **Compaction moves things out of the window and loses nothing.**
-  - Theirs: both summarize and drop.
-  - Ours: everything is already stored verbatim (lossless episodes, #471). A compacted
-    checkpoint carries the episode ids of what it dropped, and the model can read any of it
-    back exactly with `get_episode`.
-- **The checkpoint's facts are computed, not written by the model.**
+- **No compaction. codeoid never summarizes a conversation away.**
+  - Theirs: both summarize the history and drop what they summarized. The model keeps working
+    from an LLM's paraphrase of its own past.
+  - Ours: codeoid is compaction-free today (`docs/FEATURES.md`, "Context reduction stack").
+    - Everything stays verbatim in memory.
+    - Near the ceiling, the backing context is **rotated**: the window starts fresh, the
+      public session id stays the same, and a `<rotation_context>` task anchor is added.
+    - Anything older is one `recall` / `get_episode` away.
+  - The native loop keeps that model, and it goes further because codeoid owns the window
+    itself. Rotation is the CLI's backing session on Claude, but on the native loop it is just
+    a choice of which canonical turns go in the next request. No process is restarted and
+    nothing is re-seeded.
+- **The rotation anchor is computed from facts, not written by a model.**
   - Computed from canonical history and the memory facts: files read and modified, commands
-    run with their exit codes, failing checks, the last error.
-  - The model summarizes only intent, decisions and next steps. That makes the summary
-    cheaper and the facts exact, following the LongCapHarness rule: code where the rules are
-    explicit.
-- **Compaction is measured.** A `codeoid-core` probe asks questions that were answerable
-  before a compaction, and they must still be answerable after it. A change to the compactor
-  is accepted on that score.
+    run with their exit codes, failing checks, the last error, and the work ledger.
+  - Code builds it, so it is exact and costs no model call (the LongCapHarness rule: code
+    where the rules are explicit).
+- **Rotation is measured.** A `codeoid-core` probe asks questions that were answerable before
+  a rotation, and they must still be answerable after it, through recall. A change to what
+  the anchor carries is accepted on that score.
 - **Large outputs spill into memory, not a temp file.**
   - Bash and Read past their cap are stored as an episode. The model gets its id and the
     view, and `get_episode` pages the rest.
   - It survives a restart, a fork and a backend switch, and the same output is visible to
     every frontend. A temp path survives none of those.
-- **A cheaper model can do the compaction.** It runs on any source the owner picks, such as a
-  local model, because the request is built from canonical history.
+  - This is what output compression (Layer B) already does for Claude's Bash.
 
 ### Sub-agents and safety
 
@@ -232,7 +237,7 @@ harness can't take is declared.
 | Each edit checked at once | In the edit's result | Run after the call. Delivered through Claude's PostToolUse context, otherwise as the next input. |
 | Daemon-wide rate limiting | Every model call | Only the in-daemon backends. A CLI makes its own calls (declared). |
 | Failover across sources | Mid-turn | At the turn boundary, as a backend or account switch with the full history. |
-| Lossless compaction and spill | Native | The CLI compacts itself. Recall tools over MCP and the ledger in the next prompt make up the difference. |
+| Compaction-free rotation and spill to memory | Native: codeoid owns the window | Claude: backing-session rotation as today. Other CLIs: `/rotate` where they can start fresh. A CLI that compacts on its own is declared, and the ledger and recall tools over MCP make up the difference. |
 | Sub-agents as sessions, per-command sandbox | Native | Sub-agents via the conductor's `Task` over MCP. Sandbox per process or natively (`docs/sandbox.md`). |
 
 ## 3. Shape
@@ -244,7 +249,7 @@ Session ──▶ NativeProvider (AgentProvider, wrapped by StatelessSessionProv
               ├── Tools           Read Write Edit Bash Glob Grep + patch, Task, WebFetch,
               │                   TodoWrite, ask_user, request_directory, memory, MCP   (§5)
               ├── Prompt          base + family addendum + Session's append   (§7)
-              └── Compactor       structured checkpoint + ledger   (§8)
+              └── Window          verbatim turns + rotation anchor + ledger (§8)
 ```
 
 - **Id and label `codeoid`, one more entry in the backend picker that already exists.** Users
@@ -445,35 +450,53 @@ same view.
 
 ## 8. Context, cache and the ledger
 
-- **Trigger.** Compaction runs between steps when the estimated prompt is at least the window
-  minus max(15%, 16k) (opencode). The estimate is the last measured usage plus a character
-  estimate for what came after it. When a provider rejects a request for overflow before any
-  output, the loop compacts once and retries.
-- **The checkpoint** has fixed headings: Objective, Constraints, Decisions, Work state (done,
-  active, blocked), Next, Files read, Files modified (up to 15), Exact errors.
-  - Files read and modified, commands with their exit codes, failing checks, and the last
-    error are computed from canonical history and the memory facts. The model writes only
-    objective, decisions and next steps (§2a).
-  - Paths, commands and error text are kept verbatim.
-  - A later compaction *updates* the previous checkpoint instead of starting over.
-  - It never cuts between a tool call and its result.
-  - The newest ~15–20k tokens are kept verbatim.
-  - Anything older is one `recall`/`get_episode` away. `VerbatimWorkingSetStrategy` already
-    advertises the recall tools.
-- **The cache.** The summary request reuses the normal request prefix, so it hits the cache.
-  Anthropic's four breakpoints go to:
+To investigate in depth when the work is taken up. What follows is the direction, and it holds
+to codeoid's rule: **compaction-free**. Nothing is summarized away; the window is a view of a
+history kept verbatim.
+
+- **What goes in a request.** Each request is built from the canonical turns:
+  - the system prompt and memory index (Layer C);
+  - the current turn whole;
+  - as many recent turns verbatim as fit the window, minus a reserve for output.
+  - It never splits a tool call from its result.
+- **Rotation, not compaction.** When the window would overflow, the loop starts the next
+  request from a fresh window.
+  - The window holds the `<rotation_context>` anchor (`renderRotationSeed`, Layer D), with
+    facts computed per §2a, the work ledger, and the newest turns verbatim.
+  - Older turns are still canonical and still in memory. `VerbatimWorkingSetStrategy` already
+    advertises the recall tools, and `get_episode` returns their exact bytes.
+  - When a provider rejects a request as too long before any output, the loop rotates once
+    and retries.
+  - On Claude, rotation stays what it is today: the backing CLI session rolls over. The
+    trigger and anchor are the same at the Session seam, so the behaviour matches across
+    backends.
+- **Open questions for then:**
+  - Is the old-turn cutoff a token budget or a turn count? What does the anchor carry beyond
+    the facts and the ledger?
+  - How do rotation and the prompt cache interact? A rotation is a cache miss, so it should
+    be rare and late.
+  - What does the §2a probe eval accept?
+- **The cache.** Anthropic's four breakpoints go to:
   - the last tool definition;
   - the first and last system parts;
   - the conversation tail, which moves forward after each tool result.
-- **Manual compaction** (`/compact [focus]`) is a Session verb on every backend:
+
+  Between rotations the prefix only grows, so the cache holds.
+- **Manual rotation** (`/rotate`) already exists for Claude. It becomes a Session verb on
+  every backend, from the web UI and the terminal alike:
   - native on the native loop;
-  - the CLI's own compaction where a harness has one (Claude, pi, Codex);
+  - the backing session's rollover on Claude;
+  - a fresh native session with the anchor on harnesses that can start one (Codex, pi,
+    opencode);
   - declared unsupported elsewhere.
+
+  When a vendor CLI compacts on its own, codeoid can't stop it. The capability record says
+  so, and the ledger and recall tools are still there after it does.
 - **The work ledger is a Session-level feature** (KiroCrew). It records goal, phase, next,
-  tried and artifacts. It is fed by `TodoWrite`, by the checkpoint's Work state and Next, and
-  by loop and routine state.
-  - It is re-sent after every compaction, rotation and loop cycle, on every backend: in the
-    native loop's checkpoint, and as the next prompt's prefix for CLI harnesses.
+  tried and artifacts. It is fed by `TodoWrite` and by loop and routine state.
+  - It is re-sent after every rotation, a vendor CLI's own compaction, and every loop cycle,
+    on every backend: in the native loop's anchor, and as the next prompt's prefix for CLI
+    harnesses.
   - It is shown in the web UI, so the context window becomes a cache rather than the only
     copy of where the work stands.
 - **The per-turn badge.** Every turn records the model that actually answered (fallbacks
@@ -587,7 +610,7 @@ Following LongCapHarness, a strong model designs and a cheap model executes.
 |---|---|---|
 | 0. Evals | Task schema, `codeoid eval run` (headless compare, evidence graders, `eval` owner kind), the `/data/codeoid-evals` writer, `codeoid-core` v0, and a baseline on today's backends with 2–3 models, one of them local. | A reproducible report. A rerun of the same protocol matches within noise. |
 | 1. Minimal native loop | `codeoid` id and model sources (Anthropic Messages, OpenAI Chat). Read, Write, Edit, MultiEdit, Bash, Glob, Grep, ask_user, request_directory, memory, MCP. `confinementFor` case and per-command sandbox. Budgets on turns, cost and wall time. Max steps ends with `toolChoice: none` and a summary prompt. Steer and queue mapped to `pushMidTurn`. Settles stale tool calls on resume. From §2a: done means verified, budgets enforced in the gate, per-step checkpoints with `Revert`, refusing an edit against a stale read, the repeated-failure hint and stop, and output spilled into memory. | Conformance green, including "autonomous Bash never runs unsandboxed". Each §2a item has its eval task. On `codeoid-core` it **beats** opencode and pi on the same endpoint model, not just matches them. |
-| 2. Long sessions | Compaction and checkpoint, the Session-level work ledger for all backends, prompt caching, background Bash, Task as a child session, project instructions and skills index for all backends, the per-turn badge for all backends, `/compact` everywhere, Gemini, and `apply_patch` for patch-format models. From §2a: checking each edit at once, daemon-wide rate limiting, failover across sources, compaction from facts that loses nothing (with its probe eval), `Consult`, and edit formats chosen from eval data. Each Session-level item lands on the vendor harnesses in the same PR (§2a table). | Long-task evals don't regress against phase 1. If the native loop beats the plain chat backends, it becomes their default. |
+| 2. Long sessions | Compaction-free windowing and rotation (§8), the Session-level work ledger for all backends, prompt caching, background Bash, Task as a child session, project instructions and skills index for all backends, the per-turn badge for all backends, `/rotate` everywhere, Gemini, and `apply_patch` for patch-format models. From §2a: checking each edit at once, daemon-wide rate limiting, failover across sources, the rotation anchor computed from facts (with its probe eval), `Consult`, and edit formats chosen from eval data. Each Session-level item lands on the vendor harnesses in the same PR (§2a table). | Long-task evals don't regress against phase 1. If the native loop beats the plain chat backends, it becomes their default. |
 | 3. Workers | The native loop as the default worker for non-Claude models in loops, routines and the conductor. An independent diff reviewer as a loop stage (any backend). Lessons with an approval queue. | Loop pass rate on heldout tasks doesn't drop compared with vendor-harness workers. |
 | 4. Harness improvement | §10, gated on heldout evals. | An accepted improvement on heldout that also holds on a second model. |
 
