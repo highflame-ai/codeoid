@@ -76,6 +76,10 @@ interface PendingApproval {
   answers: Record<string, string[]>;
   /** Unix ms when this approval was registered — used to prune stale entries. */
   createdAt: number;
+  /** The rules the card offered to save (secrets-and-memory-design.md §4.1). */
+  rules?: string[];
+  /** An answer is on its way to the daemon: a second tap waits for it. */
+  answering?: boolean;
 }
 
 /** Cap the pending-approval map so untapped prompts (interrupted turns, closed
@@ -1289,6 +1293,7 @@ export class TelegramFrontend implements Frontend {
         questions,
         answers: {},
         createdAt: Date.now(),
+        ...(tool.state.phase === "waiting_confirmation" && tool.state.ruleOffer ? { rules: tool.state.ruleOffer.rules } : {}),
       });
     }
 
@@ -1526,20 +1531,31 @@ export class TelegramFrontend implements Frontend {
     };
 
     if (kind === "a") {
+      // A second tap while the first is on its way: the first one's result stands.
+      if (pending.answering) {
+        await ctx.answerCallbackQuery().catch(() => {});
+        return;
+      }
       const save = rest[0] === "s" ? "session" : rest[0] === "r" ? "repository" : undefined;
       const approved = rest[0] === "y" || save !== undefined;
-      const res = await this.#manager.handle(
-        {
-          type: "session.approve",
-          id: randomUUID(),
-          sessionId: pending.sessionId,
-          approvalId: pending.approvalId,
-          approved,
-          ...(save ? { save } : {}),
-        },
-        state.auth,
-        client,
-      );
+      pending.answering = true;
+      let res: DaemonMessage | undefined;
+      try {
+        res = await this.#manager.handle(
+          {
+            type: "session.approve",
+            id: randomUUID(),
+            sessionId: pending.sessionId,
+            approvalId: pending.approvalId,
+            approved,
+            ...(save ? { save, rules: pending.rules ?? [] } : {}),
+          },
+          state.auth,
+          client,
+        );
+      } finally {
+        pending.answering = false;
+      }
       // A refused save leaves the call waiting: the buttons stay, and the reason is shown.
       if (res?.type === "response.error") {
         await ctx.answerCallbackQuery({ text: res.error.slice(0, 190), show_alert: true }).catch(() => {});

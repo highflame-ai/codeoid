@@ -108,30 +108,81 @@ A rule is one of:
 | `Bash(npm test)` | exactly `npm test` |
 | `Bash(npm test:*)` | `npm test`, and `npm test` with more words after it |
 | `mcp__linear__list_issues` | that MCP tool |
-| `WebFetch(domain:docs.rs)` | a fetch of exactly that host |
+| `WebFetch(domain:docs.rs)` | a fetch of that host on its usual port (not its subdomains) |
 
-For a command, the card proposes `program subcommand:*` (`npm test:*`, `cargo build:*`) when the second word
-reads as a subcommand. Otherwise it proposes the exact command.
+**What the card offers to save.** For building and checking the project, it offers the command with any words
+after it:
 
-A command line runs on rules only when every command in it is covered. A command is covered when it is a plain
-read (`tail -50` in `npm test 2>&1 | tail -50`), a `cd` into the workspace, or a match for one of your rules.
+- `npm test:*`, `cargo build:*` and `make lint:*`;
+- `npm run lint:*` for a package script that tests, builds, lints, checks or formats.
+
+For anything else it offers the exact command that ran. Approving `gh pr view 1` saves `gh pr view 1`, never
+`gh pr:*`, which would also merge.
+
+**When a command line runs on rules.** Every command in the line must be covered. A command is covered when it is
+one of these:
+
+- a plain read (`tail -50` in `npm test 2>&1 | tail -50`);
+- a `cd` into the workspace;
+- a match for one of your rules.
+
 These never run on a rule:
 
 - a command rated high or not understood, or one naming a credential file;
 - a line that sets a variable (`CI=1 npm test`), or uses a loop or arithmetic;
 - a command run through a wrapper (`sudo`, `env`, `timeout`, `xargs`, `bash -c`);
 - a command that writes with a redirect (`> out.txt`; `> /dev/null` is fine);
-- a command that runs outside the workspace.
+- a command that runs outside the workspace, or names a path outside it (`git -C /tmp …`, `--output=~/.bashrc`);
+- a command whose shell may have moved without the backend saying where.
 
-There are no rules for shells, `eval` or wrappers. An interpreter or package runner needs what it runs named:
-`Bash(python3 manage.py test:*)`, not `Bash(python3:*)`.
+**Rules that can't be allow rules:**
 
-Only the session's owner, with their own token, can save a rule. Anyone else can still allow the call once.
+- A rule for a shell, `eval`, a wrapper, or a builtin that changes what later words run (`hash`, `enable`,
+  `shopt`, `set`, `export`) or prints the environment (`printenv`).
+- A wildcard right after the program (`Bash(git:*)`, `Bash(python3:*)`).
+- A runner's `run`, `exec` or `dlx` with nothing after it (`Bash(bun run:*)`, `Bash(npm exec:*)`). Name what it
+  runs, as in `Bash(bun run test:*)`.
+- A fetch of a local or IP address (`localhost`, `127.0.0.1`, a name without a dot).
 
-Interactive mode ignores allow rules. Autonomous mode doesn't need them.
+Only the session's owner, with their own token, can save a rule. Anyone else can still allow the call once. A
+session an agent made (a dispatched worker, a conductor's child) is the agent's, not yours. Your rules don't
+apply to it, and its cards don't offer a save.
 
-**Deny rules** refuse what they match in every mode. You add them in settings or the CLI, not on a card. A deny
-rule matches a command however it is run: `Bash(npm publish:*)` also refuses `sudo npm publish`.
+**Modes.** Interactive mode ignores allow rules. Autonomous mode doesn't need them.
+
+### Deny rules
+
+Deny rules refuse what they match in every mode. You add them in Settings or with the CLI, not on a card. A deny
+rule may name any program.
+
+A deny rule matches its words in order past options and through wrappers and runners. `Bash(npm publish:*)`
+refuses all of these:
+
+- `npm publish`
+- `npm --yes publish`
+- `sudo npm publish`
+- `npx npm publish`
+
+A line codeoid can't read in full (a script piped to a shell, a line too long to read) is refused when its text
+names the rule's words in order. A WebFetch deny rule also covers the host's subdomains. While any WebFetch deny
+rule exists, a fetch whose host can't be read is refused.
+
+**Deny rules are a best effort, not a boundary.** They match what the line shows. A command reached another way is
+not refused:
+
+- an alias (`npm pub`);
+- a variable (`$(which npm) publish`);
+- flags in another order (`rm -fr` for `Bash(rm -rf:*)`).
+
+The OS sandbox is the boundary. On Claude, deny rules are checked in its PreToolUse hook too, before any allow rule
+in your or the repository's Claude settings.
+
+**Calls that never reach codeoid**, so no rule can refuse them:
+
+- **Codex in autonomous mode** asks codeoid about nothing.
+- **Qwen Code's read-only shell commands** run without asking (see Limits).
+
+### Managing rules
 
 Rules are listed, added and removed in **Settings → Approvals**, or with these commands:
 
@@ -143,16 +194,25 @@ codeoid approvals add 'Bash(npm publish:*)' --deny --everywhere
 codeoid approvals rm <id>
 ```
 
-The list shows where each rule applies, when it last ran a call, and how many times it has. A rule can apply to a
-session, a repository, a workstream, or everywhere.
+The list shows where each rule applies, when it last ran a call, and how many times it has.
 
-Each rule is yours alone and applies only to your own sessions. Each use is audited:
+| Scope | Card | Settings | CLI |
+| --- | --- | --- | --- |
+| A session | yes | no | yes |
+| A repository | yes | yes | yes |
+| A workstream | no | yes | yes |
+| Everywhere | no | yes | yes |
+
+Each rule is yours alone and applies only to your own sessions, whoever is driving a turn in them. Each use is
+audited:
 
 - `session.rule_allow` when a rule runs a call;
 - `session.rule_deny` when a rule refuses one;
 - `approval_rule.add` and `approval_rule.remove` when a rule is added or removed.
 
-Codex names only the server when it asks about an MCP call, so MCP rules don't apply to Codex's MCP calls.
+MCP allow rules apply only to sessions whose MCP servers codeoid manages, and only while no project file declares
+a server, as `trust: readonly` does. They don't run Codex's MCP calls, whose tool codeoid reads from Codex's
+message. MCP deny rules apply everywhere.
 
 ## Autonomous mode
 

@@ -2,7 +2,7 @@ import { beforeAll, describe, expect, test } from "bun:test";
 import { homedir } from "node:os";
 import { commandCoverage } from "../risk/shell-risk.js";
 import { loadShellParser, parseShellSync } from "../shell/parse.js";
-import { fetchHostOf, formatRule, type MatchableRule, parseRule, proposeShellRules, proposeToolRule, shellLineVerdict, toolRuleMatch } from "./rules.js";
+import { backendShellScript, fetchHostOf, formatRule, type MatchableRule, parseRule, proposeShellRules, proposeToolRule, shellLineVerdict, toolRuleMatch } from "./rules.js";
 
 const WS = "/work/repo";
 const CTX = { cwd: WS, workdir: WS, configDir: `${homedir()}/.codeoid` };
@@ -12,14 +12,20 @@ beforeAll(async () => {
 });
 
 function rule(text: string, effect: "allow" | "deny" = "allow"): MatchableRule {
-  const p = parseRule(text);
+  const p = parseRule(text, effect);
   if (!p.ok) throw new Error(`${text}: ${p.error}`);
   return { id: text, pattern: p.pattern, effect, scope: "repository" };
 }
 
 function verdict(line: string, rules: MatchableRule[], cwd = WS) {
   const parsed = parseShellSync(line);
-  return shellLineVerdict(parsed, commandCoverage(line, parsed, { ...CTX, cwd }), rules);
+  return shellLineVerdict(parsed, commandCoverage(line, parsed, { ...CTX, cwd }), rules, line);
+}
+
+function parsedDeny(text: string): MatchableRule {
+  const p = parseRule(text, "deny");
+  if (!p.ok) throw new Error(`${text}: ${p.error}`);
+  return { id: text, pattern: p.pattern, effect: "deny", scope: "repository" };
 }
 
 function propose(line: string, rules: MatchableRule[] = []) {
@@ -159,13 +165,21 @@ describe("proposeShellRules", () => {
   test.each([
     ["npm test", ["Bash(npm test:*)"]],
     ["cargo build --release", ["Bash(cargo build:*)"]],
-    ["git commit -m 'fix: x'", ["Bash(git commit:*)"]],
+    ["make lint", ["Bash(make lint:*)"]],
+    ["npm run lint", ["Bash(npm run lint:*)"]],
+    ["bun run test", ["Bash(bun run test:*)"]],
     ["rm -rf build", ["Bash(rm -rf build)"]],
     ["python3 -m pytest", ["Bash(python3 -m pytest)"]],
     ["npm test 2>&1 | tail -50", ["Bash(npm test:*)"]],
     ["make lint && npm test", ["Bash(make lint:*)", "Bash(npm test:*)"]],
     ["npm test -- $FILE", ["Bash(npm test:*)"]],
-    ["cd sub && npm run build", ["Bash(npm run:*)"]],
+    ["cd sub && npm run build", ["Bash(npm run build:*)"]],
+    // Anything else is offered exactly as it ran: a read never becomes a rule that writes.
+    ["gh pr view 1", ["Bash(gh pr view 1)"]],
+    ["git push origin feat", ["Bash(git push origin feat)"]],
+    ["kubectl get pods", ["Bash(kubectl get pods)"]],
+    ["npm exec cowsay", ["Bash(npm exec cowsay)"]],
+    ["git status", []],
   ])("%s offers %j", (line, expected) => {
     expect(propose(line)).toEqual(expected);
   });
@@ -177,9 +191,12 @@ describe("proposeShellRules", () => {
     ["npm test > out.txt"],
     ["cat x | sh"],
     ["$X test"],
-    ["echo 'a b' > /dev/null; ./run.sh \"a b\""],
+    ["git commit -m 'fix: x'"],
     ["python3 -c 'print(1)'"],
-    ["git status"],
+    ["hash -p /tmp/evil npm; npm test"],
+    ["npm test $(printenv)"],
+    ["git -C /tmp status"],
+    ["make test -C ../other"],
   ])("%s offers nothing", (line) => {
     expect(propose(line)).toBeNull();
   });
@@ -189,21 +206,112 @@ describe("proposeShellRules", () => {
   });
 });
 
+describe("allow rules can't be wider than what they name", () => {
+  test.each([
+    ["Bash(git:*)"],
+    ["Bash(bun run:*)"],
+    ["Bash(npm exec:*)"],
+    ["Bash(pnpm dlx:*)"],
+    ["Bash(deno run:*)"],
+    ["Bash(uv run:*)"],
+    ["Bash(go run:*)"],
+    ["Bash(python3.12:*)"],
+    ["Bash(tsx:*)"],
+    ["Bash(rbash)"],
+    ["Bash(hash -p x npm)"],
+    ["Bash(printenv)"],
+    ["Bash(systemd-run:*)"],
+    ["Bash(npm\u200btest)"],
+    ["Bash(a\u001bb)"],
+    ["WebFetch(domain:localhost)"],
+    ["WebFetch(domain:127.0.0.1)"],
+    ["WebFetch(domain:intranet)"],
+  ])("%s isn't an allow rule", (text) => {
+    expect(parseRule(text).ok).toBe(false);
+  });
+
+  test("runners' run with a named script is", () => {
+    expect(parseRule("Bash(bun run test:*)").ok).toBe(true);
+    expect(parseRule("Bash(go run ./cmd/tool:*)").ok).toBe(true);
+  });
+
+  test.each([["Bash(ssh:*)"], ["Bash(sudo:*)"], ["Bash(python3:*)"], ["Bash(npx:*)"], ["WebFetch(domain:localhost)"]])("%s is a deny rule", (text) => {
+    expect(parseRule(text, "deny").ok).toBe(true);
+  });
+
+  test("a command naming a path outside the workspace never runs on a rule", () => {
+    const rules = [rule("Bash(git log:*)"), rule("Bash(go test:*)"), rule("Bash(cargo test:*)"), rule("Bash(make test:*)")];
+    for (const line of ["git log --output=/home/u/.bashrc", "go test -exec /tmp/x ./...", 'cargo test --config build.rustc-wrapper="/tmp/x"', "make test -f /tmp/Makefile"]) {
+      expect(verdict(line, rules).kind).toBe("none");
+    }
+    expect(verdict("go test ./...", rules).kind).toBe("allow");
+  });
+});
+
+describe("deny rules match however the command is written", () => {
+  const rules = [rule("Bash(npm publish:*)", "deny"), rule("Bash(git push:*)", "deny"), rule("Bash(ssh:*)", "deny")];
+  test.each([
+    ["npm --yes publish"],
+    ["npm --registry=https://x publish"],
+    ["git -C . push"],
+    ["git --no-pager push origin"],
+    ["git -c a=b push"],
+    ["npx npm publish"],
+    ["echo npm publish | bash"],
+    ["ssh host id"],
+  ])("%s is refused", (line) => {
+    expect(verdict(line, rules).kind).toBe("deny");
+  });
+
+  test.each([["echo npm publish"], ["npm pack"], ["git pull"]])("%s isn't", (line) => {
+    expect(verdict(line, rules).kind).not.toBe("deny");
+  });
+
+  test("a line too long to read that names it is refused", () => {
+    const line = `npm publish # ${"x".repeat(110_000)}`;
+    const parsed = parseShellSync(line);
+    expect(shellLineVerdict(parsed, commandCoverage(line, parsed, CTX), rules, line).kind).toBe("deny");
+  });
+});
+
+describe("backendShellScript", () => {
+  test.each([
+    ["bash -lc 'npm test'", "npm test"],
+    ["/bin/zsh -c 'make lint && npm test'", "make lint && npm test"],
+    ["bash -lc 'npm test' | tail", null],
+    ["bash -lc \"$X\"", null],
+    ["npm test", null],
+    ["bash script.sh", null],
+  ])("%s → %j", (line, expected) => {
+    expect(backendShellScript(parseShellSync(line))).toBe(expected);
+  });
+});
+
 describe("non-shell rules", () => {
-  const rules = [rule("mcp__linear__list_issues"), rule("WebFetch(domain:docs.rs)"), rule("WebFetch(domain:evil.example)", "deny")];
+  const rules = [rule("mcp__linear__list_issues"), rule("WebFetch(domain:docs.rs)"), parsedDeny("WebFetch(domain:evil.example)")];
 
   test("an MCP tool by its exact name", () => {
     expect(toolRuleMatch("mcp__linear__list_issues", {}, rules)?.effect).toBe("allow");
     expect(toolRuleMatch("mcp__linear__create_issue", {}, rules)).toBeNull();
   });
 
-  test("a fetch by its exact host", () => {
+  test("an allowed fetch: the exact host, on its default port", () => {
     expect(toolRuleMatch("WebFetch", { url: "https://docs.rs/serde" }, rules)?.effect).toBe("allow");
+    expect(toolRuleMatch("WebFetch", { url: "https://docs.rs./serde" }, rules)?.effect).toBe("allow");
+    expect(toolRuleMatch("WebFetch", { url: "https://docs.rs:8443/x" }, rules)).toBeNull();
     expect(toolRuleMatch("WebFetch", { url: "https://sub.docs.rs/x" }, rules)).toBeNull();
-    expect(toolRuleMatch("WebFetch", { url: "https://docs.rs.evil.example/x" }, rules)).toBeNull();
-    expect(toolRuleMatch("WebFetch", { url: "https://user:pw@docs.rs/x" }, rules)).toBeNull();
-    expect(toolRuleMatch("WebFetch", { url: "file:///etc/passwd" }, rules)).toBeNull();
+    expect(toolRuleMatch("WebFetch", { url: "https://docs.rs.attacker.example/x" }, rules)).toBeNull();
+    // Not a plain URL: refused while a fetch deny rule exists, never allowed.
+    expect(toolRuleMatch("WebFetch", { url: "https://user:pw@docs.rs/x" }, rules)?.effect).toBe("deny");
+    expect(toolRuleMatch("WebFetch", { url: "file:///etc/passwd" }, rules)?.effect).toBe("deny");
+    expect(toolRuleMatch("WebFetch", { url: "https://user:pw@docs.rs/x" }, [rules[1]!])).toBeNull();
+  });
+
+  test("a denied host: its subdomains, a trailing dot, and an unreadable URL while any fetch deny exists", () => {
     expect(toolRuleMatch("WebFetch", { url: "https://evil.example/" }, rules)?.effect).toBe("deny");
+    expect(toolRuleMatch("WebFetch", { url: "https://evil.example./" }, rules)?.effect).toBe("deny");
+    expect(toolRuleMatch("WebFetch", { url: "https://www.evil.example/" }, rules)?.effect).toBe("deny");
+    expect(toolRuleMatch("WebFetch", { prompt: "read https://evil.example" }, rules)?.effect).toBe("deny");
   });
 
   test("hosts read as URL reads them", () => {
@@ -214,6 +322,8 @@ describe("non-shell rules", () => {
 
   test("offers", () => {
     expect(proposeToolRule("WebFetch", { url: "https://docs.rs/x" })).toEqual({ tool: "WebFetch", host: "docs.rs" });
+    expect(proposeToolRule("WebFetch", { url: "http://localhost:3000/docs" })).toBeNull();
+    expect(proposeToolRule("WebFetch", { url: "http://169.254.169.254/latest" })).toBeNull();
     expect(proposeToolRule("mcp__linear__list_issues", {})).toEqual({ tool: "mcp", name: "mcp__linear__list_issues" });
     expect(proposeToolRule("Edit", { file_path: "x" })).toBeNull();
   });

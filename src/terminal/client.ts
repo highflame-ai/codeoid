@@ -1361,7 +1361,7 @@ export class TerminalClient {
       sessionId,
       approvalId: pending.approvalId,
       approved,
-      ...(opts.save ? { save: opts.save } : {}),
+      ...(opts.save ? { save: opts.save, rules: pending.ruleOffer?.rules ?? [] } : {}),
     });
 
     if (resp.type !== "response.ok") {

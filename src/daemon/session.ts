@@ -230,7 +230,7 @@ import { outsideEffects } from "./risk/effects.js";
 import { assessShellCommandSync, commandCoverage, type ShellRisk, UNREADABLE_SHELL_CALL } from "./risk/shell-risk.js";
 import { loadShellParser, parseShellSync, shellParserReady } from "./shell/parse.js";
 import type { ApprovalRuleService, RuleSubject, StoredRule } from "./approval-rules/service.js";
-import { formatRule, proposeShellRules, proposeToolRule, type RulePattern, shellLineVerdict, toolRuleMatch } from "./approval-rules/rules.js";
+import { backendShellScript, formatRule, proposeShellRules, proposeToolRule, type RulePattern, shellLineVerdict, toolRuleMatch } from "./approval-rules/rules.js";
 import { isShellTool, runsNoCommand, shellCallOf, shellCommandOf } from "./shell/tool-call.js";
 import { PRIMARY_CHAIN, RepeatToolGuard } from "./guard/index.js";
 import { asksOutsideSandbox } from "./sandbox/confinement.js";
@@ -1510,6 +1510,8 @@ export class Session {
   #approvalRules: ApprovalRuleService | undefined;
   /** The repository's folder, as a card's "in this repository" names it: found once. */
   #repositoryLabel: string | undefined;
+  /** The session was made by a person, whose own token can save a card's rules (§4.1). */
+  #ownerIsPerson = false;
   /** What a backend gets as extra env: a live view over both (see #liveExtraEnv). */
   #extraEnv: Readonly<Record<string, string>> | undefined;
   /** The extra env the current backend was built with, to rebuild it when the workstream's changes. */
@@ -1971,6 +1973,8 @@ export class Session {
         opts.initialMode.mode === "autonomous" ? opts.initialMode.maxTurns : undefined;
     }
     this.createdBy = opts.auth.sub;
+    // Made by a person, not an agent (a dispatched worker, a conductor's child): only a person's cards can save rules.
+    this.#ownerIsPerson = turnOrigin(opts.auth) === "user";
     // Restored from TranscriptMeta on resume, stamped fresh only for a new
     // session. Both were previously unconditional `now`, which meant every
     // daemon restart re-dated every session: `createdAt` became the restart
@@ -2315,6 +2319,8 @@ export class Session {
             },
           }
         : {}),
+      // Saved deny rules (§4.1), refused in Claude's hook before the CLI's own allow rules.
+      ...(this.#approvalRules ? { approvalRuleRefusal: (toolName: string, input: unknown, cwd: string | null | undefined) => this.#hookRuleRefusal(toolName, input, cwd) } : {}),
       // Read each time the backend starts, and only what was resolved for THIS backend.
       sandbox: () => this.#sandbox?.runtimeFor(factory.id) ?? null,
       ...(this.#extraEnv ? { extraEnv: this.#extraEnv } : {}),
@@ -6638,15 +6644,25 @@ export class Session {
    * again from the input the gate holds, never taken from the client. An
    * error leaves the call waiting.
    */
-  saveApprovalRules(approvalId: string, scope: ApprovalSaveScope, sender: AuthContext): { ok: true; rules: string[] } | { ok: false; error: string } {
-    if (!this.#approvalRules) return { ok: false, error: "This daemon doesn't keep approval rules" };
-    if (!this.#isOwnApproval(sender)) return { ok: false, error: "Only the session's owner, with their own token, can save a rule; allow it once instead" };
+  saveApprovalRules(
+    approvalId: string,
+    scope: ApprovalSaveScope,
+    sender: AuthContext,
+    shown?: readonly string[],
+  ): { ok: true; rules: string[] } | { ok: false; error: string; code: "forbidden" | "not_found" | "invalid_request" } {
+    if (!this.#approvalRules) return { ok: false, error: "This daemon doesn't keep approval rules", code: "invalid_request" };
+    if (!this.#isOwnApproval(sender)) return { ok: false, error: "Only the session's owner, with their own token, can save a rule; allow it once instead", code: "forbidden" };
     const gated = this.#approvalInputs.get(approvalId);
-    if (!gated || !this.#pendingApprovals.has(approvalId)) return { ok: false, error: "That call isn't waiting for an answer" };
+    if (!gated || !this.#pendingApprovals.has(approvalId)) return { ok: false, error: "That call isn't waiting for an answer (yet); try again", code: "not_found" };
     const input = gated.input as Record<string, unknown>;
     const risk = this.#shellRisk(gated.toolName, input, gated.shellCwd);
     const patterns = this.#alwaysAsks(gated.toolName, input, risk, gated.shellCwd) ? null : this.#offeredPatterns(gated.toolName, input, risk, gated.shellCwd);
-    if (!patterns) return { ok: false, error: "No rule can run this call; allow it once instead" };
+    if (!patterns) return { ok: false, error: "No rule can run this call; allow it once instead", code: "invalid_request" };
+    // What the card showed must be what is saved: a rule removed meanwhile, or a hook's rewrite, changes it.
+    const texts = patterns.map(formatRule);
+    if (shown && (shown.length !== texts.length || texts.some((t, i) => t !== shown[i]))) {
+      return { ok: false, error: `The rule to save is now ${texts.join(", ") || "nothing (already covered)"}; look again before saving`, code: "invalid_request" };
+    }
     // paths: the repository's folder, recorded as the rule's label; nothing opened in it
     this.#repositoryLabel ??= sandboxWorkspaceOf(this.workdir);
     const where = scope === "session" ? { key: this.id, label: this.name } : { key: this.#workspaceId, label: this.#repositoryLabel };
@@ -6654,7 +6670,7 @@ export class Session {
     const saved: string[] = [];
     for (const pattern of patterns) {
       const info = this.#approvalRules.add(owner, { pattern, effect: "allow", scope, ...where });
-      this.#store.audit(sender.sub, "approval_rule.add", this.id, `rule=${info.id} scope=${scope} pattern=${info.rule} from=card`);
+      if (info.created) this.#store.audit(sender.sub, "approval_rule.add", this.id, `rule=${info.id} scope=${scope} pattern=${info.rule} from=card`);
       saved.push(info.rule);
     }
     return { ok: true, rules: saved };
@@ -9781,18 +9797,33 @@ export class Session {
     return isFleetSendTool(toolName) || isElicitationTool(toolName) || isUnresolvedPathTool(toolName) || isRequestDirectoryTool(toolName);
   }
 
-  /** MCP allow rules hold only where no project file may declare a server named like the rule's (#395), as readonly trust. */
+  /**
+   * MCP allow rules hold only for a tool named the way the session's own
+   * servers are, where no project file may declare a server named like the
+   * rule's (#395), as readonly trust; never on Codex, whose MCP approval
+   * names the tool from its message text.
+   */
   #mcpRulesHold(toolName: string): boolean {
-    if (!toolName.startsWith("mcp__") || !this.#mcpView) return true;
+    if (!toolName.startsWith("mcp__")) return true;
+    if (!this.#mcpView || this.providerId === "codex") return false;
     return this.#noteProjectMcpNames() && this.#mcpProjectNames.size === 0;
   }
 
-  /** A shell line, read for rules: where it runs, as #shellRisk judges it. */
+  /**
+   * A shell line, read for rules: where it runs, as #shellRisk judges it.
+   * Codex hands its commands over inside its own shell (`bash -lc '<script>'`):
+   * for allow rules that wrapper is the backend's, so the script is read; deny
+   * rules read both.
+   */
   #ruleLine(call: { command: string; cwd: string | null }, shellCwd: string | null | undefined) {
     const base = typeof shellCwd === "string" && isAbsolute(shellCwd) ? shellCwd : this.workdir;
     const cwd = call.cwd ? resolvePath(base, call.cwd) : base;
-    const parsed = parseShellSync(call.command);
-    return { parsed, coverage: commandCoverage(call.command, parsed, { cwd, workdir: this.workdir, configDir: getConfigDir() }) };
+    const ctx = { cwd, workdir: this.workdir, configDir: getConfigDir() };
+    const outer = parseShellSync(call.command);
+    const script = this.providerId === "codex" ? backendShellScript(outer) : null;
+    const command = script ?? call.command;
+    const parsed = script !== null ? parseShellSync(script) : outer;
+    return { parsed, outer, command, text: call.command, coverage: commandCoverage(command, parsed, ctx) };
   }
 
   /**
@@ -9813,9 +9844,12 @@ export class Session {
     const call = shellCallOf(toolName, input);
     if (call) {
       const line = this.#ruleLine(call, shellCwd);
-      const v = shellLineVerdict(line.parsed, line.coverage, rules);
+      const outer = line.outer === line.parsed ? null : shellLineVerdict(line.outer, [], rules, line.text);
+      if (outer?.kind === "deny") return { kind: "deny", rule: outer.rule as StoredRule };
+      const v = shellLineVerdict(line.parsed, line.coverage, rules, line.text);
       if (v.kind === "deny") return { kind: "deny", rule: v.rule as StoredRule };
-      const plain = risk !== null && (risk.level === "low" || risk.level === "medium") && !risk.secret && !risk.unreadable;
+      // Where the backend's shell is isn't known (it may have moved and didn't say): nothing runs on a rule.
+      const plain = risk !== null && (risk.level === "low" || risk.level === "medium") && !risk.secret && !risk.unreadable && shellCwd !== null;
       return v.kind === "allow" && this.#mode === "guarded" && plain ? { kind: "allow", rules: v.rules as StoredRule[] } : null;
     }
     if (isShellTool(toolName)) return null;
@@ -9832,17 +9866,18 @@ export class Session {
    */
   #ruleOffer(toolName: string, input: Record<string, unknown>, risk: ShellRisk | null, shellCwd: string | null | undefined): ApprovalRuleOffer | undefined {
     const patterns = this.#offeredPatterns(toolName, input, risk, shellCwd);
-    if (!patterns) return undefined;
+    if (!patterns || patterns.length === 0) return undefined;
     // paths: the repository's folder, named on the card's button; nothing opened in it
     this.#repositoryLabel ??= sandboxWorkspaceOf(this.workdir);
     return { rules: patterns.map(formatRule), scopes: ["session", "repository"], repository: this.#repositoryLabel };
   }
 
+  /** The rules a save would add: none (empty) when the call is covered already; null when no rule can run it. */
   #offeredPatterns(toolName: string, input: Record<string, unknown>, risk: ShellRisk | null, shellCwd: string | null | undefined): RulePattern[] | null {
-    if (!this.#approvalRules || this.#mode !== "guarded" || this.#ruleExempt(toolName)) return null;
+    if (!this.#approvalRules || !this.#ownerIsPerson || this.#mode !== "guarded" || this.#ruleExempt(toolName)) return null;
     const call = shellCallOf(toolName, input);
     if (call) {
-      if (!risk || (risk.level !== "low" && risk.level !== "medium") || risk.secret || risk.unreadable) return null;
+      if (!risk || (risk.level !== "low" && risk.level !== "medium") || risk.secret || risk.unreadable || shellCwd === null) return null;
       const line = this.#ruleLine(call, shellCwd);
       return proposeShellRules(line.parsed, line.coverage, this.#savedRules());
     }
@@ -9851,9 +9886,28 @@ export class Session {
     return p ? [p] : null;
   }
 
+  /** A deny rule's refusal of a call, for Claude's PreToolUse hook: audited and said, as at the gate. */
+  #hookRuleRefusal(toolName: string, input: unknown, cwd: string | null | undefined): string | null {
+    if (!input || typeof input !== "object") return null;
+    const call = input as Record<string, unknown>;
+    const ruled = this.#ruleVerdict(toolName, call, this.#shellRisk(toolName, call, cwd), cwd);
+    if (ruled?.kind !== "deny") return null;
+    const rule = ruled.rule;
+    this.#store.audit(SYSTEM_IDENTITY.sub, "session.rule_deny", this.id, `rule=${rule.id} scope=${rule.scope} tool=${toolName} at=hook`);
+    this.#approvalRules?.noteUse(this.#ruleSubject(), rule.id);
+    const infoMsg = this.#makeMessage("info", `⛔ Refused ${toolName}: your rule ${rule.text}`, SYSTEM_IDENTITY, undefined, undefined, {
+      event: "approval_rule.denied",
+      tool: toolName,
+      rule: rule.text,
+    });
+    this.#persistAndBuffer(infoMsg);
+    this.#broadcastRaw(infoMsg);
+    return ruleRefusalText(rule);
+  }
+
   /** Refuse a call a deny rule matches, in every mode: its card, the audit, and an info line. */
   #refuseByRule(approvalId: string, toolName: string, rule: StoredRule, sender: AuthContext): { behavior: "deny"; message: string } {
-    const reason = `Refused by your saved rule ${rule.text} (${rule.scope}); remove it in Settings → Approvals to allow this`;
+    const reason = ruleRefusalText(rule);
     this.#approvalPatchKeys.delete(approvalId);
     this.#resolveToolCallMessage(approvalId, { phase: "cancelled", reason: "denied", message: reason });
     this.#store.audit(sender.sub, "session.rule_deny", this.id, `rule=${rule.id} scope=${rule.scope} tool=${toolName}`);
@@ -10932,7 +10986,7 @@ export class Session {
               : outside
                 ? { reason: hostFileBreachReason(outside) }
                 : (this.#autonomousRefusal(event.name, event.input, risk, secret, held) ??
-                  (ruled?.kind === "deny" ? { reason: `Refused by your saved rule ${ruled.rule.text} (${ruled.rule.scope})` } : null));
+                  (ruled?.kind === "deny" ? { reason: ruleRefusalText(ruled.rule) } : null));
         const ruleOffer = refused || autoApprove || asksAnyway || networkAsk ? undefined : this.#ruleOffer(event.name, event.input, risk, event.shellCwd);
         const toolMsg = this.#makeMessage(
           "tool_call",
@@ -13023,6 +13077,11 @@ function isNativeRef(ref: unknown): ref is NativeTurnRef {
  * its display name without the vendor in parentheses ("Codex (OpenAI)" →
  * "Codex"), an endpoint's own name, else its id.
  */
+/** What a deny rule's refusal tells the agent and the card. */
+function ruleRefusalText(rule: StoredRule): string {
+  return `Refused by your saved rule ${rule.text} (${rule.scope}); remove it in Settings → Approvals to allow this`;
+}
+
 export function backendLabel(provider: { displayName?: string; id: string }): string {
   // An endpoint's display name is the user's own words: used as is.
   if (provider.id.startsWith("oai:")) return provider.displayName?.trim() || provider.id.slice("oai:".length);

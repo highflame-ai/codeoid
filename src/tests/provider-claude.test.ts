@@ -2622,6 +2622,30 @@ describe("ClaudeProvider – fork boundary (CLAUDE_CODE_RESUME_SOURCE_ALIVE)", (
     await c.provider.teardown();
   });
 
+  it("a saved deny rule refuses in the hook, before any allow rule of the CLI's own settings, and fails closed (secrets-and-memory-design.md §4.1)", async () => {
+    const reason = "Refused by your saved rule Bash(npm publish:*) (everywhere); remove it in Settings → Approvals to allow this";
+    const { provider } = makeForeignAwareProvider({
+      isFork: () => false,
+      approvalRuleRefusal: (tool, input) => (tool === "Bash" && String((input as { command?: string }).command).includes("publish") ? reason : null),
+    });
+    turnOn(provider);
+    expect(await hookCall("Bash", { command: "npm --yes publish" })).toEqual(denyWith(reason));
+    expect(await hookCall("Bash", { command: "npm test" })).not.toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    openGate();
+    await provider.teardown();
+    const broken = makeForeignAwareProvider({
+      isFork: () => false,
+      approvalRuleRefusal: () => {
+        throw new Error("rules broke");
+      },
+    });
+    sdkGate = new Promise<void>((r) => { openGate = r; });
+    turnOn(broken.provider);
+    expect(await hookCall("Bash", { command: "npm test" })).toMatchObject({ hookSpecificOutput: { permissionDecision: "deny" } });
+    openGate();
+    await broken.provider.teardown();
+  });
+
   it("no agent of the fork can stop a parent's task, under any of the stop tool's names (I-1)", async () => {
     const { provider } = makeForeignAwareProvider({ isOwnTask: (id) => id === "bown0001" });
     turnOn(provider);

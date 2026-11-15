@@ -62,10 +62,10 @@ export class ApprovalRuleService {
   }
 
   /** Save a rule; the one already saved for the same scope, rule and effect is kept (a session's lasts longer). */
-  add(o: RuleOwner, r: { pattern: RulePattern; effect: RuleEffect; scope: ApprovalRuleScopeKind; key: string; label: string }): ApprovalRuleInfo {
+  add(o: RuleOwner, r: { pattern: RulePattern; effect: RuleEffect; scope: ApprovalRuleScopeKind; key: string; label: string }): ApprovalRuleInfo & { created: boolean } {
     const now = this.#now();
     const expiresAt = r.scope === "session" ? now + this.#sessionGrantHours() * 3_600_000 : null;
-    const { id } = this.#store.addApprovalRule(
+    const { id, created } = this.#store.addApprovalRule(
       o,
       { id: randomUUID(), scopeKind: r.scope, scopeKey: r.key, scopeLabel: r.label, rule: formatRule(r.pattern), effect: r.effect, expiresAt },
       now,
@@ -73,7 +73,7 @@ export class ApprovalRuleService {
     this.#byOwner.delete(ownerKey(o));
     const row = this.#rows(o).find((x) => x.row.id === id)?.row;
     if (!row) throw new Error("the rule wasn't saved");
-    return infoOf(row);
+    return { ...infoOf(row), created };
   }
 
   remove(o: RuleOwner, id: string): boolean {
@@ -104,9 +104,11 @@ export class ApprovalRuleService {
     if (!rows) {
       rows = [];
       for (const row of this.#store.listApprovalRules(o, this.#now())) {
-        const parsed = parseRule(row.rule);
-        // A rule that can't be one any more (the rules got stricter) is left out, never read loosely.
-        if (!parsed.ok || !SCOPE_KINDS.has(row.scopeKind) || (row.effect !== "allow" && row.effect !== "deny")) continue;
+        if (!SCOPE_KINDS.has(row.scopeKind) || (row.effect !== "allow" && row.effect !== "deny")) continue;
+        // An allow rule that can't be one any more (the rules got stricter) is left out, never read loosely;
+        // a deny rule is read as a deny rule may be written, so a stricter allow-list never drops a refusal.
+        const parsed = parseRule(row.rule, row.effect);
+        if (!parsed.ok) continue;
         rows.push({
           row,
           rule: { id: row.id, pattern: parsed.pattern, effect: row.effect, scope: row.scopeKind as ApprovalRuleScopeKind, text: row.rule, scopeKey: row.scopeKey },

@@ -1874,6 +1874,8 @@ export interface SessionApproveMsg extends BaseClientMsg {
    * token can save; any other is refused and the card stays open.
    */
   save?: ApprovalSaveScope;
+  /** With `save`: the rules the card showed. The save is refused when the daemon would now save others. */
+  rules?: string[];
 }
 
 /** Device platform for a push registration. */

@@ -13,7 +13,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import type { ProviderEvent } from "../daemon/providers/interface.js";
+import { McpHub } from "../daemon/mcp/hub.js";
+import { McpRegistry } from "../daemon/mcp/registry.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
+import { workstreamsSchema } from "../daemon/workstreams/schema.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { loadShellParser } from "../daemon/shell/parse.js";
 import { Store } from "../daemon/store.js";
@@ -65,6 +68,7 @@ beforeEach(() => {
     autoRotate: { enabled: false, warnPct: 0.6, rotatePct: 0.8, hardRotatePct: 0.9, minTurnsBeforeRotate: 3, strategy: "task-anchor" },
     session: {},
     approvals: { autoAllowLowRisk: false, askOnUnknown: true, sessionGrantHours: 8 },
+    workstreams: workstreamsSchema.parse({ items: [{ id: "proj", match: { paths: [repo] } }] }),
   } as unknown as CodeoidConfig;
   manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
     config,
@@ -85,9 +89,17 @@ afterEach(async () => {
   rmSync(tmp, { recursive: true, force: true });
 });
 
-function call(name: string, input: Record<string, unknown>): ProviderEvent[] {
+function call(name: string, input: Record<string, unknown>, shellCwd?: string | null): ProviderEvent[] {
   return [
-    { type: "tool_start", toolId: "t1", sdkToolUseId: "sdk-t1", name, input, approvalId: `ap-${Math.random().toString(36).slice(2)}` },
+    {
+      type: "tool_start",
+      toolId: "t1",
+      sdkToolUseId: "sdk-t1",
+      name,
+      input,
+      approvalId: `ap-${Math.random().toString(36).slice(2)}`,
+      ...(shellCwd !== undefined ? { shellCwd } : {}),
+    },
     { type: "tool_complete", sdkToolUseId: "sdk-t1", output: "ok", success: true },
     {
       type: "turn_done",
@@ -112,9 +124,9 @@ async function create(mode: SessionMode = "guarded", dir = repo, auth = AUTH) {
 }
 
 /** Run one call in a new session: whether it asked, what the card offered, and how the gate ended. */
-async function run(name: string, input: Record<string, unknown>, opts: { mode?: SessionMode; dir?: string } = {}) {
-  script = [call(name, input)];
-  const session = await create(opts.mode, opts.dir);
+async function run(name: string, input: Record<string, unknown>, opts: { mode?: SessionMode; dir?: string; shellCwd?: string | null; auth?: AuthContext } = {}) {
+  script = [call(name, input, opts.shellCwd)];
+  const session = await create(opts.mode, opts.dir, opts.auth);
   const sending = session.send("go", AUTH);
   const provider = providers.at(-1)!;
   await until(() => provider.canUseToolResults.length > 0 || session.pendingToolApprovals().length > 0);
@@ -223,8 +235,8 @@ describe("a card offers its call as a rule, and the owner saves it", () => {
 
 describe("what rules never run", () => {
   test("a high-risk command asks whatever rule matches it, and offers none", async () => {
-    expect((await add("Bash(rm:*)", "everywhere")).type).toBe("approval_rules.add.result");
-    const r = await run("Bash", { command: "rm -rf ~/Documents" });
+    expect((await add("Bash(git push:*)", "everywhere")).type).toBe("approval_rules.add.result");
+    const r = await run("Bash", { command: "git push --force origin main" });
     expect(r.asked).toBe(true);
     expect(r.pending[0]!.ruleOffer).toBeUndefined();
     await finish(r);
@@ -250,7 +262,7 @@ describe("what rules never run", () => {
     const r = await run("Bash", { command: "npm test && npm publish" });
     expect(r.asked).toBe(true);
     // The offer is only what isn't covered yet.
-    expect(r.pending[0]!.ruleOffer?.rules).toEqual(["Bash(npm publish:*)"]);
+    expect(r.pending[0]!.ruleOffer?.rules).toEqual(["Bash(npm publish)"]);
     await finish(r);
   });
 
@@ -304,7 +316,8 @@ describe("rules for MCP tools and fetches", () => {
     await finish(other);
   });
 
-  test("an MCP tool by name", async () => {
+  test("an MCP tool by name, where codeoid manages the session's MCP servers", async () => {
+    manager.setMcp(new McpRegistry({}, { memoryEnabled: false }), new McpHub({}));
     await add("mcp__linear__list_issues", "everywhere");
     const ok = await run("mcp__linear__list_issues", { q: "x" });
     expect(ok.asked).toBe(false);
@@ -312,6 +325,69 @@ describe("rules for MCP tools and fetches", () => {
     const other = await run("mcp__linear__create_issue", { title: "x" });
     expect(other.asked).toBe(true);
     await finish(other);
+  });
+});
+
+describe("round 1: what else keeps a rule from running or saving", () => {
+  test("a shell whose directory the backend can't say runs on no rule, and offers none", async () => {
+    await add("Bash(npm test:*)", "everywhere");
+    const r = await run("Bash", { command: "npm test" }, { shellCwd: null });
+    expect(r.asked).toBe(true);
+    expect(r.pending[0]!.ruleOffer).toBeUndefined();
+    await finish(r);
+  });
+
+  test("a workstream's rule runs in its sessions only", async () => {
+    await add("Bash(npm test:*)", "workstream", { workstream: "proj" });
+    const inside = await run("Bash", { command: "npm test" });
+    expect(inside.asked).toBe(false);
+    await inside.sending;
+    const elsewhere = join(tmp, "elsewhere");
+    mkdirSync(elsewhere);
+    const outside = await run("Bash", { command: "npm test" }, { dir: elsewhere });
+    expect(outside.asked).toBe(true);
+    await finish(outside);
+  });
+
+  test("a session an agent made (a delegated token) offers no save", async () => {
+    const r = await run("Bash", { command: "npm test" }, { auth: DELEGATED });
+    expect(r.asked).toBe(true);
+    expect(r.pending[0]!.ruleOffer).toBeUndefined();
+    await finish(r);
+  });
+
+  test("a save whose rules differ from what the card showed is refused, and the card stays", async () => {
+    const r = await run("Bash", { command: "npm test" });
+    const approvalId = r.pending[0]!.approvalId;
+    const res = await manager.handle(
+      { type: "session.approve", id: "ap", sessionId: r.session.id, approvalId, approved: true, save: "repository", rules: ["Bash(npm:*)"] } as never,
+      AUTH,
+      CLIENT,
+    );
+    expect(res).toMatchObject({ type: "response.error", code: "invalid_request" });
+    expect(r.session.pendingToolApprovals()).toHaveLength(1);
+    expect(await rules()).toEqual([]);
+    await finish(r);
+  });
+
+  test("saving a call another rule covers by now succeeds and saves nothing more", async () => {
+    const r = await run("Bash", { command: "npm test" });
+    await add("Bash(npm test:*)", "everywhere");
+    const res = await manager.handle(
+      { type: "session.approve", id: "ap", sessionId: r.session.id, approvalId: r.pending[0]!.approvalId, approved: true, save: "session" } as never,
+      AUTH,
+      CLIENT,
+    );
+    expect(res).toMatchObject({ type: "response.ok", data: { savedRules: [] } });
+    await r.sending;
+    expect(await rules()).toHaveLength(1);
+  });
+
+  test("a deny rule refuses a command however its options are placed, in autonomous mode", async () => {
+    await add("Bash(npm publish:*)", "everywhere", {}, "deny");
+    const r = await run("Bash", { command: "npm --registry=https://r.example publish" }, { mode: "autonomous" });
+    expect(result(r)).toMatchObject({ behavior: "deny" });
+    await r.sending;
   });
 });
 
@@ -341,6 +417,7 @@ describe("approval_rules.* messages", () => {
     const r = await run("Bash", { command: "npm test" });
     expect(r.asked).toBe(true);
     await finish(r);
-    expect(audits.filter((x) => x.action.startsWith("approval_rule.")).map((x) => x.action)).toEqual(["approval_rule.add", "approval_rule.add", "approval_rule.remove"]);
+    // The second add changed nothing: one audit row.
+    expect(audits.filter((x) => x.action.startsWith("approval_rule.")).map((x) => x.action)).toEqual(["approval_rule.add", "approval_rule.remove"]);
   });
 });

@@ -600,8 +600,11 @@ a `cd` into the workspace, where it runs and whether its redirects only read);
 `ApprovalRuleService` keeps an owner's rules (`approval_rules`, per tenant and
 owner; scope session / repository = `workspaceId` / workstream / everywhere).
 `Session#ruleVerdict` runs in the gate after every refusal: deny refuses in every
-mode (`#refuseByRule`), allow is one more disjunct of `autoApprove` in guarded mode
-only, for a low/medium line with no credential path. The card's `ruleOffer`
+mode (`#refuseByRule`; on Claude also in the PreToolUse hook, `approvalRuleRefusal`,
+before the CLI's own allow rules), allow is one more disjunct of `autoApprove` in
+guarded mode only, for a low/medium line with no credential path and a known shell
+cwd. Cards propose `verb:*` for build/test verbs only, else the exact command;
+deny rules match words in order past options and are a best effort. The card's `ruleOffer`
 (`#ruleOffer`), and `session.approve` `save` → `Session.saveApprovalRules`
 (owner's own token, rules worked out again from the gated input) before the
 approval settles; `approval_rules.*` in `SessionManager.#approvalRulesHandle`.

@@ -107,6 +107,8 @@ export interface CommandCoverage {
   inWorkspace: boolean;
   /** Its redirects only read inside the workspace, duplicate a descriptor or write /dev/null. */
   plainRedirects: boolean;
+  /** Every path its words name (an option's value too: `--output=x`, `-C dir`) is inside the workspace and no credential file. */
+  pathsInside: boolean;
 }
 
 /**
@@ -123,17 +125,19 @@ export function commandCoverage(command: string, parsed: ParsedShell, ctx: RiskC
     const here: Ctx = { ...full, cwd: cwd ?? full.cwd };
     const inWorkspace = cwd !== null && where(cwd, full) === "workspace";
     const plainRedirects = cmd.redirects.every((r) => notLowRedirect(r, here) === null);
+    const words = [...cmd.argv.slice(1), ...(cmd.wrapped ?? [])].filter((w) => w.value !== null && !w.input);
+    const pathsInside = words.every((w) => pathCandidates(w.value!).every((p) => outsideWorkspace({ ...w, value: p }, here) === null));
     const prog = programOf(cmd);
     if (cmd.argv[0]?.value === prog && (prog === "cd" || prog === "pushd" || prog === "popd")) {
       const to = cdTarget(cmd, prog, cwd, full);
       const inside = to !== null && cmd.argv.slice(1).every((w) => w.value !== null && !w.glob && !w.input) && where(to, full) === "workspace";
-      out.push({ index, plainRead: false, cd: { inside }, inWorkspace, plainRedirects });
+      out.push({ index, plainRead: false, cd: { inside }, inWorkspace, plainRedirects, pathsInside });
       cwd = to;
       return;
     }
     // A plain read inside `$(…)` only hands words to the command around it, which must be covered itself.
     const alone: SimpleCommand = cmd.substitution === "command" ? { ...cmd, substitution: null } : cmd;
-    out.push({ index, plainRead: inWorkspace && notLowCommand(alone, here) === null, inWorkspace, plainRedirects });
+    out.push({ index, plainRead: inWorkspace && notLowCommand(alone, here) === null, inWorkspace, plainRedirects, pathsInside });
   });
   return out;
 }

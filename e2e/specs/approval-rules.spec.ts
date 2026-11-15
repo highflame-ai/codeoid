@@ -26,6 +26,7 @@ test("allow in this repository: the next matching command runs unasked, Settings
     NPM_TEST("^first", "npm test 2>&1 | tail -20"),
     NPM_TEST("^second", "npm test -- --ci"),
     NPM_TEST("^third", "npm test"),
+    NPM_TEST("^fourth", "npm test"),
   ]);
   await openUi(page, codeoid);
   await createSessionInUi(page, "rules", codeoid.workdir);
@@ -75,6 +76,22 @@ test("allow in this repository: the next matching command runs unasked, Settings
   await send(page, "third");
   await expect(page.getByText("Approval needed")).toBeVisible();
   await page.getByRole("button", { name: "approve", exact: true }).click();
+  await waitIdle(page);
+
+  // Added in Settings, for everywhere: listed at once, and the next call runs on it.
+  await page.getByTitle("Settings", { exact: true }).first().click();
+  await page.getByRole("button", { name: /Approvals/ }).click();
+  await page.getByRole("button", { name: "Add rule" }).click();
+  const form = page.getByTestId("approval-rule-add");
+  await form.getByPlaceholder(/Bash\(npm test/).fill("Bash(npm test:*)");
+  await form.locator("select").nth(1).selectOption("everywhere");
+  await form.getByRole("button", { name: "Save rule" }).click();
+  await expect(page.locator('[data-testid^="approval-rule-"]', { hasText: "everywhere" })).toBeVisible();
+  await expect(page.getByTestId("approval-rule-add")).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await send(page, "fourth");
+  await expect(messages(page).filter({ hasText: "Ran npm test." })).toHaveCount(2);
+  await expect(page.getByText("Approval needed")).toHaveCount(0);
   await waitIdle(page);
 });
 

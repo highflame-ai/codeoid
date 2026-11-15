@@ -8,7 +8,7 @@
 import { createSignal } from "solid-js";
 
 import { getClient, newRequestId, request } from "./connection";
-import type { ApprovalRuleEffect, ApprovalRuleInfo, ApprovalRuleScopeKind, ApprovalRulesListResultMsg } from "../protocol/types";
+import type { ApprovalRuleEffect, ApprovalRuleInfo, ApprovalRuleScopeKind, ApprovalRulesAddResultMsg, ApprovalRulesListResultMsg } from "../protocol/types";
 
 interface RulesState {
   loaded: boolean;
@@ -46,7 +46,12 @@ export async function addApprovalRule(r: {
   workdir?: string;
   workstream?: string;
 }): Promise<void> {
-  await request({ type: "approval_rules.add", id: newRequestId(), ...r });
+  const id = newRequestId();
+  // The daemon answers with the saved rule, not response.ok.
+  await getClient().request<ApprovalRulesAddResultMsg>(
+    { type: "approval_rules.add", id, ...r },
+    { waitForResult: (m) => (m.type === "approval_rules.add.result" && m.requestId === id ? m : undefined) },
+  );
   await fetchApprovalRules();
 }
 

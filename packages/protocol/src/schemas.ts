@@ -229,6 +229,7 @@ export const sessionApproveSchema = z.object({
   approved: z.boolean(),
   updatedInput: z.record(z.string(), z.unknown()).optional(),
   save: z.enum(["session", "repository"]).optional(),
+  rules: z.array(z.string().max(1000)).max(50).optional(),
 });
 
 const pushTokenField = z.string().min(1).max(LIMITS.PUSH_TOKEN_MAX);

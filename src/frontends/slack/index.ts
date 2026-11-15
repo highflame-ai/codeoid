@@ -43,6 +43,8 @@ interface PendingApproval {
   /** The tool call's message, whose later updates close the card. */
   messageId?: string;
   createdAt: number;
+  /** The rules the card offered to save (secrets-and-memory-design.md §4.1). */
+  rules?: string[];
 }
 
 interface UserState {
@@ -451,7 +453,15 @@ export class SlackFrontend implements Frontend {
     if (messageId && this.#answered.has(messageId)) return;
     const key = `${userId}:${st.approvalId}`;
     if (this.#approvals.has(key)) return;
-    const pending: PendingApproval = { approvalId: st.approvalId, sessionId, userId, channel, createdAt: Date.now(), ...(messageId ? { messageId } : {}) };
+    const pending: PendingApproval = {
+      approvalId: st.approvalId,
+      sessionId,
+      userId,
+      channel,
+      createdAt: Date.now(),
+      ...(messageId ? { messageId } : {}),
+      ...(st.ruleOffer ? { rules: st.ruleOffer.rules } : {}),
+    };
     this.#approvals.set(key, pending);
     if (messageId) {
       const keys = this.#cardOfMessage.get(messageId) ?? new Set<string>();
@@ -538,12 +548,12 @@ export class SlackFrontend implements Frontend {
     const save = action.action_id === "approve_session" ? "session" : action.action_id === "approve_repository" ? "repository" : undefined;
     const approved = action.action_id !== "deny";
     const resp = await this.#manager.handle(
-      { type: "session.approve", id: randomUUID(), sessionId: pending.sessionId, approvalId: pending.approvalId, approved, ...(save ? { save } : {}) },
+      { type: "session.approve", id: randomUUID(), sessionId: pending.sessionId, approvalId: pending.approvalId, approved, ...(save ? { save, rules: pending.rules ?? [] } : {}) },
       state.auth!,
       this.#client(userId, state),
     );
-    if (resp.type === "response.error" && save) {
-      // A refused save leaves the call waiting: the card stays, the reason beside it.
+    // A refused save leaves the call waiting: the card stays, the reason beside it (unless it was answered elsewhere meanwhile).
+    if (resp.type === "response.error" && save && !(pending.messageId && this.#answered.has(pending.messageId))) {
       this.#justAnswered.delete(key);
       this.#approvals.set(key, pending);
       if (pending.messageId) this.#cardOfMessage.set(pending.messageId, (this.#cardOfMessage.get(pending.messageId) ?? new Set<string>()).add(key));

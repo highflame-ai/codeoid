@@ -3695,12 +3695,12 @@ mcpHub: this.#mcpHub,
       this.#store.audit(auth.sub, "approval_rule.remove", "", `rule=${msg.ruleId}`);
       return { type: "response.ok", requestId: msg.id };
     }
-    const parsed = parseRule(msg.rule);
+    const parsed = parseRule(msg.rule, msg.effect);
     if (!parsed.ok) return { type: "response.error", requestId: msg.id, error: parsed.error, code: "invalid_request" };
     const where = this.#ruleScope(msg, auth);
     if ("error" in where) return { type: "response.error", requestId: msg.id, error: where.error, code: where.code };
-    const info = this.#approvalRules.add(owner, { pattern: parsed.pattern, effect: msg.effect, scope: msg.scope, ...where });
-    this.#store.audit(auth.sub, "approval_rule.add", msg.sessionId ?? "", `rule=${info.id} scope=${msg.scope} effect=${msg.effect} pattern=${info.rule}`);
+    const { created, ...info } = this.#approvalRules.add(owner, { pattern: parsed.pattern, effect: msg.effect, scope: msg.scope, ...where });
+    if (created) this.#store.audit(auth.sub, "approval_rule.add", msg.sessionId ?? "", `rule=${info.id} scope=${msg.scope} effect=${msg.effect} pattern=${info.rule}`);
     return { type: "approval_rules.add.result", requestId: msg.id, rule: info };
   }
 
@@ -10229,10 +10229,10 @@ mcpHub: this.#mcpHub,
     let saved: string[] | undefined;
     if (msg.save !== undefined) {
       if (!msg.approved) return { type: "response.error", requestId: msg.id, error: "A rule is saved with an approval, not a denial", code: "invalid_request" };
-      const r = session.saveApprovalRules(msg.approvalId, msg.save, auth);
+      const r = session.saveApprovalRules(msg.approvalId, msg.save, auth, msg.rules);
       if (!r.ok) {
-        this.#store.audit(auth.sub, "approval_rule.save_refused", session.id, `approvalId=${msg.approvalId} scope=${msg.save}`);
-        return { type: "response.error", requestId: msg.id, error: r.error, code: "forbidden" };
+        this.#store.audit(auth.sub, "approval_rule.save_refused", session.id, `approvalId=${JSON.stringify(msg.approvalId)} scope=${msg.save}`);
+        return { type: "response.error", requestId: msg.id, error: r.error, code: r.code };
       }
       saved = r.rules;
     }

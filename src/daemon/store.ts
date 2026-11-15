@@ -246,7 +246,6 @@ function enableWalWithRetry(db: Database, dbPath: string): void {
   );
 }
 
-/** Which stored OAuth credential: a server at a URL, and a slot ('' / absent = its default sign-in). */
 /** A saved approval rule as stored (docs/secrets-and-memory-design.md §4.1). */
 export interface ApprovalRuleRow {
   id: string;
@@ -262,6 +261,7 @@ export interface ApprovalRuleRow {
   useCount: number;
 }
 
+/** Which stored OAuth credential: a server at a URL, and a slot ('' / absent = its default sign-in). */
 export interface McpOAuthServerKey {
   name: string;
   url: string;

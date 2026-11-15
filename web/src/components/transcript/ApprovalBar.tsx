@@ -171,11 +171,12 @@ const ApprovalBar: Component = () => {
     approved: boolean,
     updatedInput?: Record<string, unknown>,
     save?: ApprovalSaveScope,
+    rules?: string[],
   ): void => {
     if (busy()) return;
     setError(null);
     setBusy(true);
-    approve(sessionId, approvalId, approved, updatedInput, save)
+    approve(sessionId, approvalId, approved, updatedInput, save, rules)
       // Success keeps the bar disabled: it dismisses when the daemon's
       // tool-state delta lands, and re-enabling before that would let a
       // second (now stale) approve fire for the same approvalId.
@@ -210,11 +211,11 @@ const ApprovalBar: Component = () => {
         const isPlanMode = () =>
           snap().toolName === "ExitPlanMode" || snap().toolName === "exit_plan_mode";
         const isAsk = () => isAskUserQuestion(snap().toolName);
-        const safeApprove = (approved: boolean, updatedInput?: Record<string, unknown>, save?: ApprovalSaveScope) => {
+        const safeApprove = (approved: boolean, updatedInput?: Record<string, unknown>, save?: ApprovalSaveScope, rules?: string[]) => {
           const cur = snapshot();
           if (!cur || cur.approvalId !== snap().approvalId) return;
           if (cur.sessionId !== snap().sessionId) return;
-          dispatch(snap().sessionId, snap().approvalId, approved, updatedInput, save);
+          dispatch(snap().sessionId, snap().approvalId, approved, updatedInput, save, rules);
         };
         return (
           <>
@@ -241,7 +242,7 @@ const ApprovalBar: Component = () => {
                 busy={busy()}
                 onApprove={() => safeApprove(true)}
                 ruleOffer={snap().ruleOffer}
-                onSave={(scope) => safeApprove(true, undefined, scope)}
+                onSave={(scope) => safeApprove(true, undefined, scope, snap().ruleOffer?.rules)}
                 onRefine={() => {
                   safeApprove(false);
                   focusPromptWithHint(
@@ -656,6 +657,8 @@ export function approve(
   approved: boolean,
   updatedInput?: Record<string, unknown>,
   save?: ApprovalSaveScope,
+  /** With save: the rules the card showed (the daemon refuses a save that would keep others). */
+  rules?: string[],
 ): Promise<unknown> {
   return request({
     type: "session.approve",
@@ -664,7 +667,7 @@ export function approve(
     approvalId,
     approved,
     ...(updatedInput ? { updatedInput } : {}),
-    ...(save ? { save } : {}),
+    ...(save ? { save, ...(rules ? { rules } : {}) } : {}),
   });
 }
 
