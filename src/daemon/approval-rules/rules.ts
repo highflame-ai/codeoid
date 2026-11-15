@@ -340,7 +340,7 @@ export function toolRuleMatch(toolName: string, input: Record<string, unknown>, 
 export function proposeToolRule(toolName: string, input: Record<string, unknown>): RulePattern | null {
   if (toolName === "WebFetch") {
     const target = fetchTargetOf(input);
-    return target && target.defaultPort && !localHost(target.host) ? { tool: "WebFetch", host: target.host } : null;
+    return target?.defaultPort && !localHost(target.host) ? { tool: "WebFetch", host: target.host } : null;
   }
   return MCP_NAME.test(toolName) ? { tool: "mcp", name: toolName } : null;
 }
