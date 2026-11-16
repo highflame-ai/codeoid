@@ -10,6 +10,7 @@
  * enforcement (servers, credentials, env) is W1.
  */
 
+import { normalizeRemote } from "./match.js";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import type { SessionWorkstreamInfo, WorkstreamResolution, WorkstreamSummary } from "../../protocol/types.js";
@@ -340,6 +341,13 @@ export class WorkstreamService {
    * Whether a session homed in `home` may read `target` (a reference,
    * §7.1): `open` yes, `ask` with its owner's confirm, `closed` never.
    */
+  /** The workstream a remote URL belongs to, by the workstreams' remote rules (none: no rule matches it). */
+  remoteWorkstream(url: string): string | undefined {
+    const origin = normalizeRemote(url);
+    if (!origin || !this.#matchables.some((m) => m.remotes.length > 0)) return undefined;
+    return matchFolder(this.#matchables, { paths: [], origin }).best?.workstream;
+  }
+
   referenceVerdict(home: string | undefined, ref: { workstream: string; paths?: readonly string[] }, recorded: readonly string[] = []): ShareVerdict {
     const ws = this.#effective.get(ref.workstream);
     if (!ws) return { ok: false, error: `Unknown workstream "${ref.workstream}"` };

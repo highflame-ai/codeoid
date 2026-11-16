@@ -1119,11 +1119,17 @@ export class SessionSandbox {
    */
   #gatewayFor(workspace: string, network: NetworkPolicy): GitGatewaySpec | undefined {
     if (!this.#gitGateway || this.#providerId === "docker") return undefined;
+    // Codex's own sandbox refuses a unix socket's connect with its network off: there the gateway can't be reached.
+    if (this.#resolvedFor === "codex" && network.mode !== "on") return undefined;
     const g = this.#gitGateway();
     if (!g) return undefined;
     const off = network.mode !== "on";
     // Whole URLs only (a prefix would hand the rest of a URL to ext::, which reads `%` in it).
-    const urls = [...g.urls, ...workspaceRemoteUrls(workspace).filter((u) => off || !/^https?:\/\//i.test(u))];
+    const kindOf = (u: string) => (/^https:\/\//i.test(u) ? "https" : /^ssh:\/\//i.test(u) || /^(?:[A-Za-z0-9._~-]+@)?[A-Za-z0-9.-]+:(?!\/\/)\S+$/.test(u) ? "ssh" : null);
+    // Only remotes the gateway can reach for it (local paths, file:// and git:// are left to git, as before).
+    // (Tests only: a local bare repository as the workspace's remote, as the gateway's file:// allowance.)
+    const testFile = (u: string) => process.env.NODE_ENV === "test" && u.startsWith("file://");
+    const urls = [...g.urls, ...workspaceRemoteUrls(workspace).filter((u) => kindOf(u) === "ssh" || (off && kindOf(u) === "https") || testFile(u))];
     return { ...g, urls: [...new Set(urls)] };
   }
 

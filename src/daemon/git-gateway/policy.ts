@@ -45,6 +45,19 @@ export function plainBranchName(name: string): boolean {
 }
 
 /**
+ * Whether `name` (after `refs/heads/`) is a branch name git itself takes (`git check-ref-format`'s rules), and so one
+ * a refspec can't read as anything else: no `:` (a refspec's split), `..`, `@{`, `^`, `~`, `?`, `*`, `[`, `\\`, no
+ * control or space, no empty, leading `.` or `.lock`-ending component, no leading, trailing or doubled `/`, no
+ * trailing `.`, not `@`.
+ */
+export function validBranchRef(name: string): boolean {
+  if (!name || name === "@" || name.length > 250) return false;
+  if (/[\x00-\x20\x7f:?*[\\^~]/.test(name) || name.includes("..") || name.includes("@{")) return false;
+  if (name.startsWith("/") || name.endsWith("/") || name.endsWith(".") || name.includes("//")) return false;
+  return name.split("/").every((c) => c.length > 0 && !c.startsWith(".") && !c.endsWith(".lock"));
+}
+
+/**
  * Why `u` may not go to the remote, or null. `isAncestor(old, new)` answers whether the update is a fast-forward
  * (the pushed objects and the remote's, as the gateway just fetched them, both at hand).
  */
@@ -52,7 +65,7 @@ export async function refUpdateProblem(u: RefUpdate, policy: PushPolicy, isAnces
   if (!OID.test(u.old) || !OID.test(u.new)) return `${u.ref}: not an update git sent`;
   if (!u.ref.startsWith("refs/heads/")) return `${u.ref}: only branches are pushed for agents (no tags, notes or other refs)`;
   const branch = u.ref.slice("refs/heads/".length);
-  if (!plainBranchName(branch)) return `${JSON.stringify(branch)} isn't a plain branch name`;
+  if (!validBranchRef(branch) || !plainBranchName(branch)) return `${JSON.stringify(branch)} isn't a plain branch name`;
   if (branch.toUpperCase() === "HEAD") return "HEAD isn't a branch";
   if (ZERO.test(u.new)) return `${branch}: deleting a branch isn't done for agents`;
   if (policy.protectedBranches.some((p) => branchMatches(p, branch))) {

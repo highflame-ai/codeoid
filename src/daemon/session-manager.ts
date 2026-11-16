@@ -216,7 +216,7 @@ import {
 import { GIT_BIN, hardenedGit, safeGit } from "./git-env.js";
 import { connectionId, GitCredentials, probeConnection } from "./git-gateway/connect.js";
 import { type GatewayHost, GitGateway } from "./git-gateway/gateway.js";
-import { programTrustProblem } from "./git-gateway/hostpath.js";
+import { hostPathProblem } from "./git-gateway/hostpath.js";
 import { redactCredentials, remoteUrlProblem, shownGitUrl } from "./git-gateway/text.js";
 import { systemSsh, upstreamKind } from "./git-gateway/upstream.js";
 import type { GitGatewaySpec } from "./sandbox/policy.js";
@@ -4660,7 +4660,10 @@ mcpHub: this.#mcpHub,
     const g = this.#gitGatewayInstance();
     if (!g) return undefined;
     if (sandboxConfigOf(this.#config).git?.enabled === false) return undefined;
-    const owner = this.#sessions.get(sessionId)?.createdBy ?? this.#store.getSession(sessionId)?.createdBy;
+    const live = this.#sessions.get(sessionId);
+    // A session a delegated token made: none (its git isn't routed into a refusal).
+    if (live?.createdByDelegate) return undefined;
+    const owner = live?.createdBy ?? this.#store.getSession(sessionId)?.createdBy;
     const urls = owner ? this.#store.listGitConnections(owner).map((c) => c.url) : [];
     // Only for an owner who connected a remote: nothing changes for anyone else's sessions.
     if (urls.length === 0) return undefined;
@@ -4699,8 +4702,20 @@ mcpHub: this.#mcpHub,
       if (problem) return { refused: problem };
       // What runs on the host for it (git's servers and the push hook): codeoid's git and runtime, never a session's.
       for (const program of [GIT_BIN, process.execPath]) {
-        const bad = programTrustProblem(program, this.#allSandboxWritable());
-        if (bad) return { refused: bad };
+        // Under the home is fine (Bun's own installer puts it there; the home is read-only in every sandbox): never
+        // where a session may write, nor anyone else's or open to others.
+        const bad = hostPathProblem(program, this.#allSandboxWritable(), undefined, { homeAllowed: true });
+        if (bad) return { refused: `${program} can't be trusted to run with your credentials: ${bad}` };
+      }
+      // Another workstream's remote, under isolation: fetched only as a reference its share allows; never pushed.
+      const ws = this.#workstreams.remoteWorkstream(url);
+      const home = session.workstream?.id;
+      if (ws && ws !== home && session.hasWorkstreamFence) {
+        const referenced = (session.workstream?.references ?? []).some((r) => r.workstream === ws);
+        const verdict = this.#workstreams.referenceVerdict(home, { workstream: ws });
+        if (service === "git-receive-pack" || !referenced || !verdict.ok || verdict.ask.length > 0) {
+          return { refused: `${shownGitUrl(url)} is workstream "${ws}"'s, not this session's${service === "git-receive-pack" ? "" : " (nor a reference it may read)"}` };
+        }
       }
       const owner = session.createdBy;
       let conn = this.#store.gitConnection(owner, url);
@@ -8390,6 +8405,8 @@ mcpHub: this.#mcpHub,
           initialMode: { mode: "autonomous", maxTurns: budget },
           requireSandbox: true,
           auth: this.#dispatchSenderAuth(task),
+          // The conductor's sender identity (depth 1) attributes the worker's prompts; the worker is the owner's own.
+          createdByDelegate: false,
           store: this.#store,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,

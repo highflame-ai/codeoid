@@ -251,8 +251,8 @@ export class GitGateway {
       try {
         if (c.destroyed) return;
         c.write("ok\n");
-        await this.#serve(service, cache, c, rest, ticket, protocol);
-        if (service === "git-upload-pack" && !gone.signal.aborted) this.#host.report(sessionId, { kind: "fetch", url, ok: true, detail: `fetched from ${shownGitUrl(url)}` });
+        const code = await this.#serve(service, cache, c, rest, ticket, protocol);
+        if (service === "git-upload-pack" && code === 0) this.#host.report(sessionId, { kind: "fetch", url, ok: true, detail: `fetched from ${shownGitUrl(url)}` });
       } finally {
         this.#tickets.delete(ticket);
       }
@@ -263,7 +263,7 @@ export class GitGateway {
   }
 
   /** git's own server on the cache, its stdio the client's, until it exits. */
-  #serve(service: GitService, cache: string, c: Socket, rest: Buffer, ticket: string, protocol: string): Promise<void> {
+  #serve(service: GitService, cache: string, c: Socket, rest: Buffer, ticket: string, _protocol: string): Promise<number | null> {
     const config: Array<readonly [string, string]> = [
       ["core.hooksPath", service === "git-receive-pack" ? this.#scripts.hooksDir : "/dev/null"],
       ["core.fsmonitor", "false"],
@@ -286,7 +286,7 @@ export class GitGateway {
       GIT_CONFIG_NOSYSTEM: "1",
       GIT_CEILING_DIRECTORIES: dirname(cache),
       ...configEnv(config),
-      ...(protocol && service === "git-upload-pack" ? { GIT_PROTOCOL: protocol } : {}),
+      // No protocol v2 for upload-pack: v2's fetch takes any object the cache holds (allowAnySHA1InWant is v0's).
       ...(service === "git-receive-pack" ? { CODEOID_GW_HOOK: this.#controlPath, CODEOID_GW_TICKET: ticket } : {}),
     };
     return new Promise((done) => {
@@ -323,12 +323,12 @@ export class GitGateway {
         if (!ended) p.stdin.end();
       });
       p.stdout.pipe(c, { end: false });
-      const finish = () => {
+      const finish = (code: number | null) => {
         c.end();
-        done();
+        done(code);
       };
-      p.on("close", finish);
-      p.on("error", finish);
+      p.on("close", (code) => finish(code));
+      p.on("error", () => finish(null));
       c.on("close", () => {
         if (p.exitCode !== null || !p.pid) return;
         try {

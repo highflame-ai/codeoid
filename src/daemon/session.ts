@@ -1135,6 +1135,11 @@ export class Session {
   get worktree(): SessionWorktree | undefined {
     return this.#worktree;
   }
+  /** Whether workstream isolation holds this session to a fence (its home's folders, references, foreign ones hidden). */
+  get hasWorkstreamFence(): boolean {
+    return this.#workstreamFence?.() !== undefined;
+  }
+
   /** Home workstream binding (docs/workstreams-design.md G5). */
   get workstream(): WorkstreamBinding | undefined {
     return this.#workstream;
@@ -2226,6 +2231,7 @@ export class Session {
         collaboration: this.collaboration,
         collaborationRole: this.collaborationRole,
         ...(this.workstreamAhead ? { workstream: this.workstreamAhead } : {}),
+        ...(this.createdByDelegate ? { createdByDelegate: true } : {}),
         // Fire-and-forget: saveMeta's write chain owns the failure log; an
         // unconsumed rejection here would be an unhandled-rejection crash.
       }).catch(() => {});

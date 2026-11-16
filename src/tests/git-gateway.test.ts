@@ -306,6 +306,21 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(shownGitUrl("git@h:o/r\u202e.git")).toContain("\\u{202e}");
   });
 
+  test("round 3 (gateway): a ref name a refspec would read as two (q:refs/heads/main) and the other names git refuses: refused", async () => {
+    const { validBranchRef } = await import("../daemon/git-gateway/policy.js");
+    const z = "0".repeat(40);
+    const a = "a".repeat(40);
+    const p = { protectedBranches: ["main"], defaultBranch: "main", defaultKnown: true, symrefs: new Set<string>(), agentBranches: new Set<string>() };
+    expect(await refUpdateProblem({ old: z, new: a, ref: "refs/heads/q:refs/heads/main" }, p, async () => true)).toContain("isn't a plain branch name");
+    for (const bad of ["q:x", "a..b", "x@{1}", "x^", "x~1", "x?", "x*", "x[1]", "a\\b", "/x", "x/", "a//b", ".x", "x.lock", "x.", "@", "a/.b"]) expect([bad, validBranchRef(bad)]).toEqual([bad, false]);
+    for (const good of ["feature/x", "fix-1.2", "agent/ü", "release/2026.11"]) expect([good, validBranchRef(good)]).toEqual([good, true]);
+    const { remoteUrlProblem, shownGitUrl } = await import("../daemon/git-gateway/text.js");
+    expect(remoteUrlProblem("https://ghp_FAKE@github.com/o/r.git")).toContain("user name");
+    expect(remoteUrlProblem("ssh://git@host/x=y.git")).toContain("=");
+    expect(remoteUrlProblem("git@github.com:o/r.git")).toBeNull();
+    expect(shownGitUrl("https://ghp_FAKE@github.com/o/r.git")).not.toContain("ghp_FAKE");
+  });
+
   test("the policy alone: only plain branch updates that fast-forward", async () => {
     const z = "0".repeat(40);
     const a = "a".repeat(40);

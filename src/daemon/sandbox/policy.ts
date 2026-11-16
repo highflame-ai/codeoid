@@ -441,7 +441,7 @@ export function gitGatewayEnv(g: GitGatewaySpec): Record<string, string> {
   const entries: Array<[string, string]> = [["protocol.ext.allow", "user"]];
   for (const u of new Set(g.urls)) {
     // The old `'key=value'` form, which every git parses (the split form is git 2.31's): a URL with `=` can't be in it.
-    if (/[\s'=]/.test(u)) continue;
+    if (/[\s'=]/.test(u) || /^https?:\/\/[^/]*@/i.test(u) || /[?#]/.test(u)) continue;
     const target = `ext::${g.ext} %S ${u.replace(/%/g, "%%")}`;
     entries.push([`url.${target}.insteadOf`, u], [`url.${target}.pushInsteadOf`, u]);
   }

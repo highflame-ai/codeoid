@@ -8,7 +8,7 @@
  */
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { GIT_BIN } from "../git-env.js";
@@ -176,7 +176,8 @@ export function runGit(args: string[], cwd: string, env: Record<string, string>,
 /** git's error, its telling lines (not its access-rights boilerplate), redacted: what the agent and the owner read. */
 export function gitError(r: GitResult, what: string): string {
   if (r.timedOut) return `${what} timed out`;
-  const lines = shownOutput(r.stderr)
+  // The gateway's own paths (its cache) aren't the agent's to read about.
+  const lines = shownOutput(r.stderr.replace(/\/[^\s'"]*\/git-gateway\/[^\s'"]*/g, "<codeoid's cache>"))
     .split("\n")
     .map((l) => l.trim())
     .filter((l) => l && !/^Please make sure you have the correct access rights|^and the repository exists\.?$/.test(l));
@@ -208,6 +209,7 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
     const env = cacheEnv(base, cache);
     const deadline = Date.now() + timeoutMs;
     const left = () => Math.max(1_000, deadline - Date.now());
+    sweepLocks(cache);
     if (!(await isRepo(cache, env))) {
       rmSync(cache, { recursive: true, force: true });
       const tmp = `${cache}.tmp-${randomBytes(6).toString("hex")}`;
@@ -238,6 +240,41 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
     const defaultKnown = h.code === 0 && (defaultBranch !== null || heads === 0);
     return { defaultBranch, defaultKnown, symrefs, empty: h.code === 0 && heads === 0 };
   });
+}
+
+/** Remove ref locks (`*.lock` under refs/, `packed-refs.lock`) a killed git left, a few minutes old or more. */
+// paths: the daemon's own cache repository: its stale lock files, removed
+function sweepLocks(cache: string): void {
+  const stale = (p: string) => {
+    try {
+      if (Date.now() - lstatSync(p).mtimeMs > 5 * 60_000) rmSync(p, { force: true });
+    } catch {
+      /* gone */
+    }
+  };
+  stale(join(cache, "packed-refs.lock"));
+  stale(join(cache, "HEAD.lock"));
+  const walk = (dir: string, depth: number) => {
+    if (depth > 8) return;
+    let names: string[] = [];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return;
+    }
+    for (const n of names) {
+      const p = join(dir, n);
+      if (n.endsWith(".lock")) stale(p);
+      else {
+        try {
+          if (lstatSync(p).isDirectory()) walk(p, depth + 1);
+        } catch {
+          /* gone */
+        }
+      }
+    }
+  };
+  walk(join(cache, "refs"), 0);
 }
 
 /** A git env bound to the cache repository `cache` exactly (`GIT_DIR`), git's discovery stopped at its dir. */
@@ -275,12 +312,20 @@ export async function pushUpstream(
 ): Promise<{ ok: true; output: string } | { ok: false; error: string; output: string }> {
   return withUpstreamEnv(up, ssh, async (base) => {
     const env = { ...cacheEnv(base, cache), GIT_OBJECT_DIRECTORY: objects.dir, GIT_ALTERNATE_OBJECT_DIRECTORIES: objects.alternates };
+    // Built from names the policy judged (validBranchRef: nothing a refspec reads as a split or a pattern).
+    for (const u of updates) if (!/^refs\/heads\/[^:]+$/.test(u.ref) || !/^[0-9a-f]{40,64}$/.test(u.new)) return { ok: false as const, error: "codeoid refused it: not a branch update", output: "" };
     const specs = updates.map((u) => `${u.new}:${u.ref}`);
     // The remote moves only from exactly what was checked: each branch where the gateway saw it (none, for a new one).
     const leases = updates.map((u) => `--force-with-lease=${u.ref}:${/^0+$/.test(u.old) ? "" : u.old}`);
     const r = await runGit(["push", "--atomic", "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", ...leases, "--", up.url, ...specs], cache, env, timeoutMs, signal);
     const output = redactCredentials(shownOutput(`${r.stdout}\n${r.stderr}`));
-    if (r.code === 0) return { ok: true, output };
+    if (r.code === 0) {
+      // Every ref the remote reports updated is one that was judged (a belt to the refspecs' braces).
+      const judged = new Set(updates.map((u) => u.ref));
+      const moved = r.stdout.split("\n").filter((l) => /^[ *+=-]\t/.test(l)).map((l) => l.split("\t")[1]?.split(":")[1] ?? "");
+      if (moved.some((ref) => !judged.has(ref))) return { ok: false, error: "the remote reported a ref codeoid didn't check", output };
+      return { ok: true, output };
+    }
     const rejected = r.stdout
       .split("\n")
       .filter((l) => l.startsWith("!"))

@@ -11,7 +11,10 @@ import { redactMcpUrl } from "../mcp/redact.js";
  * is hidden anyway.
  */
 export function shownGitUrl(url: string): string {
-  const masked = url.replace(/^([a-z][a-z0-9+.-]*:\/\/[^/@\s]*?):[^/@\s]*@/i, "$1:…@").replace(/[?#].*$/, "?…");
+  const masked = url
+    .replace(/^([a-z][a-z0-9+.-]*:\/\/[^/@\s]*?):[^/@\s]*@/i, "$1:…@")
+    .replace(/^(https?:\/\/)[^/@\s]*@/i, "$1…@")
+    .replace(/[?#].*$/, "?…");
   return shownName(masked.length > 300 ? `${masked.slice(0, 300)}…` : masked);
 }
 
@@ -19,7 +22,10 @@ export function shownGitUrl(url: string): string {
 export function remoteUrlProblem(url: string): string | null {
   // Never a credential in the URL itself: it would go into sandboxes as git's config does (a token for it is `--token`).
   if (/^[a-z][a-z0-9+.-]*:\/\/[^/@]*:[^/@]*@/i.test(url)) return "it holds a password: connect the URL without it, and give the token with --token";
+  // A token as an https user name is as much a credential (a user name goes with `--token user:token`).
+  if (/^https?:\/\/[^/]*@/i.test(url)) return "it holds a user name (a token, often): connect the URL without it, and give it with --token user:token";
   if (/[?#]/.test(url)) return "it has a query or a fragment";
+  if (url.includes("=")) return "it holds `=`, which git's config for the sandbox can't carry";
   if (/[\x00-\x20\x7f]/.test(url)) return "it holds spaces or control characters";
   // Shown to the owner as is: nothing invisible or reordering in it.
   if (/[\p{Cf}\p{Cc}\p{Zl}\p{Zp}\p{Co}\p{Cn}\u0085\u00a0]/u.test(url)) return "it holds invisible or reordering characters";

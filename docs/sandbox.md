@@ -1271,10 +1271,12 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
   token. Use it for a shared daemon or a sensitive organisation.
 - **Permissions:** you need `settings:write`, and a delegated token can't connect. A connection is yours: it decides
   only your sessions, and never one a delegated token made.
-- **No credential in the URL:** a URL with a password, a query or a fragment can't be connected. Give a token with
-  `--token`. Cards, `ls` and the audit show the URL whole, every path segment, so you can see which repository it is.
+- **No credential in the URL:** a URL with any user info for https (a token as a user name included), a password,
+  a query, a fragment or `=` can't be connected. Give a token with `--token user:token`. Cards, `ls` and the audit show the URL whole, every path segment, so you can see which repository it is.
 - **Running sessions** pick up a connection, or a disconnection, at their next turn. A process backend is
   restarted then.
+- **Workstreams:** under workstream isolation, a remote that another workstream's rules claim is never pushed from
+  a session homed elsewhere. It is fetched only as a reference whose share allows reads without asking.
 - **In guarded mode,** an agent that reaches a remote you haven't connected raises a card offering to connect it. In
   autonomous mode it's refused, and the agent is told the command.
 
@@ -1315,6 +1317,8 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
     - the remotes you connected;
     - the workspace repository's other ssh remotes;
     - with the network not on, its https remotes too.
+
+    Local paths, `file://` and `git://` remotes are left to git, as before.
   - The launcher relays git's protocol over the session's own unix socket, bound into that session's sandbox
     alone.
   - Nothing inside holds a credential, and with the network on a public https remote is fetched directly as before.
@@ -1332,6 +1336,10 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
     reach the other unix sockets they can see. Local database sockets stay hidden, and the host's `/tmp` is denied,
     as with Docker access.
   - Under Seatbelt, the gateway's other sockets are denied by rule.
+  - Codex's own sandbox refuses a unix socket's `connect` with its network off, so Codex sessions with the network
+    off or an allowlist don't get the gateway.
+- **Fetches** are served with git's protocol v0, which only gives what the remote's branches and tags reach, never
+  an object the cache keeps from before.
 - **Audit:**
   - `sandbox.git_connected` and `sandbox.git_disconnected`;
   - `session.git_push_request`, `session.git_push_approved` and `session.git_push_denied`;
