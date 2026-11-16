@@ -111,6 +111,12 @@ describe("push, decided by the session", () => {
     const r = await m.handle({ type: "sandbox.trust_push", id: "tp", action: "trust", path: t.workdir } as never, AUTH, CLIENT);
     expect(r).toMatchObject({ type: "response.error" });
     expect(JSON.stringify(r)).toContain("can (or could) write");
+    expect(JSON.stringify(r)).toContain("codeoid sandbox forget-writable");
+    // The owner checks the file, then forgets the place: the trust goes ahead (a delegated token can't do that).
+    expect(await m.handle({ type: "sandbox.trust_push", id: "f0", action: "forget_writable", path: t.sibling } as never, { ...AUTH, delegationDepth: 1 }, CLIENT)).toMatchObject({ type: "response.error", code: "forbidden" });
+    expect(await m.handle({ type: "sandbox.trust_push", id: "f", action: "forget_writable", path: t.sibling } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok", data: { forgotten: expect.any(Number) } });
+    expect(t.audits.some((a) => a.action === "sandbox.writable_forgotten")).toBe(true);
+    expect(await m.handle({ type: "sandbox.trust_push", id: "tp2", action: "trust", path: t.workdir } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
   });
 
   it("round 4: a trust is its owner's; it can always be taken back, whatever state the repository is in", async () => {

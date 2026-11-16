@@ -10630,6 +10630,18 @@ mcpHub: this.#mcpHub,
     if (msg.action === "list") return { type: "response.ok", requestId: msg.id, data: { trusts: this.#store.listPushTrust(auth.sub).map((t) => ({ ...t, url: shownUrl(t.url) })) } };
     if (!msg.path || !isAbsolute(msg.path)) return fail("Give the repository's absolute path.");
     const remote = msg.remote ?? "origin";
+    if (msg.action === "forget_writable") {
+      const paths = new Set([resolve(msg.path)]);
+      try {
+        paths.add(physicalPath(msg.path));
+      } catch {
+        /* gone */
+      }
+      let forgotten = 0;
+      for (const p of paths) forgotten += this.#store.forgetSandboxWritable(p);
+      this.#store.audit(auth.sub, "sandbox.writable_forgotten", undefined, `${msg.path} forgotten=${forgotten}`);
+      return { type: "response.ok", requestId: msg.id, data: { forgotten, path: msg.path } };
+    }
     if (msg.action === "untrust") {
       // Always possible, whatever state the repository is in (moved, broken, gone): by its git dir as found, or
       // the path as `--list` shows it.

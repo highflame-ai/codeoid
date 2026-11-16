@@ -1360,6 +1360,18 @@ sandboxCmd
     client.disconnect();
   });
 
+sandboxCmd
+  .command("forget-writable <dir>")
+  .description(
+    "Forget that sandboxed sessions could write <dir> (and what is under it), once you've checked what is there. Until then codeoid's push never takes a git config file or a program from it (docs/sandbox.md \"Pushing a branch\")",
+  )
+  .action(async (dir: string) => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    await client.sandboxForgetWritable(resolve(dir));
+    client.disconnect();
+  });
+
 for (const action of ["add", "remove"] as const) {
   sandboxCmd
     .command(`${action} <session> <dir>`)

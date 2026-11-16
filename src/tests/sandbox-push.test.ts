@@ -317,22 +317,81 @@ describe("push: the plan", () => {
     expect(existsSync(marker)).toBe(true);
   });
 
-  test("round 10: what git runs as a program (core.sshCommand, a credential helper) comes from ~/.gitconfig itself, never an include", async () => {
-    const inc = join(root, "dotfiles.gitconfig");
+  test("round 10/11: what git runs as a program comes from your own config files: an include only when it is yours alone, never a session's", async () => {
+    // An include of yours (a per-folder ssh key), yours alone: taken.
+    const inc = join(root, "work.gitconfig");
     writeFileSync(inc, "[core]\n\tsshCommand = ssh -i ~/.ssh/k\n");
-    writeFileSync(join(root, ".gitconfig"), `[include]\n\tpath = ${inc}\n`);
-    expect(await refusal()).toContain("set what git runs (core.sshCommand, a credential helper) in ~/.gitconfig itself");
-    writeFileSync(inc, "[credential]\n\thelper = store\n");
-    expect(await refusal()).toContain("a file your config includes");
-    // Other settings from an include are fine (and shown to the owner); the same command in ~/.gitconfig is too.
-    writeFileSync(inc, "[http]\n\tpostBuffer = 1048576\n");
-    expect(await planned()).toMatchObject({ userSettings: ["global\thttp.postbuffer\t1048576"] });
+    chmodSync(inc, 0o644);
+    writeFileSync(join(root, ".gitconfig"), `[includeIf "gitdir:${repo}/"]\n\tpath = ${inc}\n`);
+    expect(await planned()).toMatchObject({ sshCommand: "ssh -i ~/.ssh/k" });
+    // One everyone may write: refused, saying how else.
+    chmodSync(inc, 0o666);
+    expect(await refusal()).toContain("Host alias in ~/.ssh/config");
+    chmodSync(inc, 0o644);
+    // One a session may write (or could): refused, naming how to clear it once checked.
+    mkdirSync(join(root, "scratch"), { recursive: true });
+    const theirs = join(root, "scratch", "team.gitconfig");
+    writeFileSync(theirs, "[credential]\n\thelper = store\n");
+    writeFileSync(join(root, ".gitconfig"), `[include]\n\tpath = ${theirs}\n`);
+    expect(await refusal()).toMatch(/includes .*can \(or could\) write|can \(or could\) write/);
     writeFileSync(join(root, ".gitconfig"), "[core]\n\tsshCommand = ssh -i ~/.ssh/k\n");
     expect(await planned()).toMatchObject({ sshCommand: "ssh -i ~/.ssh/k" });
-    // Shown: a secret-looking value hidden.
+  });
+
+  test("round 11: a setting shown to the owner never shows a credential, in its value or in its key", async () => {
     const { shownSetting } = await import("../daemon/sandbox/push.js");
     expect(shownSetting("global\thttp.extraheader\tAuthorization: Bearer x")).toBe("http.extraheader = (hidden)");
-    expect(shownSetting("global\thttp.proxy\thttp://p:1")).toBe("http.proxy = http://p:1/");
+    expect(shownSetting("global\thttp.proxy\thttp://p:1")).toBe("http.proxy = http://p:1");
+    for (const entry of [
+      "global\turl.https://bob:ghp_FAKE1234@github.com/.insteadof\thttps://github.com/",
+      "global\turl.https://ghp_FAKE1234@github.com/.pushinsteadof\thttps://github.com/",
+      "global\thttp.https://bob:hunter2@git.example.com/.sslverify\tfalse",
+      "global\thttp.proxy\thttp://user:ghp_FAKE1234@proxy:8080",
+      "global\turl.https://host/x?private_token=ghp_FAKE1234.insteadof\thttps://host/",
+      "global\tcredential.helper\t!f() { echo password=ghp_FAKE1234; }; f",
+    ]) {
+      const shown = shownSetting(entry);
+      expect([entry, shown.includes("ghp_FAKE1234") || shown.includes("hunter2")]).toEqual([entry, false]);
+    }
+  });
+
+  test("round 11: a recorded writable dir that no longer resolves (a file now, unreadable) decides nothing and breaks nothing", async () => {
+    const { gitBinProblem, hostPathProblem, safePathFor } = await import("../daemon/sandbox/push.js");
+    const gone = join(root, "was-a-workspace");
+    writeFileSync(gone, "a file now\n");
+    const history = [join(gone, "inner"), join(root, "never-made", "x")];
+    expect(gitBinProblem("/usr/bin/git", history, join(root, "h"))).toBeNull();
+    expect(hostPathProblem("/usr/bin", history, join(root, "h"))).toBeNull();
+    expect(safePathFor(history, "/usr/bin", join(root, "h"))).toContain("/usr/bin");
+    expect(await plan({}, { agentWritable: [repo, ...history] })).not.toHaveProperty("refused");
+  });
+
+  test("round 11: a branch name with an invisible or reordering character is refused (the card shows names as they are)", async () => {
+    for (const branch of ["ma\u200bin", "fix/\u202etsil-wolla\u202c", "a\u2028b", "x\u00ady"]) expect(typeof cleanPushInput({ branch })).toBe("string");
+    expect(cleanPushInput({ branch: "feature/ü-ok" })).toEqual({ branch: "feature/ü-ok" });
+  });
+
+  test("round 11: the history of writable dirs is seeded once from the sessions made before it, and can be forgotten", async () => {
+    const { Store } = await import("../daemon/store.js");
+    const { Database } = await import("bun:sqlite");
+    const dbPath = join(root, "seed.db");
+    const first = new Store(dbPath);
+    first.createSession({ id: "s1", name: "old", workdir: join(root, "old-work"), status: "idle", createdBy: "u", createdAt: new Date().toISOString(), attachedClients: 0, accountId: "a", projectId: "p" });
+    first.close();
+    // A database from before the history: no table yet.
+    const raw = new Database(dbPath);
+    raw.exec("DROP TABLE sandbox_writable");
+    raw.close();
+    const again = new Store(dbPath);
+    expect(again.sandboxWritableHistory()).toContain(join(root, "old-work"));
+    again.noteSandboxWritable([join(root, "old-work", "sub"), join(root, "keep")]);
+    expect(again.forgetSandboxWritable(join(root, "old-work"))).toBe(2);
+    expect(again.sandboxWritableHistory()).toEqual([join(root, "keep")]);
+    again.close();
+    // Seeded once only: a later start doesn't bring the forgotten back.
+    const later = new Store(dbPath);
+    expect(later.sandboxWritableHistory()).toEqual([join(root, "keep")]);
+    later.close();
   });
 
   test("round 7: a tag named like the checked-out branch doesn't change which branch is pushed", async () => {

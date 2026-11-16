@@ -249,7 +249,7 @@ import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/v
 const NOT_STORED = "‹not stored›";
 import { PUSH_TOOL_FQ, REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
 import { bundleFromChild, gitBinProblem, planPush, runPush, shownSetting, shownUrl, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
-import { physicalPath } from "./physical-path.js";
+import { physicalPath, within } from "./physical-path.js";
 import { GIT_BIN, gitEnv } from "./git-env.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -2296,7 +2296,7 @@ export class Session {
       ...(this.#sandbox
         ? {
             requestDirectory: (input: RequestDirectoryInput) => this.requestDirectory(input),
-            ...(this.#sandbox.config.push?.enabled === false ? {} : { push: (input: PushInput) => this.push(input) }),
+            ...(this.#sandbox.config.push?.enabled === false || this.#pushRoleDenies() ? {} : { push: (input: PushInput) => this.push(input) }),
             sandboxMcp: () => this.#sandboxMcp?.(this.id),
           }
         : {}),
@@ -4418,8 +4418,17 @@ export class Session {
     if (!sbx || sbx.info?.state !== "on") return;
     try {
       const spec = sbx.runtime?.spec;
-      const paths = [...this.sandboxAgentWritable, ...(spec ? [spec.workspace, ...spec.writable] : [])];
-      this.#store.noteSandboxWritable?.([...paths, ...paths.map((p) => physicalPath(p))]);
+      // Roots, not the daemon's own private dirs (each session's temp dir there is new, and nothing is run from it).
+      const own = getConfigDir();
+      const paths = [...this.sandboxAgentWritable, ...(spec ? [spec.workspace, ...spec.writable] : [])].filter((p) => !within(own, p) && p !== spec?.tempDir);
+      const real = paths.flatMap((p) => {
+        try {
+          return [physicalPath(p)];
+        } catch {
+          return [];
+        }
+      });
+      this.#store.noteSandboxWritable?.([...paths, ...real]);
     } catch {
       /* best effort: the live list still counts */
     }
@@ -9566,7 +9575,7 @@ export class Session {
     if (this.#requestDirectoryMounted()) lines.push("To write in another directory, call the `request_directory` tool (path, reason). What it grants is writable from your next turn.");
     else lines.push("To write in another directory, ask the owner to add it (`/sandbox add <dir>`).");
     lines.push(
-      this.#requestDirectoryMounted() && sbx.config.push?.enabled !== false
+      this.#requestDirectoryMounted() && sbx.config.push?.enabled !== false && !this.#pushRoleDenies()
         ? "Your commands can't `git push` (no network to the git host, no credentials). Commit, then call the `push` tool (branch, remote): codeoid pushes for you with the owner's credentials."
         : "Your commands can't `git push` (no network to the git host, no credentials): commit, and ask the owner to push.",
     );

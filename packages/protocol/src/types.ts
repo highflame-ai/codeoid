@@ -2025,7 +2025,11 @@ export interface SandboxProvidersMsg extends BaseClientMsg {
  */
 export interface SandboxTrustPushMsg extends BaseClientMsg {
   type: "sandbox.trust_push";
-  action: "trust" | "untrust" | "list";
+  /**
+   * `forget_writable`: forget that sandboxed sessions could write `path` (and what is under it), after you have
+   * checked what is there: codeoid's push never takes a config file or a program from such a place.
+   */
+  action: "trust" | "untrust" | "list" | "forget_writable";
   /** The repository (a directory in it), absolute; not for `list`. */
   path?: string;
   /** Default `origin`. */

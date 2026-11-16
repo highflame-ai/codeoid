@@ -1252,7 +1252,9 @@ network and your credentials, which the agent never sees.
 
 **What it pushes**
 
-- One local branch, by name. The default is the one checked out.
+- One local branch, by name. The default is the one checked out. A name
+  with an invisible or reordering character (a zero-width space, a bidi
+  control) is refused, since the card shows names as they are.
 - As the commit it is when the push is planned. That commit id is what gets
   pushed, and a commit made after it isn't.
 - To the branch of the same name on one of the repository's remotes. The
@@ -1349,8 +1351,13 @@ the push and for asking the remote which branch is its default. A file your
 config includes is refused if any sandboxed session's commands may write it,
 or ever could: codeoid keeps, for good, every directory a sandboxed session
 could write (in its database), since what an agent left there outlives the
-session. The guarded card and `codeoid sandbox trust-push` list the settings
-of yours that decide the push (a secret-looking value hidden).
+session. On first start with this, every session's working directory from
+before is added (whether it was sandboxed isn't known: fail closed). Once
+you've checked what is in such a place, and no session works there, clear it
+with `codeoid sandbox forget-writable <dir>`; the refusal names the command.
+The guarded card and `codeoid sandbox trust-push` list the settings of yours
+that decide the push, with every URL's user info and query, and any
+secret-looking value or credential helper, hidden.
 
 Also refused:
 
@@ -1374,8 +1381,9 @@ It runs hardened (`git-env.ts`):
 
 - On a PATH of git's own dir and your PATH's absolute entries that are
   outside your home, outside anything a sandboxed session may write or ever
-  could, owned by you or root, and not writable by everyone or by a group
-  you aren't in (Homebrew's and Linuxbrew's group-writable dirs are fine). A session that has ended may have left a program in its
+  could, owned by you or root, and writable by nobody else: not by everyone,
+  and by a group only if it is your own primary group (Linuxbrew's) or, on
+  macOS, `admin` (Homebrew's). A session that has ended may have left a program in its
   workspace, so "under your home" is out whatever runs now. `ssh` is found on
   that PATH. An ssh command (`core.sshCommand`, `GIT_SSH_COMMAND`, `GIT_SSH`)
   or credential helper naming a path that fails the same test, or a relative
@@ -1384,8 +1392,10 @@ It runs hardened (`git-env.ts`):
   either.
 - With no askpass program (`GIT_ASKPASS`, `SSH_ASKPASS`): a push never prompts.
 - What git runs as a program, `core.sshCommand` and credential helpers,
-  comes only from your own `~/.gitconfig` (or `$XDG_CONFIG_HOME/git/config`)
-  or the system config, never from a file those include.
+  comes from your own `~/.gitconfig` (or `$XDG_CONFIG_HOME/git/config`), the
+  system config, or a file those include that is yours alone (owned by you,
+  writable by nobody else, never where a session could write): a per-folder
+  `includeIf "gitdir:…"` ssh key works.
 - With your config exactly as it applies to the session's repository. The push
   runs from codeoid's own staging repository. If a conditional include
   (`includeIf "gitdir:…"`, `onbranch:`, `hasconfig:`) makes your `credential.*`,

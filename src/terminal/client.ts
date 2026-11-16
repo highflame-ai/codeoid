@@ -518,6 +518,17 @@ export class TerminalClient {
   }
 
   /** Trust (or stop trusting) a repository's remote for agents' pushes, or list the trusts (sandbox/push.ts). */
+  /** Forget that sandboxed sessions could write `dir` (after checking what is there). */
+  async sandboxForgetWritable(dir: string): Promise<void> {
+    const resp = await this.#request({ type: "sandbox.trust_push", id: randomUUID(), action: "forget_writable", path: dir });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const n = (resp.data as { forgotten?: number }).forgotten ?? 0;
+    console.log(n ? `Forgotten: ${n} recorded director${n === 1 ? "y" : "ies"} under ${sanitizeTerminalOutput(dir)} no longer count as written by a sandboxed session.` : "Nothing recorded there.");
+  }
+
   async sandboxTrustPush(action: "trust" | "untrust" | "list", path?: string, remote?: string): Promise<void> {
     const resp = await this.#request({ type: "sandbox.trust_push", id: randomUUID(), action, ...(path ? { path } : {}), ...(remote ? { remote } : {}) });
     if (resp.type !== "response.ok") {

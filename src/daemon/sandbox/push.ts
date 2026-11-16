@@ -26,7 +26,7 @@
  */
 
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readSync, rmSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, rmSync, writeSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { GIT_BIN, safeGit, safeGitEnv } from "../git-env.js";
@@ -67,6 +67,8 @@ const REMOTE_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 /** A branch name git takes, that also reads as nothing but a name in a refspec (no leading `+`, which means force). */
 function isPushableBranchName(name: string): boolean {
   if (name.startsWith("+")) return false;
+  // Shown to the owner as is: nothing invisible, nothing that reorders the line (a zero-width space makes "ma\u200bin").
+  if (/[\p{Cf}\p{Zl}\p{Zp}\p{Cc}\p{Co}\p{Cn}]/u.test(name)) return false;
   try {
     validateBranchName(name);
     return true;
@@ -214,6 +216,11 @@ const REPO_REFUSED = /^(?:https?\.(?!(?:[\s\S]+\.)?(?:postbuffer|version|lowspee
  * name, only from outside what the session's commands may write), codeoid's overrides, and the repository's
  * own config files while the sandbox holds them read-only — never, there, a key in {@link REPO_REFUSED}.
  */
+/** How the owner clears a refusal for a place a session could once write, once they've checked it. */
+function forgetHint(root: string): string {
+  return ` (once you've checked it, and no session works there now: \`codeoid sandbox forget-writable ${root}\`)`;
+}
+
 /** Keys whose value git runs as a program on the host. */
 const RUNS_PROGRAM = /^(?:core\.sshcommand|credential\.(?:[\s\S]+\.)?helper)$/i;
 
@@ -224,12 +231,16 @@ function originProblem(e: OriginEntry, own: readonly string[], repo: string, age
   const file = physicalPath(isAbsolute(raw) ? raw : resolve(repo, raw));
   if (USER_SCOPES.has(e.scope)) {
     // Your config's own files, and what they include from outside what the session's commands may write.
-    if (agentWritable.some((w) => within(w, file) || within(physicalPath(w), file))) return `\`${e.key}\` comes from ${raw}, a file a sandboxed session's agent can (or could) write`;
+    const root = agentWritable.find((w) => within(w, file));
+    if (root) return `\`${e.key}\` comes from ${raw}, a file a sandboxed session's agent can (or could) write${forgetHint(root)}`;
     // What git runs as a program comes only from your own ~/.gitconfig (or XDG's) or the system's, never an include.
     if (e.scope === "global" && RUNS_PROGRAM.test(e.key)) {
       const h = home ?? homedir();
       const own = [join(h, ".gitconfig"), join(process.env.XDG_CONFIG_HOME || join(h, ".config"), "git", "config")].map((f) => physicalPath(f));
-      if (!own.includes(file)) return `\`${e.key}\` comes from ${raw}, a file your config includes: set what git runs (core.sshCommand, a credential helper) in ~/.gitconfig itself`;
+      if (!own.includes(file)) {
+        const bad = hostPathProblem(file, agentWritable, h, { homeAllowed: true });
+        if (bad) return `\`${e.key}\` comes from ${raw}, a file your config includes that codeoid can't trust to say what git runs (${bad}): set it in ~/.gitconfig itself, or use a Host alias in ~/.ssh/config`;
+      }
     }
     return null;
   }
@@ -253,9 +264,10 @@ function includeProblem(e: OriginEntry, repo: string, agentWritable: readonly st
   const from = raw ? (isAbsolute(raw) ? raw : resolve(repo, raw)) : repo;
   const h = home ?? process.env.HOME ?? "";
   const named = e.value.startsWith("~/") ? join(h, e.value.slice(2)) : isAbsolute(e.value) ? e.value : resolve(dirname(from), e.value);
-  const targets = [resolve(named), physicalPath(named)];
-  if (agentWritable.some((w) => targets.some((t) => within(w, t)))) {
-    return `your git config includes ${e.value}, a file a sandboxed session's agent can (or could) write (\`${e.key}\`): codeoid doesn't push with it`;
+  const targets = [resolve(named), physicalPathOr(named)];
+  const root = agentWritable.find((w) => targets.some((t) => within(w, t)));
+  if (root) {
+    return `your git config includes ${e.value}, a file a sandboxed session's agent can (or could) write (\`${e.key}\`): codeoid doesn't push with it${forgetHint(root)}`;
   }
   return null;
 }
@@ -290,7 +302,9 @@ export function pushUrlProblem(url: string): string | null {
 export function shownSetting(entry: string): string {
   const [, key = "", ...rest] = entry.split("\t");
   const value = rest.join("\t");
-  return /extraheader|cookie|password|token|secret|auth/i.test(key) ? `${key} = (hidden)` : `${key} = ${redactMcpUrl(value)}`;
+  const line = /extraheader|cookie|password|token|secret|auth|helper/i.test(key) ? `${key} = (hidden)` : `${key} = ${value}`;
+  // A URL anywhere in it (a key's subsection, `url.https://user:tok@host/.insteadof`, holds one): no user info, no query.
+  return line.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]*@/gi, "$1…@").replace(/(\/\/[^\s]*?)\?[^\s]*/g, "$1?…");
 }
 
 /** A remote's URL, safe to show. scp-like ones have no credentials to hide but a user name, which stays. */
@@ -362,7 +376,7 @@ export async function readPushTarget(
     }
   }
   const entries = (await config(repo, DECIDING_GIT)).filter((e) => DECIDING.test(e.key));
-  const writable = (opts.agentWritable ?? []).map((p) => physicalPath(p));
+  const writable = physicalAll(opts.agentWritable ?? []);
   for (const e of entries) {
     const problem = originProblem(e, own, repo, writable, opts.home) ?? includeProblem(e, repo, writable, opts.home);
     if (problem) return refuse(problem);
@@ -635,6 +649,20 @@ export function safePathFor(writable: readonly string[], path = process.env.PATH
   return out.join(":");
 }
 
+/**
+ * Each path as given and where it really is, once (a long history is judged in one pass). One that no longer
+ * resolves (gone, a file now, unreadable) stands as itself: nothing that resolves can be in it.
+ */
+function physicalAll(paths: readonly string[]): string[] {
+  const out = new Set<string>();
+  for (const p of paths) {
+    if (!p) continue;
+    out.add(p);
+    out.add(physicalPathOr(p));
+  }
+  return [...out];
+}
+
 function physicalPathOr(p: string): string {
   try {
     return physicalPath(p);
@@ -646,8 +674,18 @@ function physicalPathOr(p: string): string {
 /** The id a user namespace shows for an owner it doesn't map (root's files, inside a container or bwrap). */
 const OVERFLOW_UID = 65534;
 
+/** Whether the daemon runs in a user namespace that doesn't map root (where root's files show as the overflow id). */
+function inUserNamespace(): boolean {
+  try {
+    const map = readFileSync("/proc/self/uid_map", "utf8").trim().split("\n");
+    return !map.some((l) => /^\s*0\s+0\s+/.test(l));
+  } catch {
+    return false;
+  }
+}
+
 /** Why a program the push may run, or a dir it may come from, isn't trusted on the host; else null. */
-export function hostPathProblem(at: string, writable: readonly string[], home = homedir()): string | null {
+export function hostPathProblem(at: string, writable: readonly string[], home = homedir(), o: { homeAllowed?: boolean } = {}): string | null {
   let real: string;
   try {
     real = physicalPath(at);
@@ -655,18 +693,21 @@ export function hostPathProblem(at: string, writable: readonly string[], home = 
     return `${at} can't be resolved`;
   }
   if (programProblem(at, writable) || programProblem(real, writable)) return `${at} is in a directory a session's commands may write`;
-  if (home && (within(home, real) || within(home, at))) return `${at} is under your home, where a session's commands may write (or have written)`;
+  if (!o.homeAllowed && home && (within(home, real) || within(home, at))) return `${at} is under your home, where a session's commands may write (or have written)`;
   // Neither it nor a dir above it (as named, and where it really is) owned by anyone but you or root, writable by
   // everyone, or writable by a group you aren't in.
   const uid = typeof process.getuid === "function" ? process.getuid() : -1;
-  const groups = new Set(typeof process.getgroups === "function" ? process.getgroups() : []);
-  if (typeof process.getgid === "function") groups.add(process.getgid());
+  // Group-write only by your own primary group (Linuxbrew's), or macOS's admin group (Homebrew's): never a group
+  // every local user is in (staff, users, everyone).
+  const groups = new Set<number>(typeof process.getgid === "function" ? [process.getgid()] : []);
+  if (process.platform === "darwin") groups.add(80);
+  const overflow = inUserNamespace() ? OVERFLOW_UID : -2;
   for (const start of new Set([real, at])) {
     for (let d = start; ; d = dirname(d)) {
       try {
         const st = lstatSync(d);
         // Root's, yours, or the kernel's overflow id (root's files seen from a user namespace): no other user's.
-        if (uid >= 0 && st.uid !== 0 && st.uid !== uid && st.uid !== OVERFLOW_UID) return `${d} belongs to another user`;
+        if (uid >= 0 && st.uid !== 0 && st.uid !== uid && st.uid !== overflow) return `${d} belongs to another user`;
         // A link's own mode means nothing (always 0777): whether it can be replaced is its dir's, checked next.
         if (st.isSymbolicLink()) {
           if (dirname(d) === d) break;
@@ -702,8 +743,8 @@ export function commandProblem(command: string, writable: readonly string[], hom
 }
 
 function programProblem(program: string, writable: readonly string[]): boolean {
-  const real = physicalPath(program);
-  return writable.filter(Boolean).some((w) => within(w, program) || within(w, real) || within(physicalPath(w), real) || within(physicalPath(w), program));
+  const real = physicalPathOr(program);
+  return physicalAll(writable).some((w) => within(w, program) || within(w, real));
 }
 
 /** A staging dir older than this is a push a stopped daemon left behind (a push takes minutes at most). */

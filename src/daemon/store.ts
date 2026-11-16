@@ -362,6 +362,8 @@ export class Store {
     // directly (audit, future admin surfaces) rather than only via meta.
     this.#addColumnIfMissing("sessions", "collaboration", "TEXT");
 
+    // The history of what sandboxed sessions could write began with it: what came before is seeded once, below.
+    const hadWritableHistory = !!this.#db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sandbox_writable'").get();
     this.#db.exec(`
 
       CREATE TABLE IF NOT EXISTS audit_log (
@@ -636,6 +638,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_compare_runs_parent
         ON compare_runs(account_id, project_id, parent_session_id);
     `);
+    // Every session's workdir from before (sandboxed or not, which the table doesn't say): fail closed.
+    if (!hadWritableHistory) this.#db.exec("INSERT OR IGNORE INTO sandbox_writable (path, first_seen) SELECT DISTINCT workdir, 0 FROM sessions");
 
     // Per-child backend selection on spawn tasks. Additive so a database
     // written before collaborative sessions keeps its queued tasks: NULL on
@@ -2345,6 +2349,14 @@ export class Store {
     const stmt = this.#db.prepare("INSERT OR IGNORE INTO sandbox_writable (path, first_seen) VALUES (?, ?)");
     const now = Date.now();
     for (const p of new Set(paths.filter(Boolean))) stmt.run(p, now);
+  }
+
+  /** Forget the directories within `dir` (an owner's word, after reviewing what is there); how many. */
+  forgetSandboxWritable(dir: string): number {
+    const rows = this.sandboxWritableHistory().filter((p) => p === dir || p.startsWith(dir.endsWith("/") ? dir : `${dir}/`));
+    const stmt = this.#db.prepare("DELETE FROM sandbox_writable WHERE path = ?");
+    for (const p of rows) stmt.run(p);
+    return rows.length;
   }
 
   /** Every directory a sandboxed session's commands could ever write. */

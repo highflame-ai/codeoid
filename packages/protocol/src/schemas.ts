@@ -332,7 +332,7 @@ export const sandboxProvidersSchema = z.object({ ...base, type: z.literal("sandb
 export const sandboxTrustPushSchema = z.object({
   ...base,
   type: z.literal("sandbox.trust_push"),
-  action: z.enum(["trust", "untrust", "list"]),
+  action: z.enum(["trust", "untrust", "list", "forget_writable"]),
   path: z.string().min(1).max(4096).optional(),
   remote: z.string().min(1).max(100).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/).optional(),
 });
