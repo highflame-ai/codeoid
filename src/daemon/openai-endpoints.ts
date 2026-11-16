@@ -89,13 +89,17 @@ const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const CONTROL_CHARS = /[\x00-\x1f\x7f]/;
 
 /**
- * What a model id a server lists, or a user picks, may not hold: C0 and C1
- * controls (U+009B is a terminal's CSI), zero-width and bidi marks (they
- * disguise which id is chosen), line and paragraph separators. Stored
+ * What a model id a server lists, or a user picks, may not hold: control
+ * characters, C0 and C1 (U+009B is a terminal's CSI); format characters —
+ * zero-width, bidi and tag marks, which disguise which id is chosen; lone
+ * surrogates; line and paragraph separators; and the invisible fillers and
+ * variation selectors that render as nothing. Stored
  * configuration keeps its own, older rule (CONTROL_CHARS), so no saved
  * endpoint stops loading.
  */
-export const UNSAFE_MODEL_ID_CHARS = /[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/;
+export const UNSAFE_MODEL_ID_CHARS =
+  // Combining marks (U+034F, the variation selectors) as alternatives: in a class they'd read as joined to their neighbour.
+  /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\u115f\u1160\u3164\uffa0]|\u034f|\p{Variation_Selector}/u;
 
 /** A model id safe to offer, print and send: one line, 1–256 characters, nothing in {@link UNSAFE_MODEL_ID_CHARS}. */
 export function isSafeModelId(id: unknown): id is string {

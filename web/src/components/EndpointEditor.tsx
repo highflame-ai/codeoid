@@ -349,7 +349,7 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
       <div class="grid grid-cols-2 gap-3">
         <label class="block space-y-1">
           <span class={label}>Default model</span>
-          <input class={input} value={defaultModel()} onInput={(e) => setDefaultModel(e.currentTarget.value)} placeholder="the server's first" list="endpoint-model-ids" />
+          <input class={input} value={defaultModel()} onInput={(e) => setDefaultModel(e.currentTarget.value)} placeholder="first configured, else the server's first" list="endpoint-model-ids" />
           <datalist id="endpoint-model-ids">
             <For each={defaultModelChoices()}>{(id) => <option value={id} />}</For>
           </datalist>

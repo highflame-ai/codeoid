@@ -54,6 +54,7 @@ import {
   EndpointCatalog,
   fetchListedModels,
   type ModelsSource,
+  NOT_LISTED_MARK,
   notServed,
   fetchLlamaCppContext,
   syncEndpointProviders,
@@ -1647,7 +1648,7 @@ mcpHub: this.#mcpHub,
       case "fleet.unsubscribe":
         return this.#fleetUnsubscribe(msg, client);
       case "models.list":
-        return this.#modelsList(msg);
+        return this.#modelsList(msg, auth);
       case "providers.list":
         return this.#providersList(msg, client);
       case "endpoints.list":
@@ -2548,15 +2549,22 @@ mcpHub: this.#mcpHub,
    * (briefly cached); it reports none through `onModels`, so its
    * `#currentModels` would always be empty.
    */
-  async #pickableModels(providerId: string): Promise<{ models: ModelInfo[]; live: boolean; source?: ModelsSource }> {
+  async #pickableModels(
+    providerId: string,
+    opts?: { configuredOnly?: boolean },
+  ): Promise<{ models: ModelInfo[]; live: boolean; source?: ModelsSource; notListed?: string[] }> {
     const endpoint = endpointNameOf(providerId);
     if (endpoint === null) return this.#currentModels(providerId);
-    const { models, live, source } = await this.#endpointCatalog.models(endpoint);
+    const { models, live, source, notListed } = opts?.configuredOnly
+      ? this.#endpointCatalog.configured(endpoint)
+      : await this.#endpointCatalog.models(endpoint);
     return {
       source,
+      notListed,
       models: models.map((m) => ({
         value: m.id,
         displayName: m.displayName,
+        ...(m.description ? { description: m.description } : {}),
         ...(m.contextWindow ? { contextWindow: m.contextWindow } : {}),
       })),
       live,
@@ -2565,10 +2573,17 @@ mcpHub: this.#mcpHub,
 
   async #modelsList(
     msg: Extract<ClientMessage, { type: "models.list" }>,
+    auth: AuthContext,
   ): Promise<DaemonMessage> {
     // No provider = the catalog of the backend a new session would land on.
     const provider = msg.provider ?? this.#providers.defaultId;
-    const { models, live } = await this.#pickableModels(provider);
+    // An endpoint's server list is read with its stored key: only for a caller who could use or
+    // configure it. Anyone else sees its configured models, and nothing is asked of the server.
+    const scopes = auth.scopes as string[];
+    const configuredOnly =
+      endpointNameOf(provider) !== null &&
+      ![SCOPES.SESSION_CREATE, SCOPES.SESSION_SEND, SCOPES.SETTINGS_READ].some((sc) => hasScope(scopes, sc));
+    const { models, live } = await this.#pickableModels(provider, { configuredOnly });
     return { type: "models.list.result", requestId: msg.id, models, live, provider };
   }
 
@@ -10029,7 +10044,7 @@ mcpHub: this.#mcpHub,
     if (endpoint !== null && !this.#safeEndpoint(endpoint)) {
       return { type: "response.error", requestId: msg.id, error: `The endpoint "${endpoint}" no longer exists: switch the session to another backend.`, code: "invalid_request" };
     }
-    const { models, source } = await this.#pickableModels(providerId);
+    const { models, source, notListed } = await this.#pickableModels(providerId);
     // The backend changed while the list was fetched: a pick checked against the old one isn't the new one's.
     if (session.providerId !== providerId) {
       return { type: "response.error", requestId: msg.id, error: "The session's backend changed while the model was being checked: pick again.", code: "invalid_request" };
@@ -10042,8 +10057,13 @@ mcpHub: this.#mcpHub,
     const resolvedModel = resolve(msg.model);
     if (!resolvedModel) {
       const listed = models.map((m) => m.value).join(", ");
-      // A gateway can serve hundreds: the first few say enough.
-      const served = models.length > 10 ? `${models.slice(0, 10).map((m) => m.value).join(", ")}, … (${models.length} in all)` : listed;
+      // "It serves" names only what the server listed; configured ones it doesn't list, and a list
+      // that is configuration alone, are "Configured". A gateway can serve hundreds: the first few say enough.
+      const few = (ids: string[]) => (ids.length > 10 ? `${ids.slice(0, 10).join(", ")}, … (${ids.length} in all)` : ids.join(", "));
+      const unlisted = new Set(notListed ?? []);
+      const servedIds = source === "configured" ? [] : models.map((m) => m.value).filter((v) => !unlisted.has(v));
+      const configuredIds = source === "configured" ? models.map((m) => m.value) : models.map((m) => m.value).filter((v) => unlisted.has(v));
+      const offeredText = [servedIds.length ? `It serves: ${few(servedIds)}. ` : "", configuredIds.length ? `Configured: ${few(configuredIds)}. ` : ""].join("");
       const invalid = endpoint !== null && !isEndpointModelId(msg.model.trim());
       return {
         type: "response.error",
@@ -10053,7 +10073,7 @@ mcpHub: this.#mcpHub,
             ? `Unknown model "${msg.model}". Available: ${listed}`
             : invalid
               ? `${JSON.stringify(msg.model)} isn't a model id: one line, at most 256 characters, no control, invisible or direction-changing characters.`
-              : `"${msg.model}" is a Claude model, not one this endpoint serves. ${served ? `${source === "configured" ? "Configured" : "It serves"}: ${served}. ` : ""}Any other model id is passed to the server.`,
+              : `"${msg.model}" is a Claude model, not one this endpoint serves. ${offeredText}Any other model id is passed to the server.`,
         code: "invalid_request",
       };
     }
@@ -11096,8 +11116,16 @@ function isClaudeShaped(id: string, providerId: string): boolean {
 /** How a model pick resolves on an endpoint (see SessionManager's set_model). */
 export function resolveOnEndpoint(raw: string, models: ReadonlyArray<ModelInfo>, providerId: string): string | null {
   const id = raw.trim();
+  // An offered id is taken exactly, whatever it holds: it is the owner's configuration or a list the
+  // daemon already vetted. Free text must pass the id rule.
+  const exact = models.find((m) => m.value === id);
+  if (exact) return exact.value;
   if (!isEndpointModelId(id)) return null;
-  const listed = models.find((m) => m.value === id) ?? models.find((m) => m.displayName.toLowerCase() === id.toLowerCase());
-  if (listed) return listed.value;
+  // A label matches without the "not listed" mark, which is the picker's note, not the name.
+  const label = (m: ModelInfo) => (m.displayName.endsWith(NOT_LISTED_MARK) ? m.displayName.slice(0, -NOT_LISTED_MARK.length) : m.displayName).toLowerCase();
+  const byLabel = models.filter((m) => label(m) === id.toLowerCase());
+  // Two entries with one label: neither is guessed.
+  if (byLabel.length === 1) return byLabel[0]!.value;
+  if (byLabel.length > 1) return null;
   return isClaudeShaped(id, providerId) ? null : id;
 }

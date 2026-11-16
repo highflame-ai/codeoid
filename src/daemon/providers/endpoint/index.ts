@@ -35,8 +35,41 @@ const MODELS_TIMEOUT_MS = 5_000;
 const PROPS_TIMEOUT_MS = 2_000;
 /** How long a server's `/models` answer is reused before asking again. */
 const MODELS_TTL_MS = 60_000;
-/** A gateway can serve hundreds (OpenRouter); past this the list is cut. */
+/** A gateway can serve hundreds (OpenRouter): past this many, its other models aren't offered. */
 const MAX_LISTED_MODELS = 1000;
+/** Ids read from one answer: every configured model is found among them, offered or not. */
+const MAX_SCANNED_MODELS = 10_000;
+/** A `/models` answer is read up to this size: 10 000 ids with their metadata fit well inside. */
+const MAX_MODELS_BYTES = 4 * 1024 * 1024;
+/** llama-server's `/props` is a few KB. */
+const MAX_PROPS_BYTES = 256 * 1024;
+
+/**
+ * A response body as text, read up to `max` bytes: a server that sends more
+ * is refused, not buffered (a fast one can send gigabytes inside the timeout).
+ */
+async function readCapped(res: Response, max: number, what: string): Promise<string> {
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > max) {
+    await res.body?.cancel().catch(() => {});
+    throw new EndpointError(`${what} answered more than ${Math.round(max / 1024)} KB`);
+  }
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > max) {
+      await reader.cancel().catch(() => {});
+      throw new EndpointError(`${what} answered more than ${Math.round(max / 1024)} KB`);
+    }
+    chunks.push(value);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
 
 /** One model a server's `/models` lists. */
 export interface ListedModel {
@@ -112,9 +145,16 @@ export async function fetchListedModels(
   }
   if (res.status === 401 || res.status === 403) throw new EndpointError(`the endpoint rejected the credentials (HTTP ${res.status})`);
   if (!res.ok) throw new EndpointError(`${conn.baseURL}/models answered HTTP ${res.status}`);
+  let text: string;
+  try {
+    text = await readCapped(res, MAX_MODELS_BYTES, `${conn.baseURL}/models`);
+  } catch (err) {
+    if (err instanceof EndpointError) throw err;
+    throw new EndpointError(`${conn.baseURL}/models ${err instanceof Error && err.name === "TimeoutError" ? "timed out" : "could not be read"}`);
+  }
   let body: unknown;
   try {
-    body = await res.json();
+    body = JSON.parse(text);
   } catch {
     throw new EndpointError(`${conn.baseURL}/models did not answer JSON — is the base URL right (usually ending in /v1)?`);
   }
@@ -128,7 +168,7 @@ export async function fetchListedModels(
     if (!isModelId(id) || seen.has(id)) continue;
     seen.add(id);
     listed.push({ id, chat: isChatEntry(m) });
-    if (listed.length >= MAX_LISTED_MODELS) break;
+    if (listed.length >= MAX_SCANNED_MODELS) break;
   }
   return listed;
 }
@@ -144,7 +184,7 @@ export async function fetchLlamaCppContext(
     redirect: "error",
   });
   if (!res.ok) return undefined;
-  const props = (await res.json()) as { default_generation_settings?: { n_ctx?: unknown } };
+  const props = JSON.parse(await readCapped(res, MAX_PROPS_BYTES, propsUrl(conn.baseURL))) as { default_generation_settings?: { n_ctx?: unknown } };
   const n = props.default_generation_settings?.n_ctx;
   return typeof n === "number" && n > 0 ? n : undefined;
 }
@@ -212,13 +252,17 @@ export class EndpointCatalog {
    * The models to offer for `name`. `live` = the server answered (now or
    * within the minute); `source` says what stands in when it didn't.
    */
-  async models(name: string): Promise<{ models: ModelInfo[]; live: boolean; source: ModelsSource }> {
+  async models(name: string): Promise<{ models: ModelInfo[]; live: boolean; source: ModelsSource; notListed: string[] }> {
     const e = this.#store.get(name);
-    if (!e) return { models: [], live: false, source: "configured" };
+    if (!e) return { models: [], live: false, source: "configured", notListed: [] };
     const { listed, live, source } = await this.#listed(e);
-    if (!listed) return { models: e.models.map((m) => modelInfo(e, m.id, false)), live: false, source };
-    const served = new Set(listed.map((m) => m.id));
-    return { models: offered(e, listed).map((id) => modelInfo(e, id, !served.has(id))), live, source };
+    return { ...present(e, listed), live, source };
+  }
+
+  /** The configured models alone, asking nobody: for a caller who may not see the server's list. */
+  configured(name: string): { models: ModelInfo[]; live: boolean; source: ModelsSource; notListed: string[] } {
+    const e = this.#store.get(name);
+    return { ...(e ? present(e, undefined) : { models: [], notListed: [] }), live: false, source: "configured" };
   }
 
   /**
@@ -257,7 +301,7 @@ export class EndpointCatalog {
     const e = this.#store.get(name);
     if (!e || connectionOf(e).fingerprint !== fingerprint) return false;
     this.#failed.delete(name);
-    this.#keep(name, { at: Date.now(), fingerprint, models });
+    this.#keep(name, { at: Date.now(), fingerprint, models: forKeeping(e, models) });
     return true;
   }
 
@@ -281,42 +325,64 @@ export class EndpointCatalog {
     return kept && kept.fingerprint === fingerprint ? kept.models : undefined;
   }
 
-  async #listed(e: StoredEndpoint): Promise<{ listed: ListedModel[] | undefined; live: boolean; source: ModelsSource; error?: string }> {
+  async #listed(
+    e: StoredEndpoint,
+    retried = false,
+  ): Promise<{ listed: ListedModel[] | undefined; live: boolean; source: ModelsSource; error?: string }> {
     const conn = connectionOf(e);
     const now = Date.now();
     const hit = this.#live.get(e.name);
     if (hit && hit.fingerprint === conn.fingerprint && now - hit.at < MODELS_TTL_MS) return { listed: hit.models, live: true, source: "server" };
+    const keptList = this.#loadKnown().get(e.name);
+    const kept = keptList && keptList.fingerprint === conn.fingerprint ? keptList.models : undefined;
     const failed = this.#failed.get(e.name);
     let error: string | undefined =
       failed && failed.fingerprint === conn.fingerprint && now - failed.at < FAILED_TTL_MS ? failed.error : undefined;
+    if (error === undefined && kept) {
+      // A list the server gave is on hand: answer with it now and ask the server in the background,
+      // so a slow server never holds up a picker or a pick (the next call has the fresh answer).
+      this.#fetchShared(e.name, conn).catch(() => {});
+      return { listed: kept, live: false, source: "kept" };
+    }
     if (error === undefined) {
       try {
         const models = await this.#fetchShared(e.name, conn);
+        // Moved while it was read: that answer is the old server's, never offered for the new one.
+        const now2 = this.#store.get(e.name);
+        if (!now2) return { listed: undefined, live: false, source: "configured" };
+        if (connectionOf(now2).fingerprint !== conn.fingerprint) {
+          return retried ? { listed: undefined, live: false, source: "configured" } : this.#listed(now2, true);
+        }
         return { listed: models, live: true, source: "server" };
       } catch (err) {
         error = err instanceof Error ? err.message : String(err);
       }
     }
-    const kept = this.#loadKnown().get(e.name);
-    if (kept && kept.fingerprint === conn.fingerprint) return { listed: kept.models, live: false, source: "kept", error };
+    if (kept) return { listed: kept, live: false, source: "kept", error };
     return { listed: undefined, live: false, source: "configured", error };
   }
 
-  /** One request per endpoint and connection at a time; its answer (or failure) is recorded once. */
+  /** One request per endpoint and connection at a time; its answer (or failure) is recorded once, for that connection only. */
   #fetchShared(name: string, conn: EndpointConnection): Promise<ListedModel[]> {
     const key = `${name}\u0000${conn.fingerprint}`;
     const running = this.#inFlight.get(key);
     if (running) return running;
+    const current = () => {
+      const e = this.#store.get(name);
+      return e && connectionOf(e).fingerprint === conn.fingerprint ? e : undefined;
+    };
     const p = fetchListedModels(conn, this.#fetch)
       .then((models) => {
-        this.#failed.delete(name);
-        // Kept only if the endpoint is still on the connection it was read over.
-        const e = this.#store.get(name);
-        if (e && connectionOf(e).fingerprint === conn.fingerprint) this.#keep(name, { at: Date.now(), fingerprint: conn.fingerprint, models });
+        const e = current();
+        // Recorded only if the endpoint is still on the connection it was read over.
+        if (e) {
+          this.#failed.delete(name);
+          this.#keep(name, { at: Date.now(), fingerprint: conn.fingerprint, models: forKeeping(e, models) });
+        }
         return models;
       })
       .catch((err: unknown) => {
-        this.#failed.set(name, { at: Date.now(), fingerprint: conn.fingerprint, error: err instanceof Error ? err.message : String(err) });
+        if (current()) this.#failed.set(name, { at: Date.now(), fingerprint: conn.fingerprint, error: err instanceof Error ? err.message : String(err) });
         throw err;
       })
       .finally(() => this.#inFlight.delete(key));
@@ -366,8 +432,16 @@ export class EndpointCatalog {
     const names = new Set(this.#store.entries().map((e) => e.name));
     const endpoints: Record<string, KnownList> = {};
     for (const [name, list] of known) if (names.has(name)) endpoints[name] = list;
+    let text = `${JSON.stringify({ version: 1, endpoints })}\n`;
+    if (text.length > MAX_KEPT_BYTES) {
+      // Never write what the next start would refuse to read: each list keeps its head, in proportion.
+      const share = Math.max(1, Math.floor(MAX_LISTED_MODELS * (MAX_KEPT_BYTES / text.length) * 0.9));
+      for (const list of Object.values(endpoints)) list.models = list.models.slice(0, share);
+      text = `${JSON.stringify({ version: 1, endpoints })}\n`;
+      if (text.length > MAX_KEPT_BYTES) return;
+    }
     try {
-      atomicWrite(this.#cacheFile, `${JSON.stringify({ version: 1, endpoints })}\n`, 0o600);
+      atomicWrite(this.#cacheFile, text, 0o600);
     } catch (err) {
       // A cache: a failed write costs the fallback after a restart, nothing else.
       console.error(`[codeoid] could not keep endpoint model lists: ${err instanceof Error ? err.message : String(err)}`);
@@ -413,7 +487,7 @@ function sameList(a: readonly ListedModel[], b: readonly ListedModel[]): boolean
 /**
  * What a picker offers: the configured models first, in their configured
  * order (the owner's choices, listed by the server or not), then the server's
- * other chat models in its order.
+ * other chat models in its order, up to {@link MAX_LISTED_MODELS}.
  */
 function offered(e: StoredEndpoint, listed: readonly ListedModel[]): string[] {
   const out: string[] = [];
@@ -424,10 +498,31 @@ function offered(e: StoredEndpoint, listed: readonly ListedModel[]): string[] {
       seen.add(m.id);
     }
   }
+  let others = 0;
   for (const m of listed) {
+    if (others >= MAX_LISTED_MODELS) break;
     if (m.chat && !seen.has(m.id)) {
       out.push(m.id);
       seen.add(m.id);
+      others++;
+    }
+  }
+  return out;
+}
+
+/**
+ * What is kept of a server's answer: every configured model it names (found
+ * however far down the list), and the head of the rest — what is offered.
+ */
+function forKeeping(e: StoredEndpoint, listed: readonly ListedModel[]): ListedModel[] {
+  const configured = new Set(e.models.map((m) => m.id));
+  const out: ListedModel[] = [];
+  let others = 0;
+  for (const m of listed) {
+    if (configured.has(m.id)) out.push(m);
+    else if (others < MAX_LISTED_MODELS) {
+      out.push(m);
+      others++;
     }
   }
   return out;
@@ -439,19 +534,37 @@ export function notServed(e: StoredEndpoint, listed: readonly ListedModel[]): st
   return e.models.map((m) => m.id).filter((id) => !served.has(id));
 }
 
-/** Marks a configured model the server's list doesn't name, in pickers. */
+/** Marks a configured model the server's list doesn't name, in pickers. Never part of what a pick matches. */
 export const NOT_LISTED_MARK = " (not listed by the server)";
 
-function modelInfo(e: StoredEndpoint, id: string, notListed: boolean): ModelInfo {
-  const m = e.models.find((x) => x.id === id);
-  const contextWindow = m?.contextWindow ?? e.contextWindow;
-  // A local server names its model by the file it loaded; the path is noise in a picker.
-  const label = m?.name || id.split("/").pop() || id;
-  return {
-    id,
-    displayName: notListed ? `${label}${NOT_LISTED_MARK}` : label,
-    ...(contextWindow ? { contextWindow } : {}),
-  };
+/**
+ * The picker entries. A configured model reads as its label, else its full
+ * id (as on main). A server's id is shortened to its last path segment — a
+ * local server names its model by the file it loaded — only when no other
+ * entry shortens to the same: `openai/gpt-4o` and `azure/gpt-4o` stay whole.
+ */
+function present(e: StoredEndpoint, listed: readonly ListedModel[] | undefined): { models: ModelInfo[]; notListed: string[] } {
+  const ids = listed ? offered(e, listed) : e.models.map((m) => m.id);
+  const served = listed ? new Set(listed.map((m) => m.id)) : undefined;
+  const configured = new Map(e.models.map((m) => [m.id, m]));
+  const short = (id: string) => id.split("/").pop() || id;
+  const shortCount = new Map<string, number>();
+  for (const id of ids) shortCount.set(short(id), (shortCount.get(short(id)) ?? 0) + 1);
+  const notListed: string[] = [];
+  const models = ids.map((id): ModelInfo => {
+    const m = configured.get(id);
+    const label = m ? m.name || id : shortCount.get(short(id)) === 1 ? short(id) : id;
+    const unlisted = served !== undefined && !served.has(id);
+    if (unlisted) notListed.push(id);
+    const contextWindow = m?.contextWindow ?? e.contextWindow;
+    return {
+      id,
+      displayName: unlisted ? `${label}${NOT_LISTED_MARK}` : label,
+      ...(unlisted ? { description: "Configured; the server's model list doesn't name it" } : {}),
+      ...(contextWindow ? { contextWindow } : {}),
+    };
+  });
+  return { models, notListed };
 }
 
 /** The MCP registry narrowed to what the endpoint offers — read live, so an edit applies next turn. */

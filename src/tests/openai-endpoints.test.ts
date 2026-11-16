@@ -375,13 +375,101 @@ describe("a server's model list", () => {
     expect(listed.filter((m) => m.chat).map((m) => m.id)).toEqual(["f", "g", "Some-Embedding-Model"]);
   });
 
+  test("round 2: a /models answer is read up to 4 MB, declared or streamed, never buffered past it", async () => {
+    const big = (async () => new Response("{}", { headers: { "content-length": String(50 * 1024 * 1024) } })) as unknown as typeof fetch;
+    await expect(fetchListedModels(conn, big)).rejects.toThrow(/answered more than/);
+    const chunk = new Uint8Array(1024 * 1024).fill(0x20);
+    let sent = 0;
+    const endless = (async () =>
+      new Response(
+        new ReadableStream({
+          pull(c) {
+            sent++;
+            c.enqueue(chunk);
+          },
+        }),
+      )) as unknown as typeof fetch;
+    await expect(fetchListedModels(conn, endless)).rejects.toThrow(/answered more than/);
+    expect(sent).toBeLessThan(10);
+  });
+
+  test("round 2: ids with format, invisible or tag characters, or lone surrogates, are dropped", async () => {
+    const listed = await fetchListedModels(
+      conn,
+      answering({ data: ["ok", "a\u2060b", "a\u00adb", "a\ufe0fb", "a\u{e0041}b", "a\u061cb", "a\u3164b", "a\ud800b", "a\u180eb"] }),
+    );
+    expect(listed.map((m) => m.id)).toEqual(["ok"]);
+  });
+
+  /** A fetch the test settles by hand, per URL. */
+  const controlled = () => {
+    const calls: Array<{ url: string; settle: (r: Response | Error) => void }> = [];
+    const impl = ((url: string) =>
+      new Promise<Response>((resolve, reject) => {
+        calls.push({ url: String(url), settle: (r) => (r instanceof Error ? reject(r) : resolve(r)) });
+      })) as unknown as typeof fetch;
+    return { calls, impl };
+  };
+
+  test("round 2: an answer over the old connection, settling after a move, is neither offered nor clears the new one's failure", async () => {
+    const store = storeAt();
+    store.upsert({ name: "box", baseUrl: "http://127.0.0.1:1/v1", models: [] });
+    const { calls, impl } = controlled();
+    const catalog = new EndpointCatalog(store, impl);
+    const first = catalog.models("box"); // in flight over the old URL
+    store.upsert({ name: "box", baseUrl: "http://127.0.0.1:1/other/v1", models: [] });
+    const second = catalog.models("box"); // over the new URL
+    await Bun.sleep(5);
+    calls[1]!.settle(new Error("down"));
+    expect((await second).models).toEqual([]);
+    calls[0]!.settle(Response.json({ data: [{ id: "old-server-model" }] }));
+    // The first caller asked before the move: it gets the new connection's answer, never the old server's list.
+    expect((await first).models.map((m) => m.id)).not.toContain("old-server-model");
+    // The new connection's failure still stands: no new request.
+    const before = calls.length;
+    await catalog.models("box");
+    expect(calls.length).toBe(before);
+  });
+
+  test("round 2: with a kept list on hand, a slow server never holds up a picker; the answer refreshes in the background", async () => {
+    const store = storeAt();
+    store.upsert({ name: "box", baseUrl: "http://127.0.0.1:1/v1", models: [{ id: "cfg" }] });
+    const { calls, impl } = controlled();
+    const catalog = new EndpointCatalog(store, impl, { cacheFile: store.modelsCachePath });
+    const firstAsk = catalog.models("box");
+    await Bun.sleep(5);
+    calls[0]!.settle(Response.json({ data: [{ id: "cfg" }, { id: "a" }] }));
+    expect((await firstAsk).source).toBe("server");
+    catalog.invalidate("box"); // the minute is over
+    const started = Date.now();
+    const quick = await catalog.models("box");
+    expect(Date.now() - started).toBeLessThan(100);
+    expect(quick).toMatchObject({ source: "kept", live: false });
+    expect(quick.models.map((m) => m.id)).toEqual(["cfg", "a"]);
+    expect(calls.length).toBe(2); // the background refresh
+    calls[1]!.settle(Response.json({ data: [{ id: "cfg" }, { id: "b" }] }));
+    await Bun.sleep(5);
+    expect((await catalog.models("box")).models.map((m) => m.id)).toEqual(["cfg", "b"]);
+  });
+
+  test("round 2: a configured model far down a long list is found, and the offer is capped past the configured ones", async () => {
+    const store = storeAt();
+    store.upsert({ name: "box", baseUrl: "http://127.0.0.1:1/v1", models: [{ id: "vendor/m-1050" }] });
+    const data = Array.from({ length: 1100 }, (_, i) => ({ id: `vendor/m-${i}` }));
+    const catalog = new EndpointCatalog(store, answering({ data }));
+    const r = await catalog.models("box");
+    expect(r.notListed).toEqual([]);
+    expect(r.models[0]).toMatchObject({ id: "vendor/m-1050", displayName: "vendor/m-1050" });
+    expect(r.models).toHaveLength(1001);
+  });
+
   test("a kept list that is unreadable or malformed is ignored, not trusted", async () => {
     const store = storeAt();
     store.upsert({ name: "box", baseUrl: "http://127.0.0.1:1/v1", models: [{ id: "cfg" }] });
     for (const content of ["{not json", JSON.stringify({ version: 2, endpoints: {} }), JSON.stringify({ version: 1, endpoints: { box: { fingerprint: 7, at: 0, models: [] } } })]) {
       writeFileSync(store.modelsCachePath, content);
       const catalog = new EndpointCatalog(store, (async () => new Response("down", { status: 503 })) as unknown as typeof fetch, { cacheFile: store.modelsCachePath });
-      expect(await catalog.models("box")).toEqual({ models: [{ id: "cfg", displayName: "cfg" }], live: false, source: "configured" });
+      expect(await catalog.models("box")).toEqual({ models: [{ id: "cfg", displayName: "cfg" }], live: false, source: "configured", notListed: [] });
     }
   });
 });
@@ -723,7 +811,8 @@ describe("daemon", () => {
     expect(await handle({ type: "session.set_model", id: "sm", sessionId: created.data!.id, model: "claude-sonnet-4-5" })).toMatchObject({ type: "response.ok" });
     // An unconfigured, unlisted Claude id is still refused, naming what the server serves.
     const refused = await handle({ type: "session.set_model", id: "sm2", sessionId: created.data!.id, model: "claude-opus-4-1" });
-    expect(String(refused.error)).toContain("It serves: claude-sonnet-4-5, gpt-x");
+    // "It serves" names only what the server listed; the configured one it doesn't list is "Configured".
+    expect(String(refused.error)).toContain("It serves: gpt-x. Configured: claude-sonnet-4-5.");
   });
 
   test("round 1: a server that is down is asked once per half minute, and concurrent asks share one request", async () => {
@@ -793,6 +882,43 @@ describe("daemon", () => {
     const viaLink = new SessionManager(store, transcript, undefined, undefined, undefined, { endpoints: storeAt() });
     const r2 = (await viaLink.handle({ type: "models.list", id: "m", provider: "oai:box" }, AUTH, { ...client })) as unknown as { models: Array<{ value: string }> };
     expect(r2.models.map((m) => m.value)).toEqual(["cfg"]);
+  });
+
+  test("round 2: a configured model's label picks it while the server is up and doesn't list it", async () => {
+    listedModels = [{ id: "other" }];
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "alias-x", name: "Fast" }, { id: "anthropic/claude-sonnet-4.5", name: "Sonnet" }] });
+    const offered = await pickable();
+    expect(offered.models.map((m) => m.displayName)).toEqual(["Fast (not listed by the server)", "Sonnet (not listed by the server)", "other"]);
+    const created = (await handle({ type: "session.create", id: "c", name: "lb", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
+    const sessionId = created.data!.id;
+    await handle({ type: "session.attach", id: "a", sessionId });
+    expect(await handle({ type: "session.set_model", id: "s1", sessionId, model: "fast" })).toMatchObject({ type: "response.ok", data: { model: "alias-x" } });
+    expect(await handle({ type: "session.set_model", id: "s2", sessionId, model: "Sonnet" })).toMatchObject({ type: "response.ok", data: { model: "anthropic/claude-sonnet-4.5" } });
+    await handle({ type: "session.send", id: "m1", sessionId, text: "hi" });
+    await waitFor(() => assistantTexts().length === 1);
+    expect(assistantTexts()[0]).toBe("hello from anthropic/claude-sonnet-4.5");
+  });
+
+  test("round 2: labels: a configured model reads as its full id; a server id is shortened only when the short name is unique", async () => {
+    listedModels = [{ id: "openai/gpt-4o" }, { id: "azure/gpt-4o" }, { id: "models/served.gguf" }, { id: "openai/gpt-x" }];
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "openai/gpt-x" }] });
+    expect((await pickable()).models.map((m) => m.displayName)).toEqual(["openai/gpt-x", "openai/gpt-4o", "azure/gpt-4o", "served.gguf"]);
+  });
+
+  test("round 2: a stored configured id the free-text rule wouldn't take is still pickable from the list", async () => {
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "model\u200bx" }] });
+    const created = (await handle({ type: "session.create", id: "c", name: "zw", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
+    expect(await handle({ type: "session.set_model", id: "s1", sessionId: created.data!.id, model: "model\u200bx" })).toMatchObject({ type: "response.ok" });
+  });
+
+  test("round 2: a caller who can't use or configure endpoints sees the configured models only, and the server isn't asked", async () => {
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "cfg" }] });
+    const watcher: AuthContext = { ...AUTH, sub: "user:watcher", scopes: ["session:watch", "session:list"] as AuthContext["scopes"] };
+    const before = modelsHits();
+    const r = (await handle({ type: "models.list", id: "m", provider: "oai:box" }, watcher)) as unknown as { models: Array<{ value: string }>; live: boolean };
+    expect(r.models.map((m) => m.value)).toEqual(["cfg"]);
+    expect(r.live).toBe(false);
+    expect(modelsHits()).toBe(before);
   });
 
   test("endpoints.test: a stored endpoint, a draft, a rejected key, llama.cpp's window", async () => {
