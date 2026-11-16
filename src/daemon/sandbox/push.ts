@@ -275,6 +275,8 @@ function includeProblem(e: OriginEntry, repo: string, agentWritable: readonly st
 /** `ssh://…`, `git@host:path` (scp-like) or `https://…`: the protocols the push may use. */
 export function pushUrlProblem(url: string): string | null {
   if (/[\x00-\x20\x7f]/.test(url)) return "it holds spaces or control characters";
+  // Shown to the owner as is: nothing invisible or reordering in it.
+  if (/[\p{Cf}\p{Cc}\p{Zl}\p{Zp}\p{Co}\p{Cn}\u0085\u00a0]/u.test(url)) return "it holds invisible or reordering characters";
   if (url.startsWith("-")) return "it starts with -";
   const scheme = /^(https|ssh):\/\/([^/]*)/i.exec(url);
   if (scheme) {
@@ -788,15 +790,29 @@ export function commandProblem(command: string, writable: readonly string[], hom
     // Any path word may be a program (`sh <script>`, `env <prog>`, a `!f() { … }` body, `ProxyCommand=<prog>`):
     // nowhere a session could leave one, your home included. Only a file handed in a known data position (a key,
     // a store file, a socket, ~/.ssh's own) may be under your home, yours alone, never where a session writes.
-    const data = DATA_OPTIONS.has((words[i - 1] ?? "").toLowerCase()) || within(sshDir, word);
+    const data = isDataPosition(words, i) || within(sshDir, word);
     const bad = hostPathProblem(word, writable, home, { homeAllowed: data });
     if (bad) return bad;
   }
   return null;
 }
 
-/** Options whose value is a file the program reads (ssh's and git's credential helpers'), never one it runs. */
-const DATA_OPTIONS = new Set(["-i", "-s", "--file", "--socket", "identityfile", "userknownhostsfile", "globalknownhostsfile", "controlpath", "certificatefile", "identityagent"]);
+/**
+ * Whether `words[i]` is a file the command's program only reads: ssh's `-i` and its file options (`-o IdentityFile=`
+ * and the like), git's store and cache helpers' `--file` / `--socket`. Judged by the program it follows, and the
+ * flag exactly (`env -i <prog>`, `ssh -I <lib>` aren't data).
+ */
+function isDataPosition(words: readonly string[], i: number): boolean {
+  const program = (words[0] ?? "").split("/").at(-1) ?? "";
+  const prev = words[i - 1] ?? "";
+  if (program === "ssh") return prev === "-i" || SSH_FILE_OPTIONS.has(prev.toLowerCase());
+  if (/^(?:git-credential-)?store$/.test(program)) return prev === "--file";
+  if (/^(?:git-credential-)?cache$/.test(program)) return prev === "--socket";
+  return false;
+}
+
+/** ssh options (`-o Name=value`, any case as ssh takes them) whose value is a file ssh reads, never runs. */
+const SSH_FILE_OPTIONS = new Set(["identityfile", "userknownhostsfile", "globalknownhostsfile", "controlpath", "certificatefile", "identityagent"]);
 
 function programProblem(program: string, writable: readonly string[]): boolean {
   const real = physicalPathOr(program);

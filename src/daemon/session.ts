@@ -4210,6 +4210,9 @@ export class Session {
     const run = this.#push(input).catch((err: unknown) => {
       const why = shownName(redactCredentials(err instanceof Error ? err.message : String(err)));
       this.#store.audit(SYSTEM_IDENTITY.sub, "session.push_refused", this.id, `push: ${why}`.slice(0, 2000));
+      const m = this.#makeMessage("info", `⬆ The agent asked to push: refused (the push couldn't be checked: ${why})`, SYSTEM_IDENTITY, undefined, undefined, { event: "sandbox.push_refused" });
+      this.#persistAndBuffer(m);
+      this.#broadcastRaw(m);
       return `Refused: the push couldn't be checked (${why}).`;
     });
     this.#pushing = run;
@@ -4256,7 +4259,8 @@ export class Session {
     const deadline = Date.now() + budgetMs;
     const left = () => Math.max(0, deadline - Date.now());
     const what = `${input.branch ? shownName(input.branch) : "the checked-out branch"} to ${input.remote ?? "origin"}`;
-    this.#store.audit(SYSTEM_IDENTITY.sub, "session.push_request", this.id, `${what}${input.reason ? ` reason=${input.reason}` : ""}`.slice(0, 2000));
+    const auditedReason = input.reason ? shownName(input.reason.replace(/\r\n?|[\n\u0085\u2028\u2029]/g, " ⏎ ")) : "";
+    this.#store.audit(SYSTEM_IDENTITY.sub, "session.push_request", this.id, `${what}${auditedReason ? ` reason=${auditedReason}` : ""}`.slice(0, 2000));
     const note = (text: string, event: string, extra: Record<string, unknown> = {}) => {
       const m = this.#makeMessage("info", text, SYSTEM_IDENTITY, undefined, undefined, { event, ...extra });
       this.#persistAndBuffer(m);

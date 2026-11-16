@@ -403,6 +403,11 @@ describe("push: the plan", () => {
       expect([c, commandProblem(c, [], home)]).toEqual([c, expect.stringContaining("under your home")]);
     }
     for (const c of ["store --file ~/.git-credentials", "ssh -o IdentityFile=~/keys/k", "ssh -i ~/.ssh/k -F ~/.ssh/config"]) expect([c, commandProblem(c, [], home)]).toEqual([c, null]);
+    // Round 14: a data position is the program's own, flag exact: env -i / -S, ssh -I run something.
+    for (const c of ["env -i ~/proj/prog", "env -S ~/proj/prog", "ssh -I ~/proj/lib.so", "sh --file ~/proj/x", "ssh -o identityfile=~/keys/k"]) {
+      expect([c, commandProblem(c, [], home) === null]).toEqual([c, c.startsWith("ssh -o")]);
+    }
+    expect(pushUrlProblem("git@github.com:o/r\u202e.git")).toContain("invisible");
     // An empty remote: said as that, not "try again".
     const empty = join(root, "empty.git");
     git(root, "init", "-q", "--bare", empty);
