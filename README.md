@@ -273,15 +273,17 @@ Set keys from the Settings screen (⚙ / `/settings`) or by editing `~/.codeoid/
 Add several local servers or hosted gateways; each becomes a backend named `oai:<name>` without restarting the daemon:
 
 ```bash
-codeoid endpoint add gpu-box --base-url http://localhost:8000/v1 --model qwen3-coder:128k
+codeoid endpoint templates                                   # OpenAI, OpenRouter, Groq, Together, DeepSeek, Fireworks, Mistral, Ollama, LM Studio, llama.cpp, vLLM
+codeoid endpoint add openrouter --template openrouter --key
+codeoid endpoint add gpu-box --template vllm --base-url http://gpu-box:8000/v1 --model qwen3-coder:128k
 codeoid endpoint add gateway --base-url https://gateway.example.com/v1 --key
 codeoid endpoint test gpu-box
 codeoid new local-work . --provider oai:gpu-box
 ```
 
-`--key` prompts for the credential without echo. Keys and custom header values are stored in `~/.codeoid/endpoints.json` with mode 0600; list responses expose only whether a key exists and the header names. Public URLs require HTTPS. Use `--flavor llamacpp` for llama-server's context-window discovery and strict tool schemas. Omit `--model` to use the server's `/models` catalog. `codeoid endpoint import-pi --file <path>` imports compatible `openai-completions` providers from pi's `models.json`; command-based secrets are not executed.
+`--key` prompts for the credential without echo. Keys and custom header values are stored in `~/.codeoid/endpoints.json` with mode 0600; list responses expose only whether a key exists and the header names. Public URLs require HTTPS. Use `--flavor llamacpp` for llama-server's context-window discovery and strict tool schemas. Pickers offer every chat model the server's `/models` lists, read live and kept for when it can't be reached (`~/.codeoid/endpoint-models.json`). `--model id:context:maxTokens` names a model to offer first, with its settings, and is the default when none is set; one the server doesn't list is still offered, marked, and `codeoid endpoint test <name>` names it. `codeoid endpoint import-pi --file <path>` imports compatible `openai-completions` providers from pi's `models.json`; command-based secrets are not executed.
 
-Manage endpoints in the web Settings → OpenAI endpoints tab or with `codeoid endpoint ls|set|rm|test`. Edits apply on the next turn. Sessions on a removed endpoint report an error until you choose another backend.
+Manage them in the web Settings → Model servers tab ("Start from" a template) or with `codeoid endpoint ls|set|rm|test|templates`. That tab, and `codeoid endpoint ls`, also list the two built-in servers of the same kind — `openai` (OpenAI's own API, `OPENAI_API_KEY` or an OpenAI account) and `llamacpp` (`providers.llamacpp`) — set up there; their backend ids are unchanged. Edits apply on the next turn. Sessions on a removed endpoint report an error until you choose another backend.
 
 In `codeoid tui`, `/provider` opens the live backend picker and `/model` fetches the selected backend's model catalog.
 You can also enter `/provider oai:gpu-box` or `/model <id>` directly.

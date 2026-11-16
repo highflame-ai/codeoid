@@ -47,6 +47,59 @@ function fillNew(name: string, url = "http://localhost:8080/v1") {
 }
 
 describe("EndpointEditor", () => {
+  it("round 3: a key typed for one template's server never follows the form to another's; a typed base URL is kept", async () => {
+    clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [] });
+    const done = vi.fn();
+    const { getByText, getByPlaceholderText, getByDisplayValue, container } = render(() => <EndpointEditor onDone={done} />);
+    fireEvent.click(getByText("OpenRouter"));
+    const keyInput = () => container.querySelector('input[type="password"]') as HTMLInputElement;
+    fireEvent.input(keyInput(), { target: { value: "sk-or-OPENROUTER-SECRET" } });
+    fireEvent.click(getByText("Groq"));
+    expect(keyInput().value).toBe("");
+    fireEvent.input(keyInput(), { target: { value: "gsk-GROQ" } });
+    fireEvent.click(getByText("Add endpoint"));
+    await waitFor(() => expect(done).toHaveBeenCalled());
+    expect(sent()[0]).toMatchObject({ baseUrl: "https://api.groq.com/openai/v1", apiKey: "gsk-GROQ" });
+    cleanup();
+    // A base URL the user typed stays when a template is picked for its request shape.
+    const r = render(() => <EndpointEditor onDone={() => {}} />);
+    fireEvent.input(r.getByPlaceholderText("http://localhost:11434/v1"), { target: { value: "https://gw.corp.example/v1" } });
+    fireEvent.click(r.getByText("Custom"));
+    expect(r.getByDisplayValue("https://gw.corp.example/v1")).toBeTruthy();
+    fireEvent.click(r.getByText("llama.cpp server"));
+    expect(r.getByDisplayValue("https://gw.corp.example/v1")).toBeTruthy();
+    void getByPlaceholderText;
+    void getByDisplayValue;
+  });
+
+  it("a template fills the server and its request shape; typed fields are kept, and a key is asked for where one is needed", async () => {
+    clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [] });
+    const done = vi.fn();
+    const { getByText, getByPlaceholderText, getByDisplayValue } = render(() => <EndpointEditor onDone={done} />);
+    fireEvent.click(getByText("OpenRouter"));
+    expect((getByPlaceholderText("gpu-box") as HTMLInputElement).value).toBe("openrouter");
+    expect(getByDisplayValue("https://openrouter.ai/api/v1")).toBeTruthy();
+    expect(getByText(/Needs an API key/)).toBeTruthy();
+    // A key is required: saving without one is refused in the form.
+    expect((getByText("Add endpoint") as HTMLButtonElement).disabled).toBe(true);
+    // Switching template: the suggested name follows, a typed one wouldn't.
+    fireEvent.click(getByText("llama.cpp server"));
+    expect((getByPlaceholderText("gpu-box") as HTMLInputElement).value).toBe("llama");
+    fireEvent.input(getByPlaceholderText("gpu-box"), { target: { value: "my-llama" } });
+    fireEvent.click(getByText("Add endpoint"));
+    await waitFor(() => expect(done).toHaveBeenCalled());
+    expect(sent()[0]).toMatchObject({
+      type: "endpoints.set",
+      name: "my-llama",
+      displayName: "llama.cpp server",
+      baseUrl: "http://127.0.0.1:8080/v1",
+      flavor: "llamacpp",
+      strictToolSchemas: true,
+      mcpServers: [],
+    });
+  });
+
+
   it("editing keeps the stored key and headers unless replaced — they are never sent back", async () => {
     clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [STORED] });
     const done = vi.fn();
@@ -101,13 +154,13 @@ describe("EndpointEditor", () => {
     expect(add.disabled).toBe(false);
 
     fireEvent.click(getByText("Test connection"));
-    await findByText(/answered in 5 ms — 2 models/);
+    await findByText(/answered in 5 ms — 2 chat models/);
     expect(sent()[0]).toMatchObject({ type: "endpoints.test", baseUrl: "http://localhost:11434/v1" });
     expect("name" in sent()[0]!).toBe(false);
-    fireEvent.click(getByText("Add the server's models"));
     fireEvent.click(add);
     await waitFor(() => expect(done).toHaveBeenCalled());
-    expect(sent()[1]).toMatchObject({ type: "endpoints.set", name: "ollama", models: [{ id: "a" }, { id: "b" }] });
+    // No model names are written down: the server's list is what pickers offer.
+    expect(sent()[1]).toMatchObject({ type: "endpoints.set", name: "ollama", models: [] });
   });
 
   it("typing into a model row keeps the same input, focused, with every character", () => {

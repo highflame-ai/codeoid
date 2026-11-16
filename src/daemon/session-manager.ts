@@ -45,14 +45,17 @@ import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, readDotEnvValueSet, writeConfigBlock, writeCredentialValue, writeMcpServerEntry, writeWorktreeTrust } from "./settings/store.js";
 import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption, shellArg } from "./mcp/adopt.js";
 import { readWorkdirServers } from "./mcp/workdir-servers.js";
-import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcpUrl, serverProgram, shownLabel, visibleCompact, visibleVerbatim } from "./mcp/redact.js";
+import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcpUrl, serverProgram, urlHasHiddenParts, shownLabel, visibleCompact, visibleVerbatim } from "./mcp/redact.js";
 import { BackendLoginBroker, BackendLoginError, type LoginOutcome, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore } from "./claude-accounts.js";
 import { AccountError, type AccountStore, LOGIN_KINDS, validateAccountName } from "./accounts.js";
-import { configuredContextWindow, draftConnection, EndpointError, EndpointStore } from "./openai-endpoints.js";
+import { configuredContextWindow, draftConnection, EndpointError, EndpointStore, isSafeModelId } from "./openai-endpoints.js";
 import {
   EndpointCatalog,
-  fetchEndpointModels,
+  fetchListedModels,
+  type ModelsSource,
+  NOT_LISTED_MARK,
+  notServed,
   fetchLlamaCppContext,
   syncEndpointProviders,
   watchEndpointProviders,
@@ -161,7 +164,7 @@ import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpT
 import { isOAuthServer, type McpServerSpec, OAUTH_UNSUPPORTED_BACKENDS } from "./mcp/types.js";
 import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, dotEnvShadowed, getConfigDir, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
-import { endpointNameOf, endpointProviderId, FLEET_TOOL_PREFIX, ORCHESTRATOR_ROLE, type ProviderInfo } from "../protocol/types.js";
+import { endpointNameOf, endpointProviderId, FLEET_TOOL_PREFIX, ORCHESTRATOR_ROLE, type BuiltinServerInfo, type ProviderInfo } from "../protocol/types.js";
 import type {
   AuthContext,
   ClaudeConfigMcpServer,
@@ -798,7 +801,7 @@ export class SessionManager {
     this.#compressionRegistry = opts?.compressionRegistry;
     this.#endpoints = opts?.endpoints ?? new EndpointStore();
     this.#endpointFetch = opts?._testEndpointFetch ?? fetch;
-    this.#endpointCatalog = new EndpointCatalog(this.#endpoints, this.#endpointFetch);
+    this.#endpointCatalog = new EndpointCatalog(this.#endpoints, this.#endpointFetch, { cacheFile: this.#endpoints.modelsCachePath });
     const endpoints = { store: this.#endpoints, catalog: this.#endpointCatalog };
     // Before the registry: a keyed backend with named accounts is registered without an env key.
     this.#claudeAccounts = opts?.claudeAccounts ?? new ClaudeAccountStore(opts?.accounts);
@@ -1645,7 +1648,7 @@ mcpHub: this.#mcpHub,
       case "fleet.unsubscribe":
         return this.#fleetUnsubscribe(msg, client);
       case "models.list":
-        return this.#modelsList(msg);
+        return this.#modelsList(msg, auth);
       case "providers.list":
         return this.#providersList(msg, client);
       case "endpoints.list":
@@ -2546,14 +2549,22 @@ mcpHub: this.#mcpHub,
    * (briefly cached); it reports none through `onModels`, so its
    * `#currentModels` would always be empty.
    */
-  async #pickableModels(providerId: string): Promise<{ models: ModelInfo[]; live: boolean }> {
+  async #pickableModels(
+    providerId: string,
+    opts?: { configuredOnly?: boolean },
+  ): Promise<{ models: ModelInfo[]; live: boolean; source?: ModelsSource; notListed?: string[] }> {
     const endpoint = endpointNameOf(providerId);
     if (endpoint === null) return this.#currentModels(providerId);
-    const { models, live } = await this.#endpointCatalog.models(endpoint);
+    const { models, live, source, notListed } = opts?.configuredOnly
+      ? this.#endpointCatalog.configured(endpoint)
+      : await this.#endpointCatalog.models(endpoint);
     return {
+      source,
+      notListed,
       models: models.map((m) => ({
         value: m.id,
         displayName: m.displayName,
+        ...(m.description ? { description: m.description } : {}),
         ...(m.contextWindow ? { contextWindow: m.contextWindow } : {}),
       })),
       live,
@@ -2562,10 +2573,17 @@ mcpHub: this.#mcpHub,
 
   async #modelsList(
     msg: Extract<ClientMessage, { type: "models.list" }>,
+    auth: AuthContext,
   ): Promise<DaemonMessage> {
     // No provider = the catalog of the backend a new session would land on.
     const provider = msg.provider ?? this.#providers.defaultId;
-    const { models, live } = await this.#pickableModels(provider);
+    // An endpoint's server list is read with its stored key: only for a caller who could use or
+    // configure it. Anyone else sees its configured models, and nothing is asked of the server.
+    const scopes = auth.scopes as string[];
+    const configuredOnly =
+      endpointNameOf(provider) !== null &&
+      ![SCOPES.SESSION_CREATE, SCOPES.SESSION_SEND, SCOPES.SETTINGS_READ].some((sc) => hasScope(scopes, sc));
+    const { models, live } = await this.#pickableModels(provider, { configuredOnly });
     return { type: "models.list.result", requestId: msg.id, models, live, provider };
   }
 
@@ -3366,7 +3384,41 @@ mcpHub: this.#mcpHub,
   }
 
   #endpointsResult(requestId: string): DaemonMessage {
-    return { type: "endpoints.result", requestId, endpoints: this.#endpoints.list() };
+    return { type: "endpoints.result", requestId, endpoints: this.#endpoints.list(), builtins: this.#builtinServers() };
+  }
+
+  /**
+   * The built-in backends of the same kind as endpoints, listed with them so one list holds every
+   * OpenAI-compatible server: OpenAI's own API and the configured llama.cpp server. Their ids,
+   * settings and environment are unchanged; this only says how each is set up.
+   */
+  #builtinServers(): BuiltinServerInfo[] {
+    const openaiUp = this.#providers.has("openai");
+    const llama = this.#config?.providers?.llamacpp;
+    const llamaUp = this.#providers.has("llamacpp");
+    // A base URL can carry a credential (userinfo, `?api-key=`): only its origin and path are shown,
+    // as for MCP servers. OPENAI_BASE_URL is the daemon's environment, shown nowhere else.
+    const shown = (url: string) => (urlHasHiddenParts(url) ? `${redactMcpUrl(url)} (credentials hidden)` : redactMcpUrl(url));
+    return [
+      {
+        id: "openai",
+        displayName: "OpenAI",
+        available: openaiUp,
+        baseUrl: process.env.OPENAI_BASE_URL ? shown(process.env.OPENAI_BASE_URL) : "https://api.openai.com/v1",
+        detail: openaiUp
+          ? "OpenAI's API, with OPENAI_API_KEY or an OpenAI account"
+          : "needs OPENAI_API_KEY (Settings → Model servers, or ~/.codeoid/.env), or an OpenAI account: codeoid account add-key <name> --backend openai",
+      },
+      {
+        id: "llamacpp",
+        displayName: "llama.cpp (local)",
+        available: llamaUp,
+        baseUrl: shown(llama?.baseUrl ?? "http://127.0.0.1:8080/v1"),
+        detail: llamaUp
+          ? "a local llama-server (providers.llamacpp)"
+          : "off: set providers.llamacpp.enabled (Settings → Model servers, or codeoid config), then restart the daemon",
+      },
+    ];
   }
 
   #endpointsError(requestId: string, err: unknown): DaemonMessage {
@@ -3502,17 +3554,27 @@ mcpHub: this.#mcpHub,
     }
     const started = Date.now();
     try {
-      const models = await fetchEndpointModels(conn, this.#endpointFetch);
+      const listed = await fetchListedModels(conn, this.#endpointFetch);
+      const latencyMs = Date.now() - started;
       const flavor = msg.flavor ?? existing?.flavor ?? "openai";
       const contextWindow =
         flavor === "llamacpp" ? await fetchLlamaCppContext(conn, this.#endpointFetch).catch(() => undefined) : undefined;
+      // Over the stored endpoint's own connection, the answer is its model list now,
+      // and its configured models can be checked against it (a draft's can't).
+      const own = existing ? this.#endpointCatalog.remember(existing.name, conn.fingerprint, listed) : false;
+      // A configured model is offered whatever the server marks it (the owner's choice): not listed as one that isn't.
+      const configured = new Set(own && existing ? existing.models.map((m) => m.id) : []);
+      const notChat = listed.filter((m) => !m.chat && !configured.has(m.id)).map((m) => m.id);
+      const stale = own && existing ? notServed(existing, listed) : [];
       return {
         type: "endpoints.test.result",
         requestId: msg.id,
         ok: true,
-        models,
-        latencyMs: Date.now() - started,
+        models: listed.slice(0, 200).map((m) => m.id),
+        latencyMs,
         ...(contextWindow ? { contextWindow } : {}),
+        ...(notChat.length ? { notChat: notChat.slice(0, 200) } : {}),
+        ...(stale.length ? { notServed: stale } : {}),
       };
     } catch (err) {
       return fail(err instanceof Error ? err.message : String(err));
@@ -10016,7 +10078,7 @@ mcpHub: this.#mcpHub,
     if (endpoint !== null && !this.#safeEndpoint(endpoint)) {
       return { type: "response.error", requestId: msg.id, error: `The endpoint "${endpoint}" no longer exists: switch the session to another backend.`, code: "invalid_request" };
     }
-    const { models } = await this.#pickableModels(providerId);
+    const { models, source, notListed } = await this.#pickableModels(providerId);
     // The backend changed while the list was fetched: a pick checked against the old one isn't the new one's.
     if (session.providerId !== providerId) {
       return { type: "response.error", requestId: msg.id, error: "The session's backend changed while the model was being checked: pick again.", code: "invalid_request" };
@@ -10029,6 +10091,13 @@ mcpHub: this.#mcpHub,
     const resolvedModel = resolve(msg.model);
     if (!resolvedModel) {
       const listed = models.map((m) => m.value).join(", ");
+      // "It serves" names only what the server listed; configured ones it doesn't list, and a list
+      // that is configuration alone, are "Configured". A gateway can serve hundreds: the first few say enough.
+      const few = (ids: string[]) => (ids.length > 10 ? `${ids.slice(0, 10).join(", ")}, … (${ids.length} in all)` : ids.join(", "));
+      const unlisted = new Set(notListed ?? []);
+      const servedIds = source === "configured" ? [] : models.map((m) => m.value).filter((v) => !unlisted.has(v));
+      const configuredIds = source === "configured" ? models.map((m) => m.value) : models.map((m) => m.value).filter((v) => unlisted.has(v));
+      const offeredText = [servedIds.length ? `It serves: ${few(servedIds)}. ` : "", configuredIds.length ? `Configured: ${few(configuredIds)}. ` : ""].join("");
       const invalid = endpoint !== null && !isEndpointModelId(msg.model.trim());
       return {
         type: "response.error",
@@ -10037,8 +10106,8 @@ mcpHub: this.#mcpHub,
           endpoint === null
             ? `Unknown model "${msg.model}". Available: ${listed}`
             : invalid
-              ? `${JSON.stringify(msg.model)} isn't a model id: one line, at most 256 characters, no control characters.`
-              : `"${msg.model}" is a Claude model, not one this endpoint serves. ${listed ? `Configured: ${listed}. ` : ""}Any other model id is passed to the server.`,
+              ? `${JSON.stringify(msg.model)} isn't a model id: one line, at most 256 characters, no control, invisible or direction-changing characters.`
+              : `"${msg.model}" is a Claude model, not one this endpoint serves. ${offeredText}Any other model id is passed to the server.`,
         code: "invalid_request",
       };
     }
@@ -11068,9 +11137,9 @@ function referenceFolder(p: string): string {
   }
 }
 
-/** A model id an endpoint may be sent: the endpoint store's own rule (openai-endpoints.ts validateModels). */
+/** A model id an endpoint may be sent: the same rule as for the ids its server lists (openai-endpoints.ts isSafeModelId). */
 function isEndpointModelId(id: string): boolean {
-  return id.length > 0 && id.length <= 256 && !/[\x00-\x1f\x7f]/.test(id);
+  return isSafeModelId(id);
 }
 
 /** Claude's ids in every form a gateway may name them: the catalog's, `claude-*`, Bedrock's `[region.]anthropic.claude-*`. */
@@ -11081,8 +11150,16 @@ function isClaudeShaped(id: string, providerId: string): boolean {
 /** How a model pick resolves on an endpoint (see SessionManager's set_model). */
 export function resolveOnEndpoint(raw: string, models: ReadonlyArray<ModelInfo>, providerId: string): string | null {
   const id = raw.trim();
+  // An offered id is taken exactly, whatever it holds: it is the owner's configuration or a list the
+  // daemon already vetted. Free text must pass the id rule.
+  const exact = models.find((m) => m.value === id);
+  if (exact) return exact.value;
   if (!isEndpointModelId(id)) return null;
-  const listed = models.find((m) => m.value === id) ?? models.find((m) => m.displayName.toLowerCase() === id.toLowerCase());
-  if (listed) return listed.value;
+  // A label matches without the "not listed" mark, which is the picker's note, not the name.
+  const label = (m: ModelInfo) => (m.displayName.endsWith(NOT_LISTED_MARK) ? m.displayName.slice(0, -NOT_LISTED_MARK.length) : m.displayName).toLowerCase();
+  const byLabel = models.filter((m) => label(m) === id.toLowerCase());
+  // Two entries with one label: neither is guessed.
+  if (byLabel.length === 1) return byLabel[0]!.value;
+  if (byLabel.length > 1) return null;
   return isClaudeShaped(id, providerId) ? null : id;
 }
