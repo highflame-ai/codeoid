@@ -10,6 +10,8 @@
  * them refuse to run rather than fall back to another backend.
  */
 
+import { readFileSync } from "node:fs";
+import { atomicWrite } from "../../../config.js";
 import { isOwnServer } from "../llamacpp/index.js";
 import type { McpServerSource } from "../../mcp/tool-source.js";
 import { AccountError, type ResolvedAccount } from "../../accounts.js";
@@ -32,7 +34,41 @@ const MODELS_TIMEOUT_MS = 5_000;
 const PROPS_TIMEOUT_MS = 2_000;
 /** How long a server's `/models` answer is reused before asking again. */
 const MODELS_TTL_MS = 60_000;
-const MAX_LISTED_MODELS = 200;
+/** A gateway can serve hundreds (OpenRouter); past this the list is cut. */
+const MAX_LISTED_MODELS = 1000;
+
+/** One model a server's `/models` lists. */
+export interface ListedModel {
+  id: string;
+  /**
+   * False when the server marks it as something other than a chat model
+   * (embeddings, rerankers, image or audio models). Only a mark the server
+   * gives counts; a name is never guessed from ("Qwen3-Embedding-8B" on a
+   * server that marks nothing stays a chat model, and a pick of it fails at
+   * the server, which says why).
+   */
+  chat: boolean;
+}
+
+/**
+ * The fields servers mark a model's kind with: LM Studio and Together `type`,
+ * LiteLLM `mode`, others `task`. A value names a kind that isn't chat.
+ */
+const NOT_CHAT_KIND =
+  /^(?:embeddings?|text[-_]embedding|rerank(?:er|ing)?|moderation|image(?:[-_]generation)?|audio(?:[-_](?:transcription|speech))?|transcription|tts|speech)$/i;
+
+function isChatEntry(m: unknown): boolean {
+  if (typeof m !== "object" || m === null) return true;
+  for (const key of ["type", "mode", "task"] as const) {
+    const v = (m as Record<string, unknown>)[key];
+    if (typeof v === "string" && NOT_CHAT_KIND.test(v.trim())) return false;
+  }
+  return true;
+}
+
+function isModelId(id: unknown): id is string {
+  return typeof id === "string" && id.length > 0 && id.length <= 256 && !/[\x00-\x1f\x7f]/.test(id);
+}
 
 /** `Authorization` + custom headers for a direct request to the endpoint. */
 function requestHeaders(conn: Pick<EndpointConnection, "apiKey" | "headers">): Record<string, string> {
@@ -51,6 +87,14 @@ export async function fetchEndpointModels(
   conn: Pick<EndpointConnection, "baseURL" | "apiKey" | "headers">,
   fetchImpl: typeof fetch = fetch,
 ): Promise<string[]> {
+  return (await fetchListedModels(conn, fetchImpl)).map((m) => m.id);
+}
+
+/** GET `<baseUrl>/models`, with each model's kind where the server marks it. Throws as {@link fetchEndpointModels}. */
+export async function fetchListedModels(
+  conn: Pick<EndpointConnection, "baseURL" | "apiKey" | "headers">,
+  fetchImpl: typeof fetch = fetch,
+): Promise<ListedModel[]> {
   let res: Response;
   try {
     res = await fetchImpl(`${conn.baseURL}/models`, {
@@ -77,13 +121,17 @@ export async function fetchEndpointModels(
   }
   const data = (body as { data?: unknown; models?: unknown }).data ?? (body as { models?: unknown }).models;
   if (!Array.isArray(data)) throw new EndpointError(`${conn.baseURL}/models did not list models`);
-  const ids: string[] = [];
+  const listed: ListedModel[] = [];
+  const seen = new Set<string>();
   for (const m of data) {
     const id = typeof m === "string" ? m : (m as { id?: unknown; name?: unknown })?.id ?? (m as { name?: unknown })?.name;
-    if (typeof id === "string" && id && !/[\x00-\x1f\x7f]/.test(id)) ids.push(id.slice(0, 256));
-    if (ids.length >= MAX_LISTED_MODELS) break;
+    // An over-long id is dropped, not cut: a cut id names a model the server doesn't serve.
+    if (!isModelId(id) || seen.has(id)) continue;
+    seen.add(id);
+    listed.push({ id, chat: isChatEntry(m) });
+    if (listed.length >= MAX_LISTED_MODELS) break;
   }
-  return ids;
+  return listed;
 }
 
 /** llama-server's per-request context window, from `/props` (with the endpoint's credentials). */
@@ -102,83 +150,204 @@ export async function fetchLlamaCppContext(
   return typeof n === "number" && n > 0 ? n : undefined;
 }
 
+/** A server's answer, and the connection it was read over. */
+interface KnownList {
+  at: number;
+  fingerprint: string;
+  models: ListedModel[];
+}
+
 /**
- * Model catalogs for endpoints: the configured list when there is one, else
- * the server's own `/models`, cached briefly. Shared by the factories (default
- * model) and the session manager (`models.list`).
+ * Model catalogs for endpoints. The server's `/models` is the source of truth:
+ * model names change and retire, so codeoid doesn't keep a list of its own.
+ * Configured models are settings applied by id (label, context window), and the
+ * fallback when the server's list can't be read. Shared by the factories
+ * (default model) and the session manager (`models.list`, `endpoints.test`).
+ *
+ * Each list a server gives is kept, in memory for a minute and on disk
+ * (`cacheFile`, 0600) for good, so a daemon restart or a server that is down
+ * for a moment still offers what it served last. A kept list is used only on
+ * the connection it was read over (base URL, key and headers, fingerprinted):
+ * an endpoint moved to another server never offers the old server's models.
+ *
+ * Fallback order: the server now; the list it gave last; the configured
+ * models; nothing (a custom id can still be typed).
  */
 export class EndpointCatalog {
   readonly #store: EndpointStore;
   readonly #fetch: typeof fetch;
-  readonly #live = new Map<string, { at: number; fingerprint: string; ids: string[] }>();
+  readonly #cacheFile: string | undefined;
+  readonly #live = new Map<string, KnownList>();
+  #known: Map<string, KnownList> | undefined;
 
-  constructor(store: EndpointStore, fetchImpl: typeof fetch = fetch) {
+  constructor(store: EndpointStore, fetchImpl: typeof fetch = fetch, opts?: { cacheFile?: string }) {
     this.#store = store;
     this.#fetch = fetchImpl;
+    this.#cacheFile = opts?.cacheFile;
   }
 
-  /** The models to offer for `name`. `live` = asked the server just now (or within the TTL). */
+  /**
+   * The models to offer for `name`. `live` = the server answered (now or
+   * within the minute); false = a kept list or the configured one stands in.
+   */
   async models(name: string): Promise<{ models: ModelInfo[]; live: boolean }> {
     const e = this.#store.get(name);
     if (!e) return { models: [], live: false };
-    if (e.models.length > 0) {
-      return {
-        models: e.models.map((m) => ({
-          id: m.id,
-          displayName: m.name || m.id,
-          ...(m.contextWindow ?? e.contextWindow ? { contextWindow: m.contextWindow ?? e.contextWindow } : {}),
-        })),
-        live: true,
-      };
-    }
-    try {
-      const ids = await this.#liveIds(e);
-      return {
-        models: ids.map((id) => ({
-          id,
-          // A local server names its model by the file it loaded; the path is noise in a picker.
-          displayName: id.split("/").pop() || id,
-          ...(e.contextWindow ? { contextWindow: e.contextWindow } : {}),
-        })),
-        live: true,
-      };
-    } catch {
-      return { models: [], live: false };
-    }
+    const { listed, live } = await this.#listed(e);
+    if (!listed) return { models: e.models.map((m) => modelInfo(e, m.id)), live: false };
+    return { models: offered(e, listed).map((id) => modelInfo(e, id)), live };
   }
 
-  /** The model a turn without an explicit choice runs on. Throws when none can be determined. */
+  /**
+   * The model a turn without an explicit choice runs on: the endpoint's
+   * default; else the first configured model the server lists; else the
+   * server's first chat model. Without a list from the server, the first
+   * configured model. Throws when none can be determined.
+   */
   async defaultModel(name: string): Promise<string> {
     const e = this.#store.get(name);
     if (!e) throw new EndpointError(`the endpoint "${name}" no longer exists`);
     if (e.defaultModel) return e.defaultModel;
-    if (e.models[0]) return e.models[0].id;
-    let ids: string[] = [];
-    try {
-      ids = await this.#liveIds(e);
-    } catch (err) {
+    const { listed, error } = await this.#listed(e);
+    if (!listed) {
+      if (e.models[0]) return e.models[0].id;
       throw new EndpointError(
-        `no model chosen for endpoint "${name}", and its model list couldn't be read (${err instanceof Error ? err.message : String(err)}) — pick one with /model, or configure models on the endpoint`,
+        `no model chosen for endpoint "${name}", and its model list couldn't be read (${error ?? "no answer"}) — pick one with /model, or set a default model on the endpoint`,
       );
     }
-    if (!ids[0]) throw new EndpointError(`endpoint "${name}" lists no models — pick one with /model, or configure models on the endpoint`);
-    return ids[0];
+    const first = offered(e, listed)[0];
+    if (!first) throw new EndpointError(`endpoint "${name}" lists no chat models — pick one with /model, or set a default model on the endpoint`);
+    return first;
   }
 
-  /** Forget cached `/models` answers (after an edit). */
+  /**
+   * Keep a list read for a stored endpoint elsewhere (`endpoints.test`), when
+   * it was read over the endpoint's own connection: a draft's never counts.
+   * True when it was kept.
+   */
+  remember(name: string, fingerprint: string, models: ListedModel[]): boolean {
+    const e = this.#store.get(name);
+    if (!e || connectionOf(e).fingerprint !== fingerprint) return false;
+    this.#keep(name, { at: Date.now(), fingerprint, models });
+    return true;
+  }
+
+  /** Forget the minute's `/models` answers (after an edit). Kept lists stay, bound to their connection. */
   invalidate(name?: string): void {
     if (name) this.#live.delete(name);
     else this.#live.clear();
   }
 
-  async #liveIds(e: StoredEndpoint): Promise<string[]> {
+  async #listed(e: StoredEndpoint): Promise<{ listed: ListedModel[] | undefined; live: boolean; error?: string }> {
     const conn = connectionOf(e);
     const hit = this.#live.get(e.name);
-    if (hit && hit.fingerprint === conn.fingerprint && Date.now() - hit.at < MODELS_TTL_MS) return hit.ids;
-    const ids = await fetchEndpointModels(conn, this.#fetch);
-    this.#live.set(e.name, { at: Date.now(), fingerprint: conn.fingerprint, ids });
-    return ids;
+    if (hit && hit.fingerprint === conn.fingerprint && Date.now() - hit.at < MODELS_TTL_MS) return { listed: hit.models, live: true };
+    try {
+      const models = await fetchListedModels(conn, this.#fetch);
+      this.#keep(e.name, { at: Date.now(), fingerprint: conn.fingerprint, models });
+      return { listed: models, live: true };
+    } catch (err) {
+      const kept = this.#loadKnown().get(e.name);
+      return {
+        listed: kept && kept.fingerprint === conn.fingerprint ? kept.models : undefined,
+        live: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
+
+  #keep(name: string, list: KnownList): void {
+    this.#live.set(name, list);
+    const known = this.#loadKnown();
+    const before = known.get(name);
+    known.set(name, list);
+    // Written only when the list or its connection changed, not every minute.
+    if (before && before.fingerprint === list.fingerprint && sameList(before.models, list.models)) return;
+    this.#saveKnown(known);
+  }
+
+  #loadKnown(): Map<string, KnownList> {
+    if (this.#known) return this.#known;
+    this.#known = new Map();
+    if (!this.#cacheFile) return this.#known;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(readFileSync(this.#cacheFile, "utf8"));
+    } catch {
+      return this.#known; // missing or unreadable: nothing kept yet
+    }
+    const lists = (raw as { version?: unknown; endpoints?: unknown })?.endpoints;
+    if ((raw as { version?: unknown })?.version !== 1 || typeof lists !== "object" || lists === null) return this.#known;
+    for (const [name, v] of Object.entries(lists as Record<string, unknown>)) {
+      const l = v as Partial<KnownList> | null;
+      if (!l || typeof l.fingerprint !== "string" || typeof l.at !== "number" || !Array.isArray(l.models)) continue;
+      const models = l.models
+        .filter((m): m is ListedModel => isModelId((m as ListedModel)?.id) && typeof (m as ListedModel).chat === "boolean")
+        .slice(0, MAX_LISTED_MODELS)
+        .map((m) => ({ id: m.id, chat: m.chat }));
+      this.#known.set(name, { at: l.at, fingerprint: l.fingerprint, models });
+    }
+    return this.#known;
+  }
+
+  #saveKnown(known: Map<string, KnownList>): void {
+    if (!this.#cacheFile) return;
+    // Removed endpoints' lists go with the next write.
+    const names = new Set(this.#store.entries().map((e) => e.name));
+    const endpoints: Record<string, KnownList> = {};
+    for (const [name, list] of known) if (names.has(name)) endpoints[name] = list;
+    try {
+      atomicWrite(this.#cacheFile, `${JSON.stringify({ version: 1, endpoints })}\n`, 0o600);
+    } catch (err) {
+      // A cache: a failed write costs the fallback after a restart, nothing else.
+      console.error(`[codeoid] could not keep endpoint model lists: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+}
+
+function sameList(a: readonly ListedModel[], b: readonly ListedModel[]): boolean {
+  return a.length === b.length && a.every((m, i) => m.id === b[i]!.id && m.chat === b[i]!.chat);
+}
+
+/**
+ * What a picker offers from a server's list: configured models it lists
+ * first, in their configured order (the owner's choices), then its other
+ * chat models in its order. A configured model it doesn't list isn't offered.
+ */
+function offered(e: StoredEndpoint, listed: readonly ListedModel[]): string[] {
+  const served = new Map(listed.map((m) => [m.id, m]));
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const m of e.models) {
+    if (served.has(m.id) && !seen.has(m.id)) {
+      out.push(m.id);
+      seen.add(m.id);
+    }
+  }
+  for (const m of listed) {
+    if (m.chat && !seen.has(m.id)) {
+      out.push(m.id);
+      seen.add(m.id);
+    }
+  }
+  return out;
+}
+
+/** Configured ids the server doesn't list: names that went stale. */
+export function notServed(e: StoredEndpoint, listed: readonly ListedModel[]): string[] {
+  const served = new Set(listed.map((m) => m.id));
+  return e.models.map((m) => m.id).filter((id) => !served.has(id));
+}
+
+function modelInfo(e: StoredEndpoint, id: string): ModelInfo {
+  const m = e.models.find((x) => x.id === id);
+  const contextWindow = m?.contextWindow ?? e.contextWindow;
+  return {
+    id,
+    // A local server names its model by the file it loaded; the path is noise in a picker.
+    displayName: m?.name || id.split("/").pop() || id,
+    ...(contextWindow ? { contextWindow } : {}),
+  };
 }
 
 /** The MCP registry narrowed to what the endpoint offers — read live, so an edit applies next turn. */

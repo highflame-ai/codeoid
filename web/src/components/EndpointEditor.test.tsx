@@ -101,13 +101,13 @@ describe("EndpointEditor", () => {
     expect(add.disabled).toBe(false);
 
     fireEvent.click(getByText("Test connection"));
-    await findByText(/answered in 5 ms — 2 models/);
+    await findByText(/answered in 5 ms — 2 chat models/);
     expect(sent()[0]).toMatchObject({ type: "endpoints.test", baseUrl: "http://localhost:11434/v1" });
     expect("name" in sent()[0]!).toBe(false);
-    fireEvent.click(getByText("Add the server's models"));
     fireEvent.click(add);
     await waitFor(() => expect(done).toHaveBeenCalled());
-    expect(sent()[1]).toMatchObject({ type: "endpoints.set", name: "ollama", models: [{ id: "a" }, { id: "b" }] });
+    // No model names are written down: the server's list is what pickers offer.
+    expect(sent()[1]).toMatchObject({ type: "endpoints.set", name: "ollama", models: [] });
   });
 
   it("typing into a model row keeps the same input, focused, with every character", () => {

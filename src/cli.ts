@@ -880,10 +880,16 @@ function printTestResult(resp: DaemonMessage | undefined): void {
     process.exitCode = 1;
     return;
   }
-  const models = resp.models ?? [];
-  console.log(`✓ answered in ${resp.latencyMs ?? "?"} ms — ${models.length} model${models.length === 1 ? "" : "s"}${resp.contextWindow ? `, context ${resp.contextWindow} tokens` : ""}`);
+  const notChat = new Set(resp.notChat ?? []);
+  const models = (resp.models ?? []).filter((m) => !notChat.has(m));
+  console.log(`✓ answered in ${resp.latencyMs ?? "?"} ms — ${models.length} chat model${models.length === 1 ? "" : "s"}${resp.contextWindow ? `, context ${resp.contextWindow} tokens` : ""}`);
   for (const m of models.slice(0, 30)) console.log(`    ${m}`);
   if (models.length > 30) console.log(`    … and ${models.length - 30} more`);
+  if (notChat.size) console.log(`  not for chat (not offered): ${[...notChat].join(", ")}`);
+  if (resp.notServed?.length) {
+    console.log(`  configured but not served any more (not offered): ${resp.notServed.join(", ")}`);
+    console.log("    remove or rename them: codeoid endpoint set <name> … --model <id>");
+  }
 }
 
 const collect = (v: string, prev: string[] = []) => [...prev, v];
@@ -906,7 +912,7 @@ endpoint
   .requiredOption("--base-url <url>", "the OpenAI-compatible base URL, usually ending in /v1 (https, or http for localhost / a private network)")
   .option("--display-name <label>", "label in pickers")
   .option("--flavor <flavor>", "openai | llamacpp (llama-server: live context window from /props, strict tool schemas)")
-  .option("--model <id[:context[:maxTokens]]>", "a model it serves, repeatable (e.g. qwen3-coder:128k); none = whatever the server lists", collect, [] as string[])
+  .option("--model <id[:context[:maxTokens]]>", "settings for a model it serves, repeatable (e.g. qwen3-coder:128k): a context window and output cap by id. Pickers offer what the server lists; these stand in only when its list can't be read", collect, [] as string[])
   .option("--default-model <id>", "the model new sessions use")
   .option("--context <tokens>", "context window for models without their own (e.g. 32k)")
   .option("--key", "set the API key (asked for without echo, or read from stdin)")

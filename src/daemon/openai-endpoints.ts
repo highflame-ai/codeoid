@@ -16,7 +16,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { isIP } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { atomicWrite, getConfigDir } from "../config.js";
 import {
   type EndpointFlavor,
@@ -335,6 +335,11 @@ export class EndpointStore {
 
   constructor(path: string = join(getConfigDir(), "endpoints.json")) {
     this.#path = path;
+  }
+
+  /** Where the model lists the endpoints' servers gave are kept (beside the store, 0600). */
+  get modelsCachePath(): string {
+    return join(dirname(this.#path), "endpoint-models.json");
   }
 
   /** Called after every successful change (add, replace, remove). */

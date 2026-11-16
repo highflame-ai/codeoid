@@ -279,7 +279,7 @@ codeoid endpoint test gpu-box
 codeoid new local-work . --provider oai:gpu-box
 ```
 
-`--key` prompts for the credential without echo. Keys and custom header values are stored in `~/.codeoid/endpoints.json` with mode 0600; list responses expose only whether a key exists and the header names. Public URLs require HTTPS. Use `--flavor llamacpp` for llama-server's context-window discovery and strict tool schemas. Omit `--model` to use the server's `/models` catalog. `codeoid endpoint import-pi --file <path>` imports compatible `openai-completions` providers from pi's `models.json`; command-based secrets are not executed.
+`--key` prompts for the credential without echo. Keys and custom header values are stored in `~/.codeoid/endpoints.json` with mode 0600; list responses expose only whether a key exists and the header names. Public URLs require HTTPS. Use `--flavor llamacpp` for llama-server's context-window discovery and strict tool schemas. Pickers offer the models the server's `/models` lists, read live and kept for when it can't be reached (`~/.codeoid/endpoint-models.json`). `--model id:context:maxTokens` adds settings to a model by id and stands in only when the server's list can't be read; `codeoid endpoint test <name>` flags a configured model the server no longer serves. `codeoid endpoint import-pi --file <path>` imports compatible `openai-completions` providers from pi's `models.json`; command-based secrets are not executed.
 
 Manage endpoints in the web Settings → OpenAI endpoints tab or with `codeoid endpoint ls|set|rm|test`. Edits apply on the next turn. Sessions on a removed endpoint report an error until you choose another backend.
 

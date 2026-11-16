@@ -52,7 +52,8 @@ import { AccountError, type AccountStore, LOGIN_KINDS, validateAccountName } fro
 import { configuredContextWindow, draftConnection, EndpointError, EndpointStore } from "./openai-endpoints.js";
 import {
   EndpointCatalog,
-  fetchEndpointModels,
+  fetchListedModels,
+  notServed,
   fetchLlamaCppContext,
   syncEndpointProviders,
   watchEndpointProviders,
@@ -798,7 +799,7 @@ export class SessionManager {
     this.#compressionRegistry = opts?.compressionRegistry;
     this.#endpoints = opts?.endpoints ?? new EndpointStore();
     this.#endpointFetch = opts?._testEndpointFetch ?? fetch;
-    this.#endpointCatalog = new EndpointCatalog(this.#endpoints, this.#endpointFetch);
+    this.#endpointCatalog = new EndpointCatalog(this.#endpoints, this.#endpointFetch, { cacheFile: this.#endpoints.modelsCachePath });
     const endpoints = { store: this.#endpoints, catalog: this.#endpointCatalog };
     // Before the registry: a keyed backend with named accounts is registered without an env key.
     this.#claudeAccounts = opts?.claudeAccounts ?? new ClaudeAccountStore(opts?.accounts);
@@ -3502,17 +3503,25 @@ mcpHub: this.#mcpHub,
     }
     const started = Date.now();
     try {
-      const models = await fetchEndpointModels(conn, this.#endpointFetch);
+      const listed = await fetchListedModels(conn, this.#endpointFetch);
+      const latencyMs = Date.now() - started;
       const flavor = msg.flavor ?? existing?.flavor ?? "openai";
       const contextWindow =
         flavor === "llamacpp" ? await fetchLlamaCppContext(conn, this.#endpointFetch).catch(() => undefined) : undefined;
+      // Over the stored endpoint's own connection, the answer is its model list now,
+      // and its configured models can be checked against it (a draft's can't).
+      const own = existing ? this.#endpointCatalog.remember(existing.name, conn.fingerprint, listed) : false;
+      const notChat = listed.filter((m) => !m.chat).map((m) => m.id);
+      const stale = own && existing ? notServed(existing, listed) : [];
       return {
         type: "endpoints.test.result",
         requestId: msg.id,
         ok: true,
-        models,
-        latencyMs: Date.now() - started,
+        models: listed.slice(0, 200).map((m) => m.id),
+        latencyMs,
         ...(contextWindow ? { contextWindow } : {}),
+        ...(notChat.length ? { notChat: notChat.slice(0, 200) } : {}),
+        ...(stale.length ? { notServed: stale } : {}),
       };
     } catch (err) {
       return fail(err instanceof Error ? err.message : String(err));
@@ -10029,6 +10038,8 @@ mcpHub: this.#mcpHub,
     const resolvedModel = resolve(msg.model);
     if (!resolvedModel) {
       const listed = models.map((m) => m.value).join(", ");
+      // A gateway can serve hundreds: the first few say enough.
+      const served = models.length > 10 ? `${models.slice(0, 10).map((m) => m.value).join(", ")}, … (${models.length} in all)` : listed;
       const invalid = endpoint !== null && !isEndpointModelId(msg.model.trim());
       return {
         type: "response.error",
@@ -10038,7 +10049,7 @@ mcpHub: this.#mcpHub,
             ? `Unknown model "${msg.model}". Available: ${listed}`
             : invalid
               ? `${JSON.stringify(msg.model)} isn't a model id: one line, at most 256 characters, no control characters.`
-              : `"${msg.model}" is a Claude model, not one this endpoint serves. ${listed ? `Configured: ${listed}. ` : ""}Any other model id is passed to the server.`,
+              : `"${msg.model}" is a Claude model, not one this endpoint serves. ${served ? `It serves: ${served}. ` : ""}Any other model id is passed to the server.`,
         code: "invalid_request",
       };
     }

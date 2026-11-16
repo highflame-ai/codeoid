@@ -10,7 +10,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, wri
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { draftConnection, EndpointError, EndpointStore, isPrivateHost } from "../daemon/openai-endpoints.js";
-import { EndpointCatalog, syncEndpointProviders, watchEndpointProviders } from "../daemon/providers/endpoint/index.js";
+import { EndpointCatalog, fetchListedModels, syncEndpointProviders, watchEndpointProviders } from "../daemon/providers/endpoint/index.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { resolveOnEndpoint, SessionManager } from "../daemon/session-manager.js";
 import { backendLabel } from "../daemon/session.js";
@@ -41,12 +41,19 @@ interface SeenRequest {
 let server: ReturnType<typeof Bun.serve>;
 const seen: SeenRequest[] = [];
 let validKey = "sk-good";
+/** What the fake server's /models lists: entries as a server sends them. */
+const DEFAULT_LISTED: unknown[] = [{ id: "served-a" }, { id: "org/served-b.gguf" }];
+let listedModels: unknown[] = DEFAULT_LISTED;
+/** False: the fake server's /models fails (a gateway without one, or one that is down). */
+let modelsUp = true;
 beforeAll(() => {
   server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
     async fetch(req) {
       const url = new URL(req.url);
+      // The same server under another base path: another connection to codeoid.
+      if (url.pathname.startsWith("/alt/")) url.pathname = url.pathname.slice("/alt".length);
       const body = req.method === "POST" ? ((await req.json()) as Record<string, unknown>) : null;
       seen.push({ path: url.pathname, auth: req.headers.get("authorization"), headers: Object.fromEntries(req.headers), body });
       // A server that bounces requests to another origin (localhost vs 127.0.0.1).
@@ -56,7 +63,7 @@ beforeAll(() => {
       if (req.headers.get("authorization") !== `Bearer ${validKey}`) {
         return Response.json({ error: { message: "bad key" } }, { status: 401 });
       }
-      if (url.pathname === "/v1/models") return Response.json({ data: [{ id: "served-a" }, { id: "org/served-b.gguf" }] });
+      if (url.pathname === "/v1/models") return modelsUp ? Response.json({ data: listedModels }) : new Response("no", { status: 404 });
       if (url.pathname === "/props") return Response.json({ default_generation_settings: { n_ctx: 8192 } });
       if (url.pathname === "/v1/chat/completions") {
         const model = String(body?.model);
@@ -330,6 +337,54 @@ describe("EndpointStore", () => {
   });
 });
 
+describe("a server's model list", () => {
+  const answering = (body: unknown, status = 200): typeof fetch =>
+    (async () => Response.json(body, { status })) as unknown as typeof fetch;
+  const conn = { baseURL: "http://127.0.0.1:1/v1", headers: {} };
+
+  test("is read as the server sends it: ids or names, objects or strings, once each; a bad id is dropped, never cut", async () => {
+    const listed = await fetchListedModels(
+      conn,
+      answering({ data: ["plain", { id: "obj" }, { name: "named" }, { id: "obj" }, { id: "x".repeat(257) }, { id: "bad\nid" }, { id: "" }, 42, null] }),
+    );
+    expect(listed).toEqual([
+      { id: "plain", chat: true },
+      { id: "obj", chat: true },
+      { id: "named", chat: true },
+    ]);
+    expect(await fetchListedModels(conn, answering({ models: [{ id: "ollama-style" }] }))).toEqual([{ id: "ollama-style", chat: true }]);
+  });
+
+  test("only a kind the server marks makes a model not for chat", async () => {
+    const listed = await fetchListedModels(
+      conn,
+      answering({
+        data: [
+          { id: "a", type: "embedding" },
+          { id: "b", type: "Embeddings" },
+          { id: "c", mode: "rerank" },
+          { id: "d", task: "text-embedding" },
+          { id: "e", mode: "image_generation" },
+          { id: "f", type: "llm" },
+          { id: "g", mode: "chat" },
+          { id: "Some-Embedding-Model" },
+        ],
+      }),
+    );
+    expect(listed.filter((m) => m.chat).map((m) => m.id)).toEqual(["f", "g", "Some-Embedding-Model"]);
+  });
+
+  test("a kept list that is unreadable or malformed is ignored, not trusted", async () => {
+    const store = storeAt();
+    store.upsert({ name: "box", baseUrl: "http://127.0.0.1:1/v1", models: [{ id: "cfg" }] });
+    for (const content of ["{not json", JSON.stringify({ version: 2, endpoints: {} }), JSON.stringify({ version: 1, endpoints: { box: { fingerprint: 7, at: 0, models: [] } } })]) {
+      writeFileSync(store.modelsCachePath, content);
+      const catalog = new EndpointCatalog(store, (async () => new Response("down", { status: 503 })) as unknown as typeof fetch, { cacheFile: store.modelsCachePath });
+      expect(await catalog.models("box")).toEqual({ models: [{ id: "cfg", displayName: "cfg" }], live: false });
+    }
+  });
+});
+
 // ── CLI helpers ───────────────────────────────────────────────────────────────
 
 describe("CLI helpers", () => {
@@ -419,6 +474,8 @@ describe("daemon", () => {
   beforeEach(() => {
     seen.length = 0;
     validKey = "sk-good";
+    listedModels = DEFAULT_LISTED;
+    modelsUp = true;
     store = new Store(join(dir, "codeoid.db"));
     transcript = new TranscriptStore(join(dir, "transcripts"));
     endpoints = storeAt();
@@ -465,6 +522,8 @@ describe("daemon", () => {
   });
 
   test("a session runs on the endpoint: key, headers, default model; edits apply next turn; removal refuses", async () => {
+    // The configured model the server serves is the default, ahead of the server's own first.
+    listedModels = [{ id: "served-a" }, { id: "cfg-model" }];
     await handle({
       type: "endpoints.set",
       id: "s",
@@ -522,6 +581,113 @@ describe("daemon", () => {
     await handle({ type: "session.send", id: "m1", sessionId: created.data!.id, text: "hi" });
     await waitFor(() => assistantTexts().length === 1);
     expect(assistantTexts()[0]).toBe("hello from served-a");
+  });
+
+  const pickable = async (provider = "oai:box") => {
+    const r = (await handle({ type: "models.list", id: "m", provider })) as unknown as { models: Array<{ value: string; displayName: string; contextWindow?: number }>; live: boolean };
+    return { ids: r.models.map((m) => m.value), models: r.models, live: r.live };
+  };
+
+  test("the server's list decides what's offered: configured models are settings, the reported case (2 configured, 5 served)", async () => {
+    // The shape of the report: two models configured, the gateway serves five, one of them an embedding model.
+    listedModels = [
+      { id: "DeepSeek-V4-Flash" },
+      { id: "DeepSeek-V4.1-Flash" },
+      { id: "GLM-5.3-Coding" },
+      { id: "MiMo-V2.5" },
+      { id: "Qwen3-Embedding-8B" },
+    ];
+    await handle({
+      type: "endpoints.set",
+      id: "s",
+      name: "box",
+      baseUrl: baseUrl(),
+      apiKey: validKey,
+      models: [{ id: "GLM-5.3-Coding", name: "GLM coding", contextWindow: 200_000 }, { id: "DeepSeek-V4.1-Flash" }],
+    });
+    const offered = await pickable();
+    expect(offered.live).toBe(true);
+    // Every served model, the configured ones first in their configured order. A name is
+    // never guessed from: the server marks nothing, so the embedding model is offered too.
+    expect(offered.ids).toEqual(["GLM-5.3-Coding", "DeepSeek-V4.1-Flash", "DeepSeek-V4-Flash", "MiMo-V2.5", "Qwen3-Embedding-8B"]);
+    // Configured settings apply by id.
+    expect(offered.models[0]).toMatchObject({ displayName: "GLM coding", contextWindow: 200_000 });
+    // A served model nobody configured is a pick like any other, and runs.
+    const created = (await handle({ type: "session.create", id: "c", name: "r1", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
+    const sessionId = created.data!.id;
+    await handle({ type: "session.attach", id: "a", sessionId });
+    expect(await handle({ type: "session.set_model", id: "sm", sessionId, model: "MiMo-V2.5" })).toMatchObject({ type: "response.ok" });
+    await handle({ type: "session.send", id: "m1", sessionId, text: "hi" });
+    await waitFor(() => assistantTexts().length === 1);
+    expect(assistantTexts()[0]).toBe("hello from MiMo-V2.5");
+  });
+
+  test("a model the server marks as not for chat isn't offered or chosen as the default; test says which", async () => {
+    // LM Studio / Together mark `type`, LiteLLM `mode`.
+    listedModels = [
+      { id: "embed-a", type: "embeddings" },
+      { id: "rerank-b", mode: "rerank" },
+      { id: "chat-c", type: "llm" },
+      { id: "chat-d" },
+    ];
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey });
+    expect((await pickable()).ids).toEqual(["chat-c", "chat-d"]);
+    const created = (await handle({ type: "session.create", id: "c", name: "r2", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
+    await handle({ type: "session.attach", id: "a", sessionId: created.data!.id });
+    await handle({ type: "session.send", id: "m1", sessionId: created.data!.id, text: "hi" });
+    await waitFor(() => assistantTexts().length === 1);
+    expect(assistantTexts()[0]).toBe("hello from chat-c");
+    const t = await handle({ type: "endpoints.test", id: "t", name: "box" });
+    expect(t).toMatchObject({ ok: true, models: ["embed-a", "rerank-b", "chat-c", "chat-d"], notChat: ["embed-a", "rerank-b"] });
+  });
+
+  test("a configured model the server no longer serves isn't offered, and test names it; a draft's test doesn't", async () => {
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "gone-model" }, { id: "served-a" }] });
+    expect((await pickable()).ids).toEqual(["served-a", "org/served-b.gguf"]);
+    const t = await handle({ type: "endpoints.test", id: "t", name: "box" });
+    expect(t).toMatchObject({ ok: true, notServed: ["gone-model"] });
+    // A draft on another URL is a different server: its list says nothing about the stored models.
+    const draft = await handle({ type: "endpoints.test", id: "t2", name: "box", baseUrl: baseUrl().replace("/v1", "/alt/v1") });
+    expect(draft).toMatchObject({ ok: true });
+    expect("notServed" in draft).toBe(false);
+  });
+
+  test("a server that can't answer: its last list stands in (also after a restart); without one, the configured models", async () => {
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "served-a", contextWindow: 9000 }] });
+    expect((await pickable()).ids).toEqual(["served-a", "org/served-b.gguf"]);
+    const kept = join(dir, "endpoint-models.json");
+    expect(statSync(kept).mode & 0o777).toBe(0o600);
+    expect(readFileSync(kept, "utf8")).not.toContain(validKey);
+
+    modelsUp = false;
+    // A label edit keeps the connection: the minute's answer is dropped, the kept list isn't.
+    await handle({ type: "endpoints.set", id: "s2", name: "box", baseUrl: baseUrl(), displayName: "Box" });
+    expect(await pickable()).toMatchObject({ ids: ["served-a", "org/served-b.gguf"], live: false });
+
+    // A daemon restart: read back from disk.
+    const restarted = new SessionManager(store, transcript, undefined, undefined, undefined, { endpoints: storeAt() });
+    const again = (await restarted.handle({ type: "models.list", id: "m", provider: "oai:box" }, AUTH, { ...client })) as unknown as {
+      models: Array<{ value: string }>;
+      live: boolean;
+    };
+    expect(again.models.map((m) => m.value)).toEqual(["served-a", "org/served-b.gguf"]);
+    expect(again.live).toBe(false);
+
+    // A list read over another connection is never used: here a new path on the same server.
+    await handle({ type: "endpoints.set", id: "s3", name: "box", baseUrl: `${baseUrl()}/elsewhere` });
+    expect(await pickable()).toMatchObject({ ids: ["served-a"], live: false });
+  });
+
+  test("with no list from the server and none kept, the first configured model runs", async () => {
+    modelsUp = false;
+    listedModels = [{ id: "cfg-1" }, { id: "cfg-2" }];
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "cfg-2" }, { id: "cfg-1" }] });
+    expect(await pickable()).toMatchObject({ ids: ["cfg-2", "cfg-1"], live: false });
+    const created = (await handle({ type: "session.create", id: "c", name: "r3", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
+    await handle({ type: "session.attach", id: "a", sessionId: created.data!.id });
+    await handle({ type: "session.send", id: "m1", sessionId: created.data!.id, text: "hi" });
+    await waitFor(() => assistantTexts().length === 1);
+    expect(assistantTexts()[0]).toBe("hello from cfg-2");
   });
 
   test("endpoints.test: a stored endpoint, a draft, a rejected key, llama.cpp's window", async () => {
@@ -678,9 +844,10 @@ describe("daemon", () => {
   });
 
   test("a model the dropdown offers is one the switch accepts, and the server answers on it; a custom id passes through, a Claude one is refused", async () => {
+    listedModels = [{ id: "conf-b" }, { id: "served-a" }, { id: "conf-a" }];
     await handle({ type: "endpoints.set", id: "s", name: "box", displayName: "GPU box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "conf-a" }, { id: "conf-b" }] });
     const listed = (await handle({ type: "models.list", id: "m", provider: "oai:box" })) as unknown as { models: Array<{ value: string }> };
-    expect(listed.models.map((m) => m.value)).toEqual(["conf-a", "conf-b"]);
+    expect(listed.models.map((m) => m.value)).toEqual(["conf-a", "conf-b", "served-a"]);
     const created = (await handle({ type: "session.create", id: "c", name: "sm", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
     const sessionId = created.data!.id;
     await handle({ type: "session.attach", id: "a", sessionId });
@@ -691,18 +858,18 @@ describe("daemon", () => {
     await waitFor(() => assistantTexts().length === 1);
     expect(assistantTexts()[0]).toBe("hello from conf-b");
 
-    // The dropdown's custom model id: not configured, so the server is the judge.
-    expect(await handle({ type: "session.set_model", id: "sm2", sessionId, model: "served-a" })).toMatchObject({ type: "response.ok", data: { model: "served-a" } });
+    // The dropdown's custom model id: not listed, so the server is the judge.
+    expect(await handle({ type: "session.set_model", id: "sm2", sessionId, model: "unlisted-x" })).toMatchObject({ type: "response.ok", data: { model: "unlisted-x" } });
     await handle({ type: "session.send", id: "m2", sessionId, text: "again" });
     await waitFor(() => assistantTexts().length === 2);
-    expect(assistantTexts()[1]).toBe("hello from served-a");
+    expect(assistantTexts()[1]).toBe("hello from unlisted-x");
 
     // A Claude model isn't the endpoint's: refused, saying why and what is configured.
     for (const model of ["claude-sonnet-4-5", "opus"]) {
       const refused = await handle({ type: "session.set_model", id: `sm-${model}`, sessionId, model });
       expect(refused).toMatchObject({ type: "response.error", code: "invalid_request" });
       expect(String(refused.error)).toContain("is a Claude model");
-      expect(String(refused.error)).toContain("Configured: conf-a, conf-b");
+      expect(String(refused.error)).toContain("It serves: conf-a, conf-b, served-a");
     }
 
     // Its replies are labelled with the endpoint, not "(Claude)".
@@ -712,6 +879,7 @@ describe("daemon", () => {
   });
 
   test("a Claude model a gateway lists is a model it serves; a removed endpoint takes no model (round-1 audit)", async () => {
+    listedModels = [{ id: "claude-sonnet-4-5" }];
     await handle({ type: "endpoints.set", id: "s", name: "gw", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "claude-sonnet-4-5" }] });
     const created = (await handle({ type: "session.create", id: "c", name: "gw1", workdir: dir, providerId: "oai:gw" })) as { data?: SessionInfo };
     const sessionId = created.data!.id;

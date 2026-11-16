@@ -69,9 +69,17 @@ export interface EndpointInfo {
   hasApiKey: boolean;
   /** Names of the extra headers sent; values are secret. */
   headerNames: string[];
-  /** Configured models. Empty = whatever the server's `/models` lists. */
+  /**
+   * Settings for models, by id: a label, a context window, an output cap. They
+   * don't decide what pickers offer. The server's `/models` does: a configured
+   * model the server doesn't list isn't offered. The list is used as is only
+   * when the server's list can't be read and none was read before.
+   */
   models: EndpointModel[];
-  /** Model a new session uses. Defaults to the first configured model, then the server's first. */
+  /**
+   * Model a new session uses. Defaults to the first configured model the
+   * server lists, then the server's first chat model.
+   */
   defaultModel?: string;
   /** Context window for a model without its own. */
   contextWindow?: number;
@@ -209,6 +217,10 @@ export interface EndpointsTestResultMsg {
   ok: boolean;
   /** Model ids the server listed (up to 200). */
   models?: string[];
+  /** Listed ids the server marks as not for chat (embeddings, rerankers). Pickers don't offer them. */
+  notChat?: string[];
+  /** A stored endpoint's configured model ids the server doesn't list: names that went stale. */
+  notServed?: string[];
   /** llama.cpp flavor: the context window the server runs with. */
   contextWindow?: number;
   latencyMs?: number;

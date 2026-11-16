@@ -158,11 +158,11 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
     );
   };
 
-  const fillModelsFromTest = () => {
+  /** Suggestions for the default model: what the last test listed, then the configured ids. */
+  const defaultModelChoices = () => {
     const t = test();
-    if (!t || t === "running" || !t.ok || !t.models) return;
-    const have = new Set(models().map((m) => m.id));
-    setModels([...models(), ...t.models.filter((id) => !have.has(id)).map((id) => ({ id, name: "", contextWindow: "", maxTokens: "" }))]);
+    const listed = t && t !== "running" && t.ok ? (t.models ?? []).filter((id) => !(t.notChat ?? []).includes(id)) : [];
+    return [...new Set([...listed, ...models().map((m) => m.id).filter(Boolean)])];
   };
 
   const save = async (ev: Event) => {
@@ -316,13 +316,10 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
 
       <div class="space-y-1">
         <div class="flex items-center justify-between">
-          <span class={label}>Models (none = whatever the server lists)</span>
+          <span class={label} title="Pickers offer what the server lists. A model here adds a label, a context window or an output cap to it, and the list stands in only when the server's can't be read.">
+            Model settings (optional — the server's list decides what's offered)
+          </span>
           <div class="flex gap-2">
-            <Show when={test() && test() !== "running" && (test() as EndpointsTestResultMsg).ok}>
-              <button type="button" class={button} onClick={fillModelsFromTest}>
-                Add the server's models
-              </button>
-            </Show>
             <button type="button" class={button} onClick={() => setModels([...models(), { id: "", name: "", contextWindow: "", maxTokens: "" }])}>
               + Model
             </button>
@@ -352,9 +349,9 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
       <div class="grid grid-cols-2 gap-3">
         <label class="block space-y-1">
           <span class={label}>Default model</span>
-          <input class={input} value={defaultModel()} onInput={(e) => setDefaultModel(e.currentTarget.value)} placeholder="first model" list="endpoint-model-ids" />
+          <input class={input} value={defaultModel()} onInput={(e) => setDefaultModel(e.currentTarget.value)} placeholder="the server's first" list="endpoint-model-ids" />
           <datalist id="endpoint-model-ids">
-            <For each={models()}>{(m) => <option value={m.id} />}</For>
+            <For each={defaultModelChoices()}>{(id) => <option value={id} />}</For>
           </datalist>
         </label>
         <label class="block space-y-1">
@@ -440,12 +437,22 @@ export const TestOutcome: Component<{ test?: EndpointsTestResultMsg | "running" 
   <Show when={props.test && props.test !== "running" ? (props.test as EndpointsTestResultMsg) : undefined}>
     {(t) => (
       <div class={`text-[11px] ${t().ok ? "text-success" : "text-danger"}`} role={t().ok ? undefined : "alert"}>
-        {t().ok
-          ? `✓ answered in ${t().latencyMs ?? "?"} ms — ${t().models?.length ?? 0} models${t().contextWindow ? `, context ${t().contextWindow} tokens` : ""}${
-              t().models?.length ? `: ${t().models!.slice(0, 6).join(", ")}${t().models!.length > 6 ? ", …" : ""}` : ""
-            }`
-          : `✗ ${t().error ?? "no answer"}`}
+        {t().ok ? testSummary(t()) : `✗ ${t().error ?? "no answer"}`}
+        <Show when={t().ok && t().notServed?.length}>
+          <div class="text-warn">
+            Configured but not served any more: {t().notServed!.join(", ")} — not offered; remove or rename them.
+          </div>
+        </Show>
       </div>
     )}
   </Show>
 );
+
+/** "✓ answered in 538 ms — 4 chat models: a, b, … (+1 not for chat: x)". Shared with the terminal's wording. */
+export function testSummary(t: EndpointsTestResultMsg): string {
+  const notChat = new Set(t.notChat ?? []);
+  const chat = (t.models ?? []).filter((id) => !notChat.has(id));
+  const shown = chat.length ? `: ${chat.slice(0, 6).join(", ")}${chat.length > 6 ? ", …" : ""}` : "";
+  const other = notChat.size ? ` (+${notChat.size} not for chat: ${[...notChat].slice(0, 3).join(", ")}${notChat.size > 3 ? ", …" : ""})` : "";
+  return `✓ answered in ${t.latencyMs ?? "?"} ms — ${chat.length} chat model${chat.length === 1 ? "" : "s"}${t.contextWindow ? `, context ${t.contextWindow} tokens` : ""}${shown}${other}`;
+}
