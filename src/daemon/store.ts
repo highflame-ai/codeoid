@@ -2341,6 +2341,13 @@ export class Store {
     this.#db.prepare("INSERT OR IGNORE INTO git_agent_branches (owner, url, branch, created_at) VALUES (?, ?, ?, ?)").run(owner, url, branch, Date.now());
   }
 
+  /** Forget the agents' branches the remote no longer has (one recreated later under that name is someone else's). */
+  pruneGitAgentBranches(owner: string, url: string, heads: ReadonlySet<string>): void {
+    for (const b of this.gitAgentBranches(owner, url)) {
+      if (!heads.has(b)) this.#db.prepare("DELETE FROM git_agent_branches WHERE owner = ? AND url = ? AND branch = ?").run(owner, url, b);
+    }
+  }
+
   /** The branches agents made on `url` for `owner`. */
   gitAgentBranches(owner: string, url: string): Set<string> {
     return new Set((this.#db.prepare("SELECT branch FROM git_agent_branches WHERE owner = ? AND url = ?").all(owner, url) as Array<{ branch: string }>).map((r) => r.branch));

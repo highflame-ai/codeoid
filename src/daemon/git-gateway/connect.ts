@@ -6,7 +6,7 @@
  * - https: the owner's credential read once, now, with `git credential fill` (their own helpers, at their request),
  *   or a dedicated token they hand in; kept in a 0600 file of the daemon's, sent to that remote's origin only.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
@@ -168,4 +168,19 @@ export async function probeConnection(
   const r = await lsRemote(upstream, ssh);
   if (r.code !== 0) return { error: gitError(r, `your ${kind === "ssh" ? "ssh key" : "credential"} didn't reach ${url}`) };
   return { kind, auth, ...(credential ? { credential } : {}), upstream, ssh };
+}
+
+/**
+ * The URL the owner's git really uses for `url` (their global and system `url.*.insteadOf`, from `/`: no repository's
+ * config, nothing run), or `url` itself. Sync: a spec is built so.
+ */
+// paths: git ls-remote --get-url from /, which only reads config
+export function ownerRewrite(url: string): string {
+  try {
+    const r = spawnSync(GIT_BIN, ["-C", "/", "ls-remote", "--get-url", "--", url], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
+    const out = r.status === 0 ? r.stdout.trim() : "";
+    return out && !/\s/.test(out) ? out : url;
+  } catch {
+    return url;
+  }
 }

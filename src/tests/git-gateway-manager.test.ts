@@ -11,6 +11,8 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { AUTH, CLIENT, git, infoOf, sandboxManagerHarness, until } from "./fixtures/sandbox-manager-harness.js";
 
+// The test-only allowance: a local bare repository as a connected remote (file://).
+process.env.CODEOID_GIT_GATEWAY_TEST_FILE = "1";
 const t = sandboxManagerHarness();
 
 function upstreamRepo(): string {

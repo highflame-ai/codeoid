@@ -214,7 +214,7 @@ import {
   removeForkWorktree,
 } from "./git-worktree.js";
 import { GIT_BIN, hardenedGit, safeGit } from "./git-env.js";
-import { connectionId, GitCredentials, probeConnection } from "./git-gateway/connect.js";
+import { connectionId, GitCredentials, ownerRewrite, probeConnection } from "./git-gateway/connect.js";
 import { type GatewayHost, GitGateway } from "./git-gateway/gateway.js";
 import { hostPathProblem } from "./git-gateway/hostpath.js";
 import { redactCredentials, remoteUrlProblem, shownGitUrl } from "./git-gateway/text.js";
@@ -4751,6 +4751,10 @@ mcpHub: this.#mcpHub,
       const session = this.#sessions.get(sessionId);
       return session ? session.decideGitPush(push, signal) : { refused: "this session is gone" };
     },
+    remoteHeads: (sessionId, url, heads) => {
+      const owner = this.#sessions.get(sessionId)?.createdBy;
+      if (owner) this.#store.pruneGitAgentBranches(owner, url, heads);
+    },
     report: (sessionId, e) => {
       const session = this.#sessions.get(sessionId);
       // A branch an agent made: one it may move again later (fast-forward only).
@@ -4780,7 +4784,11 @@ mcpHub: this.#mcpHub,
       if (!url) return fail(`There is no remote named ${remote} in ${msg.path}.`);
     }
     // What a connect from a repository would connect: the CLI shows it, and asks, first.
-    if (msg.action === "resolve") return { type: "response.ok", requestId: msg.id, data: { url: shownGitUrl(url), rawUrl: url, connected: !!this.#store.gitConnection(auth.sub, url) } };
+    // The URL git really uses there (the owner's own rewrite applied): what is shown, asked and connected.
+    if (msg.action === "resolve") {
+      const used = msg.url ? url : ownerRewrite(url);
+      return { type: "response.ok", requestId: msg.id, data: { url: shownGitUrl(used), rawUrl: used, ...(used !== url ? { writtenAs: shownGitUrl(url) } : {}), connected: !!this.#store.gitConnection(auth.sub, used) } };
+    }
     if (msg.action === "disconnect") {
       const removed = this.#store.removeGitConnection(auth.sub, url);
       this.#gitCredentials?.remove(connectionId(auth.sub, url));
@@ -11353,5 +11361,5 @@ export function resolveOnEndpoint(raw: string, models: ReadonlyArray<ModelInfo>,
 
 /** Tests only: a local bare repository as a connected remote (file://), never under a real daemon. */
 function testFileRemote(url: string): boolean {
-  return process.env.NODE_ENV === "test" && url.startsWith("file://");
+  return process.env.CODEOID_GIT_GATEWAY_TEST_FILE === "1" && url.startsWith("file://");
 }

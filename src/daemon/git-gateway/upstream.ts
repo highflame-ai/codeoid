@@ -196,6 +196,8 @@ export interface RemoteState {
   symrefs: ReadonlySet<string>;
   /** Whether it has any branch at all. */
   empty: boolean;
+  /** Its branches (names after `refs/heads/`), when it said. */
+  heads: ReadonlySet<string>;
 }
 
 /**
@@ -227,18 +229,25 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
     const symrefs = new Set<string>();
     let defaultBranch: string | null = null;
     let heads = 0;
+    const names = new Set<string>();
     if (h.code === 0) {
       for (const line of h.stdout.split("\n")) {
         const sym = /^ref: (refs\/heads\/\S+)\t(\S+)$/.exec(line);
         if (sym?.[1] && sym[2] === "HEAD") defaultBranch = sym[1].slice("refs/heads/".length);
         else if (sym?.[2]?.startsWith("refs/heads/")) symrefs.add(sym[2]);
-        else if (/^[0-9a-f]{40,64}\trefs\/heads\//.test(line)) heads++;
+        else {
+          const head = /^[0-9a-f]{40,64}\trefs\/heads\/(\S+)$/.exec(line);
+          if (head?.[1]) {
+            heads++;
+            names.add(head[1]);
+          }
+        }
       }
     }
     if (defaultBranch) await runGit(["symbolic-ref", "HEAD", `refs/heads/${defaultBranch}`], cache, env, 10_000, signal);
     // Branches, but no HEAD said (an unborn one: renamed or deleted): which branch would become the default isn't known.
     const defaultKnown = h.code === 0 && (defaultBranch !== null || heads === 0);
-    return { defaultBranch, defaultKnown, symrefs, empty: h.code === 0 && heads === 0 };
+    return { defaultBranch, defaultKnown, symrefs, empty: h.code === 0 && heads === 0, heads: names };
   });
 }
 
@@ -292,7 +301,8 @@ async function isRepo(cache: string, env: Record<string, string>): Promise<boole
 /** What the cache (just refreshed) has for `ref`: its id, or the zero id of `like`'s length when it has none. */
 export async function cacheRef(cache: string, ref: string, like: string): Promise<string> {
   const env = cacheEnv({ PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, cache);
-  const r = await runGit(["rev-parse", "--verify", "-q", "--end-of-options", `${ref}^{commit}`], cache, env, 10_000);
+  // That ref exactly (no DWIM: a tag named `refs/heads/x` isn't the branch x).
+  const r = await runGit(["show-ref", "--verify", "--hash", "--", ref], cache, env, 10_000);
   const oid = r.code === 0 ? r.stdout.trim() : "";
   return /^[0-9a-f]{40,64}$/.test(oid) ? oid : "0".repeat(like.length === 64 ? 64 : 40);
 }

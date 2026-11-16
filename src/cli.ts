@@ -1422,7 +1422,7 @@ sandboxGitCmd
       // The URL a repository's config names is shown, and confirmed, before anything is connected.
       const found = await client.sandboxGitResolve(resolve(dir ?? "."), o.remote);
       if (!found) return client.disconnect();
-      console.log(`This connects ${found.url}${found.connected ? " (connected already: connecting again refreshes it)" : ""} for agents in your sandboxed sessions.`);
+      console.log(`This connects ${found.url}${found.writtenAs ? ` (the repository says ${found.writtenAs}; your git config rewrites it to this)` : ""}${found.connected ? " (connected already: connecting again refreshes it)" : ""} for agents in your sandboxed sessions.`);
       if (!(await confirmOnTerminal("Connect it? [y/N] ", o.yes, "Not connected: pass --yes to connect without a terminal to confirm in, or name it with --url."))) return client.disconnect();
       url = found.rawUrl;
     }

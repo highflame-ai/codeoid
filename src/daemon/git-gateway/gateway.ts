@@ -49,6 +49,8 @@ export interface GatewayHost {
   grant(sessionId: string, service: GitService, url: string): Promise<GatewayGrant | { refused: string }>;
   /** The session's word on a checked push (its role, its mode, the owner's answer); `signal`: the agent's git is gone. */
   approve(sessionId: string, push: GatewayPush, signal: AbortSignal): Promise<{ ok: true } | { refused: string }>;
+  /** The remote's branches as a refresh found them (a branch agents made, gone from it, is no longer theirs). */
+  remoteHeads?(sessionId: string, url: string, heads: ReadonlySet<string>): void;
   /** What happened, for the session's audit and transcript. */
   report(sessionId: string, event: { kind: "fetch" | "push"; url: string; ok: boolean; detail: string; updates?: readonly RefUpdate[] }): void;
 }
@@ -242,6 +244,7 @@ export class GitGateway {
         return refreshCache(cache, upstream, grant.ssh, this.#upstreamTimeoutMs, gone.signal);
       });
       if (gone.signal.aborted) return;
+      if (!("error" in fresh) && fresh.defaultKnown) this.#host.remoteHeads?.(sessionId, url, fresh.heads);
       if ("error" in fresh) {
         this.#host.report(sessionId, { kind: service === "git-receive-pack" ? "push" : "fetch", url, ok: false, detail: fresh.error });
         return fail(fresh.error);
@@ -297,6 +300,9 @@ export class GitGateway {
       // What the client's git writes comes in frames (scripts.ts EXT_JS): a 0 length ends git's input.
       let buf = rest;
       let ended = false;
+      // A push's commands (pkt-lines, to the first flush) are read on the way: a ref name with a control character
+      // (a line feed would make two lines of the hook's input of one command) ends the request before git sees it.
+      const commands = service === "git-receive-pack" ? new CommandReader() : null;
       const take = (d: Buffer) => {
         if (ended) return;
         buf = buf.length ? Buffer.concat([buf, d]) : d;
@@ -313,7 +319,13 @@ export class GitGateway {
             return;
           }
           if (buf.length < 4 + n) return;
-          p.stdin.write(buf.subarray(4, 4 + n));
+          const chunk = buf.subarray(4, 4 + n);
+          if (commands && !commands.ok(chunk)) {
+            ended = true;
+            c.destroy();
+            return;
+          }
+          p.stdin.write(chunk);
           buf = buf.subarray(4 + n);
         }
       };
@@ -403,7 +415,9 @@ export class GitGateway {
       this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: false, detail: "the agent's git was gone before the push started, so nothing was pushed", updates });
       return verdict(false);
     }
-    const pushed = await pushUpstream(t.cache, t.grant.upstream, t.grant.ssh, updates, objects, this.#upstreamTimeoutMs, t.gone.signal);
+    // Approved and started: it finishes (bounded by its own limit), the agent's git there or not, so what the remote
+    // took is what is recorded.
+    const pushed = await pushUpstream(t.cache, t.grant.upstream, t.grant.ssh, updates, objects, this.#upstreamTimeoutMs);
     if (!pushed.ok) {
       say(pushed.error);
       this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: false, detail: pushed.error, updates });
@@ -412,6 +426,35 @@ export class GitGateway {
     say(`codeoid pushed ${updates.map((u) => u.ref.replace(/^refs\/heads\//, "")).join(", ")} to ${shownGitUrl(t.url)}`);
     this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: true, detail: `pushed to ${shownGitUrl(t.url)}`, updates });
     verdict(true);
+  }
+}
+
+/** Reads receive-pack's command pkt-lines as they stream by (to the first flush), and says whether they may go on. */
+export class CommandReader {
+  #buf: Buffer = Buffer.alloc(0);
+  #done = false;
+  ok(chunk: Buffer): boolean {
+    if (this.#done) return true;
+    this.#buf = this.#buf.length ? Buffer.concat([this.#buf, chunk]) : chunk;
+    while (this.#buf.length >= 4) {
+      const n = Number.parseInt(this.#buf.subarray(0, 4).toString("latin1"), 16);
+      if (Number.isNaN(n)) return false;
+      if (n === 0) {
+        this.#done = true;
+        this.#buf = Buffer.alloc(0);
+        return true;
+      }
+      if (n < 4 || n > 65520) return false;
+      if (this.#buf.length < n) return true;
+      // One trailing line feed is pkt-line's own; any other control character in the ref is refused.
+      const line = this.#buf.subarray(4, n).toString("latin1").replace(/\n$/, "");
+      this.#buf = this.#buf.subarray(n);
+      if (line.startsWith("shallow ")) continue;
+      // A signed push or anything but `old new ref[\0caps]`: not taken.
+      const m = /^([0-9a-f]{40,64}) ([0-9a-f]{40,64}) ([^\0]*)(\0.*)?$/s.exec(line);
+      if (!m?.[3] || /[\x00-\x1f\x7f]/.test(m[3])) return false;
+    }
+    return true;
   }
 }
 

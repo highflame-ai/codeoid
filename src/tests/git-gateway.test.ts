@@ -321,6 +321,27 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(shownGitUrl("https://ghp_FAKE@github.com/o/r.git")).not.toContain("ghp_FAKE");
   });
 
+  test("round 4 (gateway): what the card shows is what git reaches; a command with a line feed in its ref is refused; routes and spaces", async () => {
+    const { remoteUrlProblem } = await import("../daemon/git-gateway/text.js");
+    expect(remoteUrlProblem("https://github.com/myorg/sandbox-play/../../myorg/infra.git")).toContain("path segment");
+    expect(remoteUrlProblem("git@github.com:myorg/./x.git")).toContain("path segment");
+    expect(remoteUrlProblem("https://github.com/myorg/%2e%2e/infra.git")).toContain("%");
+    expect(remoteUrlProblem(`https://github.com/${"a/".repeat(160)}x.git`)).toContain("longer");
+    expect(remoteUrlProblem("git@github.com:myorg/app.git")).toBeNull();
+    const { CommandReader } = await import("../daemon/git-gateway/gateway.js");
+    const pkt = (s: string) => `${(s.length + 4).toString(16).padStart(4, "0")}${s}`;
+    const z = "0".repeat(40);
+    const a = "a".repeat(40);
+    const good = new CommandReader();
+    expect(good.ok(Buffer.from(pkt(`${z} ${a} refs/heads/x\0report-status\n`) + pkt(`${z} ${a} refs/heads/y\n`) + "0000"))).toBe(true);
+    const split = new CommandReader();
+    expect(split.ok(Buffer.from(pkt(`${z} ${a} refs/heads/a\n${z} ${a} refs/heads/b\0report-status\n`)))).toBe(false);
+    expect(new CommandReader().ok(Buffer.from(pkt("push-cert\0report-status\n")))).toBe(false);
+    const { gitGatewayEnv } = await import("../daemon/sandbox/policy.js");
+    const env = gitGatewayEnv({ socket: "/s", ext: "/home/Jane Doe/gw/codeoid-git-ext", binDir: "/b", runtime: "/r", urls: ["git@github.com:o/r.git"], routes: [["https://github.com/o/r.git", "git@github.com:o/r.git"]] });
+    expect(env.GIT_CONFIG_PARAMETERS).toContain("'url.ext::/home/Jane% Doe/gw/codeoid-git-ext %S git@github.com:o/r.git.insteadOf=https://github.com/o/r.git'");
+  });
+
   test("the policy alone: only plain branch updates that fast-forward", async () => {
     const z = "0".repeat(40);
     const a = "a".repeat(40);

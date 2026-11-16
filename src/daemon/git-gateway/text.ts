@@ -15,7 +15,7 @@ export function shownGitUrl(url: string): string {
     .replace(/^([a-z][a-z0-9+.-]*:\/\/[^/@\s]*?):[^/@\s]*@/i, "$1:…@")
     .replace(/^(https?:\/\/)[^/@\s]*@/i, "$1…@")
     .replace(/[?#].*$/, "?…");
-  return shownName(masked.length > 300 ? `${masked.slice(0, 300)}…` : masked);
+  return shownName(masked);
 }
 
 /** `ssh://…`, `git@host:path` (scp-like) or `https://…`: the protocols the push may use. */
@@ -25,6 +25,10 @@ export function remoteUrlProblem(url: string): string | null {
   // A token as an https user name is as much a credential (a user name goes with `--token user:token`).
   if (/^https?:\/\/[^/]*@/i.test(url)) return "it holds a user name (a token, often): connect the URL without it, and give it with --token user:token";
   if (/[?#]/.test(url)) return "it has a query or a fragment";
+  // What the card shows is what git reaches: no dot segment (git's transports resolve them), no %-escape, whole.
+  if (url.length > 300) return "it is longer than codeoid shows whole (300 characters)";
+  if (url.includes("%")) return "it holds a %-escape";
+  if (/(^|[/:])\.\.?(\/|$)/.test(url.replace(/^[a-z][a-z0-9+.-]*:\/\/[^/]*/i, ""))) return "it holds a . or .. path segment";
   if (url.includes("=")) return "it holds `=`, which git's config for the sandbox can't carry";
   if (/[\x00-\x20\x7f]/.test(url)) return "it holds spaces or control characters";
   // Shown to the owner as is: nothing invisible or reordering in it.

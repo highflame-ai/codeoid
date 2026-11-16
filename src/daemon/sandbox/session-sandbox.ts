@@ -22,6 +22,7 @@ import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
+import { ownerRewrite } from "../git-gateway/connect.js";
 import { buildSandboxSpec, type GitGatewaySpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
 import {
   addedDirProblem,
@@ -1120,7 +1121,9 @@ export class SessionSandbox {
   #gatewayFor(workspace: string, network: NetworkPolicy): GitGatewaySpec | undefined {
     if (!this.#gitGateway || this.#providerId === "docker") return undefined;
     // Codex's own sandbox refuses a unix socket's connect with its network off: there the gateway can't be reached.
-    if (this.#resolvedFor === "codex" && network.mode !== "on") return undefined;
+    // Judged by the session's network (its commands'), not a backend process's (Codex's app-server has it on).
+    const sessionNet = this.#info?.networkRequested ?? this.#info?.network ?? network.mode;
+    if (this.#resolvedFor === "codex" && sessionNet !== "on") return undefined;
     const g = this.#gitGateway();
     if (!g) return undefined;
     const off = network.mode !== "on";
@@ -1128,9 +1131,15 @@ export class SessionSandbox {
     const kindOf = (u: string) => (/^https:\/\//i.test(u) ? "https" : /^ssh:\/\//i.test(u) || /^(?:[A-Za-z0-9._~-]+@)?[A-Za-z0-9.-]+:(?!\/\/)\S+$/.test(u) ? "ssh" : null);
     // Only remotes the gateway can reach for it (local paths, file:// and git:// are left to git, as before).
     // (Tests only: a local bare repository as the workspace's remote, as the gateway's file:// allowance.)
-    const testFile = (u: string) => process.env.NODE_ENV === "test" && u.startsWith("file://");
-    const urls = [...g.urls, ...workspaceRemoteUrls(workspace).filter((u) => kindOf(u) === "ssh" || (off && kindOf(u) === "https") || testFile(u))];
-    return { ...g, urls: [...new Set(urls)] };
+    const testFile = (u: string) => process.env.CODEOID_GIT_GATEWAY_TEST_FILE === "1" && u.startsWith("file://");
+    const connected = new Set(g.urls);
+    // Each remote as written, and what the owner's own rewrite makes of it: the gateway is asked for that.
+    const routes: Array<readonly [string, string]> = g.urls.map((u) => [u, u] as const);
+    for (const w of workspaceRemoteUrls(workspace)) {
+      const to = testFile(w) ? w : ownerRewrite(w);
+      if (connected.has(to) || kindOf(to) === "ssh" || (off && kindOf(to) === "https") || testFile(to)) routes.push([w, to]);
+    }
+    return { ...g, urls: [...new Set(routes.map(([, to]) => to))], routes };
   }
 
   /** How many handles are open (tests). */

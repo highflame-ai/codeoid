@@ -343,7 +343,9 @@ export class WorkstreamService {
    */
   /** The workstream a remote URL belongs to, by the workstreams' remote rules (none: no rule matches it). */
   remoteWorkstream(url: string): string | undefined {
-    const origin = normalizeRemote(url);
+    // As a folder's remotes are read: the owner's ssh Host aliases applied (a second account's `github-client`).
+    const aliases = (this.#reader as { sshAliases?: () => Map<string, string> }).sshAliases?.() ?? new Map<string, string>();
+    const origin = normalizeRemote(url, aliases);
     if (!origin || !this.#matchables.some((m) => m.remotes.length > 0)) return undefined;
     return matchFolder(this.#matchables, { paths: [], origin }).best?.workstream;
   }
