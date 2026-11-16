@@ -164,7 +164,7 @@ import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpT
 import { isOAuthServer, type McpServerSpec, OAUTH_UNSUPPORTED_BACKENDS } from "./mcp/types.js";
 import { atomicWrite, type CodeoidConfig, DEFAULT_PROVIDER_ENV, dotEnvShadowed, getConfigDir, loadConfig, mutateConfigFile, validateConfigObject } from "../config.js";
 import type { CompressionRegistry } from "./compress/index.js";
-import { endpointNameOf, endpointProviderId, FLEET_TOOL_PREFIX, ORCHESTRATOR_ROLE, type ProviderInfo } from "../protocol/types.js";
+import { endpointNameOf, endpointProviderId, FLEET_TOOL_PREFIX, ORCHESTRATOR_ROLE, type BuiltinServerInfo, type ProviderInfo } from "../protocol/types.js";
 import type {
   AuthContext,
   ClaudeConfigMcpServer,
@@ -3384,7 +3384,36 @@ mcpHub: this.#mcpHub,
   }
 
   #endpointsResult(requestId: string): DaemonMessage {
-    return { type: "endpoints.result", requestId, endpoints: this.#endpoints.list() };
+    return { type: "endpoints.result", requestId, endpoints: this.#endpoints.list(), builtins: this.#builtinServers() };
+  }
+
+  /**
+   * The built-in backends of the same kind as endpoints, listed with them so one list holds every
+   * OpenAI-compatible server: OpenAI's own API and the configured llama.cpp server. Their ids,
+   * settings and environment are unchanged; this only says how each is set up.
+   */
+  #builtinServers(): BuiltinServerInfo[] {
+    const openaiUp = this.#providers.has("openai");
+    const llama = this.#config?.providers?.llamacpp;
+    const llamaUp = this.#providers.has("llamacpp");
+    return [
+      {
+        id: "openai",
+        displayName: "OpenAI",
+        available: openaiUp,
+        baseUrl: process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
+        detail: openaiUp
+          ? "OpenAI's API, with OPENAI_API_KEY or an OpenAI account"
+          : "needs an OpenAI API key (below), or an OpenAI account: codeoid account add-key <name> --backend openai",
+      },
+      {
+        id: "llamacpp",
+        displayName: "llama.cpp (local)",
+        available: llamaUp,
+        baseUrl: llama?.baseUrl ?? "http://127.0.0.1:8080/v1",
+        detail: llamaUp ? "a local llama-server (providers.llamacpp)" : "off: turn it on below (providers.llamacpp.enabled), then restart the daemon",
+      },
+    ];
   }
 
   #endpointsError(requestId: string, err: unknown): DaemonMessage {

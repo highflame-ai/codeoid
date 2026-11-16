@@ -44,6 +44,84 @@ export function endpointNameOf(providerId: string): string | null {
  */
 export type EndpointFlavor = "openai" | "llamacpp";
 
+/**
+ * A starting point for a new endpoint: the server's base URL and request
+ * shape, and whether it takes a key. Shared by the web UI's "Add" and the
+ * CLI's `--template`; the endpoint itself stores only what was saved.
+ */
+export interface EndpointTemplate {
+  id: string;
+  /** Label in pickers ("OpenRouter"). */
+  name: string;
+  /** Empty for `custom`: the user gives one. */
+  baseUrl: string;
+  flavor: EndpointFlavor;
+  /** Whether the server needs an API key. */
+  key: "required" | "optional" | "none";
+  /** Where to get a key. */
+  keyUrl?: string;
+  maxTokensField?: "max_tokens" | "max_completion_tokens";
+  /** A suggested endpoint name. */
+  suggestedName: string;
+  /** One line shown beside the template. */
+  note?: string;
+}
+
+/** The templates "Add endpoint" offers, hosted first, then local servers, then custom. */
+export const ENDPOINT_TEMPLATES: readonly EndpointTemplate[] = [
+  {
+    id: "openai",
+    name: "OpenAI",
+    baseUrl: "https://api.openai.com/v1",
+    flavor: "openai",
+    key: "required",
+    keyUrl: "https://platform.openai.com/api-keys",
+    maxTokensField: "max_completion_tokens",
+    suggestedName: "openai-api",
+    note: "Another OpenAI key or project beside the built-in OpenAI backend.",
+  },
+  { id: "openrouter", name: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", flavor: "openai", key: "required", keyUrl: "https://openrouter.ai/keys", suggestedName: "openrouter" },
+  { id: "groq", name: "Groq", baseUrl: "https://api.groq.com/openai/v1", flavor: "openai", key: "required", keyUrl: "https://console.groq.com/keys", suggestedName: "groq" },
+  { id: "together", name: "Together AI", baseUrl: "https://api.together.xyz/v1", flavor: "openai", key: "required", keyUrl: "https://api.together.ai/settings/api-keys", suggestedName: "together" },
+  { id: "deepseek", name: "DeepSeek", baseUrl: "https://api.deepseek.com/v1", flavor: "openai", key: "required", keyUrl: "https://platform.deepseek.com/api_keys", suggestedName: "deepseek" },
+  { id: "fireworks", name: "Fireworks AI", baseUrl: "https://api.fireworks.ai/inference/v1", flavor: "openai", key: "required", keyUrl: "https://fireworks.ai/account/api-keys", suggestedName: "fireworks" },
+  { id: "mistral", name: "Mistral", baseUrl: "https://api.mistral.ai/v1", flavor: "openai", key: "required", keyUrl: "https://console.mistral.ai/api-keys", suggestedName: "mistral" },
+  { id: "ollama", name: "Ollama", baseUrl: "http://localhost:11434/v1", flavor: "openai", key: "none", suggestedName: "ollama", note: "Run `ollama serve`; models are the ones you pulled." },
+  { id: "lmstudio", name: "LM Studio", baseUrl: "http://localhost:1234/v1", flavor: "openai", key: "none", suggestedName: "lmstudio", note: "Start the server in LM Studio's Developer tab." },
+  {
+    id: "llamacpp",
+    name: "llama.cpp server",
+    baseUrl: "http://127.0.0.1:8080/v1",
+    flavor: "llamacpp",
+    key: "optional",
+    suggestedName: "llama",
+    note: "A llama-server: context window read from it, strict tool schemas. See docs/local-models.md.",
+  },
+  { id: "vllm", name: "vLLM", baseUrl: "http://localhost:8000/v1", flavor: "openai", key: "optional", suggestedName: "vllm", note: "`vllm serve <model>`; a key only if started with --api-key." },
+  { id: "custom", name: "Custom", baseUrl: "", flavor: "openai", key: "optional", suggestedName: "", note: "Any server that speaks the OpenAI Chat Completions API." },
+];
+
+/** The template named `id`, if any. */
+export function endpointTemplate(id: string): EndpointTemplate | undefined {
+  return ENDPOINT_TEMPLATES.find((t) => t.id === id);
+}
+
+/**
+ * A built-in backend of the same kind, shown in the same list as the
+ * endpoints: OpenAI's own API (`openai`) and the configured llama.cpp server
+ * (`llamacpp`). Configured in Settings (their own fields) or the environment,
+ * not stored as endpoints; their ids are unchanged.
+ */
+export interface BuiltinServerInfo {
+  id: "openai" | "llamacpp";
+  displayName: string;
+  /** Registered as a backend now (a key or an account; enabled). */
+  available: boolean;
+  baseUrl: string;
+  /** How it is set up, or what it needs. */
+  detail: string;
+}
+
 /** One model an endpoint serves, as configured. */
 export interface EndpointModel {
   /** The id sent as `model` on every request. */
@@ -208,6 +286,8 @@ export interface EndpointsResultMsg {
   type: "endpoints.result";
   requestId: string;
   endpoints: EndpointInfo[];
+  /** The built-in backends of the same kind, listed with them (absent from older daemons). */
+  builtins?: BuiltinServerInfo[];
 }
 
 export interface EndpointsTestResultMsg {

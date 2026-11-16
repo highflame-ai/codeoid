@@ -8,7 +8,7 @@
 
 import { type Component, For, Index, Show, createSignal, createUniqueId } from "solid-js";
 
-import type { EndpointFlavor, EndpointInfo, EndpointModel, EndpointsTestResultMsg } from "../protocol/types";
+import { ENDPOINT_TEMPLATES, type EndpointFlavor, type EndpointInfo, type EndpointModel, type EndpointsTestResultMsg, type EndpointTemplate } from "../protocol/types";
 import { endpointNameProblem, endpointsState, saveEndpoint, testEndpoint } from "../state/endpoints";
 import { HeadersEditor } from "./HeadersEditor";
 
@@ -87,7 +87,23 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [test, setTest] = createSignal<EndpointsTestResultMsg | "running" | undefined>();
+  const [template, setTemplate] = createSignal<EndpointTemplate | undefined>();
   const uid = createUniqueId();
+
+  /** Fill the form from a template: what the server is and how it is spoken to. Fields the user typed are kept. */
+  const applyTemplate = (t: EndpointTemplate) => {
+    const was = template();
+    setTemplate(t);
+    if (!name().trim() || name() === was?.suggestedName) setName(t.suggestedName);
+    if (!displayName().trim() || displayName() === was?.name) setDisplayName(t.id === "custom" ? "" : t.name);
+    setBaseUrl(t.baseUrl);
+    setFlavor(t.flavor);
+    setStrict(undefined);
+    setMcpMode(undefined);
+    setMaxTokensField(t.maxTokensField ?? "max_tokens");
+    setKeyMode(t.key === "required" ? "set" : "none");
+    setTest(undefined);
+  };
 
   const storedHeaders = !!ex?.headerNames.length;
   /** The edited base URL points at another origin than the stored one (an unparsable URL counts as unchanged). */
@@ -113,7 +129,7 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
     }
     if (!baseUrl().trim()) return "a base URL is required";
     if (effKeyMode() === "set" && !apiKey().trim()) {
-      return originMoved() ? "enter a key for the new server, or remove it" : "enter the key, or choose to keep / remove it";
+      return originMoved() ? "enter a key for the new server, or remove it" : ex ? "enter the key, or choose to keep / remove it" : "enter the key, or choose no key";
     }
     if (Number.isNaN(tokensOf(contextWindow()) ?? 0)) return "context window: a number of tokens, like 32768 or 32k";
     for (const m of models()) {
@@ -216,6 +232,40 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
     <form class="space-y-4 rounded border border-border bg-bg/40 p-4" onSubmit={save}>
       <div class="text-[13px] font-medium text-fg">{ex ? `Edit ${ex.displayName}` : "New endpoint"}</div>
 
+      <Show when={!ex}>
+        <div class="space-y-1">
+          <span class={label}>Start from</span>
+          <div class="flex flex-wrap gap-1.5">
+            <For each={ENDPOINT_TEMPLATES}>
+              {(t) => (
+                <button
+                  type="button"
+                  class={`${button} ${template()?.id === t.id ? "border-accent text-fg" : ""}`}
+                  aria-pressed={template()?.id === t.id}
+                  onClick={() => applyTemplate(t)}
+                >
+                  {t.name}
+                </button>
+              )}
+            </For>
+          </div>
+          <Show when={template()} keyed>
+            {(t) => (
+              <p class="text-[11px] text-fg-faint">
+                {t.note ?? ""}
+                <Show when={t.key === "required"}>
+                  {" "}Needs an API key
+                  <Show when={t.keyUrl}>
+                    {" "}(<a class="text-accent hover:underline" href={t.keyUrl} target="_blank" rel="noreferrer noopener">get one</a>)
+                  </Show>
+                  .
+                </Show>
+              </p>
+            )}
+          </Show>
+        </div>
+      </Show>
+
       <div class="grid grid-cols-2 gap-3">
         <label class="block space-y-1">
           <span class={label}>Name (backend oai:{name() || "…"})</span>
@@ -317,7 +367,7 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
       <div class="space-y-1">
         <div class="flex items-center justify-between">
           <span class={label} title="Pickers offer these first, with their settings (label, context window, output cap), then every other chat model the server lists. One the server doesn't list is offered marked.">
-            Models to offer first (optional — the server's other models are offered too)
+            Models to offer first (optional)
           </span>
           <div class="flex gap-2">
             <button type="button" class={button} onClick={() => setModels([...models(), { id: "", name: "", contextWindow: "", maxTokens: "" }])}>

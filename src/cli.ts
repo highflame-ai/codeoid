@@ -50,12 +50,14 @@ import {
   type CollaborationConfig,
   type RoutineScheduleWire,
   type RoutineSpecWire,
+  ENDPOINT_TEMPLATES,
+  endpointTemplate,
   routineFirePath,
 } from "./protocol/types.js";
 import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
 import { bedrockFromSettings, formatAccounts, formatClaudeAccounts, parseHeaderFlags, parseSettingFlags } from "./terminal/claude-accounts.js";
-import { formatEndpoints, importPiModels, parseModelFlags, parseTokens } from "./terminal/endpoints.js";
+import { formatEndpoints, formatTemplates, importPiModels, parseModelFlags, parseTokens } from "./terminal/endpoints.js";
 import type { ClientMessage, DaemonMessage, EffortLevel, SessionInfo, SessionSandboxSetting } from "./protocol/types.js";
 import { sanitizeTerminalOutput } from "./tui/ansi/codes.js";
 import { parseEffort } from "@highflame/codeoid-core";
@@ -855,10 +857,10 @@ account
 
 const endpoint = program
   .command("endpoint")
-  .description("OpenAI-compatible endpoints (llama.cpp, vLLM, Ollama, LM Studio, OpenRouter, gateways): each is a backend, oai:<name>");
+  .description("OpenAI-compatible model servers (OpenRouter, Groq, Ollama, LM Studio, llama.cpp, vLLM, gateways): each is a backend, oai:<name>; `ls` lists the built-in openai and llamacpp backends with them");
 
 /** Run one endpoint request against the daemon; print the list it answers with. */
-async function endpointRequest(build: (id: string) => ClientMessage): Promise<DaemonMessage | undefined> {
+async function endpointRequest(build: (id: string) => ClientMessage, opts?: { builtins?: boolean }): Promise<DaemonMessage | undefined> {
   const config = loadConfig();
   const client = new TerminalClient(config);
   await client.connect();
@@ -869,7 +871,7 @@ async function endpointRequest(build: (id: string) => ClientMessage): Promise<Da
     process.exitCode = 1;
     return undefined;
   }
-  if (resp.type === "endpoints.result") console.log(formatEndpoints(resp.endpoints));
+  if (resp.type === "endpoints.result") console.log(formatEndpoints(resp.endpoints, opts?.builtins ? (resp.builtins ?? []) : []));
   return resp;
 }
 
@@ -897,10 +899,17 @@ const TRUST_HEAD_HELP = (when: string) =>
   `${when}you vouch for each watched branch's head as it is now — it and everything beneath it are trusted, so later merges by trusted logins are judged from it (recorded in the watch's history and the audit log, with who put the head there). <branch>=<sha> (repeatable, the commit's full id: a prefix is refused) vouches for that branch only while its head is still that commit, and for nothing if it moved — the refusal names the full id the head is now`;
 
 endpoint
+  .command("templates")
+  .description("The servers --template knows: base URL, key, notes")
+  .action(() => {
+    console.log(formatTemplates(ENDPOINT_TEMPLATES));
+  });
+
+endpoint
   .command("ls")
   .description("List endpoints (never a key or header value)")
   .action(async () => {
-    await endpointRequest((id) => ({ type: "endpoints.list", id }));
+    await endpointRequest((id) => ({ type: "endpoints.list", id }), { builtins: true });
   });
 
 endpoint
@@ -909,7 +918,8 @@ endpoint
   .description(
     "Add an endpoint, or change one. Fields you leave out keep their stored values — the key and headers only while the base URL stays on the same server (scheme, host, port); moving it elsewhere needs --key/--clear-key and --header/--clear-headers. Key and header values are asked for without echo, never taken from the command line",
   )
-  .requiredOption("--base-url <url>", "the OpenAI-compatible base URL, usually ending in /v1 (https, or http for localhost / a private network)")
+  .option("--template <id>", "start from a known server: openai, openrouter, groq, together, deepseek, fireworks, mistral, ollama, lmstudio, llamacpp, vllm (see: codeoid endpoint templates)")
+  .option("--base-url <url>", "the OpenAI-compatible base URL, usually ending in /v1 (https, or http for localhost / a private network); a --template gives one")
   .option("--display-name <label>", "label in pickers")
   .option("--flavor <flavor>", "openai | llamacpp (llama-server: live context window from /props, strict tool schemas)")
   .option("--model <id[:context[:maxTokens]]>", "a model to offer first, with its settings, repeatable (e.g. qwen3-coder:128k): a context window and output cap by id. Pickers also offer every other chat model the server lists", collect, [] as string[])
@@ -928,7 +938,8 @@ endpoint
     async (
       name: string,
       o: {
-        baseUrl: string;
+        template?: string;
+        baseUrl?: string;
         displayName?: string;
         flavor?: string;
         model: string[];
@@ -945,6 +956,12 @@ endpoint
       },
     ) => {
       try {
+        const template = o.template === undefined ? undefined : endpointTemplate(o.template);
+        if (o.template !== undefined && !template) {
+          throw new Error(`no template "${o.template}": ${ENDPOINT_TEMPLATES.map((t) => t.id).join(", ")}`);
+        }
+        const baseUrl = o.baseUrl ?? (template?.baseUrl || undefined);
+        if (!baseUrl) throw new Error(template ? `the ${template.name} template needs --base-url` : "give --base-url, or --template");
         if (o.key && o.clearKey) throw new Error("--key and --clear-key don't go together");
         if (o.header?.length && o.clearHeaders) throw new Error("--header and --clear-headers don't go together");
         if (o.flavor !== undefined && o.flavor !== "openai" && o.flavor !== "llamacpp") throw new Error("--flavor is openai or llamacpp");
@@ -966,9 +983,9 @@ endpoint
           type: "endpoints.set",
           id,
           name,
-          baseUrl: o.baseUrl,
-          ...(o.displayName !== undefined ? { displayName: o.displayName } : {}),
-          ...(o.flavor ? { flavor: o.flavor as "openai" | "llamacpp" } : {}),
+          baseUrl,
+          ...(o.displayName !== undefined ? { displayName: o.displayName } : template && template.id !== "custom" ? { displayName: template.name } : {}),
+          ...(o.flavor ? { flavor: o.flavor as "openai" | "llamacpp" } : template ? { flavor: template.flavor } : {}),
           ...(apiKey !== undefined ? { apiKey } : {}),
           ...(o.header?.length ? { headers } : o.clearHeaders ? { headers: {} } : {}),
           ...(models.length ? { models } : {}),
@@ -977,9 +994,18 @@ endpoint
           ...(mcpServers !== undefined ? { mcpServers } : {}),
           ...(o.streamUsage === false ? { streamUsage: false } : {}),
           ...(o.strictTools !== undefined ? { strictToolSchemas: o.strictTools } : {}),
-          ...(o.maxTokensField ? { maxTokensField: o.maxTokensField as "max_tokens" | "max_completion_tokens" } : {}),
+          ...(o.maxTokensField
+            ? { maxTokensField: o.maxTokensField as "max_tokens" | "max_completion_tokens" }
+            : template?.maxTokensField
+              ? { maxTokensField: template.maxTokensField }
+              : {}),
         }));
-        if (!process.exitCode) console.log(`Use it with: codeoid new <session> <dir> --provider oai:${name}`);
+        if (!process.exitCode) {
+          if (template?.key === "required" && !o.key) {
+            console.log(`${template.name} needs an API key: codeoid endpoint set ${name} --key${template.keyUrl ? `  (get one at ${template.keyUrl})` : ""}`);
+          }
+          console.log(`Use it with: codeoid new <session> <dir> --provider oai:${name}`);
+        }
       } catch (err) {
         console.error(`Error: ${(err as Error).message}`);
         process.exitCode = 1;

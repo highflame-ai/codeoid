@@ -51,11 +51,11 @@ export const EndpointsPanel: Component = () => {
   return (
     <div class="space-y-4">
       <div>
-        <h3 class="text-[15px] font-semibold text-fg">OpenAI-compatible endpoints</h3>
+        <h3 class="text-[13px] font-semibold text-fg">Endpoints</h3>
         <p class="mt-1 text-[12px] text-fg-muted">
-          Local models (llama.cpp, vLLM, Ollama, LM Studio) and hosted ones (OpenRouter, a company gateway). Each appears as its own
-          backend — pick it when creating a session or switch a session to it. Changes apply without a restart; running sessions pick
-          them up on their next turn.
+          Any other server: hosted (OpenRouter, Groq, a company gateway) or local (Ollama, LM Studio, llama.cpp, vLLM). Each is its own
+          backend, <span class="font-mono">oai:&lt;name&gt;</span> — pick it when creating a session or switch a session to it. Changes
+          apply without a restart; running sessions pick them up on their next turn.
         </p>
       </div>
 

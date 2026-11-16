@@ -37,10 +37,12 @@ import type {
   SettingField,
   SettingPatch,
   SettingState,
+  SettingsTab,
   SettingValue,
 } from "../protocol/types";
 import { AccountsPanel, focusAccountsBackend } from "./AccountsPanel";
 import { EndpointsPanel } from "./EndpointsPanel";
+import { endpointsState } from "../state/endpoints";
 import { WorkstreamsPanel } from "./WorkstreamsPanel";
 import { CredentialsPanel } from "./CredentialsPanel";
 
@@ -70,9 +72,14 @@ const SYNTHETIC_TABS = [
   { id: "accounts", icon: "⚿", title: "Accounts" },
   { id: "workstreams", icon: "◈", title: "Workstreams" },
   { id: "credentials", icon: "⚷", title: "Credentials" },
-  { id: "endpoints", icon: "⇄", title: "OpenAI endpoints" },
+  { id: "endpoints", icon: "⇄", title: "Model servers" },
 ] as const;
 const isSyntheticTab = (id: string) => SYNTHETIC_TABS.some((t) => t.id === id);
+/**
+ * Manifest tabs shown inside "Model servers" rather than in the rail: the
+ * built-in backends of the same kind as the endpoints listed there.
+ */
+const BUILTIN_SERVER_TABS = ["openai", "llamacpp"];
 const [showAdvanced, setShowAdvanced] = createSignal(false);
 
 // Staged edits, keyed by field.key. A present key is a pending change; a `null`
@@ -121,7 +128,8 @@ const SettingsDrawer: Component = () => {
     const m = manifest();
     if (!m) return undefined;
     const id = activeTab();
-    return m.tabs.find((t) => t.id === id) ?? m.tabs[0];
+    const rail = m.tabs.filter((t) => !BUILTIN_SERVER_TABS.includes(t.id));
+    return rail.find((t) => t.id === id) ?? rail[0];
   });
 
   const dirtyCount = () => Object.keys(dirty).length;
@@ -172,7 +180,7 @@ const SettingsDrawer: Component = () => {
           <div class="flex min-h-0 flex-1">
             {/* Left tab rail */}
             <nav class="w-52 shrink-0 overflow-y-auto border-r border-border bg-bg/30 py-2">
-              <For each={manifest()?.tabs ?? []}>
+              <For each={(manifest()?.tabs ?? []).filter((t) => !BUILTIN_SERVER_TABS.includes(t.id))}>
                 {(t) => {
                   const active = () => (activeTab() || manifest()?.tabs[0]?.id) === t.id;
                   return (
@@ -248,6 +256,7 @@ const SettingsDrawer: Component = () => {
                 <CredentialsPanel />
               </Show>
               <Show when={activeTab() === "endpoints"}>
+                <BuiltinServers tabs={(manifest()?.tabs ?? []).filter((t) => BUILTIN_SERVER_TABS.includes(t.id))} />
                 <EndpointsPanel />
               </Show>
               <Show when={activeTab() !== "mcp" && !isSyntheticTab(activeTab()) && tab()} keyed>
@@ -345,6 +354,60 @@ const SettingsDrawer: Component = () => {
           </footer>
         </aside>
       </div>
+    </Show>
+  );
+};
+
+// ── Built-in model servers ───────────────────────────────────────────────────
+
+/**
+ * OpenAI's own API and the configured llama.cpp server, at the head of "Model
+ * servers": the same kind of backend as the endpoints below, set up through
+ * their own settings fields (saved with the drawer's Save bar). Their backend
+ * ids, `openai` and `llamacpp`, are unchanged.
+ */
+const BuiltinServers: Component<{ tabs: SettingsTab[] }> = (props) => {
+  const status = (id: string) => endpointsState().builtins.find((b) => b.id === id);
+  return (
+    <Show when={props.tabs.length > 0}>
+      <section class="mb-6">
+        <h3 class="text-[15px] font-semibold text-fg">Model servers</h3>
+        <p class="mt-0.5 mb-3 text-[12px] text-fg-muted">
+          Every OpenAI-compatible server codeoid can run sessions on. The two built in are set up here; add any other below, from a template.
+        </p>
+        <div class="space-y-3">
+          <For each={props.tabs}>
+            {(t) => (
+              <div class="rounded border border-border">
+                <div class="space-y-0.5 border-b border-border/60 px-3 py-2">
+                  <div class="flex items-center gap-2">
+                    <span class="text-sm text-fg">{t.title}</span>
+                    <span class="font-mono text-[11px] text-fg-faint">{t.id}</span>
+                    <span class="whitespace-nowrap rounded border border-border px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-fg-faint">built in</span>
+                    <Show when={status(t.id)} keyed>
+                      {(b) => (
+                        <span class={`ml-auto whitespace-nowrap text-[11px] ${b.available ? "text-success" : "text-fg-faint"}`}>
+                          {b.available ? "● available" : "○ not set up"}
+                        </span>
+                      )}
+                    </Show>
+                  </div>
+                  <Show when={status(t.id)} keyed>
+                    {(b) => (
+                      <div class="font-mono text-[11px] text-fg-faint">
+                        {b.baseUrl} · {b.detail}
+                      </div>
+                    )}
+                  </Show>
+                </div>
+                <div class="flex flex-col divide-y divide-border/60">
+                  <For each={t.groups.flatMap((g) => g.fields)}>{(f) => <FieldRow field={f} />}</For>
+                </div>
+              </div>
+            )}
+          </For>
+        </div>
+      </section>
     </Show>
   );
 };

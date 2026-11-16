@@ -47,6 +47,34 @@ function fillNew(name: string, url = "http://localhost:8080/v1") {
 }
 
 describe("EndpointEditor", () => {
+  it("a template fills the server and its request shape; typed fields are kept, and a key is asked for where one is needed", async () => {
+    clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [] });
+    const done = vi.fn();
+    const { getByText, getByPlaceholderText, getByDisplayValue } = render(() => <EndpointEditor onDone={done} />);
+    fireEvent.click(getByText("OpenRouter"));
+    expect((getByPlaceholderText("gpu-box") as HTMLInputElement).value).toBe("openrouter");
+    expect(getByDisplayValue("https://openrouter.ai/api/v1")).toBeTruthy();
+    expect(getByText(/Needs an API key/)).toBeTruthy();
+    // A key is required: saving without one is refused in the form.
+    expect((getByText("Add endpoint") as HTMLButtonElement).disabled).toBe(true);
+    // Switching template: the suggested name follows, a typed one wouldn't.
+    fireEvent.click(getByText("llama.cpp server"));
+    expect((getByPlaceholderText("gpu-box") as HTMLInputElement).value).toBe("llama");
+    fireEvent.input(getByPlaceholderText("gpu-box"), { target: { value: "my-llama" } });
+    fireEvent.click(getByText("Add endpoint"));
+    await waitFor(() => expect(done).toHaveBeenCalled());
+    expect(sent()[0]).toMatchObject({
+      type: "endpoints.set",
+      name: "my-llama",
+      displayName: "llama.cpp server",
+      baseUrl: "http://127.0.0.1:8080/v1",
+      flavor: "llamacpp",
+      strictToolSchemas: true,
+      mcpServers: [],
+    });
+  });
+
+
   it("editing keeps the stored key and headers unless replaced — they are never sent back", async () => {
     clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [STORED] });
     const done = vi.fn();

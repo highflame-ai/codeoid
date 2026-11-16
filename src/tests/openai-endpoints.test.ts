@@ -19,7 +19,8 @@ import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
 import type { AuthContext, DaemonMessage, SessionInfo } from "../protocol/types.js";
-import { importPiModels, parseModelFlags, parseTokens, resolvePiValue } from "../terminal/endpoints.js";
+import { formatEndpoints, formatTemplates, importPiModels, parseModelFlags, parseTokens, resolvePiValue } from "../terminal/endpoints.js";
+import { ENDPOINT_TEMPLATES, endpointTemplate } from "../protocol/types.js";
 
 let dir: string;
 beforeEach(() => {
@@ -477,6 +478,25 @@ describe("a server's model list", () => {
 // ── CLI helpers ───────────────────────────────────────────────────────────────
 
 describe("CLI helpers", () => {
+  test("templates: every one has a usable base URL (custom aside) and a unique id; endpoint ls heads with the built-ins", () => {
+    const ids = ENDPOINT_TEMPLATES.map((t) => t.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const t of ENDPOINT_TEMPLATES) {
+      if (t.id === "custom") continue;
+      expect([t.id, draftConnection({ baseUrl: t.baseUrl }, undefined).baseURL]).toEqual([t.id, t.baseUrl]);
+    }
+    expect(endpointTemplate("llamacpp")?.flavor).toBe("llamacpp");
+    expect(formatTemplates(ENDPOINT_TEMPLATES)).toContain("openrouter  OpenRouter");
+    const out = formatEndpoints([], [
+      { id: "openai", displayName: "OpenAI", available: false, baseUrl: "https://api.openai.com/v1", detail: "not set up: x" },
+      { id: "llamacpp", displayName: "llama.cpp (local)", available: true, baseUrl: "http://127.0.0.1:8080/v1", detail: "enabled" },
+    ]);
+    expect(out).toContain("openai (OpenAI)  not available");
+    expect(out).toContain("llamacpp (llama.cpp (local))  available");
+    expect(out).toContain("--template <id>");
+  });
+
+
   test("--model parses trailing numbers only, so Ollama ids with colons survive", () => {
     expect(parseModelFlags(["qwen3-coder:128k", "llama3.1:8b", "llama3.1:8b:32k:4096", "plain"])).toEqual([
       { id: "qwen3-coder", contextWindow: 128000 },
@@ -919,6 +939,13 @@ describe("daemon", () => {
     expect(r.models.map((m) => m.value)).toEqual(["cfg"]);
     expect(r.live).toBe(false);
     expect(modelsHits()).toBe(before);
+  });
+
+  test("the endpoints list carries the built-in OpenAI and llama.cpp backends, with how each is set up", async () => {
+    const r = (await handle({ type: "endpoints.list", id: "l" })) as unknown as { builtins: Array<{ id: string; available: boolean; detail: string }> };
+    expect(r.builtins.map((b) => b.id)).toEqual(["openai", "llamacpp"]);
+    expect(r.builtins.find((b) => b.id === "llamacpp")).toMatchObject({ available: false });
+    expect(r.builtins.find((b) => b.id === "llamacpp")!.detail).toContain("providers.llamacpp.enabled");
   });
 
   test("endpoints.test: a stored endpoint, a draft, a rejected key, llama.cpp's window", async () => {

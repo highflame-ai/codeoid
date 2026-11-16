@@ -4,14 +4,39 @@
  * Pure — no I/O beyond what the caller passes in — so it is testable.
  */
 
-import type { EndpointInfo, EndpointModel, EndpointsSetMsg } from "../protocol/types.js";
+import type { BuiltinServerInfo, EndpointInfo, EndpointModel, EndpointsSetMsg, EndpointTemplate } from "../protocol/types.js";
 
-/** The endpoint list for `codeoid endpoint ls`. */
-export function formatEndpoints(endpoints: readonly EndpointInfo[]): string {
-  if (endpoints.length === 0) {
-    return "\n  No endpoints. Add one with: codeoid endpoint add <name> --base-url <url>\n";
+/** The built-in servers, as `codeoid endpoint ls` heads its list with them. */
+function formatBuiltins(builtins: readonly BuiltinServerInfo[]): string[] {
+  if (builtins.length === 0) return [];
+  const lines = ["", "  Built in (use as provider openai / llamacpp; set up in Settings or codeoid config):", ""];
+  for (const b of builtins) {
+    lines.push(`  ${b.id} (${b.displayName})  ${b.available ? "available" : "not available"}`);
+    lines.push(`      ${b.baseUrl}  ${b.detail}`);
   }
-  const lines = ["", "  OpenAI-compatible endpoints (use as provider oai:<name>):", ""];
+  return lines;
+}
+
+/** `codeoid endpoint templates`. */
+export function formatTemplates(templates: readonly EndpointTemplate[]): string {
+  const lines = ["", "  Templates (codeoid endpoint add <name> --template <id> [--key]):", ""];
+  for (const t of templates) {
+    const key = t.key === "required" ? "key required" : t.key === "optional" ? "key optional" : "no key";
+    lines.push(`  ${t.id.padEnd(11)} ${t.name}`);
+    lines.push(`      ${t.baseUrl || "(your base URL: --base-url)"}  ${key}${t.flavor === "llamacpp" ? "  flavor llamacpp" : ""}`);
+    if (t.note) lines.push(`      ${t.note}`);
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
+/** The endpoint list for `codeoid endpoint ls`, headed by the built-in servers of the same kind. */
+export function formatEndpoints(endpoints: readonly EndpointInfo[], builtins: readonly BuiltinServerInfo[] = []): string {
+  const head = formatBuiltins(builtins);
+  if (endpoints.length === 0) {
+    return [...head, "", "  No endpoints. Add one with: codeoid endpoint add <name> --template <id>   (codeoid endpoint templates)", ""].join("\n");
+  }
+  const lines = [...head, "", "  OpenAI-compatible endpoints (use as provider oai:<name>):", ""];
   for (const e of endpoints) {
     const title = e.displayName !== e.name ? `${e.name} (${e.displayName})` : e.name;
     lines.push(`  ${title}`);
