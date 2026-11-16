@@ -252,8 +252,34 @@ export class GitGateway {
       // paths: git's own server, run on the daemon's cache repository
       const p = spawn(GIT_BIN, [service.slice("git-".length), cache], { cwd: cache, env, stdio: ["pipe", "pipe", "ignore"] });
       p.stdin.on("error", () => {});
-      if (rest.length) p.stdin.write(rest);
-      c.pipe(p.stdin);
+      // What the client's git writes comes in frames (scripts.ts EXT_JS): a 0 length ends git's input.
+      let buf = rest;
+      let ended = false;
+      const take = (d: Buffer) => {
+        if (ended) return;
+        buf = buf.length ? Buffer.concat([buf, d]) : d;
+        while (buf.length >= 4) {
+          const n = buf.readUInt32BE(0);
+          if (n > 16 * 1024 * 1024) {
+            ended = true;
+            c.destroy();
+            return;
+          }
+          if (n === 0) {
+            ended = true;
+            p.stdin.end();
+            return;
+          }
+          if (buf.length < 4 + n) return;
+          p.stdin.write(buf.subarray(4, 4 + n));
+          buf = buf.subarray(4 + n);
+        }
+      };
+      c.on("data", take);
+      take(Buffer.alloc(0));
+      c.on("end", () => {
+        if (!ended) p.stdin.end();
+      });
       p.stdout.pipe(c, { end: false });
       const finish = () => {
         c.end();

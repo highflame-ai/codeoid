@@ -12,7 +12,11 @@
 import { chmodSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-/** git's ext:: command: `codeoid-git-ext <service> <url>`; the socket in `CODEOID_GIT_GATEWAY`. */
+/**
+ * git's ext:: command: `codeoid-git-ext <service> <url>`; the socket in `CODEOID_GIT_GATEWAY`. What git writes goes
+ * to the gateway in frames (a 4-byte length, then the bytes; a 0 length when git is done writing), so the end of
+ * git's input never depends on a socket's half-close; the gateway's answer comes back as it is, and its close ends it.
+ */
 export const EXT_JS = `"use strict";
 const net = require("node:net");
 const [service, url] = process.argv.slice(2);
@@ -20,15 +24,16 @@ const path = process.env.CODEOID_GIT_GATEWAY;
 const fail = (m) => { process.stderr.write("fatal: codeoid git gateway: " + m + "\\n"); process.exit(128); };
 if (!path) fail("this session has no git gateway (its sandbox isn't codeoid's, or it is off)");
 if (service !== "git-upload-pack" && service !== "git-receive-pack") fail("unsupported service " + JSON.stringify(service));
-const conn = net.connect({ path, allowHalfOpen: true });
+const conn = net.connect({ path });
+const frame = (d) => { const h = Buffer.alloc(4); h.writeUInt32BE(d.length, 0); conn.write(h); if (d.length) conn.write(d); };
 let head = Buffer.alloc(0);
 let relaying = false;
 const pending = [];
-process.stdin.on("data", (d) => { if (relaying) conn.write(d); else pending.push(d); });
-process.stdin.on("end", () => { if (relaying) conn.end(); else pending.push(null); });
+process.stdin.on("data", (d) => { if (relaying) frame(d); else pending.push(d); });
+process.stdin.on("end", () => { if (relaying) frame(Buffer.alloc(0)); else pending.push(null); });
 conn.on("connect", () => {
   const protocol = /^version=[0-9]$/.test(process.env.GIT_PROTOCOL || "") ? process.env.GIT_PROTOCOL : "";
-  conn.write(JSON.stringify({ v: 1, service, url, protocol }) + "\\n");
+  conn.write(JSON.stringify({ v: 2, service, url, protocol }) + "\\n");
 });
 const onHead = (c) => {
   head = Buffer.concat([head, c]);
@@ -40,11 +45,13 @@ const onHead = (c) => {
   if (status !== "ok") fail(status.replace(/^error /, ""));
   relaying = true;
   if (rest.length) process.stdout.write(rest);
-  for (const d of pending) { if (d === null) conn.end(); else conn.write(d); }
+  for (const d of pending) frame(d === null ? Buffer.alloc(0) : d);
   conn.on("data", (x) => process.stdout.write(x));
 };
 conn.on("data", onHead);
-conn.on("end", () => process.stdout.end(() => process.exit(0)));
+const done = () => process.stdout.end(() => process.exit(0));
+conn.on("end", done);
+conn.on("close", done);
 conn.on("error", (e) => fail(e.code === "ENOENT" || e.code === "ECONNREFUSED" ? "the daemon isn't reachable (is it running?)" : e.message));
 `;
 
