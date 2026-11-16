@@ -45,7 +45,7 @@ import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, readDotEnvValueSet, writeConfigBlock, writeCredentialValue, writeMcpServerEntry, writeWorktreeTrust } from "./settings/store.js";
 import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption, shellArg } from "./mcp/adopt.js";
 import { readWorkdirServers } from "./mcp/workdir-servers.js";
-import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcpUrl, serverProgram, shownLabel, visibleCompact, visibleVerbatim } from "./mcp/redact.js";
+import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcpUrl, serverProgram, urlHasHiddenParts, shownLabel, visibleCompact, visibleVerbatim } from "./mcp/redact.js";
 import { BackendLoginBroker, BackendLoginError, type LoginOutcome, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore } from "./claude-accounts.js";
 import { AccountError, type AccountStore, LOGIN_KINDS, validateAccountName } from "./accounts.js";
@@ -3396,22 +3396,27 @@ mcpHub: this.#mcpHub,
     const openaiUp = this.#providers.has("openai");
     const llama = this.#config?.providers?.llamacpp;
     const llamaUp = this.#providers.has("llamacpp");
+    // A base URL can carry a credential (userinfo, `?api-key=`): only its origin and path are shown,
+    // as for MCP servers. OPENAI_BASE_URL is the daemon's environment, shown nowhere else.
+    const shown = (url: string) => (urlHasHiddenParts(url) ? `${redactMcpUrl(url)} (credentials hidden)` : redactMcpUrl(url));
     return [
       {
         id: "openai",
         displayName: "OpenAI",
         available: openaiUp,
-        baseUrl: process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
+        baseUrl: process.env.OPENAI_BASE_URL ? shown(process.env.OPENAI_BASE_URL) : "https://api.openai.com/v1",
         detail: openaiUp
           ? "OpenAI's API, with OPENAI_API_KEY or an OpenAI account"
-          : "needs an OpenAI API key (below), or an OpenAI account: codeoid account add-key <name> --backend openai",
+          : "needs OPENAI_API_KEY (Settings → Model servers, or ~/.codeoid/.env), or an OpenAI account: codeoid account add-key <name> --backend openai",
       },
       {
         id: "llamacpp",
         displayName: "llama.cpp (local)",
         available: llamaUp,
-        baseUrl: llama?.baseUrl ?? "http://127.0.0.1:8080/v1",
-        detail: llamaUp ? "a local llama-server (providers.llamacpp)" : "off: turn it on below (providers.llamacpp.enabled), then restart the daemon",
+        baseUrl: shown(llama?.baseUrl ?? "http://127.0.0.1:8080/v1"),
+        detail: llamaUp
+          ? "a local llama-server (providers.llamacpp)"
+          : "off: set providers.llamacpp.enabled (Settings → Model servers, or codeoid config), then restart the daemon",
       },
     ];
   }

@@ -47,6 +47,31 @@ function fillNew(name: string, url = "http://localhost:8080/v1") {
 }
 
 describe("EndpointEditor", () => {
+  it("round 3: a key typed for one template's server never follows the form to another's; a typed base URL is kept", async () => {
+    clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [] });
+    const done = vi.fn();
+    const { getByText, getByPlaceholderText, getByDisplayValue, container } = render(() => <EndpointEditor onDone={done} />);
+    fireEvent.click(getByText("OpenRouter"));
+    const keyInput = () => container.querySelector('input[type="password"]') as HTMLInputElement;
+    fireEvent.input(keyInput(), { target: { value: "sk-or-OPENROUTER-SECRET" } });
+    fireEvent.click(getByText("Groq"));
+    expect(keyInput().value).toBe("");
+    fireEvent.input(keyInput(), { target: { value: "gsk-GROQ" } });
+    fireEvent.click(getByText("Add endpoint"));
+    await waitFor(() => expect(done).toHaveBeenCalled());
+    expect(sent()[0]).toMatchObject({ baseUrl: "https://api.groq.com/openai/v1", apiKey: "gsk-GROQ" });
+    cleanup();
+    // A base URL the user typed stays when a template is picked for its request shape.
+    const r = render(() => <EndpointEditor onDone={() => {}} />);
+    fireEvent.input(r.getByPlaceholderText("http://localhost:11434/v1"), { target: { value: "https://gw.corp.example/v1" } });
+    fireEvent.click(r.getByText("Custom"));
+    expect(r.getByDisplayValue("https://gw.corp.example/v1")).toBeTruthy();
+    fireEvent.click(r.getByText("llama.cpp server"));
+    expect(r.getByDisplayValue("https://gw.corp.example/v1")).toBeTruthy();
+    void getByPlaceholderText;
+    void getByDisplayValue;
+  });
+
   it("a template fills the server and its request shape; typed fields are kept, and a key is asked for where one is needed", async () => {
     clientRequestMock.mockResolvedValue({ type: "endpoints.result", requestId: "r", endpoints: [] });
     const done = vi.fn();

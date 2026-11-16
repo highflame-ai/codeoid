@@ -941,6 +941,43 @@ describe("daemon", () => {
     expect(modelsHits()).toBe(before);
   });
 
+  test("round 3: a built-in's base URL is shown without credentials, as an endpoint's could never hold them", async () => {
+    const before = process.env.OPENAI_BASE_URL;
+    process.env.OPENAI_BASE_URL = "https://alice:s3cr3t-token@gw.corp.example/v1?api-key=QUERYKEY#frag";
+    try {
+      const r = (await handle({ type: "endpoints.list", id: "l" })) as unknown as { builtins: Array<{ id: string; baseUrl: string }> };
+      const shown = r.builtins.find((b) => b.id === "openai")!.baseUrl;
+      expect(shown).not.toContain("s3cr3t");
+      expect(shown).not.toContain("alice");
+      expect(shown).not.toContain("QUERYKEY");
+      expect(shown).toContain("gw.corp.example");
+      expect(shown).toContain("credentials hidden");
+    } finally {
+      if (before === undefined) delete process.env.OPENAI_BASE_URL;
+      else process.env.OPENAI_BASE_URL = before;
+    }
+  });
+
+  test("round 3: on a list that marks no kind (OpenAI's), the default passes over image, speech and embedding models; Mistral's capabilities are read", async () => {
+    listedModels = [{ id: "dall-e-3" }, { id: "whisper-1" }, { id: "text-embedding-3-small" }, { id: "gpt-4o-mini-tts" }, { id: "gpt-x" }];
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey });
+    // Still offered: a name is no proof.
+    expect((await pickable()).ids).toContain("dall-e-3");
+    const created = (await handle({ type: "session.create", id: "c", name: "dm", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
+    await handle({ type: "session.attach", id: "a", sessionId: created.data!.id });
+    await handle({ type: "session.send", id: "m1", sessionId: created.data!.id, text: "hi" });
+    await waitFor(() => assistantTexts().length === 1);
+    expect(assistantTexts()[0]).toBe("hello from gpt-x");
+    const mistral = await fetchListedModels(
+      { baseURL: baseUrl(), headers: {} },
+      (async () => Response.json({ data: [{ id: "mistral-embed", capabilities: { completion_chat: false } }, { id: "mistral-large", capabilities: { completion_chat: true } }] })) as unknown as typeof fetch,
+    );
+    expect(mistral).toEqual([
+      { id: "mistral-embed", chat: false },
+      { id: "mistral-large", chat: true },
+    ]);
+  });
+
   test("the endpoints list carries the built-in OpenAI and llama.cpp backends, with how each is set up", async () => {
     const r = (await handle({ type: "endpoints.list", id: "l" })) as unknown as { builtins: Array<{ id: string; available: boolean; detail: string }> };
     expect(r.builtins.map((b) => b.id)).toEqual(["openai", "llamacpp"]);

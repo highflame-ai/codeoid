@@ -97,7 +97,23 @@ function isChatEntry(m: unknown): boolean {
     const v = (m as Record<string, unknown>)[key];
     if (typeof v === "string" && NOT_CHAT_KIND.test(v.trim())) return false;
   }
+  // Mistral: `capabilities: { completion_chat: false }` on an embedding or OCR model.
+  const caps = (m as { capabilities?: unknown }).capabilities;
+  if (caps && typeof caps === "object" && (caps as Record<string, unknown>).completion_chat === false) return false;
   return true;
+}
+
+/**
+ * Ids of well-known model families that don't chat (OpenAI's, Groq's, Mistral's lists mark no kind):
+ * images, speech, transcription, embeddings, moderation, rerankers. Used only to keep such a model
+ * from becoming a session's DEFAULT — it is still offered, since a name is no proof.
+ */
+const NOT_CHAT_FAMILY =
+  /(?:^|[/_.:-])(?:dall-e|gpt-image|whisper|tts|text-embedding|embed(?:ding)?s?|omni-moderation|text-moderation|moderation|rerank(?:er|ing)?|transcribe|speech|playai-tts|guard)(?:$|[/_.:-]|\d)/i;
+
+/** A listed model fit to be a default: marked chat, and not named for a family that doesn't chat. */
+function defaultable(m: ListedModel): boolean {
+  return m.chat && !NOT_CHAT_FAMILY.test(m.id);
 }
 
 const isModelId = isSafeModelId;
@@ -287,7 +303,9 @@ export class EndpointCatalog {
         `no model chosen for endpoint "${name}", and its model list couldn't be read (${error ?? "no answer"}) — pick one with /model, or set a default model on the endpoint`,
       );
     }
-    const first = offered(e, listed)[0];
+    // The server's first chat model, passing over ones named for a family that doesn't chat
+    // (an unmarked list may open with `dall-e-3` or `whisper-1`); failing that, its first.
+    const first = listed.find(defaultable)?.id ?? offered(e, listed)[0];
     if (!first) throw new EndpointError(`endpoint "${name}" lists no chat models — pick one with /model, or set a default model on the endpoint`);
     return first;
   }

@@ -90,17 +90,31 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
   const [template, setTemplate] = createSignal<EndpointTemplate | undefined>();
   const uid = createUniqueId();
 
-  /** Fill the form from a template: what the server is and how it is spoken to. Fields the user typed are kept. */
+  /**
+   * Fill the form from a template: what the server is and how it is spoken to. A field the user
+   * typed is kept — it is replaced only while empty or still the previous template's — and a key or
+   * headers typed for one server never follow the form to another: moving the base URL to another
+   * origin clears them, as the daemon refuses to send a stored one there.
+   */
   const applyTemplate = (t: EndpointTemplate) => {
     const was = template();
     setTemplate(t);
     if (!name().trim() || name() === was?.suggestedName) setName(t.suggestedName);
     if (!displayName().trim() || displayName() === was?.name) setDisplayName(t.id === "custom" ? "" : t.name);
-    setBaseUrl(t.baseUrl);
+    const url = baseUrl().trim();
+    const nextUrl = t.baseUrl && (!url || url === was?.baseUrl) ? t.baseUrl : url;
+    if (originOf(nextUrl) !== originOf(url)) {
+      setApiKey("");
+      setHeaders([]);
+    }
+    setBaseUrl(nextUrl);
+    if (t.flavor !== flavor()) {
+      // A strict-schema or MCP choice made for one kind of server doesn't carry to another.
+      setStrict(undefined);
+      setMcpMode(undefined);
+    }
     setFlavor(t.flavor);
-    setStrict(undefined);
-    setMcpMode(undefined);
-    setMaxTokensField(t.maxTokensField ?? "max_tokens");
+    if (maxTokensField() === (was?.maxTokensField ?? "max_tokens")) setMaxTokensField(t.maxTokensField ?? "max_tokens");
     setKeyMode(t.key === "required" ? "set" : "none");
     setTest(undefined);
   };

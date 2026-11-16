@@ -58,7 +58,7 @@ import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
 import { bedrockFromSettings, formatAccounts, formatClaudeAccounts, parseHeaderFlags, parseSettingFlags } from "./terminal/claude-accounts.js";
 import { formatEndpoints, formatTemplates, importPiModels, parseModelFlags, parseTokens } from "./terminal/endpoints.js";
-import type { ClientMessage, DaemonMessage, EffortLevel, SessionInfo, SessionSandboxSetting } from "./protocol/types.js";
+import type { ClientMessage, DaemonMessage, EffortLevel, EndpointFlavor, EndpointInfo, SessionInfo, SessionSandboxSetting } from "./protocol/types.js";
 import { sanitizeTerminalOutput } from "./tui/ansi/codes.js";
 import { parseEffort } from "@highflame/codeoid-core";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
@@ -859,6 +859,20 @@ const endpoint = program
   .command("endpoint")
   .description("OpenAI-compatible model servers (OpenRouter, Groq, Ollama, LM Studio, llama.cpp, vLLM, gateways): each is a backend, oai:<name>; `ls` lists the built-in openai and llamacpp backends with them");
 
+/** The stored endpoint `name`, or undefined when there is none (or the list can't be read: the set then reports why). */
+async function storedEndpoint(name: string): Promise<EndpointInfo | undefined> {
+  const client = new TerminalClient(loadConfig());
+  try {
+    await client.connect();
+    const resp = await client.request({ type: "endpoints.list", id: randomUUID() });
+    return resp.type === "endpoints.result" ? resp.endpoints.find((e) => e.name === name) : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    client.disconnect();
+  }
+}
+
 /** Run one endpoint request against the daemon; print the list it answers with. */
 async function endpointRequest(build: (id: string) => ClientMessage, opts?: { builtins?: boolean }): Promise<DaemonMessage | undefined> {
   const config = loadConfig();
@@ -918,8 +932,8 @@ endpoint
   .description(
     "Add an endpoint, or change one. Fields you leave out keep their stored values — the key and headers only while the base URL stays on the same server (scheme, host, port); moving it elsewhere needs --key/--clear-key and --header/--clear-headers. Key and header values are asked for without echo, never taken from the command line",
   )
-  .option("--template <id>", "start from a known server: openai, openrouter, groq, together, deepseek, fireworks, mistral, ollama, lmstudio, llamacpp, vllm (see: codeoid endpoint templates)")
-  .option("--base-url <url>", "the OpenAI-compatible base URL, usually ending in /v1 (https, or http for localhost / a private network); a --template gives one")
+  .option("--template <id>", "start a NEW endpoint from a known server: openai, openrouter, groq, together, deepseek, fireworks, mistral, ollama, lmstudio, llamacpp, vllm (see: codeoid endpoint templates)")
+  .option("--base-url <url>", "the OpenAI-compatible base URL, usually ending in /v1 (https, or http for localhost / a private network); a --template gives one, and an existing endpoint keeps its own")
   .option("--display-name <label>", "label in pickers")
   .option("--flavor <flavor>", "openai | llamacpp (llama-server: live context window from /props, strict tool schemas)")
   .option("--model <id[:context[:maxTokens]]>", "a model to offer first, with its settings, repeatable (e.g. qwen3-coder:128k): a context window and output cap by id. Pickers also offer every other chat model the server lists", collect, [] as string[])
@@ -960,8 +974,18 @@ endpoint
         if (o.template !== undefined && !template) {
           throw new Error(`no template "${o.template}": ${ENDPOINT_TEMPLATES.map((t) => t.id).join(", ")}`);
         }
-        const baseUrl = o.baseUrl ?? (template?.baseUrl || undefined);
-        if (!baseUrl) throw new Error(template ? `the ${template.name} template needs --base-url` : "give --base-url, or --template");
+        // A template fills a NEW endpoint; an existing one keeps what is stored unless a flag says otherwise.
+        const existing = await storedEndpoint(name);
+        if (existing && template) {
+          console.log(`"${name}" exists: --template only fills a new endpoint, so its stored settings are kept (pass flags to change them).`);
+        }
+        const fill = existing ? undefined : template;
+        const baseUrl = o.baseUrl ?? existing?.baseUrl ?? (fill?.baseUrl || undefined);
+        if (!baseUrl) throw new Error(fill ? `the ${fill.name} template needs --base-url` : "give --base-url, or --template");
+        const flavor = (o.flavor as EndpointFlavor | undefined) ?? fill?.flavor;
+        // A flavor change brings that flavor's defaults with it, as the web editor does: llama-server
+        // rejects loose tool schemas, and a small local context can't carry every MCP server.
+        const flavorMoved = !!existing && flavor !== undefined && flavor !== existing.flavor;
         if (o.key && o.clearKey) throw new Error("--key and --clear-key don't go together");
         if (o.header?.length && o.clearHeaders) throw new Error("--header and --clear-headers don't go together");
         if (o.flavor !== undefined && o.flavor !== "openai" && o.flavor !== "llamacpp") throw new Error("--flavor is openai or llamacpp");
@@ -979,30 +1003,31 @@ endpoint
         if (o.key && !apiKey) throw new Error("no API key entered — use --clear-key to remove one");
         const mcpServers =
           o.mcp === undefined ? undefined : o.mcp === "all" ? ("all" as const) : o.mcp === "none" ? [] : o.mcp.split(",").map((x) => x.trim()).filter(Boolean);
-        await endpointRequest((id) => ({
+        const resp = await endpointRequest((id) => ({
           type: "endpoints.set",
           id,
           name,
           baseUrl,
-          ...(o.displayName !== undefined ? { displayName: o.displayName } : template && template.id !== "custom" ? { displayName: template.name } : {}),
-          ...(o.flavor ? { flavor: o.flavor as "openai" | "llamacpp" } : template ? { flavor: template.flavor } : {}),
+          ...(o.displayName !== undefined ? { displayName: o.displayName } : fill && fill.id !== "custom" ? { displayName: fill.name } : {}),
+          ...(flavor ? { flavor } : {}),
           ...(apiKey !== undefined ? { apiKey } : {}),
           ...(o.header?.length ? { headers } : o.clearHeaders ? { headers: {} } : {}),
           ...(models.length ? { models } : {}),
           ...(o.defaultModel ? { defaultModel: o.defaultModel } : {}),
           ...(o.context ? { contextWindow: parseTokens(o.context) } : {}),
-          ...(mcpServers !== undefined ? { mcpServers } : {}),
+          ...(mcpServers !== undefined ? { mcpServers } : flavorMoved && flavor === "llamacpp" ? { mcpServers: [] } : {}),
           ...(o.streamUsage === false ? { streamUsage: false } : {}),
-          ...(o.strictTools !== undefined ? { strictToolSchemas: o.strictTools } : {}),
+          ...(o.strictTools !== undefined ? { strictToolSchemas: o.strictTools } : flavorMoved ? { strictToolSchemas: flavor === "llamacpp" } : {}),
           ...(o.maxTokensField
             ? { maxTokensField: o.maxTokensField as "max_tokens" | "max_completion_tokens" }
-            : template?.maxTokensField
-              ? { maxTokensField: template.maxTokensField }
+            : fill?.maxTokensField
+              ? { maxTokensField: fill.maxTokensField }
               : {}),
         }));
         if (!process.exitCode) {
-          if (template?.key === "required" && !o.key) {
-            console.log(`${template.name} needs an API key: codeoid endpoint set ${name} --key${template.keyUrl ? `  (get one at ${template.keyUrl})` : ""}`);
+          const saved = resp?.type === "endpoints.result" ? resp.endpoints.find((e) => e.name === name) : undefined;
+          if (fill?.key === "required" && saved && !saved.hasApiKey) {
+            console.log(`${fill.name} needs an API key: codeoid endpoint set ${name} --key${fill.keyUrl ? `  (get one at ${fill.keyUrl})` : ""}`);
           }
           console.log(`Use it with: codeoid new <session> <dir> --provider oai:${name}`);
         }
