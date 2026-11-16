@@ -1072,13 +1072,24 @@ describe("round 8 of the #448 audit: host-side file tools are held to the sandbo
     expect(audits.some((a) => a.action === "session.sandbox_bounds_refuse")).toBe(false);
   });
 
-  test("a command reaching the home runs in a sandboxed autonomous session (the sandbox hides the credentials), and is refused where it isn't sandboxed; a named credential stays refused everywhere", async () => {
-    for (const command of ["ls ~", "echo $HOME", "df -h /", "stat ~", "test -d ~ && echo yes"]) {
+  test("a command reaching the home runs in a sandboxed autonomous session (the sandbox hides the credentials); unsandboxed, one that reads files there is refused, saying why, and one that only lists, sizes, tests or prints a path runs; a named credential stays refused everywhere", async () => {
+    for (const command of ["ls ~", "echo $HOME", "df -h /", "stat ~", "test -d ~ && echo yes", "grep -r token ~", "find / -name x -exec cat {} +"]) {
       for (const backend of ["claude", "opencode", "pi"]) {
         const r = await gateCall("Bash", { command }, { mode: "autonomous", backend });
         expect([command, backend, r.asked, r.behavior]).toEqual([command, backend, false, "allow"]);
       }
-      expectRefused(await gateCall("Bash", { command }, { mode: "autonomous", sandbox: { provider: "off" } }), "credential_dir");
+    }
+    // Unsandboxed: a path argument only listed, sized, tested or printed reads no credential.
+    for (const command of ["ls ~", "ls /", "echo /", "tr '/' '-' < notes.txt", "df -h /", "du -sh ~", "stat ~", "realpath /", "test -d ~ && echo yes", "find / -maxdepth 1 -name x"]) {
+      const r = await gateCall("Bash", { command }, { mode: "autonomous", sandbox: { provider: "off" } });
+      expect([command, r.behavior]).toEqual([command, "allow"]);
+    }
+    // What may read files under a root holding credentials is refused there, saying why and how to change it.
+    for (const command of ["grep -r token ~", "find / -name x -exec cat {} +", "tar czf /tmp/h.tgz ~"]) {
+      const r = await gateCall("Bash", { command }, { mode: "autonomous", sandbox: { provider: "off" } });
+      expectRefused(r, "credential_dir");
+      expect(r.message).toContain("This session isn't sandboxed (off");
+      expect(r.message).toContain("codeoid sandbox set");
     }
     // codeoid's own config dir (XDG_CONFIG_HOME on CI, not ~/.codeoid).
     const named = await gateCall("Bash", { command: `cat ${join(getConfigDir(), "config.json")}` }, { mode: "autonomous" });
