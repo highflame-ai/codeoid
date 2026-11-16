@@ -515,6 +515,8 @@ export interface SessionCreateOptions {
   foreignStopGraceMs?: number;
   /** Override for how long `request_directory` waits for its owner's answer before it returns (tests). */
   requestDirectoryWaitMs?: number;
+  /** Tests only: the push tool's whole budget (ms). */
+  pushBudgetMs?: number;
   /** Optional memory engine — when provided, episodes are chunked and stored for recall. */
   memory?: MemoryEngine;
   /** Shared in-daemon memory MCP endpoint + URL, for URL-mounting backends. */
@@ -1585,6 +1587,12 @@ export class Session {
   readonly #dirRequests = new Map<string, Promise<string>>();
   /** The push running for this session (sandbox/push.ts): one at a time. */
   #pushing: Promise<string> | null = null;
+  /** Stops the git a push runs (its process group), at a drain or a destroy. */
+  #pushAbort: AbortController | null = null;
+  /** Tests only: the push's whole budget (ms), the owner's answer included. */
+  #pushBudgetMs: number | undefined;
+  /** What the end-of-turn look last found changed in the repository's git settings; a push is refused after it. */
+  #gitControlChanged: string | null = null;
   /** The pin change last said on the session (#sandboxPinRefusal): said once per change. */
   #pinSaid: string | null = null;
   /** The working directory's identity when there is no sandbox to keep it (an embedder): taken at its first use. */
@@ -1917,6 +1925,7 @@ export class Session {
     this.#sandboxMcp = opts.sandboxMcp;
     this.#sandboxCheckouts = opts.sandboxCheckouts;
     this.#requestDirectoryWaitMs = opts.requestDirectoryWaitMs;
+    this.#pushBudgetMs = opts.pushBudgetMs;
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
     this.#collaborationCost = opts.collaborationCost;
@@ -2280,7 +2289,11 @@ export class Session {
       blackboardMcp: () => this.#blackboardMcp,
       // The sandbox's ask for a directory to write (sandbox/request-directory.ts): decided here, every backend.
       ...(this.#sandbox
-        ? { requestDirectory: (input: RequestDirectoryInput) => this.requestDirectory(input), push: (input: PushInput) => this.push(input), sandboxMcp: () => this.#sandboxMcp?.(this.id) }
+        ? {
+            requestDirectory: (input: RequestDirectoryInput) => this.requestDirectory(input),
+            ...(this.#sandbox.config.push?.enabled === false ? {} : { push: (input: PushInput) => this.push(input) }),
+            sandboxMcp: () => this.#sandboxMcp?.(this.id),
+          }
         : {}),
       mcpRegistry: this.#mcpView ?? this.#mcpRegistry,
       mcpHub: this.#mcpHub,
@@ -4203,8 +4216,15 @@ export class Session {
     if (!sbx || !info || info.state !== "on") {
       return `Nothing to do: this session's commands aren't sandboxed (${info?.reason ?? info?.state ?? "no sandbox"}), so run \`git push\` yourself.`;
     }
+    if (this.#draining) return "Refused: the daemon is stopping; nothing new is pushed now.";
     const cfg = sbx.config.push;
     if (cfg?.enabled === false) return "Refused: pushing for agents is turned off here (sandbox.push.enabled). Ask the owner to push.";
+    // Everything below, the owner's answer included, ends before the backend gives up on the call (its MCP
+    // client's timeout: opencode's about a minute, the Gemini CLI's and Qwen's ten): a push nobody waits for
+    // never runs, and a late yes finds the card already closed.
+    const budgetMs = this.#pushBudgetMs ?? (this.#provider.id === "opencode" ? 50_000 : 8 * 60_000);
+    const deadline = Date.now() + budgetMs;
+    const left = () => Math.max(0, deadline - Date.now());
     const what = `${input.branch ?? "the checked-out branch"} to ${input.remote ?? "origin"}`;
     this.#store.audit(SYSTEM_IDENTITY.sub, "session.push_request", this.id, `${what}${input.reason ? ` reason=${input.reason}` : ""}`.slice(0, 2000));
     const note = (text: string, event: string, extra: Record<string, unknown> = {}) => {
@@ -4217,19 +4237,38 @@ export class Session {
       note(`⬆ The agent asked to push ${what}: refused (${why})`, "sandbox.push_refused");
       return `Refused: ${why}.`;
     };
-    const plan = await planPush(this.sandboxWorkspace, input, {
+    // The repository's git settings changed during the session (the end-of-turn look said so, or they differ
+    // from it now): the owner looks first; codeoid doesn't push from it.
+    const changed = this.#gitControlChangedSince();
+    if (changed) return refuse(`this repository's git settings changed during the session (${changed}): the owner should look at them, then push`);
+    const spec = sbx.runtime?.spec;
+    if (!spec) return refuse("this session's sandbox isn't running for its backend");
+    const planOpts = {
       protectedBranches: cfg?.protectedBranches ?? ["main", "master"],
+      heldReadOnly: spec.readOnly ?? [],
+      agentWritable: [spec.workspace, spec.tempDir, ...spec.writable, ...sbx.worktreeFolders()],
       remoteDefault: remoteDefaultBranch,
-    }).catch((err: unknown) => ({ refused: `the repository couldn't be read (${err instanceof Error ? err.message : String(err)})` }));
+      lookupTimeoutMs: Math.min(30_000, Math.max(1_000, left() / 4)),
+      notChangedSince: Date.parse(this.createdAt),
+    };
+    const plan = await planPush(this.sandboxWorkspace, input, planOpts).catch((err: unknown) => ({
+      refused: `the repository couldn't be read (${err instanceof Error ? err.message : String(err)})`,
+    }));
     if ("refused" in plan) return refuse(plan.refused);
-    const described = `${plan.branch} (${plan.sha.slice(0, 12)}${plan.ahead !== null ? `, ${plan.ahead} commit${plan.ahead === 1 ? "" : "s"} the remote-tracking refs don't have` : ""}) to ${plan.remote} — ${plan.shownUrl}`;
+    if (plan.defaultUnknown && this.#mode === "autonomous") {
+      return refuse(`codeoid couldn't ask ${plan.shownUrl} which branch is its default, so it can't be sure ${plan.branch} isn't it: try again, or ask the owner to push`);
+    }
+    const described = `${plan.branch} (commit ${plan.sha.slice(0, 12)}) to ${plan.remote} — ${plan.shownUrl}`;
     if (this.#mode !== "autonomous") {
       let answeredBy: string | undefined;
+      const reason = input.reason ? `\n\nThe agent's reason, in its own words:\n${input.reason.split("\n").map((l) => `> ${l}`).join("\n")}` : "";
+      const unknown = plan.defaultUnknown ? `\n\nThe remote didn't say which branch is its default: make sure ${plan.branch} isn't it.` : "";
       const answer = await this.requestUserInput(
         {
           method: "confirm",
           title: `The agent asks to push ${plan.branch}`,
-          message: `"${this.name}" asks codeoid to push ${described}, with your credentials.${input.reason ? `\n\nIts reason: ${input.reason}` : ""}\n\nOnly this branch, as this commit; no force, no tags.`,
+          message: `"${this.name}" asks codeoid to push ${described}, with your credentials. Only this branch, as this commit; no force, no tags.${unknown}${reason}`,
+          timeoutMs: Math.max(1_000, left() - 5_000),
         },
         {
           ownerOnly: true,
@@ -4242,30 +4281,60 @@ export class Session {
         const why =
           answer.reason === "unattended"
             ? "nobody is there to approve it in this unattended run; the owner can push it"
-            : answer.cancelled
-              ? `the question was withdrawn (${answer.reason ?? "cancelled"})`
-              : "the owner declined";
+            : answer.reason === "timeout"
+              ? "the owner didn't answer in time; the question is closed (call push again to ask again)"
+              : answer.cancelled
+                ? `the question was withdrawn (${answer.reason ?? "cancelled"})`
+                : "the owner declined";
         this.#store.audit(answeredBy ?? SYSTEM_IDENTITY.sub, "session.push_denied", this.id, `${plan.branch} ${answer.reason ?? "declined"}`);
         return refuse(why);
       }
       // The branch may have moved while the owner read the card: what is pushed is what they approved.
-      const again = await planPush(this.sandboxWorkspace, { ...input, branch: plan.branch }, { protectedBranches: cfg?.protectedBranches ?? ["main", "master"] }).catch(() => null);
+      const again = await planPush(this.sandboxWorkspace, { ...input, branch: plan.branch }, { ...planOpts, remoteDefault: undefined }).catch(() => null);
       if (!again || "refused" in again) return refuse(again && "refused" in again ? again.refused : "the repository couldn't be read again");
       if (again.sha !== plan.sha || again.url !== plan.url) return refuse(`${plan.branch} or its remote changed after you were asked (now ${again.sha.slice(0, 12)}): ask again`);
-      return this.#runPush(plan, answeredBy ?? this.createdBy, note);
+      const changedSince = this.#gitControlChangedSince();
+      if (changedSince) return refuse(`this repository's git settings changed while you were asked (${changedSince})`);
+      return this.#runPush(plan, answeredBy ?? this.createdBy, note, left());
     }
-    return this.#runPush(plan, SYSTEM_IDENTITY.sub, note);
+    return this.#runPush(plan, SYSTEM_IDENTITY.sub, note, left());
   }
 
-  async #runPush(plan: PushPlan, by: string, note: (text: string, event: string, extra?: Record<string, unknown>) => void): Promise<string> {
-    const r = await runPush(plan);
-    const detail = `${plan.branch} ${plan.sha} -> ${plan.shownUrl} refs/heads/${plan.branch}: ${r.summary}`;
-    this.#store.audit(by, r.ok ? "session.push_done" : "session.push_failed", this.id, detail.slice(0, 2000));
-    note(`⬆ ${r.ok ? "Pushed" : "Push failed"}: ${plan.branch} → ${plan.remote} (${plan.shownUrl}) — ${r.summary}`, r.ok ? "sandbox.pushed" : "sandbox.push_failed", {
-      branch: plan.branch,
-      sha: plan.sha,
-    });
-    return `${r.ok ? "Done" : "Failed"}: ${r.summary}.${r.output ? `\n\ngit said:\n${r.output}` : ""}`;
+  /** Whether the repository's git settings changed during the session: seen at a turn's end, or differing from the last look now. */
+  #gitControlChangedSince(): string | null {
+    if (this.#gitControlChanged) return this.#gitControlChanged;
+    const before = this.#gitBaseline;
+    if (!before) return null;
+    const workdir = this.#pinnedWorkdirOrSay("the check before a push");
+    if (!workdir) return "the working directory isn't where it was";
+    try {
+      const changed = gitControlChanges(before, gitControlSnapshot(workdir.path, undefined, { ownFolders: this.#sandbox?.worktreeFolders() ?? [] }));
+      return changed.length > 0 ? changed.slice(0, 5).join(", ") : null;
+    } catch {
+      return "they couldn't be read";
+    }
+  }
+
+  async #runPush(plan: PushPlan, by: string, note: (text: string, event: string, extra?: Record<string, unknown>) => void, leftMs: number): Promise<string> {
+    const abort = new AbortController();
+    this.#pushAbort = abort;
+    try {
+      const r = await runPush(plan, Math.max(5_000, Math.min(120_000, leftMs)), false, abort.signal);
+      const detail = `${plan.branch} ${plan.sha} -> ${plan.shownUrl} refs/heads/${plan.branch}: ${r.summary}`;
+      this.#store.audit(by, r.ok ? "session.push_done" : "session.push_failed", this.id, detail.slice(0, 2000));
+      note(`⬆ ${r.ok ? "Pushed" : "Push failed"}: ${plan.branch} → ${plan.remote} (${plan.shownUrl}) — ${r.summary}`, r.ok ? "sandbox.pushed" : "sandbox.push_failed", {
+        branch: plan.branch,
+        sha: plan.sha,
+      });
+      return `${r.ok ? "Done" : "Failed"}: ${r.summary}.${r.output ? `\n\ngit said:\n${r.output}` : ""}`;
+    } finally {
+      if (this.#pushAbort === abort) this.#pushAbort = null;
+    }
+  }
+
+  /** Stop a push in flight (the daemon stopping, the session destroyed): its process group is killed, and the result audited. */
+  #stopPush(): void {
+    this.#pushAbort?.abort();
   }
 
   /**
@@ -4309,6 +4378,7 @@ export class Session {
       const changed = gitControlChanges(before, now);
       this.#gitBaseline = now;
       if (changed.length > 0) {
+        this.#gitControlChanged = changed.slice(0, 5).join(", ");
         this.#store.audit(sub, "session.git_control_changed", this.id, changed.slice(0, 20).join(","));
         this.#sandboxWarning(gitControlWarning(changed), "sandbox.git_changed");
       }
@@ -5062,6 +5132,7 @@ export class Session {
    */
   beginDrain(): void {
     this.#draining = true;
+    this.#stopPush();
     if (this.#backgroundWakeFallback) {
       clearTimeout(this.#backgroundWakeFallback);
       this.#backgroundWakeFallback = null;
@@ -6784,6 +6855,7 @@ export class Session {
   }
 
   async destroy(sender: AuthContext, opts: { deleteBranch?: boolean } = {}): Promise<void> {
+    this.#stopPush();
     // Said to whoever is attached (and audited) before the session goes;
     // the commit look's git is bounded, and a destroy waits no longer.
     await Promise.race([this.#checkGitControl(sender.sub), new Promise<void>((r) => setTimeout(r, DESTROY_COMMIT_CHECK_MS).unref?.())]);
@@ -9343,7 +9415,7 @@ export class Session {
     if (this.#requestDirectoryMounted()) lines.push("To write in another directory, call the `request_directory` tool (path, reason). What it grants is writable from your next turn.");
     else lines.push("To write in another directory, ask the owner to add it (`/sandbox add <dir>`).");
     lines.push(
-      this.#requestDirectoryMounted()
+      this.#requestDirectoryMounted() && sbx.config.push?.enabled !== false
         ? "Your commands can't `git push` (no network to the git host, no credentials). Commit, then call the `push` tool (branch, remote): codeoid pushes for you with the owner's credentials."
         : "Your commands can't `git push` (no network to the git host, no credentials): commit, and ask the owner to push.",
     );

