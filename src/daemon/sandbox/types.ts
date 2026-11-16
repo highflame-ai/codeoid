@@ -186,6 +186,8 @@ export interface SandboxSpec {
    * and {@link env} points git's remotes for the session at it. Absent: no gateway.
    */
   gatewaySockets?: readonly string[];
+  /** The git gateway's own dir: what is under it (other sessions' sockets, its control socket) is never reached. */
+  gatewayRoot?: string;
   network: NetworkPolicy;
   /** Environment variables removed from what runs inside (an agent socket, a desktop bus). */
   unsetEnv: readonly string[];

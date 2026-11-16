@@ -1258,11 +1258,15 @@ codeoid sandbox git ls
 codeoid sandbox git disconnect [dir] [--remote r | --url u]
 ```
 
-- **Proved first:** connecting checks that your credential reaches the remote (`git ls-remote`).
+- **Confirmed and proved first:** from a repository, the URL its config names is shown and you confirm it
+  (`--yes` without a terminal). Then connecting checks that your credential reaches the remote (`git ls-remote`).
 - **ssh remotes** use your ssh key, through your ssh agent and `~/.ssh/config` as git does. codeoid runs the system
   `ssh`, and nothing is stored.
-- **https remotes:** your git credential for the host is read once, now, with `git credential fill`. It is kept in a
-  0600 file of the daemon's and sent to that remote's origin only.
+- **https remotes:** your git credential for the host is read once, now, with `git credential fill`. That runs from
+  `/` with a minimal environment, so only your global and system helpers answer, never a repository's. Your
+  `http.sslCAInfo` for the URL is kept with it. The credential lives in a 0600 file of the daemon's, which
+  host-side file tools are refused. Each run hands it to git through codeoid's own credential helper, for that
+  remote's origin only, with no redirects; it is never put in an environment or on a command line.
 - **`--token`** stores a dedicated token instead: a Bitbucket repository access token, or a GitHub fine-grained
   token. Use it for a shared daemon or a sensitive organisation.
 - **Permissions:** you need `settings:write`, and a delegated token can't connect. A connection is yours: it decides
@@ -1272,16 +1276,21 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
 
 **What a push may do**
 
-- One or more branches, `refs/heads/*`, each a fast-forward of what the remote has.
+- One or more branches, `refs/heads/*`: a new branch, or one an agent made there through codeoid before
+  (fast-forward only). Never a branch already on the remote that no agent made, such as a teammate's
+  `develop`.
 - Never:
   - `main`, `master` or another protected branch (`sandbox.push.protectedBranches`, case-insensitive, where a
     trailing `*` matches a prefix);
-  - the remote's default branch;
-  - a force push, a delete, tags, notes or other refs.
+  - the remote's default branch (if the remote can't say what it is, nothing is pushed);
+  - a branch the remote has as a symbolic ref (a push would move what it points at), or `HEAD`;
+  - a force push, a delete, tags, notes or other refs;
+  - anything to an empty remote (its first branch may become its default: push that one yourself).
 - The gateway checks each update against a fresh copy of the remote, then pushes the checked commits itself,
   atomically. The agent's `git push` succeeds only if the remote took them.
 - **Who decides:**
-  - guarded and interactive mode ask you per push, on an owner-only card naming the branches, commits and URL;
+  - guarded and interactive mode ask you per push, on an owner-only card naming the branches, commits and URL.
+    If the agent's git gives up first (a tool's time limit, an interrupt), the card closes and nothing is pushed;
   - autonomous mode pushes;
   - a pack role without `network: true`, or a read-only one (`write: false`), can't push, and one with
     `network: false` can't fetch.
@@ -1293,11 +1302,13 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
 
 **How it runs**
 
+- **Only once you connect a remote:** until you do, nothing changes in your sessions.
 - **Inside the sandbox:**
-  - git's config sends the session's remotes to `ext::<codeoid's launcher> %S <url>`:
+  - git's config, as `GIT_CONFIG_PARAMETERS`, sends whole URLs to `ext::<codeoid's launcher> %S <url>`, by
+    `insteadOf` and `pushInsteadOf`, so your own shorter rewrites don't bypass it. The URLs are:
     - the remotes you connected;
-    - the workspace repository's ssh remotes and the usual forges' ssh forms;
-    - with the network not on, their https forms too.
+    - the workspace repository's other ssh remotes;
+    - with the network not on, its https remotes too.
   - The launcher relays git's protocol over the session's own unix socket, bound into that session's sandbox
     alone.
   - Nothing inside holds a credential, and with the network on a public https remote is fetched directly as before.
@@ -1311,6 +1322,10 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
   who may write it), your ssh setup, and a stored https credential.
 - **Supported providers:** bubblewrap, Seatbelt and Claude's own sandbox. Docker sandboxes don't have it yet, since
   the container has no runtime for the launcher.
+  - On Linux, Claude's own sandbox can't let in one unix socket alone. With a remote connected, its commands can
+    reach the other unix sockets they can see. Local database sockets stay hidden, and the host's `/tmp` is denied,
+    as with Docker access.
+  - Under Seatbelt, the gateway's other sockets are denied by rule.
 - **Audit:**
   - `sandbox.git_connected` and `sandbox.git_disconnected`;
   - `session.git_push_request`, `session.git_push_approved` and `session.git_push_denied`;
@@ -1321,6 +1336,7 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
 
 **Settings**
 
+- `sandbox.git.enabled` (default on; `CODEOID_SANDBOX_GIT`): the gateway at all. Off, no session gets it.
 - `sandbox.push.enabled` (default on; `CODEOID_SANDBOX_PUSH`): agents' pushes through the gateway. Off, fetch still
   works.
 - `sandbox.push.protectedBranches` (`CODEOID_SANDBOX_PUSH_PROTECTED`).

@@ -2,11 +2,15 @@
  * The git gateway's side facing the remote (docs/git-gateway-design.md §3.4): every git it runs there uses none of
  * the owner's git config (no global or system config: no helper, `includeIf`, rewrite, hook or driver), only what
  * codeoid sets, and the owner's credential for that remote: ssh (the system ssh, with the owner's own key, agent and
- * `~/.ssh/config`) or https (a credential captured once, at connect, from the vault file).
+ * `~/.ssh/config`) or https (a credential captured once, at connect, handed to git by a credential helper of codeoid's
+ * that reads it from a 0600 file in the gateway's private dir for that run only: never in an env or on a command line,
+ * which other processes of the user's may read).
  */
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { GIT_BIN } from "../git-env.js";
 import { programTrustProblem } from "./hostpath.js";
 import { redactCredentials, shownOutput } from "./text.js";
@@ -17,6 +21,8 @@ export type UpstreamKind = "ssh" | "https";
 export interface HttpsCredential {
   username: string;
   password: string;
+  /** The owner's CA bundle for this remote (`http.sslCAInfo` at connect), when they set one. */
+  caInfo?: string;
 }
 
 export interface Upstream {
@@ -24,6 +30,8 @@ export interface Upstream {
   kind: UpstreamKind;
   /** For https: the credential sent to this remote's origin only. */
   credential?: HttpsCredential;
+  /** The gateway's private dir for a run's credential file (never in a sandbox). */
+  runDir?: string;
   /** Tests only: a local bare repository as the remote (`file://`), which a real one never is. */
   testFile?: boolean;
 }
@@ -68,6 +76,7 @@ const CLEAN_CONFIG: ReadonlyArray<readonly [string, string]> = [
   ["core.fsmonitor", "false"],
   ["core.askPass", ""],
   ["credential.helper", ""],
+  ["http.followRedirects", "false"],
   ["protocol.version", "2"],
   ["push.default", "nothing"],
   ["push.followTags", "false"],
@@ -81,18 +90,27 @@ const CLEAN_CONFIG: ReadonlyArray<readonly [string, string]> = [
   ["init.templateDir", ""],
 ];
 
+const sh = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+
 /**
- * The environment of a git the gateway runs toward `up`. Nothing of the daemon's environment but what ssh needs to
- * find the owner's key (HOME, the agent socket); never an askpass or a GIT_SSH of the environment's.
+ * Run `fn` with the environment of a git toward `up`: nothing of the daemon's environment but what ssh needs to find
+ * the owner's key (HOME, the agent socket); never an askpass or a GIT_SSH of the environment's. An https credential is
+ * written to a file of its own for this run, which only codeoid's helper reads, and removed after.
  */
-export function upstreamEnv(up: Upstream, ssh: string | null, extra: ReadonlyArray<readonly [string, string]> = []): Record<string, string> {
+// paths: the gateway's private run dir (made 0700): a credential file of this run's, written 0600, removed after
+export async function withUpstreamEnv<T>(up: Upstream, ssh: string | null, fn: (env: Record<string, string>) => Promise<T>, extra: ReadonlyArray<readonly [string, string]> = []): Promise<T> {
   const entries: Array<readonly [string, string]> = [...CLEAN_CONFIG, ...extra];
   if (up.kind === "ssh" && ssh) entries.push(["core.sshCommand", `${ssh} -o BatchMode=yes -o ConnectTimeout=20`]);
+  let credFile: string | null = null;
   if (up.kind === "https" && up.credential) {
-    // Sent to this remote's origin only (a redirect elsewhere gets nothing).
+    if (!up.runDir) throw new Error("no private dir for the credential");
+    mkdirSync(up.runDir, { recursive: true, mode: 0o700 });
+    credFile = join(up.runDir, `${randomBytes(12).toString("hex")}.cred`);
+    writeFileSync(credFile, `username=${up.credential.username}\npassword=${up.credential.password}\n`, { mode: 0o600 });
+    // Asked by git only for this remote's origin (a URL-scoped helper; redirects aren't followed at all).
     const origin = new URL(up.url).origin;
-    const basic = Buffer.from(`${up.credential.username}:${up.credential.password}`).toString("base64");
-    entries.push([`http.${origin}/.extraHeader`, `Authorization: Basic ${basic}`]);
+    entries.push([`credential.${origin}.helper`, `!f() { test "$1" = get && cat ${sh(credFile)}; }; f`]);
+    if (up.credential.caInfo) entries.push([`http.${origin}/.sslCAInfo`, up.credential.caInfo]);
   }
   const env: Record<string, string> = {
     PATH: "/usr/bin:/bin",
@@ -107,7 +125,11 @@ export function upstreamEnv(up: Upstream, ssh: string | null, extra: ReadonlyArr
   };
   if (process.env.SSH_AUTH_SOCK && up.kind === "ssh") env.SSH_AUTH_SOCK = process.env.SSH_AUTH_SOCK;
   for (const k of ["XDG_RUNTIME_DIR", "USER", "LOGNAME"]) if (process.env[k]) env[k] = process.env[k] as string;
-  return env;
+  try {
+    return await fn(env);
+  } finally {
+    if (credFile) rmSync(credFile, { force: true });
+  }
 }
 
 /** git, its whole process group killed at the limit or the signal; output capped. */
@@ -151,33 +173,58 @@ export function runGit(args: string[], cwd: string, env: Record<string, string>,
   });
 }
 
-/** git's error, one line, redacted: what the agent and the owner read. */
+/** git's error, its telling lines (not its access-rights boilerplate), redacted: what the agent and the owner read. */
 export function gitError(r: GitResult, what: string): string {
   if (r.timedOut) return `${what} timed out`;
-  const line = shownOutput(r.stderr)
+  const lines = shownOutput(r.stderr)
     .split("\n")
-    .filter((l) => l.trim())
-    .slice(-1)[0];
-  return redactCredentials(line ? `${what}: ${line}` : `${what} failed (exit ${r.code ?? "killed"})`);
+    .map((l) => l.trim())
+    .filter((l) => l && !/^Please make sure you have the correct access rights|^and the repository exists\.?$/.test(l));
+  const telling = lines.filter((l) => /^(fatal|error|ssh|remote|Permission|Could not|Host key|kex_|Connection)/i.test(l));
+  const shown = (telling.length > 0 ? telling : lines).slice(0, 3).join(" — ");
+  return redactCredentials(shown ? `${what}: ${shown}` : `${what} failed (exit ${r.code ?? "killed"})`);
+}
+
+/** What a refresh learned of the remote. */
+export interface RemoteState {
+  /** Its default branch (its `HEAD`), or null when it has none yet (an empty repository). */
+  defaultBranch: string | null;
+  /** Whether the remote said what its default branch is (false: the lookup failed). */
+  defaultKnown: boolean;
+  /** Its branches that are symbolic refs (a push to one would move what it points at). */
+  symrefs: ReadonlySet<string>;
+  /** Whether it has any branch at all. */
+  empty: boolean;
 }
 
 /**
  * Bring the daemon's cache of `up` (a bare repository) to what the remote has: its branches and tags, pruned. Made
- * by a bare clone the first time (which takes the remote's object format). Returns the remote's default branch, or
- * null when it has none yet (an empty repository) or didn't say.
+ * by a bare clone the first time (which takes the remote's object format). Says what it learned of the remote.
  */
-export async function refreshCache(cache: string, up: Upstream, ssh: string | null, timeoutMs: number, signal?: AbortSignal): Promise<{ defaultBranch: string | null } | { error: string }> {
-  const env = upstreamEnv(up, ssh);
-  if (!existsSync(cache)) {
-    const r = await runGit(["clone", "--bare", "--quiet", "--no-tags", "--", up.url, cache], homedir(), env, timeoutMs, signal);
-    if (r.code !== 0) return { error: gitError(r, "the remote couldn't be fetched") };
-  }
-  const f = await runGit(["fetch", "--quiet", "--prune", "--prune-tags", "--no-write-fetch-head", "--", up.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], cache, env, timeoutMs, signal);
-  if (f.code !== 0) return { error: gitError(f, "the remote couldn't be fetched") };
-  const h = await runGit(["ls-remote", "--symref", "--", up.url, "HEAD"], cache, env, Math.min(timeoutMs, 30_000), signal);
-  const head = h.code === 0 ? /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(h.stdout)?.[1] : undefined;
-  if (head) await runGit(["symbolic-ref", "HEAD", `refs/heads/${head}`], cache, env, 10_000, signal);
-  return { defaultBranch: head ?? null };
+export async function refreshCache(cache: string, up: Upstream, ssh: string | null, timeoutMs: number, signal?: AbortSignal): Promise<RemoteState | { error: string }> {
+  return withUpstreamEnv(up, ssh, async (env) => {
+    if (!existsSync(cache)) {
+      const r = await runGit(["clone", "--bare", "--quiet", "--no-tags", "--", up.url, cache], homedir(), env, timeoutMs, signal);
+      if (r.code !== 0) return { error: gitError(r, "the remote couldn't be fetched") };
+    }
+    const f = await runGit(["fetch", "--quiet", "--prune", "--prune-tags", "--no-write-fetch-head", "--", up.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], cache, env, timeoutMs, signal);
+    if (f.code !== 0) return { error: gitError(f, "the remote couldn't be fetched") };
+    // Every branch with its symref target, and HEAD (protocol v2's ls-refs symrefs).
+    const h = await runGit(["ls-remote", "--symref", "--", up.url, "HEAD", "refs/heads/*"], cache, env, Math.min(timeoutMs, 60_000), signal);
+    const symrefs = new Set<string>();
+    let defaultBranch: string | null = null;
+    let heads = 0;
+    if (h.code === 0) {
+      for (const line of h.stdout.split("\n")) {
+        const sym = /^ref: (refs\/heads\/\S+)\t(\S+)$/.exec(line);
+        if (sym?.[1] && sym[2] === "HEAD") defaultBranch = sym[1].slice("refs/heads/".length);
+        else if (sym?.[2]?.startsWith("refs/heads/")) symrefs.add(sym[2]);
+        else if (/^[0-9a-f]{40,64}\trefs\/heads\//.test(line)) heads++;
+      }
+    }
+    if (defaultBranch) await runGit(["symbolic-ref", "HEAD", `refs/heads/${defaultBranch}`], cache, env, 10_000, signal);
+    return { defaultBranch, defaultKnown: h.code === 0, symrefs, empty: h.code === 0 && heads === 0 };
+  });
 }
 
 /**
@@ -193,22 +240,29 @@ export async function pushUpstream(
   timeoutMs: number,
   signal?: AbortSignal,
 ): Promise<{ ok: true; output: string } | { ok: false; error: string; output: string }> {
-  const env = { ...upstreamEnv(up, ssh), GIT_OBJECT_DIRECTORY: objects.dir, GIT_ALTERNATE_OBJECT_DIRECTORIES: objects.alternates };
-  const specs = updates.map((u) => `${u.new}:${u.ref}`);
-  const r = await runGit(["push", "--atomic", "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", "--", up.url, ...specs], cache, env, timeoutMs, signal);
-  const output = redactCredentials(shownOutput(`${r.stdout}\n${r.stderr}`));
-  if (r.code === 0) return { ok: true, output };
-  const rejected = r.stdout
-    .split("\n")
-    .filter((l) => l.startsWith("!"))
-    .map((l) => l.split("\t").slice(2).join(" ").trim())
-    .filter(Boolean);
-  return { ok: false, error: rejected.length > 0 ? `the remote refused it (${redactCredentials(rejected.join("; "))})` : gitError(r, "the push to the remote failed"), output };
+  return withUpstreamEnv(up, ssh, async (base) => {
+    const env = { ...base, GIT_OBJECT_DIRECTORY: objects.dir, GIT_ALTERNATE_OBJECT_DIRECTORIES: objects.alternates };
+    const specs = updates.map((u) => `${u.new}:${u.ref}`);
+    const r = await runGit(["push", "--atomic", "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", "--", up.url, ...specs], cache, env, timeoutMs, signal);
+    const output = redactCredentials(shownOutput(`${r.stdout}\n${r.stderr}`));
+    if (r.code === 0) return { ok: true, output };
+    const rejected = r.stdout
+      .split("\n")
+      .filter((l) => l.startsWith("!"))
+      .map((l) => l.split("\t").slice(2).join(" ").trim())
+      .filter(Boolean);
+    return { ok: false, error: rejected.length > 0 ? `the remote refused it (${redactCredentials(rejected.join("; "))})` : gitError(r, "the push to the remote failed"), output };
+  });
 }
 
 /** Whether `old` is an ancestor of `next` in the cache, with the pushed objects in reach. */
 export async function isAncestor(cache: string, old: string, next: string, objects: { dir: string; alternates: string }): Promise<boolean> {
-  const env = { PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_OBJECT_DIRECTORY: objects.dir, GIT_ALTERNATE_OBJECT_DIRECTORIES: objects.alternates };
+  const env = { PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_NO_REPLACE_OBJECTS: "1", GIT_OBJECT_DIRECTORY: objects.dir, GIT_ALTERNATE_OBJECT_DIRECTORIES: objects.alternates };
   const r = await runGit(["merge-base", "--is-ancestor", old, next], cache, env, 30_000);
   return r.code === 0;
+}
+
+/** Probe `up` with `git ls-remote` (the connect check). */
+export function lsRemote(up: Upstream, ssh: string | null): Promise<GitResult> {
+  return withUpstreamEnv(up, ssh, (env) => runGit(["ls-remote", "--heads", "--", up.url], "/", env, 60_000));
 }

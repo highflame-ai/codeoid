@@ -250,6 +250,10 @@ const sandbox: SettingsTab = {
           default: ["@parent"],
           applies: "next-session",
         }),
+        cfg("sandbox.git.enabled", "Git gateway for agents", "Agents' own git fetch and push reach remotes you connected (codeoid sandbox git connect) with your existing credentials, which never enter the sandbox. Off: no session gets the gateway.", {
+          kind: "boolean",
+          envVar: "CODEOID_SANDBOX_GIT",
+        }),
         cfg("sandbox.push.enabled", "Push for agents", "Agents' own git push reaches remotes you connected (codeoid sandbox git connect) through the git gateway, with your existing credentials, which never enter the sandbox: branches of their own, fast-forward only; never main, master or the remote's default branch, no deletes, no tags. Guarded and interactive mode ask you per push; autonomous mode pushes. Off: fetch still works, pushes are refused.", {
           kind: "boolean",
           envVar: "CODEOID_SANDBOX_PUSH",

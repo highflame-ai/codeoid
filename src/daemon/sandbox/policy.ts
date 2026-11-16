@@ -83,9 +83,11 @@ export interface SandboxConfig {
      */
     socket: boolean;
   };
+  /** The git gateway (docs/git-gateway-design.md): off, no session gets it. */
+  git?: { enabled: boolean };
   /**
-   * The `push` tool (push.ts): codeoid pushes a session's branch on the host, since its sandboxed commands
-   * can't. `protectedBranches` are never pushed to (a trailing `*` matches a prefix), nor the remote's default.
+   * Agents' pushes through the git gateway. `protectedBranches` are never pushed to (a trailing `*` matches a
+   * prefix), nor the remote's default branch.
    */
   push?: { enabled: boolean; protectedBranches: string[] };
 }
@@ -111,6 +113,7 @@ export function sandboxConfigOf(config: Pick<CodeoidConfig, "sandbox"> | undefin
     ...(s ?? {}),
     docker: { ...DEFAULT_SANDBOX_CONFIG.docker, ...(s?.docker ?? {}) },
     push: { ...DEFAULT_SANDBOX_PUSH, ...(s?.push ?? {}) },
+    git: { enabled: true, ...(s?.git ?? {}) },
   };
 }
 
@@ -420,27 +423,28 @@ export interface GitGatewaySpec {
   binDir: string;
   /** codeoid's runtime, which the launcher runs: re-exposed read-only. */
   runtime: string;
-  /** URLs and URL prefixes the session's git reaches through the gateway (`url.<ext::…>.insteadOf`). */
+  /** URLs the session's git reaches through the gateway (`url.<ext::…>.insteadOf` / `pushInsteadOf`). */
   urls: readonly string[];
+  /** The gateway's own dir: its other sessions' sockets and its control socket, denied by rule where a sandbox can. */
+  root?: string;
 }
 
 /**
- * git's config (as `GIT_CONFIG_COUNT` env) that sends `urls` through the gateway's launcher, and the socket's path.
- * Empty when the launcher's path can't be written into an ext:: command (a space in it).
+ * git's config that sends `urls` through the gateway's launcher (fetch and push: `insteadOf` and `pushInsteadOf`, a
+ * whole URL each, which outranks a shorter rewrite of the owner's), and the socket's path. As
+ * `GIT_CONFIG_PARAMETERS`, git's own `-c` form: a backend that drops variables named like a key (Codex drops
+ * `*KEY*`, so `GIT_CONFIG_KEY_n`) keeps it. Empty when the launcher's path can't be named in an ext:: command.
  */
 export function gitGatewayEnv(g: GitGatewaySpec): Record<string, string> {
-  if (/\s|%/.test(g.ext) || g.urls.length === 0) return {};
+  if (/[\s%']/.test(g.ext) || g.urls.length === 0) return {};
+  const q = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
   const entries: Array<[string, string]> = [["protocol.ext.allow", "always"]];
   for (const u of new Set(g.urls)) {
-    if (/\s/.test(u)) continue;
-    entries.push([`url.ext::${g.ext} %S ${u.replace(/%/g, "%%")}.insteadOf`, u]);
+    if (/[\s']/.test(u)) continue;
+    const target = `ext::${g.ext} %S ${u.replace(/%/g, "%%")}`;
+    entries.push([`url.${target}.insteadOf`, u], [`url.${target}.pushInsteadOf`, u]);
   }
-  const env: Record<string, string> = { CODEOID_GIT_GATEWAY: g.socket, GIT_CONFIG_COUNT: String(entries.length) };
-  entries.forEach(([k, v], i) => {
-    env[`GIT_CONFIG_KEY_${i}`] = k;
-    env[`GIT_CONFIG_VALUE_${i}`] = v;
-  });
-  return env;
+  return { CODEOID_GIT_GATEWAY: g.socket, GIT_CONFIG_PARAMETERS: entries.map(([k, v]) => `${q(k)}=${q(v)}`).join(" ") };
 }
 
 export interface SpecInputs {
@@ -1393,9 +1397,10 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     pins,
     reexposed,
     containerSockets: containerSocketPaths(home, env).filter((p) => !exposed.has(p) && !exposed.has(realOr(p))),
-    ...((inputs.hideLocalServices ?? inputs.network.mode !== "on") ? { serviceSockets: localServiceSocketPaths() } : {}),
+    // Hidden too with the git gateway: on Claude's Linux sandbox its socket lets every unix socket be connected.
+    ...((inputs.hideLocalServices ?? inputs.network.mode !== "on") || gateway ? { serviceSockets: localServiceSocketPaths() } : {}),
     ...(sockets.length > 0 ? { dockerSockets: sockets } : {}),
-    ...(gateway ? { gatewaySockets: [gateway.socket] } : {}),
+    ...(gateway ? { gatewaySockets: [gateway.socket], ...(gateway.root ? { gatewayRoot: gateway.root } : {}) } : {}),
     network: inputs.network,
     unsetEnv: sockets.length > 0 ? SANDBOX_UNSET_ENV.filter((n) => n !== "DOCKER_HOST") : SANDBOX_UNSET_ENV,
   };

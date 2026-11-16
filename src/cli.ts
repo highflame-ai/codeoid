@@ -1413,11 +1413,21 @@ sandboxGitCmd
   .option("--remote <name>", "the remote (default: origin)")
   .option("--url <url>", "the remote's URL, instead of a repository and remote")
   .option("--token", "use a dedicated token for an https remote (user:token, or the token), read from the terminal or stdin")
-  .action(async (dir: string | undefined, o: { remote?: string; url?: string; token?: boolean }) => {
-    const token = o.token ? await readSecret("Token (user:token, or the token): ") : undefined;
+  .option("--yes", "connect a repository's remote without asking to confirm its URL (needed without a terminal)")
+  .action(async (dir: string | undefined, o: { remote?: string; url?: string; token?: boolean; yes?: boolean }) => {
     const client = new TerminalClient(loadConfig());
     await client.connect();
-    await client.sandboxGitConnect("connect", { ...(o.url ? { url: o.url } : { path: resolve(dir ?? ".") }), ...(o.remote ? { remote: o.remote } : {}), ...(token ? { token } : {}) });
+    let url = o.url;
+    if (!url) {
+      // The URL a repository's config names is shown, and confirmed, before anything is connected.
+      const found = await client.sandboxGitResolve(resolve(dir ?? "."), o.remote);
+      if (!found) return client.disconnect();
+      console.log(`This connects ${found.url}${found.connected ? " (connected already: connecting again refreshes it)" : ""} for agents in your sandboxed sessions.`);
+      if (!(await confirmOnTerminal("Connect it? [y/N] ", o.yes, "Not connected: pass --yes to connect without a terminal to confirm in, or name it with --url."))) return client.disconnect();
+      url = found.rawUrl;
+    }
+    const token = o.token ? await readSecret("Token (user:token, or the token): ") : undefined;
+    await client.sandboxGitConnect("connect", { url, ...(token ? { token } : {}) });
     client.disconnect();
   });
 

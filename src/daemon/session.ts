@@ -9322,7 +9322,7 @@ export class Session {
    * The session's word on a push the gateway checked: autonomous mode pushes; guarded and interactive ask the owner
    * (a card naming the branches, commits and URL), with an answer before the agent's git gives up waiting.
    */
-  async decideGitPush(push: { url: string; updates: ReadonlyArray<{ old: string; new: string; ref: string }> }): Promise<{ ok: true } | { refused: string }> {
+  async decideGitPush(push: { url: string; updates: ReadonlyArray<{ old: string; new: string; ref: string }> }, signal?: AbortSignal): Promise<{ ok: true } | { refused: string }> {
     const what = push.updates.map((u) => `${shownName(u.ref.replace(/^refs\/heads\//, ""))} (${u.new.slice(0, 12)})`).join(", ");
     this.#store.audit(SYSTEM_IDENTITY.sub, "session.git_push_request", this.id, `${what} -> ${shownUrl(push.url)}`.slice(0, 2000));
     const problem = this.gitAccessProblem("git-receive-pack");
@@ -9335,6 +9335,8 @@ export class Session {
         title: `The agent pushes ${push.updates.length === 1 ? shownName(push.updates[0]?.ref.replace(/^refs\/heads\//, "") ?? "") : `${push.updates.length} branches`}`,
         message: `"${this.name}" pushes ${what} to ${shownUrl(push.url)} with your credentials. No force, no delete, no tags; checked already.\n\nThe branch runs the repository's CI as it defines it, with its secrets.`,
         timeoutMs: 100_000,
+        // The agent's git gone (a tool's time limit, an interrupt): the card closes, and nothing is pushed.
+        ...(signal ? { signal } : {}),
       },
       {
         ownerOnly: true,

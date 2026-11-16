@@ -342,6 +342,8 @@ const SandboxSchema = z
         socket: z.boolean().default(false),
       })
       .default({ image: "node:22-bookworm-slim", socket: false }),
+    /** The git gateway (docs/git-gateway-design.md): agents' own git reaching remotes their owner connected. */
+    git: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
     /** Agents' pushes through the git gateway (docs/git-gateway-design.md, docs/sandbox.md "Git fetch and push"). */
     push: z
       .object({
@@ -351,7 +353,7 @@ const SandboxSchema = z
       })
       .default({ enabled: true, protectedBranches: ["main", "master"] }),
   })
-  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], projectRoots: [PROJECT_ROOT_PARENT], docker: { image: "node:22-bookworm-slim", socket: false }, push: { enabled: true, protectedBranches: ["main", "master"] } });
+  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], projectRoots: [PROJECT_ROOT_PARENT], docker: { image: "node:22-bookworm-slim", socket: false }, git: { enabled: true }, push: { enabled: true, protectedBranches: ["main", "master"] } });
 
 /** Secrets in what codeoid stores (docs/secrets-and-memory-design.md §2). */
 const SecretsSchema = z
@@ -1929,6 +1931,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_SANDBOX_DOCKER_SOCKET", path: "sandbox.docker.socket", kind: "boolean" },
   { env: "CODEOID_SANDBOX_WORKTREE_ROOTS", path: "sandbox.worktreeRoots", kind: "csv" },
   { env: "CODEOID_SANDBOX_PROJECT_ROOTS", path: "sandbox.projectRoots", kind: "csv" },
+  { env: "CODEOID_SANDBOX_GIT", path: "sandbox.git.enabled", kind: "boolean" },
   { env: "CODEOID_SANDBOX_PUSH", path: "sandbox.push.enabled", kind: "boolean" },
   { env: "CODEOID_SANDBOX_PUSH_PROTECTED", path: "sandbox.push.protectedBranches", kind: "csv" },
   { env: "CODEOID_ROUTINES_MAX_CONCURRENT", path: "routines.maxConcurrentRuns", kind: "int" },

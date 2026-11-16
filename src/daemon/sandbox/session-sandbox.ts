@@ -1106,10 +1106,10 @@ export class SessionSandbox {
   }
 
   /**
-   * What the session's sandbox gets of the git gateway: the URLs connected for its owner, and the ones its git
-   * couldn't reach by itself, so the gateway can say how the owner connects one: every ssh remote of the workspace
-   * repository and the usual forges' ssh forms (no key is ever inside), and, the network not on, their https forms too
-   * (with it on, a public https remote is fetched directly as before). Never under Docker (no runtime there for the
+   * What the session's sandbox gets of the git gateway (only for an owner who connected a remote): the URLs connected
+   * for them, and the workspace repository's other remotes its git couldn't reach by itself, so the gateway can say
+   * how the owner connects one: its ssh ones (no key is ever inside), and, the network not on, its https ones too (with
+   * it on, a public https remote is fetched directly as before). Never under Docker (no runtime there for the
    * launcher).
    */
   #gatewayFor(workspace: string, network: NetworkPolicy): GitGatewaySpec | undefined {
@@ -1117,11 +1117,8 @@ export class SessionSandbox {
     const g = this.#gitGateway();
     if (!g) return undefined;
     const off = network.mode !== "on";
+    // Whole URLs only (a prefix would hand the rest of a URL to ext::, which reads `%` in it).
     const urls = [...g.urls, ...workspaceRemoteUrls(workspace).filter((u) => off || !/^https?:\/\//i.test(u))];
-    for (const host of ["github.com", "bitbucket.org", "gitlab.com"]) {
-      urls.push(`git@${host}:`, `ssh://git@${host}/`);
-      if (off) urls.push(`https://${host}/`);
-    }
     return { ...g, urls: [...new Set(urls)] };
   }
 

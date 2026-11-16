@@ -13,7 +13,7 @@
  */
 import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { join, resolve } from "node:path";
 import { GIT_BIN } from "../git-env.js";
@@ -21,7 +21,7 @@ import { within } from "../physical-path.js";
 import { type PushPolicy, type RefUpdate, refUpdateProblem } from "./policy.js";
 import { type GatewayScripts, writeGatewayScripts } from "./scripts.js";
 import { redactCredentials, shownUrl } from "./text.js";
-import { configEnv, isAncestor, pushUpstream, refreshCache, type Upstream } from "./upstream.js";
+import { configEnv, isAncestor, pushUpstream, type RemoteState, refreshCache, type Upstream } from "./upstream.js";
 
 export type GitService = "git-upload-pack" | "git-receive-pack";
 
@@ -31,6 +31,8 @@ export interface GatewayGrant {
   /** The system ssh's path, for an ssh remote. */
   ssh: string | null;
   protectedBranches: readonly string[];
+  /** Branches agents made on this remote through the gateway (the owner's): the only existing ones they may move. */
+  agentBranches: ReadonlySet<string>;
   /** Whose cache it is (one per owner and URL). */
   cacheKey: string;
 }
@@ -45,8 +47,8 @@ export interface GatewayPush {
 export interface GatewayHost {
   /** May `sessionId` use `service` at `url`? Resolves with the grant, or why not (what the agent reads). */
   grant(sessionId: string, service: GitService, url: string): Promise<GatewayGrant | { refused: string }>;
-  /** The session's word on a checked push (its role, its mode, the owner's answer). */
-  approve(sessionId: string, push: GatewayPush): Promise<{ ok: true } | { refused: string }>;
+  /** The session's word on a checked push (its role, its mode, the owner's answer); `signal`: the agent's git is gone. */
+  approve(sessionId: string, push: GatewayPush, signal: AbortSignal): Promise<{ ok: true } | { refused: string }>;
   /** What happened, for the session's audit and transcript. */
   report(sessionId: string, event: { kind: "fetch" | "push"; url: string; ok: boolean; detail: string; updates?: readonly RefUpdate[] }): void;
 }
@@ -67,7 +69,9 @@ interface Ticket {
   grant: GatewayGrant;
   url: string;
   cache: string;
-  defaultBranch: string | null;
+  remote: RemoteState;
+  /** Aborted when the agent's git goes (its connection closes), the session closes or the gateway stops. */
+  gone: AbortController;
 }
 
 const MAX_HEADER = 64 * 1024;
@@ -79,12 +83,13 @@ export class GitGateway {
   readonly #runtime: string;
   readonly #requestTimeoutMs: number;
   readonly #upstreamTimeoutMs: number;
-  readonly #sessions = new Map<string, { server: Server; socket: string }>();
+  readonly #sessions = new Map<string, { server: Server; socket: string; live: Set<Socket>; gone: Set<AbortController> }>();
   readonly #tickets = new Map<string, Ticket>();
   readonly #locks = new Map<string, Promise<void>>();
   readonly #control: Server;
   readonly #controlPath: string;
   readonly #live = new Set<Socket>();
+  readonly #gone = new Set<AbortController>();
   #closed = false;
 
   constructor(o: GatewayOptions) {
@@ -104,6 +109,11 @@ export class GitGateway {
     this.#control = this.#listen(this.#controlPath, (c) => this.#onHook(c));
   }
 
+  /** The gateway's own dir (a sandbox denies its sockets by rule where it can: Seatbelt). */
+  get root(): string {
+    return this.#base;
+  }
+
   /** What a session's sandbox is given: its socket, the launcher, and codeoid's runtime the launcher runs. */
   forSession(sessionId: string): { socket: string; ext: string; binDir: string; runtime: string } {
     let s = this.#sessions.get(sessionId);
@@ -113,18 +123,26 @@ export class GitGateway {
       rmSync(dir, { recursive: true, force: true });
       mkdirSync(dir, { mode: 0o700 });
       const socket = join(dir, "git.sock");
-      const server = this.#listen(socket, (c) => void this.#onClient(sessionId, c));
-      s = { server, socket };
+      const live = new Set<Socket>();
+      const gone = new Set<AbortController>();
+      const server = this.#listen(socket, (c) => {
+        live.add(c);
+        c.once("close", () => live.delete(c));
+        void this.#onClient(sessionId, c, gone);
+      });
+      s = { server, socket, live, gone };
       this.#sessions.set(sessionId, s);
     }
     return { socket: s.socket, ext: this.#scripts.ext, binDir: this.#scripts.binDir, runtime: this.#runtime };
   }
 
-  /** Stop serving a session (destroyed): its socket goes, a request in flight ends. */
+  /** Stop serving a session (destroyed): its socket goes, a request in flight ends (a pending push isn't made). */
   closeSession(sessionId: string): void {
     const s = this.#sessions.get(sessionId);
     if (!s) return;
     this.#sessions.delete(sessionId);
+    for (const g of s.gone) g.abort();
+    for (const c of s.live) c.destroy();
     s.server.close();
     // paths: the daemon's own socket dir for the session
     rmSync(join(s.socket, ".."), { recursive: true, force: true });
@@ -133,6 +151,7 @@ export class GitGateway {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    for (const g of this.#gone) g.abort();
     for (const id of [...this.#sessions.keys()]) this.closeSession(id);
     this.#control.close();
     for (const c of this.#live) c.destroy();
@@ -146,7 +165,10 @@ export class GitGateway {
   #listen(path: string, onConn: (c: Socket) => void): Server {
     // paths: the daemon's own socket, replaced (a stale one from a stopped daemon)
     if (existsSync(path)) unlinkSync(path);
-    const server = createServer({ allowHalfOpen: true }, (c) => {
+    // No half-open: the client frames the end of git's input (scripts.ts), so its end of the connection means it's gone.
+    const server = createServer((c) => {
+      // A peer gone mid-write (the agent's git killed) is an error to drop, never one to throw.
+      c.on("error", () => c.destroy());
       this.#live.add(c);
       c.once("close", () => this.#live.delete(c));
       onConn(c);
@@ -181,9 +203,9 @@ export class GitGateway {
     }
   }
 
-  async #onClient(sessionId: string, c: Socket): Promise<void> {
+  async #onClient(sessionId: string, c: Socket, sessionGone: Set<AbortController>): Promise<void> {
     const fail = (why: string) => {
-      c.end(`error ${redactCredentials(why).replace(/\n/g, " ")}\n`);
+      if (!c.destroyed) c.end(`error ${redactCredentials(why).replace(/\n/g, " ")}\n`);
     };
     const limit = setTimeout(() => c.destroy(), this.#requestTimeoutMs);
     c.once("close", () => clearTimeout(limit));
@@ -204,22 +226,38 @@ export class GitGateway {
       return fail(grant.refused);
     }
     const cache = this.cachePath(grant.cacheKey);
-    await this.#locked(grant.cacheKey, async () => {
-      const fresh = await refreshCache(cache, grant.upstream, grant.ssh, this.#upstreamTimeoutMs);
+    const upstream: Upstream = { ...grant.upstream, runDir: join(this.#base, "run") };
+    // The agent's git gone (its connection closed), the session closed or the gateway stopping: nothing more is done.
+    const gone = new AbortController();
+    sessionGone.add(gone);
+    this.#gone.add(gone);
+    c.once("close", () => gone.abort());
+    c.once("end", () => gone.abort());
+    try {
+      // The lock is the refresh's alone: serving (and an owner's card) doesn't hold up other sessions' requests.
+      const fresh = await this.#locked(grant.cacheKey, async () => {
+        sweepQuarantines(cache);
+        return refreshCache(cache, upstream, grant.ssh, this.#upstreamTimeoutMs, gone.signal);
+      });
+      if (gone.signal.aborted) return;
       if ("error" in fresh) {
         this.#host.report(sessionId, { kind: service === "git-receive-pack" ? "push" : "fetch", url, ok: false, detail: fresh.error });
         return fail(fresh.error);
       }
       const ticket = randomBytes(24).toString("hex");
-      if (service === "git-receive-pack") this.#tickets.set(ticket, { sessionId, grant, url, cache, defaultBranch: fresh.defaultBranch });
+      if (service === "git-receive-pack") this.#tickets.set(ticket, { sessionId, grant: { ...grant, upstream }, url, cache, remote: fresh, gone });
       try {
+        if (c.destroyed) return;
         c.write("ok\n");
         await this.#serve(service, cache, c, rest, ticket, protocol);
-        if (service === "git-upload-pack") this.#host.report(sessionId, { kind: "fetch", url, ok: true, detail: `fetched from ${shownUrl(url)}` });
+        if (service === "git-upload-pack" && !gone.signal.aborted) this.#host.report(sessionId, { kind: "fetch", url, ok: true, detail: `fetched from ${shownUrl(url)}` });
       } finally {
         this.#tickets.delete(ticket);
       }
-    });
+    } finally {
+      sessionGone.delete(gone);
+      this.#gone.delete(gone);
+    }
   }
 
   /** git's own server on the cache, its stdio the client's, until it exits. */
@@ -250,7 +288,8 @@ export class GitGateway {
     };
     return new Promise((done) => {
       // paths: git's own server, run on the daemon's cache repository
-      const p = spawn(GIT_BIN, [service.slice("git-".length), cache], { cwd: cache, env, stdio: ["pipe", "pipe", "ignore"] });
+      // Its own process group: the hook and anything it started go with it.
+      const p = spawn(GIT_BIN, [service.slice("git-".length), cache], { cwd: cache, env, stdio: ["pipe", "pipe", "ignore"], detached: true });
       p.stdin.on("error", () => {});
       // What the client's git writes comes in frames (scripts.ts EXT_JS): a 0 length ends git's input.
       let buf = rest;
@@ -288,16 +327,23 @@ export class GitGateway {
       p.on("close", finish);
       p.on("error", finish);
       c.on("close", () => {
-        if (p.exitCode === null) p.kill("SIGKILL");
+        if (p.exitCode !== null || !p.pid) return;
+        try {
+          process.kill(-p.pid, "SIGKILL");
+        } catch {
+          /* gone */
+        }
       });
     });
   }
 
   /** The cache's pre-receive hook asks: the updates, checked, the session's word, then the remote. */
   async #onHook(c: Socket): Promise<void> {
-    const say = (line: string) => c.write(`msg ${redactCredentials(line).replace(/\n/g, " ")}\n`);
+    const say = (line: string) => {
+      if (!c.destroyed) c.write(`msg ${redactCredentials(line).replace(/\n/g, " ")}\n`);
+    };
     const verdict = (ok: boolean): void => {
-      c.end(ok ? "ok\n" : "no\n");
+      if (!c.destroyed) c.end(ok ? "ok\n" : "no\n");
     };
     let req: { ticket?: unknown; updates?: unknown; objects?: { dir?: unknown; alternates?: unknown } };
     try {
@@ -325,14 +371,30 @@ export class GitGateway {
       verdict(false);
     };
     if (updates.length === 0) return refuse("nothing to update");
-    const policy: PushPolicy = { protectedBranches: t.grant.protectedBranches, defaultBranch: t.defaultBranch };
+    const policy: PushPolicy = {
+      protectedBranches: t.grant.protectedBranches,
+      defaultBranch: t.remote.defaultBranch,
+      // An empty remote has no default yet (its first branch may become it): known, and none.
+      defaultKnown: t.remote.defaultKnown,
+      symrefs: t.remote.symrefs,
+      agentBranches: t.grant.agentBranches,
+    };
+    if (t.remote.empty) return refuse("the remote has no branch yet (an empty repository), and the first one pushed may become its default: ask the owner to push its first branch");
     for (const u of updates) {
       const problem = await refUpdateProblem(u, policy, (old, next) => isAncestor(t.cache, old, next, objects));
       if (problem) return refuse(problem);
     }
-    const word = await this.#host.approve(t.sessionId, { url: t.url, updates, defaultBranch: t.defaultBranch }).catch((err: unknown) => ({ refused: err instanceof Error ? err.message : String(err) }));
+    if (t.gone.signal.aborted) return verdict(false);
+    const word = await this.#host
+      .approve(t.sessionId, { url: t.url, updates, defaultBranch: t.remote.defaultBranch }, t.gone.signal)
+      .catch((err: unknown) => ({ refused: err instanceof Error ? err.message : String(err) }));
     if ("refused" in word) return refuse(word.refused);
-    const pushed = await pushUpstream(t.cache, t.grant.upstream, t.grant.ssh, updates, objects, this.#upstreamTimeoutMs);
+    // The agent's git gave up (a tool's time limit, an interrupt) while the owner was asked: nothing is pushed.
+    if (t.gone.signal.aborted) {
+      this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: false, detail: "the agent's git was gone before the push started, so nothing was pushed", updates });
+      return verdict(false);
+    }
+    const pushed = await pushUpstream(t.cache, t.grant.upstream, t.grant.ssh, updates, objects, this.#upstreamTimeoutMs, t.gone.signal);
     if (!pushed.ok) {
       say(pushed.error);
       this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: false, detail: pushed.error, updates });
@@ -341,6 +403,21 @@ export class GitGateway {
     say(`codeoid pushed ${updates.map((u) => u.ref.replace(/^refs\/heads\//, "")).join(", ")} to ${shownUrl(t.url)}`);
     this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: true, detail: `pushed to ${shownUrl(t.url)}`, updates });
     verdict(true);
+  }
+}
+
+/** Remove quarantines (`objects/tmp_objdir-incoming-*`) a killed receive-pack left, an hour old or more. */
+// paths: the daemon's own cache repository: its stale quarantine dirs, removed
+function sweepQuarantines(cache: string): void {
+  const objects = join(cache, "objects");
+  try {
+    for (const name of readdirSync(objects)) {
+      if (!name.startsWith("tmp_objdir-incoming-")) continue;
+      const at = join(objects, name);
+      if (Date.now() - lstatSync(at).mtimeMs > 60 * 60_000) rmSync(at, { recursive: true, force: true });
+    }
+  } catch {
+    /* no cache yet */
   }
 }
 

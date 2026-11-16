@@ -52,6 +52,22 @@ conn.on("data", onHead);
 const done = () => process.stdout.end(() => process.exit(0));
 conn.on("end", done);
 conn.on("close", done);
+// git gone (killed: a tool's time limit, an interrupt): so is this, and the gateway sees the connection close.
+// Our parent is git's remote-ext helper; its parent the git the agent ran. Either gone (killed, or the helper orphaned
+// when git was), this goes, and the gateway sees the connection close (nothing more is pushed).
+const fs = require("node:fs");
+const ppidOf = (pid) => {
+  try {
+    const stat = fs.readFileSync("/proc/" + pid + "/stat", "utf8");
+    return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
+  } catch { return pid === "self" ? process.ppid : null; }
+};
+const parent = ppidOf("self");
+const grandparent = ppidOf(parent);
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code !== "ESRCH"; } };
+const parentGone = () => ppidOf("self") !== parent || !alive(parent) || (grandparent !== null && grandparent > 1 && (ppidOf(parent) !== grandparent || !alive(grandparent)));
+setInterval(() => { if (parentGone()) { conn.destroy(); process.exit(1); } }, 250).unref();
+process.stdout.on("error", () => { conn.destroy(); process.exit(1); });
 conn.on("error", (e) => fail(e.code === "ENOENT" || e.code === "ECONNREFUSED" ? "the daemon isn't reachable (is it running?)" : e.message));
 `;
 

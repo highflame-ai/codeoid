@@ -280,7 +280,11 @@ describe("hidden paths", () => {
 describe("config", () => {
   test("on by default: auto, network on", () => {
     const c = loadConfig({ raw: {}, env: {}, quiet: true });
-    expect(c.sandbox).toEqual({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], projectRoots: ["@parent"], docker: { image: "node:22-bookworm-slim", socket: false }, push: { enabled: true, protectedBranches: ["main", "master"] } });
+    expect(c.sandbox).toEqual({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], projectRoots: ["@parent"], docker: { image: "node:22-bookworm-slim", socket: false }, git: { enabled: true }, push: { enabled: true, protectedBranches: ["main", "master"] } });
+  });
+
+  test("git gateway: on by default; the environment turns it off", () => {
+    expect(loadConfig({ raw: {}, env: { CODEOID_SANDBOX_GIT: "false" }, quiet: true }).sandbox?.git).toEqual({ enabled: false });
   });
 
   test("push: on by default, main and master protected; the environment sets both", () => {

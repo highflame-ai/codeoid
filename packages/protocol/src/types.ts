@@ -2024,7 +2024,7 @@ export interface SandboxProvidersMsg extends BaseClientMsg {
  */
 export interface SandboxGitConnectMsg extends BaseClientMsg {
   type: "sandbox.git_connect";
-  action: "connect" | "disconnect" | "list";
+  action: "connect" | "disconnect" | "list" | "resolve";
   /** The remote's URL; or `path` (a directory in a repository) and `remote` (default `origin`). */
   url?: string;
   path?: string;

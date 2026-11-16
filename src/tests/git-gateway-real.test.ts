@@ -61,7 +61,7 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: gi
     git(seed, "push", "-q", "origin", "main");
     const host: GatewayHost = {
       grant: async (_s, _svc, url) =>
-        url === URL ? { upstream: { url: `file://${upstream}`, kind: "ssh", testFile: true }, ssh: null, protectedBranches: ["main"], cacheKey: "real" } : { refused: "not connected" },
+        url === URL ? { upstream: { url: `file://${upstream}`, kind: "ssh", testFile: true }, ssh: null, protectedBranches: ["main"], agentBranches: new Set(["feature/x"]), cacheKey: "real" } : { refused: "not connected" },
       approve: async () => ({ ok: true }),
       report: () => {},
     };

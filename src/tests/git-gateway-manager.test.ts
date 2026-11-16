@@ -81,7 +81,12 @@ describe("the git gateway, decided by the session", () => {
   it("guarded: an unconnected remote is offered to the owner; each push is asked; a no is a refusal the agent's git reads", async () => {
     const up = upstreamRepo();
     const m = t.newManager();
-    // The network off: the workspace's own remotes go through the gateway, connected or not.
+    // The owner connected another remote (the gateway is only for an owner who did); the network off: the
+    // workspace's own remotes go through the gateway, connected or not.
+    const other = join(t.tmp, "other.git");
+    git(["init", "-q", "--bare", "-b", "main", other], t.tmp);
+    git(["push", "-q", `file://${other}`, "main"], t.workdir);
+    expect(await m.handle({ type: "sandbox.git_connect", id: "c-other", action: "connect", url: `file://${other}` } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
     const info = infoOf(await t.create(m, { sandbox: { network: "off" } }));
     const session = m.findByName(info?.name as string, AUTH);
     if (!session) throw new Error("no session");

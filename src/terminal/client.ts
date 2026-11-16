@@ -470,6 +470,16 @@ export class TerminalClient {
   }
 
   /** Add a directory to what a session's commands write, or remove one (docs/sandbox.md, Working across repositories). */
+  /** The URL a connect from `path` would connect (its remote's, as the repository's config names it), or null (said). */
+  async sandboxGitResolve(path: string, remote?: string): Promise<{ url: string; rawUrl: string; connected: boolean } | null> {
+    const resp = await this.#request({ type: "sandbox.git_connect", id: randomUUID(), action: "resolve", path, ...(remote ? { remote } : {}) });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return null;
+    }
+    return resp.data as { url: string; rawUrl: string; connected: boolean };
+  }
+
   /** The git gateway's connections (docs/git-gateway-design.md): connect, disconnect or list the caller's. */
   async sandboxGitConnect(action: "connect" | "disconnect" | "list", o: { url?: string; path?: string; remote?: string; token?: string }): Promise<void> {
     const resp = await this.#request({ type: "sandbox.git_connect", id: randomUUID(), action, ...o });
@@ -492,6 +502,7 @@ export class TerminalClient {
     console.log(`Connected: agents in your sandboxed sessions may fetch from ${sanitizeTerminalOutput(data.url ?? "")} and push branches of their own, with ${how}.`);
     console.log("  Never main, master or the remote's default branch; no force push, no deletes, no tags. In guarded mode you're asked for each push.");
     console.log("  A pushed branch runs the repository's CI as that branch defines it, with the CI's secrets.");
+    if (process.platform === "linux") console.log("  On Linux, Claude's own sandbox can't let in one unix socket alone: with a remote connected, its commands can reach the other unix sockets they can see (local database sockets stay hidden).");
   }
 
   async sandboxDir(sessionIdOrName: string, action: "add" | "remove", path: string): Promise<void> {

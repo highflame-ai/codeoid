@@ -333,7 +333,7 @@ export const sandboxProvidersSchema = z.object({ ...base, type: z.literal("sandb
 export const sandboxGitConnectSchema = z.object({
   ...base,
   type: z.literal("sandbox.git_connect"),
-  action: z.enum(["connect", "disconnect", "list"]),
+  action: z.enum(["connect", "disconnect", "list", "resolve"]),
   url: z.string().min(1).max(2048).optional(),
   path: z.string().min(1).max(4096).optional(),
   remote: z.string().min(1).max(100).regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/).optional(),

@@ -12,7 +12,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import { dirname } from "node:path";
 import { GIT_BIN } from "../git-env.js";
 import { remoteUrlProblem } from "./text.js";
-import { gitError, type HttpsCredential, runGit, systemSsh, type Upstream, type UpstreamKind, upstreamEnv, upstreamKind } from "./upstream.js";
+import { gitError, type HttpsCredential, lsRemote, runGit, systemSsh, type Upstream, type UpstreamKind, upstreamKind } from "./upstream.js";
 
 /** How a connection authenticates. */
 export type ConnectionAuth = "ssh" | "git-credential" | "token";
@@ -76,13 +76,26 @@ export function tokenCredential(url: string, token: string): HttpsCredential {
   return { username, password: t };
 }
 
-/** The owner's own credential for an https URL, as `git push` would find it (their helpers, run once, now). */
-// paths: git credential fill, run by the daemon for the owner, at their request (never an agent's)
+/**
+ * The environment `git credential fill` runs in: the owner's own, for their helpers (keychains, a desktop's secret
+ * service), but nothing that points git at a repository or adds config: no `GIT_*` of the daemon's.
+ */
+function ownerHelperEnv(): Record<string, string> {
+  const keep = /^(HOME|PATH|USER|LOGNAME|LANG|LC_[A-Z]+|TMPDIR|XDG_[A-Z_]+|DBUS_SESSION_BUS_ADDRESS|DISPLAY|WAYLAND_DISPLAY|SSH_AUTH_SOCK|GNUPGHOME|PASSWORD_STORE_DIR)$/;
+  const env: Record<string, string> = {};
+  for (const [k, v] of Object.entries(process.env)) if (v !== undefined && keep.test(k)) env[k] = v;
+  return { ...env, GIT_TERMINAL_PROMPT: "0", GIT_CEILING_DIRECTORIES: "/" };
+}
+
+/**
+ * The owner's own credential for an https URL, as their `git push` would find it: their global and system config's
+ * helpers, run once, now, from `/` (no repository's config is ever read: not the daemon's cwd's, not an agent's).
+ */
+// paths: git credential fill, run by the daemon for the owner, at their request (never an agent's), from /
 export function fillGitCredential(url: string, timeoutMs = 60_000): Promise<HttpsCredential | { error: string }> {
   const u = new URL(url);
   return new Promise((done) => {
-    const env = { ...process.env, GIT_TERMINAL_PROMPT: "0" } as Record<string, string>;
-    const p = spawn(GIT_BIN, ["credential", "fill"], { env, stdio: ["pipe", "pipe", "pipe"] });
+    const p = spawn(GIT_BIN, ["-C", "/", "--no-pager", "credential", "fill"], { cwd: "/", env: ownerHelperEnv(), stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     p.stdout.on("data", (d: Buffer) => {
       out += d.toString("utf8");
@@ -94,11 +107,20 @@ export function fillGitCredential(url: string, timeoutMs = 60_000): Promise<Http
       const username = field("username");
       const password = field("password");
       if (code === 0 && username && password) done({ username, password });
-      else done({ error: `your git has no credential for ${u.host} (git credential fill found none): sign in with git once, or connect with a token` });
+      else done({ error: `your git has no credential for ${u.host} (git credential fill found none): sign in with git once, or connect with --token` });
     });
     p.on("error", (err) => done({ error: err.message }));
     p.stdin.end(`protocol=${u.protocol.replace(/:$/, "")}\nhost=${u.host}\n\n`);
   });
+}
+
+/** The owner's CA bundle for `url` (`http.sslCAInfo`, by URL, from their global or system config; or GIT_SSL_CAINFO). */
+// paths: git config read for the owner, from / (no repository)
+async function ownerCaInfo(url: string): Promise<string | undefined> {
+  if (process.env.GIT_SSL_CAINFO) return process.env.GIT_SSL_CAINFO;
+  const r = await runGit(["-C", "/", "config", "--get-urlmatch", "http.sslcainfo", url], "/", ownerHelperEnv(), 10_000);
+  const v = r.code === 0 ? r.stdout.trim() : "";
+  return v || undefined;
 }
 
 export interface ConnectOptions {
@@ -106,6 +128,8 @@ export interface ConnectOptions {
   token?: string;
   /** What sandboxed sessions may write: the system ssh mustn't be there. */
   writable: readonly string[];
+  /** The gateway's private dir for a run's credential file. */
+  runDir: string;
   /** Tests only: a local bare repository as the remote. */
   testFile?: boolean;
   /** Tests only: the owner's credential, instead of `git credential fill`. */
@@ -136,11 +160,12 @@ export async function probeConnection(
   if (kind === "https") {
     const c = o.token ? tokenCredential(url, o.token) : await (o.fill ?? fillGitCredential)(url);
     if ("error" in c) return c;
-    credential = c;
+    const caInfo = await ownerCaInfo(url);
+    credential = { ...c, ...(caInfo ? { caInfo } : {}) };
     auth = o.token ? "token" : "git-credential";
   }
-  const upstream: Upstream = { url, kind, ...(credential ? { credential } : {}), ...(o.testFile ? { testFile: true } : {}) };
-  const r = await runGit(["ls-remote", "--heads", "--", url], "/", upstreamEnv(upstream, ssh), 60_000);
+  const upstream: Upstream = { url, kind, runDir: o.runDir, ...(credential ? { credential } : {}), ...(o.testFile ? { testFile: true } : {}) };
+  const r = await lsRemote(upstream, ssh);
   if (r.code !== 0) return { error: gitError(r, `your ${kind === "ssh" ? "ssh key" : "credential"} didn't reach ${url}`) };
   return { kind, auth, ...(credential ? { credential } : {}), upstream, ssh };
 }

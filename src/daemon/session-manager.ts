@@ -2429,7 +2429,7 @@ mcpHub: this.#mcpHub,
    * keeps detected secrets.
    */
   #wireSecretService(secrets: SecretService): void {
-    registerSecretPaths({ dirs: [secretMaterialDir(getConfigDir())] });
+    registerSecretPaths({ dirs: [secretMaterialDir(getConfigDir()), join(getConfigDir(), "git-gateway")] });
     // Settled dispatch tasks and routine runs keep no secret either (§2.6).
     this.#store.scrubText = (text) => secrets.scrub(text).text;
     secrets.setCapturePolicy((ws) => (ws ? (this.#workstreams.get(ws)?.captureSecrets ?? "drop") : (this.#config?.secrets?.captureSecrets ?? "drop")));
@@ -4657,9 +4657,12 @@ mcpHub: this.#mcpHub,
   readonly #gitGatewayFor = (sessionId: string): GitGatewaySpec | undefined => {
     const g = this.#gitGatewayInstance();
     if (!g) return undefined;
+    if (sandboxConfigOf(this.#config).git?.enabled === false) return undefined;
     const owner = this.#sessions.get(sessionId)?.createdBy ?? this.#store.getSession(sessionId)?.createdBy;
     const urls = owner ? this.#store.listGitConnections(owner).map((c) => c.url) : [];
-    return { ...g.forSession(sessionId), urls };
+    // Only for an owner who connected a remote: nothing changes for anyone else's sessions.
+    if (urls.length === 0) return undefined;
+    return { ...g.forSession(sessionId), urls, root: g.root };
   };
 
   /** What any live sandboxed session's commands may write: no program the gateway runs on the host is there. */
@@ -4668,7 +4671,7 @@ mcpHub: this.#mcpHub,
   /** Connect `url` for `owner`: their credential proved to reach it, then recorded (an https one kept, 0600). */
   async #connectGit(owner: string, url: string, by: string, token?: string): Promise<{ kind: string; auth: string } | { error: string }> {
     if (!this.#gitGatewayInstance() || !this.#gitCredentials) return { error: "the git gateway isn't available on this daemon" };
-    const probe = await probeConnection(url, { ...(token ? { token } : {}), writable: this.#allSandboxWritable(), ...(testFileRemote(url) ? { testFile: true } : {}) });
+    const probe = await probeConnection(url, { ...(token ? { token } : {}), writable: this.#allSandboxWritable(), runDir: join(getConfigDir(), "git-gateway", "run"), ...(testFileRemote(url) ? { testFile: true } : {}) });
     if ("error" in probe) return { error: probe.error };
     const id = connectionId(owner, url);
     if (probe.credential) this.#gitCredentials.set(id, probe.credential);
@@ -4711,15 +4714,21 @@ mcpHub: this.#mcpHub,
         upstream: { url, kind: conn.kind, ...(credential ? { credential } : {}), ...(testFileRemote(url) ? { testFile: true } : {}) },
         ssh,
         protectedBranches: session.gitProtectedBranches,
+        agentBranches: this.#store.gitAgentBranches(owner, url),
         cacheKey: connectionId(owner, url),
       };
     },
-    approve: async (sessionId, push) => {
+    approve: async (sessionId, push, signal) => {
       const session = this.#sessions.get(sessionId);
-      return session ? session.decideGitPush(push) : { refused: "this session is gone" };
+      return session ? session.decideGitPush(push, signal) : { refused: "this session is gone" };
     },
     report: (sessionId, e) => {
-      this.#sessions.get(sessionId)?.noteGit(e);
+      const session = this.#sessions.get(sessionId);
+      // A branch an agent made: one it may move again later (fast-forward only).
+      if (session && e.kind === "push" && e.ok) {
+        for (const u of e.updates ?? []) if (/^0+$/.test(u.old) && u.ref.startsWith("refs/heads/")) this.#store.noteGitAgentBranch(session.createdBy, e.url, u.ref.slice("refs/heads/".length));
+      }
+      session?.noteGit(e);
     },
   };
 
@@ -4741,6 +4750,8 @@ mcpHub: this.#mcpHub,
       }
       if (!url) return fail(`There is no remote named ${remote} in ${msg.path}.`);
     }
+    // What a connect from a repository would connect: the CLI shows it, and asks, first.
+    if (msg.action === "resolve") return { type: "response.ok", requestId: msg.id, data: { url: shownUrl(url), rawUrl: url, connected: !!this.#store.gitConnection(auth.sub, url) } };
     if (msg.action === "disconnect") {
       const removed = this.#store.removeGitConnection(auth.sub, url);
       this.#gitCredentials?.remove(connectionId(auth.sub, url));

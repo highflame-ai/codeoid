@@ -396,6 +396,15 @@ export class Store {
         PRIMARY KEY (owner, url)
       );
 
+      -- Branches agents made on a connected remote through the git gateway: the only existing ones they may move.
+      CREATE TABLE IF NOT EXISTS git_agent_branches (
+        owner      TEXT NOT NULL,
+        url        TEXT NOT NULL,
+        branch     TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (owner, url, branch)
+      );
+
       CREATE TABLE IF NOT EXISTS session_pins (
         session_id  TEXT NOT NULL,
         file_path   TEXT NOT NULL,
@@ -2321,9 +2330,20 @@ export class Store {
       .run(c.owner, c.url, c.kind, c.auth, c.connectedBy, Date.now());
   }
 
-  /** Disconnect; whether it was connected. */
+  /** Disconnect; whether it was connected. Its agents' branch record goes too. */
   removeGitConnection(owner: string, url: string): boolean {
+    this.#db.prepare("DELETE FROM git_agent_branches WHERE owner = ? AND url = ?").run(owner, url);
     return this.#db.prepare("DELETE FROM git_connections WHERE owner = ? AND url = ?").run(owner, url).changes > 0;
+  }
+
+  /** A branch an agent made on a connected remote through the gateway. */
+  noteGitAgentBranch(owner: string, url: string, branch: string): void {
+    this.#db.prepare("INSERT OR IGNORE INTO git_agent_branches (owner, url, branch, created_at) VALUES (?, ?, ?, ?)").run(owner, url, branch, Date.now());
+  }
+
+  /** The branches agents made on `url` for `owner`. */
+  gitAgentBranches(owner: string, url: string): Set<string> {
+    return new Set((this.#db.prepare("SELECT branch FROM git_agent_branches WHERE owner = ? AND url = ?").all(owner, url) as Array<{ branch: string }>).map((r) => r.branch));
   }
 
   /** One owner's connection for a URL, if any. */
