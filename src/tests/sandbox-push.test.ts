@@ -265,7 +265,7 @@ describe("push: the plan", () => {
     expect(verdict(`# v3 git bundle\n${"@object-format=sha1\n".repeat(2)}${sha} refs/heads/x\n\n`)).toMatchObject({ problem: expect.stringContaining("capability") });
     expect(verdict(`# v3 git bundle\n${"@object-format=sha1\n".repeat(5000)}@filter=blob:none\n\n`)).toMatchObject({ problem: expect.any(String) });
     expect(verdict(`# v2 git bundle\n@object-format=sha1\n${sha} refs/heads/x\n\n`)).toMatchObject({ problem: expect.stringContaining("capability") });
-    expect(verdict(`# v2 git bundle\ngitdir: /x\n\n`)).toMatchObject({ problem: expect.stringContaining("isn't a ref") });
+    expect(verdict("# v2 git bundle\ngitdir: /x\n\n")).toMatchObject({ problem: expect.stringContaining("isn't a ref") });
     // A sha256 repository pushes (its bundle staged in a sha256 repository).
     const s256 = join(root, "s256");
     const bare256 = join(root, "s256.git");
