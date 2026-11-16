@@ -117,7 +117,7 @@ describe("push: the plan", () => {
   test("round 3: an owner's trust matches only the same repository, remote, URL and repository settings", async () => {
     const { trustMatches } = await import("../daemon/sandbox/push.js");
     const p = await planned();
-    const trust = { common: p.common, remote: p.remote, url: p.url, repoSettings: p.repoSettings };
+    const trust = { common: p.common, remote: p.remote, url: p.url, repoSettings: p.repoSettings, userSettings: p.userSettings };
     expect(trustMatches(trust, p)).toBe(true);
     expect(trustMatches(null, p)).toBe(false);
     expect(trustMatches({ ...trust, url: "https://elsewhere.example/x.git" }, p)).toBe(false);
@@ -132,6 +132,60 @@ describe("push: the plan", () => {
     git(repo, "config", "branch.feature/x.remote", "origin");
     writeFileSync(join(repo, ".gitattributes"), "*.png binary\n");
     expect(trustMatches(trust, await planned())).toBe(true);
+  });
+
+  test("round 4: a rewrite in the repository's own config, or a remote section named as a URL, is refused", async () => {
+    for (const k of [`url.file://${root}/evil.git.pushInsteadOf`, `url.file://${root}/evil.git.insteadOf`]) {
+      git(repo, "config", k, `file://${bare}`);
+      expect([k, await refusal()]).toEqual([k, expect.stringContaining("never uses for a push it makes")]);
+      git(repo, "config", "--unset", k);
+    }
+    git(repo, "config", `remote.file://${bare}.pushurl`, `file://${root}/evil.git`);
+    expect(await refusal()).toContain("a remote section named as a URL");
+    git(repo, "config", "--remove-section", `remote.file://${bare}`);
+    // In your global config too (git applies it to a push to that URL).
+    writeFileSync(join(root, ".gitconfig"), `[remote "file://${bare}"]\n\tpushurl = file://${root}/evil.git\n`);
+    expect(await refusal()).toContain("a remote section named as a URL");
+  });
+
+  test("round 4: your own rewrite is followed and shown: the URL checked, shown and trusted is where git pushes", async () => {
+    const other = join(root, "other.git");
+    git(root, "init", "-q", "--bare", "-b", "main", other);
+    writeFileSync(join(root, ".gitconfig"), `[url "file://${other}"]\n\tpushInsteadOf = file://${bare}\n`);
+    const p = await planned();
+    expect(p).toMatchObject({ url: `file://${other}`, configuredUrl: `file://${bare}` });
+    expect(p.userSettings.some((x) => x.includes("pushinsteadof"))).toBe(true);
+    const r = await runPush(p, 60_000, true);
+    expect(r.ok).toBe(true);
+    expect(git(other, "rev-parse", "refs/heads/feature/x")).toBe(p.sha);
+    // Changed after the plan: the push doesn't start.
+    const p2 = await planned();
+    writeFileSync(join(root, ".gitconfig"), "");
+    expect(await runPush(p2, 60_000, true)).toMatchObject({ ok: false, summary: expect.stringContaining("changed since it was checked") });
+  });
+
+  test("round 4: a link anywhere in the git store (a ref, a loose-object dir) is refused, at the plan and right before git", async () => {
+    const { gitStoreProblem } = await import("../daemon/sandbox/push.js");
+    const secret = join(root, "secret");
+    mkdirSync(secret);
+    git(secret, "init", "-q", "-b", "topsecret");
+    symlinkSync(join(secret, ".git", "refs", "heads"), join(repo, ".git", "refs", "heads", "leak"));
+    expect(await refusal({ branch: "feature/x" })).toContain("is a link");
+    rmSync(join(repo, ".git", "refs", "heads", "leak"));
+    const p = await planned();
+    const fan = join(repo, ".git", "objects", "ab");
+    rmSync(fan, { recursive: true, force: true });
+    symlinkSync(join(secret, ".git", "objects"), fan);
+    expect(gitStoreProblem(join(repo, ".git"), null)).toContain("objects/ab is a link");
+    expect(await runPush(p, 60_000, true)).toMatchObject({ ok: false, summary: expect.stringContaining("is a link") });
+  });
+
+  test("round 4: your global push settings are part of a trust: one changed since doesn't match", async () => {
+    const { trustMatches } = await import("../daemon/sandbox/push.js");
+    const p = await planned();
+    const trust = { common: p.common, remote: p.remote, url: p.url, repoSettings: p.repoSettings, userSettings: p.userSettings };
+    writeFileSync(join(root, ".gitconfig"), "[http]\n\tproxy = http://changed.example:1\n");
+    expect(trustMatches(trust, await planned())).toBe(false);
   });
 
   test("round 1: an include of your global config that the agent can write decides nothing, even empty or missing now; your own ssh command is used", async () => {

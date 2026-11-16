@@ -524,7 +524,15 @@ export class TerminalClient {
       this.#printError(resp);
       return;
     }
-    const data = resp.data as { trusts?: Array<{ common: string; remote: string; url: string; trustedAt: number }>; repository?: string; remote?: string; url?: string; removed?: boolean };
+    const data = resp.data as {
+      trusts?: Array<{ common: string; remote: string; url: string; trustedAt: number }>;
+      repository?: string;
+      remote?: string;
+      url?: string;
+      configuredUrl?: string;
+      settings?: string[];
+      removed?: boolean;
+    };
     if (action === "list") {
       const trusts = data.trusts ?? [];
       if (trusts.length === 0) {
@@ -538,7 +546,9 @@ export class TerminalClient {
       console.log(data.removed ? `No longer trusted: agent pushes from ${sanitizeTerminalOutput(data.repository ?? "")} to ${data.remote}.` : "It wasn't trusted.");
       return;
     }
-    console.log(`Trusted: agents may push from ${sanitizeTerminalOutput(data.repository ?? "")} to ${data.remote} (${sanitizeTerminalOutput(data.url ?? "")}), autonomous mode included — as long as its URL and settings stay as they are now.`);
+    console.log(`Trusted: agents may push from ${sanitizeTerminalOutput(data.repository ?? "")} to ${data.remote}, at ${sanitizeTerminalOutput(data.url ?? "")}, autonomous mode included — as long as that and these settings stay as they are now.`);
+    if (data.configuredUrl) console.log(`  (the remote's config says ${sanitizeTerminalOutput(data.configuredUrl)}; a URL rewrite in your git config sends it to the address above)`);
+    for (const x of data.settings ?? []) console.log(`  repository setting: ${sanitizeTerminalOutput(x)}`);
   }
 
   /** The daemon's sandbox providers and whether each runs here (#448). */

@@ -387,14 +387,17 @@ export class Store {
       -- An owner's trust in a repository's remote for the sandbox's push tool (sandbox/push.ts): the
       -- repository (its git dir), the remote, its URL and what the repository's own config says that decides
       -- a push. An autonomous push goes only where this matches exactly. Not session-scoped.
+      -- One owner's: it decides only that owner's sessions' pushes (a shared daemon's other users trust their own).
       CREATE TABLE IF NOT EXISTS push_trust (
+        owner         TEXT NOT NULL,
         common        TEXT NOT NULL,
         remote        TEXT NOT NULL,
         url           TEXT NOT NULL,
         repo_settings TEXT NOT NULL,
+        user_settings TEXT NOT NULL,
         trusted_by    TEXT NOT NULL,
         trusted_at    INTEGER NOT NULL,
-        PRIMARY KEY (common, remote)
+        PRIMARY KEY (owner, common, remote)
       );
 
       CREATE TABLE IF NOT EXISTS session_pins (
@@ -2315,42 +2318,46 @@ export class Store {
     return rows.map(compareRowFrom);
   }
 
-  /** Trust (replace) a repository's remote for agent pushes (sandbox/push.ts). */
-  setPushTrust(t: { common: string; remote: string; url: string; repoSettings: string[] }, by: string): void {
+  /** Trust (replace) a repository's remote for one owner's agents' pushes (sandbox/push.ts). */
+  setPushTrust(owner: string, t: { common: string; remote: string; url: string; repoSettings: string[]; userSettings: string[] }, by: string): void {
     this.#db
-      .prepare("INSERT OR REPLACE INTO push_trust (common, remote, url, repo_settings, trusted_by, trusted_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(t.common, t.remote, t.url, JSON.stringify(t.repoSettings), by, Date.now());
+      .prepare("INSERT OR REPLACE INTO push_trust (owner, common, remote, url, repo_settings, user_settings, trusted_by, trusted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+      .run(owner, t.common, t.remote, t.url, JSON.stringify(t.repoSettings), JSON.stringify(t.userSettings), by, Date.now());
   }
 
-  /** Take a trust back; true when there was one. */
-  removePushTrust(common: string, remote: string): boolean {
-    return this.#db.prepare("DELETE FROM push_trust WHERE common = ? AND remote = ?").run(common, remote).changes > 0;
+  /** Take a trust back (every remote of `common` when `remote` is absent); how many went. */
+  removePushTrust(owner: string, common: string, remote?: string): number {
+    return remote === undefined
+      ? this.#db.prepare("DELETE FROM push_trust WHERE owner = ? AND common = ?").run(owner, common).changes
+      : this.#db.prepare("DELETE FROM push_trust WHERE owner = ? AND common = ? AND remote = ?").run(owner, common, remote).changes;
   }
 
-  /** The trust for a repository's remote, if any. */
-  pushTrust(common: string, remote: string): { common: string; remote: string; url: string; repoSettings: string[]; trustedBy: string; trustedAt: number } | null {
-    const row = this.#db.prepare("SELECT common, remote, url, repo_settings, trusted_by, trusted_at FROM push_trust WHERE common = ? AND remote = ?").get(common, remote) as
-      | { common: string; remote: string; url: string; repo_settings: string; trusted_by: string; trusted_at: number }
+  /** One owner's trust for a repository's remote, if any (a malformed row is none). */
+  pushTrust(owner: string, common: string, remote: string): { common: string; remote: string; url: string; repoSettings: string[]; userSettings: string[] } | null {
+    const row = this.#db.prepare("SELECT common, remote, url, repo_settings, user_settings FROM push_trust WHERE owner = ? AND common = ? AND remote = ?").get(owner, common, remote) as
+      | { common: string; remote: string; url: string; repo_settings: string; user_settings: string }
       | null;
     if (!row) return null;
-    let repoSettings: string[] = [];
-    try {
-      const parsed = JSON.parse(row.repo_settings) as unknown;
-      if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string")) repoSettings = parsed;
-      else return null;
-    } catch {
-      return null;
-    }
-    return { common: row.common, remote: row.remote, url: row.url, repoSettings, trustedBy: row.trusted_by, trustedAt: row.trusted_at };
+    const list = (raw: string): string[] | null => {
+      try {
+        const v = JSON.parse(raw) as unknown;
+        return Array.isArray(v) && v.every((x) => typeof x === "string") ? (v as string[]) : null;
+      } catch {
+        return null;
+      }
+    };
+    const repoSettings = list(row.repo_settings);
+    const userSettings = list(row.user_settings);
+    if (!repoSettings || !userSettings) return null;
+    return { common: row.common, remote: row.remote, url: row.url, repoSettings, userSettings };
   }
 
-  /** Every trust, newest first. */
-  listPushTrust(): Array<{ common: string; remote: string; url: string; trustedBy: string; trustedAt: number }> {
-    return this.#db.prepare("SELECT common, remote, url, trusted_by AS trustedBy, trusted_at AS trustedAt FROM push_trust ORDER BY trusted_at DESC").all() as Array<{
+  /** One owner's trusts, newest first. */
+  listPushTrust(owner: string): Array<{ common: string; remote: string; url: string; trustedAt: number }> {
+    return this.#db.prepare("SELECT common, remote, url, trusted_at AS trustedAt FROM push_trust WHERE owner = ? ORDER BY trusted_at DESC").all(owner) as Array<{
       common: string;
       remote: string;
       url: string;
-      trustedBy: string;
       trustedAt: number;
     }>;
   }

@@ -1271,13 +1271,18 @@ machine, with your network and your credentials, which the agent never sees.
 
 **Where it goes: your trust**
 
-Where an agent may push is yours to say, once per repository and remote.
-Trusting one records:
+Where an agent may push is yours to say, once per repository and remote. A
+trust is yours alone: on a shared daemon, it decides only your own sessions'
+pushes. Trusting one records:
 
 - the repository (its git dir);
 - the remote;
-- the remote's URL;
-- what the repository's own config says that decides a push.
+- where git will really push: the remote's push URL after every rewrite, as
+  `git remote get-url --push` resolves it. This is also the URL shown on the
+  card and in the terminal;
+- what the repository's own config says that decides a push;
+- what your global and system config say that decides a push (include lines
+  aside).
 
 The record lives in the daemon's database, which no agent can write. A push
 goes only where all of that still matches. Another URL, a rewrite, or a
@@ -1288,8 +1293,10 @@ Nothing on disk stands in for your trust. That includes a repository an agent
 made, a fork or worktree of one, or an old directory renamed into `.git`.
 
 - **Trust from the terminal:** `codeoid sandbox trust-push [dir] [--remote r]`.
-  Stop trusting with `--off`, and list with `--list`. You need
-  `settings:write`, and a delegated token can't do it.
+  It prints the URL and the repository's settings it trusted. Stop trusting
+  with `--off`, which always works, even for a repository that is broken, moved
+  or gone. List with `--list`. You need `settings:write`, and a delegated token
+  can't do it.
 - **Trust from a card:** in guarded mode, the push card offers "Push, and
   trust … for this repository's agent pushes".
 - **Autonomous mode** pushes only where you have trusted. Anything else is
@@ -1302,10 +1309,20 @@ On top of that, every push is checked the same way, trusted or not:
 - Includes are judged by the file they name, whatever it holds now, because
   git reads it again when it pushes. An include in the repository's own
   config is refused. An include in your config is refused if it names a file
-  the session's commands may write, even an empty or missing one.
+  the commands of any live sandboxed session may write, even an empty or
+  missing one.
+- No link anywhere in the git store the push reads: refs, objects, packed-refs,
+  HEAD and shallow. git runs on the host, where a link an agent made would be
+  followed into a repository the sandbox hides. Checked at the plan and again
+  right before git starts.
+- git pushes to the remote by name, so it resolves the destination exactly as
+  checked. The destination is resolved again right before git starts, and if
+  it changed, nothing is pushed.
 
-From the repository's config, codeoid takes the remote's `url`/`pushurl`,
-`url.*.insteadOf` and `push.*`. It never takes what would turn a push into a
+From the repository's config, codeoid takes the remote's `url`/`pushurl` and
+`push.*`. It never takes a URL rewrite (`url.*.insteadOf` / `pushInsteadOf`),
+and never a remote section named as a URL, from any config: git applies such a
+section to pushes to that URL. It never takes what would turn a push into a
 credential leak or a command on the remote host: `http.*` (bar `postBuffer`,
 `version` and the low-speed limits), `credential.*`, `core.sshCommand`,
 `ssh.variant`, `protocol.*`, and a remote's `receivepack`, `vcs` or `proxy`.

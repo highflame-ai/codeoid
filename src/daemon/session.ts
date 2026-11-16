@@ -248,7 +248,7 @@ import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/v
 /** What is recorded of a call the user listed in `secrets.dropCommands`. */
 const NOT_STORED = "‹not stored›";
 import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
-import { planPush, remoteDefaultBranch, runPush, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
+import { planPush, remoteDefaultBranch, runPush, shownUrl, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -517,6 +517,8 @@ export interface SessionCreateOptions {
   requestDirectoryWaitMs?: number;
   /** Tests only: the push tool's whole budget (ms). */
   pushBudgetMs?: number;
+  /** What every other live sandboxed session's commands may write (the manager's), for the push tool's checks. */
+  otherSessionsWritable?: () => string[];
   /** Optional memory engine — when provided, episodes are chunked and stored for recall. */
   memory?: MemoryEngine;
   /** Shared in-daemon memory MCP endpoint + URL, for URL-mounting backends. */
@@ -1591,6 +1593,7 @@ export class Session {
   #pushAbort: AbortController | null = null;
   /** Tests only: the push's whole budget (ms), the owner's answer included. */
   #pushBudgetMs: number | undefined;
+  #otherSessionsWritable: (() => string[]) | undefined;
 
   /** The pin change last said on the session (#sandboxPinRefusal): said once per change. */
   #pinSaid: string | null = null;
@@ -1925,6 +1928,7 @@ export class Session {
     this.#sandboxCheckouts = opts.sandboxCheckouts;
     this.#requestDirectoryWaitMs = opts.requestDirectoryWaitMs;
     this.#pushBudgetMs = opts.pushBudgetMs;
+    this.#otherSessionsWritable = opts.otherSessionsWritable;
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
     this.#collaborationCost = opts.collaborationCost;
@@ -4256,7 +4260,8 @@ export class Session {
     const planOpts = {
       protectedBranches: cfg?.protectedBranches ?? ["main", "master"],
       heldReadOnly: spec.readOnly ?? [],
-      agentWritable: [spec.workspace, spec.tempDir, ...spec.writable, ...sbx.worktreeFolders()],
+      // What this session's commands may write, and every other sandboxed session's: a file there decides nothing.
+      agentWritable: [spec.workspace, spec.tempDir, ...spec.writable, ...sbx.worktreeFolders(), ...(this.#otherSessionsWritable?.() ?? [])],
       remoteDefault: remoteDefaultBranch,
       lookupTimeoutMs: Math.min(30_000, Math.max(1_000, (left() - reserveMs) / 4)),
       signal,
@@ -4269,7 +4274,7 @@ export class Session {
     // Where a push may go is the owner's to say, once per repository and remote: the URL, and what the repository's
     // own config says that decides a push, exactly as they trusted it (sandbox/push.ts trustMatches). Nothing on
     // disk an agent could have made or changed stands in for that.
-    const trusted = trustMatches(this.#store.pushTrust(plan.common, plan.remote), plan);
+    const trusted = trustMatches(this.#store.pushTrust(this.createdBy, plan.common, plan.remote), plan);
     if (this.#mode === "autonomous") {
       if (!trusted) {
         return refuse(
@@ -4280,7 +4285,8 @@ export class Session {
         return refuse(`codeoid couldn't ask ${plan.shownUrl} which branch is its default, so it can't be sure ${plan.branch} isn't it: try again, or ask the owner to push`);
       }
     }
-    const described = `${plan.branch} (commit ${plan.sha.slice(0, 12)}) to ${plan.remote} — ${plan.shownUrl}`;
+    const rewritten = plan.configuredUrl ? ` (the remote's config says ${shownUrl(plan.configuredUrl)}; a URL rewrite in your git config sends it here)` : "";
+    const described = `${plan.branch} (commit ${plan.sha.slice(0, 12)}) to ${plan.remote} — ${plan.shownUrl}${rewritten}`;
     let by = SYSTEM_IDENTITY.sub;
     if (this.#mode !== "autonomous") {
       let answeredBy: string | undefined;
@@ -4330,7 +4336,7 @@ export class Session {
       }
       by = answeredBy ?? this.createdBy;
       if (chose === TRUST) {
-        this.#store.setPushTrust({ common: plan.common, remote: plan.remote, url: plan.url, repoSettings: plan.repoSettings }, by);
+        this.#store.setPushTrust(this.createdBy, { common: plan.common, remote: plan.remote, url: plan.url, repoSettings: plan.repoSettings, userSettings: plan.userSettings }, by);
         this.#store.audit(by, "session.push_trusted", this.id, `${plan.common} ${plan.remote} ${plan.shownUrl}`);
       }
     }
@@ -4347,6 +4353,13 @@ export class Session {
       sha: plan.sha,
     });
     return `${r.ok ? "Done" : "Failed"}: ${r.summary}.${r.output ? `\n\ngit said:\n${r.output}` : ""}`;
+  }
+
+  /** What this session's sandboxed commands may write (none when it isn't sandboxed or not running). */
+  get sandboxAgentWritable(): string[] {
+    const sbx = this.#sandbox;
+    const spec = sbx?.info?.state === "on" ? sbx.runtime?.spec : undefined;
+    return spec ? [spec.workspace, spec.tempDir, ...spec.writable, ...(sbx?.worktreeFolders() ?? [])] : [];
   }
 
   /** Whether this session's agent is offered `push`: its sandbox on, and pushing not turned off. */

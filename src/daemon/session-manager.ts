@@ -155,7 +155,8 @@ import type { SandboxRegistry } from "./sandbox/registry.js";
 import { canonicalAddedDirs, effectiveSetting, openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import { checkPinned, type PinnedDir, PinnedPathError } from "./sandbox/pinned.js";
 import { sandboxRootIfMade } from "./sandbox/root.js";
-import { hiddenPathsFor, sandboxConfigOf } from "./sandbox/policy.js";
+import { gitLayoutOf, hiddenPathsFor, sandboxConfigOf } from "./sandbox/policy.js";
+import { physicalPath } from "./physical-path.js";
 import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
@@ -1189,6 +1190,7 @@ export class SessionManager {
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           accounts: this.#accounts,
@@ -2069,6 +2071,7 @@ mcpHub: this.#mcpHub,
               providers: this.#providers,
               sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
               claudeAccounts: this.#claudeAccounts,
               hooks: this.#hooks,
@@ -4555,6 +4558,9 @@ mcpHub: this.#mcpHub,
   }
 
   /** A session's `/mcp/sandbox` mount: its own token, minted once. None without a sandbox or the endpoint. */
+  /** What every live sandboxed session's commands may write (sandbox/push.ts: a file there never decides a push). */
+  readonly #allSandboxWritable = (): string[] => [...this.#sessions.values()].flatMap((s) => s.sandboxAgentWritable);
+
   readonly #sandboxMcpFor = (sessionId: string): SandboxMcpMount | undefined => {
     if (!this.#sandboxMcpUrl || !this.#sandboxRegistry) return undefined;
     let token = this.#sandboxMcpTokens.get(sessionId);
@@ -5312,6 +5318,7 @@ mcpHub: this.#mcpHub,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
       ...(sandboxSetting && Object.keys(sandboxSetting).length > 0 ? { sandbox: sandboxSetting } : {}),
       claudeAccounts: this.#claudeAccounts,
@@ -5719,6 +5726,7 @@ mcpHub: this.#mcpHub,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           // The collaboration runs on the accounts its lead was created on.
@@ -6180,6 +6188,7 @@ mcpHub: this.#mcpHub,
         providers: this.#providers,
         sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
         claudeAccounts: this.#claudeAccounts,
         // A fork continues the same conversation — on the same accounts,
@@ -6441,6 +6450,7 @@ mcpHub: this.#mcpHub,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
@@ -6734,6 +6744,7 @@ mcpHub: this.#mcpHub,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
@@ -7772,6 +7783,7 @@ mcpHub: this.#mcpHub,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
@@ -7876,6 +7888,7 @@ mcpHub: this.#mcpHub,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
@@ -8186,6 +8199,7 @@ mcpHub: this.#mcpHub,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
+      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
@@ -10611,21 +10625,51 @@ mcpHub: this.#mcpHub,
     const fail = (error: string, code: "forbidden" | "invalid_request" = "invalid_request"): DaemonMessage => ({ type: "response.error", requestId: msg.id, error, code });
     if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return fail("Missing scope: settings:write", "forbidden");
     if (auth.delegationDepth > 0) return fail("A delegated token can't decide where agents push: the owner does.", "forbidden");
-    if (msg.action === "list") return { type: "response.ok", requestId: msg.id, data: { trusts: this.#store.listPushTrust().map((t) => ({ ...t, url: shownUrl(t.url) })) } };
+    // Each owner's own: what one user trusts decides only their sessions' pushes.
+    if (msg.action === "list") return { type: "response.ok", requestId: msg.id, data: { trusts: this.#store.listPushTrust(auth.sub).map((t) => ({ ...t, url: shownUrl(t.url) })) } };
     if (!msg.path || !isAbsolute(msg.path)) return fail("Give the repository's absolute path.");
     const remote = msg.remote ?? "origin";
-    const target = await readPushTarget(msg.path, remote, { requireHeld: false, agentWritable: [] }).catch((err: unknown) => ({
+    if (msg.action === "untrust") {
+      // Always possible, whatever state the repository is in (moved, broken, gone): by its git dir as found, or
+      // the path as `--list` shows it.
+      const candidates = new Set<string>();
+      try {
+        const layout = gitLayoutOf(msg.path);
+        if (layout?.common) candidates.add(physicalPath(layout.common));
+      } catch {
+        /* judged below */
+      }
+      candidates.add(resolve(msg.path));
+      candidates.add(resolve(msg.path, ".git"));
+      for (const c of [...candidates]) {
+        try {
+          candidates.add(physicalPath(c));
+        } catch {
+          /* gone */
+        }
+      }
+      let removed = 0;
+      for (const c of candidates) removed += this.#store.removePushTrust(auth.sub, c, msg.remote);
+      this.#store.audit(auth.sub, "sandbox.push_untrusted", undefined, `${msg.path} ${msg.remote ?? "*"} removed=${removed}`);
+      return { type: "response.ok", requestId: msg.id, data: { removed: removed > 0, repository: msg.path, remote: msg.remote ?? "every remote" } };
+    }
+    const target = await readPushTarget(msg.path, remote, { requireHeld: false, agentWritable: this.#allSandboxWritable() }).catch((err: unknown) => ({
       refused: err instanceof Error ? err.message : String(err),
     }));
     if ("refused" in target) return fail(`Can't trust pushes from there: ${target.refused}.`);
-    if (msg.action === "untrust") {
-      const removed = this.#store.removePushTrust(target.common, remote);
-      this.#store.audit(auth.sub, "sandbox.push_untrusted", undefined, `${target.common} ${remote}`);
-      return { type: "response.ok", requestId: msg.id, data: { removed, repository: target.repo, remote } };
-    }
-    this.#store.setPushTrust({ common: target.common, remote, url: target.url, repoSettings: target.repoSettings }, auth.sub);
+    this.#store.setPushTrust(auth.sub, { common: target.common, remote, url: target.url, repoSettings: target.repoSettings, userSettings: target.userSettings }, auth.sub);
     this.#store.audit(auth.sub, "sandbox.push_trusted", undefined, `${target.common} ${remote} ${shownUrl(target.url)}`);
-    return { type: "response.ok", requestId: msg.id, data: { repository: target.repo, remote, url: shownUrl(target.url) } };
+    return {
+      type: "response.ok",
+      requestId: msg.id,
+      data: {
+        repository: target.repo,
+        remote,
+        url: shownUrl(target.url),
+        ...(target.configuredUrl ? { configuredUrl: shownUrl(target.configuredUrl) } : {}),
+        settings: target.repoSettings.map((x) => x.split("\t").slice(1).join(" = ")),
+      },
+    };
   }
 
   /** `sandbox.providers` (#448): what the daemon has and whether each runs here. */

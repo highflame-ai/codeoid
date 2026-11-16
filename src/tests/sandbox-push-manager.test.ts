@@ -98,6 +98,24 @@ describe("push, decided by the session", () => {
     expect(await m.handle({ type: "sandbox.trust_push", id: "tp2", action: "trust", path: t.workdir } as never, delegated, CLIENT)).toMatchObject({ type: "response.error", code: "forbidden" });
   });
 
+  it("round 4: a trust is its owner's; it can always be taken back, whatever state the repository is in", async () => {
+    git(["remote", "add", "origin", "https://git.example.invalid/team/repo.git"], t.workdir);
+    const m = t.newManager();
+    const { session } = await t.autonomous(m);
+    git(["checkout", "-q", "-b", "feature/o"], t.workdir);
+    // Another user's trust decides nothing for this owner's session.
+    const other = { ...AUTH, sub: "user:someone-else" };
+    expect(await m.handle({ type: "sandbox.trust_push", id: "t1", action: "trust", path: t.workdir } as never, other, CLIENT)).toMatchObject({ type: "response.ok" });
+    expect(await session.push({})).toContain("the owner hasn't trusted");
+    // The owner's own does; then the remote goes away, and taking it back still works.
+    expect(await m.handle({ type: "sandbox.trust_push", id: "t2", action: "trust", path: t.workdir } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
+    expect(await session.push({})).not.toContain("the owner hasn't trusted");
+    git(["remote", "remove", "origin"], t.workdir);
+    expect(await m.handle({ type: "sandbox.trust_push", id: "t3", action: "untrust", path: t.workdir } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok", data: { removed: true } });
+    const listed = (await m.handle({ type: "sandbox.trust_push", id: "l", action: "list" } as never, AUTH, CLIENT)) as { data?: { trusts: unknown[] } };
+    expect(listed.data?.trusts).toEqual([]);
+  });
+
   it("round 2: a drain during the plan stops it before anything is pushed; push isn't listed where it's off", async () => {
     git(["remote", "add", "origin", "https://git.example.invalid/team/repo.git"], t.workdir);
     const m = t.newManager();

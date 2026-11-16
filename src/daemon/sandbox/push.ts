@@ -26,7 +26,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { GIT_BIN, safeGit, safeGitEnv } from "../git-env.js";
 import { validateBranchName } from "../git-worktree.js";
@@ -107,9 +107,15 @@ export interface PushPlan {
   shownUrl: string;
   /**
    * What the repository's own config says that decides a push (scope, key, value; sorted). With `common`,
-   * `remote` and `url`, what an owner's trust is given to and checked against ({@link trustMatches}).
+   * `remote`, `url` and {@link userSettings}, what an owner's trust is given to and checked against.
    */
   repoSettings: string[];
+  /** The same from your global and system config (no include lines). */
+  userSettings: string[];
+  /** A linked worktree's own git dir, else null (its refs are checked for links too). */
+  own: string | null;
+  /** The remote's URL as configured, when a rewrite of yours makes {@link url} differ; else null. */
+  configuredUrl: string | null;
 }
 
 export interface PlanOptions {
@@ -175,7 +181,7 @@ const USER_SCOPES = new Set(["global", "system", "command"]);
  * leak or a command on the remote host (a proxy, TLS off, extra headers, the remote's receive-pack program, a
  * remote helper, ssh's command or variant, protocol allowances). Rare per repository; set them globally.
  */
-const REPO_REFUSED = /^(?:https?\.(?!(?:[\s\S]+\.)?(?:postbuffer|version|lowspeedlimit|lowspeedtime|maxrequests)$)[\s\S]*|remote\.[\s\S]+\.(?:receivepack|vcs|proxy)|core\.sshcommand|ssh\.variant|protocol\.[\s\S]*|credential\.[\s\S]*)$/i;
+const REPO_REFUSED = /^(?:https?\.(?!(?:[\s\S]+\.)?(?:postbuffer|version|lowspeedlimit|lowspeedtime|maxrequests)$)[\s\S]*|remote\.[\s\S]+\.(?:receivepack|vcs|proxy)|url\.[\s\S]+\.(?:insteadof|pushinsteadof)|core\.sshcommand|ssh\.variant|protocol\.[\s\S]*|credential\.[\s\S]*)$/i;
 
 /**
  * Where an entry may come from to decide a push: your global and system config's own files (an include they
@@ -247,10 +253,17 @@ async function config(repo: string, pattern: string): Promise<OriginEntry[]> {
 export interface PushTarget {
   repo: string;
   common: string;
+  /** A linked worktree's own git dir (its HEAD and refs), else null. */
+  own: string | null;
   remote: string;
+  /** Where git will push: the remote's push URL after every rewrite (`git remote get-url --push`). */
   url: string;
+  /** As the remote's config writes it, when a rewrite of yours changes it; else null. */
+  configuredUrl: string | null;
   sshCommand: string | null;
   repoSettings: string[];
+  /** What your global and system config say that decides a push (no include lines): part of a trust too. */
+  userSettings: string[];
 }
 
 /**
@@ -274,9 +287,10 @@ export async function readPushTarget(
     return refuse("this session's workspace isn't a git repository");
   }
   const common = physicalPath(layout.common);
-  // Another repository's objects reachable through alternates (or a link) would go out with the push.
-  const objects = objectsProblem(common);
-  if (objects) return refuse(objects);
+  // Another repository's objects reachable through alternates would go out with the push (links: below).
+  for (const f of ["alternates", "http-alternates"]) {
+    if (existsSync(join(common, "objects", "info", f))) return refuse(`the repository borrows objects from elsewhere (objects/info/${f})`);
+  }
   const own = [physicalPath(join(common, "config")), ...(layout.own ? [physicalPath(join(layout.own, "config.worktree"))] : [physicalPath(join(common, "config.worktree"))])];
   // The repository's config can't change between this look and git's own read of it while the sandbox holds it
   // read-only: the session's repository (its git dir as the spec holds it), not one made or reached otherwise.
@@ -291,6 +305,11 @@ export async function readPushTarget(
   for (const e of entries) {
     const problem = originProblem(e, own, repo, writable) ?? includeProblem(e, repo, writable, opts.home);
     if (problem) return refuse(problem);
+    // A remote section named as a URL applies to a push to that URL: it would redirect it, whatever it says.
+    const section = /^remote\.([\s\S]+)\.[^.]+$/.exec(e.key)?.[1];
+    if (section !== undefined && section !== remote && /[:/]/.test(section)) {
+      return refuse(`config has a remote section named as a URL (\`${e.key}\`), which git applies to pushes to that URL: push it yourself`);
+    }
   }
   // Your own ssh command (a key per host, an agent's wrapper) — only from your config: the repository's is refused.
   const sshCommand = entries.filter((e) => e.key === "core.sshcommand" && (e.scope === "global" || e.scope === "system")).at(-1)?.value ?? null;
@@ -301,14 +320,31 @@ export async function readPushTarget(
   const chosen = pushUrls.length > 0 ? pushUrls : urls;
   if (chosen.length === 0) return refuse(`there is no remote named ${remote}`);
   if (chosen.length > 1) return refuse(`remote ${remote} has ${chosen.length} push URLs: push it yourself`);
-  const url = (chosen[0] as OriginEntry).value;
-  const bad = opts._testFileRemote && url.startsWith("file://") ? null : pushUrlProblem(url);
-  if (bad) return refuse(`remote ${remote}'s URL can't be pushed to: ${bad}`);
-  const repoSettings = entries
-    .filter((e) => !USER_SCOPES.has(e.scope))
-    .map((e) => `${e.scope}\t${e.key}\t${e.value}`)
-    .sort();
-  return { repo, common, remote, url, sshCommand, repoSettings };
+  const configured = (chosen[0] as OriginEntry).value;
+  const url = await effectivePushUrl(repo, remote).catch(() => null);
+  if (!url) return refuse(`git couldn't say where remote ${remote} pushes`);
+  for (const u of new Set([configured, url])) {
+    const bad = opts._testFileRemote && u.startsWith("file://") ? null : pushUrlProblem(u);
+    if (bad) return refuse(`remote ${remote}'s URL can't be pushed to: ${bad}`);
+  }
+  const store = gitStoreProblem(common, layout.own ?? null);
+  if (store) return refuse(store);
+  const settings = (scopes: (s: string) => boolean) =>
+    entries
+      .filter((e) => scopes(e.scope) && !/^include\.path$|^includeif\.[\s\S]+\.path$/i.test(e.key))
+      .map((e) => `${e.scope}\t${e.key}\t${e.value}`)
+      .sort();
+  return {
+    repo,
+    common,
+    own: layout.own ? physicalPath(layout.own) : null,
+    remote,
+    url,
+    configuredUrl: url === configured ? null : configured,
+    sshCommand,
+    repoSettings: settings((sc) => !USER_SCOPES.has(sc)),
+    userSettings: settings((sc) => sc === "global" || sc === "system"),
+  };
 }
 
 /** The plan for a push from `repo`, or why it is refused. */
@@ -317,7 +353,7 @@ export async function planPush(repoDir: string, input: PushInput, opts: PlanOpti
   const remote = input.remote ?? "origin";
   const target = await readPushTarget(repoDir, remote, { ...opts, requireHeld: true });
   if ("refused" in target) return target;
-  const { repo, common, url, sshCommand, repoSettings } = target;
+  const { repo, common, own, url, configuredUrl, sshCommand, repoSettings, userSettings } = target;
 
   // The branch: named, or the one checked out.
   let branch = input.branch;
@@ -348,7 +384,7 @@ export async function planPush(repoDir: string, input: PushInput, opts: PlanOpti
       return refuse(`${branch} is the remote's default branch: push your work to a branch of its own, and open a pull request`);
     }
   }
-  return { repo, common, sshCommand, defaultUnknown, branch, sha, remote, url, shownUrl: shownUrl(url), repoSettings };
+  return { repo, common, own, sshCommand, defaultUnknown, branch, sha, remote, url, configuredUrl, shownUrl: shownUrl(url), repoSettings, userSettings };
 }
 
 /** What an owner's trust in a repository's remote records (the store's `push_trust`). */
@@ -357,21 +393,88 @@ export interface PushTrust {
   remote: string;
   url: string;
   repoSettings: string[];
+  userSettings: string[];
 }
 
 /**
  * Whether a push target is what its owner trusted: the same repository (its git dir), remote, URL, and
  * repository settings that decide a push. Anything else — another URL, a rewrite, a setting added — isn't.
  */
-export function trustMatches(trust: PushTrust | null | undefined, target: Pick<PushTarget, "common" | "remote" | "url" | "repoSettings">): boolean {
+export function trustMatches(trust: PushTrust | null | undefined, target: Pick<PushTarget, "common" | "remote" | "url" | "repoSettings" | "userSettings">): boolean {
   if (!trust) return false;
-  return (
-    trust.common === target.common &&
-    trust.remote === target.remote &&
-    trust.url === target.url &&
-    trust.repoSettings.length === target.repoSettings.length &&
-    trust.repoSettings.every((x, i) => x === target.repoSettings[i])
-  );
+  const same = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i]);
+  return trust.common === target.common && trust.remote === target.remote && trust.url === target.url && same(trust.repoSettings, target.repoSettings) && same(trust.userSettings, target.userSettings);
+}
+
+/** Where git pushes for `remote`: its push URL after every rewrite, as git itself resolves it. */
+export async function effectivePushUrl(repo: string, remote: string): Promise<string | null> {
+  const out = (await safeGit(["remote", "get-url", "--push", "--end-of-options", remote], repo, { timeoutMs: 20_000 })).trim();
+  const lines = out.split("\n").filter(Boolean);
+  return lines.length === 1 ? (lines[0] as string) : null;
+}
+
+/** Files the git store is walked past before it is called too big to check. */
+const STORE_WALK_LIMIT = 300_000;
+
+/**
+ * Any link in the git store the push reads: git runs on the host, where a link the agent made (it can make a link
+ * to a path it can't see) would be followed into a repository the sandbox hides, and its history pushed. Checked
+ * at the plan and again right before git starts: refs (and a worktree's own), objects (every fan-out dir and file,
+ * packs), packed-refs, HEAD, shallow. Alternates (borrowed objects) too.
+ */
+export function gitStoreProblem(common: string, own: string | null): string | null {
+  for (const f of ["alternates", "http-alternates"]) {
+    if (existsSync(join(common, "objects", "info", f))) return `the repository borrows objects from elsewhere (objects/info/${f})`;
+  }
+  let seen = 0;
+  const walk = (dir: string, label: string): string | null => {
+    let st: ReturnType<typeof lstatSync>;
+    try {
+      st = lstatSync(dir);
+    } catch {
+      return null; // not there
+    }
+    if (st.isSymbolicLink()) return `the repository's ${label} is a link`;
+    if (!st.isDirectory()) return null;
+    let names: string[];
+    try {
+      names = readdirSync(dir);
+    } catch {
+      return `the repository's ${label} couldn't be read`;
+    }
+    for (const n of names) {
+      if (++seen > STORE_WALK_LIMIT) return "the repository has too many loose files to check (run `git gc`, then ask again)";
+      const p = join(dir, n);
+      let e: ReturnType<typeof lstatSync>;
+      try {
+        e = lstatSync(p);
+      } catch {
+        continue;
+      }
+      if (e.isSymbolicLink()) return `the repository's ${label}/${n} is a link`;
+      if (e.isDirectory()) {
+        const deeper = walk(p, `${label}/${n}`);
+        if (deeper) return deeper;
+      }
+    }
+    return null;
+  };
+  for (const [base, names] of [[common, ["refs", "objects"]], ...(own ? [[own, ["refs"]] as const] : [])] as const) {
+    for (const n of names) {
+      const problem = walk(join(base, n), n);
+      if (problem) return problem;
+    }
+  }
+  for (const base of own ? [common, own] : [common]) {
+    for (const f of ["packed-refs", "HEAD", "shallow", "commondir", "gitdir"]) {
+      try {
+        if (lstatSync(join(base, f)).isSymbolicLink()) return `the repository's ${f} is a link`;
+      } catch {
+        /* not there */
+      }
+    }
+  }
+  return null;
 }
 
 /** `main`, or a pattern with one trailing `*` (`release/*`); case-insensitive, as hosts on case-folding ref storage are. */
@@ -411,10 +514,23 @@ export interface PushResult {
 export async function runPush(plan: PushPlan, timeoutMs = 120_000, _testFileRemote = false, signal?: AbortSignal): Promise<PushResult> {
   if (signal?.aborted) return { ok: false, summary: "not pushed: the session is closing", output: "" };
   const r = await runGit(
-    ["push", "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", "--end-of-options", plan.url, `${plan.sha}:refs/heads/${plan.branch}`],
+    // By the remote's name: git resolves where it pushes exactly as `remote get-url --push` did (checked again just
+    // before this starts). The refspec is explicit, so the remote's own push refspecs don't apply.
+    ["push", "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", "--end-of-options", plan.remote, `${plan.sha}:refs/heads/${plan.branch}`],
     plan.repo,
     timeoutMs,
-    { testFile: _testFileRemote, sshCommand: plan.sshCommand, signal, precheck: () => objectsProblem(plan.common) },
+    {
+      testFile: _testFileRemote,
+      sshCommand: plan.sshCommand,
+      signal,
+      precheck: async () => {
+        const store = gitStoreProblem(plan.common, plan.own);
+        if (store) return store;
+        // Where git will push, again: the URL checked is the URL used.
+        const now = await effectivePushUrl(plan.repo, plan.remote).catch(() => null);
+        return now === plan.url ? null : `where ${plan.remote} pushes changed since it was checked (now ${now ? shownUrl(now) : "unknown"})`;
+      },
+    },
   );
   if (r.refused) return { ok: false, summary: `refused: ${r.refused}`, output: "" };
   const output = shownOutput(`${r.stdout}\n${r.stderr}`);
@@ -439,22 +555,9 @@ export async function runPush(plan: PushPlan, timeoutMs = 120_000, _testFileRemo
   return { ok: false, summary: `git push failed (exit ${r.code ?? "killed"})`, output };
 }
 
-/**
- * What of the object store would send more than the repository's own objects: borrowed ones (alternates), or
- * a link in its top levels leading elsewhere. Checked at the plan and again right before git starts.
- */
+/** @deprecated name kept for tests: {@link gitStoreProblem} without a worktree. */
 export function objectsProblem(common: string): string | null {
-  for (const f of ["alternates", "http-alternates"]) {
-    if (existsSync(join(common, "objects", "info", f))) return `the repository borrows objects from elsewhere (objects/info/${f})`;
-  }
-  for (const d of ["objects", join("objects", "pack"), join("objects", "info")]) {
-    try {
-      if (lstatSync(join(common, d)).isSymbolicLink()) return `the repository's ${d} is a link`;
-    } catch {
-      /* not there */
-    }
-  }
-  return null;
+  return gitStoreProblem(common, null);
 }
 
 /** Remote output can name URLs with tokens in them, and control sequences: shown redacted, plain, capped. */
@@ -470,11 +573,11 @@ async function runGit(
   args: string[],
   cwd: string,
   timeoutMs: number,
-  o: { testFile?: boolean; sshCommand: string | null; signal?: AbortSignal; precheck?: () => string | null },
+  o: { testFile?: boolean; sshCommand: string | null; signal?: AbortSignal; precheck?: () => Promise<string | null> },
 ): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean; aborted: boolean; refused?: string }> {
   const env = await safeGitEnv(cwd, { network: true, overrides: PUSH_OVERRIDES });
   // Checked last, right before git starts (the environment's own git run took time): the object store is the agent's to write.
-  const refused = o.precheck?.() ?? null;
+  const refused = (await o.precheck?.()) ?? null;
   if (refused) return { code: null, stdout: "", stderr: "", timedOut: false, aborted: false, refused };
   if (o.signal?.aborted) return { code: null, stdout: "", stderr: "", timedOut: false, aborted: true };
   if (o.testFile) env.GIT_ALLOW_PROTOCOL = "file";
