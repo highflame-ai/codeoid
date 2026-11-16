@@ -250,6 +250,18 @@ const sandbox: SettingsTab = {
           default: ["@parent"],
           applies: "next-session",
         }),
+        cfg("sandbox.push.enabled", "Push for agents", "Sandboxed commands can't git push (no network to the git host, no credentials). With this on, an agent asks codeoid to push a branch (the push tool) and the daemon runs it on this machine with your credentials, which the agent never sees: one branch as committed, to the same branch on a remote the repository's own config names; no force, no tags. Guarded and interactive mode ask you; autonomous mode pushes.", {
+          kind: "boolean",
+          envVar: "CODEOID_SANDBOX_PUSH",
+          default: true,
+          applies: "next-session",
+        }),
+        cfg("sandbox.push.protectedBranches", "Branches agents never push to", "Besides the remote's default branch, always protected. A trailing * matches a prefix (release/*).", {
+          kind: "string[]",
+          envVar: "CODEOID_SANDBOX_PUSH_PROTECTED",
+          default: ["main", "master"],
+          applies: "next-session",
+        }),
         cfg("sandbox.docker.socket", "Docker access", "Let sandboxed commands reach the container runtime's socket (Docker, rootless Docker, Podman; Docker Desktop on macOS) — for tests that start containers (testcontainers). Docker access can reach the whole machine: a container can mount /. Sessions say \"sandboxed, Docker access\"; a session can turn it on for itself (asked of its owner).", {
           kind: "boolean",
           envVar: "CODEOID_SANDBOX_DOCKER_SOCKET",

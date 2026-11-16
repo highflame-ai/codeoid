@@ -1072,6 +1072,15 @@ describe("round 8 of the #448 audit: host-side file tools are held to the sandbo
     expect(audits.some((a) => a.action === "session.sandbox_bounds_refuse")).toBe(false);
   });
 
+  test("push: the gate never asks first, in any mode or backend: the session decides it (sandbox/push.ts)", async () => {
+    for (const mode of ["guarded", "interactive", "autonomous"] as const) {
+      for (const backend of ["claude", "opencode", "pi"]) {
+        const r = await gateCall("mcp__codeoid_sandbox__push", { branch: "feature/x" }, { mode, backend });
+        expect([mode, backend, r.asked, r.behavior]).toEqual([mode, backend, false, "allow"]);
+      }
+    }
+  });
+
   test("a command reaching the home runs in a sandboxed autonomous session (the sandbox hides the credentials); unsandboxed, one that reads files there is refused, saying why, and one that only lists, sizes, tests or prints a path runs; a named credential stays refused everywhere", async () => {
     for (const command of ["ls ~", "echo $HOME", "df -h /", "stat ~", "test -d ~ && echo yes", "grep -r token ~", "find / -name x -exec cat {} +"]) {
       for (const backend of ["claude", "opencode", "pi"]) {

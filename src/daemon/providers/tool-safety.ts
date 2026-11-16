@@ -9,6 +9,7 @@ import { BLACKBOARD_MCP_SERVER_NAME } from "../blackboard/mcp-http.js";
 import { MEMORY_MCP_SERVER_NAME } from "../memory/mcp-http.js";
 import { MEMORY_TOOL_NAMES } from "../memory/tools.js";
 import { REQUEST_DIRECTORY_TOOL, SANDBOX_MCP_SERVER_NAME } from "../sandbox/request-directory.js";
+import { PUSH_TOOL } from "../sandbox/push.js";
 import { FLEET_READ_TOOLS, FLEET_TOOL_PREFIX } from "../../protocol/types.js";
 
 /** Built-in read-only tools that never require confirmation. */
@@ -74,6 +75,14 @@ const BLACKBOARD_SAFE_TOOLS = [
 /** The sandbox's `request_directory`, as any backend names it: the session decides it, so no gate card asks first (every mode). */
 export function isRequestDirectoryTool(name: string): boolean {
   return SANDBOX_TOOL_PREFIXES.some((p) => name === `${p}${REQUEST_DIRECTORY_TOOL}`);
+}
+
+/**
+ * The sandbox's `push` (sandbox/push.ts), as any backend names it: the session decides it (Session#push: its
+ * checks, the owner's answer in guarded and interactive mode), so no gate card asks first. Not a safe tool.
+ */
+export function isPushTool(name: string): boolean {
+  return SANDBOX_TOOL_PREFIXES.some((p) => name === `${p}${PUSH_TOOL}`);
 }
 
 export function isSafeTool(name: string): boolean {

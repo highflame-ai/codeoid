@@ -48,7 +48,8 @@ import { mcpToolPrefix, resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { LOOP_MCP_SERVER_NAME, LOOP_REPORT_TOOL_FQ } from "../../loops/tools.js";
-import { buildSandboxMcpServer, REQUEST_DIRECTORY_TOOL_FQ, type RequestDirectoryInput, SANDBOX_MCP_SERVER_NAME } from "../../sandbox/request-directory.js";
+import { buildSandboxMcpServer, PUSH_TOOL_FQ, REQUEST_DIRECTORY_TOOL_FQ, type RequestDirectoryInput, SANDBOX_MCP_SERVER_NAME } from "../../sandbox/request-directory.js";
+import type { PushInput } from "../../sandbox/push.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import { type CodeoidConfig, getConfigDir } from "../../../config.js";
 import { assessShellCommandSync } from "../../risk/shell-risk.js";
@@ -201,6 +202,8 @@ export interface ClaudeProviderInit {
   blackboardMcp?: () => { url: string; token: string } | undefined;
   /** The sandbox's `request_directory`, decided by the session (sandbox/request-directory.ts): mounted in-process. */
   requestDirectory?: (input: RequestDirectoryInput) => Promise<string>;
+  /** The sandbox's `push` (sandbox/push.ts), served beside `request_directory`: decided by the session. */
+  push?: (input: PushInput) => Promise<string>;
   /** Cross-backend MCP registry — external servers are mounted natively on the
    *  SDK (claude owns its own MCP client); approval flows through canUseTool. */
   mcpRegistry?: McpServerView;
@@ -1090,7 +1093,15 @@ export class ClaudeProvider implements SessionProvider {
       ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
       ...(init.loop ? { [LOOP_MCP_SERVER_NAME]: init.loop } : {}),
       // The sandbox's ask for a directory to write (sandbox/request-directory.ts): in-process, no token.
-      ...(init.requestDirectory ? { [SANDBOX_MCP_SERVER_NAME]: buildSandboxMcpServer(init.sessionId, (_id, input) => (init.requestDirectory as (i: RequestDirectoryInput) => Promise<string>)(input)) } : {}),
+      ...(init.requestDirectory
+        ? {
+            [SANDBOX_MCP_SERVER_NAME]: buildSandboxMcpServer(
+              init.sessionId,
+              (_id, input) => (init.requestDirectory as (i: RequestDirectoryInput) => Promise<string>)(input),
+              init.push ? (_id, input) => (init.push as (i: PushInput) => Promise<string>)(input) : undefined,
+            ),
+          }
+        : {}),
       // Collaboration children only — the role-scoped goal blackboard. Mounted
       // over HTTP rather than in-process precisely so the SAME surface works on
       // gemini/codex; claude deliberately gets no privileged path here (#245).
@@ -1135,6 +1146,7 @@ export class ClaudeProvider implements SessionProvider {
       ...(this.#init.loop ? [LOOP_REPORT_TOOL_FQ] : []),
       // An ask itself: the session decides it (owner's confirm, or the project roots in autonomous mode).
       ...(this.#init.requestDirectory ? [REQUEST_DIRECTORY_TOOL_FQ] : []),
+      ...(this.#init.requestDirectory && this.#init.push ? [PUSH_TOOL_FQ] : []),
     ];
     this.#autoApprovedTools = new Set(autoApprovedToolNames);
     if (this.#consumerTask && this.#inputQueue && !this.#inputQueue.closed) {

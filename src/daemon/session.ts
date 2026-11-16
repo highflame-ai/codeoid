@@ -175,7 +175,7 @@ import {
   type MemoryEngine,
   type MemoryMcpMount,
 } from "./memory/index.js";
-import { isElicitationTool, isRequestDirectoryTool, isSafeTool, isUnresolvedPathTool, roleDeniesTool } from "./providers/tool-safety.js";
+import { isElicitationTool, isPushTool, isRequestDirectoryTool, isSafeTool, isUnresolvedPathTool, roleDeniesTool } from "./providers/tool-safety.js";
 import type { PackActivation } from "./pipeline/index.js";
 import { McpRegistry } from "./mcp/registry.js";
 import { mcpSpecKey, SessionMcpView, type WorkdirReach } from "./mcp/session-view.js";
@@ -248,6 +248,7 @@ import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/v
 /** What is recorded of a call the user listed in `secrets.dropCommands`. */
 const NOT_STORED = "‹not stored›";
 import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
+import { planPush, remoteDefaultBranch, runPush, type PushInput, type PushPlan } from "./sandbox/push.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -1582,6 +1583,8 @@ export class Session {
   readonly #addedGitBaselines = new Map<string, { git: GitControlSnapshot; refs: Promise<string[] | null> }>();
   /** The agent's `request_directory` questions still open, by directory: a repeat request joins its answer. */
   readonly #dirRequests = new Map<string, Promise<string>>();
+  /** The push running for this session (sandbox/push.ts): one at a time. */
+  #pushing: Promise<string> | null = null;
   /** The pin change last said on the session (#sandboxPinRefusal): said once per change. */
   #pinSaid: string | null = null;
   /** The working directory's identity when there is no sandbox to keep it (an embedder): taken at its first use. */
@@ -2276,7 +2279,9 @@ export class Session {
       // provider when it next builds its server list.
       blackboardMcp: () => this.#blackboardMcp,
       // The sandbox's ask for a directory to write (sandbox/request-directory.ts): decided here, every backend.
-      ...(this.#sandbox ? { requestDirectory: (input: RequestDirectoryInput) => this.requestDirectory(input), sandboxMcp: () => this.#sandboxMcp?.(this.id) } : {}),
+      ...(this.#sandbox
+        ? { requestDirectory: (input: RequestDirectoryInput) => this.requestDirectory(input), push: (input: PushInput) => this.push(input), sandboxMcp: () => this.#sandboxMcp?.(this.id) }
+        : {}),
       mcpRegistry: this.#mcpView ?? this.#mcpRegistry,
       mcpHub: this.#mcpHub,
       fleet: this.#fleet,
@@ -4171,6 +4176,96 @@ export class Session {
     clearTimeout(timer);
     if (first !== null) return first;
     return `No answer yet: the owner has been asked to let you write ${dir}, and the question stays open. If they say yes, it is writable from a later turn (call request_directory again to see). Carry on without it, or end this turn.`;
+  }
+
+  /**
+   * The sandbox's `push` (sandbox/push.ts): a branch of this session's
+   * repository to its remote, run by the daemon on the host with the owner's
+   * network and credentials, which the agent never sees. The plan is checked
+   * whoever asks (planPush); then guarded and interactive mode ask the owner
+   * (owner-only card, like request_directory), autonomous mode runs it (an
+   * unattended run's too: never parked). One at a time; audited.
+   */
+  async push(input: PushInput): Promise<string> {
+    if (this.#pushing) return "Refused: a push for this session is still running; wait for it, then call push again if it's needed.";
+    const run = this.#push(input);
+    this.#pushing = run;
+    try {
+      return await run;
+    } finally {
+      this.#pushing = null;
+    }
+  }
+
+  async #push(input: PushInput): Promise<string> {
+    const sbx = this.#sandbox;
+    const info = sbx?.info;
+    if (!sbx || !info || info.state !== "on") {
+      return `Nothing to do: this session's commands aren't sandboxed (${info?.reason ?? info?.state ?? "no sandbox"}), so run \`git push\` yourself.`;
+    }
+    const cfg = sbx.config.push;
+    if (cfg?.enabled === false) return "Refused: pushing for agents is turned off here (sandbox.push.enabled). Ask the owner to push.";
+    const what = `${input.branch ?? "the checked-out branch"} to ${input.remote ?? "origin"}`;
+    this.#store.audit(SYSTEM_IDENTITY.sub, "session.push_request", this.id, `${what}${input.reason ? ` reason=${input.reason}` : ""}`.slice(0, 2000));
+    const note = (text: string, event: string, extra: Record<string, unknown> = {}) => {
+      const m = this.#makeMessage("info", text, SYSTEM_IDENTITY, undefined, undefined, { event, ...extra });
+      this.#persistAndBuffer(m);
+      this.#broadcastRaw(m);
+    };
+    const refuse = (why: string): string => {
+      this.#store.audit(SYSTEM_IDENTITY.sub, "session.push_refused", this.id, `${what}: ${why}`.slice(0, 2000));
+      note(`⬆ The agent asked to push ${what}: refused (${why})`, "sandbox.push_refused");
+      return `Refused: ${why}.`;
+    };
+    const plan = await planPush(this.sandboxWorkspace, input, {
+      protectedBranches: cfg?.protectedBranches ?? ["main", "master"],
+      remoteDefault: remoteDefaultBranch,
+    }).catch((err: unknown) => ({ refused: `the repository couldn't be read (${err instanceof Error ? err.message : String(err)})` }));
+    if ("refused" in plan) return refuse(plan.refused);
+    const described = `${plan.branch} (${plan.sha.slice(0, 12)}${plan.ahead !== null ? `, ${plan.ahead} commit${plan.ahead === 1 ? "" : "s"} the remote-tracking refs don't have` : ""}) to ${plan.remote} — ${plan.shownUrl}`;
+    if (this.#mode !== "autonomous") {
+      let answeredBy: string | undefined;
+      const answer = await this.requestUserInput(
+        {
+          method: "confirm",
+          title: `The agent asks to push ${plan.branch}`,
+          message: `"${this.name}" asks codeoid to push ${described}, with your credentials.${input.reason ? `\n\nIts reason: ${input.reason}` : ""}\n\nOnly this branch, as this commit; no force, no tags.`,
+        },
+        {
+          ownerOnly: true,
+          onAnswer: (sub) => {
+            answeredBy = sub;
+          },
+        },
+      );
+      if (answer.cancelled || answer.confirmed !== true) {
+        const why =
+          answer.reason === "unattended"
+            ? "nobody is there to approve it in this unattended run; the owner can push it"
+            : answer.cancelled
+              ? `the question was withdrawn (${answer.reason ?? "cancelled"})`
+              : "the owner declined";
+        this.#store.audit(answeredBy ?? SYSTEM_IDENTITY.sub, "session.push_denied", this.id, `${plan.branch} ${answer.reason ?? "declined"}`);
+        return refuse(why);
+      }
+      // The branch may have moved while the owner read the card: what is pushed is what they approved.
+      const again = await planPush(this.sandboxWorkspace, { ...input, branch: plan.branch }, { protectedBranches: cfg?.protectedBranches ?? ["main", "master"] }).catch(() => null);
+      if (!again || "refused" in again) return refuse(again && "refused" in again ? again.refused : "the repository couldn't be read again");
+      if (again.sha !== plan.sha || again.url !== plan.url) return refuse(`${plan.branch} or its remote changed after you were asked (now ${again.sha.slice(0, 12)}): ask again`);
+      return this.#runPush(plan, answeredBy ?? this.createdBy, note);
+    }
+    return this.#runPush(plan, SYSTEM_IDENTITY.sub, note);
+  }
+
+  async #runPush(plan: PushPlan, by: string, note: (text: string, event: string, extra?: Record<string, unknown>) => void): Promise<string> {
+    const r = await runPush(plan);
+    const detail = `${plan.branch} ${plan.sha} -> ${plan.shownUrl} refs/heads/${plan.branch}: ${r.summary}`;
+    this.#store.audit(by, r.ok ? "session.push_done" : "session.push_failed", this.id, detail.slice(0, 2000));
+    note(`⬆ ${r.ok ? "Pushed" : "Push failed"}: ${plan.branch} → ${plan.remote} (${plan.shownUrl}) — ${r.summary}`, r.ok ? "sandbox.pushed" : "sandbox.push_failed", {
+      branch: plan.branch,
+      sha: plan.sha,
+    });
+    return `${r.ok ? "Done" : "Failed"}: ${r.summary}.${r.output ? `\n\ngit said:\n${r.output}` : ""}`;
   }
 
   /**
@@ -9247,6 +9342,11 @@ export class Session {
     if (added.length > 0) lines.push(`Besides the workspace, they can write ${added.map((d) => `${d}/`).join(", ")} (git structure and project settings there read-only, as in the workspace).`);
     if (this.#requestDirectoryMounted()) lines.push("To write in another directory, call the `request_directory` tool (path, reason). What it grants is writable from your next turn.");
     else lines.push("To write in another directory, ask the owner to add it (`/sandbox add <dir>`).");
+    lines.push(
+      this.#requestDirectoryMounted()
+        ? "Your commands can't `git push` (no network to the git host, no credentials). Commit, then call the `push` tool (branch, remote): codeoid pushes for you with the owner's credentials."
+        : "Your commands can't `git push` (no network to the git host, no credentials): commit, and ask the owner to push.",
+    );
     return lines.join("\n");
   }
 
@@ -9373,8 +9473,8 @@ export class Session {
     // resolve for certain is never run unasked (tool-safety.ts).
     if (isUnresolvedPathTool(toolName)) return false;
 
-    // An ask itself (sandbox/request-directory.ts): the session decides it, so it never waits on a card first.
-    if (isRequestDirectoryTool(toolName)) return true;
+    // An ask itself (sandbox/request-directory.ts, sandbox/push.ts): the session decides it, so it never waits on a card first.
+    if (isRequestDirectoryTool(toolName) || isPushTool(toolName)) return true;
 
     if (this.#mode === "interactive") return false;
 
@@ -9447,7 +9547,7 @@ export class Session {
     if (isFleetSendTool(toolName)) return false;
     if (isElicitationTool(toolName)) return false;
     if (isUnresolvedPathTool(toolName)) return false;
-    if (isRequestDirectoryTool(toolName)) return true;
+    if (isRequestDirectoryTool(toolName) || isPushTool(toolName)) return true;
     if (this.#mode === "interactive") return false;
     if (isSafeTool(toolName)) return true;
     if (this.#isReadonlyMcpTool(toolName)) return true;

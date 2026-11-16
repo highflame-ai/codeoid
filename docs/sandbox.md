@@ -1233,6 +1233,99 @@ home is the workspace).
   as in the workspace (what runs after the agent touched it isn't vouched
   for).
 
+## Pushing a branch
+
+A sandboxed command can't `git push`, for two reasons:
+
+- **No network to the git host.** Claude's own sandbox lets a command out
+  only through its HTTP(S) proxy: it resolves no DNS and opens no other
+  connection, so `ssh git@bitbucket.org` (port 22) fails before it starts.
+  codeoid's own sandboxes run with the session's network setting.
+- **No credentials.** `~/.ssh`, `SSH_AUTH_SOCK`, git's credential helpers and
+  stores, the keychain, and `gh`/`glab` logins are hidden.
+
+That is the sandbox doing its job. To get work pushed anyway, the agent calls
+the **`push` tool**. It is served next to `request_directory` on every backend
+that has it: Claude, Qwen and pi in-process; Codex, the Gemini CLI and
+opencode over `/mcp/sandbox`. The daemon then runs `git push` itself on this
+machine, with your network and your credentials, which the agent never sees.
+
+**What it pushes**
+
+- One local branch, by name. The default is the one checked out.
+- As the commit it is when the push is planned. That commit id is what gets
+  pushed, and a later commit isn't.
+- To the branch of the same name on one of the repository's remotes. The
+  default remote is `origin`.
+- Only from the session's own repository: its workspace, or the codeoid
+  worktree it works in.
+
+**What it never does**
+
+- Force, delete, or push tags, other refs or push options.
+- Push to the remote's default branch, or to a protected one:
+  `sandbox.push.protectedBranches`, `main` and `master` by default, where a
+  trailing `*` matches a prefix.
+- Push a non-fast-forward. The remote refuses it, and the agent is told to
+  rebase or merge first.
+
+**Where it goes**
+
+Where the push goes, and how git connects and authenticates, is decided only
+by config the agent couldn't have written: your global and system config, and
+the repository's own `.git/config`, which is read-only to sandboxed commands
+(a host-side file tool's write to it is held). That covers:
+
+- the remote's `url`/`pushurl`;
+- `url.*.insteadOf`;
+- `http.*` (proxy, TLS, extra headers);
+- `credential.*` and `core.sshCommand`;
+- `push.*`.
+
+Any of these that comes from another file, such as an include, is refused.
+So is anything else that could redirect or widen the push:
+
+- a remote with more than one push URL;
+- a URL that isn't ssh or https;
+- a repository that borrows objects from elsewhere (`objects/info/alternates`).
+
+**How git runs**
+
+It runs hardened (`git-env.ts`):
+
+- No hooks, so neither `pre-push` nor git-lfs's run. LFS objects aren't
+  uploaded: push those yourself.
+- No drivers or credential helpers the repository's agent-writable config
+  names.
+- https and ssh only.
+- ssh in batch mode, so it never waits for a prompt.
+- A two-minute limit, after which the whole process group is killed.
+
+Remote output is shown with URLs redacted.
+
+**Who decides**
+
+In guarded and interactive mode you are asked first, on an owner-only card
+naming the branch, the commit, the remote's URL and the agent's reason. If
+the branch or remote changed while you read the card, it is refused and the
+agent asks again.
+
+In autonomous mode, including an unattended run, it runs without asking. One
+push runs at a time per session.
+
+Every request, refusal, approval and result is audited: `session.push_request`,
+`session.push_refused`, `session.push_denied`, `session.push_done` and
+`session.push_failed`. Each is also said in the transcript.
+
+**Settings**
+
+`sandbox.push.enabled` (default on; `CODEOID_SANDBOX_PUSH`) and
+`sandbox.push.protectedBranches` (`CODEOID_SANDBOX_PUSH_PROTECTED`). Both are
+in Settings → Sandbox and `codeoid config`.
+
+The in-daemon backends (OpenAI, endpoints, Gemini's API) run no commands, so
+they have nothing to push.
+
 ## Docker access
 
 Tests that start containers (testcontainers' MySQL or Postgres, `docker run`

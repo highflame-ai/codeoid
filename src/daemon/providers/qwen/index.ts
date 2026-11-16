@@ -63,6 +63,7 @@ import { qwenAccountEnv } from "../../account-apply.js";
 import { preparePrivateHome, QWEN_HOME_LAYOUT, withLoginsSynced } from "../../sandbox/backend-home.js";
 import { programLocations } from "../../sandbox/policy.js";
 import { buildSandboxMcpServer, type RequestDirectoryInput, SANDBOX_MCP_SERVER_NAME } from "../../sandbox/request-directory.js";
+import type { PushInput } from "../../sandbox/push.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../../sandbox/types.js";
 
@@ -95,6 +96,8 @@ export interface QwenProviderInit {
   fleet?: { type: "sdk"; name: string; instance: unknown };
   /** The sandbox's `request_directory`, decided by the session (sandbox/request-directory.ts): mounted in-process. */
   requestDirectory?: (input: RequestDirectoryInput) => Promise<string>;
+  /** The sandbox's `push` (sandbox/push.ts), served beside `request_directory`: decided by the session. */
+  push?: (input: PushInput) => Promise<string>;
   /** The daemon's OAuth MCP relay (#396): how this backend reaches the
    *  registry's OAuth servers without holding their tokens. */
   mcpProxy?: McpProxyMount;
@@ -443,7 +446,15 @@ export class QwenProvider implements SessionProvider {
         : {}),
       ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
       // The sandbox's ask for a directory to write (sandbox/request-directory.ts), in-process like memory.
-      ...(init.requestDirectory ? { [SANDBOX_MCP_SERVER_NAME]: buildSandboxMcpServer(init.sessionId, (_id, input) => (init.requestDirectory as (i: RequestDirectoryInput) => Promise<string>)(input)) } : {}),
+      ...(init.requestDirectory
+        ? {
+            [SANDBOX_MCP_SERVER_NAME]: buildSandboxMcpServer(
+              init.sessionId,
+              (_id, input) => (init.requestDirectory as (i: RequestDirectoryInput) => Promise<string>)(input),
+              init.push ? (_id, input) => (init.push as (i: PushInput) => Promise<string>)(input) : undefined,
+            ),
+          }
+        : {}),
     };
 
     // An account is an API key with its endpoint; it replaces the configured auth.

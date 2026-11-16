@@ -83,8 +83,14 @@ export interface SandboxConfig {
      */
     socket: boolean;
   };
+  /**
+   * The `push` tool (push.ts): codeoid pushes a session's branch on the host, since its sandboxed commands
+   * can't. `protectedBranches` are never pushed to (a trailing `*` matches a prefix), nor the remote's default.
+   */
+  push?: { enabled: boolean; protectedBranches: string[] };
 }
 
+export const DEFAULT_SANDBOX_PUSH = { enabled: true, protectedBranches: ["main", "master"] };
 
 export const DEFAULT_SANDBOX_CONFIG: SandboxConfig = {
   provider: "auto",
@@ -95,6 +101,7 @@ export const DEFAULT_SANDBOX_CONFIG: SandboxConfig = {
   worktreeRoots: [],
   projectRoots: ["@parent"],
   docker: { image: "node:22-bookworm-slim", socket: false },
+  push: { ...DEFAULT_SANDBOX_PUSH, protectedBranches: [...DEFAULT_SANDBOX_PUSH.protectedBranches] },
 };
 
 export function sandboxConfigOf(config: Pick<CodeoidConfig, "sandbox"> | undefined): SandboxConfig {
@@ -103,6 +110,7 @@ export function sandboxConfigOf(config: Pick<CodeoidConfig, "sandbox"> | undefin
     ...DEFAULT_SANDBOX_CONFIG,
     ...(s ?? {}),
     docker: { ...DEFAULT_SANDBOX_CONFIG.docker, ...(s?.docker ?? {}) },
+    push: { ...DEFAULT_SANDBOX_PUSH, ...(s?.push ?? {}) },
   };
 }
 

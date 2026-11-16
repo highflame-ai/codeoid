@@ -280,7 +280,12 @@ describe("hidden paths", () => {
 describe("config", () => {
   test("on by default: auto, network on", () => {
     const c = loadConfig({ raw: {}, env: {}, quiet: true });
-    expect(c.sandbox).toEqual({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], projectRoots: ["@parent"], docker: { image: "node:22-bookworm-slim", socket: false } });
+    expect(c.sandbox).toEqual({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], projectRoots: ["@parent"], docker: { image: "node:22-bookworm-slim", socket: false }, push: { enabled: true, protectedBranches: ["main", "master"] } });
+  });
+
+  test("push: on by default, main and master protected; the environment sets both", () => {
+    const c = loadConfig({ raw: {}, env: { CODEOID_SANDBOX_PUSH: "false", CODEOID_SANDBOX_PUSH_PROTECTED: "main,release/*" }, quiet: true });
+    expect(c.sandbox?.push).toEqual({ enabled: false, protectedBranches: ["main", "release/*"] });
   });
 
   test("env vars override the file", () => {

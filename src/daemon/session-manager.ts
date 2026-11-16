@@ -22,6 +22,7 @@ import { credentialsSchema } from "./credentials/schema.js";
 import { workstreamsSchema } from "./workstreams/schema.js";
 import { registerSecretPaths } from "./secret-paths.js";
 import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
+import type { PushInput } from "./sandbox/push.js";
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
@@ -537,7 +538,10 @@ export class SessionManager {
    *  Always constructed: with no minted tokens every request fails closed. */
   readonly #blackboardMcp = new BlackboardMcpHttp();
   /** The sandbox's `request_directory` for the URL-mounting backends (sandbox/request-directory.ts): one token per session. */
-  readonly #sandboxMcp = new SandboxMcpHttp((sessionId, input) => this.#requestDirectoryFor(sessionId, input));
+  readonly #sandboxMcp = new SandboxMcpHttp(
+    (sessionId, input) => this.#requestDirectoryFor(sessionId, input),
+    (sessionId, input) => this.#pushFor(sessionId, input),
+  );
   #sandboxMcpUrl?: string;
   readonly #sandboxMcpTokens = new Map<string, string>();
   #blackboardUrl?: string;
@@ -4584,6 +4588,17 @@ mcpHub: this.#mcpHub,
       return "Refused: this session is gone.";
     }
     return session.requestDirectory(input);
+  }
+
+  /** The sandbox's `push` for one session (sandbox/push.ts): decided by the session, as request_directory is. */
+  async #pushFor(sessionId: string, input: PushInput): Promise<string> {
+    const session = this.#sessions.get(sessionId);
+    if (!session) {
+      this.#sandboxMcp.revokeSession(sessionId);
+      this.#sandboxMcpTokens.delete(sessionId);
+      return "Refused: this session is gone.";
+    }
+    return session.push(input);
   }
 
   /** Inject the cross-backend MCP registry + daemon-owned client pool. Sessions
