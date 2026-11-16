@@ -248,7 +248,8 @@ import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/v
 /** What is recorded of a call the user listed in `secrets.dropCommands`. */
 const NOT_STORED = "‹not stored›";
 import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
-import { planPush, remoteDefaultBranch, runPush, shownUrl, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
+import { bundleFromChild, planPush, runPush, shownUrl, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
+import { gitEnv } from "./git-env.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -4262,8 +4263,6 @@ export class Session {
       heldReadOnly: spec.readOnly ?? [],
       // What this session's commands may write, and every other sandboxed session's: a file there decides nothing.
       agentWritable: [spec.workspace, spec.tempDir, ...spec.writable, ...sbx.worktreeFolders(), ...(this.#otherSessionsWritable?.() ?? [])],
-      remoteDefault: remoteDefaultBranch,
-      lookupTimeoutMs: Math.min(30_000, Math.max(1_000, (left() - reserveMs) / 4)),
       signal,
     };
     const plan = await planPush(this.sandboxWorkspace, input, planOpts).catch((err: unknown) => ({
@@ -4281,9 +4280,6 @@ export class Session {
           `the owner hasn't trusted agent pushes from this repository to ${plan.shownUrl} (or something that decides the push changed since): they can, with \`codeoid sandbox trust-push ${plan.repo}${plan.remote === "origin" ? "" : ` --remote ${plan.remote}`}\`, or by approving a push in guarded mode — or push it themselves`,
         );
       }
-      if (plan.defaultUnknown) {
-        return refuse(`codeoid couldn't ask ${plan.shownUrl} which branch is its default, so it can't be sure ${plan.branch} isn't it: try again, or ask the owner to push`);
-      }
     }
     const rewritten = plan.configuredUrl ? ` (the remote's config says ${shownUrl(plan.configuredUrl)}; a URL rewrite in your git config sends it here)` : "";
     const described = `${plan.branch} (commit ${plan.sha.slice(0, 12)}) to ${plan.remote} — ${plan.shownUrl}${rewritten}`;
@@ -4291,7 +4287,7 @@ export class Session {
     if (this.#mode !== "autonomous") {
       let answeredBy: string | undefined;
       const reason = input.reason ? `\n\nThe agent's reason, in its own words:\n${input.reason.split("\n").map((l) => `> ${l}`).join("\n")}` : "";
-      const unknown = plan.defaultUnknown ? `\n\nThe remote didn't say which branch is its default: make sure ${plan.branch} isn't it.` : "";
+      const unknown = `\n\nThe remote's default branch is asked after you answer (a push there is refused); if it can't be asked, the push goes ahead.`;
       const PUSH = "Push";
       const TRUST = `Push, and trust ${plan.shownUrl} for this repository's agent pushes (autonomous mode too)`;
       const NO = "Don't push";
@@ -4341,11 +4337,26 @@ export class Session {
       }
     }
     if (closing()) return refuse("the session closed before the push started");
-    return this.#runPush(plan, by, note, left(), signal);
+    return this.#runPush(plan, by, note, left(), signal, sbx);
   }
 
-  async #runPush(plan: PushPlan, by: string, note: (text: string, event: string, extra?: Record<string, unknown>) => void, leftMs: number, signal: AbortSignal): Promise<string> {
-    const r = await runPush(plan, Math.max(5_000, Math.min(120_000, leftMs)), false, signal);
+  async #runPush(
+    plan: PushPlan,
+    by: string,
+    note: (text: string, event: string, extra?: Record<string, unknown>) => void,
+    leftMs: number,
+    signal: AbortSignal,
+    sbx: SessionSandbox,
+  ): Promise<string> {
+    const r = await runPush(plan, {
+      timeoutMs: Math.max(5_000, Math.min(120_000, leftMs)),
+      signal,
+      // The daemon's own dir, which no session's sandbox shows.
+      stagingRoot: join(getConfigDir(), "push-staging"),
+      makeBundle: (repo, ref, dest) => this.#bundleInSandbox(sbx, repo, ref, dest, Math.max(1_000, Math.min(120_000, leftMs) / 2), signal),
+      // The default branch is asked only now: after the owner's trust or answer, so nobody untrusted is contacted.
+      checkDefault: this.#mode === "autonomous" ? "refuse-unknown" : "allow-unknown",
+    });
     const detail = `${plan.branch} ${plan.sha} -> ${plan.shownUrl} refs/heads/${plan.branch}: ${r.summary}`;
     this.#store.audit(by, r.ok ? "session.push_done" : "session.push_failed", this.id, detail.slice(0, 2000));
     note(`⬆ ${r.ok ? "Pushed" : "Push failed"}: ${plan.branch} → ${plan.remote} (${plan.shownUrl}) — ${r.summary}`, r.ok ? "sandbox.pushed" : "sandbox.push_failed", {
@@ -4357,15 +4368,40 @@ export class Session {
 
   /** What this session's sandboxed commands may write (none when it isn't sandboxed or not running). */
   get sandboxAgentWritable(): string[] {
-    const sbx = this.#sandbox;
-    const spec = sbx?.info?.state === "on" ? sbx.runtime?.spec : undefined;
-    return spec ? [spec.workspace, spec.tempDir, ...spec.writable, ...(sbx?.worktreeFolders() ?? [])] : [];
+    // From the setting, never by building a spec (that has effects of its own, and can throw).
+    try {
+      if (!this.#sandbox) return [];
+      return [this.sandboxWorkspace, ...this.sandboxAddedDirs(), ...this.sandboxWorktreeFolders()];
+    } catch {
+      return [this.workdir];
+    }
   }
 
   /** Whether this session's agent is offered `push`: its sandbox on, and pushing not turned off. */
   get pushOffered(): boolean {
     const sbx = this.#sandbox;
     return !!sbx && sbx.info?.state === "on" && sbx.config.push?.enabled !== false;
+  }
+
+  /**
+   * `git bundle create` of `ref`, run inside this session's sandbox (no network), its stdout streamed into `dest`
+   * (the daemon's own file): there a link the agent made into a path the sandbox hides leads nowhere, so the bundle
+   * holds only what its own commands could read.
+   */
+  async #bundleInSandbox(sbx: SessionSandbox, repo: string, ref: string, dest: string, timeoutMs: number, signal: AbortSignal): Promise<string | null> {
+    const rt = sbx.runtime;
+    if (!rt) return "the sandbox isn't running";
+    let handle: Awaited<ReturnType<typeof rt.open>> | null = null;
+    try {
+      handle = await rt.open([]);
+      if (signal.aborted) return "the session is closing";
+      const child = handle.spawn("git", ["-c", "core.fsmonitor=false", "-C", repo, "bundle", "create", "-q", "-", ref], { cwd: repo, env: gitEnv({ LANG: "C" }) });
+      return await bundleFromChild(child, dest, { timeoutMs, signal });
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    } finally {
+      await handle?.close().catch(() => {});
+    }
   }
 
   /** Stop a push in flight (the daemon stopping, the session destroyed): its process group is killed, and the result audited. */

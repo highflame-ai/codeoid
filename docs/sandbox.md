@@ -1247,14 +1247,14 @@ A sandboxed command can't `git push`, for two reasons:
 That is the sandbox doing its job. To get work pushed anyway, the agent calls
 the **`push` tool**. It is served next to `request_directory` on every backend
 that has it: Claude, Qwen and pi in-process; Codex, the Gemini CLI and
-opencode over `/mcp/sandbox`. The daemon then runs `git push` itself on this
-machine, with your network and your credentials, which the agent never sees.
+opencode over `/mcp/sandbox`. The daemon then pushes it itself, with your
+network and your credentials, which the agent never sees.
 
 **What it pushes**
 
 - One local branch, by name. The default is the one checked out.
 - As the commit it is when the push is planned. That commit id is what gets
-  pushed, and a later commit isn't.
+  pushed, and a commit made after it isn't.
 - To the branch of the same name on one of the repository's remotes. The
   default remote is `origin`.
 - Only from the session's own repository: its workspace, or the codeoid
@@ -1311,13 +1311,19 @@ On top of that, every push is checked the same way, trusted or not:
   config is refused. An include in your config is refused if it names a file
   the commands of any live sandboxed session may write, even an empty or
   missing one.
-- No link anywhere in the git store the push reads: refs, objects, packed-refs,
-  HEAD and shallow. git runs on the host, where a link an agent made would be
-  followed into a repository the sandbox hides. Checked at the plan and again
-  right before git starts.
-- git pushes to the remote by name, so it resolves the destination exactly as
-  checked. The destination is resolved again right before git starts, and if
-  it changed, nothing is pushed.
+- The host's git never reads the agent's repository for the push. The branch is
+  bundled (`git bundle create`) inside the session's sandbox, where a ref or
+  object the agent linked into a repository the sandbox hides leads nowhere,
+  and the bundle streams over stdout into a file of the daemon's own. The
+  daemon fetches it into a private bare repository under `~/.codeoid/push-staging`,
+  which no session can see, checks that it holds the planned commit, and pushes
+  that commit from there. No link, alternates file, reflog or FIFO in the agent's
+  repository is ever followed outside the sandbox, and nothing is written back
+  into it (no remote-tracking ref, no reflog). The staging repository is removed
+  after each push.
+- The private repository's remote is set to the checked URL, and git resolves
+  it again there, after your rewrites. If that isn't the checked URL, nothing
+  is pushed.
 
 From the repository's config, codeoid takes the remote's `url`/`pushurl` and
 `push.*`. It never takes a URL rewrite (`url.*.insteadOf` / `pushInsteadOf`),
@@ -1336,13 +1342,13 @@ Also refused:
 
 - a remote with more than one push URL;
 - a URL that isn't ssh or https;
-- a repository that borrows objects from elsewhere (`objects/info/alternates`),
-  or whose object store's top levels are links. Both are checked again right
-  before git starts.
+- a repository that borrows objects from elsewhere (`objects/info/alternates`).
 
-If the remote can't be asked which branch is its default (an error, a
-timeout, no `HEAD` symref), autonomous mode refuses the push; guarded mode
-says so on the card.
+The remote is asked which branch is its default only after your trust matched,
+or after you answered the card, and from the private repository, so a remote
+you never approved is never contacted. A push there is refused. If it can't be
+asked (an error, a timeout, no `HEAD` symref), autonomous mode refuses the
+push; in guarded mode it goes ahead (you approved it), and the result says so.
 
 **How git runs**
 
@@ -1354,7 +1360,8 @@ It runs hardened (`git-env.ts`):
   names.
 - https and ssh only.
 - ssh in batch mode, so it never waits for a prompt.
-- A two-minute limit, after which the whole process group is killed.
+- A two-minute limit, after which the whole process group is killed. The
+  bundle inside the sandbox gets half of it, and at most 8 GiB.
 
 Remote output is shown with URLs redacted.
 

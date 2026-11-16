@@ -25,8 +25,8 @@
  * drivers or credential helpers the agent named, https and ssh only.
  */
 
-import { spawn } from "node:child_process";
-import { existsSync, lstatSync, readdirSync } from "node:fs";
+import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
+import { closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, rmSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { GIT_BIN, safeGit, safeGitEnv } from "../git-env.js";
 import { validateBranchName } from "../git-worktree.js";
@@ -327,8 +327,6 @@ export async function readPushTarget(
     const bad = opts._testFileRemote && u.startsWith("file://") ? null : pushUrlProblem(u);
     if (bad) return refuse(`remote ${remote}'s URL can't be pushed to: ${bad}`);
   }
-  const store = gitStoreProblem(common, layout.own ?? null);
-  if (store) return refuse(store);
   const settings = (scopes: (s: string) => boolean) =>
     entries
       .filter((e) => scopes(e.scope) && !/^include\.path$|^includeif\.[\s\S]+\.path$/i.test(e.key))
@@ -492,6 +490,7 @@ const PUSH_OVERRIDES: ReadonlyArray<readonly [string, string]> = [
   ["push.pushOption", ""],
   ["push.default", "nothing"],
   ["push.autoSetupRemote", "false"],
+  ["core.logAllRefUpdates", "false"],
 ];
 
 /** The remote's default branch (`ls-remote --symref <url> HEAD`), or null. */
@@ -510,50 +509,198 @@ export interface PushResult {
   output: string;
 }
 
-/** Run the push the plan names, on the host. */
-export async function runPush(plan: PushPlan, timeoutMs = 120_000, _testFileRemote = false, signal?: AbortSignal): Promise<PushResult> {
-  if (signal?.aborted) return { ok: false, summary: "not pushed: the session is closing", output: "" };
-  const r = await runGit(
-    // By the remote's name: git resolves where it pushes exactly as `remote get-url --push` did (checked again just
-    // before this starts). The refspec is explicit, so the remote's own push refspecs don't apply.
-    ["push", "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", "--end-of-options", plan.remote, `${plan.sha}:refs/heads/${plan.branch}`],
-    plan.repo,
-    timeoutMs,
-    {
-      testFile: _testFileRemote,
-      sshCommand: plan.sshCommand,
-      signal,
-      precheck: async () => {
-        const store = gitStoreProblem(plan.common, plan.own);
-        if (store) return store;
-        // Where git will push, again: the URL checked is the URL used.
-        const now = await effectivePushUrl(plan.repo, plan.remote).catch(() => null);
-        return now === plan.url ? null : `where ${plan.remote} pushes changed since it was checked (now ${now ? shownUrl(now) : "unknown"})`;
-      },
-    },
-  );
-  if (r.refused) return { ok: false, summary: `refused: ${r.refused}`, output: "" };
-  const output = shownOutput(`${r.stdout}\n${r.stderr}`);
-  if (r.aborted) return { ok: false, summary: "stopped: the session closed while it was pushing (the remote may or may not have it)", output };
-  if (r.timedOut) return { ok: false, summary: `the push timed out after ${Math.round(timeoutMs / 1000)}s (the remote may or may not have it)`, output };
-  // Porcelain: a tab-separated line per ref, flag first: ` ` fast-forward, `*` new, `=` up to date, `!` rejected.
-  const line = r.stdout.split("\n").find((l) => l.includes(`:refs/heads/${plan.branch}\t`) || l.endsWith(`:refs/heads/${plan.branch}`));
-  const flag = line?.[0];
-  if (r.code === 0 && flag === "=") return { ok: true, summary: `${plan.branch} is already up to date on ${plan.remote}`, output };
-  if (r.code === 0) return { ok: true, summary: `pushed ${plan.branch} (${plan.sha.slice(0, 12)}) to ${plan.remote}${flag === "*" ? ", a new branch there" : ""}`, output };
-  if (flag === "!") {
-    // `!<TAB>from:to<TAB>[rejected] (non-fast-forward)`.
-    const why = line?.split("\t").slice(2).join(" ").trim() || "rejected";
-    return {
-      ok: false,
-      summary: /non-fast-forward|fetch first|stale info/.test(why)
-        ? `the remote's ${plan.branch} has commits yours doesn't (${why}): a force push isn't done for agents. Your commands can't fetch either (no network to the git host, no credentials): ask the owner to fetch it (or merge the remote's branch for you), or push to a new branch of your own`
-        : `the remote refused it (${why})`,
-      output,
-    };
-  }
-  return { ok: false, summary: `git push failed (exit ${r.code ?? "killed"})`, output };
+/**
+ * Writes a bundle of `ref` (and the history it needs) from `repo` into `dest`, a file of the daemon's own. The
+ * session's: `git bundle create` inside its sandbox, its stdout streamed to `dest` ({@link bundleFromChild}), so a
+ * link the agent made into a path the sandbox hides leads nowhere, and the file is never one the agent can reach.
+ * Resolves with why it couldn't, or null.
+ */
+export type BundleMaker = (repo: string, ref: string, dest: string) => Promise<string | null>;
+
+export interface RunOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  /** Where the daemon stages the push: a private dir of its own, which no session can see. */
+  stagingRoot: string;
+  makeBundle: BundleMaker;
+  /**
+   * Ask the remote for its default branch first (refused as a target): `refuse-unknown` refuses when it can't be
+   * read (autonomous mode), `allow-unknown` goes on and says so (the owner approved it); absent: not asked.
+   */
+  checkDefault?: "refuse-unknown" | "allow-unknown";
+  /** Tests only: a local bare repository as the remote. */
+  _testFileRemote?: boolean;
 }
+
+/** The largest bundle taken into the daemon's staging repository. */
+export const MAX_BUNDLE_BYTES = 8 * 1024 * 1024 * 1024;
+
+/**
+ * Stream `child`'s stdout (a `git bundle create … -`) into `dest`, created new (never through a link), stopping it at
+ * `maxBytes`, `timeoutMs` or `signal`. Resolves with why it failed, or null once it exited 0.
+ */
+export function bundleFromChild(child: ChildProcessWithoutNullStreams, dest: string, o: { maxBytes?: number; timeoutMs: number; signal?: AbortSignal }): Promise<string | null> {
+  const max = o.maxBytes ?? MAX_BUNDLE_BYTES;
+  return new Promise((done) => {
+    let fd: number | null = null;
+    let size = 0;
+    let why: string | null = null;
+    let stderr = "";
+    const stop = (reason: string) => {
+      why ??= reason;
+      child.kill("SIGKILL");
+    };
+    try {
+      fd = openSync(dest, fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    } catch (err) {
+      stop(`the staging file couldn't be made (${err instanceof Error ? err.message : String(err)})`);
+    }
+    const timer = setTimeout(() => stop(`it took longer than ${Math.round(o.timeoutMs / 1000)}s`), o.timeoutMs);
+    const onAbort = () => stop("the session is closing");
+    o.signal?.addEventListener("abort", onAbort, { once: true });
+    if (o.signal?.aborted) onAbort();
+    child.stdout.on("data", (c: Buffer) => {
+      if (why || fd === null) return;
+      size += c.length;
+      if (size > max) return stop("the branch's history is too big to push this way");
+      try {
+        writeSync(fd, c);
+      } catch (err) {
+        stop(`the staging file couldn't be written (${err instanceof Error ? err.message : String(err)})`);
+      }
+    });
+    child.stderr.setEncoding("utf8");
+    child.stderr.on("data", (c: string) => {
+      if (stderr.length < 4096) stderr += c;
+    });
+    child.stdin.on("error", () => {});
+    child.stdin.end();
+    let settled = false;
+    const finish = (code: number | null, sig: NodeJS.Signals | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      o.signal?.removeEventListener("abort", onAbort);
+      if (fd !== null) closeSync(fd);
+      if (!why && code !== 0) why = stderr.trim().split("\n").slice(-1)[0]?.slice(0, 300) || `git bundle exited ${code ?? sig}`;
+      done(why);
+    };
+    child.once("error", (err) => {
+      why ??= err.message;
+      finish(null, null);
+    });
+    child.once("close", finish);
+  });
+}
+
+/**
+ * Run the push the plan names. The host's git never reads the agent's repository for it: the branch is bundled
+ * inside the session's sandbox (`makeBundle`) into a file of the daemon's own, fetched into a bare repository of the
+ * daemon's own, its tip checked against the plan's commit, and the push made from there to the plan's URL. So no
+ * link, alternates file, reflog or FIFO the agent puts in its repository — now or while the push runs — is
+ * followed by a git that sees what the sandbox hides, and nothing is written back into the agent's repository.
+ */
+export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult & { defaultUnknown?: boolean }> {
+  const timeoutMs = o.timeoutMs ?? 120_000;
+  const deadline = Date.now() + timeoutMs;
+  const left = () => Math.max(1_000, deadline - Date.now());
+  if (o.signal?.aborted) return { ok: false, summary: "not pushed: the session is closing", output: "" };
+  mkdirSync(o.stagingRoot, { recursive: true, mode: 0o700 });
+  const stage = mkdtempSync(join(o.stagingRoot, "push-"));
+  try {
+    // 1. The bundle, made where the agent's links lead nowhere.
+    const bundle = join(stage, "push.bundle");
+    const made = await o.makeBundle(plan.repo, `refs/heads/${plan.branch}`, bundle).catch((e: unknown) => (e instanceof Error ? e.message : String(e)));
+    if (made) return { ok: false, summary: `refused: the branch couldn't be bundled in the session's sandbox (${made})`, output: "" };
+    if (o.signal?.aborted) return { ok: false, summary: "not pushed: the session is closing", output: "" };
+    // 2. A repository of the daemon's own, holding just that branch.
+    const repo = join(stage, "repo.git");
+    const local = async (args: string[]) => {
+      const r = await runGit(args, stage, left(), { sshCommand: null, signal: o.signal, protocol: "file" });
+      if (r.code !== 0) throw new Error(shownOutput(r.stderr).split("\n")[0] || `git ${args[0]} failed`);
+      return r.stdout;
+    };
+    try {
+      await local(["init", "-q", "--bare", repo]);
+      await local(["--git-dir", repo, "fetch", "-q", "--no-tags", "--no-write-fetch-head", bundle, `refs/heads/${plan.branch}:refs/heads/${plan.branch}`]);
+      const tip = (await local(["--git-dir", repo, "rev-parse", "--verify", "-q", "--end-of-options", `refs/heads/${plan.branch}^{commit}`])).trim();
+      // The checked commit, or one the agent made on top of it since (only the checked one is pushed, from here).
+      const holds =
+        tip === plan.sha ||
+        (await runGit(["--git-dir", repo, "merge-base", "--is-ancestor", plan.sha, tip], stage, left(), { sshCommand: null, signal: o.signal, protocol: "file" })).code === 0;
+      if (!holds) {
+        return {
+          ok: false,
+          summary: `refused: what the session's sandbox holds for ${plan.branch} (${tip.slice(0, 12)}) doesn't have the commit that was checked (${plan.sha.slice(0, 12)})`,
+          output: "",
+        };
+      }
+      await local(["--git-dir", repo, "config", "remote.target.url", plan.url]);
+      // Where git will push from here, after your rewrites: the plan's URL, or nothing is pushed.
+      const there = (await local(["--git-dir", repo, "remote", "get-url", "--push", "target"])).trim();
+      if (there !== plan.url) return { ok: false, summary: `refused: your git config rewrites ${shownUrl(plan.url)} again (to ${shownUrl(there)})`, output: "" };
+    } catch (err) {
+      return { ok: false, summary: `refused: the branch couldn't be staged for the push (${err instanceof Error ? err.message : String(err)})`, output: "" };
+    }
+    // 3. The remote's default branch, asked from here (never from the agent's repository and its legacy remotes files).
+    let defaultUnknown = false;
+    if (o.checkDefault) {
+      const r = await runGit(["--git-dir", repo, "ls-remote", "--symref", "target", "HEAD"], stage, Math.min(30_000, left()), {
+        sshCommand: plan.sshCommand,
+        signal: o.signal,
+        ...(o._testFileRemote ? { protocol: "file" as const } : {}),
+      });
+      const head = r.code === 0 ? /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(r.stdout)?.[1] : undefined;
+      if (head && head.toLowerCase() === plan.branch.toLowerCase()) {
+        return { ok: false, summary: `refused: ${plan.branch} is the remote's default branch: push your work to a branch of its own, and open a pull request`, output: "" };
+      }
+      if (!head) {
+        if (o.checkDefault === "refuse-unknown") {
+          return {
+            ok: false,
+            summary: `refused: codeoid couldn't ask ${plan.shownUrl} which branch is its default, so it can't be sure ${plan.branch} isn't it: try again, or ask the owner to push`,
+            output: "",
+          };
+        }
+        defaultUnknown = true;
+      }
+    }
+    if (o.signal?.aborted) return { ok: false, summary: "not pushed: the session is closing", output: "" };
+    // 4. The push, from the daemon's repository.
+    const r = await runGit(
+      ["--git-dir", repo, "push", "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", "--end-of-options", "target", `${plan.sha}:refs/heads/${plan.branch}`],
+      stage,
+      left(),
+      { sshCommand: plan.sshCommand, signal: o.signal, ...(o._testFileRemote ? { protocol: "file" as const } : {}) },
+    );
+    const output = shownOutput(`${r.stdout}\n${r.stderr}`);
+    const unknownNote = defaultUnknown ? " (the remote didn't say which branch is its default)" : "";
+    if (r.aborted) return { ok: false, summary: "stopped: the session closed while it was pushing (the remote may or may not have it)", output };
+    if (r.timedOut) return { ok: false, summary: `the push timed out after ${Math.round(timeoutMs / 1000)}s (the remote may or may not have it)`, output };
+    // Porcelain: a tab-separated line per ref, flag first: ` ` fast-forward, `*` new, `=` up to date, `!` rejected.
+    const line = r.stdout.split("\n").find((l) => l.includes(`:refs/heads/${plan.branch}\t`) || l.endsWith(`:refs/heads/${plan.branch}`));
+    const flag = line?.[0];
+    if (r.code === 0 && flag === "=") return { ok: true, summary: `${plan.branch} is already up to date on ${plan.remote}${unknownNote}`, output, defaultUnknown };
+    if (r.code === 0) {
+      return { ok: true, summary: `pushed ${plan.branch} (${plan.sha.slice(0, 12)}) to ${plan.remote}${flag === "*" ? ", a new branch there" : ""}${unknownNote}`, output, defaultUnknown };
+    }
+    if (flag === "!") {
+      // `!<TAB>from:to<TAB>[rejected] (non-fast-forward)`.
+      const why = line?.split("\t").slice(2).join(" ").trim() || "rejected";
+      return {
+        ok: false,
+        summary: /non-fast-forward|fetch first|stale info/.test(why)
+          ? `the remote's ${plan.branch} has commits yours doesn't (${why}): a force push isn't done for agents. Your commands can't fetch either (no network to the git host, no credentials): ask the owner to fetch it (or merge the remote's branch for you), or push to a new branch of your own`
+          : `the remote refused it (${why})`,
+        output,
+      };
+    }
+    return { ok: false, summary: `git push failed (exit ${r.code ?? "killed"})`, output };
+  } finally {
+    rmSync(stage, { recursive: true, force: true });
+  }
+}
+
 
 /** @deprecated name kept for tests: {@link gitStoreProblem} without a worktree. */
 export function objectsProblem(common: string): string | null {
@@ -573,14 +720,12 @@ async function runGit(
   args: string[],
   cwd: string,
   timeoutMs: number,
-  o: { testFile?: boolean; sshCommand: string | null; signal?: AbortSignal; precheck?: () => Promise<string | null> },
-): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean; aborted: boolean; refused?: string }> {
+  o: { sshCommand: string | null; signal?: AbortSignal; protocol?: "file" },
+): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean; aborted: boolean }> {
   const env = await safeGitEnv(cwd, { network: true, overrides: PUSH_OVERRIDES });
-  // Checked last, right before git starts (the environment's own git run took time): the object store is the agent's to write.
-  const refused = (await o.precheck?.()) ?? null;
-  if (refused) return { code: null, stdout: "", stderr: "", timedOut: false, aborted: false, refused };
   if (o.signal?.aborted) return { code: null, stdout: "", stderr: "", timedOut: false, aborted: true };
-  if (o.testFile) env.GIT_ALLOW_PROTOCOL = "file";
+  // A local bundle into the daemon's own repository (and tests' local remotes): that protocol alone.
+  if (o.protocol) env.GIT_ALLOW_PROTOCOL = o.protocol;
   // How ssh runs: your environment's GIT_SSH_COMMAND / GIT_SSH first (as git itself ranks them), then your own
   // core.sshCommand (planPush took it from your global or system config only), else ssh that never waits for a
   // person (a host-key or passphrase prompt) and gives up on a dead host. The time limit bounds any of them.

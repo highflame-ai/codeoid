@@ -152,8 +152,8 @@ describe("push, decided by the session", () => {
     expect(asked[0]?.title).toBe("The agent asks to push feature/y");
     expect(asked[0]?.message).toContain("https://git.example.invalid/team/repo.git");
     expect(asked[0]?.message).toContain("The agent's reason, in its own words:\n> open a PR");
-    // The remote couldn't be asked which branch is its default (no network here): the card says so.
-    expect(asked[0]?.message).toContain("make sure feature/y isn't it");
+    // The remote's default branch is asked only after the answer (nobody untrusted is contacted first).
+    expect(asked[0]?.message).toContain("The remote's default branch is asked after you answer");
     expect(asked[0]?.message).toContain("You haven't trusted agent pushes from this repository to this URL yet");
     await m.handle({ type: "session.ui_response", id: "u", sessionId: info?.id as string, requestId: asked[0]?.requestId as string, value: "Don't push" } as never, AUTH, CLIENT);
     expect(await pending).toBe("Refused: the owner declined.");

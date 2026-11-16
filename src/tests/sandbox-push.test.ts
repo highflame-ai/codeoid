@@ -5,12 +5,12 @@
  * https only).
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isPushTool, isSafeTool } from "../daemon/providers/tool-safety.js";
-import { branchMatches, cleanPushInput, planPush, pushUrlProblem, runPush, shownUrl, type PushPlan } from "../daemon/sandbox/push.js";
+import { branchMatches, bundleFromChild, cleanPushInput, planPush, pushUrlProblem, type RunOptions, runPush, shownUrl, type PushPlan } from "../daemon/sandbox/push.js";
 import { SandboxMcpHttp } from "../daemon/sandbox/request-directory.js";
 
 let root: string;
@@ -53,6 +53,10 @@ const planned = async (input: Parameters<typeof planPush>[1] = {}): Promise<Push
   if ("refused" in p) throw new Error(p.refused);
   return p;
 };
+/** The session's bundler, on the host (the real one runs inside the sandbox: sandbox-push-manager.test.ts). */
+const hostBundle = (r: string, ref: string, dest: string) => bundleFromChild(spawn("git", ["-C", r, "bundle", "create", "-q", "-", ref]), dest, { timeoutMs: 30_000 });
+/** runPush as the session calls it, against the local bare remote. */
+const run = (p: PushPlan, o: Partial<RunOptions> = {}) => runPush(p, { timeoutMs: 60_000, _testFileRemote: true, stagingRoot: join(root, "staging"), makeBundle: hostBundle, ...o });
 const refusal = async (input: Parameters<typeof planPush>[1] = {}, o: Partial<Parameters<typeof planPush>[2]> = {}): Promise<string> => {
   const p = await plan(input, o);
   if (!("refused" in p)) throw new Error(`expected a refusal, got a plan for ${p.branch}`);
@@ -155,29 +159,47 @@ describe("push: the plan", () => {
     const p = await planned();
     expect(p).toMatchObject({ url: `file://${other}`, configuredUrl: `file://${bare}` });
     expect(p.userSettings.some((x) => x.includes("pushinsteadof"))).toBe(true);
-    const r = await runPush(p, 60_000, true);
+    const r = await run(p);
     expect(r.ok).toBe(true);
     expect(git(other, "rev-parse", "refs/heads/feature/x")).toBe(p.sha);
-    // Changed after the plan: the push doesn't start.
-    const p2 = await planned();
+    // A rewrite added after the plan: git would push elsewhere, so nothing is pushed.
     writeFileSync(join(root, ".gitconfig"), "");
-    expect(await runPush(p2, 60_000, true)).toMatchObject({ ok: false, summary: expect.stringContaining("changed since it was checked") });
+    const p2 = await planned();
+    writeFileSync(join(root, ".gitconfig"), `[url "file://${other}"]\n\tpushInsteadOf = file://${bare}\n`);
+    expect(await run(p2)).toMatchObject({ ok: false, summary: expect.stringContaining("rewrites") });
   });
 
-  test("round 4: a link anywhere in the git store (a ref, a loose-object dir) is refused, at the plan and right before git", async () => {
-    const { gitStoreProblem } = await import("../daemon/sandbox/push.js");
-    const secret = join(root, "secret");
-    mkdirSync(secret);
-    git(secret, "init", "-q", "-b", "topsecret");
-    symlinkSync(join(secret, ".git", "refs", "heads"), join(repo, ".git", "refs", "heads", "leak"));
-    expect(await refusal({ branch: "feature/x" })).toContain("is a link");
-    rmSync(join(repo, ".git", "refs", "heads", "leak"));
+  test("round 5: the push is made from the daemon's own repository: only the planned commit, as the sandbox bundled it; the agent's repository isn't read or written", async () => {
     const p = await planned();
-    const fan = join(repo, ".git", "objects", "ab");
-    rmSync(fan, { recursive: true, force: true });
-    symlinkSync(join(secret, ".git", "objects"), fan);
-    expect(gitStoreProblem(join(repo, ".git"), null)).toContain("objects/ab is a link");
-    expect(await runPush(p, 60_000, true)).toMatchObject({ ok: false, summary: expect.stringContaining("is a link") });
+    // What the sandbox bundled isn't the commit that was checked (a ref moved, a bundle of something else): refused.
+    const fake = join(root, "fake");
+    git(root, "clone", "-q", "-b", "main", repo, fake);
+    git(fake, "checkout", "-q", "-b", "feature/x");
+    git(fake, "commit", "-q", "--allow-empty", "-m", "unrelated");
+    const other = await run(p, { makeBundle: (_r, ref, dest) => hostBundle(fake, ref, dest) });
+    expect(other).toMatchObject({ ok: false, summary: expect.stringContaining("doesn't have the commit that was checked") });
+    expect(git(bare, "for-each-ref", "refs/heads/feature")).toBe("");
+    // The sandbox couldn't bundle it (a link into a path it hides leads nowhere there): refused, saying so.
+    expect(await run(p, { makeBundle: async () => "fatal: bad object" })).toMatchObject({ ok: false, summary: expect.stringContaining("couldn't be bundled in the session's sandbox (fatal: bad object)") });
+    expect(await run(p, { makeBundle: async () => Promise.reject(new Error("boom")) })).toMatchObject({ ok: false, summary: expect.stringContaining("(boom)") });
+    // Nothing the push does writes into the agent's repository (no remote-tracking ref, no reflog, no FETCH_HEAD).
+    const store = () => (readdirSync(join(repo, ".git"), { recursive: true }) as string[]).sort().map((f) => `${f} ${statSync(join(repo, ".git", f)).size}`);
+    const before = store();
+    expect(await run(p)).toMatchObject({ ok: true });
+    expect(store()).toEqual(before);
+    // The staging repository is gone after each push.
+    expect(readdirSync(join(root, "staging"))).toEqual([]);
+  });
+
+  test("round 5: the bundle stream goes only into a new file of the daemon's, and stops at its size cap", async () => {
+    const dest = join(root, "staged.bundle");
+    symlinkSync(join(root, "elsewhere"), dest);
+    expect(await bundleFromChild(spawn("git", ["-C", repo, "bundle", "create", "-q", "-", "HEAD"]), dest, { timeoutMs: 30_000 })).toContain("staging file couldn't be made");
+    expect(existsSync(join(root, "elsewhere"))).toBe(false);
+    rmSync(dest);
+    expect(await bundleFromChild(spawn("git", ["-C", repo, "bundle", "create", "-q", "-", "HEAD"]), dest, { timeoutMs: 30_000, maxBytes: 10 })).toContain("too big");
+    rmSync(dest);
+    expect(await bundleFromChild(spawn("git", ["-C", repo, "bundle", "create", "-q", "-", "nope"]), dest, { timeoutMs: 30_000 })).not.toBeNull();
   });
 
   test("round 4: your global push settings are part of a trust: one changed since doesn't match", async () => {
@@ -244,13 +266,13 @@ describe("push: the run", () => {
     git(repo, "branch", "other");
     git(repo, "tag", "v1");
     const p = await planned();
-    const r = await runPush(p, 60_000, true);
+    const r = await run(p);
     expect(r).toMatchObject({ ok: true });
     expect(r.summary).toContain("a new branch there");
     expect(git(bare, "rev-parse", "refs/heads/feature/x")).toBe(p.sha);
     expect(() => git(bare, "rev-parse", "--verify", "-q", "refs/heads/other")).toThrow();
     expect(() => git(bare, "rev-parse", "--verify", "-q", "refs/tags/v1")).toThrow();
-    const again = await runPush(await planned(), 60_000, true);
+    const again = await run(await planned());
     expect(again).toMatchObject({ ok: true });
     expect(again.summary).toContain("already up to date");
   });
@@ -264,32 +286,31 @@ describe("push: the run", () => {
     writeFileSync(join(repo, "c.txt"), "c\n");
     git(repo, "add", ".");
     git(repo, "commit", "-q", "-m", "after the plan");
-    const r = await runPush(p, 60_000, true);
+    const r = await run(p);
     expect(r.ok).toBe(true);
     expect(existsSync(marker)).toBe(false);
     expect(git(bare, "rev-parse", "refs/heads/feature/x")).toBe(p.sha);
   });
 
-  test("round 1: borrowed objects that appear after the plan stop the push; a stop kills it, and says the remote may have it", async () => {
+  test("a stop before or during the bundle ends it, saying the session is closing", async () => {
     const p = await planned();
-    writeFileSync(join(repo, ".git", "objects", "info", "alternates"), "/elsewhere/objects\n");
-    expect(await runPush(p, 60_000, true)).toMatchObject({ ok: false, summary: expect.stringContaining("borrows objects") });
-    rmSync(join(repo, ".git", "objects", "info", "alternates"));
-    // Round 2: a link in the object store's top levels too.
-    const { objectsProblem } = await import("../daemon/sandbox/push.js");
-    const pack = join(repo, ".git", "objects", "pack");
-    rmSync(pack, { recursive: true, force: true });
-    symlinkSync(join(root, "elsewhere"), pack);
-    expect(objectsProblem(join(repo, ".git"))).toContain("is a link");
-    rmSync(pack);
-    mkdirSync(pack);
     const stopped = new AbortController();
     stopped.abort();
-    expect(await runPush(p, 60_000, true, stopped.signal)).toMatchObject({ ok: false, summary: expect.stringContaining("closing") });
+    expect(await run(p, { signal: stopped.signal })).toMatchObject({ ok: false, summary: expect.stringContaining("closing") });
+    const later = new AbortController();
+    const slow = await run(p, {
+      signal: later.signal,
+      makeBundle: (_r, _ref, dest) => {
+        const child = spawn("sleep", ["30"]);
+        setTimeout(() => later.abort(), 50);
+        return bundleFromChild(child, dest, { timeoutMs: 30_000, signal: later.signal });
+      },
+    });
+    expect(slow).toMatchObject({ ok: false, summary: expect.stringContaining("the session is closing") });
   });
 
   test("a remote branch with commits ours doesn't have: refused by the remote, never forced, and the agent is told what to do", async () => {
-    await runPush(await planned(), 60_000, true);
+    await run(await planned());
     // Someone else moves the remote branch.
     const other = join(root, "other");
     git(root, "clone", "-q", `file://${bare}`, other);
@@ -300,7 +321,7 @@ describe("push: the run", () => {
     git(other, "push", "-q", "origin", "feature/x");
     const theirs = git(other, "rev-parse", "HEAD");
     git(repo, "commit", "-q", "--amend", "-m", "rewritten");
-    const r = await runPush(await planned(), 60_000, true);
+    const r = await run(await planned());
     expect(r.ok).toBe(false);
     expect(r.summary).toContain("a force push isn't done for agents");
     expect(git(bare, "rev-parse", "refs/heads/feature/x")).toBe(theirs);
