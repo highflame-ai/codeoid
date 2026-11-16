@@ -22,7 +22,7 @@ import { credentialsSchema } from "./credentials/schema.js";
 import { workstreamsSchema } from "./workstreams/schema.js";
 import { registerSecretPaths } from "./secret-paths.js";
 import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
-import { readPushTarget, shownSetting, shownUrl, type PushInput } from "./sandbox/push.js";
+import { readPushTarget, redactCredentials, shownSetting, shownUrl, type PushInput } from "./sandbox/push.js";
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -10669,7 +10669,7 @@ mcpHub: this.#mcpHub,
     const target = await readPushTarget(msg.path, remote, { requireHeld: false, agentWritable: this.#allSandboxWritable() }).catch((err: unknown) => ({
       refused: err instanceof Error ? err.message : String(err),
     }));
-    if ("refused" in target) return fail(`Can't trust pushes from there: ${target.refused}.`);
+    if ("refused" in target) return fail(`Can't trust pushes from there: ${redactCredentials(target.refused)}.`);
     this.#store.setPushTrust(auth.sub, { common: target.common, remote, url: target.url, repoSettings: target.repoSettings, userSettings: target.userSettings }, auth.sub);
     this.#store.audit(auth.sub, "sandbox.push_trusted", undefined, `${target.common} ${remote} ${shownUrl(target.url)}`);
     return {
@@ -10680,7 +10680,7 @@ mcpHub: this.#mcpHub,
         remote,
         url: shownUrl(target.url),
         ...(target.configuredUrl ? { configuredUrl: shownUrl(target.configuredUrl) } : {}),
-        settings: target.repoSettings.map((x) => x.split("\t").slice(1).join(" = ")),
+        settings: target.repoSettings.map((x) => shownSetting(x)),
         userSettings: target.userSettings.map((x) => shownSetting(x)),
       },
     };

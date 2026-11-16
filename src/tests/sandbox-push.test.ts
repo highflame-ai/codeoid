@@ -355,6 +355,41 @@ describe("push: the plan", () => {
     }
   });
 
+  test("round 12: no credential in any text the push says: refusals naming a key, values without a scheme, passwords holding @", async () => {
+    const { redactCredentials, shownName, shownSetting } = await import("../daemon/sandbox/push.js");
+    const secrets = ["SECRET-REPO-TOKEN-123", "p@ss@word", "Hunter2Fake", "proxypass"];
+    const leaks = (t: string) => secrets.some((x) => t.includes(x));
+    // A refusal that names the repository's own key, with the token in it.
+    git(repo, "config", "url.https://ci-user:SECRET-REPO-TOKEN-123@github.com/.insteadOf", "https://github.com/");
+    const why = await refusal();
+    expect(leaks(why)).toBe(true);
+    expect(leaks(redactCredentials(why))).toBe(false);
+    for (const text of [
+      "http.proxy = user:proxypass@proxy:8080",
+      "http.proxy = http://user:p@ss@word@proxy:8080",
+      "your git config's http.https://ci:Hunter2Fake@git.example.com/.sslverify apply differently",
+      "`url.https://ci-user:SECRET-REPO-TOKEN-123@github.com/.insteadof`",
+    ]) expect([text, leaks(redactCredentials(text))]).toEqual([text, false]);
+    expect(leaks(shownSetting("global\thttp.proxy\tuser:proxypass@proxy:8080"))).toBe(false);
+    expect(leaks(shownSetting("local\tremote.origin.url\thttps://x-access-token:SECRET-REPO-TOKEN-123@github.com/o/r.git"))).toBe(false);
+    // What stays readable.
+    expect(redactCredentials("git@github.com:o/r.git to origin")).toBe("git@github.com:o/r.git to origin");
+    expect(redactCredentials("https://github.com/o/r.git")).toBe("https://github.com/o/r.git");
+    // A refused name, as the owner's line shows it.
+    expect(shownName("ma\u200bin")).toBe("ma\\u{200b}in");
+  });
+
+  test("round 12: a file a helper or ssh is handed (a key, a store, a socket) may be under your home; the program may not", async () => {
+    const { commandProblem } = await import("../daemon/sandbox/push.js");
+    const home = join(root, "h");
+    mkdirSync(join(home, ".cache"), { recursive: true });
+    writeFileSync(join(home, ".git-credentials"), "");
+    for (const c of ["store --file ~/.git-credentials", "cache --socket ~/.cache/git/credential/socket", "ssh -o IdentityFile=~/keys/work_ed25519"]) expect([c, commandProblem(c, [], home)]).toEqual([c, null]);
+    expect(commandProblem("~/.local/bin/helper get", [], home)).toContain("under your home");
+    // Never one a session could write.
+    expect(commandProblem("store --file ~/.git-credentials", [home], home)).toContain("may write");
+  });
+
   test("round 11: a recorded writable dir that no longer resolves (a file now, unreadable) decides nothing and breaks nothing", async () => {
     const { gitBinProblem, hostPathProblem, safePathFor } = await import("../daemon/sandbox/push.js");
     const gone = join(root, "was-a-workspace");

@@ -248,7 +248,7 @@ import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/v
 /** What is recorded of a call the user listed in `secrets.dropCommands`. */
 const NOT_STORED = "‹not stored›";
 import { PUSH_TOOL_FQ, REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
-import { bundleFromChild, gitBinProblem, planPush, runPush, shownSetting, shownUrl, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
+import { bundleFromChild, gitBinProblem, planPush, redactCredentials, runPush, shownName, shownSetting, shownUrl, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
 import { physicalPath, within } from "./physical-path.js";
 import { GIT_BIN, gitEnv } from "./git-env.js";
 import {
@@ -4251,14 +4251,16 @@ export class Session {
     const reserveMs = Math.min(opencode ? 12_000 : 90_000, Math.floor(budgetMs / 2));
     const deadline = Date.now() + budgetMs;
     const left = () => Math.max(0, deadline - Date.now());
-    const what = `${input.branch ?? "the checked-out branch"} to ${input.remote ?? "origin"}`;
+    const what = `${input.branch ? shownName(input.branch) : "the checked-out branch"} to ${input.remote ?? "origin"}`;
     this.#store.audit(SYSTEM_IDENTITY.sub, "session.push_request", this.id, `${what}${input.reason ? ` reason=${input.reason}` : ""}`.slice(0, 2000));
     const note = (text: string, event: string, extra: Record<string, unknown> = {}) => {
       const m = this.#makeMessage("info", text, SYSTEM_IDENTITY, undefined, undefined, { event, ...extra });
       this.#persistAndBuffer(m);
       this.#broadcastRaw(m);
     };
-    const refuse = (why: string): string => {
+    const refuse = (raw: string): string => {
+      // A reason may name your config's keys and values: never a credential in what the agent, transcript or audit reads.
+      const why = shownName(redactCredentials(raw));
       this.#store.audit(SYSTEM_IDENTITY.sub, "session.push_refused", this.id, `${what}: ${why}`.slice(0, 2000));
       note(`⬆ The agent asked to push ${what}: refused (${why})`, "sandbox.push_refused");
       return `Refused: ${why}.`;
@@ -4375,19 +4377,20 @@ export class Session {
       // The push runs on the host: no program from what a session may write (its PATH, ssh, credential helpers).
       hostWritable: this.#pushHostWritable(sbx),
     });
-    const detail = `${plan.branch} ${plan.sha} -> ${plan.shownUrl} refs/heads/${plan.branch}: ${r.summary}`;
+    const summary = redactCredentials(r.summary);
+    const detail = `${plan.branch} ${plan.sha} -> ${plan.shownUrl} refs/heads/${plan.branch}: ${summary}`;
     if (r.refused) {
-      const why = r.summary.replace(/^refused: /, "");
+      const why = summary.replace(/^refused: /, "");
       this.#store.audit(by, "session.push_refused", this.id, detail.slice(0, 2000));
       note(`⬆ The agent asked to push ${plan.branch} to ${plan.remote}: refused (${why})`, "sandbox.push_refused", { branch: plan.branch });
       return `Refused: ${why}.`;
     }
     this.#store.audit(by, r.ok ? "session.push_done" : "session.push_failed", this.id, detail.slice(0, 2000));
-    note(`⬆ ${r.ok ? "Pushed" : "Push failed"}: ${plan.branch} → ${plan.remote} (${plan.shownUrl}) — ${r.summary}`, r.ok ? "sandbox.pushed" : "sandbox.push_failed", {
+    note(`⬆ ${r.ok ? "Pushed" : "Push failed"}: ${plan.branch} → ${plan.remote} (${plan.shownUrl}) — ${summary}`, r.ok ? "sandbox.pushed" : "sandbox.push_failed", {
       branch: plan.branch,
       sha: plan.sha,
     });
-    return `${r.ok ? "Done" : "Failed"}: ${r.summary}.${r.output ? `\n\ngit said:\n${r.output}` : ""}`;
+    return `${r.ok ? "Done" : "Failed"}: ${summary}.${r.output ? `\n\ngit said:\n${r.output}` : ""}`;
   }
 
   /** What this session's sandboxed commands may write (none when it isn't sandboxed or not running). */

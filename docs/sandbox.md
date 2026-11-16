@@ -1352,12 +1352,17 @@ config includes is refused if any sandboxed session's commands may write it,
 or ever could: codeoid keeps, for good, every directory a sandboxed session
 could write (in its database), since what an agent left there outlives the
 session. On first start with this, every session's working directory from
-before is added (whether it was sandboxed isn't known: fail closed). Once
+before is added (whether it was sandboxed isn't known: fail closed). A session
+destroyed before that start left no record, so what its agent wrote outside
+your home isn't known to codeoid: if you ran sandboxed sessions before, check
+the git config files your config includes and the directories on your PATH. Once
 you've checked what is in such a place, and no session works there, clear it
 with `codeoid sandbox forget-writable <dir>`; the refusal names the command.
 The guarded card and `codeoid sandbox trust-push` list the settings of yours
 that decide the push, with every URL's user info and query, and any
-secret-looking value or credential helper, hidden.
+secret-looking value or credential helper, hidden. Refusals (what the agent,
+the transcript and the audit read) are redacted the same way, `user:pass@host`
+without a scheme included.
 
 Also refused:
 
@@ -1382,12 +1387,14 @@ It runs hardened (`git-env.ts`):
 - On a PATH of git's own dir and your PATH's absolute entries that are
   outside your home, outside anything a sandboxed session may write or ever
   could, owned by you or root, and writable by nobody else: not by everyone,
-  and by a group only if it is your own primary group (Linuxbrew's) or, on
-  macOS, `admin` (Homebrew's). A session that has ended may have left a program in its
+  and by a group only if it is your user-private group (named as you, nobody
+  else in it: Linuxbrew's) or, on macOS, `admin` (Homebrew's). Never macOS's
+  `staff` or a shared `users` group. A session that has ended may have left a program in its
   workspace, so "under your home" is out whatever runs now. `ssh` is found on
   that PATH. An ssh command (`core.sshCommand`, `GIT_SSH_COMMAND`, `GIT_SSH`)
-  or credential helper naming a path that fails the same test, or a relative
-  one, is refused. (Paths under `~/.ssh`, such as keys and config, are yours
+  or credential helper whose program fails the same test, or is a relative
+  path, is refused. A file it is handed (`store --file ~/.git-credentials`, a
+  key, a socket) may be under your home, but never where a session could write. (Paths under `~/.ssh`, such as keys and config, are yours
   to name.) A git of codeoid's own under your home can't push for agents
   either.
 - With no askpass program (`GIT_ASKPASS`, `SSH_ASKPASS`): a push never prompts.

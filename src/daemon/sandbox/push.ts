@@ -27,7 +27,7 @@
 
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readFileSync, readSync, rmSync, writeSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { GIT_BIN, safeGit, safeGitEnv } from "../git-env.js";
 import { validateBranchName } from "../git-worktree.js";
@@ -302,9 +302,24 @@ export function pushUrlProblem(url: string): string | null {
 export function shownSetting(entry: string): string {
   const [, key = "", ...rest] = entry.split("\t");
   const value = rest.join("\t");
-  const line = /extraheader|cookie|password|token|secret|auth|helper/i.test(key) ? `${key} = (hidden)` : `${key} = ${value}`;
-  // A URL anywhere in it (a key's subsection, `url.https://user:tok@host/.insteadof`, holds one): no user info, no query.
-  return line.replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/@]*@/gi, "$1…@").replace(/(\/\/[^\s]*?)\?[^\s]*/g, "$1?…");
+  return redactCredentials(/extraheader|cookie|password|token|secret|auth|helper/i.test(key) ? `${key} = (hidden)` : `${key} = ${value}`);
+}
+
+/**
+ * Text that may name a config key or value (a refusal, a shown setting), with no credential in it: a URL's user
+ * info (to its last `@`, a password may hold one), `user:pass@host` without a scheme, and a URL's query. Everything
+ * the agent, the transcript, the audit or a card reads goes through it.
+ */
+export function redactCredentials(text: string): string {
+  return text
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/`'"]*@/gi, "$1…@")
+    .replace(/(^|[\s=,(`'"])[^\s/@`'"=,()]*:[^\s/`'"]*@/g, "$1…@")
+    .replace(/(\/\/[^\s`'"]*?)\?[^\s`'"]*/g, "$1?…");
+}
+
+/** A name as the owner's line shows it: an invisible or reordering character written as its code. */
+export function shownName(name: string): string {
+  return name.replace(/[\p{Cf}\p{Cc}\p{Zl}\p{Zp}\p{Co}\p{Cn}]/gu, (c) => `\\u{${(c.codePointAt(0) ?? 0).toString(16)}}`);
 }
 
 /** A remote's URL, safe to show. scp-like ones have no credentials to hide but a user name, which stays. */
@@ -674,6 +689,31 @@ function physicalPathOr(p: string): string {
 /** The id a user namespace shows for an owner it doesn't map (root's files, inside a container or bwrap). */
 const OVERFLOW_UID = 65534;
 
+/**
+ * Your user-private group (Linux: named as you, nobody else in it), if you have one. macOS's staff and a shared
+ * `users` group are every local user's: never.
+ */
+function privateGroup(): number[] {
+  if (process.platform === "darwin" || typeof process.getgid !== "function") return [];
+  const gid = process.getgid();
+  try {
+    // Your name by your uid (passwd), not the environment's.
+    const uid = typeof process.getuid === "function" ? String(process.getuid()) : "";
+    const me =
+      readFileSync("/etc/passwd", "utf8")
+        .split("\n")
+        .find((l) => l.split(":")[2] === uid)
+        ?.split(":")[0] ?? userInfo().username;
+    const line = readFileSync("/etc/group", "utf8")
+      .split("\n")
+      .find((l) => l.split(":")[2] === String(gid));
+    const [name, , , members = ""] = line?.split(":") ?? [];
+    return name === me && members.split(",").every((m) => !m || m === me) ? [gid] : [];
+  } catch {
+    return [];
+  }
+}
+
 /** Whether the daemon runs in a user namespace that doesn't map root (where root's files show as the overflow id). */
 function inUserNamespace(): boolean {
   try {
@@ -699,7 +739,7 @@ export function hostPathProblem(at: string, writable: readonly string[], home = 
   const uid = typeof process.getuid === "function" ? process.getuid() : -1;
   // Group-write only by your own primary group (Linuxbrew's), or macOS's admin group (Homebrew's): never a group
   // every local user is in (staff, users, everyone).
-  const groups = new Set<number>(typeof process.getgid === "function" ? [process.getgid()] : []);
+  const groups = new Set<number>(privateGroup());
   if (process.platform === "darwin") groups.add(80);
   const overflow = inUserNamespace() ? OVERFLOW_UID : -2;
   for (const start of new Set([real, at])) {
@@ -730,13 +770,19 @@ export function hostPathProblem(at: string, writable: readonly string[], home = 
  * (a word with a `/`, `~` expanded) is judged by {@link hostPathProblem}. Bare names resolve on {@link safePathFor}.
  */
 export function commandProblem(command: string, writable: readonly string[], home = homedir()): string | null {
+  let first = true;
   for (const raw of command.replace(/^\s*!/, "").split(/[\s;|&()<>`"'=]+/)) {
+    if (!raw) continue;
+    const isProgram = first;
+    first = false;
     if (!raw.includes("/") && !raw.startsWith("~")) continue;
     const word = raw.startsWith("~/") || raw === "~" ? join(home, raw.slice(1)) : raw;
     // A key file, a socket and the like are the user's; only what could be run matters: an absolute or ~ path, or a relative one (refused).
     if (!isAbsolute(word)) return `${raw} is a relative path`;
     if (/(^|\/)\.ssh(\/|$)/.test(word)) continue;
-    const bad = hostPathProblem(word, writable, home);
+    // The program: nowhere a session could leave one (your home included). A path it is handed (a key, a store
+    // file, a socket, or a script `sh -c` runs): yours alone, never where a session could write.
+    const bad = hostPathProblem(word, writable, home, { homeAllowed: !isProgram });
     if (bad) return bad;
   }
   return null;
