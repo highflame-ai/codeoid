@@ -128,10 +128,17 @@ export class SandboxMcpHttp {
   readonly #tokens = new Map<string, string>();
   readonly #handle: RequestDirectoryHandler;
   readonly #push: PushHandler | undefined;
+  /** Whether `push` is offered to a session (its sandbox on, pushing not turned off); absent: always. */
+  readonly #pushOffered: ((sessionId: string) => boolean) | undefined;
 
-  constructor(handle: RequestDirectoryHandler, push?: PushHandler) {
+  constructor(handle: RequestDirectoryHandler, push?: PushHandler, pushOffered?: (sessionId: string) => boolean) {
     this.#handle = handle;
     this.#push = push;
+    this.#pushOffered = pushOffered;
+  }
+
+  #offersPush(sessionId: string): boolean {
+    return this.#push !== undefined && (this.#pushOffered?.(sessionId) ?? true);
   }
 
   /** A token scoped to `sessionId`: the scope of every call made with it. */
@@ -200,12 +207,12 @@ export class SandboxMcpHttp {
         return ok(id, {
           tools: [
             { name: REQUEST_DIRECTORY_TOOL, description: REQUEST_DIRECTORY_DESCRIPTION, inputSchema: REQUEST_DIRECTORY_SCHEMA },
-            ...(this.#push ? [{ name: PUSH_TOOL, description: PUSH_DESCRIPTION, inputSchema: PUSH_SCHEMA }] : []),
+            ...(this.#offersPush(sessionId) ? [{ name: PUSH_TOOL, description: PUSH_DESCRIPTION, inputSchema: PUSH_SCHEMA }] : []),
           ],
         });
       case "tools/call": {
         const name = msg.params?.name;
-        if (name === PUSH_TOOL && this.#push) {
+        if (name === PUSH_TOOL && this.#push && this.#offersPush(sessionId)) {
           const input = cleanPushInput((msg.params?.arguments ?? {}) as Record<string, unknown>);
           const push = this.#push;
           const text = typeof input === "string" ? input : await push(sessionId, input).catch((e) => `Refused: ${e instanceof Error ? e.message : String(e)}`);

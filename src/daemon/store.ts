@@ -384,6 +384,14 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_log(session_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id, project_id);
 
+      -- Workspaces a session worked in while they weren't a git repository (sandbox/push.ts): a repository
+      -- made inside one after that (its .git born since) is the agent's, and codeoid never pushes from it.
+      -- Not session-scoped: the record outlives the session (a routine's next run, a fork, a later session).
+      CREATE TABLE IF NOT EXISTS non_repo_workspaces (
+        path       TEXT PRIMARY KEY,
+        first_seen INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS session_pins (
         session_id  TEXT NOT NULL,
         file_path   TEXT NOT NULL,
@@ -2300,6 +2308,24 @@ export class Store {
       )
       .all(parentSessionId, accountId, projectId) as Array<Record<string, unknown>>;
     return rows.map(compareRowFrom);
+  }
+
+  /** Note that `path` (physical) was a session's workspace while it wasn't a git repository; the first time is kept. */
+  noteNonRepoWorkspace(path: string, at: number = Date.now()): void {
+    try {
+      this.#db.prepare("INSERT OR IGNORE INTO non_repo_workspaces (path, first_seen) VALUES (?, ?)").run(path, at);
+    } catch (err) {
+      console.error(`[codeoid/store] noting a workspace without a repository failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /** Every workspace noted by {@link noteNonRepoWorkspace}, with when it was first seen. */
+  nonRepoWorkspaces(): Array<{ path: string; since: number }> {
+    try {
+      return (this.#db.prepare("SELECT path, first_seen AS since FROM non_repo_workspaces").all() as Array<{ path: string; since: number }>).slice();
+    } catch {
+      return [];
+    }
   }
 
   audit(subject: string, action: string, sessionId?: string, detail?: string): void {

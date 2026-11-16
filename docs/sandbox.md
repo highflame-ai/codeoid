@@ -1272,19 +1272,27 @@ machine, with your network and your credentials, which the agent never sees.
 **Where it goes**
 
 Where the push goes, and how git connects and authenticates, is decided only
-by config the agent couldn't have written: your global and system config,
-and the repository's own `.git/config`. The repository's config counts only
-if all three of these hold:
+by config the agent couldn't have written: your global and system config, and
+the repository's own `.git/config`. The repository's config counts only if all
+three of these hold:
 
-- the session's sandbox holds it read-only (its git dir as the spec was built);
-- it predates the session: its ctime, which nothing can set back, is earlier
-  than the session's start;
-- the end-of-turn check of the repository's git settings saw no change during
-  the session.
+- **The sandbox holds it read-only.** That is the repository's git dir as the
+  session's sandbox spec holds it.
+- **It isn't an agent's repository.** codeoid notes, for good, every workspace
+  a session (sandboxed or not) worked in while it wasn't a repository. A
+  repository inside one, whose `.git` was born after that, is an agent's: no
+  session ever pushes from it. That includes later sessions, a routine's next
+  run and forks.
+- **Nothing that decides a push changed.** The settings that decide a push
+  (the keys listed below, from every file) are snapshotted before the
+  session's first turn, and the push is refused if they differ now. Branch
+  tracking (`git push -u`, `checkout -t`, codeoid's own worktrees),
+  `.gitattributes`, aliases and the like aren't part of that.
 
-A repository the agent made with `git init` in a folder that wasn't one, or
-config rewritten during the session (yours included: push those yourself),
-decides nothing.
+Includes are judged by the file they name, whatever it holds now, because git
+reads it again when it pushes. An include in the repository's own config is
+refused. An include in your config is refused if it names a file the
+session's commands may write, even an empty or missing one.
 
 From the repository's config, codeoid takes the remote's `url`/`pushurl`,
 `url.*.insteadOf` and `push.*`. It never takes what would turn a push into a
@@ -1294,15 +1302,16 @@ credential leak or a command on the remote host: `http.*` (bar `postBuffer`,
 Set those in your global config.
 
 From your global config, codeoid takes everything, including your
-`core.sshCommand` (a key per host, an agent's wrapper), with one exception: a
-file it includes from somewhere the session's commands can write.
+`core.sshCommand` (a key per host, an agent's wrapper). It uses it both for
+the push and for asking the remote which branch is its default.
 
 Also refused:
 
 - a remote with more than one push URL;
 - a URL that isn't ssh or https;
-- a repository that borrows objects from elsewhere (`objects/info/alternates`,
-  checked again right before git starts).
+- a repository that borrows objects from elsewhere (`objects/info/alternates`),
+  or whose object store's top levels are links. Both are checked again right
+  before git starts.
 
 If the remote can't be asked which branch is its default (an error, a
 timeout, no `HEAD` symref), autonomous mode refuses the push; guarded mode
@@ -1335,8 +1344,16 @@ push runs at a time per session.
 
 Everything, your answer included, ends before the backend's own tool-call
 timeout: about 50 seconds on opencode, 8 minutes elsewhere. A card nobody
-answered in time closes, so a late yes never pushes. A push in flight is
-stopped, and audited, when the daemon stops or the session is destroyed.
+answered in time closes, so a late yes never pushes. Time for the push
+itself is kept back from the card. A push is stopped when the daemon drains or
+the session is destroyed, whether it is being checked, waiting on the card or
+running, and the stop is audited.
+
+`push` is offered only where it works: a sandboxed session, with pushing on.
+That holds over `/mcp/sandbox` too.
+
+Repositories made by agents before this feature can't be told apart. If you
+let an agent create repositories in older sessions, push those yourself.
 
 Every request, refusal, approval and result is audited: `session.push_request`,
 `session.push_refused`, `session.push_denied`, `session.push_done` and

@@ -541,6 +541,7 @@ export class SessionManager {
   readonly #sandboxMcp = new SandboxMcpHttp(
     (sessionId, input) => this.#requestDirectoryFor(sessionId, input),
     (sessionId, input) => this.#pushFor(sessionId, input),
+    (sessionId) => this.#sessions.get(sessionId)?.pushOffered ?? false,
   );
   #sandboxMcpUrl?: string;
   readonly #sandboxMcpTokens = new Map<string, string>();

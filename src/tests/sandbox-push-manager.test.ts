@@ -17,6 +17,9 @@ describe("push, decided by the session", () => {
   it("autonomous: a protected branch, or a missing remote, is refused at once, with no card; audited and said", async () => {
     const m = t.newManager();
     const { info, session } = await t.autonomous(m);
+    // A push is always asked for in a turn: the session's baseline is taken at its start.
+    await session.send("go", AUTH);
+    await until(() => session.toInfo().status === "idle");
     const asked = t.dialogs(m, info?.name as string);
     expect(await session.push({})).toBe("Refused: main is a protected branch (sandbox.push.protectedBranches): push your work to a branch of its own, and open a pull request.");
     git(["checkout", "-q", "-b", "feature/x"], t.workdir);
@@ -34,7 +37,8 @@ describe("push, decided by the session", () => {
     mkdirSync(plain, { recursive: true });
     const m = t.newManager();
     const { session } = await t.autonomous(m, { workdir: plain });
-    await session.ensureSandbox();
+    await session.send("go", AUTH);
+    await until(() => session.toInfo().status === "idle");
     // What the agent's commands could do in there: a repository of its own, with a remote of its choosing.
     git(["init", "-q", "-b", "feature/z"], plain);
     writeFileSync(join(plain, "z.txt"), "z\n");
@@ -43,8 +47,64 @@ describe("push, decided by the session", () => {
     git(["remote", "add", "origin", "https://git.example.invalid/victim/other.git"], plain);
     const r = await session.push({});
     expect(r).toStartWith("Refused:");
-    expect(r).toMatch(/aren't held read-only|git settings changed|after this session began/);
+    expect(r).toMatch(/aren't held read-only|wasn't a git repository when it began|made where an agent worked/);
     expect(t.audits.some((a) => a.action === "session.push_done" || a.action === "session.push_failed")).toBe(false);
+  });
+
+  it("round 2: a repository an agent made in an earlier session's workspace is refused in a later one", async () => {
+    const plain = join(t.workdir, "..", "plain2");
+    mkdirSync(plain, { recursive: true });
+    const m = t.newManager();
+    // Session 1 works there while it isn't a repository (its first turn notes that).
+    const first = await t.autonomous(m, { workdir: plain });
+    await first.session.send("go", AUTH);
+    await until(() => first.session.toInfo().status === "idle");
+    // Its agent makes one.
+    git(["init", "-q", "-b", "feature/z"], plain);
+    writeFileSync(join(plain, "z.txt"), "z\n");
+    git(["add", "."], plain);
+    git(["commit", "-qm", "z"], plain);
+    git(["remote", "add", "origin", "https://git.example.invalid/victim/other.git"], plain);
+    // Session 2, later, in the same place.
+    const second = await t.autonomous(m, { workdir: plain });
+    await second.session.send("go", AUTH);
+    await until(() => second.session.toInfo().status === "idle");
+    const r = await second.session.push({});
+    expect(r).toContain("made where an agent worked before it was one");
+  });
+
+  it("round 2: committing a .gitattributes, or the owner's branch tracking, doesn't stop a push; a changed remote URL does", async () => {
+    git(["remote", "add", "origin", "https://git.example.invalid/team/repo.git"], t.workdir);
+    const m = t.newManager();
+    const { session } = await t.autonomous(m);
+    await session.send("go", AUTH);
+    await until(() => session.toInfo().status === "idle");
+    git(["checkout", "-q", "-b", "feature/attr"], t.workdir);
+    writeFileSync(join(t.workdir, ".gitattributes"), "*.png binary\n");
+    git(["add", "."], t.workdir);
+    git(["commit", "-qm", "attrs"], t.workdir);
+    git(["config", "branch.feature/attr.remote", "origin"], t.workdir);
+    await t.sendWhenReady(session, "again");
+    await until(() => session.toInfo().status === "idle");
+    // Gets past every trust check to the remote lookup (no network here: autonomous mode refuses an unknown default).
+    expect(await session.push({})).toContain("which branch is its default");
+    git(["remote", "set-url", "origin", "https://elsewhere.example.invalid/x.git"], t.workdir);
+    expect(await session.push({})).toContain("changed during this session (remote.origin.url)");
+  });
+
+  it("round 2: a drain during the plan stops it before anything is pushed; push isn't listed where it's off", async () => {
+    git(["remote", "add", "origin", "https://git.example.invalid/team/repo.git"], t.workdir);
+    const m = t.newManager();
+    const { session } = await t.autonomous(m);
+    await session.send("go", AUTH);
+    await until(() => session.toInfo().status === "idle");
+    git(["checkout", "-q", "-b", "feature/d"], t.workdir);
+    const pending = session.push({});
+    session.beginDrain();
+    const r = await pending;
+    expect(r).toStartWith("Refused:");
+    expect(t.audits.some((a) => a.action === "session.push_done" || a.action === "session.push_failed")).toBe(false);
+    expect(session.pushOffered).toBe(true);
   });
 
   it("guarded: the owner is asked, the card naming the branch, the commit and where to; a no is a refusal the agent reads", async () => {
@@ -55,7 +115,8 @@ describe("push, decided by the session", () => {
     const info = infoOf(await t.create(m));
     const session = m.findByName(info?.name as string, AUTH);
     if (!session) throw new Error("no session");
-    await session.ensureSandbox();
+    await session.send("go", AUTH);
+    await until(() => session.toInfo().status === "idle");
     git(["checkout", "-q", "-b", "feature/y"], t.workdir);
     writeFileSync(join(t.workdir, "y.txt"), "y\n");
     git(["add", "."], t.workdir);

@@ -26,8 +26,8 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, statSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { existsSync, lstatSync, statSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { GIT_BIN, safeGit, safeGitEnv } from "../git-env.js";
 import { validateBranchName } from "../git-worktree.js";
 import { redactMcpUrl } from "../mcp/redact.js";
@@ -119,14 +119,21 @@ export interface PlanOptions {
   /** What the session's sandboxed commands may write: a file there (an include of your config's) decides nothing. */
   agentWritable?: readonly string[];
   /**
-   * When the session began (ms since the epoch): the repository's config files must be older (their ctime, which
-   * nothing can set back), so a repository made during the session, or config rewritten in it, decides nothing.
+   * Workspaces a session worked in while they weren't a repository (the store's record, kept across sessions): a
+   * repository inside one whose git dir was born since then is an agent's, and decides nothing.
    */
-  notChangedSince?: number;
+  untrustedRoots?: ReadonlyArray<{ path: string; since: number }>;
+  /**
+   * The settings that decide a push as they were before the session's first turn ({@link pushDecidingSnapshot}):
+   * if they differ now, the push is refused.
+   */
+  snapshot?: readonly string[];
+  /** Stops the remote lookup (a drain, a destroy). */
+  signal?: AbortSignal;
   /** How long the remote's default-branch lookup may take (ms). */
   lookupTimeoutMs?: number;
   /** Ask the remote for its default branch (refused as a target). Off only in tests without a network. */
-  remoteDefault?: (url: string, cwd: string, timeoutMs: number) => Promise<string | null>;
+  remoteDefault?: (url: string, cwd: string, timeoutMs: number, ssh: string | null, signal?: AbortSignal) => Promise<string | null>;
   /** Tests only: a local bare repository as the remote (a `file://` URL), which a real push never takes. */
   _testFileRemote?: boolean;
 }
@@ -196,6 +203,51 @@ function originProblem(e: OriginEntry, own: readonly string[], repo: string, age
   return null;
 }
 
+/** An entry as compared between the snapshot and now: where it came from and what it says. */
+function serializeDeciding(entries: readonly OriginEntry[]): string[] {
+  return entries.filter((e) => e.scope !== "command").map((e) => `${e.scope}\t${e.origin}\t${e.key}\t${e.value}`);
+}
+
+/**
+ * The settings that decide a push in `repo` (every scope but codeoid's own), taken before a session's first
+ * turn: planPush refuses when they differ. Not the whole git config: branch tracking, aliases and the like
+ * change in ordinary use and decide nothing about where a push goes.
+ */
+export async function pushDecidingSnapshot(repo: string): Promise<string[]> {
+  const top = (await safeGit(["rev-parse", "--show-toplevel"], repo, { timeoutMs: 20_000 })).trim();
+  return serializeDeciding((await config(top, DECIDING_GIT)).filter((e) => DECIDING.test(e.key)));
+}
+
+/**
+ * An include (`include.path`, `includeIf.<cond>.path`) is judged by what it names, whatever is there now: never in
+ * the repository's own config (its target is relative to the repository the agent writes), and from your config
+ * only when it names nothing the session's commands may write — git reads the file again when it pushes.
+ */
+function includeProblem(e: OriginEntry, repo: string, agentWritable: readonly string[], home?: string): string | null {
+  if (!/^include\.path$|^includeif\.[\s\S]+\.path$/i.test(e.key)) return null;
+  if (!USER_SCOPES.has(e.scope)) return `the repository's own config includes another file (\`${e.key}\`), which codeoid doesn't follow for a push`;
+  if (e.scope === "command") return null;
+  const raw = e.origin.startsWith("file:") ? e.origin.slice("file:".length) : "";
+  const from = raw ? (isAbsolute(raw) ? raw : resolve(repo, raw)) : repo;
+  const h = home ?? process.env.HOME ?? "";
+  const named = e.value.startsWith("~/") ? join(h, e.value.slice(2)) : isAbsolute(e.value) ? e.value : resolve(dirname(from), e.value);
+  const targets = [resolve(named), physicalPath(named)];
+  if (agentWritable.some((w) => targets.some((t) => within(w, t)))) {
+    return `your git config includes ${e.value}, a file this session's agent can write (\`${e.key}\`): codeoid doesn't push with it`;
+  }
+  return null;
+}
+
+/** When a repository's git dir was made (its birth time; a git dir is never replaced in place), or null where the filesystem doesn't say. */
+function gitDirBirth(common: string): number | null {
+  try {
+    const b = statSync(common).birthtimeMs;
+    return b > 0 ? b : null;
+  } catch {
+    return null;
+  }
+}
+
 /** `ssh://…`, `git@host:path` (scp-like) or `https://…`: the protocols the push may use. */
 export function pushUrlProblem(url: string): string | null {
   if (/[\x00-\x20\x7f]/.test(url)) return "it holds spaces or control characters";
@@ -233,10 +285,9 @@ export async function planPush(repoDir: string, input: PushInput, opts: PlanOpti
     return refuse("this session's workspace isn't a git repository");
   }
   const common = physicalPath(layout.common);
-  // Another repository's objects reachable through alternates would go out with the push.
-  for (const f of ["alternates", "http-alternates"]) {
-    if (existsSync(join(common, "objects", "info", f))) return refuse(`the repository borrows objects from elsewhere (objects/info/${f})`);
-  }
+  // Another repository's objects reachable through alternates (or a link) would go out with the push.
+  const objects = objectsProblem(common);
+  if (objects) return refuse(objects);
   const own = [physicalPath(join(common, "config")), ...(layout.own ? [physicalPath(join(layout.own, "config.worktree"))] : [physicalPath(join(common, "config.worktree"))])];
   // The trust anchor: the repository's config is the user's only while the sandbox holds it read-only, which it
   // does for the repository the workspace was when its spec was built. One made since (`git init`) isn't held.
@@ -244,18 +295,11 @@ export async function planPush(repoDir: string, input: PushInput, opts: PlanOpti
   if (!held.some((h) => within(h, own[0] as string))) {
     return refuse("this repository's git settings aren't held read-only by this session's sandbox (a repository made during the session, or one outside its workspace): push it yourself");
   }
-  if (opts.notChangedSince !== undefined) {
-    for (const f of own) {
-      let st: { ctimeMs: number; size: number };
-      try {
-        st = statSync(f);
-      } catch {
-        continue; // a config.worktree that isn't there
-      }
-      // An empty one decides nothing (codeoid makes config.worktree empty when it holds the git dir).
-      if (st.size > 0 && st.ctimeMs >= opts.notChangedSince) {
-        return refuse(`this repository's git settings (${f}) were made or changed after this session began: codeoid only pushes from a repository whose settings predate the session — push it yourself`);
-      }
+  // A repository an agent made: inside a workspace a session worked in while it wasn't one, born since then.
+  const born = gitDirBirth(common);
+  for (const r of opts.untrustedRoots ?? []) {
+    if (within(r.path, physicalPath(repo)) && (born === null || born >= r.since)) {
+      return refuse("this repository was made where an agent worked before it was one (codeoid noted that workspace without a repository): push it yourself");
     }
   }
 
@@ -285,8 +329,16 @@ export async function planPush(repoDir: string, input: PushInput, opts: PlanOpti
   const entries = (await config(repo, DECIDING_GIT)).filter((e) => DECIDING.test(e.key));
   const writable = (opts.agentWritable ?? []).map((p) => physicalPath(p));
   for (const e of entries) {
-    const problem = originProblem(e, own, repo, writable);
+    const problem = originProblem(e, own, repo, writable) ?? includeProblem(e, repo, writable, opts.home);
     if (problem) return refuse(problem);
+  }
+  if (opts.snapshot) {
+    const now = serializeDeciding(entries);
+    const before = new Set(opts.snapshot);
+    const changed = [...new Set([...now.filter((x) => !before.has(x)), ...opts.snapshot.filter((x) => !now.includes(x))])].map((x) => x.split("\t")[2] ?? x);
+    if (changed.length > 0) {
+      return refuse(`settings that decide where a push goes changed during this session (${[...new Set(changed)].slice(0, 5).join(", ")}): the owner should look at them, then push — or start a new session`);
+    }
   }
   // Your own ssh command (a key per host, an agent's wrapper) — only from your config: the repository's is refused.
   const ssh = entries.filter((e) => e.key === "core.sshcommand" && (e.scope === "global" || e.scope === "system")).at(-1)?.value ?? null;
@@ -303,7 +355,7 @@ export async function planPush(repoDir: string, input: PushInput, opts: PlanOpti
 
   let defaultUnknown = false;
   if (opts.remoteDefault) {
-    const head = await opts.remoteDefault(url, repo, opts.lookupTimeoutMs ?? 30_000).catch(() => null);
+    const head = await opts.remoteDefault(url, repo, opts.lookupTimeoutMs ?? 30_000, ssh, opts.signal).catch(() => null);
     if (head === null) defaultUnknown = true;
     else if (head.toLowerCase() === branch.toLowerCase()) {
       return refuse(`${branch} is the remote's default branch: push your work to a branch of its own, and open a pull request`);
@@ -330,8 +382,8 @@ const PUSH_OVERRIDES: ReadonlyArray<readonly [string, string]> = [
 ];
 
 /** The remote's default branch (`ls-remote --symref <url> HEAD`), or null. */
-export async function remoteDefaultBranch(url: string, cwd: string, timeoutMs = 30_000): Promise<string | null> {
-  const r = await runGit(["ls-remote", "--symref", "--end-of-options", url, "HEAD"], cwd, timeoutMs, { sshCommand: null });
+export async function remoteDefaultBranch(url: string, cwd: string, timeoutMs = 30_000, ssh: string | null = null, signal?: AbortSignal): Promise<string | null> {
+  const r = await runGit(["ls-remote", "--symref", "--end-of-options", url, "HEAD"], cwd, timeoutMs, { sshCommand: ssh, signal });
   if (r.code !== 0) return null;
   const m = /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(r.stdout);
   return m ? (m[1] as string) : null;
@@ -347,17 +399,14 @@ export interface PushResult {
 
 /** Run the push the plan names, on the host. */
 export async function runPush(plan: PushPlan, timeoutMs = 120_000, _testFileRemote = false, signal?: AbortSignal): Promise<PushResult> {
-  // Checked again right before git starts: objects/info is writable to the agent.
-  for (const f of ["alternates", "http-alternates"]) {
-    if (existsSync(join(plan.common, "objects", "info", f))) return { ok: false, summary: `refused: the repository borrows objects from elsewhere (objects/info/${f})`, output: "" };
-  }
   if (signal?.aborted) return { ok: false, summary: "not pushed: the session is closing", output: "" };
   const r = await runGit(
     ["push", "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", "--end-of-options", plan.url, `${plan.sha}:refs/heads/${plan.branch}`],
     plan.repo,
     timeoutMs,
-    { testFile: _testFileRemote, sshCommand: plan.sshCommand, signal },
+    { testFile: _testFileRemote, sshCommand: plan.sshCommand, signal, precheck: () => objectsProblem(plan.common) },
   );
+  if (r.refused) return { ok: false, summary: `refused: ${r.refused}`, output: "" };
   const output = shownOutput(`${r.stdout}\n${r.stderr}`);
   if (r.aborted) return { ok: false, summary: "stopped: the session closed while it was pushing (the remote may or may not have it)", output };
   if (r.timedOut) return { ok: false, summary: `the push timed out after ${Math.round(timeoutMs / 1000)}s (the remote may or may not have it)`, output };
@@ -380,6 +429,24 @@ export async function runPush(plan: PushPlan, timeoutMs = 120_000, _testFileRemo
   return { ok: false, summary: `git push failed (exit ${r.code ?? "killed"})`, output };
 }
 
+/**
+ * What of the object store would send more than the repository's own objects: borrowed ones (alternates), or
+ * a link in its top levels leading elsewhere. Checked at the plan and again right before git starts.
+ */
+export function objectsProblem(common: string): string | null {
+  for (const f of ["alternates", "http-alternates"]) {
+    if (existsSync(join(common, "objects", "info", f))) return `the repository borrows objects from elsewhere (objects/info/${f})`;
+  }
+  for (const d of ["objects", join("objects", "pack"), join("objects", "info")]) {
+    try {
+      if (lstatSync(join(common, d)).isSymbolicLink()) return `the repository's ${d} is a link`;
+    } catch {
+      /* not there */
+    }
+  }
+  return null;
+}
+
 /** Remote output can name URLs with tokens in them, and control sequences: shown redacted, plain, capped. */
 function shownOutput(text: string): string {
   const plain = text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "").replace(/[\x00-\x08\x0b-\x1f\x7f]/g, "");
@@ -393,9 +460,13 @@ async function runGit(
   args: string[],
   cwd: string,
   timeoutMs: number,
-  o: { testFile?: boolean; sshCommand: string | null; signal?: AbortSignal },
-): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean; aborted: boolean }> {
+  o: { testFile?: boolean; sshCommand: string | null; signal?: AbortSignal; precheck?: () => string | null },
+): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean; aborted: boolean; refused?: string }> {
   const env = await safeGitEnv(cwd, { network: true, overrides: PUSH_OVERRIDES });
+  // Checked last, right before git starts (the environment's own git run took time): the object store is the agent's to write.
+  const refused = o.precheck?.() ?? null;
+  if (refused) return { code: null, stdout: "", stderr: "", timedOut: false, aborted: false, refused };
+  if (o.signal?.aborted) return { code: null, stdout: "", stderr: "", timedOut: false, aborted: true };
   if (o.testFile) env.GIT_ALLOW_PROTOCOL = "file";
   // How ssh runs: your environment's GIT_SSH_COMMAND / GIT_SSH first (as git itself ranks them), then your own
   // core.sshCommand (planPush took it from your global or system config only), else ssh that never waits for a
