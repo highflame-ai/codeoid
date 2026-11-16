@@ -1347,6 +1347,7 @@ export type ClientMessage =
   | SessionRemoveReferenceMsg
   | SessionSetWorkstreamMsg
   | SandboxProvidersMsg
+  | SandboxTrustPushMsg
   | SessionPinMsg
   | SessionUnpinMsg
   | SessionRotateMsg
@@ -2014,6 +2015,21 @@ export interface SessionSandboxDirMsg extends BaseClientMsg {
 /** The sandbox providers this daemon has, and whether each runs here (#448). Needs session:create. */
 export interface SandboxProvidersMsg extends BaseClientMsg {
   type: "sandbox.providers";
+}
+
+/**
+ * The owner's trust in a repository's remote for the sandbox's `push` tool (docs/sandbox.md, "Pushing a
+ * branch"): `trust` records the repository's remote as it is now (its URL, and what the repository's own
+ * config says that decides a push), so an autonomous agent may push there; `untrust` takes it back; `list`
+ * answers every trust. Needs settings:write, undelegated. Reply: `response.ok` with `data`.
+ */
+export interface SandboxTrustPushMsg extends BaseClientMsg {
+  type: "sandbox.trust_push";
+  action: "trust" | "untrust" | "list";
+  /** The repository (a directory in it), absolute; not for `list`. */
+  path?: string;
+  /** Default `origin`. */
+  remote?: string;
 }
 
 /** One entry of the `sandbox.providers` reply's `data.providers`. */

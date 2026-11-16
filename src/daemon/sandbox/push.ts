@@ -26,7 +26,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync, lstatSync, statSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { GIT_BIN, safeGit, safeGitEnv } from "../git-env.js";
 import { validateBranchName } from "../git-worktree.js";
@@ -105,6 +105,11 @@ export interface PushPlan {
   url: string;
   /** The same, safe to show (no credentials, query or fragment). */
   shownUrl: string;
+  /**
+   * What the repository's own config says that decides a push (scope, key, value; sorted). With `common`,
+   * `remote` and `url`, what an owner's trust is given to and checked against ({@link trustMatches}).
+   */
+  repoSettings: string[];
 }
 
 export interface PlanOptions {
@@ -118,16 +123,6 @@ export interface PlanOptions {
   heldReadOnly?: readonly string[];
   /** What the session's sandboxed commands may write: a file there (an include of your config's) decides nothing. */
   agentWritable?: readonly string[];
-  /**
-   * Workspaces a session worked in while they weren't a repository (the store's record, kept across sessions): a
-   * repository inside one whose git dir was born since then is an agent's, and decides nothing.
-   */
-  untrustedRoots?: ReadonlyArray<{ path: string; since: number }>;
-  /**
-   * The settings that decide a push as they were before the session's first turn ({@link pushDecidingSnapshot}):
-   * if they differ now, the push is refused.
-   */
-  snapshot?: readonly string[];
   /** Stops the remote lookup (a drain, a destroy). */
   signal?: AbortSignal;
   /** How long the remote's default-branch lookup may take (ms). */
@@ -203,21 +198,6 @@ function originProblem(e: OriginEntry, own: readonly string[], repo: string, age
   return null;
 }
 
-/** An entry as compared between the snapshot and now: where it came from and what it says. */
-function serializeDeciding(entries: readonly OriginEntry[]): string[] {
-  return entries.filter((e) => e.scope !== "command").map((e) => `${e.scope}\t${e.origin}\t${e.key}\t${e.value}`);
-}
-
-/**
- * The settings that decide a push in `repo` (every scope but codeoid's own), taken before a session's first
- * turn: planPush refuses when they differ. Not the whole git config: branch tracking, aliases and the like
- * change in ordinary use and decide nothing about where a push goes.
- */
-export async function pushDecidingSnapshot(repo: string): Promise<string[]> {
-  const top = (await safeGit(["rev-parse", "--show-toplevel"], repo, { timeoutMs: 20_000 })).trim();
-  return serializeDeciding((await config(top, DECIDING_GIT)).filter((e) => DECIDING.test(e.key)));
-}
-
 /**
  * An include (`include.path`, `includeIf.<cond>.path`) is judged by what it names, whatever is there now: never in
  * the repository's own config (its target is relative to the repository the agent writes), and from your config
@@ -236,16 +216,6 @@ function includeProblem(e: OriginEntry, repo: string, agentWritable: readonly st
     return `your git config includes ${e.value}, a file this session's agent can write (\`${e.key}\`): codeoid doesn't push with it`;
   }
   return null;
-}
-
-/** When a repository's git dir was made (its birth time; a git dir is never replaced in place), or null where the filesystem doesn't say. */
-function gitDirBirth(common: string): number | null {
-  try {
-    const b = statSync(common).birthtimeMs;
-    return b > 0 ? b : null;
-  } catch {
-    return null;
-  }
 }
 
 /** `ssh://…`, `git@host:path` (scp-like) or `https://…`: the protocols the push may use. */
@@ -273,7 +243,26 @@ async function config(repo: string, pattern: string): Promise<OriginEntry[]> {
 }
 
 /** The plan for a push from `repo`, or why it is refused. */
-export async function planPush(repoDir: string, input: PushInput, opts: PlanOptions): Promise<PushPlan | { refused: string }> {
+/** Where a push from a repository goes, and what decides it: every part checked (see {@link planPush}). */
+export interface PushTarget {
+  repo: string;
+  common: string;
+  remote: string;
+  url: string;
+  sshCommand: string | null;
+  repoSettings: string[];
+}
+
+/**
+ * The remote a push from `repoDir` goes to, and the settings that decide it, checked: the repository's own
+ * config only from its own files (never an include, never a key in REPO_REFUSED), yours only from files the
+ * session can't write (an include judged by what it names), ssh or https only, no borrowed objects.
+ */
+export async function readPushTarget(
+  repoDir: string,
+  remote: string,
+  opts: Pick<PlanOptions, "heldReadOnly" | "agentWritable" | "home" | "_testFileRemote"> & { requireHeld: boolean },
+): Promise<PushTarget | { refused: string }> {
   const refuse = (refused: string) => ({ refused });
   const layout = gitLayoutOf(repoDir, opts.home);
   if (!layout) return refuse("this session's workspace isn't a git repository");
@@ -289,19 +278,46 @@ export async function planPush(repoDir: string, input: PushInput, opts: PlanOpti
   const objects = objectsProblem(common);
   if (objects) return refuse(objects);
   const own = [physicalPath(join(common, "config")), ...(layout.own ? [physicalPath(join(layout.own, "config.worktree"))] : [physicalPath(join(common, "config.worktree"))])];
-  // The trust anchor: the repository's config is the user's only while the sandbox holds it read-only, which it
-  // does for the repository the workspace was when its spec was built. One made since (`git init`) isn't held.
-  const held = (opts.heldReadOnly ?? []).map((p) => physicalPath(p));
-  if (!held.some((h) => within(h, own[0] as string))) {
-    return refuse("this repository's git settings aren't held read-only by this session's sandbox (a repository made during the session, or one outside its workspace): push it yourself");
-  }
-  // A repository an agent made: inside a workspace a session worked in while it wasn't one, born since then.
-  const born = gitDirBirth(common);
-  for (const r of opts.untrustedRoots ?? []) {
-    if (within(r.path, physicalPath(repo)) && (born === null || born >= r.since)) {
-      return refuse("this repository was made where an agent worked before it was one (codeoid noted that workspace without a repository): push it yourself");
+  // The repository's config can't change between this look and git's own read of it while the sandbox holds it
+  // read-only: the session's repository (its git dir as the spec holds it), not one made or reached otherwise.
+  if (opts.requireHeld) {
+    const held = (opts.heldReadOnly ?? []).map((p) => physicalPath(p));
+    if (!held.some((h) => within(h, own[0] as string))) {
+      return refuse("this repository's git settings aren't held read-only by this session's sandbox (a repository made during the session, or one outside its workspace): push it yourself");
     }
   }
+  const entries = (await config(repo, DECIDING_GIT)).filter((e) => DECIDING.test(e.key));
+  const writable = (opts.agentWritable ?? []).map((p) => physicalPath(p));
+  for (const e of entries) {
+    const problem = originProblem(e, own, repo, writable) ?? includeProblem(e, repo, writable, opts.home);
+    if (problem) return refuse(problem);
+  }
+  // Your own ssh command (a key per host, an agent's wrapper) — only from your config: the repository's is refused.
+  const sshCommand = entries.filter((e) => e.key === "core.sshcommand" && (e.scope === "global" || e.scope === "system")).at(-1)?.value ?? null;
+  // The subsection (the remote's name) is case-sensitive; git prints the section and the variable lowercased.
+  const ofRemote = (name: string) => entries.filter((e) => e.key === `remote.${remote}.${name}`);
+  const pushUrls = ofRemote("pushurl");
+  const urls = ofRemote("url");
+  const chosen = pushUrls.length > 0 ? pushUrls : urls;
+  if (chosen.length === 0) return refuse(`there is no remote named ${remote}`);
+  if (chosen.length > 1) return refuse(`remote ${remote} has ${chosen.length} push URLs: push it yourself`);
+  const url = (chosen[0] as OriginEntry).value;
+  const bad = opts._testFileRemote && url.startsWith("file://") ? null : pushUrlProblem(url);
+  if (bad) return refuse(`remote ${remote}'s URL can't be pushed to: ${bad}`);
+  const repoSettings = entries
+    .filter((e) => !USER_SCOPES.has(e.scope))
+    .map((e) => `${e.scope}\t${e.key}\t${e.value}`)
+    .sort();
+  return { repo, common, remote, url, sshCommand, repoSettings };
+}
+
+/** The plan for a push from `repo`, or why it is refused. */
+export async function planPush(repoDir: string, input: PushInput, opts: PlanOptions): Promise<PushPlan | { refused: string }> {
+  const refuse = (refused: string) => ({ refused });
+  const remote = input.remote ?? "origin";
+  const target = await readPushTarget(repoDir, remote, { ...opts, requireHeld: true });
+  if ("refused" in target) return target;
+  const { repo, common, url, sshCommand, repoSettings } = target;
 
   // The branch: named, or the one checked out.
   let branch = input.branch;
@@ -324,44 +340,38 @@ export async function planPush(repoDir: string, input: PushInput, opts: PlanOpti
   }
   if (!/^[0-9a-f]{40,64}$/.test(sha)) return refuse(`${branch} doesn't name a commit`);
 
-  // Where to, and every setting that decides how: only from your config or the repository's own.
-  const remote = input.remote ?? "origin";
-  const entries = (await config(repo, DECIDING_GIT)).filter((e) => DECIDING.test(e.key));
-  const writable = (opts.agentWritable ?? []).map((p) => physicalPath(p));
-  for (const e of entries) {
-    const problem = originProblem(e, own, repo, writable) ?? includeProblem(e, repo, writable, opts.home);
-    if (problem) return refuse(problem);
-  }
-  if (opts.snapshot) {
-    const now = serializeDeciding(entries);
-    const before = new Set(opts.snapshot);
-    const changed = [...new Set([...now.filter((x) => !before.has(x)), ...opts.snapshot.filter((x) => !now.includes(x))])].map((x) => x.split("\t")[2] ?? x);
-    if (changed.length > 0) {
-      return refuse(`settings that decide where a push goes changed during this session (${[...new Set(changed)].slice(0, 5).join(", ")}): the owner should look at them, then push — or start a new session`);
-    }
-  }
-  // Your own ssh command (a key per host, an agent's wrapper) — only from your config: the repository's is refused.
-  const ssh = entries.filter((e) => e.key === "core.sshcommand" && (e.scope === "global" || e.scope === "system")).at(-1)?.value ?? null;
-  // The subsection (the remote's name) is case-sensitive; git prints the section and the variable lowercased.
-  const ofRemote = (name: string) => entries.filter((e) => e.key === `remote.${remote}.${name}`);
-  const pushUrls = ofRemote("pushurl");
-  const urls = ofRemote("url");
-  const chosen = pushUrls.length > 0 ? pushUrls : urls;
-  if (chosen.length === 0) return refuse(`there is no remote named ${remote}`);
-  if (chosen.length > 1) return refuse(`remote ${remote} has ${chosen.length} push URLs: push it yourself`);
-  const url = (chosen[0] as OriginEntry).value;
-  const bad = opts._testFileRemote && url.startsWith("file://") ? null : pushUrlProblem(url);
-  if (bad) return refuse(`remote ${remote}'s URL can't be pushed to: ${bad}`);
-
   let defaultUnknown = false;
   if (opts.remoteDefault) {
-    const head = await opts.remoteDefault(url, repo, opts.lookupTimeoutMs ?? 30_000, ssh, opts.signal).catch(() => null);
+    const head = await opts.remoteDefault(url, repo, opts.lookupTimeoutMs ?? 30_000, sshCommand, opts.signal).catch(() => null);
     if (head === null) defaultUnknown = true;
     else if (head.toLowerCase() === branch.toLowerCase()) {
       return refuse(`${branch} is the remote's default branch: push your work to a branch of its own, and open a pull request`);
     }
   }
-  return { repo, common, sshCommand: ssh, defaultUnknown, branch, sha, remote, url, shownUrl: shownUrl(url) };
+  return { repo, common, sshCommand, defaultUnknown, branch, sha, remote, url, shownUrl: shownUrl(url), repoSettings };
+}
+
+/** What an owner's trust in a repository's remote records (the store's `push_trust`). */
+export interface PushTrust {
+  common: string;
+  remote: string;
+  url: string;
+  repoSettings: string[];
+}
+
+/**
+ * Whether a push target is what its owner trusted: the same repository (its git dir), remote, URL, and
+ * repository settings that decide a push. Anything else — another URL, a rewrite, a setting added — isn't.
+ */
+export function trustMatches(trust: PushTrust | null | undefined, target: Pick<PushTarget, "common" | "remote" | "url" | "repoSettings">): boolean {
+  if (!trust) return false;
+  return (
+    trust.common === target.common &&
+    trust.remote === target.remote &&
+    trust.url === target.url &&
+    trust.repoSettings.length === target.repoSettings.length &&
+    trust.repoSettings.every((x, i) => x === target.repoSettings[i])
+  );
 }
 
 /** `main`, or a pattern with one trailing `*` (`release/*`); case-insensitive, as hosts on case-folding ref storage are. */
@@ -421,7 +431,7 @@ export async function runPush(plan: PushPlan, timeoutMs = 120_000, _testFileRemo
     return {
       ok: false,
       summary: /non-fast-forward|fetch first|stale info/.test(why)
-        ? `the remote's ${plan.branch} has commits yours doesn't (${why}): fetch and rebase or merge, then push again — a force push isn't done for agents`
+        ? `the remote's ${plan.branch} has commits yours doesn't (${why}): a force push isn't done for agents. Your commands can't fetch either (no network to the git host, no credentials): ask the owner to fetch it (or merge the remote's branch for you), or push to a new branch of your own`
         : `the remote refused it (${why})`,
       output,
     };

@@ -1269,30 +1269,40 @@ machine, with your network and your credentials, which the agent never sees.
 - Push a non-fast-forward. The remote refuses it, and the agent is told to
   rebase or merge first.
 
-**Where it goes**
+**Where it goes: your trust**
 
-Where the push goes, and how git connects and authenticates, is decided only
-by config the agent couldn't have written: your global and system config, and
-the repository's own `.git/config`. The repository's config counts only if all
-three of these hold:
+Where an agent may push is yours to say, once per repository and remote.
+Trusting one records:
 
-- **The sandbox holds it read-only.** That is the repository's git dir as the
-  session's sandbox spec holds it.
-- **It isn't an agent's repository.** codeoid notes, for good, every workspace
-  a session (sandboxed or not) worked in while it wasn't a repository. A
-  repository inside one, whose `.git` was born after that, is an agent's: no
-  session ever pushes from it. That includes later sessions, a routine's next
-  run and forks.
-- **Nothing that decides a push changed.** The settings that decide a push
-  (the keys listed below, from every file) are snapshotted before the
-  session's first turn, and the push is refused if they differ now. Branch
-  tracking (`git push -u`, `checkout -t`, codeoid's own worktrees),
-  `.gitattributes`, aliases and the like aren't part of that.
+- the repository (its git dir);
+- the remote;
+- the remote's URL;
+- what the repository's own config says that decides a push.
 
-Includes are judged by the file they name, whatever it holds now, because git
-reads it again when it pushes. An include in the repository's own config is
-refused. An include in your config is refused if it names a file the
-session's commands may write, even an empty or missing one.
+The record lives in the daemon's database, which no agent can write. A push
+goes only where all of that still matches. Another URL, a rewrite, or a
+setting added since doesn't match, and has to be trusted again. Branch
+tracking, `.gitattributes` and the like aren't part of it.
+
+Nothing on disk stands in for your trust. That includes a repository an agent
+made, a fork or worktree of one, or an old directory renamed into `.git`.
+
+- **Trust from the terminal:** `codeoid sandbox trust-push [dir] [--remote r]`.
+  Stop trusting with `--off`, and list with `--list`. You need
+  `settings:write`, and a delegated token can't do it.
+- **Trust from a card:** in guarded mode, the push card offers "Push, and
+  trust … for this repository's agent pushes".
+- **Autonomous mode** pushes only where you have trusted. Anything else is
+  refused, and the agent is told how you can trust it.
+
+On top of that, every push is checked the same way, trusted or not:
+
+- The repository's config must be held read-only by the session's sandbox.
+  Then it can't change between codeoid's check and git's own read of it.
+- Includes are judged by the file they name, whatever it holds now, because
+  git reads it again when it pushes. An include in the repository's own
+  config is refused. An include in your config is refused if it names a file
+  the session's commands may write, even an empty or missing one.
 
 From the repository's config, codeoid takes the remote's `url`/`pushurl`,
 `url.*.insteadOf` and `push.*`. It never takes what would turn a push into a
@@ -1335,12 +1345,18 @@ Remote output is shown with URLs redacted.
 
 In guarded and interactive mode you are asked first, on an owner-only card
 naming the branch, the commit, the remote's URL and the agent's reason
-(quoted, in its own words). If the branch, its remote or the repository's git
-settings changed while you read the card, it is refused and the agent asks
-again.
+(quoted, in its own words). The card offers three choices:
 
-In autonomous mode, including an unattended run, it runs without asking. One
-push runs at a time per session.
+- **Push.**
+- **Push, and trust** (only for a repository and remote not yet trusted).
+- **Don't push.**
+
+If the branch, its remote or a deciding setting changed while you read it, the
+push is refused and the agent asks again.
+
+In autonomous mode, including an unattended run, a push to a trusted remote
+runs without asking. Anything else is refused. One push runs at a time per
+session.
 
 Everything, your answer included, ends before the backend's own tool-call
 timeout: about 50 seconds on opencode, 8 minutes elsewhere. A card nobody
@@ -1352,12 +1368,10 @@ running, and the stop is audited.
 `push` is offered only where it works: a sandboxed session, with pushing on.
 That holds over `/mcp/sandbox` too.
 
-Repositories made by agents before this feature can't be told apart. If you
-let an agent create repositories in older sessions, push those yourself.
-
-Every request, refusal, approval and result is audited: `session.push_request`,
-`session.push_refused`, `session.push_denied`, `session.push_done` and
-`session.push_failed`. Each is also said in the transcript.
+Every request, refusal, approval, trust and result is audited:
+`session.push_request`, `session.push_refused`, `session.push_denied`,
+`session.push_trusted`, `session.push_done`, `session.push_failed`,
+`sandbox.push_trusted` and `sandbox.push_untrusted`. Each is also said in the transcript.
 
 **Settings**
 

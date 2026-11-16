@@ -22,10 +22,10 @@ import { credentialsSchema } from "./credentials/schema.js";
 import { workstreamsSchema } from "./workstreams/schema.js";
 import { registerSecretPaths } from "./secret-paths.js";
 import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
-import type { PushInput } from "./sandbox/push.js";
+import { readPushTarget, shownUrl, type PushInput } from "./sandbox/push.js";
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, resolve, sep } from "node:path";
 import { type FleetCardTarget, type ForkPoint, RewindError, type SendHold, SendStoppedError, SHUTDOWN_AUTH, Session, type AttachedClient, type WindowScope } from "./session.js";
 import type { CanonicalTurn } from "./providers/canonical.js";
 import { sweepCheckpoints } from "./checkpoints.js";
@@ -1605,6 +1605,8 @@ mcpHub: this.#mcpHub,
         return this.#loopWorkerGuard(msg, "change the workstream of") ?? this.#sessionWorkstreamEdit(msg, auth);
       case "sandbox.providers":
         return this.#sandboxProviders(msg, auth);
+      case "sandbox.trust_push":
+        return this.#sandboxTrustPush(msg, auth);
       case "session.pin":
         return this.#pin(msg, auth);
       case "session.unpin":
@@ -10599,6 +10601,31 @@ mcpHub: this.#mcpHub,
         () => {},
       );
     return reply({ pending: true, message: `asked on the session: ${what}?` });
+  }
+
+  /**
+   * `sandbox.trust_push`: the owner trusts (or stops trusting) a repository's remote for agents' pushes
+   * (sandbox/push.ts). Recorded as it is now, checked the way a push checks it; settings:write, undelegated.
+   */
+  async #sandboxTrustPush(msg: Extract<ClientMessage, { type: "sandbox.trust_push" }>, auth: AuthContext): Promise<DaemonMessage> {
+    const fail = (error: string, code: "forbidden" | "invalid_request" = "invalid_request"): DaemonMessage => ({ type: "response.error", requestId: msg.id, error, code });
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return fail("Missing scope: settings:write", "forbidden");
+    if (auth.delegationDepth > 0) return fail("A delegated token can't decide where agents push: the owner does.", "forbidden");
+    if (msg.action === "list") return { type: "response.ok", requestId: msg.id, data: { trusts: this.#store.listPushTrust().map((t) => ({ ...t, url: shownUrl(t.url) })) } };
+    if (!msg.path || !isAbsolute(msg.path)) return fail("Give the repository's absolute path.");
+    const remote = msg.remote ?? "origin";
+    const target = await readPushTarget(msg.path, remote, { requireHeld: false, agentWritable: [] }).catch((err: unknown) => ({
+      refused: err instanceof Error ? err.message : String(err),
+    }));
+    if ("refused" in target) return fail(`Can't trust pushes from there: ${target.refused}.`);
+    if (msg.action === "untrust") {
+      const removed = this.#store.removePushTrust(target.common, remote);
+      this.#store.audit(auth.sub, "sandbox.push_untrusted", undefined, `${target.common} ${remote}`);
+      return { type: "response.ok", requestId: msg.id, data: { removed, repository: target.repo, remote } };
+    }
+    this.#store.setPushTrust({ common: target.common, remote, url: target.url, repoSettings: target.repoSettings }, auth.sub);
+    this.#store.audit(auth.sub, "sandbox.push_trusted", undefined, `${target.common} ${remote} ${shownUrl(target.url)}`);
+    return { type: "response.ok", requestId: msg.id, data: { repository: target.repo, remote, url: shownUrl(target.url) } };
   }
 
   /** `sandbox.providers` (#448): what the daemon has and whether each runs here. */

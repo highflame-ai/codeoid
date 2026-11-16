@@ -384,12 +384,17 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_log(session_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id, project_id);
 
-      -- Workspaces a session worked in while they weren't a git repository (sandbox/push.ts): a repository
-      -- made inside one after that (its .git born since) is the agent's, and codeoid never pushes from it.
-      -- Not session-scoped: the record outlives the session (a routine's next run, a fork, a later session).
-      CREATE TABLE IF NOT EXISTS non_repo_workspaces (
-        path       TEXT PRIMARY KEY,
-        first_seen INTEGER NOT NULL
+      -- An owner's trust in a repository's remote for the sandbox's push tool (sandbox/push.ts): the
+      -- repository (its git dir), the remote, its URL and what the repository's own config says that decides
+      -- a push. An autonomous push goes only where this matches exactly. Not session-scoped.
+      CREATE TABLE IF NOT EXISTS push_trust (
+        common        TEXT NOT NULL,
+        remote        TEXT NOT NULL,
+        url           TEXT NOT NULL,
+        repo_settings TEXT NOT NULL,
+        trusted_by    TEXT NOT NULL,
+        trusted_at    INTEGER NOT NULL,
+        PRIMARY KEY (common, remote)
       );
 
       CREATE TABLE IF NOT EXISTS session_pins (
@@ -2310,22 +2315,44 @@ export class Store {
     return rows.map(compareRowFrom);
   }
 
-  /** Note that `path` (physical) was a session's workspace while it wasn't a git repository; the first time is kept. */
-  noteNonRepoWorkspace(path: string, at: number = Date.now()): void {
-    try {
-      this.#db.prepare("INSERT OR IGNORE INTO non_repo_workspaces (path, first_seen) VALUES (?, ?)").run(path, at);
-    } catch (err) {
-      console.error(`[codeoid/store] noting a workspace without a repository failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+  /** Trust (replace) a repository's remote for agent pushes (sandbox/push.ts). */
+  setPushTrust(t: { common: string; remote: string; url: string; repoSettings: string[] }, by: string): void {
+    this.#db
+      .prepare("INSERT OR REPLACE INTO push_trust (common, remote, url, repo_settings, trusted_by, trusted_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(t.common, t.remote, t.url, JSON.stringify(t.repoSettings), by, Date.now());
   }
 
-  /** Every workspace noted by {@link noteNonRepoWorkspace}, with when it was first seen. */
-  nonRepoWorkspaces(): Array<{ path: string; since: number }> {
+  /** Take a trust back; true when there was one. */
+  removePushTrust(common: string, remote: string): boolean {
+    return this.#db.prepare("DELETE FROM push_trust WHERE common = ? AND remote = ?").run(common, remote).changes > 0;
+  }
+
+  /** The trust for a repository's remote, if any. */
+  pushTrust(common: string, remote: string): { common: string; remote: string; url: string; repoSettings: string[]; trustedBy: string; trustedAt: number } | null {
+    const row = this.#db.prepare("SELECT common, remote, url, repo_settings, trusted_by, trusted_at FROM push_trust WHERE common = ? AND remote = ?").get(common, remote) as
+      | { common: string; remote: string; url: string; repo_settings: string; trusted_by: string; trusted_at: number }
+      | null;
+    if (!row) return null;
+    let repoSettings: string[] = [];
     try {
-      return (this.#db.prepare("SELECT path, first_seen AS since FROM non_repo_workspaces").all() as Array<{ path: string; since: number }>).slice();
+      const parsed = JSON.parse(row.repo_settings) as unknown;
+      if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string")) repoSettings = parsed;
+      else return null;
     } catch {
-      return [];
+      return null;
     }
+    return { common: row.common, remote: row.remote, url: row.url, repoSettings, trustedBy: row.trusted_by, trustedAt: row.trusted_at };
+  }
+
+  /** Every trust, newest first. */
+  listPushTrust(): Array<{ common: string; remote: string; url: string; trustedBy: string; trustedAt: number }> {
+    return this.#db.prepare("SELECT common, remote, url, trusted_by AS trustedBy, trusted_at AS trustedAt FROM push_trust ORDER BY trusted_at DESC").all() as Array<{
+      common: string;
+      remote: string;
+      url: string;
+      trustedBy: string;
+      trustedAt: number;
+    }>;
   }
 
   audit(subject: string, action: string, sessionId?: string, detail?: string): void {

@@ -1344,6 +1344,22 @@ sandboxCmd
     client.disconnect();
   });
 
+sandboxCmd
+  .command("trust-push [dir]")
+  .description(
+    "Trust a repository's remote for agents' pushes (the push tool, docs/sandbox.md \"Pushing a branch\"): an autonomous agent may then push branches there with your credentials — never main, master or the remote's default, never a force. Recorded as the URL and settings are now; a change asks again",
+  )
+  .option("--remote <name>", "the remote (default: origin)")
+  .option("--off", "stop trusting it")
+  .option("--list", "list the trusted repositories")
+  .action(async (dir: string | undefined, o: { remote?: string; off?: boolean; list?: boolean }) => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    if (o.list) await client.sandboxTrustPush("list");
+    else await client.sandboxTrustPush(o.off ? "untrust" : "trust", resolve(dir ?? "."), o.remote);
+    client.disconnect();
+  });
+
 for (const action of ["add", "remove"] as const) {
   sandboxCmd
     .command(`${action} <session> <dir>`)

@@ -114,24 +114,24 @@ describe("push: the plan", () => {
     expect(await refusal({}, { heldReadOnly: [join(root, "elsewhere")] })).toContain("aren't held read-only");
   });
 
-  test("round 2: a repository made where an agent worked before it was one is refused, in any later session; an older one there isn't", async () => {
-    // The workspace was noted without a repository after this one was made: this one predates it.
-    expect("refused" in (await plan({}, { untrustedRoots: [{ path: join(root, "work"), since: Date.now() + 60_000 }] }))).toBe(false);
-    // Noted before this repository's git dir was born: the agent's.
-    expect(await refusal({}, { untrustedRoots: [{ path: join(root, "work"), since: Date.now() - 60_000 }] })).toContain("made where an agent worked");
-    // A workspace elsewhere says nothing about this one.
-    expect("refused" in (await plan({}, { untrustedRoots: [{ path: join(root, "other"), since: 0 }] }))).toBe(false);
-  });
-
-  test("round 2: settings that decide a push, changed since the session began, refuse it; branch tracking and the like don't", async () => {
-    const { pushDecidingSnapshot } = await import("../daemon/sandbox/push.js");
-    const snapshot = await pushDecidingSnapshot(repo);
+  test("round 3: an owner's trust matches only the same repository, remote, URL and repository settings", async () => {
+    const { trustMatches } = await import("../daemon/sandbox/push.js");
+    const p = await planned();
+    const trust = { common: p.common, remote: p.remote, url: p.url, repoSettings: p.repoSettings };
+    expect(trustMatches(trust, p)).toBe(true);
+    expect(trustMatches(null, p)).toBe(false);
+    expect(trustMatches({ ...trust, url: "https://elsewhere.example/x.git" }, p)).toBe(false);
+    expect(trustMatches({ ...trust, remote: "upstream" }, p)).toBe(false);
+    expect(trustMatches({ ...trust, common: join(root, "other", ".git") }, p)).toBe(false);
+    // A setting of the repository's own that decides a push, added since: no longer what was trusted.
+    git(repo, "config", "push.default", "current");
+    const changed = await planned();
+    expect(trustMatches(trust, changed)).toBe(false);
+    // Branch tracking, attributes and the like aren't part of it.
+    git(repo, "config", "--unset", "push.default");
     git(repo, "config", "branch.feature/x.remote", "origin");
-    git(repo, "config", "branch.feature/x.merge", "refs/heads/feature/x");
     writeFileSync(join(repo, ".gitattributes"), "*.png binary\n");
-    expect("refused" in (await plan({}, { snapshot }))).toBe(false);
-    git(repo, "config", "remote.origin.pushurl", `file://${bare}`);
-    expect(await refusal({}, { snapshot })).toContain("changed during this session (remote.origin.pushurl)");
+    expect(trustMatches(trust, await planned())).toBe(true);
   });
 
   test("round 1: an include of your global config that the agent can write decides nothing, even empty or missing now; your own ssh command is used", async () => {

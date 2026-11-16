@@ -238,8 +238,7 @@ import { CLAUDE_ALL_SOCKETS_NOTE, describeSandbox, resolveSandbox, SandboxRequir
 import { type WorktreeEntryFinding, worktreeEntryLine, worktreeEntryWarning } from "./sandbox/worktree-entries.js";
 import { type GitControlSnapshot, gitControlChanges, gitControlSnapshot, gitControlWarning, refTips, settingsCommits, settingsCommitWarning } from "./sandbox/git-watch.js";
 import { worktreeFolderNote } from "./sandbox/worktrees.js";
-import { physicalPath } from "./physical-path.js";
-import { gitLayoutOf, hiddenPathsFor, protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
+import { hiddenPathsFor, protectedWriteTargets, userHiddenPaths } from "./sandbox/policy.js";
 import { addedDirProblem, addedDirReal, autonomousGrantProblem, checkoutOverlap, inAnyDir, nestedControl, normalizeSandboxDir, type OtherCheckout } from "./sandbox/project-roots.js";
 import { sandboxRootIfMade } from "./sandbox/root.js";
 import type { SecretService } from "./secrets/service.js";
@@ -249,7 +248,7 @@ import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/v
 /** What is recorded of a call the user listed in `secrets.dropCommands`. */
 const NOT_STORED = "‹not stored›";
 import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
-import { planPush, pushDecidingSnapshot, remoteDefaultBranch, runPush, type PushInput, type PushPlan } from "./sandbox/push.js";
+import { planPush, remoteDefaultBranch, runPush, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -1592,10 +1591,7 @@ export class Session {
   #pushAbort: AbortController | null = null;
   /** Tests only: the push's whole budget (ms), the owner's answer included. */
   #pushBudgetMs: number | undefined;
-  /** Whether #notePushBaseline ran. */
-  #pushBaselineTaken = false;
-  /** The settings that decide a push, as they were before this session's first turn (sandbox/push.ts). */
-  #pushSnapshot: Promise<string[] | null> | null = null;
+
   /** The pin change last said on the session (#sandboxPinRefusal): said once per change. */
   #pinSaid: string | null = null;
   /** The working directory's identity when there is no sandbox to keep it (an embedder): taken at its first use. */
@@ -4239,7 +4235,7 @@ export class Session {
     // never runs, and a late yes finds the card already closed. The push itself keeps time of its own.
     const opencode = this.#provider.id === "opencode";
     const budgetMs = this.#pushBudgetMs ?? (opencode ? 50_000 : 8 * 60_000);
-    const reserveMs = Math.min(opencode ? 30_000 : 90_000, Math.floor(budgetMs / 2));
+    const reserveMs = Math.min(opencode ? 12_000 : 90_000, Math.floor(budgetMs / 2));
     const deadline = Date.now() + budgetMs;
     const left = () => Math.max(0, deadline - Date.now());
     const what = `${input.branch ?? "the checked-out branch"} to ${input.remote ?? "origin"}`;
@@ -4257,14 +4253,10 @@ export class Session {
     const closing = () => signal.aborted || this.#draining || this.#destroyed;
     const spec = sbx.runtime?.spec;
     if (!spec) return refuse("this session's sandbox isn't running for its backend");
-    const snapshot = this.#pushSnapshot ? await this.#pushSnapshot : null;
-    if (!snapshot) return refuse("this session's workspace wasn't a git repository when it began (or its settings couldn't be read then): push it yourself");
     const planOpts = {
       protectedBranches: cfg?.protectedBranches ?? ["main", "master"],
       heldReadOnly: spec.readOnly ?? [],
       agentWritable: [spec.workspace, spec.tempDir, ...spec.writable, ...sbx.worktreeFolders()],
-      untrustedRoots: this.#store.nonRepoWorkspaces(),
-      snapshot,
       remoteDefault: remoteDefaultBranch,
       lookupTimeoutMs: Math.min(30_000, Math.max(1_000, (left() - reserveMs) / 4)),
       signal,
@@ -4274,8 +4266,19 @@ export class Session {
     }));
     if (closing()) return refuse("the session closed while the push was being checked");
     if ("refused" in plan) return refuse(plan.refused);
-    if (plan.defaultUnknown && this.#mode === "autonomous") {
-      return refuse(`codeoid couldn't ask ${plan.shownUrl} which branch is its default, so it can't be sure ${plan.branch} isn't it: try again, or ask the owner to push`);
+    // Where a push may go is the owner's to say, once per repository and remote: the URL, and what the repository's
+    // own config says that decides a push, exactly as they trusted it (sandbox/push.ts trustMatches). Nothing on
+    // disk an agent could have made or changed stands in for that.
+    const trusted = trustMatches(this.#store.pushTrust(plan.common, plan.remote), plan);
+    if (this.#mode === "autonomous") {
+      if (!trusted) {
+        return refuse(
+          `the owner hasn't trusted agent pushes from this repository to ${plan.shownUrl} (or something that decides the push changed since): they can, with \`codeoid sandbox trust-push ${plan.repo}${plan.remote === "origin" ? "" : ` --remote ${plan.remote}`}\`, or by approving a push in guarded mode — or push it themselves`,
+        );
+      }
+      if (plan.defaultUnknown) {
+        return refuse(`codeoid couldn't ask ${plan.shownUrl} which branch is its default, so it can't be sure ${plan.branch} isn't it: try again, or ask the owner to push`);
+      }
     }
     const described = `${plan.branch} (commit ${plan.sha.slice(0, 12)}) to ${plan.remote} — ${plan.shownUrl}`;
     let by = SYSTEM_IDENTITY.sub;
@@ -4283,11 +4286,16 @@ export class Session {
       let answeredBy: string | undefined;
       const reason = input.reason ? `\n\nThe agent's reason, in its own words:\n${input.reason.split("\n").map((l) => `> ${l}`).join("\n")}` : "";
       const unknown = plan.defaultUnknown ? `\n\nThe remote didn't say which branch is its default: make sure ${plan.branch} isn't it.` : "";
+      const PUSH = "Push";
+      const TRUST = `Push, and trust ${plan.shownUrl} for this repository's agent pushes (autonomous mode too)`;
+      const NO = "Don't push";
+      const firstTime = trusted ? "" : `\n\nYou haven't trusted agent pushes from this repository to this URL yet.`;
       const answer = await this.requestUserInput(
         {
-          method: "confirm",
+          method: "select",
+          options: trusted ? [PUSH, NO] : [PUSH, TRUST, NO],
           title: `The agent asks to push ${plan.branch}`,
-          message: `"${this.name}" asks codeoid to push ${described}, with your credentials. Only this branch, as this commit; no force, no tags.${unknown}${reason}`,
+          message: `"${this.name}" asks codeoid to push ${described}, with your credentials. Only this branch, as this commit; no force, no tags.${firstTime}${unknown}${reason}`,
           // Closed with time left for the push itself.
           timeoutMs: Math.max(1_000, left() - reserveMs),
           signal,
@@ -4299,7 +4307,8 @@ export class Session {
           },
         },
       );
-      if (answer.cancelled || answer.confirmed !== true) {
+      const chose = answer.value;
+      if (answer.cancelled || (chose !== PUSH && chose !== TRUST)) {
         const why =
           answer.reason === "unattended"
             ? "nobody is there to approve it in this unattended run; the owner can push it"
@@ -4316,8 +4325,14 @@ export class Session {
       // The branch may have moved while the owner read the card: what is pushed is what they approved.
       const again = await planPush(this.sandboxWorkspace, { ...input, branch: plan.branch }, { ...planOpts, remoteDefault: undefined }).catch(() => null);
       if (!again || "refused" in again) return refuse(again && "refused" in again ? again.refused : "the repository couldn't be read again");
-      if (again.sha !== plan.sha || again.url !== plan.url) return refuse(`${plan.branch} or its remote changed after you were asked (now ${again.sha.slice(0, 12)}): ask again`);
+      if (again.sha !== plan.sha || again.url !== plan.url || !trustMatches({ ...plan }, again)) {
+        return refuse(`${plan.branch}, its remote or the settings deciding the push changed after you were asked (now ${again.sha.slice(0, 12)}): ask again`);
+      }
       by = answeredBy ?? this.createdBy;
+      if (chose === TRUST) {
+        this.#store.setPushTrust({ common: plan.common, remote: plan.remote, url: plan.url, repoSettings: plan.repoSettings }, by);
+        this.#store.audit(by, "session.push_trusted", this.id, `${plan.common} ${plan.remote} ${plan.shownUrl}`);
+      }
     }
     if (closing()) return refuse("the session closed before the push started");
     return this.#runPush(plan, by, note, left(), signal);
@@ -4338,21 +4353,6 @@ export class Session {
   get pushOffered(): boolean {
     const sbx = this.#sandbox;
     return !!sbx && sbx.info?.state === "on" && sbx.config.push?.enabled !== false;
-  }
-
-  /** Once per session, before its first turn's work: see #push's trust anchors. */
-  #notePushBaseline(): void {
-    if (this.#pushBaselineTaken) return;
-    this.#pushBaselineTaken = true;
-    try {
-      if (!gitLayoutOf(this.workdir)) {
-        this.#store.noteNonRepoWorkspace(physicalPath(this.workdir));
-        return;
-      }
-    } catch {
-      return;
-    }
-    this.#pushSnapshot = pushDecidingSnapshot(this.sandboxWorkspace).catch(() => null);
   }
 
   /** Stop a push in flight (the daemon stopping, the session destroyed): its process group is killed, and the result audited. */
@@ -5344,10 +5344,6 @@ export class Session {
     // Its worktree folders, removed while empty at the last turn's end, are there again for this one's commands: only
     // once its directories are what was pinned (#448 round 14), and never made through a link (worktrees.ts).
     this.#sandbox?.prepareFolders();
-    // Whose repository a later push may trust (sandbox/push.ts), before the agent works: a workspace that isn't one
-    // is noted for good, so a repository an agent makes there (in this session or a later one) is never pushed
-    // from; one that is gets the settings that decide a push snapshotted, and a push is refused if they change.
-    this.#notePushBaseline();
     // What of the repository git runs at the user's next command, as it is before the agent works (#448), in the
     // working directory as pinned (checked just above with the sandbox's pins).
     const baselineDir = this.#sandbox && (!this.#gitBaseline || !this.#refBaseline) ? this.#pinnedWorkdirOrSay("the look at the repository's git settings") : null;

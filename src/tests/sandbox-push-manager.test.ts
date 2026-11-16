@@ -17,18 +17,15 @@ describe("push, decided by the session", () => {
   it("autonomous: a protected branch, or a missing remote, is refused at once, with no card; audited and said", async () => {
     const m = t.newManager();
     const { info, session } = await t.autonomous(m);
-    // A push is always asked for in a turn: the session's baseline is taken at its start.
-    await session.send("go", AUTH);
-    await until(() => session.toInfo().status === "idle");
     const asked = t.dialogs(m, info?.name as string);
-    expect(await session.push({})).toBe("Refused: main is a protected branch (sandbox.push.protectedBranches): push your work to a branch of its own, and open a pull request.");
-    git(["checkout", "-q", "-b", "feature/x"], t.workdir);
     expect(await session.push({})).toContain("there is no remote named origin");
+    git(["remote", "add", "origin", "https://git.example.invalid/team/repo.git"], t.workdir);
+    expect(await session.push({})).toBe("Refused: main is a protected branch (sandbox.push.protectedBranches): push your work to a branch of its own, and open a pull request.");
     expect(asked).toHaveLength(0);
     expect(t.audits.filter((a) => a.action === "session.push_request")).toHaveLength(2);
     expect(t.audits.filter((a) => a.action === "session.push_refused").map((a) => a.detail)).toEqual([
-      expect.stringContaining("main is a protected branch"),
       expect.stringContaining("no remote named origin"),
+      expect.stringContaining("main is a protected branch"),
     ]);
   });
 
@@ -69,14 +66,20 @@ describe("push, decided by the session", () => {
     const second = await t.autonomous(m, { workdir: plain });
     await second.session.send("go", AUTH);
     await until(() => second.session.toInfo().status === "idle");
+    // Nothing an agent made decides anything: the owner never trusted pushes from there.
     const r = await second.session.push({});
-    expect(r).toContain("made where an agent worked before it was one");
+    expect(r).toContain("the owner hasn't trusted agent pushes from this repository");
   });
 
-  it("round 2: committing a .gitattributes, or the owner's branch tracking, doesn't stop a push; a changed remote URL does", async () => {
+  it("round 3: once the owner trusts the repository's remote, an autonomous push goes ahead; .gitattributes and branch tracking don't matter; a changed URL needs trusting again", async () => {
     git(["remote", "add", "origin", "https://git.example.invalid/team/repo.git"], t.workdir);
     const m = t.newManager();
     const { session } = await t.autonomous(m);
+    // Not trusted yet: refused, saying how.
+    git(["checkout", "-q", "-b", "feature/first"], t.workdir);
+    expect(await session.push({})).toContain("codeoid sandbox trust-push");
+    expect(await m.handle({ type: "sandbox.trust_push", id: "tp", action: "trust", path: t.workdir } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok", data: { remote: "origin" } });
+    expect(t.audits.some((a) => a.action === "sandbox.push_trusted")).toBe(true);
     await session.send("go", AUTH);
     await until(() => session.toInfo().status === "idle");
     git(["checkout", "-q", "-b", "feature/attr"], t.workdir);
@@ -89,7 +92,10 @@ describe("push, decided by the session", () => {
     // Gets past every trust check to the remote lookup (no network here: autonomous mode refuses an unknown default).
     expect(await session.push({})).toContain("which branch is its default");
     git(["remote", "set-url", "origin", "https://elsewhere.example.invalid/x.git"], t.workdir);
-    expect(await session.push({})).toContain("changed during this session (remote.origin.url)");
+    expect(await session.push({})).toContain("the owner hasn't trusted agent pushes from this repository to https://elsewhere.example.invalid/x.git");
+    // A delegated token can't trust anything.
+    const delegated = { ...AUTH, delegationDepth: 1 };
+    expect(await m.handle({ type: "sandbox.trust_push", id: "tp2", action: "trust", path: t.workdir } as never, delegated, CLIENT)).toMatchObject({ type: "response.error", code: "forbidden" });
   });
 
   it("round 2: a drain during the plan stops it before anything is pushed; push isn't listed where it's off", async () => {
@@ -99,6 +105,7 @@ describe("push, decided by the session", () => {
     await session.send("go", AUTH);
     await until(() => session.toInfo().status === "idle");
     git(["checkout", "-q", "-b", "feature/d"], t.workdir);
+    await m.handle({ type: "sandbox.trust_push", id: "tp", action: "trust", path: t.workdir } as never, AUTH, CLIENT);
     const pending = session.push({});
     session.beginDrain();
     const r = await pending;
@@ -129,13 +136,18 @@ describe("push, decided by the session", () => {
     expect(asked[0]?.message).toContain("The agent's reason, in its own words:\n> open a PR");
     // The remote couldn't be asked which branch is its default (no network here): the card says so.
     expect(asked[0]?.message).toContain("make sure feature/y isn't it");
-    await m.handle({ type: "session.ui_response", id: "u", sessionId: info?.id as string, requestId: asked[0]?.requestId as string, confirmed: false } as never, AUTH, CLIENT);
+    expect(asked[0]?.message).toContain("You haven't trusted agent pushes from this repository to this URL yet");
+    await m.handle({ type: "session.ui_response", id: "u", sessionId: info?.id as string, requestId: asked[0]?.requestId as string, value: "Don't push" } as never, AUTH, CLIENT);
     expect(await pending).toBe("Refused: the owner declined.");
     expect(t.audits.some((a) => a.action === "session.push_denied")).toBe(true);
     // A second call while none is running is decided afresh.
     const again = session.push({});
     await until(() => asked.length > 1);
-    await m.handle({ type: "session.ui_response", id: "u2", sessionId: info?.id as string, requestId: asked[1]?.requestId as string, confirmed: false } as never, AUTH, CLIENT);
-    expect(await again).toContain("Refused");
+    // The owner pushes and trusts: the trust is recorded (the push itself fails here: no network).
+    await m.handle({ type: "session.ui_response", id: "u2", sessionId: info?.id as string, requestId: asked[1]?.requestId as string, value: "Push, and trust https://git.example.invalid/team/repo.git for this repository's agent pushes (autonomous mode too)" } as never, AUTH, CLIENT);
+    expect(await again).toStartWith("Failed:");
+    expect(t.audits.some((a) => a.action === "session.push_trusted")).toBe(true);
+    const listed = (await m.handle({ type: "sandbox.trust_push", id: "l", action: "list" } as never, AUTH, CLIENT)) as { data?: { trusts: Array<{ url: string }> } };
+    expect(listed.data?.trusts.map((x) => x.url)).toEqual(["https://git.example.invalid/team/repo.git"]);
   });
 });

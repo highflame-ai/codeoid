@@ -517,6 +517,30 @@ export class TerminalClient {
     if (refs.length > 0) console.log(`  reads: ${sanitizeTerminalOutput(refs.map((r) => `${r.workstream}${r.paths ? ` (${r.paths.join(", ")})` : ""}`).join("; "))}`);
   }
 
+  /** Trust (or stop trusting) a repository's remote for agents' pushes, or list the trusts (sandbox/push.ts). */
+  async sandboxTrustPush(action: "trust" | "untrust" | "list", path?: string, remote?: string): Promise<void> {
+    const resp = await this.#request({ type: "sandbox.trust_push", id: randomUUID(), action, ...(path ? { path } : {}), ...(remote ? { remote } : {}) });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const data = resp.data as { trusts?: Array<{ common: string; remote: string; url: string; trustedAt: number }>; repository?: string; remote?: string; url?: string; removed?: boolean };
+    if (action === "list") {
+      const trusts = data.trusts ?? [];
+      if (trusts.length === 0) {
+        console.log("No repository is trusted for agent pushes. Trust one: codeoid sandbox trust-push <dir>");
+        return;
+      }
+      for (const t of trusts) console.log(`  ${sanitizeTerminalOutput(t.common)}  ${sanitizeTerminalOutput(t.remote)} → ${sanitizeTerminalOutput(t.url)}  (since ${new Date(t.trustedAt).toISOString().slice(0, 10)})`);
+      return;
+    }
+    if (action === "untrust") {
+      console.log(data.removed ? `No longer trusted: agent pushes from ${sanitizeTerminalOutput(data.repository ?? "")} to ${data.remote}.` : "It wasn't trusted.");
+      return;
+    }
+    console.log(`Trusted: agents may push from ${sanitizeTerminalOutput(data.repository ?? "")} to ${data.remote} (${sanitizeTerminalOutput(data.url ?? "")}), autonomous mode included — as long as its URL and settings stay as they are now.`);
+  }
+
   /** The daemon's sandbox providers and whether each runs here (#448). */
   async sandboxProviders(): Promise<void> {
     const resp = await this.#request({ type: "sandbox.providers", id: randomUUID() });
