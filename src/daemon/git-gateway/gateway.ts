@@ -35,6 +35,8 @@ export interface GatewayGrant {
   agentBranches: ReadonlyMap<string, string>;
   /** Whose cache it is (one per owner and URL). */
   cacheKey: string;
+  /** The connection's own URL, when the request named another spelling of it: what is reached, shown and recorded. */
+  url?: string;
 }
 
 export interface GatewayPush {
@@ -221,14 +223,17 @@ export class GitGateway {
       return fail(err instanceof Error ? err.message : String(err));
     }
     const service = header.service;
-    const url = header.url;
-    if ((service !== "git-upload-pack" && service !== "git-receive-pack") || typeof url !== "string" || url.length > 2048) return fail("not a git request");
+    const requested = header.url;
+    if ((service !== "git-upload-pack" && service !== "git-receive-pack") || typeof requested !== "string" || requested.length > 2048) return fail("not a git request");
+    let url: string = requested;
     const protocol = typeof header.protocol === "string" && /^version=[0-9]$/.test(header.protocol) ? header.protocol : "";
     const grant = await this.#host.grant(sessionId, service, url).catch((err: unknown) => ({ refused: err instanceof Error ? err.message : String(err) }));
     if ("refused" in grant) {
       this.#host.report(sessionId, { kind: service === "git-receive-pack" ? "push" : "fetch", url, ok: false, detail: grant.refused });
       return fail(grant.refused);
     }
+    // A spelling of a connected URL is the connection's own from here on (reached, shown, recorded).
+    url = grant.url ?? url;
     const cache = this.cachePath(grant.cacheKey);
     const upstream: Upstream = { ...grant.upstream, runDir: join(this.#base, "run") };
     // The agent's git gone (its connection closed), the session closed or the gateway stopping: nothing more is done.

@@ -4749,10 +4749,12 @@ mcpHub: this.#mcpHub,
         ssh = s.path;
       }
       return {
-        upstream: { url, kind: conn.kind, ...(credential ? { credential } : {}), ...(testFileRemote(url) ? { testFile: true } : {}) },
+        // Exactly the repository that was connected and proved (another spelling could be another repository).
+        upstream: { url: conn.url, kind: conn.kind, ...(credential ? { credential } : {}), ...(testFileRemote(conn.url) ? { testFile: true } : {}) },
+        url: conn.url,
         ssh,
         protectedBranches: session.gitProtectedBranches,
-        agentBranches: this.#store.gitAgentBranches(owner, url),
+        agentBranches: this.#store.gitAgentBranches(owner, conn.url),
         cacheKey: connectionId(owner, conn.url),
       };
     },
@@ -4797,11 +4799,24 @@ mcpHub: this.#mcpHub,
     // The URL git really uses there (the owner's own rewrite applied): what is shown, asked and connected.
     if (msg.action === "resolve") {
       const used = msg.url ? url : ownerRewrite(url);
-      return { type: "response.ok", requestId: msg.id, data: { url: shownGitUrl(used), rawUrl: used, ...(used !== url ? { writtenAs: shownGitUrl(url) } : {}), connected: !!this.#store.gitConnection(auth.sub, used) } };
+      const pushUsed = msg.url ? url : ownerPushRewrite(url);
+      return {
+        type: "response.ok",
+        requestId: msg.id,
+        data: {
+          url: shownGitUrl(used),
+          rawUrl: used,
+          ...(used !== url ? { writtenAs: shownGitUrl(url) } : {}),
+          // Pushes go elsewhere (the owner's pushInsteadOf): that is what agents' pushes need connected.
+          ...(pushUsed !== used ? { pushUrl: shownGitUrl(pushUsed), rawPushUrl: pushUsed } : {}),
+          connected: !!this.#store.gitConnection(auth.sub, used),
+        },
+      };
     }
     if (msg.action === "disconnect") {
       // From a repository: the URL as written and as the owner's git uses it (connect connected the latter).
-      const forms = msg.url ? [url] : [...new Set([url, ownerRewrite(url), ownerPushRewrite(url)])];
+      const written = msg.url ? [url] : [url, ownerRewrite(url), ownerPushRewrite(url)];
+      const forms = [...new Set(written.flatMap((u) => [u, ...sameRepoSpellings(u)]))];
       let removed = false;
       for (const u of forms) {
         removed = this.#store.removeGitConnection(auth.sub, u) || removed;

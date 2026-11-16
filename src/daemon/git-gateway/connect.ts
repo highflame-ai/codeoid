@@ -8,9 +8,9 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
 import { physicalPath, within } from "../physical-path.js";
 
 import { GIT_BIN } from "../git-env.js";
@@ -219,15 +219,83 @@ export function ownerPushRewrite(url: string): string {
   }
 }
 
+let ownerFiles: { at: number; key: string; files: string[] } | null = null;
+
+/**
+ * Every file the owner's git and ssh configs are read from, each as named and where it really is (a dotfiles link):
+ * `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`, every file their includes name (git's own `--show-origin
+ * --includes`, from `/`: nothing run), `~/.ssh` and `~/.ssh/config`, and every file its `Include` lines name (a
+ * pattern's matches in its dir). Cached for a few seconds (a spec is built from it).
+ */
+// paths: the owner's config files, read (git config from /, ssh's config and its includes), nothing run
+export function ownerConfigFiles(): string[] {
+  const home = process.env.HOME || homedir();
+  const xdg = process.env.XDG_CONFIG_HOME || join(home, ".config");
+  const key = `${home}\0${xdg}`;
+  if (ownerFiles && ownerFiles.key === key && Date.now() - ownerFiles.at < 5_000) return ownerFiles.files;
+  const out = new Set<string>();
+  const add = (p: string) => {
+    out.add(p);
+    out.add(physicalPathOr(p));
+  };
+  for (const f of [join(home, ".gitconfig"), join(xdg, "git", "config"), join(home, ".ssh"), join(home, ".ssh", "config")]) add(f);
+  try {
+    const r = spawnSync(GIT_BIN, ["-C", "/", "config", "--global", "--list", "--show-origin", "--includes", "--null"], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
+    for (const part of (r.status === 0 ? r.stdout : "").split("\0")) if (part.startsWith("file:")) add(part.slice("file:".length));
+  } catch {
+    /* none read */
+  }
+  const sshDir = join(home, ".ssh");
+  const seen = new Set<string>();
+  const readSsh = (file: string, depth: number) => {
+    if (depth > 4 || seen.has(file)) return;
+    seen.add(file);
+    let text = "";
+    try {
+      text = readFileSync(file, "utf8");
+    } catch {
+      return;
+    }
+    for (const line of text.split("\n")) {
+      const m = /^\s*Include\s+(.+)$/i.exec(line);
+      if (!m?.[1]) continue;
+      for (const raw of m[1].trim().split(/\s+/)) {
+        const named = raw.startsWith("~/") ? join(home, raw.slice(2)) : isAbsolute(raw) ? raw : join(sshDir, raw);
+        const matches = /[*?[]/.test(named) ? globIn(named) : [named];
+        // A pattern's dir, and each match: an agent's new file there would match too.
+        if (/[*?[]/.test(named)) add(dirname(named));
+        for (const f of matches) {
+          add(f);
+          readSsh(f, depth + 1);
+        }
+      }
+    }
+  };
+  readSsh(join(sshDir, "config"), 0);
+  ownerFiles = { at: Date.now(), key, files: [...out] };
+  return ownerFiles.files;
+}
+
+/** The files a pattern (wildcards in its last component) matches in its dir. */
+function globIn(pattern: string): string[] {
+  const dir = dirname(pattern);
+  const re = new RegExp(`^${basename(pattern).replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
+  try {
+    return readdirSync(dir)
+      .filter((n) => re.test(n))
+      .map((n) => join(dir, n));
+  } catch {
+    return [];
+  }
+}
+
 /**
  * Why the owner's own git config can't be used for the gateway now (a credential helper, a CA, a rewrite read from
- * it, ssh's config): one of those files is in what a sandboxed session may write (a session whose workspace is the
- * home), so what it says may be an agent's. Null: none is.
+ * it, ssh's config): one of the files it is read from (resolved: a dotfiles link; an include) is in what a sandboxed
+ * session may write, so what it says may be an agent's. Null: none is.
  */
 export function ownerConfigProblem(writable: readonly string[]): string | null {
-  const home = homedir();
-  const xdg = process.env.XDG_CONFIG_HOME || join(home, ".config");
-  const files = [join(home, ".gitconfig"), join(xdg, "git", "config"), join(home, ".ssh")];
-  const hit = files.find((f) => writable.some((w) => within(w, f) || within(physicalPathOr(w), f)));
-  return hit ? `${hit} is in what a sandboxed session may write (its workspace is your home?), so codeoid doesn't use your git or ssh config for agents while it is` : null;
+  const roots = [...new Set(writable.flatMap((w) => [w, physicalPathOr(w)]))];
+  const hit = ownerConfigFiles().find((f) => roots.some((w) => within(w, f)));
+  return hit ? `${hit} (your git or ssh config, or a file it includes) is in what a sandboxed session may write, so codeoid doesn't use your git or ssh config for agents while it is` : null;
 }

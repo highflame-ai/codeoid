@@ -1425,6 +1425,11 @@ sandboxGitCmd
       console.log(`This connects ${found.url}${found.writtenAs ? ` (the repository says ${found.writtenAs}; your git config rewrites it to this)` : ""}${found.connected ? " (connected already: connecting again refreshes it)" : ""} for agents in your sandboxed sessions.`);
       if (!(await confirmOnTerminal("Connect it? [y/N] ", o.yes, "Not connected: pass --yes to connect without a terminal to confirm in, or name it with --url."))) return client.disconnect();
       url = found.rawUrl;
+      // Your git pushes elsewhere (pushInsteadOf): agents' pushes go there, so that is connected too, when asked.
+      if (found.rawPushUrl && found.pushUrl) {
+        console.log(`Your git pushes it to ${found.pushUrl} (pushInsteadOf): agents' pushes go there.`);
+        if (await confirmOnTerminal("Connect that too? [y/N] ", o.yes, "")) await client.sandboxGitConnect("connect", { url: found.rawPushUrl });
+      }
     }
     const token = o.token ? await readSecret("Token (user:token, or the token): ") : undefined;
     await client.sandboxGitConnect("connect", { url, ...(token ? { token } : {}) });

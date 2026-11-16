@@ -464,6 +464,12 @@ export function gitGatewayEnv(g: GitGatewaySpec): Record<string, string> {
 
 export interface SpecInputs {
   sessionId: string;
+  /**
+   * The owner's git and ssh config files (connect.ts `ownerConfigFiles`: as named, resolved, and what they include):
+   * held read-only wherever the session may write them (a dotfiles repository as a workspace), as project settings
+   * are, so no sandboxed command writes what the host's git and ssh read.
+   */
+  ownerConfigFiles?: readonly string[];
   /** The session's git gateway (docs/git-gateway-design.md); absent: git reaches remotes as the network allows. */
   gitGateway?: GitGatewaySpec;
   /**
@@ -1353,7 +1359,9 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const inWritable = (p: string) => writableRoots.some((w) => within(p, w));
   // Held read-only, by real path (#448 round 14: resolved here, once, never again at a launch); only inside
   // something writable.
-  const readOnly = [...new Set([...git.readOnly, ...projectConfig].map(realOr))].filter(inWritable);
+  // paths: a look (does each of the owner's config files exist), no write
+  const ownerConfig = (inputs.ownerConfigFiles ?? []).filter((f) => existsSync(f));
+  const readOnly = [...new Set([...git.readOnly, ...projectConfig, ...ownerConfig].map(realOr))].filter(inWritable);
   // Held in place (no rename, still writable inside): every dir between a writable root and a hidden path in it,
   // and between two nested writable roots (pinned); the working directory and every dir between it and the
   // workspace (a monorepo's package dir moved aside takes its held settings with it, #448 round 14), and every

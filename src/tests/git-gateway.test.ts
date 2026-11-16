@@ -5,7 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { type GatewayHost, type GatewayPush, GitGateway } from "../daemon/git-gateway/gateway.js";
@@ -365,6 +365,45 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(await refUpdateProblem({ old: c, new: b, ref: "refs/heads/feature/x" }, p, async (old) => old !== a)).toContain("wasn't made by an agent");
     expect(await refUpdateProblem({ old: z, new: b, ref: "refs/heads/feature/y" }, p, async () => true)).toBeNull();
   });
+
+  test("round 6 (gateway): dotfiles linked or included from a workspace: the owner's config is judged where it really is, and held read-only", async () => {
+    const { ownerConfigProblem } = await import("../daemon/git-gateway/connect.js");
+    const { buildSandboxSpec } = await import("../daemon/sandbox/policy.js");
+    const { ownerConfigFiles } = await import("../daemon/git-gateway/connect.js");
+    const home = join(root, "home");
+    const dots = join(home, "dotfiles");
+    mkdirSync(join(dots, "ssh"), { recursive: true });
+    const saved = process.env.HOME;
+    process.env.HOME = home;
+    const fresh = async () => {
+      // The files' cache is a few seconds: wait it out between layouts.
+      await new Promise((r) => setTimeout(r, 5_100));
+    };
+    try {
+      // ~/.gitconfig a link into the dotfiles repository.
+      writeFileSync(join(dots, "gitconfig"), "[user]\n\tname = t\n");
+      symlinkSync(join(dots, "gitconfig"), join(home, ".gitconfig"));
+      expect(ownerConfigProblem([dots])).toContain("gitconfig");
+      // The spec for a session working there holds the link's target read-only.
+      const spec = buildSandboxSpec({ sessionId: "dots", workspace: dots, tempDir: join(root, "t"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" }, cache: false, ownerConfigFiles: ownerConfigFiles() });
+      expect(spec.readOnly).toContain(realpathSync(join(dots, "gitconfig")));
+      await fresh();
+      // A plain ~/.gitconfig including a file there; and ~/.ssh/config including one there.
+      rmSync(join(home, ".gitconfig"));
+      writeFileSync(join(dots, "extra"), "[user]\n\tname = t\n");
+      writeFileSync(join(home, ".gitconfig"), `[include]\n\tpath = ${join(dots, "extra")}\n`);
+      expect(ownerConfigProblem([dots])).toContain("extra");
+      await fresh();
+      writeFileSync(join(home, ".gitconfig"), "");
+      mkdirSync(join(home, ".ssh"), { recursive: true });
+      writeFileSync(join(dots, "ssh", "work.conf"), "Host w\n");
+      writeFileSync(join(home, ".ssh", "config"), `Include ${join(dots, "ssh")}/*.conf\n`);
+      expect(ownerConfigProblem([dots])).toMatch(/dotfiles\/ssh/);
+      expect(ownerConfigProblem([join(root, "elsewhere")])).toBeNull();
+    } finally {
+      process.env.HOME = saved;
+    }
+  }, 30_000);
 
   test("the policy alone: only plain branch updates that fast-forward", async () => {
     const z = "0".repeat(40);

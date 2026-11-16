@@ -22,7 +22,7 @@ import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
-import { ownerPushRewrite, ownerRewrite } from "../git-gateway/connect.js";
+import { ownerConfigFiles, ownerPushRewrite, ownerRewrite } from "../git-gateway/connect.js";
 import { buildSandboxSpec, type GitGatewaySpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
 import {
   addedDirProblem,
@@ -1173,6 +1173,7 @@ export class SessionSandbox {
     const gateway = this.#gatewayFor(workspace, network);
     const build = () => buildSandboxSpec({
       ...(gateway ? { gitGateway: gateway } : {}),
+      ownerConfigFiles: ownerConfigFiles(),
       backendReadable: readable,
       sessionId: this.#sessionId,
       workspace,
