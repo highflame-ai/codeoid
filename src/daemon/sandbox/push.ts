@@ -387,7 +387,7 @@ export async function readPushTarget(
   const common = physicalPath(layout.common);
   // Another repository's objects reachable through alternates would go out with the push (links: below).
   for (const f of ["alternates", "http-alternates"]) {
-    if (existsSync(join(common, "objects", "info", f))) return refuse(`the repository borrows objects from elsewhere (objects/info/${f})`);
+    if (existsSync(join(common, "objects", "info", f))) return refuse(`the repository borrows objects from elsewhere (objects/info/${f})`); // paths: a look at the repository's own git dir
   }
   const own = [physicalPath(join(common, "config")), ...(layout.own ? [physicalPath(join(layout.own, "config.worktree"))] : [physicalPath(join(common, "config.worktree"))])];
   // The repository's config can't change between this look and git's own read of it while the sandbox holds it
@@ -527,6 +527,7 @@ const STORE_WALK_LIMIT = 300_000;
  * at the plan and again right before git starts: refs (and a worktree's own), objects (every fan-out dir and file,
  * packs), packed-refs, HEAD, shallow. Alternates (borrowed objects) too.
  */
+// paths: a look (lstat, readdir, no link followed) at the repository's own git dir, judged; nothing written
 export function gitStoreProblem(common: string, own: string | null): string | null {
   for (const f of ["alternates", "http-alternates"]) {
     if (existsSync(join(common, "objects", "info", f))) return `the repository borrows objects from elsewhere (objects/info/${f})`;
@@ -701,6 +702,7 @@ const OVERFLOW_UID = 65534;
  * Your user-private group (Linux: named as you, nobody else in it), if you have one. macOS's staff and a shared
  * `users` group are every local user's: never.
  */
+// paths: the system's account files, read
 function privateGroup(): number[] {
   if (process.platform === "darwin" || typeof process.getgid !== "function") return [];
   const gid = process.getgid();
@@ -723,6 +725,7 @@ function privateGroup(): number[] {
 }
 
 /** Whether the daemon runs in a user namespace that doesn't map root (where root's files show as the overflow id). */
+// paths: the kernel's view of this process, read
 function inUserNamespace(): boolean {
   try {
     const map = readFileSync("/proc/self/uid_map", "utf8").trim().split("\n");
@@ -733,6 +736,7 @@ function inUserNamespace(): boolean {
 }
 
 /** Why a program the push may run, or a dir it may come from, isn't trusted on the host; else null. */
+// paths: a look (lstat) up the path, judged; nothing followed or written
 export function hostPathProblem(at: string, writable: readonly string[], home = homedir(), o: { homeAllowed?: boolean } = {}): string | null {
   let real: string;
   try {
@@ -826,6 +830,7 @@ const STALE_STAGE_MS = 6 * 60 * 60 * 1000;
  * Why `root` can't stage a push: it must be a real directory (no link), the daemon's own, that nobody else can
  * read or write. Made (0700) when missing.
  */
+// paths: the daemon's own config dir (push-staging), made 0700 and checked before use
 export function stagingRootProblem(root: string): string | null {
   try {
     mkdirSync(root, { recursive: true, mode: 0o700 });
@@ -840,6 +845,7 @@ export function stagingRootProblem(root: string): string | null {
 }
 
 /** Remove the staging dirs a stopped daemon left behind (never a running push's). */
+// paths: the daemon's own staging dir: its push-* dirs, no link followed (lstat), removed when stale
 function sweepStaging(root: string): void {
   try {
     for (const name of readdirSync(root)) {
@@ -861,6 +867,7 @@ function sweepStaging(root: string): void {
  * What `file`'s header says, if it is a plain git bundle (v2, or v3 with at most an `@object-format`): its object
  * format. Else why not. The whole header is read (to the blank line that ends it), every line of it checked.
  */
+// paths: the daemon's own staged file, opened O_NOFOLLOW and read
 export function readBundleHeader(file: string): { format: "sha1" | "sha256" } | { problem: string } {
   let fd: number;
   try {
@@ -918,6 +925,7 @@ export const MAX_BUNDLE_BYTES = 8 * 1024 * 1024 * 1024;
  * Stream `child`'s stdout (a `git bundle create … -`) into `dest`, created new (never through a link), stopping it at
  * `maxBytes`, `timeoutMs` or `signal`. Resolves with why it failed, or null once it exited 0.
  */
+// paths: the daemon's own staging file, made O_EXCL|O_NOFOLLOW (never through a link)
 export function bundleFromChild(child: ChildProcessWithoutNullStreams, dest: string, o: { maxBytes?: number; timeoutMs: number; signal?: AbortSignal }): Promise<string | null> {
   const max = o.maxBytes ?? MAX_BUNDLE_BYTES;
   return new Promise((done) => {
@@ -979,6 +987,7 @@ export function bundleFromChild(child: ChildProcessWithoutNullStreams, dest: str
  * link, alternates file, reflog or FIFO the agent puts in its repository — now or while the push runs — is
  * followed by a git that sees what the sandbox hides, and nothing is written back into the agent's repository.
  */
+// paths: the daemon's own staging dir (mkdtemp under its 0700 root), removed in finally
 export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult & { defaultUnknown?: boolean }> {
   const timeoutMs = o.timeoutMs ?? 120_000;
   const deadline = Date.now() + timeoutMs;
@@ -1130,6 +1139,7 @@ function shownOutput(text: string): string {
 }
 
 /** git with the hardened, networked environment; the whole process group is killed on timeout (ssh too). */
+// paths: git run in the daemon's own staging dir, hardened env (safeGitEnv), its own process group
 async function runGit(
   args: string[],
   cwd: string,

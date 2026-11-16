@@ -4465,7 +4465,7 @@ export class Session {
       if (signal.aborted) return "the session is closing";
       const git = this.#sandboxGitBin(sbx);
       if ("error" in git) return git.error;
-      const child = handle.spawn(git.bin, ["-c", "core.fsmonitor=false", "-C", repo, "bundle", "create", "-q", "-", ref], { cwd: repo, env: git.env });
+      const child = handle.spawn(git.bin, ["-c", "core.fsmonitor=false", "-C", repo, "bundle", "create", "-q", "-", ref], { cwd: repo, env: git.env }); // paths: run inside the session's sandbox (its handle), in its own workspace
       return await bundleFromChild(child, dest, { timeoutMs, signal });
     } catch (err) {
       return err instanceof Error ? err.message : String(err);
@@ -4500,7 +4500,7 @@ export class Session {
     let handle: Awaited<ReturnType<typeof rt.open>> | null = null;
     try {
       handle = await rt.open([]);
-      const r = await handle.exec([git.bin, "-c", "core.fsmonitor=false", "-C", repo, ...args], { cwd: repo, env: { ...git.env, GIT_OPTIONAL_LOCKS: "0" }, timeoutMs: 20_000 });
+      const r = await handle.exec([git.bin, "-c", "core.fsmonitor=false", "-C", repo, ...args], { cwd: repo, env: { ...git.env, GIT_OPTIONAL_LOCKS: "0" }, timeoutMs: 20_000 }); // paths: run inside the session's sandbox (its handle), in its own workspace
       if (r.exitCode === 0) return r.stdout;
       // `-q` queries exit 1 for "no such ref" and "not a symbolic ref"; anything else is git not running right.
       if (r.exitCode === 1) return null;
