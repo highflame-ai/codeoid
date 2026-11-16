@@ -16,7 +16,7 @@
 import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { isIP } from "node:net";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { atomicWrite, getConfigDir } from "../config.js";
 import {
   type EndpointFlavor,
@@ -87,6 +87,24 @@ const NAME_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 /** RFC 7230 token characters — a header name can't carry a separator or a newline. */
 const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const CONTROL_CHARS = /[\x00-\x1f\x7f]/;
+
+/**
+ * What a model id a server lists, or a user picks, may not hold: control
+ * characters, C0 and C1 (U+009B is a terminal's CSI); format characters —
+ * zero-width, bidi and tag marks, which disguise which id is chosen; lone
+ * surrogates; line and paragraph separators; and the invisible fillers and
+ * variation selectors that render as nothing. Stored
+ * configuration keeps its own, older rule (CONTROL_CHARS), so no saved
+ * endpoint stops loading.
+ */
+export const UNSAFE_MODEL_ID_CHARS =
+  // Combining marks (U+034F, the variation selectors) as alternatives: in a class they'd read as joined to their neighbour.
+  /[\p{Cc}\p{Cf}\p{Cs}\p{Zl}\p{Zp}\u115f\u1160\u3164\uffa0]|\u034f|\p{Variation_Selector}/u;
+
+/** A model id safe to offer, print and send: one line, 1–256 characters, nothing in {@link UNSAFE_MODEL_ID_CHARS}. */
+export function isSafeModelId(id: unknown): id is string {
+  return typeof id === "string" && id.length > 0 && id.length <= 256 && !UNSAFE_MODEL_ID_CHARS.test(id);
+}
 /** Headers the HTTP client owns; setting them would break or smuggle the request. */
 const RESERVED_HEADERS = new Set(["host", "content-length", "content-type", "transfer-encoding", "connection", "accept-encoding"]);
 const MIN_CONTEXT = 256;
@@ -335,6 +353,11 @@ export class EndpointStore {
 
   constructor(path: string = join(getConfigDir(), "endpoints.json")) {
     this.#path = path;
+  }
+
+  /** Where the model lists the endpoints' servers gave are kept (beside the store, 0600). */
+  get modelsCachePath(): string {
+    return join(dirname(this.#path), "endpoint-models.json");
   }
 
   /** Called after every successful change (add, replace, remove). */

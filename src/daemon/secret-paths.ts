@@ -81,6 +81,10 @@ function isSecretConfigFile(name: string): boolean {
     name.startsWith("accounts.json.") ||
     name === "endpoints.json" || // OpenAI-compatible endpoint keys
     name.startsWith("endpoints.json.") ||
+    // The model lists their servers gave: no key, but each bound to a fingerprint of the
+    // connection (key included), and a planted list could choose a session's model.
+    name === "endpoint-models.json" ||
+    name.startsWith("endpoint-models.json.") ||
     name === "config.json" ||
     name.startsWith("config.json.") ||
     name === ".env" ||

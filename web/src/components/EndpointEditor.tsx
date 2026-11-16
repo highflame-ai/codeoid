@@ -8,7 +8,7 @@
 
 import { type Component, For, Index, Show, createSignal, createUniqueId } from "solid-js";
 
-import type { EndpointFlavor, EndpointInfo, EndpointModel, EndpointsTestResultMsg } from "../protocol/types";
+import { ENDPOINT_TEMPLATES, type EndpointFlavor, type EndpointInfo, type EndpointModel, type EndpointsTestResultMsg, type EndpointTemplate } from "../protocol/types";
 import { endpointNameProblem, endpointsState, saveEndpoint, testEndpoint } from "../state/endpoints";
 import { HeadersEditor } from "./HeadersEditor";
 
@@ -87,7 +87,37 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [test, setTest] = createSignal<EndpointsTestResultMsg | "running" | undefined>();
+  const [template, setTemplate] = createSignal<EndpointTemplate | undefined>();
   const uid = createUniqueId();
+
+  /**
+   * Fill the form from a template: what the server is and how it is spoken to. A field the user
+   * typed is kept — it is replaced only while empty or still the previous template's — and a key or
+   * headers typed for one server never follow the form to another: moving the base URL to another
+   * origin clears them, as the daemon refuses to send a stored one there.
+   */
+  const applyTemplate = (t: EndpointTemplate) => {
+    const was = template();
+    setTemplate(t);
+    if (!name().trim() || name() === was?.suggestedName) setName(t.suggestedName);
+    if (!displayName().trim() || displayName() === was?.name) setDisplayName(t.id === "custom" ? "" : t.name);
+    const url = baseUrl().trim();
+    const nextUrl = t.baseUrl && (!url || url === was?.baseUrl) ? t.baseUrl : url;
+    if (originOf(nextUrl) !== originOf(url)) {
+      setApiKey("");
+      setHeaders([]);
+    }
+    setBaseUrl(nextUrl);
+    if (t.flavor !== flavor()) {
+      // A strict-schema or MCP choice made for one kind of server doesn't carry to another.
+      setStrict(undefined);
+      setMcpMode(undefined);
+    }
+    setFlavor(t.flavor);
+    if (maxTokensField() === (was?.maxTokensField ?? "max_tokens")) setMaxTokensField(t.maxTokensField ?? "max_tokens");
+    setKeyMode(t.key === "required" ? "set" : "none");
+    setTest(undefined);
+  };
 
   const storedHeaders = !!ex?.headerNames.length;
   /** The edited base URL points at another origin than the stored one (an unparsable URL counts as unchanged). */
@@ -113,7 +143,7 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
     }
     if (!baseUrl().trim()) return "a base URL is required";
     if (effKeyMode() === "set" && !apiKey().trim()) {
-      return originMoved() ? "enter a key for the new server, or remove it" : "enter the key, or choose to keep / remove it";
+      return originMoved() ? "enter a key for the new server, or remove it" : ex ? "enter the key, or choose to keep / remove it" : "enter the key, or choose no key";
     }
     if (Number.isNaN(tokensOf(contextWindow()) ?? 0)) return "context window: a number of tokens, like 32768 or 32k";
     for (const m of models()) {
@@ -158,11 +188,11 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
     );
   };
 
-  const fillModelsFromTest = () => {
+  /** Suggestions for the default model: what the last test listed, then the configured ids. */
+  const defaultModelChoices = () => {
     const t = test();
-    if (!t || t === "running" || !t.ok || !t.models) return;
-    const have = new Set(models().map((m) => m.id));
-    setModels([...models(), ...t.models.filter((id) => !have.has(id)).map((id) => ({ id, name: "", contextWindow: "", maxTokens: "" }))]);
+    const listed = t && t !== "running" && t.ok ? (t.models ?? []).filter((id) => !(t.notChat ?? []).includes(id)) : [];
+    return [...new Set([...listed, ...models().map((m) => m.id).filter(Boolean)])];
   };
 
   const save = async (ev: Event) => {
@@ -215,6 +245,40 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
   return (
     <form class="space-y-4 rounded border border-border bg-bg/40 p-4" onSubmit={save}>
       <div class="text-[13px] font-medium text-fg">{ex ? `Edit ${ex.displayName}` : "New endpoint"}</div>
+
+      <Show when={!ex}>
+        <div class="space-y-1">
+          <span class={label}>Start from</span>
+          <div class="flex flex-wrap gap-1.5">
+            <For each={ENDPOINT_TEMPLATES}>
+              {(t) => (
+                <button
+                  type="button"
+                  class={`${button} ${template()?.id === t.id ? "border-accent text-fg" : ""}`}
+                  aria-pressed={template()?.id === t.id}
+                  onClick={() => applyTemplate(t)}
+                >
+                  {t.name}
+                </button>
+              )}
+            </For>
+          </div>
+          <Show when={template()} keyed>
+            {(t) => (
+              <p class="text-[11px] text-fg-faint">
+                {t.note ?? ""}
+                <Show when={t.key === "required"}>
+                  {" "}Needs an API key
+                  <Show when={t.keyUrl}>
+                    {" "}(<a class="text-accent hover:underline" href={t.keyUrl} target="_blank" rel="noreferrer noopener">get one</a>)
+                  </Show>
+                  .
+                </Show>
+              </p>
+            )}
+          </Show>
+        </div>
+      </Show>
 
       <div class="grid grid-cols-2 gap-3">
         <label class="block space-y-1">
@@ -316,13 +380,10 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
 
       <div class="space-y-1">
         <div class="flex items-center justify-between">
-          <span class={label}>Models (none = whatever the server lists)</span>
+          <span class={label} title="Pickers offer these first, with their settings (label, context window, output cap), then every other chat model the server lists. One the server doesn't list is offered marked.">
+            Models to offer first (optional)
+          </span>
           <div class="flex gap-2">
-            <Show when={test() && test() !== "running" && (test() as EndpointsTestResultMsg).ok}>
-              <button type="button" class={button} onClick={fillModelsFromTest}>
-                Add the server's models
-              </button>
-            </Show>
             <button type="button" class={button} onClick={() => setModels([...models(), { id: "", name: "", contextWindow: "", maxTokens: "" }])}>
               + Model
             </button>
@@ -352,9 +413,9 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
       <div class="grid grid-cols-2 gap-3">
         <label class="block space-y-1">
           <span class={label}>Default model</span>
-          <input class={input} value={defaultModel()} onInput={(e) => setDefaultModel(e.currentTarget.value)} placeholder="first model" list="endpoint-model-ids" />
+          <input class={input} value={defaultModel()} onInput={(e) => setDefaultModel(e.currentTarget.value)} placeholder="first configured, else the server's first" list="endpoint-model-ids" />
           <datalist id="endpoint-model-ids">
-            <For each={models()}>{(m) => <option value={m.id} />}</For>
+            <For each={defaultModelChoices()}>{(id) => <option value={id} />}</For>
           </datalist>
         </label>
         <label class="block space-y-1">
@@ -440,12 +501,22 @@ export const TestOutcome: Component<{ test?: EndpointsTestResultMsg | "running" 
   <Show when={props.test && props.test !== "running" ? (props.test as EndpointsTestResultMsg) : undefined}>
     {(t) => (
       <div class={`text-[11px] ${t().ok ? "text-success" : "text-danger"}`} role={t().ok ? undefined : "alert"}>
-        {t().ok
-          ? `✓ answered in ${t().latencyMs ?? "?"} ms — ${t().models?.length ?? 0} models${t().contextWindow ? `, context ${t().contextWindow} tokens` : ""}${
-              t().models?.length ? `: ${t().models!.slice(0, 6).join(", ")}${t().models!.length > 6 ? ", …" : ""}` : ""
-            }`
-          : `✗ ${t().error ?? "no answer"}`}
+        {t().ok ? testSummary(t()) : `✗ ${t().error ?? "no answer"}`}
+        <Show when={t().ok && t().notServed?.length}>
+          <div class="text-warn">
+            Configured, not listed by the server: {t().notServed!.join(", ")} — still offered, marked (a gateway can serve an alias it doesn't list); remove any it no longer serves.
+          </div>
+        </Show>
       </div>
     )}
   </Show>
 );
+
+/** "✓ answered in 538 ms — 4 chat models: a, b, … (+1 not for chat: x)". Shared with the terminal's wording. */
+export function testSummary(t: EndpointsTestResultMsg): string {
+  const notChat = new Set(t.notChat ?? []);
+  const chat = (t.models ?? []).filter((id) => !notChat.has(id));
+  const shown = chat.length ? `: ${chat.slice(0, 6).join(", ")}${chat.length > 6 ? ", …" : ""}` : "";
+  const other = notChat.size ? ` (+${notChat.size} not for chat: ${[...notChat].slice(0, 3).join(", ")}${notChat.size > 3 ? ", …" : ""})` : "";
+  return `✓ answered in ${t.latencyMs ?? "?"} ms — ${chat.length} chat model${chat.length === 1 ? "" : "s"}${t.contextWindow ? `, context ${t.contextWindow} tokens` : ""}${shown}${other}`;
+}
