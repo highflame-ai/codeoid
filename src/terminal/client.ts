@@ -487,7 +487,7 @@ export class TerminalClient {
       this.#printError(resp);
       return;
     }
-    const data = resp.data as { connections?: Array<{ url: string; kind: string; auth: string; connectedAt: number }>; url?: string; kind?: string; auth?: string; removed?: boolean };
+    const data = resp.data as { connections?: Array<{ url: string; kind: string; auth: string; connectedAt: number }>; url?: string; kind?: string; auth?: string; via?: string; removed?: boolean };
     if (action === "list") {
       const list = data.connections ?? [];
       if (list.length === 0) console.log("No remote is connected for agents. Connect one: codeoid sandbox git connect [dir]");
@@ -500,6 +500,7 @@ export class TerminalClient {
     }
     const how = data.auth === "ssh" ? "your ssh key (ssh-agent and ~/.ssh/config as git uses them)" : data.auth === "token" ? "the token you gave" : "your git credential for it (kept by codeoid, 0600)";
     console.log(`Connected: agents in your sandboxed sessions may fetch from ${sanitizeTerminalOutput(data.url ?? "")} and push branches of their own, with ${how}.`);
+    if (data.via) console.log(`  As your ssh config says now: ${sanitizeTerminalOutput(data.via)} (taken once, as data; later changes to your ssh config don't apply until you connect again).`);
     console.log("  Never main, master or the remote's default branch; no force push, no deletes, no tags. In guarded mode you're asked for each push.");
     console.log("  A pushed branch runs the repository's CI as that branch defines it, with the CI's secrets.");
     if (process.platform === "linux") console.log("  On Linux, Claude's own sandbox can't let in one unix socket alone: with a remote connected, its commands can reach the other unix sockets they can see (local database sockets stay hidden).");

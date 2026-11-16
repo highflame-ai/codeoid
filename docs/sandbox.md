@@ -1260,11 +1260,20 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
 
 - **Confirmed and proved first:** from a repository, the URL its config names is shown and you confirm it
   (`--yes` without a terminal). Then connecting checks that your credential reaches the remote (`git ls-remote`).
-- **ssh remotes** use your ssh key, through your ssh agent and `~/.ssh/config` as git does. codeoid runs the system
-  `ssh`, and nothing is stored.
-- **https remotes:** your git credential for the host is read once, now, with `git credential fill`. That runs from
-  `/` with a minimal environment, so only your global and system helpers answer, never a repository's. Your
-  `http.sslCAInfo` for the URL is kept with it. The credential lives in a 0600 file of the daemon's, which
+- **Data, never programs:** nothing your git or ssh config names is ever run by the gateway. It takes data from
+  them, once, when you connect.
+- **ssh remotes** use your ssh key, through your ssh agent. When you connect, codeoid reads `~/.ssh/config` (and
+  what it `Include`s) for that host's data alone: `HostName`, `User`, `Port`, `IdentityFile`, `CertificateFile`,
+  `IdentitiesOnly`, `UserKnownHostsFile`, `HostKeyAlias`, `ProxyJump`. `Match` blocks, `ProxyCommand`,
+  `LocalCommand` and the rest are never taken. Every run is the system `ssh` with `-F` on a config codeoid writes
+  from that, so neither your ssh config nor the system's decides anything later; connect again after changing it.
+  The connect output says where ssh goes and as whom. A key or known-hosts file in what a session may write is
+  refused. A remote connected before this keeps working only after it is connected again.
+- **https remotes:** your git credential for the host is read once, now, with `git credential fill`. Only the
+  helpers git and the platforms ship are run (`osxkeychain`, `libsecret`, `gnome-keyring`, `wincred`, `manager`,
+  `manager-core`, `cache`, `store` with a file no session may write), from your global and system config, never a
+  repository's; any other helper (a `!` shell snippet, a path, another name) is refused, and you connect with
+  `--token` instead. Your `http.sslCAInfo` for the URL is kept with it, when it isn't in what a session may write. The credential lives in a 0600 file of the daemon's, which
   host-side file tools are refused. Each run hands it to git through codeoid's own credential helper, for that
   remote's origin only, with no redirects; it is never put in an environment or on a command line.
 - **`--token`** stores a dedicated token instead: a Bitbucket repository access token, or a GitHub fine-grained

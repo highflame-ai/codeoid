@@ -635,6 +635,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_compare_runs_parent
         ON compare_runs(account_id, project_id, parent_session_id);
     `);
+    this.#addColumnIfMissing("git_connections", "ssh", "TEXT");
     this.#addColumnIfMissing("git_agent_branches", "tip", "TEXT");
 
     // Per-child backend selection on spawn tasks. Additive so a database
@@ -2326,10 +2327,10 @@ export class Store {
   }
 
   /** Connect (replace) a remote for one owner's agents (the git gateway). */
-  setGitConnection(c: { owner: string; url: string; kind: string; auth: string; connectedBy: string }): void {
+  setGitConnection(c: { owner: string; url: string; kind: string; auth: string; connectedBy: string; ssh?: string }): void {
     this.#db
-      .prepare("INSERT OR REPLACE INTO git_connections (owner, url, kind, auth, connected_by, connected_at) VALUES (?, ?, ?, ?, ?, ?)")
-      .run(c.owner, c.url, c.kind, c.auth, c.connectedBy, Date.now());
+      .prepare("INSERT OR REPLACE INTO git_connections (owner, url, kind, auth, connected_by, connected_at, ssh) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(c.owner, c.url, c.kind, c.auth, c.connectedBy, Date.now(), c.ssh ?? null);
   }
 
   /** Disconnect; whether it was connected. Its agents' branch record goes too. */
@@ -2359,10 +2360,10 @@ export class Store {
   }
 
   /** One owner's connection for a URL, if any. */
-  gitConnection(owner: string, url: string): { owner: string; url: string; kind: "ssh" | "https"; auth: "ssh" | "git-credential" | "token"; connectedBy: string; connectedAt: number } | null {
+  gitConnection(owner: string, url: string): { owner: string; url: string; kind: "ssh" | "https"; auth: "ssh" | "git-credential" | "token"; connectedBy: string; connectedAt: number; ssh: string | null } | null {
     const row = this.#db
-      .prepare("SELECT owner, url, kind, auth, connected_by AS connectedBy, connected_at AS connectedAt FROM git_connections WHERE owner = ? AND url = ?")
-      .get(owner, url) as { owner: string; url: string; kind: string; auth: string; connectedBy: string; connectedAt: number } | null;
+      .prepare("SELECT owner, url, kind, auth, connected_by AS connectedBy, connected_at AS connectedAt, ssh FROM git_connections WHERE owner = ? AND url = ?")
+      .get(owner, url) as { owner: string; url: string; kind: string; auth: string; connectedBy: string; connectedAt: number; ssh: string | null } | null;
     if (!row || (row.kind !== "ssh" && row.kind !== "https") || !["ssh", "git-credential", "token"].includes(row.auth)) return null;
     return row as ReturnType<Store["gitConnection"]> & object;
   }

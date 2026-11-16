@@ -218,6 +218,7 @@ import { connectionId, GitCredentials, ownerConfigProblem, ownerPushRewrite, own
 import { type GatewayHost, GitGateway } from "./git-gateway/gateway.js";
 import { hostPathProblem } from "./git-gateway/hostpath.js";
 import { redactCredentials, remoteUrlProblem, shownGitUrl } from "./git-gateway/text.js";
+import { type SshSnapshot, snapshotProblem, sshConfigText, sshSnapshotLine } from "./git-gateway/ssh-snapshot.js";
 import { systemSsh, upstreamKind } from "./git-gateway/upstream.js";
 import type { GitGatewaySpec } from "./sandbox/policy.js";
 import {
@@ -4674,7 +4675,7 @@ mcpHub: this.#mcpHub,
   readonly #allSandboxWritable = (): string[] => [...this.#sessions.values()].flatMap((s) => s.sandboxAgentWritable);
 
   /** Connect `url` for `owner`: their credential proved to reach it, then recorded (an https one kept, 0600). */
-  async #connectGit(owner: string, url: string, by: string, token?: string): Promise<{ kind: string; auth: string } | { error: string }> {
+  async #connectGit(owner: string, url: string, by: string, token?: string): Promise<{ kind: string; auth: string; via?: string } | { error: string }> {
     if (!this.#gitGatewayInstance() || !this.#gitCredentials) return { error: "the git gateway isn't available on this daemon" };
     const ownConfig = ownerConfigProblem(this.#allSandboxWritable());
     if (ownConfig) return { error: ownConfig };
@@ -4683,10 +4684,10 @@ mcpHub: this.#mcpHub,
     const id = connectionId(owner, url);
     if (probe.credential) this.#gitCredentials.set(id, probe.credential);
     else this.#gitCredentials.remove(id);
-    this.#store.setGitConnection({ owner, url, kind: probe.kind, auth: probe.auth, connectedBy: by });
+    this.#store.setGitConnection({ owner, url, kind: probe.kind, auth: probe.auth, connectedBy: by, ...(probe.sshSnapshot ? { ssh: JSON.stringify(probe.sshSnapshot) } : {}) });
     this.#store.audit(by, "sandbox.git_connected", undefined, `${shownGitUrl(url)} ${probe.kind} ${probe.auth} owner=${owner}`);
     this.#gitConnectionsChanged(owner);
-    return { kind: probe.kind, auth: probe.auth };
+    return { kind: probe.kind, auth: probe.auth, ...(probe.sshSnapshot ? { via: sshSnapshotLine(probe.sshSnapshot) } : {}) };
   }
 
   /** An owner's connections changed: their sandboxed sessions get the gateway as it is now, between turns. */
@@ -4743,14 +4744,26 @@ mcpHub: this.#mcpHub,
       const credential = conn.kind === "https" ? this.#gitCredentials?.get(connectionId(owner, conn.url)) : undefined;
       if (conn.kind === "https" && !credential) return { refused: `the credential for ${shownGitUrl(url)} is gone: the owner can connect it again` };
       let ssh: string | null = null;
+      let sshConfig: string | undefined;
       if (conn.kind === "ssh" && !testFileRemote(url)) {
         const s = systemSsh(this.#allSandboxWritable());
         if ("problem" in s) return { refused: s.problem };
         ssh = s.path;
+        // The connection's ssh snapshot (data taken at connect): what this run's ssh is given, never the owner's config.
+        let snap: SshSnapshot | null = null;
+        try {
+          snap = conn.ssh ? (JSON.parse(conn.ssh) as SshSnapshot) : null;
+        } catch {
+          snap = null;
+        }
+        if (!snap) return { refused: `${shownGitUrl(conn.url)} was connected before codeoid kept its ssh settings: connect it again` };
+        const bad = snapshotProblem(snap, this.#allSandboxWritable(), process.env.HOME || homedir());
+        if (bad) return { refused: bad };
+        sshConfig = sshConfigText(snap);
       }
       return {
         // Exactly the repository that was connected and proved (another spelling could be another repository).
-        upstream: { url: conn.url, kind: conn.kind, ...(credential ? { credential } : {}), ...(testFileRemote(conn.url) ? { testFile: true } : {}) },
+        upstream: { url: conn.url, kind: conn.kind, ...(credential ? { credential } : {}), ...(sshConfig ? { sshConfig } : {}), ...(testFileRemote(conn.url) ? { testFile: true } : {}) },
         url: conn.url,
         ssh,
         protectedBranches: session.gitProtectedBranches,

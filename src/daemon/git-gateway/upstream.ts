@@ -30,8 +30,10 @@ export interface Upstream {
   kind: UpstreamKind;
   /** For https: the credential sent to this remote's origin only. */
   credential?: HttpsCredential;
-  /** The gateway's private dir for a run's credential file (never in a sandbox). */
+  /** The gateway's private dir for a run's credential and ssh config files (never in a sandbox). */
   runDir?: string;
+  /** For ssh: the ssh config codeoid writes from the connection's snapshot (ssh-snapshot.ts); absent: an empty one. */
+  sshConfig?: string;
   /** Tests only: a local bare repository as the remote (`file://`), which a real one never is. */
   testFile?: boolean;
 }
@@ -100,8 +102,16 @@ const sh = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
 // paths: the gateway's private run dir (made 0700): a credential file of this run's, written 0600, removed after
 export async function withUpstreamEnv<T>(up: Upstream, ssh: string | null, fn: (env: Record<string, string>) => Promise<T>, extra: ReadonlyArray<readonly [string, string]> = []): Promise<T> {
   const entries: Array<readonly [string, string]> = [...CLEAN_CONFIG, ...extra];
-  if (up.kind === "ssh" && ssh) entries.push(["core.sshCommand", `${ssh} -o BatchMode=yes -o ConnectTimeout=20`]);
   let credFile: string | null = null;
+  let sshFile: string | null = null;
+  if (up.kind === "ssh" && ssh) {
+    // Never the owner's ssh config, nor the system's: only what codeoid writes (the connection's snapshot, as data).
+    if (!up.runDir) throw new Error("no private dir for the ssh config");
+    mkdirSync(up.runDir, { recursive: true, mode: 0o700 });
+    sshFile = join(up.runDir, `${randomBytes(12).toString("hex")}.ssh_config`);
+    writeFileSync(sshFile, up.sshConfig ?? "Host *\n  BatchMode yes\n  ConnectTimeout 20\n", { mode: 0o600 });
+    entries.push(["core.sshCommand", `${ssh} -F ${sh(sshFile)} -o BatchMode=yes -o ConnectTimeout=20`]);
+  }
   if (up.kind === "https" && up.credential) {
     if (!up.runDir) throw new Error("no private dir for the credential");
     mkdirSync(up.runDir, { recursive: true, mode: 0o700 });
@@ -129,6 +139,7 @@ export async function withUpstreamEnv<T>(up: Upstream, ssh: string | null, fn: (
     return await fn(env);
   } finally {
     if (credFile) rmSync(credFile, { force: true });
+    if (sshFile) rmSync(sshFile, { force: true });
   }
 }
 
