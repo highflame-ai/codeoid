@@ -1367,14 +1367,22 @@ push; in guarded mode it goes ahead (you approved it), and the result says so.
 
 It runs hardened (`git-env.ts`):
 
-- On a PATH with nothing any sandboxed session may write, and no relative
-  entries, so `ssh` and credential helpers are never an agent's program. An
-  ssh command (`core.sshCommand`, `GIT_SSH_COMMAND`) or credential helper given
-  by a path in such a directory is refused.
-- With your config as it applies to the session's repository. A setting an
-  `includeIf "gitdir:…"` or `onbranch:` include of yours makes there (a work
-  identity's `credential.*`, `http.*`) is handed to the push, which runs from
-  codeoid's own staging repository where that include wouldn't apply.
+- On a PATH of git's own dir and your PATH's absolute entries that are
+  outside your home, outside anything a sandboxed session may write, and not
+  writable by others. A session that has ended may have left a program in its
+  workspace, so "under your home" is out whatever runs now. `ssh` is found on
+  that PATH. An ssh command (`core.sshCommand`, `GIT_SSH_COMMAND`, `GIT_SSH`)
+  or credential helper naming a path that fails the same test, or a relative
+  one, is refused. (Paths under `~/.ssh`, such as keys and config, are yours
+  to name.) A git of codeoid's own under your home can't push for agents
+  either.
+- With no askpass program (`GIT_ASKPASS`, `SSH_ASKPASS`): a push never prompts.
+- With your config exactly as it applies to the session's repository. The push
+  runs from codeoid's own staging repository. If a conditional include
+  (`includeIf "gitdir:…"`, `onbranch:`, `hasconfig:`) makes your `credential.*`,
+  `http.*`, `ssh.variant` or `protocol.*` differ between the two, the push is
+  refused, naming the keys. Set them unconditionally, or for the remote's URL
+  (`credential.<url>.*`, `http.<url>.*`).
 
 - No hooks, so neither `pre-push` nor git-lfs's run. LFS objects aren't
   uploaded: push those yourself.
@@ -1425,6 +1433,8 @@ the session is destroyed, whether it is being checked, waiting on the card or
 running, and the stop is audited.
 
 `push` is offered only where it works: a sandboxed session, with pushing on.
+A pack role without `network: true`, or a read-only one (`write: false`),
+can't push.
 That holds over `/mcp/sandbox` too.
 
 Every request, refusal (codeoid's own, before or during the push), approval,

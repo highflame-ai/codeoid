@@ -27,6 +27,7 @@
 
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
 import { closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readSync, rmSync, writeSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { GIT_BIN, safeGit, safeGitEnv } from "../git-env.js";
 import { validateBranchName } from "../git-worktree.js";
@@ -591,35 +592,69 @@ export interface RunOptions {
   _testFileRemote?: boolean;
 }
 
-/** What `planned` (your entries where the push was planned) has that `here` (in the staging repository) doesn't, in order. */
-export function carriedEntries(planned: ReadonlyArray<[string, string]>, here: ReadonlyArray<[string, string]>): Array<[string, string]> {
-  const left = new Map<string, number>();
-  for (const [k, v] of here) left.set(`${k}\0${v}`, (left.get(`${k}\0${v}`) ?? 0) + 1);
-  const out: Array<[string, string]> = [];
-  for (const [k, v] of planned) {
-    const n = left.get(`${k}\0${v}`) ?? 0;
-    if (n > 0) left.set(`${k}\0${v}`, n - 1);
-    else out.push([k, v]);
-  }
-  return out;
+/**
+ * The keys whose entries (in order) differ between `planned` (your config where the push was planned, the session's
+ * repository) and `here` (where codeoid pushes from): what a conditional include makes apply in one and not the other.
+ */
+export function differingKeys(planned: ReadonlyArray<[string, string]>, here: ReadonlyArray<[string, string]>): string[] {
+  const keys = new Set([...planned, ...here].map(([k]) => k));
+  const of = (list: ReadonlyArray<[string, string]>, k: string) => JSON.stringify(list.filter(([x]) => x === k).map(([, v]) => v));
+  return [...keys].filter((k) => of(planned, k) !== of(here, k)).sort();
 }
 
-/** The daemon's PATH without anything in `writable` (and without relative entries), git's own dir first. */
-export function safePathFor(writable: readonly string[], path = process.env.PATH ?? ""): string {
+/**
+ * The daemon's PATH for the push, which runs on the host with your credentials: git's own dir, then the absolute
+ * entries {@link hostPathProblem} doesn't refuse. A dir under your home is out (a session's workspace may be, or
+ * may have been: a program an agent left there outlives its session), and so is one others may write.
+ */
+export function safePathFor(writable: readonly string[], path = process.env.PATH ?? "", home = homedir()): string {
   const out = [dirname(GIT_BIN)];
   for (const e of path.split(":")) {
     if (!e || !isAbsolute(e) || out.includes(e)) continue;
-    if (programProblem(join(e, "x"), writable)) continue;
+    if (hostPathProblem(e, writable, home)) continue;
     out.push(e);
   }
   return out.join(":");
 }
 
-/** Why the program a command line starts (`ssh -i …`, `!helper`, `/path/to/helper`) can't run for the push, or null. */
-export function commandProblem(command: string, writable: readonly string[]): string | null {
-  const first = command.trim().replace(/^!/, "").trim().split(/\s+/)[0]?.replace(/^["']|["']$/g, "") ?? "";
-  if (!first || !isAbsolute(first)) return null;
-  return programProblem(first, writable) ? `${first} is in a directory a session's commands may write` : null;
+/** Why a program the push may run, or a dir it may come from, isn't trusted on the host; else null. */
+export function hostPathProblem(at: string, writable: readonly string[], home = homedir()): string | null {
+  let real: string;
+  try {
+    real = physicalPath(at);
+  } catch {
+    return `${at} can't be resolved`;
+  }
+  if (programProblem(at, writable) || programProblem(real, writable)) return `${at} is in a directory a session's commands may write`;
+  if (home && (within(home, real) || within(home, at))) return `${at} is under your home, where a session's commands may write (or have written)`;
+  // Neither it nor a dir above it writable by anyone but its owner (a shared dir, a world-writable /tmp tool).
+  for (let d = real; ; d = dirname(d)) {
+    try {
+      const st = lstatSync(d);
+      if ((st.mode & 0o022) !== 0 && !(st.isDirectory() && (st.mode & 0o1000) !== 0 && d !== real)) return `${d} is writable by others`;
+    } catch {
+      /* a part that isn't there: nothing runs from it */
+    }
+    if (dirname(d) === d) break;
+  }
+  return null;
+}
+
+/**
+ * Why a command line the push would run (`ssh -i …`, `!helper get`, `/path/to/helper`) can't: every path it names
+ * (a word with a `/`, `~` expanded) is judged by {@link hostPathProblem}. Bare names resolve on {@link safePathFor}.
+ */
+export function commandProblem(command: string, writable: readonly string[], home = homedir()): string | null {
+  for (const raw of command.replace(/^\s*!/, "").split(/[\s;|&()<>`"'=]+/)) {
+    if (!raw.includes("/") && !raw.startsWith("~")) continue;
+    const word = raw.startsWith("~/") || raw === "~" ? join(home, raw.slice(1)) : raw;
+    // A key file, a socket and the like are the user's; only what could be run matters: an absolute or ~ path, or a relative one (refused).
+    if (!isAbsolute(word)) return `${raw} is a relative path`;
+    if (/(^|\/)\.ssh(\/|$)/.test(word)) continue;
+    const bad = hostPathProblem(word, writable, home);
+    if (bad) return bad;
+  }
+  return null;
 }
 
 function programProblem(program: string, writable: readonly string[]): boolean {
@@ -713,11 +748,10 @@ export function bundleHeaderProblem(file: string): string | null {
  * Why `gitBin` can't be the git run inside a session's sandbox: it must be an absolute path outside everything that
  * session's commands may write (lexically and physically), so no agent's program stands in for it.
  */
-export function gitBinProblem(gitBin: string, writable: readonly string[]): string | null {
+export function gitBinProblem(gitBin: string, writable: readonly string[], home = homedir()): string | null {
   if (!isAbsolute(gitBin)) return "codeoid found no git on this machine";
-  const real = physicalPath(gitBin);
-  const inside = writable.filter(Boolean).some((w) => within(w, gitBin) || within(w, real) || within(physicalPath(w), real) || within(physicalPath(w), gitBin));
-  return inside ? `the git codeoid runs (${gitBin}) is in a directory this session's commands may write` : null;
+  const bad = hostPathProblem(gitBin, writable, home);
+  return bad ? `the git codeoid runs (${gitBin}) can't be trusted for a push: ${bad}` : null;
 }
 
 /** The largest bundle taken into the daemon's staging repository. */
@@ -796,7 +830,7 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
   const writable = o.hostWritable ?? [];
   const path = o.hostWritable ? safePathFor(writable) : undefined;
   const programs = [plan.sshCommand, process.env.GIT_SSH_COMMAND, process.env.GIT_SSH, ...plan.userEntries.filter(([k]) => /^credential\.([\s\S]+\.)?helper$/i.test(k)).map(([, v]) => v)];
-  for (const c of programs) {
+  for (const c of o.hostWritable ? programs : []) {
     const bad = c ? commandProblem(c, writable) : null;
     if (bad) return { ok: false, refused: true, summary: `refused: the push would run ${bad}`, output: "" };
   }
@@ -812,7 +846,6 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
     if (o.signal?.aborted) return { ok: false, summary: "not pushed: the session is closing", output: "" };
     // 2. A repository of the daemon's own, holding just that branch.
     const repo = join(stage, "repo.git");
-    const carried: Array<[string, string]> = [];
     const local = async (args: string[]) => {
       const r = await runGit(args, stage, left(), { sshCommand: null, signal: o.signal, path });
       if (r.code !== 0) throw new Error(shownOutput(r.stderr).split("\n")[0] || `git ${args[0]} failed`);
@@ -829,6 +862,7 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
       const tip = /^([0-9a-f]{40,64}) refs\/heads\/(\S+)$/m.exec(listed);
       if (!tip?.[1] || tip[2] !== plan.branch) return { ok: false, refused: true, summary: `refused: the bundle the session's sandbox made doesn't hold ${plan.branch}`, output: "" };
       await local(["--git-dir", repo, "update-ref", `refs/heads/${plan.branch}`, tip[1]]);
+      await local(["--git-dir", repo, "symbolic-ref", "HEAD", `refs/heads/${plan.branch}`]);
       // The checked commit, or one the agent made on top of it since (only the checked one is pushed, from here).
       const holds =
         tip[1] === plan.sha ||
@@ -840,8 +874,22 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
       const there = (await local(["--git-dir", repo, "remote", "get-url", "--push", "target"])).trim();
       if (there !== plan.url) return { ok: false, refused: true, summary: `refused: your git config rewrites ${shownUrl(plan.url)} again (to ${shownUrl(there)})`, output: "" };
       // What your config set where the push was planned and doesn't set here (an includeIf), handed to the push.
+      // How the push authenticates and connects must be what was checked and trusted: your config as it applies in
+      // the session's repository. A conditional include (gitdir:, onbranch:, hasconfig:) that applies there and not
+      // here, or here and not there, refuses the push rather than send other credentials or settings.
       const here = (await config(repo, DECIDING_GIT)).filter((e) => (e.scope === "global" || e.scope === "system") && CARRIED.test(e.key));
-      carried.push(...carriedEntries(plan.userEntries, here.map((e) => [e.key, e.value] as [string, string])));
+      const differ = differingKeys(
+        plan.userEntries,
+        here.map((e) => [e.key, e.value] as [string, string]),
+      );
+      if (differ.length > 0) {
+        return {
+          ok: false,
+          refused: true,
+          summary: `refused: your git config's ${differ.slice(0, 5).join(", ")}${differ.length > 5 ? ", …" : ""} apply differently in this repository than where codeoid pushes from (a conditional include, includeIf): set them unconditionally, or for the remote's URL (credential.<url>.*, http.<url>.*)`,
+          output: "",
+        };
+      }
     } catch (err) {
       return { ok: false, refused: true, summary: `refused: the branch couldn't be staged for the push (${err instanceof Error ? err.message : String(err)})`, output: "" };
     }
@@ -852,7 +900,6 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
         sshCommand: plan.sshCommand,
         signal: o.signal,
         path,
-        carried,
         ...(o._testFileRemote ? { protocol: "file" as const } : {}),
       });
       const head = r.code === 0 ? /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(r.stdout)?.[1] : undefined;
@@ -877,7 +924,7 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
       ["--git-dir", repo, "push", "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", "--end-of-options", "target", `${plan.sha}:refs/heads/${plan.branch}`],
       stage,
       left(),
-      { sshCommand: plan.sshCommand, signal: o.signal, path, carried, ...(o._testFileRemote ? { protocol: "file" as const } : {}) },
+      { sshCommand: plan.sshCommand, signal: o.signal, path, ...(o._testFileRemote ? { protocol: "file" as const } : {}) },
     );
     const output = shownOutput(`${r.stdout}\n${r.stderr}`);
     const unknownNote = defaultUnknown ? " (the remote didn't say which branch is its default)" : "";
@@ -926,20 +973,23 @@ async function runGit(
   args: string[],
   cwd: string,
   timeoutMs: number,
-  o: { sshCommand: string | null; signal?: AbortSignal; protocol?: "file"; path?: string; carried?: ReadonlyArray<readonly [string, string]> },
+  o: { sshCommand: string | null; signal?: AbortSignal; protocol?: "file"; path?: string },
 ): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean; aborted: boolean }> {
-  const env = await safeGitEnv(cwd, { network: true, overrides: [...(o.carried ?? []), ...PUSH_OVERRIDES] });
+  const env = await safeGitEnv(cwd, { network: true, overrides: PUSH_OVERRIDES });
   if (o.path !== undefined) env.PATH = o.path;
+  // A push never prompts: no askpass program (one from the daemon's environment may be in what a session writes).
+  for (const k of ["GIT_ASKPASS", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE", "DISPLAY"]) delete env[k];
   if (o.signal?.aborted) return { code: null, stdout: "", stderr: "", timedOut: false, aborted: true };
   // A local bundle into the daemon's own repository (and tests' local remotes): that protocol alone.
   if (o.protocol) env.GIT_ALLOW_PROTOCOL = o.protocol;
   // How ssh runs: your environment's GIT_SSH_COMMAND / GIT_SSH first (as git itself ranks them), then your own
   // core.sshCommand (planPush took it from your global or system config only), else ssh that never waits for a
   // person (a host-key or passphrase prompt) and gives up on a dead host. The time limit bounds any of them.
-  if (!env.GIT_SSH_COMMAND && !env.GIT_SSH) {
-    // ssh by its full path on that PATH: never one found first in a directory a session writes.
+  if (!env.GIT_SSH_COMMAND) {
+    // git's own order: GIT_SSH_COMMAND, then core.sshCommand, then GIT_SSH. Else ssh by its full path on that PATH.
     const ssh = o.path !== undefined && typeof Bun !== "undefined" ? (Bun.which("ssh", { PATH: o.path }) ?? "ssh") : "ssh";
-    env.GIT_SSH_COMMAND = o.sshCommand ?? `${ssh} -o BatchMode=yes -o ConnectTimeout=20`;
+    if (o.sshCommand) env.GIT_SSH_COMMAND = o.sshCommand;
+    else if (!env.GIT_SSH) env.GIT_SSH_COMMAND = `${ssh} -o BatchMode=yes -o ConnectTimeout=20`;
   }
   return new Promise((done) => {
     const child = spawn(GIT_BIN, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });

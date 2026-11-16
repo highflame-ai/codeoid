@@ -10,7 +10,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSyn
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { GIT_BIN } from "../daemon/git-env.js";
-import { isPushTool, isSafeTool } from "../daemon/providers/tool-safety.js";
+import { isPushTool, isSafeTool, roleDeniesTool } from "../daemon/providers/tool-safety.js";
 import { branchMatches, bundleFromChild, cleanPushInput, planPush, pushUrlProblem, type RunOptions, runPush, shownUrl, type PushPlan } from "../daemon/sandbox/push.js";
 import { SandboxMcpHttp } from "../daemon/sandbox/request-directory.js";
 
@@ -241,24 +241,30 @@ describe("push: the plan", () => {
     for (const url of ["https://github.com/o/r.git", "https://user@bitbucket.org/t/r.git", "ssh://git@host:2222/x.git", "https://[::1]:8443/x.git"]) expect([url, pushUrlProblem(url)]).toEqual([url, null]);
   });
 
-  test("round 8: an includeIf of your config applies to the push as where it was planned; nothing it set is dropped or doubled", async () => {
-    const { carriedEntries } = await import("../daemon/sandbox/push.js");
+  test("round 9: your config must apply to the push as where it was checked: a conditional include that differs refuses it, naming the keys", async () => {
+    const { differingKeys } = await import("../daemon/sandbox/push.js");
     const inc = join(root, "work.gitconfig");
-    writeFileSync(inc, "[credential \"https://git.example.invalid\"]\n\tusername = work-account\n[http]\n\tsslCAInfo = /etc/work-ca.pem\n");
-    writeFileSync(join(root, ".gitconfig"), `[credential]\n\thelper = store\n[includeIf "gitdir:${repo}/"]\n\tpath = ${inc}\n`);
+    writeFileSync(inc, '[credential "https://git.example.invalid"]\n\tusername = work-account\n[http]\n\tsslVerify = false\n');
+    writeFileSync(join(root, ".gitconfig"), `[credential]\n\thelper = store\n[includeIf "gitdir:${repo}/"]\n\tpath = ${inc}\n[http]\n\tsslVerify = true\n`);
     const p = await planned();
     expect(p.userEntries).toEqual([
       ["credential.helper", "store"],
       ["credential.https://git.example.invalid.username", "work-account"],
-      ["http.sslcainfo", "/etc/work-ca.pem"],
+      ["http.sslverify", "false"],
+      ["http.sslverify", "true"],
     ]);
-    // In the staging repository only the unconditional one applies: the rest is handed to the push, once.
-    expect(carriedEntries(p.userEntries, [["credential.helper", "store"]])).toEqual([
-      ["credential.https://git.example.invalid.username", "work-account"],
-      ["http.sslcainfo", "/etc/work-ca.pem"],
-    ]);
-    expect(carriedEntries([["credential.helper", ""], ["credential.helper", "x"]], [["credential.helper", "x"]])).toEqual([["credential.helper", ""]]);
-    expect(await run(p)).toMatchObject({ ok: true });
+    // In codeoid's staging repository the gitdir: include doesn't apply: refused, never pushed with other settings.
+    const r = await run(p);
+    expect(r).toMatchObject({ ok: false, refused: true, summary: expect.stringContaining("credential.https://git.example.invalid.username, http.sslverify") });
+    expect(String(r.summary).includes("work-account")).toBe(false);
+    expect(git(bare, "for-each-ref", "refs/heads/feature")).toBe("");
+    // Order counts (last wins), and so does a value only one side has.
+    expect(differingKeys([["a", "1"], ["a", "2"]], [["a", "2"], ["a", "1"]])).toEqual(["a"]);
+    expect(differingKeys([["a", "1"]], [["a", "1"], ["b", "x"]])).toEqual(["b"]);
+    expect(differingKeys([["a", "1"]], [["a", "1"]])).toEqual([]);
+    // Unconditional settings apply in both: the push goes ahead.
+    writeFileSync(join(root, ".gitconfig"), `[credential]\n\thelper = store\n[credential "https://git.example.invalid"]\n\tusername = work-account\n`);
+    expect(await run(await planned())).toMatchObject({ ok: true });
   });
 
   test("round 8: the push's PATH holds nothing a session may write; an ssh command or credential helper there is refused", async () => {
@@ -276,6 +282,19 @@ describe("push: the plan", () => {
     const p = { ...(await planned()), sshCommand: `${bin}/ssh` };
     expect(await run(p, { hostWritable: [repo] })).toMatchObject({ ok: false, refused: true, summary: expect.stringContaining("may write") });
     expect(await run(await planned(), { hostWritable: [repo] })).toMatchObject({ ok: true });
+    // Round 9: anything under your home is out (a session that wrote there may be gone), and every path a command names counts.
+    const { hostPathProblem } = await import("../daemon/sandbox/push.js");
+    const home = join(root, "h");
+    expect(safePathFor([], `${join(home, ".local", "bin")}:/usr/bin`, home).split(":")).not.toContain(join(home, ".local", "bin"));
+    expect(hostPathProblem(join(home, ".local", "bin", "ssh"), [], home)).toContain("under your home");
+    expect(commandProblem(`sh -c '${bin}/helper get'`, [repo])).toContain("may write");
+    expect(commandProblem("~/bin/helper", [], home)).toContain("under your home");
+    expect(commandProblem("./helper", [])).toContain("relative");
+    expect(commandProblem("ssh -i ~/.ssh/id -F ~/.ssh/config", [], home)).toBeNull();
+    const shared = join(root, "shared");
+    mkdirSync(shared);
+    chmodSync(shared, 0o777);
+    expect(hostPathProblem(join(shared, "ssh"), [], join(root, "elsewhere-home"))).toContain("writable by others");
   });
 
   test("round 7: a tag named like the checked-out branch doesn't change which branch is pushed", async () => {
@@ -285,7 +304,7 @@ describe("push: the plan", () => {
 
   test("round 7: a git in anything a session may write is never the one run inside the sandbox", async () => {
     const { gitBinProblem } = await import("../daemon/sandbox/push.js");
-    expect(gitBinProblem(join(repo, "bin", "git"), [repo])).toContain("in a directory this session's commands may write");
+    expect(gitBinProblem(join(repo, "bin", "git"), [repo])).toContain("may write");
     expect(gitBinProblem(join(root, "home", ".local", "bin", "git"), [join(root, "home")])).not.toBeNull();
     const linked = join(root, "linked-bin");
     mkdirSync(join(repo, "bin"), { recursive: true });
@@ -491,6 +510,11 @@ describe("push: how it is offered", () => {
       expect(isSafeTool(name)).toBe(false);
     }
     for (const name of ["push", "mcp__other__push", "mcp__codeoid_sandbox__pushx", "x_mcp__codeoid_sandbox__push"]) expect(isPushTool(name)).toBe(false);
+    // Round 9: a role without the network, or a read-only one, can't push (it writes a remote and runs its CI).
+    for (const role of [{ write: false, network: true }, { write: true, network: false }, { write: true, network: "read-only" }] as const) {
+      expect(roleDeniesTool({ ...role, envelope: "all" }, "mcp__codeoid_sandbox__push")).toContain("doesn't allow pushing");
+    }
+    expect(roleDeniesTool({ write: true, network: true, envelope: "all" }, "mcp__codeoid_sandbox__push")).toBeNull();
   });
 
   test("the daemon's /mcp/sandbox lists push beside request_directory and routes a call to the session's handler", async () => {

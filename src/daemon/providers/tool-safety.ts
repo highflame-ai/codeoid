@@ -195,6 +195,10 @@ export function roleDeniesTool(role: ToolRole, toolName: string): string | null 
   if (role.write === false && isUnresolvedPathTool(toolName)) {
     return `capability role is read-only (write: false) — "${toolName}" names a path that can't be resolved for certain`;
   }
+  // A push writes a remote and runs its CI: neither a read-only role's nor one without the network's.
+  if (isPushTool(toolName) && (role.write === false || role.network !== true)) {
+    return `capability role doesn't allow pushing (write: ${String(role.write)}, network: ${String(role.network)}) — "${toolName}" is not permitted`;
+  }
   if (role.network === false && isNetworkTool(toolName)) {
     return `capability role forbids network access (network: false) — "${toolName}" is not permitted`;
   }
