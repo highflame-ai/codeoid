@@ -88,6 +88,24 @@ describe("credential helpers", () => {
     expect(r).toEqual({ username: "agent", password: "secret-value" });
   });
 
+  test("an allowed helper's name is never found in a PATH dir a session may write", async () => {
+    const ws = join(home, "ws");
+    const mark = join(home, "ran");
+    mkdirSync(join(ws, "bin"), { recursive: true });
+    writeFileSync(join(ws, "bin", "git-credential-manager"), `#!/bin/sh\ntouch ${mark}\necho password=x\n`, { mode: 0o755 });
+    writeFileSync(join(home, ".gitconfig"), "[credential]\n\thelper = manager\n");
+    process.env.HOME = home;
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${join(ws, "bin")}:${savedPath}`;
+    try {
+      const r = await fillGitCredential("https://host.invalid/x.git", { runDir: join(home, "run"), writable: [ws] }, 10_000);
+      expect("error" in r).toBe(true);
+      expect(existsSync(mark)).toBe(false);
+    } finally {
+      process.env.PATH = savedPath;
+    }
+  });
+
   test("a store file a session may write is refused", async () => {
     const ws = join(home, "ws");
     mkdirSync(ws);

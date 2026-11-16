@@ -1473,6 +1473,8 @@ export async function openCheckSandbox(opts: {
   try {
     const spec = buildSandboxSpec({
       sessionId: `check-${safe}`,
+      // A check runs agent-written code with its dir writable: the owner's config files there are held too.
+      ownerConfigFiles: ownerConfigFiles(),
       workspace: sandboxWorkspaceOf(opts.workspace),
       workdir: opts.workspace,
       tempDir,

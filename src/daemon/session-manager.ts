@@ -214,7 +214,7 @@ import {
   removeForkWorktree,
 } from "./git-worktree.js";
 import { GIT_BIN, hardenedGit, safeGit } from "./git-env.js";
-import { connectionId, GitCredentials, ownerConfigProblem, ownerPushRewrite, ownerRewrite, probeConnection } from "./git-gateway/connect.js";
+import { connectionId, GitCredentials, ownerConfigProblem, ownerPushRewrite, ownerRewrite, probeConnection, sshHome } from "./git-gateway/connect.js";
 import { type GatewayHost, GitGateway } from "./git-gateway/gateway.js";
 import { hostPathProblem } from "./git-gateway/hostpath.js";
 import { redactCredentials, remoteUrlProblem, shownGitUrl } from "./git-gateway/text.js";
@@ -4757,7 +4757,7 @@ mcpHub: this.#mcpHub,
           snap = null;
         }
         if (!snap) return { refused: `${shownGitUrl(conn.url)} was connected before codeoid kept its ssh settings: connect it again` };
-        const bad = snapshotProblem(snap, this.#allSandboxWritable(), process.env.HOME || homedir());
+        const bad = snapshotProblem(snap, this.#allSandboxWritable(), sshHome());
         if (bad) return { refused: bad };
         sshConfig = sshConfigText(snap);
       }

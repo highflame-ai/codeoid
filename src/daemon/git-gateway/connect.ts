@@ -9,7 +9,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { physicalPath, within } from "../physical-path.js";
 
@@ -154,7 +154,13 @@ export function fillGitCredential(url: string, o: { runDir: string; writable: re
   const cfg = join(o.runDir, `${createHash("sha256").update(`${Date.now()}${Math.random()}`).digest("hex").slice(0, 16)}.gitconfig`);
   writeFileSync(cfg, `[credential]\n${usable.map((h) => `\thelper = ${h}\n`).join("")}`, { mode: 0o600 });
   return new Promise((done) => {
-    const env = { ...ownerHelperEnv(), GIT_CONFIG_GLOBAL: cfg, GIT_CONFIG_NOSYSTEM: "1" };
+    // git finds a helper by name in its exec path, then PATH: only PATH dirs no session may write.
+    const base = ownerHelperEnv();
+    const path = (base.PATH ?? "/usr/bin:/bin")
+      .split(":")
+      .filter((d) => isAbsolute(d) && !hostPathProblem(d, o.writable, undefined, { homeAllowed: true }))
+      .join(":");
+    const env = { ...base, PATH: path || "/usr/bin:/bin", GIT_CONFIG_GLOBAL: cfg, GIT_CONFIG_NOSYSTEM: "1" };
     const p = spawn(GIT_BIN, ["-C", "/", "--no-pager", "credential", "fill"], { cwd: "/", env, stdio: ["pipe", "pipe", "pipe"] });
     let out = "";
     p.stdout.on("data", (d: Buffer) => {
@@ -186,6 +192,15 @@ async function ownerCaInfo(url: string, writable: readonly string[]): Promise<st
   if (!v) return undefined;
   const bad = hostPathProblem(v, writable, undefined, { homeAllowed: true });
   return bad ? { error: `your CA bundle ${v} can't be used: ${bad}` } : v;
+}
+
+/** The home OpenSSH uses (`getpwuid`'s, never `$HOME`): where its config, keys and known hosts are. */
+export function sshHome(): string {
+  try {
+    return userInfo().homedir || homedir();
+  } catch {
+    return homedir();
+  }
 }
 
 export interface ConnectOptions {
@@ -227,7 +242,8 @@ export async function probeConnection(
     // The owner's ssh setup for this host, as data (ssh-snapshot.ts): what every run uses, never their config itself.
     const host = sshHostOf(url);
     if (!host) return { error: `${url} names no host codeoid can reach by ssh` };
-    const home = o.home ?? (process.env.HOME || homedir());
+    // OpenSSH's home is the passwd one (it ignores $HOME): what its keys and known hosts are read from.
+    const home = o.home ?? sshHome();
     snapshot = sshSnapshot(host, home);
     const bad = snapshotProblem(snapshot, o.writable, home);
     if (bad) return { error: bad };
