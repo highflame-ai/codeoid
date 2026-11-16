@@ -1401,31 +1401,45 @@ sandboxCmd
     client.disconnect();
   });
 
-sandboxCmd
-  .command("trust-push [dir]")
+const sandboxGitCmd = sandboxCmd
+  .command("git")
+  .description("The git gateway (docs/git-gateway-design.md): agents' own git fetch and push reach remotes you connect, with your existing credentials, which never enter the sandbox");
+
+sandboxGitCmd
+  .command("connect [dir]")
   .description(
-    "Trust a repository's remote for agents' pushes (the push tool, docs/sandbox.md \"Pushing a branch\"): an autonomous agent may then push branches there with your credentials — never main, master or the remote's default, never a force. Recorded as the URL and settings are now; a change asks again",
+    "Connect a repository's remote for agents in your sandboxed sessions: they may fetch from it and push branches of their own (never main, master or its default branch, no force, no deletes, no tags), with your ssh key or your git credential for it (read once, now), or --token. Proved to work first. A pushed branch runs the repository's CI with its secrets",
   )
   .option("--remote <name>", "the remote (default: origin)")
-  .option("--off", "stop trusting it")
-  .option("--list", "list the trusted repositories")
-  .action(async (dir: string | undefined, o: { remote?: string; off?: boolean; list?: boolean }) => {
+  .option("--url <url>", "the remote's URL, instead of a repository and remote")
+  .option("--token", "use a dedicated token for an https remote (user:token, or the token), read from the terminal or stdin")
+  .action(async (dir: string | undefined, o: { remote?: string; url?: string; token?: boolean }) => {
+    const token = o.token ? await readSecret("Token (user:token, or the token): ") : undefined;
     const client = new TerminalClient(loadConfig());
     await client.connect();
-    if (o.list) await client.sandboxTrustPush("list");
-    else await client.sandboxTrustPush(o.off ? "untrust" : "trust", resolve(dir ?? "."), o.remote);
+    await client.sandboxGitConnect("connect", { ...(o.url ? { url: o.url } : { path: resolve(dir ?? ".") }), ...(o.remote ? { remote: o.remote } : {}), ...(token ? { token } : {}) });
     client.disconnect();
   });
 
-sandboxCmd
-  .command("forget-writable <dir>")
-  .description(
-    "Forget that sandboxed sessions could write <dir> (and what is under it), once you've checked what is there. Until then codeoid's push never takes a git config file or a program from it (docs/sandbox.md \"Pushing a branch\")",
-  )
-  .action(async (dir: string) => {
+sandboxGitCmd
+  .command("disconnect [dir]")
+  .description("Take a connected remote back: agents' git no longer reaches it (a kept credential is deleted)")
+  .option("--remote <name>", "the remote (default: origin)")
+  .option("--url <url>", "the remote's URL, instead of a repository and remote")
+  .action(async (dir: string | undefined, o: { remote?: string; url?: string }) => {
     const client = new TerminalClient(loadConfig());
     await client.connect();
-    await client.sandboxForgetWritable(resolve(dir));
+    await client.sandboxGitConnect("disconnect", { ...(o.url ? { url: o.url } : { path: resolve(dir ?? ".") }), ...(o.remote ? { remote: o.remote } : {}) });
+    client.disconnect();
+  });
+
+sandboxGitCmd
+  .command("ls")
+  .description("List the remotes you connected for agents")
+  .action(async () => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    await client.sandboxGitConnect("list", {});
     client.disconnect();
   });
 

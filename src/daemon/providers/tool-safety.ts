@@ -9,7 +9,6 @@ import { BLACKBOARD_MCP_SERVER_NAME } from "../blackboard/mcp-http.js";
 import { MEMORY_MCP_SERVER_NAME } from "../memory/mcp-http.js";
 import { MEMORY_TOOL_NAMES } from "../memory/tools.js";
 import { REQUEST_DIRECTORY_TOOL, SANDBOX_MCP_SERVER_NAME } from "../sandbox/request-directory.js";
-import { PUSH_TOOL } from "../sandbox/push.js";
 import { FLEET_READ_TOOLS, FLEET_TOOL_PREFIX } from "../../protocol/types.js";
 
 /** Built-in read-only tools that never require confirmation. */
@@ -75,14 +74,6 @@ const BLACKBOARD_SAFE_TOOLS = [
 /** The sandbox's `request_directory`, as any backend names it: the session decides it, so no gate card asks first (every mode). */
 export function isRequestDirectoryTool(name: string): boolean {
   return SANDBOX_TOOL_PREFIXES.some((p) => name === `${p}${REQUEST_DIRECTORY_TOOL}`);
-}
-
-/**
- * The sandbox's `push` (sandbox/push.ts), as any backend names it: the session decides it (Session#push: its
- * checks, the owner's answer in guarded and interactive mode), so no gate card asks first. Not a safe tool.
- */
-export function isPushTool(name: string): boolean {
-  return SANDBOX_TOOL_PREFIXES.some((p) => name === `${p}${PUSH_TOOL}`);
 }
 
 export function isSafeTool(name: string): boolean {
@@ -194,10 +185,6 @@ export function roleDeniesTool(role: ToolRole, toolName: string): string | null 
   // It may be a write, and where it leads isn't known: not a read-only role's to ask about.
   if (role.write === false && isUnresolvedPathTool(toolName)) {
     return `capability role is read-only (write: false) — "${toolName}" names a path that can't be resolved for certain`;
-  }
-  // A push writes a remote and runs its CI: neither a read-only role's nor one without the network's.
-  if (isPushTool(toolName) && (role.write === false || role.network !== true)) {
-    return `capability role doesn't allow pushing (write: ${String(role.write)}, network: ${String(role.network)}) — "${toolName}" is not permitted`;
   }
   if (role.network === false && isNetworkTool(toolName)) {
     return `capability role forbids network access (network: false) — "${toolName}" is not permitted`;

@@ -470,6 +470,30 @@ export class TerminalClient {
   }
 
   /** Add a directory to what a session's commands write, or remove one (docs/sandbox.md, Working across repositories). */
+  /** The git gateway's connections (docs/git-gateway-design.md): connect, disconnect or list the caller's. */
+  async sandboxGitConnect(action: "connect" | "disconnect" | "list", o: { url?: string; path?: string; remote?: string; token?: string }): Promise<void> {
+    const resp = await this.#request({ type: "sandbox.git_connect", id: randomUUID(), action, ...o });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const data = resp.data as { connections?: Array<{ url: string; kind: string; auth: string; connectedAt: number }>; url?: string; kind?: string; auth?: string; removed?: boolean };
+    if (action === "list") {
+      const list = data.connections ?? [];
+      if (list.length === 0) console.log("No remote is connected for agents. Connect one: codeoid sandbox git connect [dir]");
+      for (const c of list) console.log(`  ${sanitizeTerminalOutput(c.url)}  ${c.kind}, ${c.auth === "ssh" ? "your ssh key" : c.auth === "token" ? "a token" : "your git credential"}  (since ${new Date(c.connectedAt).toISOString().slice(0, 10)})`);
+      return;
+    }
+    if (action === "disconnect") {
+      console.log(data.removed ? `Disconnected: agents' git no longer reaches ${sanitizeTerminalOutput(data.url ?? "")}.` : "It wasn't connected.");
+      return;
+    }
+    const how = data.auth === "ssh" ? "your ssh key (ssh-agent and ~/.ssh/config as git uses them)" : data.auth === "token" ? "the token you gave" : "your git credential for it (kept by codeoid, 0600)";
+    console.log(`Connected: agents in your sandboxed sessions may fetch from ${sanitizeTerminalOutput(data.url ?? "")} and push branches of their own, with ${how}.`);
+    console.log("  Never main, master or the remote's default branch; no force push, no deletes, no tags. In guarded mode you're asked for each push.");
+    console.log("  A pushed branch runs the repository's CI as that branch defines it, with the CI's secrets.");
+  }
+
   async sandboxDir(sessionIdOrName: string, action: "add" | "remove", path: string): Promise<void> {
     const sessionId = await this.#resolveSession(sessionIdOrName);
     if (!sessionId) return;
@@ -515,54 +539,6 @@ export class TerminalClient {
     if (ws) console.log(`  ${sanitizeTerminalOutput(ws)}`);
     const refs = data.workstream?.references ?? [];
     if (refs.length > 0) console.log(`  reads: ${sanitizeTerminalOutput(refs.map((r) => `${r.workstream}${r.paths ? ` (${r.paths.join(", ")})` : ""}`).join("; "))}`);
-  }
-
-  /** Trust (or stop trusting) a repository's remote for agents' pushes, or list the trusts (sandbox/push.ts). */
-  /** Forget that sandboxed sessions could write `dir` (after checking what is there). */
-  async sandboxForgetWritable(dir: string): Promise<void> {
-    const resp = await this.#request({ type: "sandbox.trust_push", id: randomUUID(), action: "forget_writable", path: dir });
-    if (resp.type !== "response.ok") {
-      this.#printError(resp);
-      return;
-    }
-    const n = (resp.data as { forgotten?: number }).forgotten ?? 0;
-    console.log(n ? `Forgotten: ${n} recorded director${n === 1 ? "y" : "ies"} under ${sanitizeTerminalOutput(dir)} no longer count as written by a sandboxed session.` : "Nothing recorded there.");
-  }
-
-  async sandboxTrustPush(action: "trust" | "untrust" | "list", path?: string, remote?: string): Promise<void> {
-    const resp = await this.#request({ type: "sandbox.trust_push", id: randomUUID(), action, ...(path ? { path } : {}), ...(remote ? { remote } : {}) });
-    if (resp.type !== "response.ok") {
-      this.#printError(resp);
-      return;
-    }
-    const data = resp.data as {
-      trusts?: Array<{ common: string; remote: string; url: string; trustedAt: number }>;
-      repository?: string;
-      remote?: string;
-      url?: string;
-      configuredUrl?: string;
-      settings?: string[];
-      userSettings?: string[];
-      removed?: boolean;
-    };
-    if (action === "list") {
-      const trusts = data.trusts ?? [];
-      if (trusts.length === 0) {
-        console.log("No repository is trusted for agent pushes. Trust one: codeoid sandbox trust-push <dir>");
-        return;
-      }
-      for (const t of trusts) console.log(`  ${sanitizeTerminalOutput(t.common)}  ${sanitizeTerminalOutput(t.remote)} → ${sanitizeTerminalOutput(t.url)}  (since ${new Date(t.trustedAt).toISOString().slice(0, 10)})`);
-      return;
-    }
-    if (action === "untrust") {
-      console.log(data.removed ? `No longer trusted: agent pushes from ${sanitizeTerminalOutput(data.repository ?? "")} to ${data.remote}.` : "It wasn't trusted.");
-      return;
-    }
-    console.log(`Trusted: agents may push from ${sanitizeTerminalOutput(data.repository ?? "")} to ${data.remote}, at ${sanitizeTerminalOutput(data.url ?? "")}, autonomous mode included — as long as that and these settings stay as they are now.`);
-    console.log("  A pushed branch runs the repository's CI as that branch defines it (pipeline files an agent wrote included), with the CI's secrets.");
-    if (data.configuredUrl) console.log(`  (the remote's config says ${sanitizeTerminalOutput(data.configuredUrl)}; a URL rewrite in your git config sends it to the address above)`);
-    for (const x of data.settings ?? []) console.log(`  repository setting: ${sanitizeTerminalOutput(x)}`);
-    for (const x of data.userSettings ?? []) console.log(`  your setting: ${sanitizeTerminalOutput(x)}`);
   }
 
   /** The daemon's sandbox providers and whether each runs here (#448). */

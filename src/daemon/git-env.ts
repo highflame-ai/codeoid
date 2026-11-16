@@ -233,15 +233,12 @@ async function scopedDrivers(cwd: string, env: Record<string, string>, timeout: 
  * no missing object is fetched; with it, https and ssh only. System config
  * is still read (it is the machine's, not the agent's).
  */
-export async function safeGitEnv(
-  cwd: string,
-  opts: { network?: boolean; timeoutMs?: number; overrides?: ReadonlyArray<readonly [string, string]> } = {},
-): Promise<Record<string, string>> {
+export async function safeGitEnv(cwd: string, opts: { network?: boolean; timeoutMs?: number } = {}): Promise<Record<string, string>> {
   const base = {
     ...gitEnv({ LANG: "C", ...PROGRAM_ENV }, { network: opts.network === true }),
     ...(opts.network ? { GIT_ALLOW_PROTOCOL: REMOTE_PROTOCOLS } : {}),
   };
-  return { ...base, ...overrideEnv([...driverOverrides(await scopedDrivers(cwd, base, opts.timeoutMs ?? 30_000), false), ...(opts.overrides ?? [])]) };
+  return { ...base, ...overrideEnv(driverOverrides(await scopedDrivers(cwd, base, opts.timeoutMs ?? 30_000), false)) };
 }
 
 /** git with {@link safeGitEnv}: its stdout. */

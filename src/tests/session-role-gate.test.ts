@@ -99,14 +99,6 @@ describe("capability-role gate", () => {
     expect(provider.canUseToolResults[0]!.behavior).toBe("allow");
   });
 
-  test("a role without network: true, or a read-only one, can't push on any backend (refused in the session itself, not offered)", async () => {
-    for (const pack of [reviewer, implementer]) {
-      const session = makeSession(new MockSessionProvider("mock", []), pack);
-      expect(await session.push({})).toStartWith(`Refused: role "${pack.roleName}": capability role doesn't allow pushing`);
-      expect(session.pushOffered).toBe(false);
-    }
-  });
-
   test("reviewer allows a read-only tool (Read)", async () => {
     const provider = new MockSessionProvider("mock", [toolTurn("Read")]);
     const session = makeSession(provider, reviewer);

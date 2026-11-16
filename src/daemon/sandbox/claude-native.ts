@@ -147,7 +147,7 @@ export function claudeSandboxSettings(
   // which are reachable (every other runtime socket, the desktop's runtime dir, the system bus, the agent's are denied
   // or hidden), and the host's /tmp (tmux, X11, ssh-agent, an IDE's sockets), which the CLI's sandbox otherwise keeps,
   // is denied too (#448 round 10): only what the sandbox shows of it (the session's own temp dirs) is there.
-  const sockets = physical(spec.dockerSockets ?? []);
+  const sockets = physical([...(spec.dockerSockets ?? []), ...(spec.gatewaySockets ?? [])]);
   const allSockets = sockets.length > 0 && platform === "linux";
   if (sockets.length > 0) Object.assign(network, allSockets ? { allowAllUnixSockets: true } : { allowUnixSockets: sockets });
   const envVars = credentialEnvNames(env, spec.unsetEnv).map((name) => ({ name, mode: "deny" as const }));

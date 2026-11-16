@@ -13,7 +13,7 @@
  * starts on it.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
@@ -22,7 +22,7 @@ import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
-import { buildSandboxSpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
+import { buildSandboxSpec, type GitGatewaySpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
 import {
   addedDirProblem,
   addedDirReal,
@@ -603,6 +603,9 @@ export class SessionSandbox {
   readonly #onWorktreeEntries: ((common: string, findings: WorktreeEntryFinding[]) => void) | undefined;
   readonly #name: () => string;
   readonly #workstreamDirs: (() => WorkstreamDirs | undefined) | undefined;
+  readonly #gitGateway: (() => GitGatewaySpec | undefined) | undefined;
+  /** The provider the last resolution chose (its id): Docker has no runtime for the gateway's launcher. */
+  #providerId: string | null = null;
   /** The fence the last resolution was made with, to see when it changed. */
   #workstreamKeyApplied = "";
 
@@ -647,8 +650,11 @@ export class SessionSandbox {
      * Undefined result = no fence.
      */
     workstreamDirs?: () => WorkstreamDirs | undefined;
+    /** The session's git gateway (docs/git-gateway-design.md): its socket, launcher and the URLs connected for it. */
+    gitGateway?: () => GitGatewaySpec | undefined;
   }) {
     this.#workstreamDirs = opts.workstreamDirs;
+    this.#gitGateway = opts.gitGateway;
     this.#onWarning = opts.onWarning;
     this.#onWorktreeEntries = opts.onWorktreeEntries;
     this.#sessionId = opts.sessionId;
@@ -933,6 +939,7 @@ export class SessionSandbox {
       return r.info;
     }
     const provider = r.provider;
+    this.#providerId = provider.id;
     const plan = r.plan;
     const config = this.config;
     const dockerSocket = r.info.dockerSocket === true;
@@ -1098,6 +1105,23 @@ export class SessionSandbox {
     return tracked;
   }
 
+  /**
+   * What the session's sandbox gets of the git gateway: the URLs connected for its owner, and, the network not on,
+   * the workspace repository's own remotes and the usual forges (git couldn't reach them anyway; the gateway says
+   * how the owner connects one). Never under Docker (no runtime there for the launcher).
+   */
+  #gatewayFor(workspace: string, network: NetworkPolicy): GitGatewaySpec | undefined {
+    if (!this.#gitGateway || this.#providerId === "docker") return undefined;
+    const g = this.#gitGateway();
+    if (!g) return undefined;
+    const urls = [...g.urls];
+    if (network.mode !== "on") {
+      urls.push(...workspaceRemoteUrls(workspace));
+      for (const host of ["github.com", "bitbucket.org", "gitlab.com"]) urls.push(`git@${host}:`, `ssh://git@${host}/`, `https://${host}/`);
+    }
+    return { ...g, urls: [...new Set(urls)] };
+  }
+
   /** How many handles are open (tests). */
   get openHandles(): number {
     return this.#handles.size;
@@ -1122,7 +1146,9 @@ export class SessionSandbox {
     const agent = new Set(this.effective().agentDirs);
     // Other workstreams' folders, as at the last resolution (a change since is a dirs change, applied between turns).
     const hiddenForWorkstream = this.#workstreamKeyApplied ? (JSON.parse(this.#workstreamKeyApplied) as WorkstreamDirs).hidden : [];
+    const gateway = this.#gatewayFor(workspace, network);
     const build = () => buildSandboxSpec({
+      ...(gateway ? { gitGateway: gateway } : {}),
       backendReadable: readable,
       sessionId: this.#sessionId,
       workspace,
@@ -1452,4 +1478,28 @@ export async function openCheckSandbox(opts: {
       rmSync(tempDir, { recursive: true, force: true });
     },
   };
+}
+
+/** The remotes' URLs in the workspace repository's own config (read, never run: git reaches them through the gateway). */
+// paths: a read of the repository's own config file
+export function workspaceRemoteUrls(workspace: string): string[] {
+  try {
+    const layout = gitLayoutOf(workspace);
+    const common = layout?.common;
+    if (!common) return [];
+    const text = readFileSync(join(common, "config"), "utf8");
+    const out: string[] = [];
+    let inRemote = false;
+    for (const raw of text.split("\n")) {
+      const line = raw.trim();
+      if (line.startsWith("[")) inRemote = /^\[remote\s+"[^"]*"\]$/.test(line);
+      else if (inRemote) {
+        const m = /^(?:url|pushurl)\s*=\s*(.+)$/i.exec(line);
+        if (m?.[1]) out.push(m[1].trim().replace(/^"(.*)"$/, "$1"));
+      }
+    }
+    return out.slice(0, 50);
+  } catch {
+    return [];
+  }
 }

@@ -175,7 +175,7 @@ import {
   type MemoryEngine,
   type MemoryMcpMount,
 } from "./memory/index.js";
-import { isElicitationTool, isPushTool, isRequestDirectoryTool, isSafeTool, isUnresolvedPathTool, roleDeniesTool } from "./providers/tool-safety.js";
+import { isElicitationTool, isRequestDirectoryTool, isSafeTool, isUnresolvedPathTool, roleDeniesTool } from "./providers/tool-safety.js";
 import type { PackActivation } from "./pipeline/index.js";
 import { McpRegistry } from "./mcp/registry.js";
 import { mcpSpecKey, SessionMcpView, type WorkdirReach } from "./mcp/session-view.js";
@@ -247,10 +247,9 @@ import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/v
 
 /** What is recorded of a call the user listed in `secrets.dropCommands`. */
 const NOT_STORED = "‹not stored›";
-import { PUSH_TOOL_FQ, REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
-import { bundleFromChild, gitBinProblem, planPush, redactCredentials, runPush, shownName, shownSetting, shownUrl, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
-import { physicalPath, within } from "./physical-path.js";
-import { GIT_BIN, gitEnv } from "./git-env.js";
+import { redactCredentials, shownName, shownUrl } from "./git-gateway/text.js";
+import type { GitGatewaySpec } from "./sandbox/policy.js";
+import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -517,10 +516,6 @@ export interface SessionCreateOptions {
   foreignStopGraceMs?: number;
   /** Override for how long `request_directory` waits for its owner's answer before it returns (tests). */
   requestDirectoryWaitMs?: number;
-  /** Tests only: the push tool's whole budget (ms). */
-  pushBudgetMs?: number;
-  /** What every other live sandboxed session's commands may write (the manager's), for the push tool's checks. */
-  otherSessionsWritable?: () => string[];
   /** Optional memory engine — when provided, episodes are chunked and stored for recall. */
   memory?: MemoryEngine;
   /** Shared in-daemon memory MCP endpoint + URL, for URL-mounting backends. */
@@ -625,6 +620,8 @@ export interface SessionCreateOptions {
   sandboxMcp?: (sessionId: string) => SandboxMcpMount | undefined;
   /** The checkouts other sessions work in (SessionManager): what an autonomous `request_directory` never touches (#448 round 13). */
   sandboxCheckouts?: (sessionId: string) => OtherCheckout[];
+  /** The session's git gateway (docs/git-gateway-design.md): what its sandbox is given; absent, none. */
+  gitGateway?: (sessionId: string) => GitGatewaySpec | undefined;
   /**
    * Pre-built codeoid_fleet MCP server (conductor sessions only). Built by
    * the SessionManager because its tools close over the manager's tenant-
@@ -1589,14 +1586,6 @@ export class Session {
   readonly #addedGitBaselines = new Map<string, { git: GitControlSnapshot; refs: Promise<string[] | null> }>();
   /** The agent's `request_directory` questions still open, by directory: a repeat request joins its answer. */
   readonly #dirRequests = new Map<string, Promise<string>>();
-  /** The push running for this session (sandbox/push.ts): one at a time. */
-  #pushing: Promise<string> | null = null;
-  /** Stops the git a push runs (its process group), at a drain or a destroy. */
-  #pushAbort: AbortController | null = null;
-  /** Tests only: the push's whole budget (ms), the owner's answer included. */
-  #pushBudgetMs: number | undefined;
-  #otherSessionsWritable: (() => string[]) | undefined;
-
   /** The pin change last said on the session (#sandboxPinRefusal): said once per change. */
   #pinSaid: string | null = null;
   /** The working directory's identity when there is no sandbox to keep it (an embedder): taken at its first use. */
@@ -1929,8 +1918,6 @@ export class Session {
     this.#sandboxMcp = opts.sandboxMcp;
     this.#sandboxCheckouts = opts.sandboxCheckouts;
     this.#requestDirectoryWaitMs = opts.requestDirectoryWaitMs;
-    this.#pushBudgetMs = opts.pushBudgetMs;
-    this.#otherSessionsWritable = opts.otherSessionsWritable;
     this.#onStatusChange = opts.onStatusChange;
     this.#workerShape = opts.workerShape;
     this.#collaborationCost = opts.collaborationCost;
@@ -1970,6 +1957,7 @@ export class Session {
         onWarning: (text) => this.#sandboxWarning(text, "sandbox.login_not_saved"),
         onWorktreeEntries: (common, findings) => this.#worktreeEntriesFound(common, findings),
         ...(this.#workstreamFence ? { workstreamDirs: () => this.#sandboxFence() } : {}),
+        ...(opts.gitGateway ? { gitGateway: () => opts.gitGateway?.(this.id) } : {}),
       });
     }
     this.#requireSandbox = opts.requireSandbox === true;
@@ -2293,13 +2281,7 @@ export class Session {
       // provider when it next builds its server list.
       blackboardMcp: () => this.#blackboardMcp,
       // The sandbox's ask for a directory to write (sandbox/request-directory.ts): decided here, every backend.
-      ...(this.#sandbox
-        ? {
-            requestDirectory: (input: RequestDirectoryInput) => this.requestDirectory(input),
-            ...(this.#sandbox.config.push?.enabled === false || this.#pushRoleDenies() ? {} : { push: (input: PushInput) => this.push(input) }),
-            sandboxMcp: () => this.#sandboxMcp?.(this.id),
-          }
-        : {}),
+      ...(this.#sandbox ? { requestDirectory: (input: RequestDirectoryInput) => this.requestDirectory(input), sandboxMcp: () => this.#sandboxMcp?.(this.id) } : {}),
       mcpRegistry: this.#mcpView ?? this.#mcpRegistry,
       mcpHub: this.#mcpHub,
       fleet: this.#fleet,
@@ -3651,7 +3633,6 @@ export class Session {
     if (sbx.resolvedFor(this.#provider.id) && sbx.info && !applyDirs) return sbx.info;
     const before = JSON.stringify(sbx.info);
     const info = await sbx.refresh(this.#provider.id);
-    this.#noteSandboxWritable();
     // Pins taken by this resolution (the workspace, a root seen first: #448 round 13) are kept with the setting.
     if (sbx.takePinsChanged()) this.#saveMetaNow();
     this.#sayDroppedDirs();
@@ -4195,324 +4176,6 @@ export class Session {
     clearTimeout(timer);
     if (first !== null) return first;
     return `No answer yet: the owner has been asked to let you write ${dir}, and the question stays open. If they say yes, it is writable from a later turn (call request_directory again to see). Carry on without it, or end this turn.`;
-  }
-
-  /**
-   * The sandbox's `push` (sandbox/push.ts): a branch of this session's
-   * repository to its remote, run by the daemon on the host with the owner's
-   * network and credentials, which the agent never sees. The plan is checked
-   * whoever asks (planPush); then guarded and interactive mode ask the owner
-   * (owner-only card, like request_directory), autonomous mode runs it (an
-   * unattended run's too: never parked). One at a time; audited.
-   */
-  async push(input: PushInput): Promise<string> {
-    if (this.#pushing) return "Refused: a push for this session is still running; wait for it, then call push again if it's needed.";
-    const run = this.#push(input).catch((err: unknown) => {
-      const why = shownName(redactCredentials(err instanceof Error ? err.message : String(err)));
-      this.#store.audit(SYSTEM_IDENTITY.sub, "session.push_refused", this.id, `push: ${why}`.slice(0, 2000));
-      const m = this.#makeMessage("info", `⬆ The agent asked to push: refused (the push couldn't be checked: ${why})`, SYSTEM_IDENTITY, undefined, undefined, { event: "sandbox.push_refused" });
-      this.#persistAndBuffer(m);
-      this.#broadcastRaw(m);
-      return `Refused: the push couldn't be checked (${why}).`;
-    });
-    this.#pushing = run;
-    try {
-      return await run;
-    } finally {
-      this.#pushing = null;
-    }
-  }
-
-  async #push(input: PushInput): Promise<string> {
-    // A capability role is held here, on every backend (Claude's auto-approved tools never reach the gate).
-    const roleDenies = this.#pushRoleDenies();
-    if (roleDenies) {
-      this.#store.audit(SYSTEM_IDENTITY.sub, "session.role_deny", this.id, `tool=${PUSH_TOOL_FQ} role=${this.#pack?.roleName}`);
-      return `Refused: role "${this.#pack?.roleName}": ${roleDenies}.`;
-    }
-    const sbx = this.#sandbox;
-    const info = sbx?.info;
-    if (!sbx || !info || info.state !== "on") {
-      return `Nothing to do: this session's commands aren't sandboxed (${info?.reason ?? info?.state ?? "no sandbox"}), so run \`git push\` yourself.`;
-    }
-    if (this.#draining || this.#destroyed) return "Refused: the session is closing; nothing new is pushed now.";
-    const cfg = sbx.config.push;
-    if (cfg?.enabled === false) return "Refused: pushing for agents is turned off here (sandbox.push.enabled). Ask the owner to push.";
-    // Stopped by a drain or a destroy at any point: the remote lookup, the owner's card, the push.
-    const abort = new AbortController();
-    this.#pushAbort = abort;
-    try {
-      return await this.#decidePush(input, sbx, abort.signal);
-    } finally {
-      if (this.#pushAbort === abort) this.#pushAbort = null;
-    }
-  }
-
-  async #decidePush(input: PushInput, sbx: SessionSandbox, signal: AbortSignal): Promise<string> {
-    const cfg = sbx.config.push;
-    // Everything below, the owner's answer included, ends before the backend gives up on the call (its MCP
-    // client's timeout: opencode's about a minute, the Gemini CLI's and Qwen's ten): a push nobody waits for
-    // never runs, and a late yes finds the card already closed. The push itself keeps time of its own.
-    const opencode = this.#provider.id === "opencode";
-    const budgetMs = this.#pushBudgetMs ?? (opencode ? 50_000 : 8 * 60_000);
-    const reserveMs = Math.min(opencode ? 12_000 : 90_000, Math.floor(budgetMs / 2));
-    const deadline = Date.now() + budgetMs;
-    const left = () => Math.max(0, deadline - Date.now());
-    const what = `${input.branch ? shownName(input.branch) : "the checked-out branch"} to ${input.remote ?? "origin"}`;
-    const auditedReason = input.reason ? shownName(input.reason.replace(/\r\n?|[\n\u0085\u2028\u2029]/g, " ⏎ ")) : "";
-    this.#store.audit(SYSTEM_IDENTITY.sub, "session.push_request", this.id, `${what}${auditedReason ? ` reason=${auditedReason}` : ""}`.slice(0, 2000));
-    const note = (text: string, event: string, extra: Record<string, unknown> = {}) => {
-      const m = this.#makeMessage("info", text, SYSTEM_IDENTITY, undefined, undefined, { event, ...extra });
-      this.#persistAndBuffer(m);
-      this.#broadcastRaw(m);
-    };
-    const refuse = (raw: string): string => {
-      // A reason may name your config's keys and values: never a credential in what the agent, transcript or audit reads.
-      const why = shownName(redactCredentials(raw));
-      this.#store.audit(SYSTEM_IDENTITY.sub, "session.push_refused", this.id, `${what}: ${why}`.slice(0, 2000));
-      note(`⬆ The agent asked to push ${what}: refused (${why})`, "sandbox.push_refused");
-      return `Refused: ${why}.`;
-    };
-    const closing = () => signal.aborted || this.#draining || this.#destroyed;
-    const spec = sbx.runtime?.spec;
-    if (!spec) return refuse("this session's sandbox isn't running for its backend");
-    // Before any git runs for the push: the daemon's git must be one no session's commands could have replaced.
-    const gitBin = this.#sandboxGitBin(sbx);
-    if ("error" in gitBin) return refuse(gitBin.error);
-    const planOpts = {
-      protectedBranches: cfg?.protectedBranches ?? ["main", "master"],
-      heldReadOnly: spec.readOnly ?? [],
-      // What this session's commands may write, and every other sandboxed session's: a file there decides nothing.
-      agentWritable: [spec.workspace, spec.tempDir, ...spec.writable, ...sbx.worktreeFolders(), ...(this.#otherSessionsWritable?.() ?? [])],
-      signal,
-      // The branch and its commit as the sandbox sees them: a ref the agent linked into a hidden path names nothing.
-      refGit: (repo: string, args: string[]) => this.#sandboxGitQuery(sbx, repo, args, signal),
-    };
-    const plan = await planPush(this.sandboxWorkspace, input, planOpts).catch((err: unknown) => ({
-      refused: `the repository couldn't be read (${err instanceof Error ? err.message : String(err)})`,
-    }));
-    if (closing()) return refuse("the session closed while the push was being checked");
-    if ("refused" in plan) return refuse(plan.refused);
-    // Where a push may go is the owner's to say, once per repository and remote: the URL, and what the repository's
-    // own config says that decides a push, exactly as they trusted it (sandbox/push.ts trustMatches). Nothing on
-    // disk an agent could have made or changed stands in for that.
-    const trusted = trustMatches(this.#store.pushTrust(this.createdBy, plan.common, plan.remote), plan);
-    if (this.#mode === "autonomous") {
-      if (!trusted) {
-        return refuse(
-          `the owner hasn't trusted agent pushes from this repository to ${plan.shownUrl} (or something that decides the push changed since): they can, with \`codeoid sandbox trust-push ${plan.repo}${plan.remote === "origin" ? "" : ` --remote ${plan.remote}`}\`, or by approving a push in guarded mode — or push it themselves`,
-        );
-      }
-    }
-    const rewritten = plan.configuredUrl ? ` (the remote's config says ${shownUrl(plan.configuredUrl)}; a URL rewrite in your git config sends it here)` : "";
-    const described = `${plan.branch} (commit ${plan.sha.slice(0, 12)}) to ${plan.remote} — ${plan.shownUrl}${rewritten}`;
-    let by = SYSTEM_IDENTITY.sub;
-    if (this.#mode !== "autonomous") {
-      let answeredBy: string | undefined;
-      // Every line of it quoted (any line break a frontend may render), nothing invisible or reordering in it.
-      const reason = input.reason
-        ? `\n\nThe agent's reason, in its own words:\n${input.reason
-            .split(/\r\n?|[\n\u0085\u2028\u2029]/)
-            .map((l) => `> ${shownName(l)}`)
-            .join("\n")}`
-        : "";
-      const unknown = `\n\nThe remote's default branch is asked after you answer (a push there is refused); if it can't be asked, the push goes ahead.`;
-      const PUSH = "Push";
-      const TRUST = `Push, and trust ${plan.shownUrl} for this repository's agent pushes (autonomous mode too)`;
-      const NO = "Don't push";
-      const yours = plan.userSettings.length > 0 ? `\n\nYour git config also decides this push:\n${plan.userSettings.map((x) => `- ${shownSetting(x)}`).join("\n")}` : "";
-      const firstTime = trusted
-        ? ""
-        : `\n\nYou haven't trusted agent pushes from this repository to this URL yet. A trust lets autonomous agents push here without asking: a pushed branch runs the repository's CI as that branch defines it (a workflow the agent wrote included), with the CI's secrets.`;
-      const answer = await this.requestUserInput(
-        {
-          method: "select",
-          options: trusted ? [PUSH, NO] : [PUSH, TRUST, NO],
-          title: `The agent asks to push ${plan.branch}`,
-          message: `"${this.name}" asks codeoid to push ${described}, with your credentials. Only this branch, as this commit; no force, no tags.${firstTime}${yours}${unknown}${reason}`,
-          // Closed with time left for the push itself.
-          timeoutMs: Math.max(1_000, left() - reserveMs),
-          signal,
-        },
-        {
-          ownerOnly: true,
-          onAnswer: (sub) => {
-            answeredBy = sub;
-          },
-        },
-      );
-      const chose = answer.value;
-      if (answer.cancelled || (chose !== PUSH && chose !== TRUST)) {
-        const why =
-          answer.reason === "unattended"
-            ? "nobody is there to approve it in this unattended run; the owner can push it"
-            : answer.reason === "timeout"
-              ? "the owner didn't answer in time; the question is closed (call push again to ask again)"
-              : closing()
-                ? "the session closed before the owner answered"
-                : answer.cancelled
-                  ? `the question was withdrawn (${answer.reason ?? "cancelled"})`
-                  : "the owner declined";
-        this.#store.audit(answeredBy ?? SYSTEM_IDENTITY.sub, "session.push_denied", this.id, `${plan.branch} ${answer.reason ?? "declined"}`);
-        return refuse(why);
-      }
-      // The branch may have moved while the owner read the card: what is pushed is what they approved.
-      const again = await planPush(this.sandboxWorkspace, { ...input, branch: plan.branch }, { ...planOpts, remoteDefault: undefined }).catch(() => null);
-      if (!again || "refused" in again) return refuse(again && "refused" in again ? again.refused : "the repository couldn't be read again");
-      if (again.sha !== plan.sha || again.url !== plan.url || !trustMatches({ ...plan }, again)) {
-        return refuse(`${plan.branch}, its remote or the settings deciding the push changed after you were asked (now ${again.sha.slice(0, 12)}): ask again`);
-      }
-      by = answeredBy ?? this.createdBy;
-      if (chose === TRUST) {
-        this.#store.setPushTrust(this.createdBy, { common: plan.common, remote: plan.remote, url: plan.url, repoSettings: plan.repoSettings, userSettings: plan.userSettings }, by);
-        this.#store.audit(by, "session.push_trusted", this.id, `${plan.common} ${plan.remote} ${plan.shownUrl}`);
-      }
-    }
-    if (closing()) return refuse("the session closed before the push started");
-    return this.#runPush(plan, by, note, left(), signal, sbx);
-  }
-
-  async #runPush(
-    plan: PushPlan,
-    by: string,
-    note: (text: string, event: string, extra?: Record<string, unknown>) => void,
-    leftMs: number,
-    signal: AbortSignal,
-    sbx: SessionSandbox,
-  ): Promise<string> {
-    const r = await runPush(plan, {
-      timeoutMs: Math.max(5_000, Math.min(120_000, leftMs)),
-      signal,
-      // The daemon's own dir, which no session's sandbox shows.
-      stagingRoot: join(getConfigDir(), "push-staging"),
-      makeBundle: (repo, ref, dest) => this.#bundleInSandbox(sbx, repo, ref, dest, Math.max(1_000, Math.min(120_000, leftMs) / 2), signal),
-      // The default branch is asked only now: after the owner's trust or answer, so nobody untrusted is contacted.
-      checkDefault: this.#mode === "autonomous" ? "refuse-unknown" : "allow-unknown",
-      // The push runs on the host: no program from what a session may write (its PATH, ssh, credential helpers).
-      hostWritable: this.#pushHostWritable(sbx),
-    });
-    const summary = redactCredentials(r.summary);
-    const detail = `${plan.branch} ${plan.sha} -> ${plan.shownUrl} refs/heads/${plan.branch}: ${summary}`;
-    if (r.refused) {
-      const why = summary.replace(/^refused: /, "");
-      this.#store.audit(by, "session.push_refused", this.id, detail.slice(0, 2000));
-      note(`⬆ The agent asked to push ${plan.branch} to ${plan.remote}: refused (${why})`, "sandbox.push_refused", { branch: plan.branch });
-      return `Refused: ${why}.`;
-    }
-    this.#store.audit(by, r.ok ? "session.push_done" : "session.push_failed", this.id, detail.slice(0, 2000));
-    note(`⬆ ${r.ok ? "Pushed" : "Push failed"}: ${plan.branch} → ${plan.remote} (${plan.shownUrl}) — ${summary}`, r.ok ? "sandbox.pushed" : "sandbox.push_failed", {
-      branch: plan.branch,
-      sha: plan.sha,
-    });
-    return `${r.ok ? "Done" : "Failed"}: ${summary}.${r.output ? `\n\ngit said:\n${r.output}` : ""}`;
-  }
-
-  /** What this session's sandboxed commands may write (none when it isn't sandboxed or not running). */
-  get sandboxAgentWritable(): string[] {
-    // From the setting, never by building a spec (that has effects of its own, and can throw).
-    try {
-      if (!this.#sandbox) return [];
-      return [this.sandboxWorkspace, ...this.sandboxAddedDirs(), ...this.sandboxWorktreeFolders()];
-    } catch {
-      return [this.workdir];
-    }
-  }
-
-  /** Whether this session's agent is offered `push`: its sandbox on, pushing not turned off, and its role allowing it. */
-  get pushOffered(): boolean {
-    const sbx = this.#sandbox;
-    return !!sbx && sbx.info?.state === "on" && sbx.config.push?.enabled !== false && !this.#pushRoleDenies();
-  }
-
-  /** Why this session's capability role doesn't allow a push, or null. */
-  #pushRoleDenies(): string | null {
-    return this.#pack?.role ? roleDeniesTool(this.#pack.role, PUSH_TOOL_FQ) : null;
-  }
-
-  /** Keep, for good, what this session's sandboxed commands may write now (a host-run push never takes from there). */
-  #noteSandboxWritable(): void {
-    const sbx = this.#sandbox;
-    if (!sbx || sbx.info?.state !== "on") return;
-    try {
-      const spec = sbx.runtime?.spec;
-      // Roots, not the daemon's own private dirs (each session's temp dir there is new, and nothing is run from it).
-      const own = getConfigDir();
-      const paths = [...this.sandboxAgentWritable, ...(spec ? [spec.workspace, ...spec.writable] : [])].filter((p) => !within(own, p) && p !== spec?.tempDir);
-      const real = paths.flatMap((p) => {
-        try {
-          return [physicalPath(p)];
-        } catch {
-          return [];
-        }
-      });
-      this.#store.noteSandboxWritable?.([...paths, ...real]);
-    } catch {
-      /* best effort: the live list still counts */
-    }
-  }
-
-  /**
-   * `git bundle create` of `ref`, run inside this session's sandbox (no network), its stdout streamed into `dest`
-   * (the daemon's own file): there a link the agent made into a path the sandbox hides leads nowhere, so the bundle
-   * holds only what its own commands could read.
-   */
-  async #bundleInSandbox(sbx: SessionSandbox, repo: string, ref: string, dest: string, timeoutMs: number, signal: AbortSignal): Promise<string | null> {
-    const rt = sbx.runtime;
-    if (!rt) return "the sandbox isn't running";
-    let handle: Awaited<ReturnType<typeof rt.open>> | null = null;
-    try {
-      handle = await rt.open([]);
-      if (signal.aborted) return "the session is closing";
-      const git = this.#sandboxGitBin(sbx);
-      if ("error" in git) return git.error;
-      const child = handle.spawn(git.bin, ["-c", "core.fsmonitor=false", "-C", repo, "bundle", "create", "-q", "-", ref], { cwd: repo, env: git.env }); // paths: run inside the session's sandbox (its handle), in its own workspace
-      return await bundleFromChild(child, dest, { timeoutMs, signal });
-    } catch (err) {
-      return err instanceof Error ? err.message : String(err);
-    } finally {
-      await handle?.close().catch(() => {});
-    }
-  }
-
-  /**
-   * The git the push runs inside the sandbox: the daemon's own, by absolute path, with a PATH of its dir and the
-   * system's alone, never a `git` the agent's commands could put first on a PATH, nor one in what they may write.
-   */
-  #sandboxGitBin(sbx: SessionSandbox): { bin: string; env: Record<string, string> } | { error: string } {
-    const problem = gitBinProblem(GIT_BIN, this.#pushHostWritable(sbx));
-    if (problem) return { error: problem };
-    return { bin: GIT_BIN, env: gitEnv({ LANG: "C", PATH: [dirname(GIT_BIN), "/usr/bin", "/bin"].join(":") }) };
-  }
-
-  /** Everything this session's and every other sandboxed session's commands may write: no program the push runs is there. */
-  #pushHostWritable(sbx: SessionSandbox): string[] {
-    const spec = sbx.runtime?.spec;
-    return [...this.sandboxAgentWritable, sbx.tempDirPath ?? "", ...(spec ? [spec.workspace, spec.tempDir, ...spec.writable] : []), ...(this.#otherSessionsWritable?.() ?? [])].filter(Boolean);
-  }
-
-  /** A read-only git query inside this session's sandbox ({@link RefGit}: null when git said no, thrown when it couldn't run). */
-  async #sandboxGitQuery(sbx: SessionSandbox, repo: string, args: string[], signal: AbortSignal): Promise<string | null> {
-    const rt = sbx.runtime;
-    if (!rt) throw new Error("the sandbox isn't running");
-    const git = this.#sandboxGitBin(sbx);
-    if ("error" in git) throw new Error(git.error);
-    if (signal.aborted) throw new Error("the session is closing");
-    let handle: Awaited<ReturnType<typeof rt.open>> | null = null;
-    try {
-      handle = await rt.open([]);
-      const r = await handle.exec([git.bin, "-c", "core.fsmonitor=false", "-C", repo, ...args], { cwd: repo, env: { ...git.env, GIT_OPTIONAL_LOCKS: "0" }, timeoutMs: 20_000 }); // paths: run inside the session's sandbox (its handle), in its own workspace
-      if (r.exitCode === 0) return r.stdout;
-      // `-q` queries exit 1 for "no such ref" and "not a symbolic ref"; anything else is git not running right.
-      if (r.exitCode === 1) return null;
-      throw new Error(r.stderr.trim().split("\n").slice(-1)[0]?.slice(0, 200) || `git exited ${r.exitCode ?? r.signal}`);
-    } finally {
-      await handle?.close().catch(() => {});
-    }
-  }
-
-  /** Stop a push in flight (the daemon stopping, the session destroyed): its process group is killed, and the result audited. */
-  #stopPush(): void {
-    this.#pushAbort?.abort();
   }
 
   /**
@@ -5309,7 +4972,6 @@ export class Session {
    */
   beginDrain(): void {
     this.#draining = true;
-    this.#stopPush();
     if (this.#backgroundWakeFallback) {
       clearTimeout(this.#backgroundWakeFallback);
       this.#backgroundWakeFallback = null;
@@ -7032,7 +6694,6 @@ export class Session {
   }
 
   async destroy(sender: AuthContext, opts: { deleteBranch?: boolean } = {}): Promise<void> {
-    this.#stopPush();
     // Said to whoever is attached (and audited) before the session goes;
     // the commit look's git is bounded, and a destroy waits no longer.
     await Promise.race([this.#checkGitControl(sender.sub), new Promise<void>((r) => setTimeout(r, DESTROY_COMMIT_CHECK_MS).unref?.())]);
@@ -9591,12 +9252,116 @@ export class Session {
     if (added.length > 0) lines.push(`Besides the workspace, they can write ${added.map((d) => `${d}/`).join(", ")} (git structure and project settings there read-only, as in the workspace).`);
     if (this.#requestDirectoryMounted()) lines.push("To write in another directory, call the `request_directory` tool (path, reason). What it grants is writable from your next turn.");
     else lines.push("To write in another directory, ask the owner to add it (`/sandbox add <dir>`).");
-    lines.push(
-      this.#requestDirectoryMounted() && sbx.config.push?.enabled !== false && !this.#pushRoleDenies()
-        ? "Your commands can't `git push` (no network to the git host, no credentials). Commit, then call the `push` tool (branch, remote): codeoid pushes for you with the owner's credentials."
-        : "Your commands can't `git push` (no network to the git host, no credentials): commit, and ask the owner to push.",
-    );
+    if (sbx.runtime?.spec.gatewaySockets?.length && !this.gitAccessProblem("git-receive-pack")) {
+      lines.push(
+        "`git fetch` and `git push` work for remotes the owner connected: codeoid reaches them for you with the owner's credentials (you never see them). Commit, then push a branch of your own; pushes to main, master or the remote's default branch, force pushes, deletes and tags are refused, and the owner may be asked first.",
+      );
+    }
     return lines.join("\n");
+  }
+
+  /**
+   * Why this session's agent may not use `service` through the git gateway, or null: its sandbox must be on, and a
+   * capability role must allow the network (a push: the network and writes).
+   */
+  gitAccessProblem(service: "git-upload-pack" | "git-receive-pack"): string | null {
+    const sbx = this.#sandbox;
+    if (!sbx || sbx.info?.state !== "on") return "this session's commands aren't sandboxed";
+    if (this.#destroyed || this.#draining) return "the session is closing";
+    const push = service === "git-receive-pack";
+    if (push && sbx.config.push?.enabled === false) return "pushing for agents is turned off here (sandbox.push.enabled): ask the owner to push";
+    const role = this.#pack?.role;
+    if (role && role.network !== true && (push || role.network === false)) {
+      return `role "${this.#pack?.roleName}" doesn't allow ${push ? "pushing" : "fetching"} (network: ${String(role.network)})`;
+    }
+    if (role && push && role.write === false) return `role "${this.#pack?.roleName}" is read-only (write: false): it doesn't push`;
+    return null;
+  }
+
+  /** The protected branches this session's pushes never reach (`sandbox.push.protectedBranches`). */
+  get gitProtectedBranches(): readonly string[] {
+    return this.#sandbox?.config.push?.protectedBranches ?? ["main", "master"];
+  }
+
+  /** What this session's sandboxed commands may write (none when it isn't sandboxed). */
+  get sandboxAgentWritable(): string[] {
+    try {
+      if (!this.#sandbox) return [];
+      return [this.sandboxWorkspace, ...this.sandboxAddedDirs(), ...this.sandboxWorktreeFolders(), ...(this.#sandbox.tempDirPath ? [this.#sandbox.tempDirPath] : [])];
+    } catch {
+      return [this.workdir];
+    }
+  }
+
+  /**
+   * A remote this session's agent reached for that its owner hasn't connected: in guarded and interactive mode the
+   * owner is asked (a card), in autonomous mode never. Resolves with who said yes, or null.
+   */
+  async askToConnectGit(url: string, how: string): Promise<string | null> {
+    if (this.#mode === "autonomous") return null;
+    let answeredBy: string | undefined;
+    const answer = await this.requestUserInput(
+      {
+        method: "confirm",
+        title: `The agent's git reached for ${shownUrl(url)}`,
+        message: `"${this.name}" ran git against ${shownUrl(url)}, which you haven't connected for agents.\n\nConnect it? Agents in your sandboxed sessions could then fetch from it, and push to branches of their own (never main, master or its default branch, never a force push, a delete or a tag), with ${how}. Your credential stays with codeoid; the agent never sees it. A pushed branch runs the repository's CI as that branch defines it, with its secrets.`,
+        timeoutMs: 100_000,
+      },
+      {
+        ownerOnly: true,
+        onAnswer: (sub) => {
+          answeredBy = sub;
+        },
+      },
+    );
+    if (answer.cancelled || answer.confirmed !== true) return null;
+    return answeredBy ?? this.createdBy;
+  }
+
+  /**
+   * The session's word on a push the gateway checked: autonomous mode pushes; guarded and interactive ask the owner
+   * (a card naming the branches, commits and URL), with an answer before the agent's git gives up waiting.
+   */
+  async decideGitPush(push: { url: string; updates: ReadonlyArray<{ old: string; new: string; ref: string }> }): Promise<{ ok: true } | { refused: string }> {
+    const what = push.updates.map((u) => `${shownName(u.ref.replace(/^refs\/heads\//, ""))} (${u.new.slice(0, 12)})`).join(", ");
+    this.#store.audit(SYSTEM_IDENTITY.sub, "session.git_push_request", this.id, `${what} -> ${shownUrl(push.url)}`.slice(0, 2000));
+    const problem = this.gitAccessProblem("git-receive-pack");
+    if (problem) return { refused: problem };
+    if (this.#mode === "autonomous") return { ok: true };
+    let answeredBy: string | undefined;
+    const answer = await this.requestUserInput(
+      {
+        method: "confirm",
+        title: `The agent pushes ${push.updates.length === 1 ? shownName(push.updates[0]?.ref.replace(/^refs\/heads\//, "") ?? "") : `${push.updates.length} branches`}`,
+        message: `"${this.name}" pushes ${what} to ${shownUrl(push.url)} with your credentials. No force, no delete, no tags; checked already.\n\nThe branch runs the repository's CI as it defines it, with its secrets.`,
+        timeoutMs: 100_000,
+      },
+      {
+        ownerOnly: true,
+        onAnswer: (sub) => {
+          answeredBy = sub;
+        },
+      },
+    );
+    if (answer.cancelled || answer.confirmed !== true) {
+      const why = answer.reason === "unattended" ? "nobody is there to approve it in this unattended run" : answer.cancelled ? `the owner didn't answer (${answer.reason ?? "closed"})` : "the owner declined";
+      this.#store.audit(answeredBy ?? SYSTEM_IDENTITY.sub, "session.git_push_denied", this.id, `${what}: ${why}`.slice(0, 2000));
+      return { refused: why };
+    }
+    this.#store.audit(answeredBy ?? this.createdBy, "session.git_push_approved", this.id, what.slice(0, 2000));
+    return { ok: true };
+  }
+
+  /** What the git gateway did for this session: audited, and a push (or a refusal) said in the transcript. */
+  noteGit(e: { kind: "fetch" | "push"; url: string; ok: boolean; detail: string; updates?: ReadonlyArray<{ new: string; ref: string }> }): void {
+    const detail = shownName(redactCredentials(e.detail));
+    this.#store.audit(SYSTEM_IDENTITY.sub, `session.git_${e.kind}_${e.ok ? "done" : "refused"}`, this.id, `${shownUrl(e.url)}: ${detail}`.slice(0, 2000));
+    if (e.kind === "fetch" && e.ok) return;
+    const branches = (e.updates ?? []).map((u) => shownName(u.ref.replace(/^refs\/heads\//, ""))).join(", ");
+    const text = e.ok ? `⬆ Pushed ${branches} → ${shownUrl(e.url)}` : `⬆ The agent's git ${e.kind} to ${shownUrl(e.url)}${branches ? ` (${branches})` : ""}: refused (${detail})`;
+    const m = this.#makeMessage("info", text, SYSTEM_IDENTITY, undefined, undefined, { event: e.ok ? "sandbox.git_pushed" : "sandbox.git_refused" });
+    this.#persistAndBuffer(m);
+    this.#broadcastRaw(m);
   }
 
   /** Whether this session's backend has the sandbox's `request_directory` (sandbox/request-directory.ts). */
@@ -9722,8 +9487,8 @@ export class Session {
     // resolve for certain is never run unasked (tool-safety.ts).
     if (isUnresolvedPathTool(toolName)) return false;
 
-    // An ask itself (sandbox/request-directory.ts, sandbox/push.ts): the session decides it, so it never waits on a card first.
-    if (isRequestDirectoryTool(toolName) || isPushTool(toolName)) return true;
+    // An ask itself (sandbox/request-directory.ts): the session decides it, so it never waits on a card first.
+    if (isRequestDirectoryTool(toolName)) return true;
 
     if (this.#mode === "interactive") return false;
 
@@ -9796,7 +9561,7 @@ export class Session {
     if (isFleetSendTool(toolName)) return false;
     if (isElicitationTool(toolName)) return false;
     if (isUnresolvedPathTool(toolName)) return false;
-    if (isRequestDirectoryTool(toolName) || isPushTool(toolName)) return true;
+    if (isRequestDirectoryTool(toolName)) return true;
     if (this.#mode === "interactive") return false;
     if (isSafeTool(toolName)) return true;
     if (this.#isReadonlyMcpTool(toolName)) return true;

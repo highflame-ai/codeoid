@@ -47,7 +47,6 @@ import { AccountError, type AccountStore, type ResolvedAccount } from "../accoun
 import { type EndpointCatalog, syncEndpointProviders } from "./endpoint/index.js";
 import { registerSecretPaths } from "../secret-paths.js";
 import type { RequestDirectoryInput, SandboxMcpMount } from "../sandbox/request-directory.js";
-import type { PushInput } from "../sandbox/push.js";
 import type { SandboxRuntime } from "../sandbox/session-sandbox.js";
 
 /**
@@ -80,9 +79,7 @@ export interface ProviderSessionInit {
    * or a bridge (pi) serve it from this; present when the daemon sandboxes.
    */
   requestDirectory?: (input: RequestDirectoryInput) => Promise<string>;
-  /** The sandbox's `push` (sandbox/push.ts), served beside it the same ways: decided by the session. */
-  push?: (input: PushInput) => Promise<string>;
-  /** The same tools over the daemon's `/mcp/sandbox`, for the backends that mount a URL (Codex, the Gemini CLI, opencode). */
+  /** The same tool over the daemon's `/mcp/sandbox`, for the backends that mount a URL (Codex, the Gemini CLI, opencode). */
   sandboxMcp?: () => SandboxMcpMount | undefined;
   /** Cross-backend MCP registry — the servers to mount on this session's backend. */
   mcpRegistry?: McpServerView;
@@ -470,7 +467,6 @@ export function createDefaultProviderRegistry(
         loop: init.loop,
         blackboardMcp: init.blackboardMcp,
         requestDirectory: init.requestDirectory,
-        push: init.push,
         mcpRegistry: init.mcpRegistry,
         mcpHub: init.mcpHub,
         config: init.config,
@@ -553,7 +549,6 @@ export function createDefaultProviderRegistry(
             extraEnv: init.extraEnv,
             sandbox: init.sandbox,
             requestDirectory: init.requestDirectory,
-        push: init.push,
           }),
       });
     } else {
@@ -663,7 +658,6 @@ export function createDefaultProviderRegistry(
           extraEnv: init.extraEnv,
           sandbox: init.sandbox,
           requestDirectory: init.requestDirectory,
-        push: init.push,
         }),
     });
   }

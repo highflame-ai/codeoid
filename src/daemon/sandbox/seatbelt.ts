@@ -145,7 +145,7 @@ export function seatbeltProfile(
   // Container runtime sockets the owner let in (spec.dockerSockets), last, so they win over the rules above: the file
   // (by its own path and where it leads: Docker Desktop's `/var/run/docker.sock` links into the home), read and
   // written as a socket is, never removed or replaced, and a connection to it, the network off or not.
-  for (const s of spec.dockerSockets ?? []) {
+  for (const s of [...(spec.dockerSockets ?? []), ...(spec.gatewaySockets ?? [])]) {
     for (const p of new Set([s, real(s)])) {
       lines.push(`(allow file-read* file-write-data (literal ${param(p)}))`);
       lines.push(`(allow network-outbound (remote unix-socket (path-literal ${param(p)})))`);

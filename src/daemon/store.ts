@@ -362,8 +362,6 @@ export class Store {
     // directly (audit, future admin surfaces) rather than only via meta.
     this.#addColumnIfMissing("sessions", "collaboration", "TEXT");
 
-    // The history of what sandboxed sessions could write began with it: what came before is seeded once, below.
-    const hadWritableHistory = !!this.#db.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'sandbox_writable'").get();
     this.#db.exec(`
 
       CREATE TABLE IF NOT EXISTS audit_log (
@@ -386,27 +384,16 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_log(session_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id, project_id);
 
-      -- An owner's trust in a repository's remote for the sandbox's push tool (sandbox/push.ts): the
-      -- repository (its git dir), the remote, its URL and what the repository's own config says that decides
-      -- a push. An autonomous push goes only where this matches exactly. Not session-scoped.
-      -- One owner's: it decides only that owner's sessions' pushes (a shared daemon's other users trust their own).
-      -- Every directory a sandboxed session's commands could write, ever (sandbox/push.ts): what an agent left
-      -- there outlives its session, so a host-run push never takes a program or a config file from one.
-      CREATE TABLE IF NOT EXISTS sandbox_writable (
-        path       TEXT PRIMARY KEY,
-        first_seen INTEGER NOT NULL
-      );
-
-      CREATE TABLE IF NOT EXISTS push_trust (
-        owner         TEXT NOT NULL,
-        common        TEXT NOT NULL,
-        remote        TEXT NOT NULL,
-        url           TEXT NOT NULL,
-        repo_settings TEXT NOT NULL,
-        user_settings TEXT NOT NULL,
-        trusted_by    TEXT NOT NULL,
-        trusted_at    INTEGER NOT NULL,
-        PRIMARY KEY (owner, common, remote)
+      -- Remotes an owner connected for the git gateway (git-gateway/connect.ts): their sandboxed sessions' agents
+      -- may fetch and push there with the owner's credential. One owner's: it decides only that owner's sessions.
+      CREATE TABLE IF NOT EXISTS git_connections (
+        owner        TEXT NOT NULL,
+        url          TEXT NOT NULL,
+        kind         TEXT NOT NULL,
+        auth         TEXT NOT NULL,
+        connected_by TEXT NOT NULL,
+        connected_at INTEGER NOT NULL,
+        PRIMARY KEY (owner, url)
       );
 
       CREATE TABLE IF NOT EXISTS session_pins (
@@ -638,8 +625,6 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_compare_runs_parent
         ON compare_runs(account_id, project_id, parent_session_id);
     `);
-    // Every session's workdir from before (sandboxed or not, which the table doesn't say): fail closed.
-    if (!hadWritableHistory) this.#db.exec("INSERT OR IGNORE INTO sandbox_writable (path, first_seen) SELECT DISTINCT workdir, 0 FROM sessions");
 
     // Per-child backend selection on spawn tasks. Additive so a database
     // written before collaborative sessions keeps its queued tasks: NULL on
@@ -2329,67 +2314,34 @@ export class Store {
     return rows.map(compareRowFrom);
   }
 
-  /** Trust (replace) a repository's remote for one owner's agents' pushes (sandbox/push.ts). */
-  setPushTrust(owner: string, t: { common: string; remote: string; url: string; repoSettings: string[]; userSettings: string[] }, by: string): void {
+  /** Connect (replace) a remote for one owner's agents (the git gateway). */
+  setGitConnection(c: { owner: string; url: string; kind: string; auth: string; connectedBy: string }): void {
     this.#db
-      .prepare("INSERT OR REPLACE INTO push_trust (owner, common, remote, url, repo_settings, user_settings, trusted_by, trusted_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-      .run(owner, t.common, t.remote, t.url, JSON.stringify(t.repoSettings), JSON.stringify(t.userSettings), by, Date.now());
+      .prepare("INSERT OR REPLACE INTO git_connections (owner, url, kind, auth, connected_by, connected_at) VALUES (?, ?, ?, ?, ?, ?)")
+      .run(c.owner, c.url, c.kind, c.auth, c.connectedBy, Date.now());
   }
 
-  /** Take a trust back (every remote of `common` when `remote` is absent); how many went. */
-  removePushTrust(owner: string, common: string, remote?: string): number {
-    return remote === undefined
-      ? this.#db.prepare("DELETE FROM push_trust WHERE owner = ? AND common = ?").run(owner, common).changes
-      : this.#db.prepare("DELETE FROM push_trust WHERE owner = ? AND common = ? AND remote = ?").run(owner, common, remote).changes;
+  /** Disconnect; whether it was connected. */
+  removeGitConnection(owner: string, url: string): boolean {
+    return this.#db.prepare("DELETE FROM git_connections WHERE owner = ? AND url = ?").run(owner, url).changes > 0;
   }
 
-  /** One owner's trust for a repository's remote, if any (a malformed row is none). */
-  /** Note directories a sandboxed session's commands may write (kept for good). */
-  noteSandboxWritable(paths: readonly string[]): void {
-    const stmt = this.#db.prepare("INSERT OR IGNORE INTO sandbox_writable (path, first_seen) VALUES (?, ?)");
-    const now = Date.now();
-    for (const p of new Set(paths.filter(Boolean))) stmt.run(p, now);
+  /** One owner's connection for a URL, if any. */
+  gitConnection(owner: string, url: string): { owner: string; url: string; kind: "ssh" | "https"; auth: "ssh" | "git-credential" | "token"; connectedBy: string; connectedAt: number } | null {
+    const row = this.#db
+      .prepare("SELECT owner, url, kind, auth, connected_by AS connectedBy, connected_at AS connectedAt FROM git_connections WHERE owner = ? AND url = ?")
+      .get(owner, url) as { owner: string; url: string; kind: string; auth: string; connectedBy: string; connectedAt: number } | null;
+    if (!row || (row.kind !== "ssh" && row.kind !== "https") || !["ssh", "git-credential", "token"].includes(row.auth)) return null;
+    return row as ReturnType<Store["gitConnection"]> & object;
   }
 
-  /** Forget the directories within `dir` (an owner's word, after reviewing what is there); how many. */
-  forgetSandboxWritable(dir: string): number {
-    const rows = this.sandboxWritableHistory().filter((p) => p === dir || p.startsWith(dir.endsWith("/") ? dir : `${dir}/`));
-    const stmt = this.#db.prepare("DELETE FROM sandbox_writable WHERE path = ?");
-    for (const p of rows) stmt.run(p);
-    return rows.length;
-  }
-
-  /** Every directory a sandboxed session's commands could ever write. */
-  sandboxWritableHistory(): string[] {
-    return (this.#db.prepare("SELECT path FROM sandbox_writable").all() as Array<{ path: string }>).map((r) => r.path);
-  }
-
-  pushTrust(owner: string, common: string, remote: string): { common: string; remote: string; url: string; repoSettings: string[]; userSettings: string[] } | null {
-    const row = this.#db.prepare("SELECT common, remote, url, repo_settings, user_settings FROM push_trust WHERE owner = ? AND common = ? AND remote = ?").get(owner, common, remote) as
-      | { common: string; remote: string; url: string; repo_settings: string; user_settings: string }
-      | null;
-    if (!row) return null;
-    const list = (raw: string): string[] | null => {
-      try {
-        const v = JSON.parse(raw) as unknown;
-        return Array.isArray(v) && v.every((x) => typeof x === "string") ? (v as string[]) : null;
-      } catch {
-        return null;
-      }
-    };
-    const repoSettings = list(row.repo_settings);
-    const userSettings = list(row.user_settings);
-    if (!repoSettings || !userSettings) return null;
-    return { common: row.common, remote: row.remote, url: row.url, repoSettings, userSettings };
-  }
-
-  /** One owner's trusts, newest first. */
-  listPushTrust(owner: string): Array<{ common: string; remote: string; url: string; trustedAt: number }> {
-    return this.#db.prepare("SELECT common, remote, url, trusted_at AS trustedAt FROM push_trust WHERE owner = ? ORDER BY trusted_at DESC").all(owner) as Array<{
-      common: string;
-      remote: string;
+  /** One owner's connections, newest first. */
+  listGitConnections(owner: string): Array<{ url: string; kind: string; auth: string; connectedAt: number }> {
+    return this.#db.prepare("SELECT url, kind, auth, connected_at AS connectedAt FROM git_connections WHERE owner = ? ORDER BY connected_at DESC").all(owner) as Array<{
       url: string;
-      trustedAt: number;
+      kind: string;
+      auth: string;
+      connectedAt: number;
     }>;
   }
 

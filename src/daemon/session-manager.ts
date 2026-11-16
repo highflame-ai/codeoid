@@ -22,7 +22,6 @@ import { credentialsSchema } from "./credentials/schema.js";
 import { workstreamsSchema } from "./workstreams/schema.js";
 import { registerSecretPaths } from "./secret-paths.js";
 import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
-import { readPushTarget, redactCredentials, shownSetting, shownUrl, type PushInput } from "./sandbox/push.js";
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -158,8 +157,7 @@ import type { SandboxRegistry } from "./sandbox/registry.js";
 import { canonicalAddedDirs, effectiveSetting, openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import { checkPinned, type PinnedDir, PinnedPathError } from "./sandbox/pinned.js";
 import { sandboxRootIfMade } from "./sandbox/root.js";
-import { gitLayoutOf, hiddenPathsFor, sandboxConfigOf } from "./sandbox/policy.js";
-import { physicalPath } from "./physical-path.js";
+import { hiddenPathsFor, sandboxConfigOf } from "./sandbox/policy.js";
 import { redactCommand } from "./skill-command.js";
 import type { McpHub } from "./mcp/hub.js";
 import { mcpOAuthBindingCookieName, type McpOAuth, type McpOAuthProof, type McpTenant } from "./mcp/oauth.js";
@@ -215,7 +213,12 @@ import {
   mainWorktreeRoot,
   removeForkWorktree,
 } from "./git-worktree.js";
-import { hardenedGit } from "./git-env.js";
+import { hardenedGit, safeGit } from "./git-env.js";
+import { connectionId, GitCredentials, probeConnection } from "./git-gateway/connect.js";
+import { type GatewayHost, GitGateway } from "./git-gateway/gateway.js";
+import { redactCredentials, remoteUrlProblem, shownUrl } from "./git-gateway/text.js";
+import { systemSsh, upstreamKind } from "./git-gateway/upstream.js";
+import type { GitGatewaySpec } from "./sandbox/policy.js";
 import {
   loadSetupRecipe,
   prepareWorktree,
@@ -542,11 +545,7 @@ export class SessionManager {
    *  Always constructed: with no minted tokens every request fails closed. */
   readonly #blackboardMcp = new BlackboardMcpHttp();
   /** The sandbox's `request_directory` for the URL-mounting backends (sandbox/request-directory.ts): one token per session. */
-  readonly #sandboxMcp = new SandboxMcpHttp(
-    (sessionId, input) => this.#requestDirectoryFor(sessionId, input),
-    (sessionId, input) => this.#pushFor(sessionId, input),
-    (sessionId) => this.#sessions.get(sessionId)?.pushOffered ?? false,
-  );
+  readonly #sandboxMcp = new SandboxMcpHttp((sessionId, input) => this.#requestDirectoryFor(sessionId, input));
   #sandboxMcpUrl?: string;
   readonly #sandboxMcpTokens = new Map<string, string>();
   #blackboardUrl?: string;
@@ -1193,8 +1192,8 @@ export class SessionManager {
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
-      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
           claudeAccounts: this.#claudeAccounts,
           accounts: this.#accounts,
           claudeAccount: meta.claudeAccount ?? null,
@@ -1610,8 +1609,8 @@ mcpHub: this.#mcpHub,
         return this.#loopWorkerGuard(msg, "change the workstream of") ?? this.#sessionWorkstreamEdit(msg, auth);
       case "sandbox.providers":
         return this.#sandboxProviders(msg, auth);
-      case "sandbox.trust_push":
-        return this.#sandboxTrustPush(msg, auth);
+      case "sandbox.git_connect":
+        return this.#sandboxGitConnect(msg, auth);
       case "session.pin":
         return this.#pin(msg, auth);
       case "session.unpin":
@@ -2074,8 +2073,8 @@ mcpHub: this.#mcpHub,
               providers: this.#providers,
               sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
-      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
               claudeAccounts: this.#claudeAccounts,
               hooks: this.#hooks,
               ...(this.#identityManager
@@ -4620,10 +4619,6 @@ mcpHub: this.#mcpHub,
   }
 
   /** A session's `/mcp/sandbox` mount: its own token, minted once. None without a sandbox or the endpoint. */
-  /** What every live sandboxed session's commands may write (sandbox/push.ts: a file there never decides a push). */
-  /** What any sandboxed session's commands may write now, or ever could (what an agent left there outlives it). */
-  readonly #allSandboxWritable = (): string[] => [...[...this.#sessions.values()].flatMap((s) => s.sandboxAgentWritable), ...(this.#store.sandboxWritableHistory?.() ?? [])];
-
   readonly #sandboxMcpFor = (sessionId: string): SandboxMcpMount | undefined => {
     if (!this.#sandboxMcpUrl || !this.#sandboxRegistry) return undefined;
     let token = this.#sandboxMcpTokens.get(sessionId);
@@ -4640,6 +4635,123 @@ mcpHub: this.#mcpHub,
    * `request_directory` never touches one, the owner's card says it
    * (#448 round 13, project-roots.ts `checkoutOverlap`).
    */
+  #gateway: GitGateway | null = null;
+  #gatewayFailed = false;
+  #gitCredentials: GitCredentials | null = null;
+
+  /** The git gateway (docs/git-gateway-design.md), made on first use; none when it can't be (said once). */
+  #gitGatewayInstance(): GitGateway | null {
+    if (this.#gateway || this.#gatewayFailed) return this.#gateway;
+    try {
+      const base = join(getConfigDir(), "git-gateway");
+      this.#gitCredentials = new GitCredentials(join(base, "credentials.json"));
+      this.#gateway = new GitGateway({ base, host: this.#gitGatewayHost });
+    } catch (err) {
+      this.#gatewayFailed = true;
+      console.error(`[codeoid] git gateway unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return this.#gateway;
+  }
+
+  /** What a sandboxed session gets of the git gateway: its socket and launcher, and its owner's connected URLs. */
+  readonly #gitGatewayFor = (sessionId: string): GitGatewaySpec | undefined => {
+    const g = this.#gitGatewayInstance();
+    if (!g) return undefined;
+    const owner = this.#sessions.get(sessionId)?.createdBy ?? this.#store.getSession(sessionId)?.createdBy;
+    const urls = owner ? this.#store.listGitConnections(owner).map((c) => c.url) : [];
+    return { ...g.forSession(sessionId), urls };
+  };
+
+  /** What any live sandboxed session's commands may write: no program the gateway runs on the host is there. */
+  readonly #allSandboxWritable = (): string[] => [...this.#sessions.values()].flatMap((s) => s.sandboxAgentWritable);
+
+  /** Connect `url` for `owner`: their credential proved to reach it, then recorded (an https one kept, 0600). */
+  async #connectGit(owner: string, url: string, by: string, token?: string): Promise<{ kind: string; auth: string } | { error: string }> {
+    if (!this.#gitGatewayInstance() || !this.#gitCredentials) return { error: "the git gateway isn't available on this daemon" };
+    const probe = await probeConnection(url, { ...(token ? { token } : {}), writable: this.#allSandboxWritable() });
+    if ("error" in probe) return { error: probe.error };
+    const id = connectionId(owner, url);
+    if (probe.credential) this.#gitCredentials.set(id, probe.credential);
+    else this.#gitCredentials.remove(id);
+    this.#store.setGitConnection({ owner, url, kind: probe.kind, auth: probe.auth, connectedBy: by });
+    this.#store.audit(by, "sandbox.git_connected", undefined, `${shownUrl(url)} ${probe.kind} ${probe.auth} owner=${owner}`);
+    return { kind: probe.kind, auth: probe.auth };
+  }
+
+  /** The gateway's host: who may reach what, the session's word on a push, what happened. */
+  readonly #gitGatewayHost: GatewayHost = {
+    grant: async (sessionId, service, url) => {
+      const session = this.#sessions.get(sessionId);
+      if (!session) return { refused: "this session is gone" };
+      const problem = session.gitAccessProblem(service);
+      if (problem) return { refused: problem };
+      const owner = session.createdBy;
+      let conn = this.#store.gitConnection(owner, url);
+      if (!conn) {
+        const kind = upstreamKind(url);
+        const bad = remoteUrlProblem(url);
+        const how = `\`codeoid sandbox git connect --url ${url}\` (or from the repository: \`codeoid sandbox git connect\`)`;
+        if (!kind || bad) return { refused: `${shownUrl(url)} can't be reached for agents${bad ? `: ${bad}` : ""}` };
+        const yes = await session.askToConnectGit(url, kind === "ssh" ? "your ssh key" : "your git credential for it");
+        if (!yes) return { refused: `${shownUrl(url)} isn't connected for agents: the owner can connect it with ${how}` };
+        const done = await this.#connectGit(owner, url, yes);
+        if ("error" in done) return { refused: done.error };
+        conn = this.#store.gitConnection(owner, url);
+        if (!conn) return { refused: "the connection wasn't recorded" };
+      }
+      const credential = conn.kind === "https" ? this.#gitCredentials?.get(connectionId(owner, url)) : undefined;
+      if (conn.kind === "https" && !credential) return { refused: `the credential for ${shownUrl(url)} is gone: the owner can connect it again` };
+      let ssh: string | null = null;
+      if (conn.kind === "ssh") {
+        const s = systemSsh(this.#allSandboxWritable());
+        if ("problem" in s) return { refused: s.problem };
+        ssh = s.path;
+      }
+      return {
+        upstream: { url, kind: conn.kind, ...(credential ? { credential } : {}) },
+        ssh,
+        protectedBranches: session.gitProtectedBranches,
+        cacheKey: connectionId(owner, url),
+      };
+    },
+    approve: async (sessionId, push) => {
+      const session = this.#sessions.get(sessionId);
+      return session ? session.decideGitPush(push) : { refused: "this session is gone" };
+    },
+    report: (sessionId, e) => {
+      this.#sessions.get(sessionId)?.noteGit(e);
+    },
+  };
+
+  async #sandboxGitConnect(msg: Extract<ClientMessage, { type: "sandbox.git_connect" }>, auth: AuthContext): Promise<DaemonMessage> {
+    const fail = (error: string, code: "forbidden" | "invalid_request" = "invalid_request"): DaemonMessage => ({ type: "response.error", requestId: msg.id, error: redactCredentials(error), code });
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return fail("Missing scope: settings:write", "forbidden");
+    if (auth.delegationDepth > 0) return fail("A delegated token can't connect remotes for agents: the owner does.", "forbidden");
+    if (msg.action === "list") {
+      return { type: "response.ok", requestId: msg.id, data: { connections: this.#store.listGitConnections(auth.sub).map((c) => ({ ...c, url: shownUrl(c.url) })) } };
+    }
+    let url = msg.url;
+    if (!url) {
+      if (!msg.path || !isAbsolute(msg.path)) return fail("Give the remote's URL, or the repository's absolute path.");
+      const remote = msg.remote ?? "origin";
+      try {
+        url = (await safeGit(["config", "--local", "--get", `remote.${remote}.url`], msg.path, { timeoutMs: 20_000 })).trim();
+      } catch {
+        return fail(`There is no remote named ${remote} in ${msg.path}.`);
+      }
+      if (!url) return fail(`There is no remote named ${remote} in ${msg.path}.`);
+    }
+    if (msg.action === "disconnect") {
+      const removed = this.#store.removeGitConnection(auth.sub, url);
+      this.#gitCredentials?.remove(connectionId(auth.sub, url));
+      this.#store.audit(auth.sub, "sandbox.git_disconnected", undefined, `${shownUrl(url)} removed=${removed}`);
+      return { type: "response.ok", requestId: msg.id, data: { removed, url: shownUrl(url) } };
+    }
+    const done = await this.#connectGit(auth.sub, url, auth.sub, msg.token);
+    if ("error" in done) return fail(`Not connected: ${done.error}`);
+    return { type: "response.ok", requestId: msg.id, data: { url: shownUrl(url), ...done } };
+  }
+
   readonly #sandboxCheckoutsFor = (sessionId: string): OtherCheckout[] => {
     const out: OtherCheckout[] = [];
     for (const s of this.#sessions.values()) {
@@ -4660,17 +4772,6 @@ mcpHub: this.#mcpHub,
       return "Refused: this session is gone.";
     }
     return session.requestDirectory(input);
-  }
-
-  /** The sandbox's `push` for one session (sandbox/push.ts): decided by the session, as request_directory is. */
-  async #pushFor(sessionId: string, input: PushInput): Promise<string> {
-    const session = this.#sessions.get(sessionId);
-    if (!session) {
-      this.#sandboxMcp.revokeSession(sessionId);
-      this.#sandboxMcpTokens.delete(sessionId);
-      return "Refused: this session is gone.";
-    }
-    return session.push(input);
   }
 
   /** Inject the cross-backend MCP registry + daemon-owned client pool. Sessions
@@ -4748,6 +4849,8 @@ mcpHub: this.#mcpHub,
     try {
       await this.#drain(timeoutMs);
     } finally {
+      // The git gateway's sockets go with the sessions (a request in flight ends).
+      await this.#gateway?.close();
       // Last: the gate keeps refusing opencode's credential files while sessions stop.
       if (this.#ownsProviders) this.#providers.dispose();
     }
@@ -5381,8 +5484,8 @@ mcpHub: this.#mcpHub,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
-      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
       ...(sandboxSetting && Object.keys(sandboxSetting).length > 0 ? { sandbox: sandboxSetting } : {}),
       claudeAccounts: this.#claudeAccounts,
       // The Claude choice also when the session lands elsewhere: it applies if it is switched to Claude.
@@ -5451,6 +5554,7 @@ mcpHub: this.#mcpHub,
         // was attempted, and a failed spawn shouldn't refund an attempt into a
         // retry loop.
         this.#sessions.delete(session.id);
+        this.#gateway?.closeSession(session.id);
         return {
           type: "response.error",
           requestId: msg.id,
@@ -5789,8 +5893,8 @@ mcpHub: this.#mcpHub,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
-      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
           claudeAccounts: this.#claudeAccounts,
           // The collaboration runs on the accounts its lead was created on.
           claudeAccount: parent.claudeAccount,
@@ -5883,6 +5987,7 @@ mcpHub: this.#mcpHub,
       }
       this.#revokeBlackboardToken(child.id);
       this.#sessions.delete(child.id);
+      this.#gateway?.closeSession(child.id);
       this.#store.audit(
         "system:collaboration",
         "collaboration.child_destroyed",
@@ -6251,8 +6356,8 @@ mcpHub: this.#mcpHub,
         providers: this.#providers,
         sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
-      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
         claudeAccounts: this.#claudeAccounts,
         // A fork continues the same conversation — on the same accounts,
         // thinking as hard (#417).
@@ -6513,8 +6618,8 @@ mcpHub: this.#mcpHub,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
-      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
@@ -6807,8 +6912,8 @@ mcpHub: this.#mcpHub,
       providers: this.#providers,
       sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
-      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
@@ -7006,6 +7111,7 @@ mcpHub: this.#mcpHub,
       };
     } catch (e) {
       this.#sessions.delete(runSession.id);
+      this.#gateway?.closeSession(runSession.id);
       try {
         await runSession.destroy(this.#dispatchSystemAuth(auth.accountId, auth.projectId));
       } catch {
@@ -7846,8 +7952,8 @@ mcpHub: this.#mcpHub,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
-      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -7951,8 +8057,8 @@ mcpHub: this.#mcpHub,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
-      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -8050,6 +8156,7 @@ mcpHub: this.#mcpHub,
         this.#forgetComparesOf(id);
         this.#forgetCompareBranch(id);
         this.#sessions.delete(id);
+        this.#gateway?.closeSession(id);
       },
       runFinished: (e) => {
         const r = e.routine;
@@ -8262,8 +8369,8 @@ mcpHub: this.#mcpHub,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
-      otherSessionsWritable: this.#allSandboxWritable,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -8295,6 +8402,7 @@ mcpHub: this.#mcpHub,
             // Best-effort cleanup.
           }
           this.#sessions.delete(session.id);
+          this.#gateway?.closeSession(session.id);
           throw err;
         }
         return { sessionId: session.id };
@@ -8378,6 +8486,7 @@ mcpHub: this.#mcpHub,
         // Revoke before dropping, same reason as the destroy handler.
         this.#revokeBlackboardToken(sessionId);
         this.#sessions.delete(sessionId);
+        this.#gateway?.closeSession(sessionId);
       },
 
       deliverEvents: async (
@@ -9431,6 +9540,7 @@ mcpHub: this.#mcpHub,
       for (const s of created) {
         await s.destroy(auth, { deleteBranch: true }).catch(() => {});
         this.#sessions.delete(s.id);
+        this.#gateway?.closeSession(s.id);
       }
       const reason = err instanceof Error ? err.message : String(err);
       this.#store.audit(auth.sub, "session.compare.failed", parent.id, `targets=${msg.targets.map(label).join(",")} reason=${reason.slice(0, 200)}`);
@@ -10687,74 +10797,6 @@ mcpHub: this.#mcpHub,
     return reply({ pending: true, message: `asked on the session: ${what}?` });
   }
 
-  /**
-   * `sandbox.trust_push`: the owner trusts (or stops trusting) a repository's remote for agents' pushes
-   * (sandbox/push.ts). Recorded as it is now, checked the way a push checks it; settings:write, undelegated.
-   */
-  async #sandboxTrustPush(msg: Extract<ClientMessage, { type: "sandbox.trust_push" }>, auth: AuthContext): Promise<DaemonMessage> {
-    const fail = (error: string, code: "forbidden" | "invalid_request" = "invalid_request"): DaemonMessage => ({ type: "response.error", requestId: msg.id, error, code });
-    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return fail("Missing scope: settings:write", "forbidden");
-    if (auth.delegationDepth > 0) return fail("A delegated token can't decide where agents push: the owner does.", "forbidden");
-    // Each owner's own: what one user trusts decides only their sessions' pushes.
-    if (msg.action === "list") return { type: "response.ok", requestId: msg.id, data: { trusts: this.#store.listPushTrust(auth.sub).map((t) => ({ ...t, url: shownUrl(t.url) })) } };
-    if (!msg.path || !isAbsolute(msg.path)) return fail("Give the repository's absolute path.");
-    const remote = msg.remote ?? "origin";
-    if (msg.action === "forget_writable") {
-      const paths = new Set([resolve(msg.path)]);
-      try {
-        paths.add(physicalPath(msg.path));
-      } catch {
-        /* gone */
-      }
-      let forgotten = 0;
-      for (const p of paths) forgotten += this.#store.forgetSandboxWritable(p);
-      this.#store.audit(auth.sub, "sandbox.writable_forgotten", undefined, `${msg.path} forgotten=${forgotten}`);
-      return { type: "response.ok", requestId: msg.id, data: { forgotten, path: msg.path } };
-    }
-    if (msg.action === "untrust") {
-      // Always possible, whatever state the repository is in (moved, broken, gone): by its git dir as found, or
-      // the path as `--list` shows it.
-      const candidates = new Set<string>();
-      try {
-        const layout = gitLayoutOf(msg.path);
-        if (layout?.common) candidates.add(physicalPath(layout.common));
-      } catch {
-        /* judged below */
-      }
-      candidates.add(resolve(msg.path));
-      candidates.add(resolve(msg.path, ".git"));
-      for (const c of [...candidates]) {
-        try {
-          candidates.add(physicalPath(c));
-        } catch {
-          /* gone */
-        }
-      }
-      let removed = 0;
-      for (const c of candidates) removed += this.#store.removePushTrust(auth.sub, c, msg.remote);
-      this.#store.audit(auth.sub, "sandbox.push_untrusted", undefined, `${msg.path} ${msg.remote ?? "*"} removed=${removed}`);
-      return { type: "response.ok", requestId: msg.id, data: { removed: removed > 0, repository: msg.path, remote: msg.remote ?? "every remote" } };
-    }
-    const target = await readPushTarget(msg.path, remote, { requireHeld: false, agentWritable: this.#allSandboxWritable() }).catch((err: unknown) => ({
-      refused: err instanceof Error ? err.message : String(err),
-    }));
-    if ("refused" in target) return fail(`Can't trust pushes from there: ${redactCredentials(target.refused)}.`);
-    this.#store.setPushTrust(auth.sub, { common: target.common, remote, url: target.url, repoSettings: target.repoSettings, userSettings: target.userSettings }, auth.sub);
-    this.#store.audit(auth.sub, "sandbox.push_trusted", undefined, `${target.common} ${remote} ${shownUrl(target.url)}`);
-    return {
-      type: "response.ok",
-      requestId: msg.id,
-      data: {
-        repository: target.repo,
-        remote,
-        url: shownUrl(target.url),
-        ...(target.configuredUrl ? { configuredUrl: shownUrl(target.configuredUrl) } : {}),
-        settings: target.repoSettings.map((x) => shownSetting(x)),
-        userSettings: target.userSettings.map((x) => shownSetting(x)),
-      },
-    };
-  }
-
   /** `sandbox.providers` (#448): what the daemon has and whether each runs here. */
   async #sandboxProviders(msg: Extract<ClientMessage, { type: "sandbox.providers" }>, auth: AuthContext): Promise<DaemonMessage> {
     if (!hasScope(auth.scopes as string[], SCOPES.SESSION_CREATE)) {
@@ -11103,6 +11145,7 @@ mcpHub: this.#mcpHub,
     // authorizing reads/writes on the goal after the session is gone.
     this.#revokeBlackboardToken(msg.sessionId);
     this.#sessions.delete(msg.sessionId);
+    this.#gateway?.closeSession(msg.sessionId);
     return { type: "response.ok", requestId: msg.id };
   }
 

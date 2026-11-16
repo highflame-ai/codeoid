@@ -19,8 +19,7 @@
  *   - `get_commands` → codeoid `session.commands` (slash passthrough)
  */
 
-import { PUSH_TOOL_FQ, REQUEST_DIRECTORY_DESCRIPTION, REQUEST_DIRECTORY_SCHEMA, REQUEST_DIRECTORY_TOOL_FQ, type RequestDirectoryInput } from "../../sandbox/request-directory.js";
-import { cleanPushInput, PUSH_DESCRIPTION, PUSH_SCHEMA, type PushInput } from "../../sandbox/push.js";
+import { REQUEST_DIRECTORY_DESCRIPTION, REQUEST_DIRECTORY_SCHEMA, REQUEST_DIRECTORY_TOOL_FQ, type RequestDirectoryInput } from "../../sandbox/request-directory.js";
 import type { McpTenant } from "../../mcp/oauth.js";
 import { randomUUID } from "node:crypto";
 import { AsyncQueue } from "../../async-queue.js";
@@ -99,8 +98,6 @@ export interface PiProviderInit {
    * (sandbox/request-directory.ts): a bridge tool, as registry servers' are.
    */
   requestDirectory?: (input: RequestDirectoryInput) => Promise<string>;
-  /** The sandbox's `push` (sandbox/push.ts), served beside `request_directory`: decided by the session. */
-  push?: (input: PushInput) => Promise<string>;
   /**
    * This session's account for the backend, resolved when the process is
    * spawned (accounts.ts); null = the daemon's own login. Throws when the
@@ -149,7 +146,6 @@ export class PiProvider implements SessionProvider {
   #mcpRegistry: McpServerView | null;
   #mcpHub: McpHub | null;
   readonly #requestDirectory: ((input: RequestDirectoryInput) => Promise<string>) | null;
-  readonly #push: ((input: PushInput) => Promise<string>) | null;
 
   #proc: PiRpcProcess | null = null;
   #bridgeReady = false;
@@ -187,7 +183,6 @@ export class PiProvider implements SessionProvider {
     this.#mcpRegistry = init.mcpRegistry ?? null;
     this.#mcpHub = init.mcpHub ?? null;
     this.#requestDirectory = init.requestDirectory ?? null;
-    this.#push = init.requestDirectory ? (init.push ?? null) : null;
   }
 
   /**
@@ -815,10 +810,9 @@ export class PiProvider implements SessionProvider {
   /** Discover external MCP tools to register in the bridge at spawn time. */
   async #discoverMcpTools(): Promise<BridgeMcpTool[]> {
     // The sandbox's ask for a directory to write: served here, not by the hub.
-    const own: BridgeMcpTool[] = [
-      ...(this.#requestDirectory ? [{ name: REQUEST_DIRECTORY_TOOL_FQ, description: REQUEST_DIRECTORY_DESCRIPTION, parameters: REQUEST_DIRECTORY_SCHEMA }] : []),
-      ...(this.#push ? [{ name: PUSH_TOOL_FQ, description: PUSH_DESCRIPTION, parameters: PUSH_SCHEMA }] : []),
-    ];
+    const own: BridgeMcpTool[] = this.#requestDirectory
+      ? [{ name: REQUEST_DIRECTORY_TOOL_FQ, description: REQUEST_DIRECTORY_DESCRIPTION, parameters: REQUEST_DIRECTORY_SCHEMA }]
+      : [];
     const view = this.#mcpToolsView();
     if (!view || !view.hasServers()) return own;
     const handles = await view.handles();
@@ -836,12 +830,6 @@ export class PiProvider implements SessionProvider {
         p = JSON.parse(String(frame.placeholder ?? "{}")) as typeof p;
       } catch {
         /* judged below */
-      }
-      if (p.name === PUSH_TOOL_FQ && this.#push) {
-        const input = cleanPushInput(p.args ?? {});
-        const push = this.#push;
-        reply(typeof input === "string" ? input : await push(input).catch((e) => `Refused: ${e instanceof Error ? e.message : String(e)}`));
-        return;
       }
       if (p.name === REQUEST_DIRECTORY_TOOL_FQ) {
         const path = typeof p.args?.path === "string" ? p.args.path : "";

@@ -411,8 +411,42 @@ function within(child: string, parent: string): boolean {
   return child === parent || child.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
 }
 
+/** A session's git gateway as its sandbox is given it (git-gateway/gateway.ts `forSession`, and what goes there). */
+export interface GitGatewaySpec {
+  socket: string;
+  /** The launcher git runs (`ext::<it> %S <url>`). */
+  ext: string;
+  /** The launcher's dir: re-exposed read-only. */
+  binDir: string;
+  /** codeoid's runtime, which the launcher runs: re-exposed read-only. */
+  runtime: string;
+  /** URLs and URL prefixes the session's git reaches through the gateway (`url.<ext::…>.insteadOf`). */
+  urls: readonly string[];
+}
+
+/**
+ * git's config (as `GIT_CONFIG_COUNT` env) that sends `urls` through the gateway's launcher, and the socket's path.
+ * Empty when the launcher's path can't be written into an ext:: command (a space in it).
+ */
+export function gitGatewayEnv(g: GitGatewaySpec): Record<string, string> {
+  if (/\s|%/.test(g.ext) || g.urls.length === 0) return {};
+  const entries: Array<[string, string]> = [["protocol.ext.allow", "always"]];
+  for (const u of new Set(g.urls)) {
+    if (/\s/.test(u)) continue;
+    entries.push([`url.ext::${g.ext} %S ${u.replace(/%/g, "%%")}.insteadOf`, u]);
+  }
+  const env: Record<string, string> = { CODEOID_GIT_GATEWAY: g.socket, GIT_CONFIG_COUNT: String(entries.length) };
+  entries.forEach(([k, v], i) => {
+    env[`GIT_CONFIG_KEY_${i}`] = k;
+    env[`GIT_CONFIG_VALUE_${i}`] = v;
+  });
+  return env;
+}
+
 export interface SpecInputs {
   sessionId: string;
+  /** The session's git gateway (docs/git-gateway-design.md); absent: git reaches remotes as the network allows. */
+  gitGateway?: GitGatewaySpec;
   /**
    * More paths hidden for this session alone: other workstreams' folders
    * under its read fence (workstreams §7.3). Never the workspace or what
@@ -1259,6 +1293,8 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   // leads to elsewhere in the home stays hidden (a project of yours, with its `.env`), and the link dangles.
   const reexposed = [
     ...(inputs.backendReadable ?? []).map((p) => resolve(p)),
+    // The git gateway's launcher and the runtime it runs, read-only (the socket is bound on its own).
+    ...(inputs.gitGateway ? [inputs.gitGateway.binDir, inputs.gitGateway.runtime, realOr(inputs.gitGateway.runtime)] : []),
     // The allowlist, less what `sandbox.hiddenPaths` hides: an explicit hide wins.
     ...allowed,
     // The worktree locations holding the session's folders, read-only: a worktree added elsewhere in one fails
@@ -1334,6 +1370,9 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   for (const l of git.locations) pin(pinOf(realOr(l), "a worktree location", { mayBeMissing: true, noId: true }));
   // The container runtime's sockets, when the owner opted in: reachable at their own paths, `DOCKER_HOST` the first.
   const sockets = inputs.dockerSocket ? dockerSocketPaths(home, env) : [];
+  // The git gateway: its env (none when its launcher can't be named in git's config), then its socket.
+  const gatewayEnv = inputs.gitGateway ? gitGatewayEnv(inputs.gitGateway) : {};
+  const gateway = inputs.gitGateway && Object.keys(gatewayEnv).length > 0 ? inputs.gitGateway : undefined;
   const exposed = new Set(sockets.flatMap((s) => [s, realOr(s)]));
   const spec: SandboxSpec = {
     sessionId: inputs.sessionId,
@@ -1346,7 +1385,9 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     ...(locations.length > 0 ? { worktreeFolders: locations } : {}),
     ...(roots.length > 0 ? { projectRoots: roots } : {}),
     ...(addedDirs.length > 0 ? { addedDirs } : {}),
-    ...(cache || sockets.length > 0 ? { env: { ...(cache ? toolchainCacheEnv(cache, home, env) : {}), ...(sockets[0] ? { DOCKER_HOST: `unix://${sockets[0]}` } : {}) } } : {}),
+    ...(cache || sockets.length > 0 || gateway
+      ? { env: { ...(cache ? toolchainCacheEnv(cache, home, env) : {}), ...(sockets[0] ? { DOCKER_HOST: `unix://${sockets[0]}` } : {}), ...gatewayEnv } }
+      : {}),
     pinned,
     ...(heldInPlace.length > 0 ? { heldInPlace } : {}),
     pins,
@@ -1354,6 +1395,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     containerSockets: containerSocketPaths(home, env).filter((p) => !exposed.has(p) && !exposed.has(realOr(p))),
     ...((inputs.hideLocalServices ?? inputs.network.mode !== "on") ? { serviceSockets: localServiceSocketPaths() } : {}),
     ...(sockets.length > 0 ? { dockerSockets: sockets } : {}),
+    ...(gateway ? { gatewaySockets: [gateway.socket] } : {}),
     network: inputs.network,
     unsetEnv: sockets.length > 0 ? SANDBOX_UNSET_ENV.filter((n) => n !== "DOCKER_HOST") : SANDBOX_UNSET_ENV,
   };

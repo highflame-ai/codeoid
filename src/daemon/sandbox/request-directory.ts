@@ -22,14 +22,11 @@ import { randomUUID } from "node:crypto";
 import { createSdkMcpServer, tool, type McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { DEFAULT_MCP_PROTOCOL_VERSION, ok, rpcErr, tokenFrom, type JsonRpcMessage, type JsonRpcResponse } from "../mcp/jsonrpc-http.js";
-import { cleanPushInput, PUSH_DESCRIPTION, PUSH_SCHEMA, PUSH_TOOL, type PushHandler } from "./push.js";
 
 export const SANDBOX_MCP_SERVER_NAME = "codeoid_sandbox";
 export const REQUEST_DIRECTORY_TOOL = "request_directory";
 /** The tool's name as the Claude SDK exposes it. */
 export const REQUEST_DIRECTORY_TOOL_FQ = `mcp__${SANDBOX_MCP_SERVER_NAME}__${REQUEST_DIRECTORY_TOOL}`;
-/** `push` (sandbox/push.ts), served beside it, as the Claude SDK exposes it. */
-export const PUSH_TOOL_FQ = `mcp__${SANDBOX_MCP_SERVER_NAME}__${PUSH_TOOL}`;
 /** Where the endpoint is mounted on the daemon's HTTP server. */
 export const SANDBOX_MCP_PATH = "/mcp/sandbox";
 /** The env var a URL-mounting backend reads the token from (Codex's `bearer_token_env_var`; out of its commands' environment: `CODEOID_*_TOKEN`). */
@@ -70,8 +67,8 @@ function clean(input: Record<string, unknown>): RequestDirectoryInput | string {
   return { path, reason };
 }
 
-/** The tools as an in-process MCP server bound to one session (Claude; Qwen's SDK takes the same shape): `push` when a handler is given. */
-export function buildSandboxMcpServer(sessionId: string, handle: RequestDirectoryHandler, push?: PushHandler): McpSdkServerConfigWithInstance {
+/** The tool as an in-process MCP server bound to one session (Claude; Qwen's SDK takes the same shape). */
+export function buildSandboxMcpServer(sessionId: string, handle: RequestDirectoryHandler): McpSdkServerConfigWithInstance {
   const request = tool(
     REQUEST_DIRECTORY_TOOL,
     REQUEST_DIRECTORY_DESCRIPTION,
@@ -85,25 +82,7 @@ export function buildSandboxMcpServer(sessionId: string, handle: RequestDirector
       return { content: [{ type: "text" as const, text }] };
     },
   );
-  const pushTool = push
-    ? [
-        tool(
-          PUSH_TOOL,
-          PUSH_DESCRIPTION,
-          {
-            branch: z.string().max(255).optional().describe("The local branch to push (default: the one checked out)."),
-            remote: z.string().max(100).optional().describe("The remote's name (default: origin)."),
-            reason: z.string().max(1000).optional().describe("Why: the owner reads it when asked."),
-          },
-          async (args) => {
-            const input = cleanPushInput(args as Record<string, unknown>);
-            const text = typeof input === "string" ? input : await push(sessionId, input).catch((e) => `Refused: ${e instanceof Error ? e.message : String(e)}`);
-            return { content: [{ type: "text" as const, text }] };
-          },
-        ),
-      ]
-    : [];
-  return createSdkMcpServer({ name: SANDBOX_MCP_SERVER_NAME, version: "0.1.0", tools: [request, ...pushTool] });
+  return createSdkMcpServer({ name: SANDBOX_MCP_SERVER_NAME, version: "0.1.0", tools: [request] });
 }
 
 /** What a session hands a URL-mounting backend. */
@@ -123,22 +102,13 @@ export const REQUEST_DIRECTORY_SCHEMA: Record<string, unknown> = {
   additionalProperties: false,
 };
 
-/** The daemon's `/mcp/sandbox` endpoint: one token per session; `request_directory`, and `push` when a handler is given. */
+/** The daemon's `/mcp/sandbox` endpoint: one token per session, `request_directory` its one tool. */
 export class SandboxMcpHttp {
   readonly #tokens = new Map<string, string>();
   readonly #handle: RequestDirectoryHandler;
-  readonly #push: PushHandler | undefined;
-  /** Whether `push` is offered to a session (its sandbox on, pushing not turned off); absent: always. */
-  readonly #pushOffered: ((sessionId: string) => boolean) | undefined;
 
-  constructor(handle: RequestDirectoryHandler, push?: PushHandler, pushOffered?: (sessionId: string) => boolean) {
+  constructor(handle: RequestDirectoryHandler) {
     this.#handle = handle;
-    this.#push = push;
-    this.#pushOffered = pushOffered;
-  }
-
-  #offersPush(sessionId: string): boolean {
-    return this.#push !== undefined && (this.#pushOffered?.(sessionId) ?? true);
   }
 
   /** A token scoped to `sessionId`: the scope of every call made with it. */
@@ -204,20 +174,9 @@ export class SandboxMcpHttp {
       case "ping":
         return ok(id, {});
       case "tools/list":
-        return ok(id, {
-          tools: [
-            { name: REQUEST_DIRECTORY_TOOL, description: REQUEST_DIRECTORY_DESCRIPTION, inputSchema: REQUEST_DIRECTORY_SCHEMA },
-            ...(this.#offersPush(sessionId) ? [{ name: PUSH_TOOL, description: PUSH_DESCRIPTION, inputSchema: PUSH_SCHEMA }] : []),
-          ],
-        });
+        return ok(id, { tools: [{ name: REQUEST_DIRECTORY_TOOL, description: REQUEST_DIRECTORY_DESCRIPTION, inputSchema: REQUEST_DIRECTORY_SCHEMA }] });
       case "tools/call": {
         const name = msg.params?.name;
-        if (name === PUSH_TOOL && this.#push && this.#offersPush(sessionId)) {
-          const input = cleanPushInput((msg.params?.arguments ?? {}) as Record<string, unknown>);
-          const push = this.#push;
-          const text = typeof input === "string" ? input : await push(sessionId, input).catch((e) => `Refused: ${e instanceof Error ? e.message : String(e)}`);
-          return ok(id, { content: [{ type: "text", text }], isError: false });
-        }
         if (name !== REQUEST_DIRECTORY_TOOL) return ok(id, { content: [{ type: "text", text: `Unknown tool: ${String(name)}` }], isError: true });
         const input = clean((msg.params?.arguments ?? {}) as Record<string, unknown>);
         const text = typeof input === "string" ? input : await this.#handle(sessionId, input).catch((e) => `Refused: ${e instanceof Error ? e.message : String(e)}`);

@@ -1347,7 +1347,7 @@ export type ClientMessage =
   | SessionRemoveReferenceMsg
   | SessionSetWorkstreamMsg
   | SandboxProvidersMsg
-  | SandboxTrustPushMsg
+  | SandboxGitConnectMsg
   | SessionPinMsg
   | SessionUnpinMsg
   | SessionRotateMsg
@@ -2018,22 +2018,19 @@ export interface SandboxProvidersMsg extends BaseClientMsg {
 }
 
 /**
- * The owner's trust in a repository's remote for the sandbox's `push` tool (docs/sandbox.md, "Pushing a
- * branch"): `trust` records the repository's remote as it is now (its URL, and what the repository's own
- * config says that decides a push), so an autonomous agent may push there; `untrust` takes it back; `list`
- * answers every trust. Needs settings:write, undelegated. Reply: `response.ok` with `data`.
+ * Connect a remote for the git gateway (docs/git-gateway-design.md): agents in the caller's sandboxed sessions may
+ * then fetch from it and push branches of their own, with the caller's existing credential (or `token`). Needs
+ * settings:write; refused for a delegated token. `list` lists the caller's own; `disconnect` takes one back.
  */
-export interface SandboxTrustPushMsg extends BaseClientMsg {
-  type: "sandbox.trust_push";
-  /**
-   * `forget_writable`: forget that sandboxed sessions could write `path` (and what is under it), after you have
-   * checked what is there: codeoid's push never takes a config file or a program from such a place.
-   */
-  action: "trust" | "untrust" | "list" | "forget_writable";
-  /** The repository (a directory in it), absolute; not for `list`. */
+export interface SandboxGitConnectMsg extends BaseClientMsg {
+  type: "sandbox.git_connect";
+  action: "connect" | "disconnect" | "list";
+  /** The remote's URL; or `path` (a directory in a repository) and `remote` (default `origin`). */
+  url?: string;
   path?: string;
-  /** Default `origin`. */
   remote?: string;
+  /** A dedicated token for an https remote (`user:token` or a token), instead of the caller's own credential. */
+  token?: string;
 }
 
 /** One entry of the `sandbox.providers` reply's `data.providers`. */
