@@ -219,11 +219,67 @@ describe("push: the plan", () => {
     const p = await plan({}, {
       refGit: async (_repo, args) => {
         asked.push(args);
-        return args[0] === "symbolic-ref" ? "feature/x\n" : null;
+        return args[0] === "symbolic-ref" ? "refs/heads/feature/x\n" : null;
       },
     });
     expect(p).toEqual({ refused: "there is no local branch feature/x: commit to it first" });
     expect(asked.map((a) => a[0])).toEqual(["symbolic-ref", "rev-parse"]);
+    // Round 7: a query that couldn't run is said as that, never as "no branch".
+    const broken = await plan({}, {
+      refGit: async () => {
+        throw new Error("git: not found");
+      },
+    });
+    expect(broken).toEqual({ refused: "the session's sandbox couldn't run git to read the branch (git: not found)" });
+  });
+
+  test("round 7: a tag named like the checked-out branch doesn't change which branch is pushed", async () => {
+    git(repo, "tag", "feature/x");
+    expect(await planned()).toMatchObject({ branch: "feature/x", sha: git(repo, "rev-parse", "refs/heads/feature/x") });
+  });
+
+  test("round 7: a git in anything a session may write is never the one run inside the sandbox", async () => {
+    const { gitBinProblem } = await import("../daemon/sandbox/push.js");
+    expect(gitBinProblem(join(repo, "bin", "git"), [repo])).toContain("in a directory this session's commands may write");
+    expect(gitBinProblem(join(root, "home", ".local", "bin", "git"), [join(root, "home")])).not.toBeNull();
+    const linked = join(root, "linked-bin");
+    mkdirSync(join(repo, "bin"), { recursive: true });
+    symlinkSync(join(repo, "bin"), linked);
+    expect(gitBinProblem(join(linked, "git"), [repo])).not.toBeNull();
+    expect(gitBinProblem("/usr/bin/git", [repo, join(root, "scratch")])).toBeNull();
+    expect(gitBinProblem("git", [])).toContain("no git");
+  });
+
+  test("round 7: the header is read whole: a filter anywhere, a second capability, a header that doesn't end, are refused; sha256 is staged as sha256", async () => {
+    const { readBundleHeader } = await import("../daemon/sandbox/push.js");
+    const sha = git(repo, "rev-parse", "HEAD");
+    const f = join(root, "h.bundle");
+    const verdict = (body: string) => {
+      rmSync(f, { force: true });
+      writeFileSync(f, body);
+      return readBundleHeader(f);
+    };
+    expect(verdict(`# v3 git bundle\n@object-format=sha1\n${sha} refs/heads/feature/x\n\nPACK`)).toEqual({ format: "sha1" });
+    expect(verdict(`# v2 git bundle\n${sha} refs/heads/feature/x\n\nPACK`)).toEqual({ format: "sha1" });
+    expect(verdict(`# v3 git bundle\n${sha} refs/heads/feature/x\n@object-format=sha1\n@filter=blob:none\n\nPACK`)).toMatchObject({ problem: expect.stringContaining("capability") });
+    expect(verdict(`# v3 git bundle\n${"@object-format=sha1\n".repeat(2)}${sha} refs/heads/x\n\n`)).toMatchObject({ problem: expect.stringContaining("capability") });
+    expect(verdict(`# v3 git bundle\n${"@object-format=sha1\n".repeat(5000)}@filter=blob:none\n\n`)).toMatchObject({ problem: expect.any(String) });
+    expect(verdict(`# v2 git bundle\n@object-format=sha1\n${sha} refs/heads/x\n\n`)).toMatchObject({ problem: expect.stringContaining("capability") });
+    expect(verdict(`# v2 git bundle\ngitdir: /x\n\n`)).toMatchObject({ problem: expect.stringContaining("isn't a ref") });
+    // A sha256 repository pushes (its bundle staged in a sha256 repository).
+    const s256 = join(root, "s256");
+    const bare256 = join(root, "s256.git");
+    git(root, "init", "-q", "--bare", "--object-format=sha256", "-b", "main", bare256);
+    git(root, "init", "-q", "--object-format=sha256", "-b", "feature/z", s256);
+    writeFileSync(join(s256, "z.txt"), "z\n");
+    git(s256, "add", ".");
+    git(s256, "commit", "-q", "-m", "z");
+    git(s256, "remote", "add", "origin", `file://${bare256}`);
+    const p = await planPush(s256, {}, { ...opts(), heldReadOnly: [join(s256, ".git")], agentWritable: [s256] });
+    if ("refused" in p) throw new Error(p.refused);
+    expect(p.sha).toHaveLength(64);
+    expect(await run(p)).toMatchObject({ ok: true });
+    expect(git(bare256, "rev-parse", "refs/heads/feature/z")).toBe(p.sha);
   });
 
   test("round 6: the staging dir must be the daemon's own, closed to others; one a stopped daemon left is swept", async () => {

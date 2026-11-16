@@ -248,9 +248,8 @@ import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/v
 /** What is recorded of a call the user listed in `secrets.dropCommands`. */
 const NOT_STORED = "‹not stored›";
 import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
-import { bundleFromChild, planPush, runPush, shownUrl, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
+import { bundleFromChild, gitBinProblem, planPush, runPush, shownUrl, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
 import { GIT_BIN, gitEnv } from "./git-env.js";
-import { physicalPath, within } from "./physical-path.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -4259,6 +4258,9 @@ export class Session {
     const closing = () => signal.aborted || this.#draining || this.#destroyed;
     const spec = sbx.runtime?.spec;
     if (!spec) return refuse("this session's sandbox isn't running for its backend");
+    // Before any git runs for the push: the daemon's git must be one no session's commands could have replaced.
+    const gitBin = this.#sandboxGitBin(sbx);
+    if ("error" in gitBin) return refuse(gitBin.error);
     const planOpts = {
       protectedBranches: cfg?.protectedBranches ?? ["main", "master"],
       heldReadOnly: spec.readOnly ?? [],
@@ -4414,27 +4416,28 @@ export class Session {
    * system's alone, never a `git` the agent's commands could put first on a PATH, nor one in what they may write.
    */
   #sandboxGitBin(sbx: SessionSandbox): { bin: string; env: Record<string, string> } | { error: string } {
-    if (!isAbsolute(GIT_BIN)) return { error: "codeoid found no git on this machine" };
-    const writable = [...this.sandboxAgentWritable, sbx.tempDirPath ?? ""].filter(Boolean);
-    const real = physicalPath(GIT_BIN);
-    if (writable.some((w) => within(GIT_BIN, w) || within(real, w) || within(real, physicalPath(w)))) {
-      return { error: `the git codeoid runs (${GIT_BIN}) is in a directory this session's commands may write` };
-    }
+    const spec = sbx.runtime?.spec;
+    const writable = [...this.sandboxAgentWritable, sbx.tempDirPath ?? "", ...(spec ? [spec.workspace, spec.tempDir, ...spec.writable] : []), ...(this.#otherSessionsWritable?.() ?? [])];
+    const problem = gitBinProblem(GIT_BIN, writable);
+    if (problem) return { error: problem };
     return { bin: GIT_BIN, env: gitEnv({ LANG: "C", PATH: [dirname(GIT_BIN), "/usr/bin", "/bin"].join(":") }) };
   }
 
-  /** A read-only git query inside this session's sandbox: its stdout, or null when it failed. */
+  /** A read-only git query inside this session's sandbox ({@link RefGit}: null when git said no, thrown when it couldn't run). */
   async #sandboxGitQuery(sbx: SessionSandbox, repo: string, args: string[], signal: AbortSignal): Promise<string | null> {
     const rt = sbx.runtime;
+    if (!rt) throw new Error("the sandbox isn't running");
     const git = this.#sandboxGitBin(sbx);
-    if (!rt || "error" in git || signal.aborted) return null;
+    if ("error" in git) throw new Error(git.error);
+    if (signal.aborted) throw new Error("the session is closing");
     let handle: Awaited<ReturnType<typeof rt.open>> | null = null;
     try {
       handle = await rt.open([]);
       const r = await handle.exec([git.bin, "-c", "core.fsmonitor=false", "-C", repo, ...args], { cwd: repo, env: { ...git.env, GIT_OPTIONAL_LOCKS: "0" }, timeoutMs: 20_000 });
-      return r.exitCode === 0 ? r.stdout : null;
-    } catch {
-      return null;
+      if (r.exitCode === 0) return r.stdout;
+      // `-q` queries exit 1 for "no such ref" and "not a symbolic ref"; anything else is git not running right.
+      if (r.exitCode === 1) return null;
+      throw new Error(r.stderr.trim().split("\n").slice(-1)[0]?.slice(0, 200) || `git exited ${r.exitCode ?? r.signal}`);
     } finally {
       await handle?.close().catch(() => {});
     }

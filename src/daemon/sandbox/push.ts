@@ -145,10 +145,22 @@ export interface PlanOptions {
   _testFileRemote?: boolean;
 }
 
-/** A read-only git query in a repository: its stdout, or null when it failed. */
+/**
+ * A read-only git query in a repository: its stdout, or null when git said no (exit 1: no such ref, a detached
+ * HEAD). Throws when it couldn't be run at all (the sandbox, a missing git, a timeout): that is said as itself.
+ */
 export type RefGit = (repo: string, args: string[]) => Promise<string | null>;
 
 const hostRefGit: RefGit = (repo, args) => safeGit(args, repo, { timeoutMs: 20_000 }).catch(() => null);
+
+/** {@link RefGit}, a failure to run said as one. */
+async function askRef(refGit: RefGit, repo: string, args: string[]): Promise<{ out: string | null } | { refused: string }> {
+  try {
+    return { out: await refGit(repo, args) };
+  } catch (err) {
+    return { refused: `the session's sandbox couldn't run git to read the branch (${err instanceof Error ? err.message : String(err)})` };
+  }
+}
 
 /** One config entry with where it came from (`git config --show-scope --show-origin --null`). */
 interface OriginEntry {
@@ -368,14 +380,20 @@ export async function planPush(repoDir: string, input: PushInput, opts: PlanOpti
   const refGit = opts.refGit ?? hostRefGit;
   let branch = input.branch;
   if (!branch) {
-    branch = (await refGit(repo, ["symbolic-ref", "--short", "-q", "HEAD"]))?.trim() || undefined;
-    if (!branch) return refuse("no branch is checked out (a detached HEAD): name the branch to push");
+    // The full name (`--short` would say `heads/x` beside a tag x).
+    const head = await askRef(refGit, repo, ["symbolic-ref", "-q", "HEAD"]);
+    if ("refused" in head) return head;
+    const full = head.out?.trim() ?? "";
+    if (!full.startsWith("refs/heads/")) return refuse("no branch is checked out (a detached HEAD): name the branch to push");
+    branch = full.slice("refs/heads/".length);
   }
   if (!isPushableBranchName(branch)) return refuse(`${JSON.stringify(branch)} isn't a branch name`);
   if (opts.protectedBranches.some((p) => branchMatches(p, branch as string))) {
     return refuse(`${branch} is a protected branch (sandbox.push.protectedBranches): push your work to a branch of its own, and open a pull request`);
   }
-  const sha = (await refGit(repo, ["rev-parse", "--verify", "-q", "--end-of-options", `refs/heads/${branch}^{commit}`]))?.trim() ?? "";
+  const asked = await askRef(refGit, repo, ["rev-parse", "--verify", "-q", "--end-of-options", `refs/heads/${branch}^{commit}`]);
+  if ("refused" in asked) return asked;
+  const sha = asked.out?.trim() ?? "";
   if (!sha) return refuse(`there is no local branch ${branch}: commit to it first`);
   if (!/^[0-9a-f]{40,64}$/.test(sha)) return refuse(`${branch} doesn't name a commit`);
 
@@ -575,28 +593,59 @@ function sweepStaging(root: string): void {
   }
 }
 
-/** Why `file` isn't a plain git bundle (v2 or v3, no filter): its header is read, nothing else. */
-export function bundleHeaderProblem(file: string): string | null {
+/**
+ * What `file`'s header says, if it is a plain git bundle (v2, or v3 with at most an `@object-format`): its object
+ * format. Else why not. The whole header is read (to the blank line that ends it), every line of it checked.
+ */
+export function readBundleHeader(file: string): { format: "sha1" | "sha256" } | { problem: string } {
   let fd: number;
   try {
     fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   } catch {
-    return "it isn't there";
+    return { problem: "it isn't there" };
   }
   try {
     const buf = Buffer.alloc(64 * 1024);
     const n = readSync(fd, buf, 0, buf.length, 0);
     const head = buf.subarray(0, n).toString("latin1");
-    if (!head.startsWith("# v2 git bundle\n") && !head.startsWith("# v3 git bundle\n")) return "no bundle header";
-    // v3's capabilities come first: a filter (a partial bundle) is never taken.
-    for (const line of head.split("\n").slice(1)) {
-      if (!line.startsWith("@")) break;
-      if (!/^@object-format=(sha1|sha256)$/.test(line)) return `capability ${JSON.stringify(line.slice(0, 40))}`;
+    const v3 = head.startsWith("# v3 git bundle\n");
+    if (!v3 && !head.startsWith("# v2 git bundle\n")) return { problem: "no bundle header" };
+    const endAt = head.indexOf("\n\n");
+    // A bundle of one branch has a header of a few lines: one that doesn't end in what was read is refused.
+    if (endAt < 0) return { problem: "its header doesn't end" };
+    let format: "sha1" | "sha256" = "sha1";
+    let caps = 0;
+    for (const line of head.slice(0, endAt).split("\n").slice(1)) {
+      if (line.startsWith("@")) {
+        // git takes a capability anywhere in a v3 header: each is checked wherever it is.
+        const m = /^@object-format=(sha1|sha256)$/.exec(line);
+        if (!v3 || !m || ++caps > 1) return { problem: `capability ${JSON.stringify(line.slice(0, 40))}` };
+        format = m[1] as "sha1" | "sha256";
+      } else if (!/^-?[0-9a-f]{40,64}( .*)?$/.test(line)) {
+        return { problem: "a header line that isn't a ref or a prerequisite" };
+      }
     }
-    return null;
+    return { format };
   } finally {
     closeSync(fd);
   }
+}
+
+/** Why `file` isn't a plain git bundle, or null ({@link readBundleHeader}). */
+export function bundleHeaderProblem(file: string): string | null {
+  const h = readBundleHeader(file);
+  return "problem" in h ? h.problem : null;
+}
+
+/**
+ * Why `gitBin` can't be the git run inside a session's sandbox: it must be an absolute path outside everything that
+ * session's commands may write (lexically and physically), so no agent's program stands in for it.
+ */
+export function gitBinProblem(gitBin: string, writable: readonly string[]): string | null {
+  if (!isAbsolute(gitBin)) return "codeoid found no git on this machine";
+  const real = physicalPath(gitBin);
+  const inside = writable.filter(Boolean).some((w) => within(w, gitBin) || within(w, real) || within(physicalPath(w), real) || within(physicalPath(w), gitBin));
+  return inside ? `the git codeoid runs (${gitBin}) is in a directory this session's commands may write` : null;
 }
 
 /** The largest bundle taken into the daemon's staging repository. */
@@ -692,9 +741,10 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
     try {
       // A bundle, by its header, and nothing else: a fetch would take any other file as a path to a repository (a
       // gitfile naming one the sandbox hides), so it is unbundled, which reads only a bundle.
-      const header = bundleHeaderProblem(bundle);
-      if (header) return { ok: false, summary: `refused: what the session's sandbox made isn't a plain git bundle (${header})`, output: "" };
-      await local(["init", "-q", "--bare", repo]);
+      const header = readBundleHeader(bundle);
+      if ("problem" in header) return { ok: false, summary: `refused: what the session's sandbox made isn't a plain git bundle (${header.problem})`, output: "" };
+      if ((header.format === "sha256") !== (plan.sha.length === 64)) return { ok: false, summary: "refused: the bundle's object format isn't the repository's", output: "" };
+      await local(["-c", "init.templateDir=", "init", "-q", "--bare", `--object-format=${header.format}`, repo]);
       const listed = await local(["--git-dir", repo, "bundle", "unbundle", bundle, `refs/heads/${plan.branch}`]);
       const tip = /^([0-9a-f]{40,64}) refs\/heads\/(\S+)$/m.exec(listed);
       if (!tip?.[1] || tip[2] !== plan.branch) return { ok: false, summary: `refused: the bundle the session's sandbox made doesn't hold ${plan.branch}`, output: "" };
