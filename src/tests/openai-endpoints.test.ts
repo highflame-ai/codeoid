@@ -6,7 +6,8 @@
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, setDefaultTimeout, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { draftConnection, EndpointError, EndpointStore, isPrivateHost } from "../daemon/openai-endpoints.js";
@@ -380,7 +381,7 @@ describe("a server's model list", () => {
     for (const content of ["{not json", JSON.stringify({ version: 2, endpoints: {} }), JSON.stringify({ version: 1, endpoints: { box: { fingerprint: 7, at: 0, models: [] } } })]) {
       writeFileSync(store.modelsCachePath, content);
       const catalog = new EndpointCatalog(store, (async () => new Response("down", { status: 503 })) as unknown as typeof fetch, { cacheFile: store.modelsCachePath });
-      expect(await catalog.models("box")).toEqual({ models: [{ id: "cfg", displayName: "cfg" }], live: false });
+      expect(await catalog.models("box")).toEqual({ models: [{ id: "cfg", displayName: "cfg" }], live: false, source: "configured" });
     }
   });
 });
@@ -641,9 +642,13 @@ describe("daemon", () => {
     expect(t).toMatchObject({ ok: true, models: ["embed-a", "rerank-b", "chat-c", "chat-d"], notChat: ["embed-a", "rerank-b"] });
   });
 
-  test("a configured model the server no longer serves isn't offered, and test names it; a draft's test doesn't", async () => {
+  test("a configured model the server doesn't list stays offered, marked, and test names it; a draft's test doesn't", async () => {
     await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "gone-model" }, { id: "served-a" }] });
-    expect((await pickable()).ids).toEqual(["served-a", "org/served-b.gguf"]);
+    const offered = await pickable();
+    // The owner's choice: a gateway can serve an alias it doesn't list, and a retired name is theirs to remove.
+    expect(offered.ids).toEqual(["gone-model", "served-a", "org/served-b.gguf"]);
+    expect(offered.models[0]!.displayName).toBe("gone-model (not listed by the server)");
+    expect(offered.models[1]!.displayName).toBe("served-a");
     const t = await handle({ type: "endpoints.test", id: "t", name: "box" });
     expect(t).toMatchObject({ ok: true, notServed: ["gone-model"] });
     // A draft on another URL is a different server: its list says nothing about the stored models.
@@ -688,6 +693,106 @@ describe("daemon", () => {
     await handle({ type: "session.send", id: "m1", sessionId: created.data!.id, text: "hi" });
     await waitFor(() => assistantTexts().length === 1);
     expect(assistantTexts()[0]).toBe("hello from cfg-2");
+  });
+
+  const modelsHits = () => seen.filter((r) => r.path === "/v1/models").length;
+
+  test("round 1: a configured model is the default with no request, even one the gateway routes but doesn't list", async () => {
+    // LiteLLM / OpenRouter aliases: routed, not listed. On main the first configured model was the default; it still is.
+    listedModels = [{ id: "zz-expensive-model" }, { id: "cheap" }];
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "my-alias" }] });
+    const created = (await handle({ type: "session.create", id: "c", name: "al", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
+    const sessionId = created.data!.id;
+    await handle({ type: "session.attach", id: "a", sessionId });
+    const before = modelsHits();
+    await handle({ type: "session.send", id: "m1", sessionId, text: "hi" });
+    await waitFor(() => assistantTexts().length === 1);
+    expect(assistantTexts()[0]).toBe("hello from my-alias");
+    expect(modelsHits()).toBe(before);
+    // Offered first, marked, and pickable.
+    const offered = await pickable();
+    expect(offered.ids).toEqual(["my-alias", "zz-expensive-model", "cheap"]);
+    expect(await handle({ type: "session.set_model", id: "sm", sessionId, model: "my-alias" })).toMatchObject({ type: "response.ok" });
+  });
+
+  test("round 1: a configured Claude id stays pickable on a gateway that doesn't list it", async () => {
+    listedModels = [{ id: "gpt-x" }];
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "claude-sonnet-4-5" }] });
+    const created = (await handle({ type: "session.create", id: "c", name: "cl", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
+    await handle({ type: "session.attach", id: "a", sessionId: created.data!.id });
+    expect(await handle({ type: "session.set_model", id: "sm", sessionId: created.data!.id, model: "claude-sonnet-4-5" })).toMatchObject({ type: "response.ok" });
+    // An unconfigured, unlisted Claude id is still refused, naming what the server serves.
+    const refused = await handle({ type: "session.set_model", id: "sm2", sessionId: created.data!.id, model: "claude-opus-4-1" });
+    expect(String(refused.error)).toContain("It serves: claude-sonnet-4-5, gpt-x");
+  });
+
+  test("round 1: a server that is down is asked once per half minute, and concurrent asks share one request", async () => {
+    modelsUp = false;
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey });
+    const before = modelsHits();
+    await Promise.all(Array.from({ length: 20 }, () => pickable()));
+    for (let i = 0; i < 5; i++) await pickable();
+    expect(modelsHits() - before).toBe(1);
+    // With nothing known, the refusal names nothing as served.
+    const created = (await handle({ type: "session.create", id: "c", name: "dn", workdir: dir, providerId: "oai:box", model: "local-x" })) as { data?: SessionInfo };
+    const refused = await handle({ type: "session.set_model", id: "sm", sessionId: created.data!.id, model: "sonnet" });
+    expect(String(refused.error)).not.toContain("It serves");
+    // Up again: concurrent cold asks share one request too.
+    modelsUp = true;
+    await handle({ type: "endpoints.set", id: "s2", name: "box", baseUrl: baseUrl(), displayName: "Box" }); // an edit forgets the failure
+    const mid = modelsHits();
+    await Promise.all(Array.from({ length: 20 }, () => pickable()));
+    expect(modelsHits() - mid).toBe(1);
+  });
+
+  test("round 1: with only configured models to go on, the refusal says Configured, not It serves", async () => {
+    modelsUp = false;
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "gone-model" }] });
+    const created = (await handle({ type: "session.create", id: "c", name: "cf", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
+    const refused = await handle({ type: "session.set_model", id: "sm", sessionId: created.data!.id, model: "sonnet" });
+    expect(String(refused.error)).toContain("Configured: gone-model");
+  });
+
+  test("round 1: a configured model the server marks not for chat is the owner's: offered, not listed as not-for-chat, never the default ahead of a chat one", async () => {
+    listedModels = [{ id: "embed-x", type: "embeddings" }, { id: "chat-a" }];
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "embed-x" }, { id: "chat-a" }] });
+    expect((await pickable()).ids).toEqual(["embed-x", "chat-a"]);
+    const t = await handle({ type: "endpoints.test", id: "t", name: "box" });
+    expect("notChat" in t).toBe(false);
+    const created = (await handle({ type: "session.create", id: "c", name: "nc", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
+    await handle({ type: "session.attach", id: "a", sessionId: created.data!.id });
+    await handle({ type: "session.send", id: "m1", sessionId: created.data!.id, text: "hi" });
+    await waitFor(() => assistantTexts().length === 1);
+    expect(assistantTexts()[0]).toBe("hello from chat-a");
+  });
+
+  test("round 1: ids with terminal controls, invisible or direction marks are dropped, and can't be picked", async () => {
+    listedModels = [{ id: "ok-model" }, { id: "evil\u009b2J" }, { id: "bidi\u202egnp.exe" }, { id: "zw\u200bsp" }, { id: "line\u2028sep" }];
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey });
+    expect((await pickable()).ids).toEqual(["ok-model"]);
+    const created = (await handle({ type: "session.create", id: "c", name: "ct", workdir: dir, providerId: "oai:box" })) as { data?: SessionInfo };
+    for (const model of ["evil\u009b2J", "bidi\u202egnp.exe"]) {
+      const r = await handle({ type: "session.set_model", id: "sm", sessionId: created.data!.id, model });
+      expect(String(r.error)).toContain("isn't a model id");
+    }
+  });
+
+  test("round 1: a FIFO, a link or a huge file at the kept-lists path never hangs or misleads the daemon", async () => {
+    await handle({ type: "endpoints.set", id: "s", name: "box", baseUrl: baseUrl(), apiKey: validKey, models: [{ id: "cfg" }] });
+    const kept = join(dir, "endpoint-models.json");
+    expect(spawnSync("mkfifo", [kept]).status).toBe(0);
+    modelsUp = false;
+    const restarted = new SessionManager(store, transcript, undefined, undefined, undefined, { endpoints: storeAt() });
+    const started = Date.now();
+    const r = (await restarted.handle({ type: "models.list", id: "m", provider: "oai:box" }, AUTH, { ...client })) as unknown as { models: Array<{ value: string }> };
+    expect(Date.now() - started).toBeLessThan(4000);
+    expect(r.models.map((m) => m.value)).toEqual(["cfg"]);
+    rmSync(kept);
+    writeFileSync(join(dir, "elsewhere.json"), JSON.stringify({ version: 1, endpoints: {} }));
+    symlinkSync(join(dir, "elsewhere.json"), kept);
+    const viaLink = new SessionManager(store, transcript, undefined, undefined, undefined, { endpoints: storeAt() });
+    const r2 = (await viaLink.handle({ type: "models.list", id: "m", provider: "oai:box" }, AUTH, { ...client })) as unknown as { models: Array<{ value: string }> };
+    expect(r2.models.map((m) => m.value)).toEqual(["cfg"]);
   });
 
   test("endpoints.test: a stored endpoint, a draft, a rejected key, llama.cpp's window", async () => {

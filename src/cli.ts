@@ -887,8 +887,8 @@ function printTestResult(resp: DaemonMessage | undefined): void {
   if (models.length > 30) console.log(`    … and ${models.length - 30} more`);
   if (notChat.size) console.log(`  not for chat (not offered): ${[...notChat].join(", ")}`);
   if (resp.notServed?.length) {
-    console.log(`  configured but not served any more (not offered): ${resp.notServed.join(", ")}`);
-    console.log("    remove or rename them: codeoid endpoint set <name> … --model <id>");
+    console.log(`  configured, not listed by the server: ${resp.notServed.join(", ")}`);
+    console.log("    still offered, marked (a gateway can serve an alias it doesn't list); remove any it no longer serves: codeoid endpoint set <name> … --model <id>");
   }
 }
 
@@ -912,7 +912,7 @@ endpoint
   .requiredOption("--base-url <url>", "the OpenAI-compatible base URL, usually ending in /v1 (https, or http for localhost / a private network)")
   .option("--display-name <label>", "label in pickers")
   .option("--flavor <flavor>", "openai | llamacpp (llama-server: live context window from /props, strict tool schemas)")
-  .option("--model <id[:context[:maxTokens]]>", "settings for a model it serves, repeatable (e.g. qwen3-coder:128k): a context window and output cap by id. Pickers offer what the server lists; these stand in only when its list can't be read", collect, [] as string[])
+  .option("--model <id[:context[:maxTokens]]>", "a model to offer first, with its settings, repeatable (e.g. qwen3-coder:128k): a context window and output cap by id. Pickers also offer every other chat model the server lists", collect, [] as string[])
   .option("--default-model <id>", "the model new sessions use")
   .option("--context <tokens>", "context window for models without their own (e.g. 32k)")
   .option("--key", "set the API key (asked for without echo, or read from stdin)")

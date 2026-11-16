@@ -49,10 +49,11 @@ import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcp
 import { BackendLoginBroker, BackendLoginError, type LoginOutcome, redact } from "./auth/backend-login.js";
 import { ClaudeAccountError, ClaudeAccountStore } from "./claude-accounts.js";
 import { AccountError, type AccountStore, LOGIN_KINDS, validateAccountName } from "./accounts.js";
-import { configuredContextWindow, draftConnection, EndpointError, EndpointStore } from "./openai-endpoints.js";
+import { configuredContextWindow, draftConnection, EndpointError, EndpointStore, isSafeModelId } from "./openai-endpoints.js";
 import {
   EndpointCatalog,
   fetchListedModels,
+  type ModelsSource,
   notServed,
   fetchLlamaCppContext,
   syncEndpointProviders,
@@ -2547,11 +2548,12 @@ mcpHub: this.#mcpHub,
    * (briefly cached); it reports none through `onModels`, so its
    * `#currentModels` would always be empty.
    */
-  async #pickableModels(providerId: string): Promise<{ models: ModelInfo[]; live: boolean }> {
+  async #pickableModels(providerId: string): Promise<{ models: ModelInfo[]; live: boolean; source?: ModelsSource }> {
     const endpoint = endpointNameOf(providerId);
     if (endpoint === null) return this.#currentModels(providerId);
-    const { models, live } = await this.#endpointCatalog.models(endpoint);
+    const { models, live, source } = await this.#endpointCatalog.models(endpoint);
     return {
+      source,
       models: models.map((m) => ({
         value: m.id,
         displayName: m.displayName,
@@ -3511,7 +3513,9 @@ mcpHub: this.#mcpHub,
       // Over the stored endpoint's own connection, the answer is its model list now,
       // and its configured models can be checked against it (a draft's can't).
       const own = existing ? this.#endpointCatalog.remember(existing.name, conn.fingerprint, listed) : false;
-      const notChat = listed.filter((m) => !m.chat).map((m) => m.id);
+      // A configured model is offered whatever the server marks it (the owner's choice): not listed as one that isn't.
+      const configured = new Set(own && existing ? existing.models.map((m) => m.id) : []);
+      const notChat = listed.filter((m) => !m.chat && !configured.has(m.id)).map((m) => m.id);
       const stale = own && existing ? notServed(existing, listed) : [];
       return {
         type: "endpoints.test.result",
@@ -10025,7 +10029,7 @@ mcpHub: this.#mcpHub,
     if (endpoint !== null && !this.#safeEndpoint(endpoint)) {
       return { type: "response.error", requestId: msg.id, error: `The endpoint "${endpoint}" no longer exists: switch the session to another backend.`, code: "invalid_request" };
     }
-    const { models } = await this.#pickableModels(providerId);
+    const { models, source } = await this.#pickableModels(providerId);
     // The backend changed while the list was fetched: a pick checked against the old one isn't the new one's.
     if (session.providerId !== providerId) {
       return { type: "response.error", requestId: msg.id, error: "The session's backend changed while the model was being checked: pick again.", code: "invalid_request" };
@@ -10048,8 +10052,8 @@ mcpHub: this.#mcpHub,
           endpoint === null
             ? `Unknown model "${msg.model}". Available: ${listed}`
             : invalid
-              ? `${JSON.stringify(msg.model)} isn't a model id: one line, at most 256 characters, no control characters.`
-              : `"${msg.model}" is a Claude model, not one this endpoint serves. ${served ? `It serves: ${served}. ` : ""}Any other model id is passed to the server.`,
+              ? `${JSON.stringify(msg.model)} isn't a model id: one line, at most 256 characters, no control, invisible or direction-changing characters.`
+              : `"${msg.model}" is a Claude model, not one this endpoint serves. ${served ? `${source === "configured" ? "Configured" : "It serves"}: ${served}. ` : ""}Any other model id is passed to the server.`,
         code: "invalid_request",
       };
     }
@@ -11079,9 +11083,9 @@ function referenceFolder(p: string): string {
   }
 }
 
-/** A model id an endpoint may be sent: the endpoint store's own rule (openai-endpoints.ts validateModels). */
+/** A model id an endpoint may be sent: the same rule as for the ids its server lists (openai-endpoints.ts isSafeModelId). */
 function isEndpointModelId(id: string): boolean {
-  return id.length > 0 && id.length <= 256 && !/[\x00-\x1f\x7f]/.test(id);
+  return isSafeModelId(id);
 }
 
 /** Claude's ids in every form a gateway may name them: the catalog's, `claude-*`, Bedrock's `[region.]anthropic.claude-*`. */

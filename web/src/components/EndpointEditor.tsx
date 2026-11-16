@@ -316,8 +316,8 @@ export const EndpointEditor: Component<{ existing?: EndpointInfo; onDone: () => 
 
       <div class="space-y-1">
         <div class="flex items-center justify-between">
-          <span class={label} title="Pickers offer what the server lists. A model here adds a label, a context window or an output cap to it, and the list stands in only when the server's can't be read.">
-            Model settings (optional — the server's list decides what's offered)
+          <span class={label} title="Pickers offer these first, with their settings (label, context window, output cap), then every other chat model the server lists. One the server doesn't list is offered marked.">
+            Models to offer first (optional — the server's other models are offered too)
           </span>
           <div class="flex gap-2">
             <button type="button" class={button} onClick={() => setModels([...models(), { id: "", name: "", contextWindow: "", maxTokens: "" }])}>
@@ -440,7 +440,7 @@ export const TestOutcome: Component<{ test?: EndpointsTestResultMsg | "running" 
         {t().ok ? testSummary(t()) : `✗ ${t().error ?? "no answer"}`}
         <Show when={t().ok && t().notServed?.length}>
           <div class="text-warn">
-            Configured but not served any more: {t().notServed!.join(", ")} — not offered; remove or rename them.
+            Configured, not listed by the server: {t().notServed!.join(", ")} — still offered, marked (a gateway can serve an alias it doesn't list); remove any it no longer serves.
           </div>
         </Show>
       </div>

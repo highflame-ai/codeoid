@@ -87,6 +87,20 @@ const NAME_RE = /^[a-z0-9][a-z0-9-]{0,39}$/;
 /** RFC 7230 token characters — a header name can't carry a separator or a newline. */
 const HEADER_NAME_RE = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
 const CONTROL_CHARS = /[\x00-\x1f\x7f]/;
+
+/**
+ * What a model id a server lists, or a user picks, may not hold: C0 and C1
+ * controls (U+009B is a terminal's CSI), zero-width and bidi marks (they
+ * disguise which id is chosen), line and paragraph separators. Stored
+ * configuration keeps its own, older rule (CONTROL_CHARS), so no saved
+ * endpoint stops loading.
+ */
+export const UNSAFE_MODEL_ID_CHARS = /[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2066-\u2069\ufeff]/;
+
+/** A model id safe to offer, print and send: one line, 1–256 characters, nothing in {@link UNSAFE_MODEL_ID_CHARS}. */
+export function isSafeModelId(id: unknown): id is string {
+  return typeof id === "string" && id.length > 0 && id.length <= 256 && !UNSAFE_MODEL_ID_CHARS.test(id);
+}
 /** Headers the HTTP client owns; setting them would break or smuggle the request. */
 const RESERVED_HEADERS = new Set(["host", "content-length", "content-type", "transfer-encoding", "connection", "accept-encoding"]);
 const MIN_CONTEXT = 256;

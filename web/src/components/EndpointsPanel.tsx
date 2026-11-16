@@ -117,7 +117,7 @@ const EndpointRow: Component<{
 }> = (props) => {
   const e = () => props.endpoint;
   const models = () =>
-    e().models.length ? `models from the server · ${e().models.length} with settings` : "models from the server";
+    e().models.length ? `${e().models.length} configured + the server's models` : "models from the server";
   return (
     <div class="space-y-1 px-3 py-2">
       <div class="flex items-center gap-3">

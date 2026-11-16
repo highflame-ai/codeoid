@@ -17,7 +17,7 @@ export function formatEndpoints(endpoints: readonly EndpointInfo[]): string {
     lines.push(`  ${title}`);
     lines.push(`      ${e.baseUrl}  [${e.flavor}]  key: ${e.hasApiKey ? "set" : "none"}${e.headerNames.length ? `  headers: ${e.headerNames.join(", ")}` : ""}`);
     const settings = e.models.length
-      ? `  settings for: ${e.models.map((m) => `${m.id}${m.contextWindow ? ` (${formatTokens(m.contextWindow)})` : ""}`).join(", ")}`
+      ? `, first: ${e.models.map((m) => `${m.id}${m.contextWindow ? ` (${formatTokens(m.contextWindow)})` : ""}`).join(", ")}`
       : "";
     lines.push(`      models: from the server${settings}${e.defaultModel ? `  default: ${e.defaultModel}` : ""}`);
     const mcp = e.mcpServers === "all" ? "all" : e.mcpServers.length ? e.mcpServers.join(", ") : "none";
