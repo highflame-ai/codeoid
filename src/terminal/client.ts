@@ -547,6 +547,7 @@ export class TerminalClient {
       return;
     }
     console.log(`Trusted: agents may push from ${sanitizeTerminalOutput(data.repository ?? "")} to ${data.remote}, at ${sanitizeTerminalOutput(data.url ?? "")}, autonomous mode included — as long as that and these settings stay as they are now.`);
+    console.log("  A pushed branch runs the repository's CI as that branch defines it (pipeline files an agent wrote included), with the CI's secrets.");
     if (data.configuredUrl) console.log(`  (the remote's config says ${sanitizeTerminalOutput(data.configuredUrl)}; a URL rewrite in your git config sends it to the address above)`);
     for (const x of data.settings ?? []) console.log(`  repository setting: ${sanitizeTerminalOutput(x)}`);
   }

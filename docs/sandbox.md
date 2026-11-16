@@ -1351,6 +1351,10 @@ Also refused:
 
 - a remote with more than one push URL;
 - a URL that isn't ssh or https;
+- an ssh or https URL whose host git and the card would read differently: a
+  `\`, `?`, `#` or `%` before the path, or more than one `@`
+  (`https://github.com\@elsewhere/…` is github.com to a URL parser and
+  `elsewhere` to git);
 - a repository that borrows objects from elsewhere (`objects/info/alternates`).
 
 The remote is asked which branch is its default only after your trust matched,
@@ -1362,6 +1366,15 @@ push; in guarded mode it goes ahead (you approved it), and the result says so.
 **How git runs**
 
 It runs hardened (`git-env.ts`):
+
+- On a PATH with nothing any sandboxed session may write, and no relative
+  entries, so `ssh` and credential helpers are never an agent's program. An
+  ssh command (`core.sshCommand`, `GIT_SSH_COMMAND`) or credential helper given
+  by a path in such a directory is refused.
+- With your config as it applies to the session's repository. A setting an
+  `includeIf "gitdir:…"` or `onbranch:` include of yours makes there (a work
+  identity's `credential.*`, `http.*`) is handed to the push, which runs from
+  codeoid's own staging repository where that include wouldn't apply.
 
 - No hooks, so neither `pre-push` nor git-lfs's run. LFS objects aren't
   uploaded: push those yourself.
@@ -1376,6 +1389,16 @@ It runs hardened (`git-env.ts`):
   limit: push that one yourself.
 
 Remote output is shown with URLs redacted.
+
+**Pushing runs CI**
+
+A pushed branch runs the repository's CI as that branch defines it:
+GitHub Actions `on: push`, `.gitlab-ci.yml`, `bitbucket-pipelines.yml`,
+including pipeline files the agent wrote, with the CI's secrets. Trusting a
+remote lets an autonomous agent do that without asking. The card and
+`codeoid sandbox trust-push` say so. Trust only remotes whose CI secrets you'd
+let the agent's code use, or protect them there (environments that need an
+approval, secrets for protected branches only).
 
 **Who decides**
 
@@ -1404,7 +1427,8 @@ running, and the stop is audited.
 `push` is offered only where it works: a sandboxed session, with pushing on.
 That holds over `/mcp/sandbox` too.
 
-Every request, refusal, approval, trust and result is audited:
+Every request, refusal (codeoid's own, before or during the push), approval,
+trust and result is audited:
 `session.push_request`, `session.push_refused`, `session.push_denied`,
 `session.push_trusted`, `session.push_done`, `session.push_failed`,
 `sandbox.push_trusted` and `sandbox.push_untrusted`. Each is also said in the transcript.

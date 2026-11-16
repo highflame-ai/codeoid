@@ -4296,7 +4296,9 @@ export class Session {
       const PUSH = "Push";
       const TRUST = `Push, and trust ${plan.shownUrl} for this repository's agent pushes (autonomous mode too)`;
       const NO = "Don't push";
-      const firstTime = trusted ? "" : `\n\nYou haven't trusted agent pushes from this repository to this URL yet.`;
+      const firstTime = trusted
+        ? ""
+        : `\n\nYou haven't trusted agent pushes from this repository to this URL yet. A trust lets autonomous agents push here without asking: a pushed branch runs the repository's CI as that branch defines it (a workflow the agent wrote included), with the CI's secrets.`;
       const answer = await this.requestUserInput(
         {
           method: "select",
@@ -4361,8 +4363,16 @@ export class Session {
       makeBundle: (repo, ref, dest) => this.#bundleInSandbox(sbx, repo, ref, dest, Math.max(1_000, Math.min(120_000, leftMs) / 2), signal),
       // The default branch is asked only now: after the owner's trust or answer, so nobody untrusted is contacted.
       checkDefault: this.#mode === "autonomous" ? "refuse-unknown" : "allow-unknown",
+      // The push runs on the host: no program from what a session may write (its PATH, ssh, credential helpers).
+      hostWritable: this.#pushHostWritable(sbx),
     });
     const detail = `${plan.branch} ${plan.sha} -> ${plan.shownUrl} refs/heads/${plan.branch}: ${r.summary}`;
+    if (r.refused) {
+      const why = r.summary.replace(/^refused: /, "");
+      this.#store.audit(by, "session.push_refused", this.id, detail.slice(0, 2000));
+      note(`⬆ The agent asked to push ${plan.branch} to ${plan.remote}: refused (${why})`, "sandbox.push_refused", { branch: plan.branch });
+      return `Refused: ${why}.`;
+    }
     this.#store.audit(by, r.ok ? "session.push_done" : "session.push_failed", this.id, detail.slice(0, 2000));
     note(`⬆ ${r.ok ? "Pushed" : "Push failed"}: ${plan.branch} → ${plan.remote} (${plan.shownUrl}) — ${r.summary}`, r.ok ? "sandbox.pushed" : "sandbox.push_failed", {
       branch: plan.branch,
@@ -4416,11 +4426,15 @@ export class Session {
    * system's alone, never a `git` the agent's commands could put first on a PATH, nor one in what they may write.
    */
   #sandboxGitBin(sbx: SessionSandbox): { bin: string; env: Record<string, string> } | { error: string } {
-    const spec = sbx.runtime?.spec;
-    const writable = [...this.sandboxAgentWritable, sbx.tempDirPath ?? "", ...(spec ? [spec.workspace, spec.tempDir, ...spec.writable] : []), ...(this.#otherSessionsWritable?.() ?? [])];
-    const problem = gitBinProblem(GIT_BIN, writable);
+    const problem = gitBinProblem(GIT_BIN, this.#pushHostWritable(sbx));
     if (problem) return { error: problem };
     return { bin: GIT_BIN, env: gitEnv({ LANG: "C", PATH: [dirname(GIT_BIN), "/usr/bin", "/bin"].join(":") }) };
+  }
+
+  /** Everything this session's and every other sandboxed session's commands may write: no program the push runs is there. */
+  #pushHostWritable(sbx: SessionSandbox): string[] {
+    const spec = sbx.runtime?.spec;
+    return [...this.sandboxAgentWritable, sbx.tempDirPath ?? "", ...(spec ? [spec.workspace, spec.tempDir, ...spec.writable] : []), ...(this.#otherSessionsWritable?.() ?? [])].filter(Boolean);
   }
 
   /** A read-only git query inside this session's sandbox ({@link RefGit}: null when git said no, thrown when it couldn't run). */

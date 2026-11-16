@@ -112,6 +112,8 @@ export interface PushPlan {
   repoSettings: string[];
   /** The same from your global and system config (no include lines). */
   userSettings: string[];
+  /** Your config's connection and credential entries where the push was planned, in order ({@link CARRIED}). */
+  userEntries: Array<[string, string]>;
   /** A linked worktree's own git dir, else null (its refs are checked for links too). */
   own: string | null;
   /** The remote's URL as configured, when a rewrite of yours makes {@link url} differ; else null. */
@@ -251,7 +253,23 @@ function includeProblem(e: OriginEntry, repo: string, agentWritable: readonly st
 export function pushUrlProblem(url: string): string | null {
   if (/[\x00-\x20\x7f]/.test(url)) return "it holds spaces or control characters";
   if (url.startsWith("-")) return "it starts with -";
-  if (/^https:\/\//i.test(url) || /^ssh:\/\//i.test(url)) return null;
+  const scheme = /^(https|ssh):\/\/([^/]*)/i.exec(url);
+  if (scheme) {
+    // The authority as git and curl read it (user info to the last @, then host[:port]) must be what a URL parser
+    // reads, which is what the card shows: `https://github.com\@elsewhere/` is github.com to one, elsewhere to the other.
+    const authority = scheme[2] ?? "";
+    if (/[\\?#%]/.test(authority) || (authority.match(/@/g)?.length ?? 0) > 1) return "its host part has characters git and the card would read differently";
+    const hostPort = authority.slice(authority.lastIndexOf("@") + 1);
+    const host = hostPort.startsWith("[") ? hostPort.slice(0, hostPort.indexOf("]") + 1) : (hostPort.split(":")[0] ?? "");
+    let parsed: string;
+    try {
+      parsed = new URL(url).hostname;
+    } catch {
+      return "it isn't a URL";
+    }
+    if (!host || host.toLowerCase() !== parsed.toLowerCase()) return "its host isn't what the card would show";
+    return null;
+  }
   // scp-like: [user@]host:path, no scheme, the host before the first colon has no slash.
   if (/^(?:[A-Za-z0-9._~-]+@)?[A-Za-z0-9.-]+:(?!\/\/)[^\s]+$/.test(url)) return null;
   return "only ssh and https remotes are pushed to";
@@ -287,6 +305,8 @@ export interface PushTarget {
   repoSettings: string[];
   /** What your global and system config say that decides a push (no include lines): part of a trust too. */
   userSettings: string[];
+  /** Your config's connection and credential entries where the push was planned, in order ({@link CARRIED}). */
+  userEntries: Array<[string, string]>;
 }
 
 /**
@@ -365,8 +385,17 @@ export async function readPushTarget(
     sshCommand,
     repoSettings: settings((sc) => !USER_SCOPES.has(sc)),
     userSettings: settings((sc) => sc === "global" || sc === "system"),
+    userEntries: entries.filter((e) => (e.scope === "global" || e.scope === "system") && CARRIED.test(e.key)).map((e) => [e.key, e.value] as [string, string]),
   };
 }
+
+/**
+ * Your config entries that the push takes as they were where it was planned (the session's repository), in order:
+ * how it authenticates and connects. An `includeIf "gitdir:…"` or `onbranch:` include applies there, not in the
+ * daemon's staging repository, so what it set is handed to the push itself. Where it goes (remote.*, url.*) is
+ * pinned already; the ssh command is passed as itself; push.* is the push's own.
+ */
+const CARRIED = /^(?:https?\.[\s\S]*|credential\.[\s\S]*|ssh\.variant|protocol\.[\s\S]*)$/i;
 
 /** The plan for a push from `repo`, or why it is refused. */
 export async function planPush(repoDir: string, input: PushInput, opts: PlanOptions): Promise<PushPlan | { refused: string }> {
@@ -405,7 +434,7 @@ export async function planPush(repoDir: string, input: PushInput, opts: PlanOpti
       return refuse(`${branch} is the remote's default branch: push your work to a branch of its own, and open a pull request`);
     }
   }
-  return { repo, common, own, sshCommand, defaultUnknown, branch, sha, remote, url, configuredUrl, shownUrl: shownUrl(url), repoSettings, userSettings };
+  return { repo, common, own, sshCommand, defaultUnknown, branch, sha, remote, url, configuredUrl, shownUrl: shownUrl(url), repoSettings, userSettings, userEntries: target.userEntries };
 }
 
 /** What an owner's trust in a repository's remote records (the store's `push_trust`). */
@@ -526,6 +555,8 @@ export async function remoteDefaultBranch(url: string, cwd: string, timeoutMs = 
 
 export interface PushResult {
   ok: boolean;
+  /** Not pushed because codeoid refused it (not a failure of git or the remote). */
+  refused?: boolean;
   /** What happened, one line. */
   summary: string;
   /** git's output, redacted and capped. */
@@ -551,8 +582,49 @@ export interface RunOptions {
    * read (autonomous mode), `allow-unknown` goes on and says so (the owner approved it); absent: not asked.
    */
   checkDefault?: "refuse-unknown" | "allow-unknown";
+  /**
+   * Everything any session's sandboxed commands may write. The push runs on the host with your credentials: its
+   * PATH keeps none of these, and an ssh command or credential helper in one is refused.
+   */
+  hostWritable?: readonly string[];
   /** Tests only: a local bare repository as the remote. */
   _testFileRemote?: boolean;
+}
+
+/** What `planned` (your entries where the push was planned) has that `here` (in the staging repository) doesn't, in order. */
+export function carriedEntries(planned: ReadonlyArray<[string, string]>, here: ReadonlyArray<[string, string]>): Array<[string, string]> {
+  const left = new Map<string, number>();
+  for (const [k, v] of here) left.set(`${k}\0${v}`, (left.get(`${k}\0${v}`) ?? 0) + 1);
+  const out: Array<[string, string]> = [];
+  for (const [k, v] of planned) {
+    const n = left.get(`${k}\0${v}`) ?? 0;
+    if (n > 0) left.set(`${k}\0${v}`, n - 1);
+    else out.push([k, v]);
+  }
+  return out;
+}
+
+/** The daemon's PATH without anything in `writable` (and without relative entries), git's own dir first. */
+export function safePathFor(writable: readonly string[], path = process.env.PATH ?? ""): string {
+  const out = [dirname(GIT_BIN)];
+  for (const e of path.split(":")) {
+    if (!e || !isAbsolute(e) || out.includes(e)) continue;
+    if (programProblem(join(e, "x"), writable)) continue;
+    out.push(e);
+  }
+  return out.join(":");
+}
+
+/** Why the program a command line starts (`ssh -i …`, `!helper`, `/path/to/helper`) can't run for the push, or null. */
+export function commandProblem(command: string, writable: readonly string[]): string | null {
+  const first = command.trim().replace(/^!/, "").trim().split(/\s+/)[0]?.replace(/^["']|["']$/g, "") ?? "";
+  if (!first || !isAbsolute(first)) return null;
+  return programProblem(first, writable) ? `${first} is in a directory a session's commands may write` : null;
+}
+
+function programProblem(program: string, writable: readonly string[]): boolean {
+  const real = physicalPath(program);
+  return writable.filter(Boolean).some((w) => within(w, program) || within(w, real) || within(physicalPath(w), real) || within(physicalPath(w), program));
 }
 
 /** A staging dir older than this is a push a stopped daemon left behind (a push takes minutes at most). */
@@ -721,6 +793,13 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
   const deadline = Date.now() + timeoutMs;
   const left = () => Math.max(1_000, deadline - Date.now());
   if (o.signal?.aborted) return { ok: false, summary: "not pushed: the session is closing", output: "" };
+  const writable = o.hostWritable ?? [];
+  const path = o.hostWritable ? safePathFor(writable) : undefined;
+  const programs = [plan.sshCommand, process.env.GIT_SSH_COMMAND, process.env.GIT_SSH, ...plan.userEntries.filter(([k]) => /^credential\.([\s\S]+\.)?helper$/i.test(k)).map(([, v]) => v)];
+  for (const c of programs) {
+    const bad = c ? commandProblem(c, writable) : null;
+    if (bad) return { ok: false, refused: true, summary: `refused: the push would run ${bad}`, output: "" };
+  }
   const rootProblem = stagingRootProblem(o.stagingRoot);
   if (rootProblem) return { ok: false, summary: `not pushed: ${rootProblem}`, output: "" };
   sweepStaging(o.stagingRoot);
@@ -729,12 +808,13 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
     // 1. The bundle, made where the agent's links lead nowhere.
     const bundle = join(stage, "push.bundle");
     const made = await o.makeBundle(plan.repo, `refs/heads/${plan.branch}`, bundle).catch((e: unknown) => (e instanceof Error ? e.message : String(e)));
-    if (made) return { ok: false, summary: `refused: the branch couldn't be bundled in the session's sandbox (${made})`, output: "" };
+    if (made) return { ok: false, refused: true, summary: `refused: the branch couldn't be bundled in the session's sandbox (${made})`, output: "" };
     if (o.signal?.aborted) return { ok: false, summary: "not pushed: the session is closing", output: "" };
     // 2. A repository of the daemon's own, holding just that branch.
     const repo = join(stage, "repo.git");
+    const carried: Array<[string, string]> = [];
     const local = async (args: string[]) => {
-      const r = await runGit(args, stage, left(), { sshCommand: null, signal: o.signal });
+      const r = await runGit(args, stage, left(), { sshCommand: null, signal: o.signal, path });
       if (r.code !== 0) throw new Error(shownOutput(r.stderr).split("\n")[0] || `git ${args[0]} failed`);
       return r.stdout;
     };
@@ -742,25 +822,28 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
       // A bundle, by its header, and nothing else: a fetch would take any other file as a path to a repository (a
       // gitfile naming one the sandbox hides), so it is unbundled, which reads only a bundle.
       const header = readBundleHeader(bundle);
-      if ("problem" in header) return { ok: false, summary: `refused: what the session's sandbox made isn't a plain git bundle (${header.problem})`, output: "" };
+      if ("problem" in header) return { ok: false, refused: true, summary: `refused: what the session's sandbox made isn't a plain git bundle (${header.problem})`, output: "" };
       if ((header.format === "sha256") !== (plan.sha.length === 64)) return { ok: false, summary: "refused: the bundle's object format isn't the repository's", output: "" };
       await local(["-c", "init.templateDir=", "init", "-q", "--bare", `--object-format=${header.format}`, repo]);
       const listed = await local(["--git-dir", repo, "bundle", "unbundle", bundle, `refs/heads/${plan.branch}`]);
       const tip = /^([0-9a-f]{40,64}) refs\/heads\/(\S+)$/m.exec(listed);
-      if (!tip?.[1] || tip[2] !== plan.branch) return { ok: false, summary: `refused: the bundle the session's sandbox made doesn't hold ${plan.branch}`, output: "" };
+      if (!tip?.[1] || tip[2] !== plan.branch) return { ok: false, refused: true, summary: `refused: the bundle the session's sandbox made doesn't hold ${plan.branch}`, output: "" };
       await local(["--git-dir", repo, "update-ref", `refs/heads/${plan.branch}`, tip[1]]);
       // The checked commit, or one the agent made on top of it since (only the checked one is pushed, from here).
       const holds =
         tip[1] === plan.sha ||
         (await runGit(["--git-dir", repo, "merge-base", "--is-ancestor", plan.sha, tip[1]], stage, left(), { sshCommand: null, signal: o.signal })).code === 0;
       // No commit id in it: the agent reads this.
-      if (!holds) return { ok: false, summary: `refused: ${plan.branch} in the session's sandbox doesn't have the commit that was checked (it moved): ask again`, output: "" };
+      if (!holds) return { ok: false, refused: true, summary: `refused: ${plan.branch} in the session's sandbox doesn't have the commit that was checked (it moved): ask again`, output: "" };
       await local(["--git-dir", repo, "config", "remote.target.url", plan.url]);
       // Where git will push from here, after your rewrites: the plan's URL, or nothing is pushed.
       const there = (await local(["--git-dir", repo, "remote", "get-url", "--push", "target"])).trim();
-      if (there !== plan.url) return { ok: false, summary: `refused: your git config rewrites ${shownUrl(plan.url)} again (to ${shownUrl(there)})`, output: "" };
+      if (there !== plan.url) return { ok: false, refused: true, summary: `refused: your git config rewrites ${shownUrl(plan.url)} again (to ${shownUrl(there)})`, output: "" };
+      // What your config set where the push was planned and doesn't set here (an includeIf), handed to the push.
+      const here = (await config(repo, DECIDING_GIT)).filter((e) => (e.scope === "global" || e.scope === "system") && CARRIED.test(e.key));
+      carried.push(...carriedEntries(plan.userEntries, here.map((e) => [e.key, e.value] as [string, string])));
     } catch (err) {
-      return { ok: false, summary: `refused: the branch couldn't be staged for the push (${err instanceof Error ? err.message : String(err)})`, output: "" };
+      return { ok: false, refused: true, summary: `refused: the branch couldn't be staged for the push (${err instanceof Error ? err.message : String(err)})`, output: "" };
     }
     // 3. The remote's default branch, asked from here (never from the agent's repository and its legacy remotes files).
     let defaultUnknown = false;
@@ -768,16 +851,19 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
       const r = await runGit(["--git-dir", repo, "ls-remote", "--symref", "target", "HEAD"], stage, Math.min(30_000, left()), {
         sshCommand: plan.sshCommand,
         signal: o.signal,
+        path,
+        carried,
         ...(o._testFileRemote ? { protocol: "file" as const } : {}),
       });
       const head = r.code === 0 ? /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(r.stdout)?.[1] : undefined;
       if (head && head.toLowerCase() === plan.branch.toLowerCase()) {
-        return { ok: false, summary: `refused: ${plan.branch} is the remote's default branch: push your work to a branch of its own, and open a pull request`, output: "" };
+        return { ok: false, refused: true, summary: `refused: ${plan.branch} is the remote's default branch: push your work to a branch of its own, and open a pull request`, output: "" };
       }
       if (!head) {
         if (o.checkDefault === "refuse-unknown") {
           return {
             ok: false,
+            refused: true,
             summary: `refused: codeoid couldn't ask ${plan.shownUrl} which branch is its default, so it can't be sure ${plan.branch} isn't it: try again, or ask the owner to push`,
             output: "",
           };
@@ -791,7 +877,7 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
       ["--git-dir", repo, "push", "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", "--end-of-options", "target", `${plan.sha}:refs/heads/${plan.branch}`],
       stage,
       left(),
-      { sshCommand: plan.sshCommand, signal: o.signal, ...(o._testFileRemote ? { protocol: "file" as const } : {}) },
+      { sshCommand: plan.sshCommand, signal: o.signal, path, carried, ...(o._testFileRemote ? { protocol: "file" as const } : {}) },
     );
     const output = shownOutput(`${r.stdout}\n${r.stderr}`);
     const unknownNote = defaultUnknown ? " (the remote didn't say which branch is its default)" : "";
@@ -840,16 +926,21 @@ async function runGit(
   args: string[],
   cwd: string,
   timeoutMs: number,
-  o: { sshCommand: string | null; signal?: AbortSignal; protocol?: "file" },
+  o: { sshCommand: string | null; signal?: AbortSignal; protocol?: "file"; path?: string; carried?: ReadonlyArray<readonly [string, string]> },
 ): Promise<{ code: number | null; stdout: string; stderr: string; timedOut: boolean; aborted: boolean }> {
-  const env = await safeGitEnv(cwd, { network: true, overrides: PUSH_OVERRIDES });
+  const env = await safeGitEnv(cwd, { network: true, overrides: [...(o.carried ?? []), ...PUSH_OVERRIDES] });
+  if (o.path !== undefined) env.PATH = o.path;
   if (o.signal?.aborted) return { code: null, stdout: "", stderr: "", timedOut: false, aborted: true };
   // A local bundle into the daemon's own repository (and tests' local remotes): that protocol alone.
   if (o.protocol) env.GIT_ALLOW_PROTOCOL = o.protocol;
   // How ssh runs: your environment's GIT_SSH_COMMAND / GIT_SSH first (as git itself ranks them), then your own
   // core.sshCommand (planPush took it from your global or system config only), else ssh that never waits for a
   // person (a host-key or passphrase prompt) and gives up on a dead host. The time limit bounds any of them.
-  if (!env.GIT_SSH_COMMAND && !env.GIT_SSH) env.GIT_SSH_COMMAND = o.sshCommand ?? "ssh -o BatchMode=yes -o ConnectTimeout=20";
+  if (!env.GIT_SSH_COMMAND && !env.GIT_SSH) {
+    // ssh by its full path on that PATH: never one found first in a directory a session writes.
+    const ssh = o.path !== undefined && typeof Bun !== "undefined" ? (Bun.which("ssh", { PATH: o.path }) ?? "ssh") : "ssh";
+    env.GIT_SSH_COMMAND = o.sshCommand ?? `${ssh} -o BatchMode=yes -o ConnectTimeout=20`;
+  }
   return new Promise((done) => {
     const child = spawn(GIT_BIN, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
     let stdout = "";

@@ -8,7 +8,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { GIT_BIN } from "../daemon/git-env.js";
 import { isPushTool, isSafeTool } from "../daemon/providers/tool-safety.js";
 import { branchMatches, bundleFromChild, cleanPushInput, planPush, pushUrlProblem, type RunOptions, runPush, shownUrl, type PushPlan } from "../daemon/sandbox/push.js";
 import { SandboxMcpHttp } from "../daemon/sandbox/request-directory.js";
@@ -231,6 +232,50 @@ describe("push: the plan", () => {
       },
     });
     expect(broken).toEqual({ refused: "the session's sandbox couldn't run git to read the branch (git: not found)" });
+  });
+
+  test("round 8: a URL whose host git and the card read differently is refused", () => {
+    for (const url of ["https://github.com\\@evil.example/o/r.git", "https://github.com:443\\@evil.example/o/r.git", "https://evil.example?@github.com/o/r.git", "https://evil.example#@github.com/o/r.git", "https://a@b@github.com/o/r.git", "https://gith%75b.com/o/r.git", "ssh://git@github.com\\@evil.example/o/r.git"]) {
+      expect([url, pushUrlProblem(url)]).toEqual([url, expect.any(String)]);
+    }
+    for (const url of ["https://github.com/o/r.git", "https://user@bitbucket.org/t/r.git", "ssh://git@host:2222/x.git", "https://[::1]:8443/x.git"]) expect([url, pushUrlProblem(url)]).toEqual([url, null]);
+  });
+
+  test("round 8: an includeIf of your config applies to the push as where it was planned; nothing it set is dropped or doubled", async () => {
+    const { carriedEntries } = await import("../daemon/sandbox/push.js");
+    const inc = join(root, "work.gitconfig");
+    writeFileSync(inc, "[credential \"https://git.example.invalid\"]\n\tusername = work-account\n[http]\n\tsslCAInfo = /etc/work-ca.pem\n");
+    writeFileSync(join(root, ".gitconfig"), `[credential]\n\thelper = store\n[includeIf "gitdir:${repo}/"]\n\tpath = ${inc}\n`);
+    const p = await planned();
+    expect(p.userEntries).toEqual([
+      ["credential.helper", "store"],
+      ["credential.https://git.example.invalid.username", "work-account"],
+      ["http.sslcainfo", "/etc/work-ca.pem"],
+    ]);
+    // In the staging repository only the unconditional one applies: the rest is handed to the push, once.
+    expect(carriedEntries(p.userEntries, [["credential.helper", "store"]])).toEqual([
+      ["credential.https://git.example.invalid.username", "work-account"],
+      ["http.sslcainfo", "/etc/work-ca.pem"],
+    ]);
+    expect(carriedEntries([["credential.helper", ""], ["credential.helper", "x"]], [["credential.helper", "x"]])).toEqual([["credential.helper", ""]]);
+    expect(await run(p)).toMatchObject({ ok: true });
+  });
+
+  test("round 8: the push's PATH holds nothing a session may write; an ssh command or credential helper there is refused", async () => {
+    const { commandProblem, safePathFor } = await import("../daemon/sandbox/push.js");
+    const bin = join(repo, "bin");
+    expect(safePathFor([repo], `${bin}:/usr/bin:./node_modules/.bin:/bin`).split(":")).not.toContain(bin);
+    expect(safePathFor([repo], `${bin}:/usr/bin`).split(":")).toContain("/usr/bin");
+    expect(safePathFor([repo], "node_modules/.bin:.").split(":")).toEqual([dirname(GIT_BIN)]);
+    expect(commandProblem(`${bin}/ssh -i k`, [repo])).toContain("may write");
+    expect(commandProblem(`!${bin}/helper get`, [repo])).toContain("may write");
+    expect(commandProblem(`"${bin}/ssh"`, [repo])).toContain("may write");
+    expect(commandProblem("ssh -i ~/.ssh/k", [repo])).toBeNull();
+    expect(commandProblem("/usr/bin/ssh", [repo])).toBeNull();
+    // A planned ssh command in a session's writable dir: refused, flagged as a refusal (not a failure).
+    const p = { ...(await planned()), sshCommand: `${bin}/ssh` };
+    expect(await run(p, { hostWritable: [repo] })).toMatchObject({ ok: false, refused: true, summary: expect.stringContaining("may write") });
+    expect(await run(await planned(), { hostWritable: [repo] })).toMatchObject({ ok: true });
   });
 
   test("round 7: a tag named like the checked-out branch doesn't change which branch is pushed", async () => {
