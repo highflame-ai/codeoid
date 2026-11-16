@@ -4668,7 +4668,7 @@ mcpHub: this.#mcpHub,
   /** Connect `url` for `owner`: their credential proved to reach it, then recorded (an https one kept, 0600). */
   async #connectGit(owner: string, url: string, by: string, token?: string): Promise<{ kind: string; auth: string } | { error: string }> {
     if (!this.#gitGatewayInstance() || !this.#gitCredentials) return { error: "the git gateway isn't available on this daemon" };
-    const probe = await probeConnection(url, { ...(token ? { token } : {}), writable: this.#allSandboxWritable() });
+    const probe = await probeConnection(url, { ...(token ? { token } : {}), writable: this.#allSandboxWritable(), ...(testFileRemote(url) ? { testFile: true } : {}) });
     if ("error" in probe) return { error: probe.error };
     const id = connectionId(owner, url);
     if (probe.credential) this.#gitCredentials.set(id, probe.credential);
@@ -4691,7 +4691,7 @@ mcpHub: this.#mcpHub,
         const kind = upstreamKind(url);
         const bad = remoteUrlProblem(url);
         const how = `\`codeoid sandbox git connect --url ${url}\` (or from the repository: \`codeoid sandbox git connect\`)`;
-        if (!kind || bad) return { refused: `${shownUrl(url)} can't be reached for agents${bad ? `: ${bad}` : ""}` };
+        if ((!kind || bad) && !testFileRemote(url)) return { refused: `${shownUrl(url)} can't be reached for agents${bad ? `: ${bad}` : ""}` };
         const yes = await session.askToConnectGit(url, kind === "ssh" ? "your ssh key" : "your git credential for it");
         if (!yes) return { refused: `${shownUrl(url)} isn't connected for agents: the owner can connect it with ${how}` };
         const done = await this.#connectGit(owner, url, yes);
@@ -4702,13 +4702,13 @@ mcpHub: this.#mcpHub,
       const credential = conn.kind === "https" ? this.#gitCredentials?.get(connectionId(owner, url)) : undefined;
       if (conn.kind === "https" && !credential) return { refused: `the credential for ${shownUrl(url)} is gone: the owner can connect it again` };
       let ssh: string | null = null;
-      if (conn.kind === "ssh") {
+      if (conn.kind === "ssh" && !testFileRemote(url)) {
         const s = systemSsh(this.#allSandboxWritable());
         if ("problem" in s) return { refused: s.problem };
         ssh = s.path;
       }
       return {
-        upstream: { url, kind: conn.kind, ...(credential ? { credential } : {}) },
+        upstream: { url, kind: conn.kind, ...(credential ? { credential } : {}), ...(testFileRemote(url) ? { testFile: true } : {}) },
         ssh,
         protectedBranches: session.gitProtectedBranches,
         cacheKey: connectionId(owner, url),
@@ -11306,4 +11306,9 @@ export function resolveOnEndpoint(raw: string, models: ReadonlyArray<ModelInfo>,
   if (byLabel.length === 1) return byLabel[0]!.value;
   if (byLabel.length > 1) return null;
   return isClaudeShaped(id, providerId) ? null : id;
+}
+
+/** Tests only: a local bare repository as a connected remote (file://), never under a real daemon. */
+function testFileRemote(url: string): boolean {
+  return process.env.NODE_ENV === "test" && url.startsWith("file://");
 }

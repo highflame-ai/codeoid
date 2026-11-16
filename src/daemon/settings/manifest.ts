@@ -250,7 +250,7 @@ const sandbox: SettingsTab = {
           default: ["@parent"],
           applies: "next-session",
         }),
-        cfg("sandbox.push.enabled", "Push for agents", "Sandboxed commands can't git push (no network to the git host, no credentials). With this on, an agent asks codeoid to push a branch (the push tool) and the daemon runs it on this machine with your credentials, which the agent never sees: one branch as committed, to the same branch on a remote the repository's own config names; no force, no tags. Guarded and interactive mode ask you; autonomous mode pushes.", {
+        cfg("sandbox.push.enabled", "Push for agents", "Agents' own git push reaches remotes you connected (codeoid sandbox git connect) through the git gateway, with your existing credentials, which never enter the sandbox: branches of their own, fast-forward only; never main, master or the remote's default branch, no deletes, no tags. Guarded and interactive mode ask you per push; autonomous mode pushes. Off: fetch still works, pushes are refused.", {
           kind: "boolean",
           envVar: "CODEOID_SANDBOX_PUSH",
           default: true,

@@ -342,7 +342,7 @@ const SandboxSchema = z
         socket: z.boolean().default(false),
       })
       .default({ image: "node:22-bookworm-slim", socket: false }),
-    /** The `push` tool: codeoid pushes a sandboxed session's branch on the host (docs/sandbox.md, "Pushing a branch"). */
+    /** Agents' pushes through the git gateway (docs/git-gateway-design.md, docs/sandbox.md "Git fetch and push"). */
     push: z
       .object({
         enabled: z.boolean().default(true),

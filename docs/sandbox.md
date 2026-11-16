@@ -1233,257 +1233,98 @@ home is the workspace).
   as in the workspace (what runs after the agent touched it isn't vouched
   for).
 
-## Pushing a branch
+## Git fetch and push: the git gateway
 
-A sandboxed command can't `git push`, for two reasons:
+A sandboxed command can't reach a git host by itself, for two reasons:
 
-- **No network to the git host.** Claude's own sandbox lets a command out
-  only through its HTTP(S) proxy: it resolves no DNS and opens no other
-  connection, so `ssh git@bitbucket.org` (port 22) fails before it starts.
-  codeoid's own sandboxes run with the session's network setting.
-- **No credentials.** `~/.ssh`, `SSH_AUTH_SOCK`, git's credential helpers and
-  stores, the keychain, and `gh`/`glab` logins are hidden.
+- **No network:** with the network off nothing gets out, and Claude's own sandbox lets commands out only through
+  its HTTP proxy, so `ssh git@bitbucket.org` never connects.
+- **No credentials:** `~/.ssh`, `SSH_AUTH_SOCK`, git's credential helpers and stores, the keychain and `gh`/`glab`
+  logins are all hidden.
 
-That is the sandbox doing its job. To get work pushed anyway, the agent calls
-the **`push` tool**. It is served next to `request_directory` on every backend
-that has it: Claude, Qwen and pi in-process; Codex, the Gemini CLI and
-opencode over `/mcp/sandbox`. The daemon then pushes it itself, with your
-network and your credentials, which the agent never sees.
+codeoid's **git gateway** fixes that without opening either (design: [git-gateway-design.md](git-gateway-design.md)).
+The agent runs plain `git fetch`, `git pull` and `git push`, on every backend. git reaches the gateway in the daemon
+over a socket only that session's sandbox sees, and the gateway reaches the remote with **your existing
+credentials**, which never enter the sandbox.
 
-**What it pushes**
+**Connect a remote once**
 
-- One local branch, by name. The default is the one checked out. A name
-  with an invisible or reordering character (a zero-width space, a bidi
-  control) is refused, since the card shows names as they are.
-- As the commit it is when the push is planned. That commit id is what gets
-  pushed, and a commit made after it isn't.
-- To the branch of the same name on one of the repository's remotes. The
-  default remote is `origin`.
-- Only from the session's own repository: its workspace, or the codeoid
-  worktree it works in.
+```bash
+codeoid sandbox git connect            # the current repository's origin
+codeoid sandbox git connect ~/code/app --remote upstream
+codeoid sandbox git connect --url git@bitbucket.org:team/repo.git
+codeoid sandbox git connect --url https://github.com/o/r.git --token   # a dedicated token instead
+codeoid sandbox git ls
+codeoid sandbox git disconnect [dir] [--remote r | --url u]
+```
 
-**What it never does**
+- **Proved first:** connecting checks that your credential reaches the remote (`git ls-remote`).
+- **ssh remotes** use your ssh key, through your ssh agent and `~/.ssh/config` as git does. codeoid runs the system
+  `ssh`, and nothing is stored.
+- **https remotes:** your git credential for the host is read once, now, with `git credential fill`. It is kept in a
+  0600 file of the daemon's and sent to that remote's origin only.
+- **`--token`** stores a dedicated token instead: a Bitbucket repository access token, or a GitHub fine-grained
+  token. Use it for a shared daemon or a sensitive organisation.
+- **Permissions:** you need `settings:write`, and a delegated token can't connect. A connection is yours: it decides
+  only your sessions.
+- **In guarded mode,** an agent that reaches a remote you haven't connected raises a card offering to connect it. In
+  autonomous mode it's refused, and the agent is told the command.
 
-- Force, delete, or push tags, other refs or push options.
-- Push to the remote's default branch, or to a protected one:
-  `sandbox.push.protectedBranches`, `main` and `master` by default, where a
-  trailing `*` matches a prefix.
-- Push a non-fast-forward. The remote refuses it, and the agent is told to
-  rebase or merge first.
+**What a push may do**
 
-**Where it goes: your trust**
+- One or more branches, `refs/heads/*`, each a fast-forward of what the remote has.
+- Never:
+  - `main`, `master` or another protected branch (`sandbox.push.protectedBranches`, case-insensitive, where a
+    trailing `*` matches a prefix);
+  - the remote's default branch;
+  - a force push, a delete, tags, notes or other refs.
+- The gateway checks each update against a fresh copy of the remote, then pushes the checked commits itself,
+  atomically. The agent's `git push` succeeds only if the remote took them.
+- **Who decides:**
+  - guarded and interactive mode ask you per push, on an owner-only card naming the branches, commits and URL;
+  - autonomous mode pushes;
+  - a pack role without `network: true`, or a read-only one (`write: false`), can't push, and one with
+    `network: false` can't fetch.
+- **CI:** a pushed branch runs the repository's CI as that branch defines it (GitHub Actions `on: push`,
+  `.gitlab-ci.yml`, `bitbucket-pipelines.yml`), including pipeline files the agent wrote, with the CI's secrets.
+  Connect only remotes whose CI you'd let the agent's code use, or protect the secrets there: environments that need
+  an approval, secrets for protected branches only.
+- **Server-side branch protection** stays the backstop.
 
-Where an agent may push is yours to say, once per repository and remote. A
-trust is yours alone: on a shared daemon, it decides only your own sessions'
-pushes. Trusting one records:
+**How it runs**
 
-- the repository (its git dir);
-- the remote;
-- where git will really push: the remote's push URL after every rewrite, as
-  `git remote get-url --push` resolves it. This is also the URL shown on the
-  card and in the terminal;
-- what the repository's own config says that decides a push;
-- what your global and system config say that decides a push (include lines
-  aside).
+- **Inside the sandbox:**
+  - git's config sends the session's remotes to `ext::<codeoid's launcher> %S <url>`:
+    - the remotes you connected;
+    - the workspace repository's ssh remotes and the usual forges' ssh forms;
+    - with the network not on, their https forms too.
+  - The launcher relays git's protocol over the session's own unix socket, bound into that session's sandbox
+    alone.
+  - Nothing inside holds a credential, and with the network on a public https remote is fetched directly as before.
+- **In the daemon:**
+  - The gateway keeps a private bare mirror of each connected remote (`<configDir>/git-gateway/cache`), refreshed
+    before every request.
+  - It serves git's own `upload-pack` or `receive-pack` on that mirror, hardened, with fsck on. A pre-receive hook
+    hands each push to the daemon for its checks and your word.
+- **None of your git config is used** for the gateway's own git: no global or system config, so no helpers,
+  `includeIf` files, URL rewrites, hooks or drivers. Only the system `ssh` (judged by where it is, who owns it and
+  who may write it), your ssh setup, and a stored https credential.
+- **Supported providers:** bubblewrap, Seatbelt and Claude's own sandbox. Docker sandboxes don't have it yet, since
+  the container has no runtime for the launcher.
+- **Audit:**
+  - `sandbox.git_connected` and `sandbox.git_disconnected`;
+  - `session.git_push_request`, `session.git_push_approved` and `session.git_push_denied`;
+  - `session.git_push_done` and `session.git_push_refused`;
+  - `session.git_fetch_done` and `session.git_fetch_refused`.
 
-The record lives in the daemon's database, which no agent can write. A push
-goes only where all of that still matches. Another URL, a rewrite, or a
-setting added since doesn't match, and has to be trusted again. Branch
-tracking, `.gitattributes` and the like aren't part of it.
-
-Nothing on disk stands in for your trust. That includes a repository an agent
-made, a fork or worktree of one, or an old directory renamed into `.git`.
-
-- **Trust from the terminal:** `codeoid sandbox trust-push [dir] [--remote r]`.
-  It prints the URL and the repository's settings it trusted. Stop trusting
-  with `--off`, which always works, even for a repository that is broken, moved
-  or gone. List with `--list`. You need `settings:write`, and a delegated token
-  can't do it.
-- **Trust from a card:** in guarded mode, the push card offers "Push, and
-  trust … for this repository's agent pushes".
-- **Autonomous mode** pushes only where you have trusted. Anything else is
-  refused, and the agent is told how you can trust it.
-
-On top of that, every push is checked the same way, trusted or not:
-
-- The repository's config must be held read-only by the session's sandbox.
-  Then it can't change between codeoid's check and git's own read of it.
-- Includes are judged by the file they name, whatever it holds now, because
-  git reads it again when it pushes. An include in the repository's own
-  config is refused. An include in your config is refused if it names a file
-  the commands of any live sandboxed session may write, even an empty or
-  missing one.
-- The host's git never reads the agent's repository for the push. The branch is
-  bundled (`git bundle create`) inside the session's sandbox, where a ref or
-  object the agent linked into a repository the sandbox hides leads nowhere,
-  and the bundle streams over stdout into a file of the daemon's own. The
-  daemon takes that file only if its header says it is a plain git bundle,
-  unbundles it (never a fetch, which would take another kind of file as a path
-  to a repository) into a private bare repository under
-  `~/.codeoid/push-staging`, which no session can see, checks that it holds the
-  planned commit, and pushes that commit from there.
-- The branch and its commit are read inside the sandbox too, so the card and
-  the push name what the agent's own commands see.
-- The git run inside the sandbox is the daemon's own, by absolute path, with a
-  PATH of system dirs. A git in a directory the session's commands may write is
-  refused. That also means a sandbox image without git (Docker) can't push.
-- The staging dir must be a real directory, the daemon's own, closed to others.
-  Dirs a stopped daemon left there are removed at the next push. No link, alternates file, reflog or FIFO in the agent's
-  repository is ever followed outside the sandbox, and nothing is written back
-  into it (no remote-tracking ref, no reflog). The staging repository is removed
-  after each push.
-- The private repository's remote is set to the checked URL, and git resolves
-  it again there, after your rewrites. If that isn't the checked URL, nothing
-  is pushed.
-
-From the repository's config, codeoid takes the remote's `url`/`pushurl` and
-`push.*`. It never takes a URL rewrite (`url.*.insteadOf` / `pushInsteadOf`),
-and never a remote section named as a URL, from any config: git applies such a
-section to pushes to that URL. It never takes what would turn a push into a
-credential leak or a command on the remote host: `http.*` (bar `postBuffer`,
-`version` and the low-speed limits), `credential.*`, `core.sshCommand`,
-`ssh.variant`, `protocol.*`, and a remote's `receivepack`, `vcs` or `proxy`.
-Set those in your global config.
-
-From your global config, codeoid takes everything, including your
-`core.sshCommand` (a key per host, an agent's wrapper). It uses it both for
-the push and for asking the remote which branch is its default. A file your
-config includes is refused if any sandboxed session's commands may write it,
-or ever could: codeoid keeps, for good, every directory a sandboxed session
-could write (in its database), since what an agent left there outlives the
-session. On first start with this, every session's working directory from
-before is added (whether it was sandboxed isn't known: fail closed). A session
-destroyed before that start left no record, so what its agent wrote outside
-your home isn't known to codeoid: if you ran sandboxed sessions before, check
-the git config files your config includes and the directories on your PATH. Once
-you've checked what is in such a place, and no session works there, clear it
-with `codeoid sandbox forget-writable <dir>`; the refusal names the command.
-The guarded card and `codeoid sandbox trust-push` list the settings of yours
-that decide the push, with every URL's user info and query, and any
-secret-looking value, credential helper and push option hidden, and
-`core.sshCommand` shown as its program alone. Refusals (what the agent,
-the transcript and the audit read) are redacted the same way, `user:pass@host`
-without a scheme included.
-
-Also refused:
-
-- a remote with more than one push URL;
-- a URL that isn't ssh or https;
-- an ssh or https URL whose host git and the card would read differently: a
-  `\`, `?`, `#` or `%` before the path, or more than one `@`
-  (`https://github.com\@elsewhere/…` is github.com to a URL parser and
-  `elsewhere` to git);
-- a repository that borrows objects from elsewhere (`objects/info/alternates`).
-
-The remote is asked which branch is its default only after your trust matched,
-or after you answered the card, and from the private repository, so a remote
-you never approved is never contacted. A push there is refused. If it can't be
-asked (an error, a timeout, no `HEAD` symref), autonomous mode refuses the
-push; in guarded mode it goes ahead (you approved it), and the result says so.
-An empty remote has no default branch yet, and its first branch pushed may
-become it: autonomous mode refuses, saying so; push its first branch
-yourself.
-
-**How git runs**
-
-It runs hardened (`git-env.ts`):
-
-- On a PATH of git's own dir and your PATH's absolute entries that are
-  outside your home, outside anything a sandboxed session may write or ever
-  could, owned by you or root, and writable by nobody else: not by everyone,
-  and by a group only if it is your user-private group (named as you, nobody
-  else in it: Linuxbrew's) or, on macOS, `admin` (Homebrew's). Never macOS's
-  `staff` or a shared `users` group. A session that has ended may have left a program in its
-  workspace, so "under your home" is out whatever runs now. `ssh` is found on
-  that PATH. An ssh command (`core.sshCommand`, `GIT_SSH_COMMAND`, `GIT_SSH`)
-  or credential helper is refused if any path in it fails the same test (any
-  of them may be a program: `sh <script>`, `!f() { <prog> …; }`,
-  `ProxyCommand=<prog>`), or is relative. Only a file in a known data position
-  (`--file`, `--socket`, ssh's `-i`, `IdentityFile=`, `ControlPath=`, and
-  `~/.ssh` itself) may be under your home, and never where a session could
-  write. (Paths under `~/.ssh`, such as keys and config, are yours
-  to name.) A git of codeoid's own under your home can't push for agents
-  either.
-- With no askpass program (`GIT_ASKPASS`, `SSH_ASKPASS`): a push never prompts.
-- What git runs as a program, `core.sshCommand` and credential helpers,
-  comes from your own `~/.gitconfig` (or `$XDG_CONFIG_HOME/git/config`), the
-  system config, or a file those include that is yours alone (owned by you,
-  writable by nobody else, never where a session could write): a per-folder
-  `includeIf "gitdir:…"` ssh key works.
-- With your config exactly as it applies to the session's repository. The push
-  runs from codeoid's own staging repository. If a conditional include
-  (`includeIf "gitdir:…"`, `onbranch:`, `hasconfig:`) makes your `credential.*`,
-  `http.*`, `ssh.variant` or `protocol.*` differ between the two, the push is
-  refused, naming the keys. Set them unconditionally, or for the remote's URL
-  (`credential.<url>.*`, `http.<url>.*`).
-
-- No hooks, so neither `pre-push` nor git-lfs's run. LFS objects aren't
-  uploaded: push those yourself.
-- No drivers or credential helpers the repository's agent-writable config
-  names.
-- https and ssh only.
-- ssh in batch mode, so it never waits for a prompt.
-- A two-minute limit, after which the whole process group is killed. The
-  bundle inside the sandbox gets half of it, and at most 8 GiB.
-- The bundle holds the branch's whole history, not only what the remote lacks.
-  That takes seconds for most repositories. A very large one may not fit the
-  limit: push that one yourself.
-
-Remote output is shown with URLs redacted.
-
-**Pushing runs CI**
-
-A pushed branch runs the repository's CI as that branch defines it:
-GitHub Actions `on: push`, `.gitlab-ci.yml`, `bitbucket-pipelines.yml`,
-including pipeline files the agent wrote, with the CI's secrets. Trusting a
-remote lets an autonomous agent do that without asking. The card and
-`codeoid sandbox trust-push` say so. Trust only remotes whose CI secrets you'd
-let the agent's code use, or protect them there (environments that need an
-approval, secrets for protected branches only).
-
-**Who decides**
-
-In guarded and interactive mode you are asked first, on an owner-only card
-naming the branch, the commit, the remote's URL and the agent's reason
-(quoted, in its own words). The card offers three choices:
-
-- **Push.**
-- **Push, and trust** (only for a repository and remote not yet trusted).
-- **Don't push.**
-
-If the branch, its remote or a deciding setting changed while you read it, the
-push is refused and the agent asks again.
-
-In autonomous mode, including an unattended run, a push to a trusted remote
-runs without asking. Anything else is refused. One push runs at a time per
-session.
-
-Everything, your answer included, ends before the backend's own tool-call
-timeout: about 50 seconds on opencode, 8 minutes elsewhere. A card nobody
-answered in time closes, so a late yes never pushes. Time for the push
-itself is kept back from the card. A push is stopped when the daemon drains or
-the session is destroyed, whether it is being checked, waiting on the card or
-running, and the stop is audited.
-
-`push` is offered only where it works: a sandboxed session, with pushing on.
-A pack role without `network: true`, or a read-only one (`write: false`),
-can't push, on every backend: the session refuses it, and doesn't offer it.
-That holds over `/mcp/sandbox` too.
-
-Every request, refusal (codeoid's own, before or during the push), approval,
-trust and result is audited:
-`session.push_request`, `session.push_refused`, `session.push_denied`,
-`session.push_trusted`, `session.push_done`, `session.push_failed`,
-`sandbox.push_trusted` and `sandbox.push_untrusted`. Each is also said in the transcript.
+  A push, and every refusal, is said in the transcript, redacted.
 
 **Settings**
 
-`sandbox.push.enabled` (default on; `CODEOID_SANDBOX_PUSH`) and
-`sandbox.push.protectedBranches` (`CODEOID_SANDBOX_PUSH_PROTECTED`). Both are
-in Settings → Sandbox and `codeoid config`.
-
-The in-daemon backends (OpenAI, endpoints, Gemini's API) run no commands, so
-they have nothing to push.
+- `sandbox.push.enabled` (default on; `CODEOID_SANDBOX_PUSH`): agents' pushes through the gateway. Off, fetch still
+  works.
+- `sandbox.push.protectedBranches` (`CODEOID_SANDBOX_PUSH_PROTECTED`).
+- Both are in Settings → Sandbox and `codeoid config`.
 
 ## Docker access
 
