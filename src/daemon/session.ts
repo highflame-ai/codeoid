@@ -249,7 +249,8 @@ import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/v
 const NOT_STORED = "‹not stored›";
 import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
 import { bundleFromChild, planPush, runPush, shownUrl, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
-import { gitEnv } from "./git-env.js";
+import { GIT_BIN, gitEnv } from "./git-env.js";
+import { physicalPath, within } from "./physical-path.js";
 import {
   CLAUDE_PROVIDER_ID,
   findModel,
@@ -4264,6 +4265,8 @@ export class Session {
       // What this session's commands may write, and every other sandboxed session's: a file there decides nothing.
       agentWritable: [spec.workspace, spec.tempDir, ...spec.writable, ...sbx.worktreeFolders(), ...(this.#otherSessionsWritable?.() ?? [])],
       signal,
+      // The branch and its commit as the sandbox sees them: a ref the agent linked into a hidden path names nothing.
+      refGit: (repo: string, args: string[]) => this.#sandboxGitQuery(sbx, repo, args, signal),
     };
     const plan = await planPush(this.sandboxWorkspace, input, planOpts).catch((err: unknown) => ({
       refused: `the repository couldn't be read (${err instanceof Error ? err.message : String(err)})`,
@@ -4395,10 +4398,43 @@ export class Session {
     try {
       handle = await rt.open([]);
       if (signal.aborted) return "the session is closing";
-      const child = handle.spawn("git", ["-c", "core.fsmonitor=false", "-C", repo, "bundle", "create", "-q", "-", ref], { cwd: repo, env: gitEnv({ LANG: "C" }) });
+      const git = this.#sandboxGitBin(sbx);
+      if ("error" in git) return git.error;
+      const child = handle.spawn(git.bin, ["-c", "core.fsmonitor=false", "-C", repo, "bundle", "create", "-q", "-", ref], { cwd: repo, env: git.env });
       return await bundleFromChild(child, dest, { timeoutMs, signal });
     } catch (err) {
       return err instanceof Error ? err.message : String(err);
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  }
+
+  /**
+   * The git the push runs inside the sandbox: the daemon's own, by absolute path, with a PATH of its dir and the
+   * system's alone, never a `git` the agent's commands could put first on a PATH, nor one in what they may write.
+   */
+  #sandboxGitBin(sbx: SessionSandbox): { bin: string; env: Record<string, string> } | { error: string } {
+    if (!isAbsolute(GIT_BIN)) return { error: "codeoid found no git on this machine" };
+    const writable = [...this.sandboxAgentWritable, sbx.tempDirPath ?? ""].filter(Boolean);
+    const real = physicalPath(GIT_BIN);
+    if (writable.some((w) => within(GIT_BIN, w) || within(real, w) || within(real, physicalPath(w)))) {
+      return { error: `the git codeoid runs (${GIT_BIN}) is in a directory this session's commands may write` };
+    }
+    return { bin: GIT_BIN, env: gitEnv({ LANG: "C", PATH: [dirname(GIT_BIN), "/usr/bin", "/bin"].join(":") }) };
+  }
+
+  /** A read-only git query inside this session's sandbox: its stdout, or null when it failed. */
+  async #sandboxGitQuery(sbx: SessionSandbox, repo: string, args: string[], signal: AbortSignal): Promise<string | null> {
+    const rt = sbx.runtime;
+    const git = this.#sandboxGitBin(sbx);
+    if (!rt || "error" in git || signal.aborted) return null;
+    let handle: Awaited<ReturnType<typeof rt.open>> | null = null;
+    try {
+      handle = await rt.open([]);
+      const r = await handle.exec([git.bin, "-c", "core.fsmonitor=false", "-C", repo, ...args], { cwd: repo, env: { ...git.env, GIT_OPTIONAL_LOCKS: "0" }, timeoutMs: 20_000 });
+      return r.exitCode === 0 ? r.stdout : null;
+    } catch {
+      return null;
     } finally {
       await handle?.close().catch(() => {});
     }

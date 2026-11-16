@@ -6,7 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { isPushTool, isSafeTool } from "../daemon/providers/tool-safety.js";
@@ -189,6 +189,60 @@ describe("push: the plan", () => {
     expect(store()).toEqual(before);
     // The staging repository is gone after each push.
     expect(readdirSync(join(root, "staging"))).toEqual([]);
+  });
+
+  test("round 6: what the sandbox wrote is taken only as a bundle: a gitfile naming a hidden repository is refused, nothing of it pushed", async () => {
+    const secret = join(root, "hidden");
+    git(root, "clone", "-q", repo, secret);
+    git(secret, "checkout", "-q", "feature/x");
+    writeFileSync(join(secret, "secret.txt"), "TOPSECRET\n");
+    git(secret, "add", ".");
+    git(secret, "commit", "-q", "-m", "TOPSECRET-HISTORY");
+    const p = { ...(await planned()), sha: git(secret, "rev-parse", "HEAD") };
+    for (const body of [`gitdir: ${join(secret, ".git")}\n`, "# v3 git bundle\n@filter=blob:none\n\n", ""]) {
+      const r = await run(p, { makeBundle: async (_r, _ref, dest) => {
+          writeFileSync(dest, body);
+          return null;
+        },
+      });
+      expect(r).toMatchObject({ ok: false, summary: expect.stringContaining("isn't a plain git bundle") });
+    }
+    expect(git(bare, "for-each-ref", "refs/heads/feature")).toBe("");
+    // A refusal for a moved branch names no commit (the agent reads it).
+    const moved = await run(p);
+    expect(moved.summary).toContain("doesn't have the commit that was checked");
+    expect(moved.summary).not.toMatch(/[0-9a-f]{12}/);
+  });
+
+  test("round 6: the branch and its commit are read by the query the session gives (inside its sandbox), not the host's git", async () => {
+    const asked: string[][] = [];
+    const p = await plan({}, {
+      refGit: async (_repo, args) => {
+        asked.push(args);
+        return args[0] === "symbolic-ref" ? "feature/x\n" : null;
+      },
+    });
+    expect(p).toEqual({ refused: "there is no local branch feature/x: commit to it first" });
+    expect(asked.map((a) => a[0])).toEqual(["symbolic-ref", "rev-parse"]);
+  });
+
+  test("round 6: the staging dir must be the daemon's own, closed to others; one a stopped daemon left is swept", async () => {
+    const { stagingRootProblem } = await import("../daemon/sandbox/push.js");
+    const open = join(root, "open-staging");
+    mkdirSync(open, { mode: 0o755 });
+    chmodSync(open, 0o755);
+    expect(stagingRootProblem(open)).toContain("open to others");
+    const link = join(root, "link-staging");
+    symlinkSync(open, link);
+    expect(stagingRootProblem(link)).toContain("isn't a directory");
+    expect(await run(await planned(), { stagingRoot: link })).toMatchObject({ ok: false, summary: expect.stringContaining("isn't a directory") });
+    const staging = join(root, "staging");
+    mkdirSync(join(staging, "push-old"), { recursive: true, mode: 0o700 });
+    chmodSync(staging, 0o700);
+    const old = new Date(Date.now() - 7 * 60 * 60 * 1000);
+    utimesSync(join(staging, "push-old"), old, old);
+    expect(await run(await planned())).toMatchObject({ ok: true });
+    expect(readdirSync(staging)).toEqual([]);
   });
 
   test("round 5: the bundle stream goes only into a new file of the daemon's, and stops at its size cap", async () => {

@@ -26,7 +26,7 @@
  */
 
 import { type ChildProcessWithoutNullStreams, spawn } from "node:child_process";
-import { closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, rmSync, writeSync } from "node:fs";
+import { closeSync, constants as fsConstants, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readdirSync, readSync, rmSync, writeSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { GIT_BIN, safeGit, safeGitEnv } from "../git-env.js";
 import { validateBranchName } from "../git-worktree.js";
@@ -135,9 +135,20 @@ export interface PlanOptions {
   lookupTimeoutMs?: number;
   /** Ask the remote for its default branch (refused as a target). Off only in tests without a network. */
   remoteDefault?: (url: string, cwd: string, timeoutMs: number, ssh: string | null, signal?: AbortSignal) => Promise<string | null>;
+  /**
+   * Runs a read-only git query (`symbolic-ref`, `rev-parse`) in the repository: the session's runs it inside its
+   * sandbox, so a ref or object the agent linked into a path the sandbox hides resolves to nothing. Absent (tests):
+   * the host's git.
+   */
+  refGit?: RefGit;
   /** Tests only: a local bare repository as the remote (a `file://` URL), which a real push never takes. */
   _testFileRemote?: boolean;
 }
+
+/** A read-only git query in a repository: its stdout, or null when it failed. */
+export type RefGit = (repo: string, args: string[]) => Promise<string | null>;
+
+const hostRefGit: RefGit = (repo, args) => safeGit(args, repo, { timeoutMs: 20_000 }).catch(() => null);
 
 /** One config entry with where it came from (`git config --show-scope --show-origin --null`). */
 interface OriginEntry {
@@ -354,24 +365,18 @@ export async function planPush(repoDir: string, input: PushInput, opts: PlanOpti
   const { repo, common, own, url, configuredUrl, sshCommand, repoSettings, userSettings } = target;
 
   // The branch: named, or the one checked out.
+  const refGit = opts.refGit ?? hostRefGit;
   let branch = input.branch;
   if (!branch) {
-    try {
-      branch = (await safeGit(["symbolic-ref", "--short", "-q", "HEAD"], repo, { timeoutMs: 20_000 })).trim();
-    } catch {
-      return refuse("no branch is checked out (a detached HEAD): name the branch to push");
-    }
+    branch = (await refGit(repo, ["symbolic-ref", "--short", "-q", "HEAD"]))?.trim() || undefined;
+    if (!branch) return refuse("no branch is checked out (a detached HEAD): name the branch to push");
   }
   if (!isPushableBranchName(branch)) return refuse(`${JSON.stringify(branch)} isn't a branch name`);
   if (opts.protectedBranches.some((p) => branchMatches(p, branch as string))) {
     return refuse(`${branch} is a protected branch (sandbox.push.protectedBranches): push your work to a branch of its own, and open a pull request`);
   }
-  let sha: string;
-  try {
-    sha = (await safeGit(["rev-parse", "--verify", "-q", "--end-of-options", `refs/heads/${branch}^{commit}`], repo, { timeoutMs: 20_000 })).trim();
-  } catch {
-    return refuse(`there is no local branch ${branch}: commit to it first`);
-  }
+  const sha = (await refGit(repo, ["rev-parse", "--verify", "-q", "--end-of-options", `refs/heads/${branch}^{commit}`]))?.trim() ?? "";
+  if (!sha) return refuse(`there is no local branch ${branch}: commit to it first`);
   if (!/^[0-9a-f]{40,64}$/.test(sha)) return refuse(`${branch} doesn't name a commit`);
 
   let defaultUnknown = false;
@@ -532,6 +537,68 @@ export interface RunOptions {
   _testFileRemote?: boolean;
 }
 
+/** A staging dir older than this is a push a stopped daemon left behind (a push takes minutes at most). */
+const STALE_STAGE_MS = 6 * 60 * 60 * 1000;
+
+/**
+ * Why `root` can't stage a push: it must be a real directory (no link), the daemon's own, that nobody else can
+ * read or write. Made (0700) when missing.
+ */
+export function stagingRootProblem(root: string): string | null {
+  try {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    const st = lstatSync(root);
+    if (st.isSymbolicLink() || !st.isDirectory()) return `the staging dir ${root} isn't a directory`;
+    if (typeof process.getuid === "function" && st.uid !== process.getuid()) return `the staging dir ${root} isn't the daemon's own`;
+    if ((st.mode & 0o077) !== 0) return `the staging dir ${root} is open to others (chmod 700 it)`;
+    return null;
+  } catch (err) {
+    return `the staging dir ${root} couldn't be made (${err instanceof Error ? err.message : String(err)})`;
+  }
+}
+
+/** Remove the staging dirs a stopped daemon left behind (never a running push's). */
+function sweepStaging(root: string): void {
+  try {
+    for (const name of readdirSync(root)) {
+      if (!name.startsWith("push-")) continue;
+      const at = join(root, name);
+      try {
+        const st = lstatSync(at);
+        if (Date.now() - st.mtimeMs > STALE_STAGE_MS) rmSync(at, { recursive: true, force: true });
+      } catch {
+        /* gone meanwhile */
+      }
+    }
+  } catch {
+    /* nothing to sweep */
+  }
+}
+
+/** Why `file` isn't a plain git bundle (v2 or v3, no filter): its header is read, nothing else. */
+export function bundleHeaderProblem(file: string): string | null {
+  let fd: number;
+  try {
+    fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  } catch {
+    return "it isn't there";
+  }
+  try {
+    const buf = Buffer.alloc(64 * 1024);
+    const n = readSync(fd, buf, 0, buf.length, 0);
+    const head = buf.subarray(0, n).toString("latin1");
+    if (!head.startsWith("# v2 git bundle\n") && !head.startsWith("# v3 git bundle\n")) return "no bundle header";
+    // v3's capabilities come first: a filter (a partial bundle) is never taken.
+    for (const line of head.split("\n").slice(1)) {
+      if (!line.startsWith("@")) break;
+      if (!/^@object-format=(sha1|sha256)$/.test(line)) return `capability ${JSON.stringify(line.slice(0, 40))}`;
+    }
+    return null;
+  } finally {
+    closeSync(fd);
+  }
+}
+
 /** The largest bundle taken into the daemon's staging repository. */
 export const MAX_BUNDLE_BYTES = 8 * 1024 * 1024 * 1024;
 
@@ -605,7 +672,9 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
   const deadline = Date.now() + timeoutMs;
   const left = () => Math.max(1_000, deadline - Date.now());
   if (o.signal?.aborted) return { ok: false, summary: "not pushed: the session is closing", output: "" };
-  mkdirSync(o.stagingRoot, { recursive: true, mode: 0o700 });
+  const rootProblem = stagingRootProblem(o.stagingRoot);
+  if (rootProblem) return { ok: false, summary: `not pushed: ${rootProblem}`, output: "" };
+  sweepStaging(o.stagingRoot);
   const stage = mkdtempSync(join(o.stagingRoot, "push-"));
   try {
     // 1. The bundle, made where the agent's links lead nowhere.
@@ -616,25 +685,26 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
     // 2. A repository of the daemon's own, holding just that branch.
     const repo = join(stage, "repo.git");
     const local = async (args: string[]) => {
-      const r = await runGit(args, stage, left(), { sshCommand: null, signal: o.signal, protocol: "file" });
+      const r = await runGit(args, stage, left(), { sshCommand: null, signal: o.signal });
       if (r.code !== 0) throw new Error(shownOutput(r.stderr).split("\n")[0] || `git ${args[0]} failed`);
       return r.stdout;
     };
     try {
+      // A bundle, by its header, and nothing else: a fetch would take any other file as a path to a repository (a
+      // gitfile naming one the sandbox hides), so it is unbundled, which reads only a bundle.
+      const header = bundleHeaderProblem(bundle);
+      if (header) return { ok: false, summary: `refused: what the session's sandbox made isn't a plain git bundle (${header})`, output: "" };
       await local(["init", "-q", "--bare", repo]);
-      await local(["--git-dir", repo, "fetch", "-q", "--no-tags", "--no-write-fetch-head", bundle, `refs/heads/${plan.branch}:refs/heads/${plan.branch}`]);
-      const tip = (await local(["--git-dir", repo, "rev-parse", "--verify", "-q", "--end-of-options", `refs/heads/${plan.branch}^{commit}`])).trim();
+      const listed = await local(["--git-dir", repo, "bundle", "unbundle", bundle, `refs/heads/${plan.branch}`]);
+      const tip = /^([0-9a-f]{40,64}) refs\/heads\/(\S+)$/m.exec(listed);
+      if (!tip?.[1] || tip[2] !== plan.branch) return { ok: false, summary: `refused: the bundle the session's sandbox made doesn't hold ${plan.branch}`, output: "" };
+      await local(["--git-dir", repo, "update-ref", `refs/heads/${plan.branch}`, tip[1]]);
       // The checked commit, or one the agent made on top of it since (only the checked one is pushed, from here).
       const holds =
-        tip === plan.sha ||
-        (await runGit(["--git-dir", repo, "merge-base", "--is-ancestor", plan.sha, tip], stage, left(), { sshCommand: null, signal: o.signal, protocol: "file" })).code === 0;
-      if (!holds) {
-        return {
-          ok: false,
-          summary: `refused: what the session's sandbox holds for ${plan.branch} (${tip.slice(0, 12)}) doesn't have the commit that was checked (${plan.sha.slice(0, 12)})`,
-          output: "",
-        };
-      }
+        tip[1] === plan.sha ||
+        (await runGit(["--git-dir", repo, "merge-base", "--is-ancestor", plan.sha, tip[1]], stage, left(), { sshCommand: null, signal: o.signal })).code === 0;
+      // No commit id in it: the agent reads this.
+      if (!holds) return { ok: false, summary: `refused: ${plan.branch} in the session's sandbox doesn't have the commit that was checked (it moved): ask again`, output: "" };
       await local(["--git-dir", repo, "config", "remote.target.url", plan.url]);
       // Where git will push from here, after your rewrites: the plan's URL, or nothing is pushed.
       const there = (await local(["--git-dir", repo, "remote", "get-url", "--push", "target"])).trim();

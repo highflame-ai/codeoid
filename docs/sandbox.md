@@ -1315,9 +1315,18 @@ On top of that, every push is checked the same way, trusted or not:
   bundled (`git bundle create`) inside the session's sandbox, where a ref or
   object the agent linked into a repository the sandbox hides leads nowhere,
   and the bundle streams over stdout into a file of the daemon's own. The
-  daemon fetches it into a private bare repository under `~/.codeoid/push-staging`,
-  which no session can see, checks that it holds the planned commit, and pushes
-  that commit from there. No link, alternates file, reflog or FIFO in the agent's
+  daemon takes that file only if its header says it is a plain git bundle,
+  unbundles it (never a fetch, which would take another kind of file as a path
+  to a repository) into a private bare repository under
+  `~/.codeoid/push-staging`, which no session can see, checks that it holds the
+  planned commit, and pushes that commit from there.
+- The branch and its commit are read inside the sandbox too, so the card and
+  the push name what the agent's own commands see.
+- The git run inside the sandbox is the daemon's own, by absolute path, with a
+  PATH of system dirs. A git in a directory the session's commands may write is
+  refused. That also means a sandbox image without git (Docker) can't push.
+- The staging dir must be a real directory, the daemon's own, closed to others.
+  Dirs a stopped daemon left there are removed at the next push. No link, alternates file, reflog or FIFO in the agent's
   repository is ever followed outside the sandbox, and nothing is written back
   into it (no remote-tracking ref, no reflog). The staging repository is removed
   after each push.
@@ -1362,6 +1371,9 @@ It runs hardened (`git-env.ts`):
 - ssh in batch mode, so it never waits for a prompt.
 - A two-minute limit, after which the whole process group is killed. The
   bundle inside the sandbox gets half of it, and at most 8 GiB.
+- The bundle holds the branch's whole history, not only what the remote lacks.
+  That takes seconds for most repositories. A very large one may not fit the
+  limit: push that one yourself.
 
 Remote output is shown with URLs redacted.
 

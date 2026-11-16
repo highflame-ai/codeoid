@@ -10,7 +10,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { gitEnv } from "../daemon/git-env.js";
+import { GIT_BIN, gitEnv } from "../daemon/git-env.js";
 import { BwrapSandboxProvider } from "../daemon/sandbox/bwrap.js";
 import { buildSandboxSpec } from "../daemon/sandbox/policy.js";
 import { bundleFromChild } from "../daemon/sandbox/push.js";
@@ -69,11 +69,15 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: th
     const h = await provider.open(spec);
     try {
       const bundle = (ref: string, dest: string) =>
-        bundleFromChild(h.spawn("git", ["-c", "core.fsmonitor=false", "-C", work, "bundle", "create", "-q", "-", ref], { cwd: work, env: gitEnv({ LANG: "C", HOME: home }) }), dest, { timeoutMs: 60_000 });
+        bundleFromChild(h.spawn(GIT_BIN, ["-c", "core.fsmonitor=false", "-C", work, "bundle", "create", "-q", "-", ref], { cwd: work, env: gitEnv({ LANG: "C", HOME: home }) }), dest, { timeoutMs: 60_000 });
       // The agent's own branch: bundled in there, its stdout the daemon's file.
       const ok = join(staging, "ok.bundle");
       expect(await bundle("refs/heads/main", ok)).toBeNull();
       expect(git(base, "bundle", "list-heads", ok)).toContain(git(work, "rev-parse", "main"));
+      // The plan reads the branch in there too: the linked ref names nothing (the host's git would name the hidden commit).
+      const q = await h.exec([GIT_BIN, "-C", work, "rev-parse", "--verify", "-q", "refs/heads/leak^{commit}"], { cwd: work, env: gitEnv({ LANG: "C", HOME: home }), timeoutMs: 30_000 });
+      expect(q.exitCode).not.toBe(0);
+      expect(q.stdout).not.toContain(hidden);
       // The linked one: nothing to bundle in there.
       const leak = join(staging, "leak.bundle");
       expect(await bundle("refs/heads/leak", leak)).not.toBeNull();
