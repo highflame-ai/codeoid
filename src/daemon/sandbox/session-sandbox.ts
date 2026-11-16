@@ -733,6 +733,11 @@ export class SessionSandbox {
     this.#generation += 1;
   }
 
+  /** The owner's git connections changed: the next resolution between turns gives the gateway as it is now. */
+  gitGatewayChanged(): void {
+    this.#dirsStale = true;
+  }
+
   /** Whether pins were taken (or let go) since the last call: the setting holding them is saved then (Session). */
   takePinsChanged(): boolean {
     const changed = this.#pinsChanged;

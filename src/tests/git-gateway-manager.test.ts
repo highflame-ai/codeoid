@@ -118,4 +118,27 @@ describe("the git gateway, decided by the session", () => {
     expect(refOf(up, "refs/heads/feature/h")).toBe("");
     expect(t.audits.some((a) => a.action === "session.git_push_denied")).toBe(true);
   });
+
+  it("round 2: a remote connected while a session runs reaches it at its next turn; a session a delegated token made gets none", async () => {
+    const up = upstreamRepo();
+    const m = t.newManager();
+    const { session } = await t.autonomous(m);
+    await session.send("go", AUTH);
+    await until(() => session.toInfo().status === "idle");
+    expect(t.runtimeSpec()?.gatewaySockets).toBeUndefined();
+    expect(await m.handle({ type: "sandbox.git_connect", id: "c", action: "connect", path: t.workdir } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
+    await t.sendWhenReady(session, "again");
+    await until(() => session.toInfo().status === "idle");
+    expect(t.runtimeSpec()?.gatewaySockets?.length).toBe(1);
+    commitOn("feature/late-connect");
+    const r = await agentGit(["push", "origin", "feature/late-connect"]);
+    expect([r.code, r.out]).toEqual([0, expect.stringContaining("codeoid pushed")]);
+    expect(refOf(up, "refs/heads/feature/late-connect")).not.toBe("");
+    // A session made with a delegated token: the owner's connections aren't its own.
+    expect(session.gitAccessProblem("git-upload-pack")).toBeNull();
+    const delegated = { ...AUTH, delegationDepth: 1 };
+    const info = infoOf(await m.handle({ type: "session.create", id: "cd", name: "deleg", workdir: t.workdir } as never, delegated, { ...CLIENT, auth: delegated }));
+    const d = info ? m.findByName(info.name, AUTH) : undefined;
+    expect(d?.gitAccessProblem("git-upload-pack")).toContain("delegated token");
+  });
 });

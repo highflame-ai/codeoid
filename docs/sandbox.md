@@ -1270,7 +1270,11 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
 - **`--token`** stores a dedicated token instead: a Bitbucket repository access token, or a GitHub fine-grained
   token. Use it for a shared daemon or a sensitive organisation.
 - **Permissions:** you need `settings:write`, and a delegated token can't connect. A connection is yours: it decides
-  only your sessions.
+  only your sessions, and never one a delegated token made.
+- **No credential in the URL:** a URL with a password, a query or a fragment can't be connected. Give a token with
+  `--token`. Cards, `ls` and the audit show the URL whole, every path segment, so you can see which repository it is.
+- **Running sessions** pick up a connection, or a disconnection, at their next turn. A process backend is
+  restarted then.
 - **In guarded mode,** an agent that reaches a remote you haven't connected raises a card offering to connect it. In
   autonomous mode it's refused, and the agent is told the command.
 
@@ -1279,6 +1283,8 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
 - One or more branches, `refs/heads/*`: a new branch, or one an agent made there through codeoid before
   (fast-forward only). Never a branch already on the remote that no agent made, such as a teammate's
   `develop`.
+- **Judged against the remote, not the client's word:** each update is checked against what the gateway just
+  fetched. The push goes upstream with a lease on exactly that state, so a branch moved meanwhile is refused.
 - Never:
   - `main`, `master` or another protected branch (`sandbox.push.protectedBranches`, case-insensitive, where a
     trailing `*` matches a prefix);

@@ -213,10 +213,11 @@ import {
   mainWorktreeRoot,
   removeForkWorktree,
 } from "./git-worktree.js";
-import { hardenedGit, safeGit } from "./git-env.js";
+import { GIT_BIN, hardenedGit, safeGit } from "./git-env.js";
 import { connectionId, GitCredentials, probeConnection } from "./git-gateway/connect.js";
 import { type GatewayHost, GitGateway } from "./git-gateway/gateway.js";
-import { redactCredentials, remoteUrlProblem, shownUrl } from "./git-gateway/text.js";
+import { programTrustProblem } from "./git-gateway/hostpath.js";
+import { redactCredentials, remoteUrlProblem, shownGitUrl } from "./git-gateway/text.js";
 import { systemSsh, upstreamKind } from "./git-gateway/upstream.js";
 import type { GitGatewaySpec } from "./sandbox/policy.js";
 import {
@@ -1199,6 +1200,7 @@ export class SessionManager {
           claudeAccount: meta.claudeAccount ?? null,
           ...(meta.accounts ? { accountChoices: meta.accounts } : {}),
           ...(meta.sandbox ? { sandbox: meta.sandbox } : {}),
+          ...(meta.createdByDelegate ? { createdByDelegate: true } : {}),
           hooks: this.#hooks,
           identityManager: this.#identityManager,
           existingId: meta.sessionId,
@@ -4677,8 +4679,14 @@ mcpHub: this.#mcpHub,
     if (probe.credential) this.#gitCredentials.set(id, probe.credential);
     else this.#gitCredentials.remove(id);
     this.#store.setGitConnection({ owner, url, kind: probe.kind, auth: probe.auth, connectedBy: by });
-    this.#store.audit(by, "sandbox.git_connected", undefined, `${shownUrl(url)} ${probe.kind} ${probe.auth} owner=${owner}`);
+    this.#store.audit(by, "sandbox.git_connected", undefined, `${shownGitUrl(url)} ${probe.kind} ${probe.auth} owner=${owner}`);
+    this.#gitConnectionsChanged(owner);
     return { kind: probe.kind, auth: probe.auth };
+  }
+
+  /** An owner's connections changed: their sandboxed sessions get the gateway as it is now, between turns. */
+  #gitConnectionsChanged(owner: string): void {
+    for (const s of this.#sessions.values()) if (s.createdBy === owner) s.gitConnectionsChanged();
   }
 
   /** The gateway's host: who may reach what, the session's word on a push, what happened. */
@@ -4686,24 +4694,30 @@ mcpHub: this.#mcpHub,
     grant: async (sessionId, service, url) => {
       const session = this.#sessions.get(sessionId);
       if (!session) return { refused: "this session is gone" };
+      if (sandboxConfigOf(this.#config).git?.enabled === false) return { refused: "the git gateway is turned off here (sandbox.git.enabled)" };
       const problem = session.gitAccessProblem(service);
       if (problem) return { refused: problem };
+      // What runs on the host for it (git's servers and the push hook): codeoid's git and runtime, never a session's.
+      for (const program of [GIT_BIN, process.execPath]) {
+        const bad = programTrustProblem(program, this.#allSandboxWritable());
+        if (bad) return { refused: bad };
+      }
       const owner = session.createdBy;
       let conn = this.#store.gitConnection(owner, url);
       if (!conn) {
         const kind = upstreamKind(url);
         const bad = remoteUrlProblem(url);
         const how = `\`codeoid sandbox git connect --url ${url}\` (or from the repository: \`codeoid sandbox git connect\`)`;
-        if ((!kind || bad) && !testFileRemote(url)) return { refused: `${shownUrl(url)} can't be reached for agents${bad ? `: ${bad}` : ""}` };
+        if ((!kind || bad) && !testFileRemote(url)) return { refused: `${shownGitUrl(url)} can't be reached for agents${bad ? `: ${bad}` : ""}` };
         const yes = await session.askToConnectGit(url, kind === "ssh" ? "your ssh key" : "your git credential for it");
-        if (!yes) return { refused: `${shownUrl(url)} isn't connected for agents: the owner can connect it with ${how}` };
+        if (!yes) return { refused: `${shownGitUrl(url)} isn't connected for agents: the owner can connect it with ${how}` };
         const done = await this.#connectGit(owner, url, yes);
         if ("error" in done) return { refused: done.error };
         conn = this.#store.gitConnection(owner, url);
         if (!conn) return { refused: "the connection wasn't recorded" };
       }
       const credential = conn.kind === "https" ? this.#gitCredentials?.get(connectionId(owner, url)) : undefined;
-      if (conn.kind === "https" && !credential) return { refused: `the credential for ${shownUrl(url)} is gone: the owner can connect it again` };
+      if (conn.kind === "https" && !credential) return { refused: `the credential for ${shownGitUrl(url)} is gone: the owner can connect it again` };
       let ssh: string | null = null;
       if (conn.kind === "ssh" && !testFileRemote(url)) {
         const s = systemSsh(this.#allSandboxWritable());
@@ -4737,7 +4751,7 @@ mcpHub: this.#mcpHub,
     if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return fail("Missing scope: settings:write", "forbidden");
     if (auth.delegationDepth > 0) return fail("A delegated token can't connect remotes for agents: the owner does.", "forbidden");
     if (msg.action === "list") {
-      return { type: "response.ok", requestId: msg.id, data: { connections: this.#store.listGitConnections(auth.sub).map((c) => ({ ...c, url: shownUrl(c.url) })) } };
+      return { type: "response.ok", requestId: msg.id, data: { connections: this.#store.listGitConnections(auth.sub).map((c) => ({ ...c, url: shownGitUrl(c.url) })) } };
     }
     let url = msg.url;
     if (!url) {
@@ -4751,16 +4765,17 @@ mcpHub: this.#mcpHub,
       if (!url) return fail(`There is no remote named ${remote} in ${msg.path}.`);
     }
     // What a connect from a repository would connect: the CLI shows it, and asks, first.
-    if (msg.action === "resolve") return { type: "response.ok", requestId: msg.id, data: { url: shownUrl(url), rawUrl: url, connected: !!this.#store.gitConnection(auth.sub, url) } };
+    if (msg.action === "resolve") return { type: "response.ok", requestId: msg.id, data: { url: shownGitUrl(url), rawUrl: url, connected: !!this.#store.gitConnection(auth.sub, url) } };
     if (msg.action === "disconnect") {
       const removed = this.#store.removeGitConnection(auth.sub, url);
       this.#gitCredentials?.remove(connectionId(auth.sub, url));
-      this.#store.audit(auth.sub, "sandbox.git_disconnected", undefined, `${shownUrl(url)} removed=${removed}`);
-      return { type: "response.ok", requestId: msg.id, data: { removed, url: shownUrl(url) } };
+      this.#gitConnectionsChanged(auth.sub);
+      this.#store.audit(auth.sub, "sandbox.git_disconnected", undefined, `${shownGitUrl(url)} removed=${removed}`);
+      return { type: "response.ok", requestId: msg.id, data: { removed, url: shownGitUrl(url) } };
     }
     const done = await this.#connectGit(auth.sub, url, auth.sub, msg.token);
     if ("error" in done) return fail(`Not connected: ${done.error}`);
-    return { type: "response.ok", requestId: msg.id, data: { url: shownUrl(url), ...done } };
+    return { type: "response.ok", requestId: msg.id, data: { url: shownGitUrl(url), ...done } };
   }
 
   readonly #sandboxCheckoutsFor = (sessionId: string): OtherCheckout[] => {

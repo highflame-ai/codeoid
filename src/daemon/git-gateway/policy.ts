@@ -4,11 +4,16 @@
  * remote (its default branch, its symbolic refs, the branches agents made there) and an ancestry check.
  */
 
-/** One ref update as git's pre-receive hook reads it: `old new ref`. */
+/** One ref update as git's pre-receive hook reads it: `old new ref` (`old` there is the client's claim). */
 export interface RefUpdate {
   old: string;
   new: string;
   ref: string;
+}
+
+/** The zero id of `oid`'s length. */
+export function zeroOf(oid: string): string {
+  return "0".repeat(oid.length === 64 ? 64 : 40);
 }
 
 export interface PushPolicy {

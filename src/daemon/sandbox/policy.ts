@@ -436,15 +436,16 @@ export interface GitGatewaySpec {
  * `*KEY*`, so `GIT_CONFIG_KEY_n`) keeps it. Empty when the launcher's path can't be named in an ext:: command.
  */
 export function gitGatewayEnv(g: GitGatewaySpec): Record<string, string> {
-  if (/[\s%']/.test(g.ext) || g.urls.length === 0) return {};
-  const q = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-  const entries: Array<[string, string]> = [["protocol.ext.allow", "always"]];
+  if (/[\s%'=]/.test(g.ext) || g.urls.length === 0) return {};
+  // `user`, not `always`: a submodule's ext:: URL (git marks those not from the user) runs nothing.
+  const entries: Array<[string, string]> = [["protocol.ext.allow", "user"]];
   for (const u of new Set(g.urls)) {
-    if (/[\s']/.test(u)) continue;
+    // The old `'key=value'` form, which every git parses (the split form is git 2.31's): a URL with `=` can't be in it.
+    if (/[\s'=]/.test(u)) continue;
     const target = `ext::${g.ext} %S ${u.replace(/%/g, "%%")}`;
     entries.push([`url.${target}.insteadOf`, u], [`url.${target}.pushInsteadOf`, u]);
   }
-  return { CODEOID_GIT_GATEWAY: g.socket, GIT_CONFIG_PARAMETERS: entries.map(([k, v]) => `${q(k)}=${q(v)}`).join(" ") };
+  return { CODEOID_GIT_GATEWAY: g.socket, GIT_CONFIG_PARAMETERS: entries.map(([k, v]) => `'${k}=${v}'`).join(" ") };
 }
 
 export interface SpecInputs {
@@ -1397,8 +1398,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     pins,
     reexposed,
     containerSockets: containerSocketPaths(home, env).filter((p) => !exposed.has(p) && !exposed.has(realOr(p))),
-    // Hidden too with the git gateway: on Claude's Linux sandbox its socket lets every unix socket be connected.
-    ...((inputs.hideLocalServices ?? inputs.network.mode !== "on") || gateway ? { serviceSockets: localServiceSocketPaths() } : {}),
+    ...((inputs.hideLocalServices ?? inputs.network.mode !== "on") ? { serviceSockets: localServiceSocketPaths() } : {}),
     ...(sockets.length > 0 ? { dockerSockets: sockets } : {}),
     ...(gateway ? { gatewaySockets: [gateway.socket], ...(gateway.root ? { gatewayRoot: gateway.root } : {}) } : {}),
     network: inputs.network,

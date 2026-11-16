@@ -62,7 +62,8 @@ git-remote-codeoid (remote helper) ───────▶  gateway
   - the workspace repository's ssh remotes;
   - its https remotes, when the network isn't on.
 
-  These are whole URLs, never prefixes, so they outrank an owner's shorter rewrite. The agent may unset this, but that only takes its own access away.
+  These are whole URLs, never prefixes, so they outrank an owner's shorter rewrite. It uses the old `'key=value'` form, which every git parses; a URL with `=` is left out. `protocol.ext.allow=user`, so a submodule's `ext::` URL runs nothing. The agent may unset this, but that only takes its own access away.
+- A connection change marks the owner's sessions' sandboxes for re-resolution between turns. A session made with a delegated token gets no gateway access.
 - The launcher (`codeoid-git-ext`, `exec <runtime> ext.js`) is in the gateway's `bin/`, re-exposed read-only with codeoid's runtime. git's `ext::` transport runs it with the service name.
 - It opens the session's socket and sends one header line (`{"service":"git-receive-pack","url":"…"}`). On `ok` it relays:
   - git's output in length-prefixed frames, with a 0 length when git is done writing (never a socket half-close);
@@ -102,6 +103,7 @@ The daemon doesn't parse or relay the pack protocol itself. It runs git's own se
      - anything to an empty remote.
 
      Several refs are taken when every one passes, and they are pushed upstream atomically.
+   - Each update's `old` is taken from the refreshed cache, never from the client. A different claim is refused, and the upstream push carries `--force-with-lease=<ref>:<that old>` (empty for a new branch).
    - The decision is tied to the agent's connection. If it closes (a tool's time limit, an interrupt) or the session closes, the owner's card closes and nothing is pushed.
    - In guarded mode, the owner is asked on a card first: the branch, commit, URL and the agent's reason. A role whose network isn't `true`, or is read-only, is refused.
    - Then the hook pushes the checked commits upstream (`git push --atomic --porcelain <upstream> <new>:<ref>` with the quarantine's object env and the gateway's upstream env). The agent's push is accepted only if upstream took them. Upstream's own messages, redacted, are relayed as the hook's output.

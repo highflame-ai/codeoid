@@ -231,6 +231,81 @@ describe("the git gateway", () => {
     expect(r.out).toContain("empty repository");
   });
 
+  test("round 2 (gateway): a client claiming an existing branch is new (a hidden advertisement) is refused; nothing moves", async () => {
+    const work = await clone();
+    plain(upstream, "branch", "release", "main");
+    const before = upstreamRef("refs/heads/release");
+    await agent(work, "fetch", "-q", "origin");
+    await agent(work, "checkout", "-q", "-B", "rel", "origin/release");
+    await commit(work, "r");
+    // An agent-side wrapper around the launcher that drops refs/heads/release from the advertisement.
+    const s = gw.forSession("s1");
+    const filter = join(root, "filter.cjs");
+    writeFileSync(
+      filter,
+      `const { spawn } = require("node:child_process");
+const [service, url] = process.argv.slice(2);
+const p = spawn(${JSON.stringify(s.ext)}, [service, url], { stdio: ["pipe", "pipe", "inherit"] });
+process.stdin.pipe(p.stdin);
+let buf = Buffer.alloc(0), adv = service === "git-receive-pack";
+p.stdout.on("data", (d) => {
+  if (!adv) return process.stdout.write(d);
+  buf = Buffer.concat([buf, d]);
+  while (adv && buf.length >= 4) {
+    const n = parseInt(buf.subarray(0, 4).toString(), 16);
+    if (n === 0) { process.stdout.write(buf.subarray(0, 4)); buf = buf.subarray(4); adv = false; break; }
+    if (buf.length < n) return;
+    const line = buf.subarray(0, n); buf = buf.subarray(n);
+    if (!line.toString("latin1").includes(" refs/heads/release")) process.stdout.write(line);
+  }
+  if (!adv && buf.length) { process.stdout.write(buf); buf = Buffer.alloc(0); }
+});
+p.stdout.on("end", () => process.stdout.end());
+p.on("exit", (c) => (process.exitCode = c ?? 1));
+`,
+    );
+    const env = { PATH: process.env.PATH ?? "", HOME: join(root, "agent-home"), GIT_CONFIG_NOSYSTEM: "1", ...ID, CODEOID_GIT_GATEWAY: s.socket, ...configEnv([["protocol.ext.allow", "always"], [`url.ext::${process.execPath} ${filter} %S ${URL}.insteadOf`, URL]]) };
+    const p = Bun.spawn(["git", "push", "origin", "HEAD:refs/heads/release"], { cwd: work, env, stdout: "pipe", stderr: "pipe" });
+    const [out, err, code] = await Promise.all([new Response(p.stdout).text(), new Response(p.stderr).text(), p.exited]);
+    expect(code).not.toBe(0);
+    expect(out + err).toContain("isn't what it has");
+    expect(upstreamRef("refs/heads/release")).toBe(before);
+    expect(agentBranches.has("release")).toBe(false);
+  });
+
+  test("round 2 (gateway): a delete is refused as one; a remote with an unborn HEAD but branches takes no push; a broken cache is made again", async () => {
+    const work = await clone();
+    await agent(work, "checkout", "-q", "-b", "feature/d");
+    await commit(work, "d");
+    expect((await agent(work, "push", "origin", "feature/d")).code).toBe(0);
+    const del = await agent(work, "push", "origin", "--delete", "feature/d");
+    expect(del.out).toContain("deleting a branch isn't done for agents");
+    expect(reports.some((e) => e.kind === "push" && !e.ok && e.detail.includes("deleting"))).toBe(true);
+    // The remote's HEAD names a branch it doesn't have (renamed away), and it has others.
+    plain(upstream, "symbolic-ref", "HEAD", "refs/heads/gone");
+    await commit(work, "e");
+    const unborn = await agent(work, "push", "origin", "HEAD:refs/heads/new-one");
+    expect(unborn.code).not.toBe(0);
+    expect(unborn.out).toContain("couldn't ask the remote which branch is its default");
+    plain(upstream, "symbolic-ref", "HEAD", "refs/heads/main");
+    // A cache dir that isn't a repository (a clone cut short): removed and cloned again, never walked up from.
+    const cache = gw.cachePath(`u:${URL}`);
+    rmSync(cache, { recursive: true, force: true });
+    mkdirSync(join(cache, "objects"), { recursive: true });
+    writeFileSync(join(cache, "config"), "");
+    expect((await agent(work, "fetch", "-q", "origin")).code).toBe(0);
+  });
+
+  test("round 2 (gateway): a URL with a password or a query can't be connected, and is shown whole otherwise", async () => {
+    const { remoteUrlProblem, shownGitUrl } = await import("../daemon/git-gateway/text.js");
+    expect(remoteUrlProblem("https://x-access-token:ghp_FAKE@github.com/o/r.git")).toContain("password");
+    expect(remoteUrlProblem("https://github.com/o/r.git?tok=1")).toContain("query");
+    expect(remoteUrlProblem("https://github.com/acme/infrastructure-terraform-prod.git")).toBeNull();
+    expect(shownGitUrl("https://github.com/acme/infrastructure-terraform-prod.git")).toBe("https://github.com/acme/infrastructure-terraform-prod.git");
+    expect(shownGitUrl("https://u:secret@h/x.git")).not.toContain("secret");
+    expect(shownGitUrl("git@h:o/r\u202e.git")).toContain("\\u{202e}");
+  });
+
   test("the policy alone: only plain branch updates that fast-forward", async () => {
     const z = "0".repeat(40);
     const a = "a".repeat(40);

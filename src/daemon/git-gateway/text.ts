@@ -4,8 +4,22 @@
  */
 import { redactMcpUrl } from "../mcp/redact.js";
 
+/**
+ * A remote's URL as the git gateway shows it to the owner (cards, the CLI, the audit, the transcript): whole, scheme,
+ * host and every path segment (never elided: which repository it is is the point), with invisible and reordering
+ * characters written as their codes. A connectable URL has no password or query (`remoteUrlProblem`); a stray one
+ * is hidden anyway.
+ */
+export function shownGitUrl(url: string): string {
+  const masked = url.replace(/^([a-z][a-z0-9+.-]*:\/\/[^/@\s]*?):[^/@\s]*@/i, "$1:…@").replace(/[?#].*$/, "?…");
+  return shownName(masked.length > 300 ? `${masked.slice(0, 300)}…` : masked);
+}
+
 /** `ssh://…`, `git@host:path` (scp-like) or `https://…`: the protocols the push may use. */
 export function remoteUrlProblem(url: string): string | null {
+  // Never a credential in the URL itself: it would go into sandboxes as git's config does (a token for it is `--token`).
+  if (/^[a-z][a-z0-9+.-]*:\/\/[^/@]*:[^/@]*@/i.test(url)) return "it holds a password: connect the URL without it, and give the token with --token";
+  if (/[?#]/.test(url)) return "it has a query or a fragment";
   if (/[\x00-\x20\x7f]/.test(url)) return "it holds spaces or control characters";
   // Shown to the owner as is: nothing invisible or reordering in it.
   if (/[\p{Cf}\p{Cc}\p{Zl}\p{Zp}\p{Co}\p{Cn}\u0085\u00a0]/u.test(url)) return "it holds invisible or reordering characters";

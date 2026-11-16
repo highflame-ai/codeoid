@@ -8,9 +8,9 @@
  */
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { GIT_BIN } from "../git-env.js";
 import { programTrustProblem } from "./hostpath.js";
 import { redactCredentials, shownOutput } from "./text.js";
@@ -201,16 +201,27 @@ export interface RemoteState {
  * Bring the daemon's cache of `up` (a bare repository) to what the remote has: its branches and tags, pruned. Made
  * by a bare clone the first time (which takes the remote's object format). Says what it learned of the remote.
  */
+// paths: the daemon's own cache repository, (re)made by a clone into a temp dir renamed into place
 export async function refreshCache(cache: string, up: Upstream, ssh: string | null, timeoutMs: number, signal?: AbortSignal): Promise<RemoteState | { error: string }> {
-  return withUpstreamEnv(up, ssh, async (env) => {
-    if (!existsSync(cache)) {
-      const r = await runGit(["clone", "--bare", "--quiet", "--no-tags", "--", up.url, cache], homedir(), env, timeoutMs, signal);
-      if (r.code !== 0) return { error: gitError(r, "the remote couldn't be fetched") };
+  return withUpstreamEnv(up, ssh, async (base) => {
+    // Every cache git on that git dir exactly: never one git finds by walking up (a dotfiles repository above).
+    const env = cacheEnv(base, cache);
+    const deadline = Date.now() + timeoutMs;
+    const left = () => Math.max(1_000, deadline - Date.now());
+    if (!(await isRepo(cache, env))) {
+      rmSync(cache, { recursive: true, force: true });
+      const tmp = `${cache}.tmp-${randomBytes(6).toString("hex")}`;
+      const r = await runGit(["clone", "--bare", "--quiet", "--no-tags", "--", up.url, tmp], dirname(cache), { ...base, GIT_CEILING_DIRECTORIES: dirname(cache) }, left(), signal);
+      if (r.code !== 0) {
+        rmSync(tmp, { recursive: true, force: true });
+        return { error: gitError(r, "the remote couldn't be fetched") };
+      }
+      renameSync(tmp, cache);
     }
-    const f = await runGit(["fetch", "--quiet", "--prune", "--prune-tags", "--no-write-fetch-head", "--", up.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], cache, env, timeoutMs, signal);
+    const f = await runGit(["fetch", "--quiet", "--prune", "--prune-tags", "--no-write-fetch-head", "--", up.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], cache, env, left(), signal);
     if (f.code !== 0) return { error: gitError(f, "the remote couldn't be fetched") };
     // Every branch with its symref target, and HEAD (protocol v2's ls-refs symrefs).
-    const h = await runGit(["ls-remote", "--symref", "--", up.url, "HEAD", "refs/heads/*"], cache, env, Math.min(timeoutMs, 60_000), signal);
+    const h = await runGit(["ls-remote", "--symref", "--", up.url, "HEAD", "refs/heads/*"], cache, env, Math.min(left(), 60_000), signal);
     const symrefs = new Set<string>();
     let defaultBranch: string | null = null;
     let heads = 0;
@@ -223,8 +234,30 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
       }
     }
     if (defaultBranch) await runGit(["symbolic-ref", "HEAD", `refs/heads/${defaultBranch}`], cache, env, 10_000, signal);
-    return { defaultBranch, defaultKnown: h.code === 0, symrefs, empty: h.code === 0 && heads === 0 };
+    // Branches, but no HEAD said (an unborn one: renamed or deleted): which branch would become the default isn't known.
+    const defaultKnown = h.code === 0 && (defaultBranch !== null || heads === 0);
+    return { defaultBranch, defaultKnown, symrefs, empty: h.code === 0 && heads === 0 };
   });
+}
+
+/** A git env bound to the cache repository `cache` exactly (`GIT_DIR`), git's discovery stopped at its dir. */
+export function cacheEnv(env: Record<string, string>, cache: string): Record<string, string> {
+  return { ...env, GIT_DIR: cache, GIT_CEILING_DIRECTORIES: dirname(cache) };
+}
+
+/** Whether `cache` is a bare repository git takes (a clone cut short leaves a dir that isn't). */
+async function isRepo(cache: string, env: Record<string, string>): Promise<boolean> {
+  if (!existsSync(cache)) return false;
+  const r = await runGit(["rev-parse", "--is-bare-repository"], cache, env, 10_000);
+  return r.code === 0 && r.stdout.trim() === "true";
+}
+
+/** What the cache (just refreshed) has for `ref`: its id, or the zero id of `like`'s length when it has none. */
+export async function cacheRef(cache: string, ref: string, like: string): Promise<string> {
+  const env = cacheEnv({ PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, cache);
+  const r = await runGit(["rev-parse", "--verify", "-q", "--end-of-options", `${ref}^{commit}`], cache, env, 10_000);
+  const oid = r.code === 0 ? r.stdout.trim() : "";
+  return /^[0-9a-f]{40,64}$/.test(oid) ? oid : "0".repeat(like.length === 64 ? 64 : 40);
 }
 
 /**
@@ -235,15 +268,17 @@ export async function pushUpstream(
   cache: string,
   up: Upstream,
   ssh: string | null,
-  updates: ReadonlyArray<{ new: string; ref: string }>,
+  updates: ReadonlyArray<{ old: string; new: string; ref: string }>,
   objects: { dir: string; alternates: string },
   timeoutMs: number,
   signal?: AbortSignal,
 ): Promise<{ ok: true; output: string } | { ok: false; error: string; output: string }> {
   return withUpstreamEnv(up, ssh, async (base) => {
-    const env = { ...base, GIT_OBJECT_DIRECTORY: objects.dir, GIT_ALTERNATE_OBJECT_DIRECTORIES: objects.alternates };
+    const env = { ...cacheEnv(base, cache), GIT_OBJECT_DIRECTORY: objects.dir, GIT_ALTERNATE_OBJECT_DIRECTORIES: objects.alternates };
     const specs = updates.map((u) => `${u.new}:${u.ref}`);
-    const r = await runGit(["push", "--atomic", "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", "--", up.url, ...specs], cache, env, timeoutMs, signal);
+    // The remote moves only from exactly what was checked: each branch where the gateway saw it (none, for a new one).
+    const leases = updates.map((u) => `--force-with-lease=${u.ref}:${/^0+$/.test(u.old) ? "" : u.old}`);
+    const r = await runGit(["push", "--atomic", "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", ...leases, "--", up.url, ...specs], cache, env, timeoutMs, signal);
     const output = redactCredentials(shownOutput(`${r.stdout}\n${r.stderr}`));
     if (r.code === 0) return { ok: true, output };
     const rejected = r.stdout
@@ -257,7 +292,11 @@ export async function pushUpstream(
 
 /** Whether `old` is an ancestor of `next` in the cache, with the pushed objects in reach. */
 export async function isAncestor(cache: string, old: string, next: string, objects: { dir: string; alternates: string }): Promise<boolean> {
-  const env = { PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_NO_REPLACE_OBJECTS: "1", GIT_OBJECT_DIRECTORY: objects.dir, GIT_ALTERNATE_OBJECT_DIRECTORIES: objects.alternates };
+  const env = {
+    ...cacheEnv({ PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_NO_REPLACE_OBJECTS: "1" }, cache),
+    GIT_OBJECT_DIRECTORY: objects.dir,
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: objects.alternates,
+  };
   const r = await runGit(["merge-base", "--is-ancestor", old, next], cache, env, 30_000);
   return r.code === 0;
 }

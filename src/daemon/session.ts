@@ -247,7 +247,7 @@ import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/v
 
 /** What is recorded of a call the user listed in `secrets.dropCommands`. */
 const NOT_STORED = "‹not stored›";
-import { redactCredentials, shownName, shownUrl } from "./git-gateway/text.js";
+import { redactCredentials, shownGitUrl, shownName } from "./git-gateway/text.js";
 import type { GitGatewaySpec } from "./sandbox/policy.js";
 import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
 import {
@@ -622,6 +622,8 @@ export interface SessionCreateOptions {
   sandboxCheckouts?: (sessionId: string) => OtherCheckout[];
   /** The session's git gateway (docs/git-gateway-design.md): what its sandbox is given; absent, none. */
   gitGateway?: (sessionId: string) => GitGatewaySpec | undefined;
+  /** Made with a delegated token (a resumed session: as its meta says). Such a session gets none of the owner's git access. */
+  createdByDelegate?: boolean;
   /**
    * Pre-built codeoid_fleet MCP server (conductor sessions only). Built by
    * the SessionManager because its tools close over the manager's tenant-
@@ -1193,6 +1195,8 @@ export class Session {
   #sandboxMcp?: (sessionId: string) => SandboxMcpMount | undefined;
   #sandboxCheckouts?: (sessionId: string) => OtherCheckout[];
   readonly createdBy: string;
+  /** Made with a delegated token: the owner's git connections aren't this session's to use. */
+  readonly createdByDelegate: boolean;
   readonly createdAt: string;
   /**
    * Tenancy stamps captured at session creation (or restored from disk
@@ -1967,6 +1971,7 @@ export class Session {
         opts.initialMode.mode === "autonomous" ? opts.initialMode.maxTurns : undefined;
     }
     this.createdBy = opts.auth.sub;
+    this.createdByDelegate = opts.createdByDelegate ?? opts.auth.delegationDepth > 0;
     // Restored from TranscriptMeta on resume, stamped fresh only for a new
     // session. Both were previously unconditional `now`, which meant every
     // daemon restart re-dated every session: `createdAt` became the restart
@@ -9268,6 +9273,7 @@ export class Session {
     const sbx = this.#sandbox;
     if (!sbx || sbx.info?.state !== "on") return "this session's commands aren't sandboxed";
     if (this.#destroyed || this.#draining) return "the session is closing";
+    if (this.createdByDelegate) return "this session was made with a delegated token: the owner's git connections are theirs alone";
     const push = service === "git-receive-pack";
     if (push && sbx.config.push?.enabled === false) return "pushing for agents is turned off here (sandbox.push.enabled): ask the owner to push";
     const role = this.#pack?.role;
@@ -9276,6 +9282,11 @@ export class Session {
     }
     if (role && push && role.write === false) return `role "${this.#pack?.roleName}" is read-only (write: false): it doesn't push`;
     return null;
+  }
+
+  /** The owner's git connections changed: applied between turns (a process backend restarted then). */
+  gitConnectionsChanged(): void {
+    this.#sandbox?.gitGatewayChanged();
   }
 
   /** The protected branches this session's pushes never reach (`sandbox.push.protectedBranches`). */
@@ -9303,8 +9314,8 @@ export class Session {
     const answer = await this.requestUserInput(
       {
         method: "confirm",
-        title: `The agent's git reached for ${shownUrl(url)}`,
-        message: `"${this.name}" ran git against ${shownUrl(url)}, which you haven't connected for agents.\n\nConnect it? Agents in your sandboxed sessions could then fetch from it, and push to branches of their own (never main, master or its default branch, never a force push, a delete or a tag), with ${how}. Your credential stays with codeoid; the agent never sees it. A pushed branch runs the repository's CI as that branch defines it, with its secrets.`,
+        title: `The agent's git reached for ${shownGitUrl(url)}`,
+        message: `"${this.name}" ran git against ${shownGitUrl(url)}, which you haven't connected for agents.\n\nConnect it? Agents in your sandboxed sessions could then fetch from it, and push to branches of their own (never main, master or its default branch, never a force push, a delete or a tag), with ${how}. Your credential stays with codeoid; the agent never sees it. A pushed branch runs the repository's CI as that branch defines it, with its secrets.`,
         timeoutMs: 100_000,
       },
       {
@@ -9324,7 +9335,7 @@ export class Session {
    */
   async decideGitPush(push: { url: string; updates: ReadonlyArray<{ old: string; new: string; ref: string }> }, signal?: AbortSignal): Promise<{ ok: true } | { refused: string }> {
     const what = push.updates.map((u) => `${shownName(u.ref.replace(/^refs\/heads\//, ""))} (${u.new.slice(0, 12)})`).join(", ");
-    this.#store.audit(SYSTEM_IDENTITY.sub, "session.git_push_request", this.id, `${what} -> ${shownUrl(push.url)}`.slice(0, 2000));
+    this.#store.audit(SYSTEM_IDENTITY.sub, "session.git_push_request", this.id, `${what} -> ${shownGitUrl(push.url)}`.slice(0, 2000));
     const problem = this.gitAccessProblem("git-receive-pack");
     if (problem) return { refused: problem };
     if (this.#mode === "autonomous") return { ok: true };
@@ -9333,7 +9344,7 @@ export class Session {
       {
         method: "confirm",
         title: `The agent pushes ${push.updates.length === 1 ? shownName(push.updates[0]?.ref.replace(/^refs\/heads\//, "") ?? "") : `${push.updates.length} branches`}`,
-        message: `"${this.name}" pushes ${what} to ${shownUrl(push.url)} with your credentials. No force, no delete, no tags; checked already.\n\nThe branch runs the repository's CI as it defines it, with its secrets.`,
+        message: `"${this.name}" pushes ${what} to ${shownGitUrl(push.url)} with your credentials. No force, no delete, no tags; checked already.\n\nThe branch runs the repository's CI as it defines it, with its secrets.`,
         timeoutMs: 100_000,
         // The agent's git gone (a tool's time limit, an interrupt): the card closes, and nothing is pushed.
         ...(signal ? { signal } : {}),
@@ -9357,10 +9368,10 @@ export class Session {
   /** What the git gateway did for this session: audited, and a push (or a refusal) said in the transcript. */
   noteGit(e: { kind: "fetch" | "push"; url: string; ok: boolean; detail: string; updates?: ReadonlyArray<{ new: string; ref: string }> }): void {
     const detail = shownName(redactCredentials(e.detail));
-    this.#store.audit(SYSTEM_IDENTITY.sub, `session.git_${e.kind}_${e.ok ? "done" : "refused"}`, this.id, `${shownUrl(e.url)}: ${detail}`.slice(0, 2000));
+    this.#store.audit(SYSTEM_IDENTITY.sub, `session.git_${e.kind}_${e.ok ? "done" : "refused"}`, this.id, `${shownGitUrl(e.url)}: ${detail}`.slice(0, 2000));
     if (e.kind === "fetch" && e.ok) return;
     const branches = (e.updates ?? []).map((u) => shownName(u.ref.replace(/^refs\/heads\//, ""))).join(", ");
-    const text = e.ok ? `⬆ Pushed ${branches} → ${shownUrl(e.url)}` : `⬆ The agent's git ${e.kind} to ${shownUrl(e.url)}${branches ? ` (${branches})` : ""}: refused (${detail})`;
+    const text = e.ok ? `⬆ Pushed ${branches} → ${shownGitUrl(e.url)}` : `⬆ The agent's git ${e.kind} to ${shownGitUrl(e.url)}${branches ? ` (${branches})` : ""}: refused (${detail})`;
     const m = this.#makeMessage("info", text, SYSTEM_IDENTITY, undefined, undefined, { event: e.ok ? "sandbox.git_pushed" : "sandbox.git_refused" });
     this.#persistAndBuffer(m);
     this.#broadcastRaw(m);
@@ -12799,6 +12810,7 @@ export class Session {
       ...this.#accountMeta(),
       ...(this.#sandbox?.setting ? { sandbox: this.#sandbox.setting } : {}),
       ...(this.#backingFresh ? { backingFresh: true } : {}),
+      ...(this.createdByDelegate ? { createdByDelegate: true } : {}),
       ...(this.#redactedBackings.size > 0 ? { redactedBackings: [...this.#redactedBackings] } : {}),
       forkedFrom: this.forkedFrom,
       ...this.#backgroundMeta(),

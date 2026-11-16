@@ -60,7 +60,15 @@ const ppidOf = (pid) => {
   try {
     const stat = fs.readFileSync("/proc/" + pid + "/stat", "utf8");
     return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]);
-  } catch { return pid === "self" ? process.ppid : null; }
+  } catch {
+    if (pid === "self") return process.ppid;
+    // No /proc (macOS): ps, by its absolute path.
+    try {
+      const out = require("node:child_process").execFileSync("/bin/ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", timeout: 2000 });
+      const n = Number(out.trim());
+      return Number.isFinite(n) && n > 0 ? n : null;
+    } catch { return null; }
+  }
 };
 const parent = ppidOf("self");
 const grandparent = ppidOf(parent);

@@ -15,13 +15,13 @@ import { spawn } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { GIT_BIN } from "../git-env.js";
 import { within } from "../physical-path.js";
 import { type PushPolicy, type RefUpdate, refUpdateProblem } from "./policy.js";
 import { type GatewayScripts, writeGatewayScripts } from "./scripts.js";
-import { redactCredentials, shownUrl } from "./text.js";
-import { configEnv, isAncestor, pushUpstream, type RemoteState, refreshCache, type Upstream } from "./upstream.js";
+import { redactCredentials, shownGitUrl } from "./text.js";
+import { cacheRef, configEnv, isAncestor, pushUpstream, type RemoteState, refreshCache, type Upstream } from "./upstream.js";
 
 export type GitService = "git-upload-pack" | "git-receive-pack";
 
@@ -104,7 +104,9 @@ export class GitGateway {
     if (!st.isDirectory() || st.isSymbolicLink()) throw new Error(`the git gateway's dir ${this.#base} isn't a directory`);
     chmodSync(this.#base, 0o700);
     this.#scripts = writeGatewayScripts(this.#base, this.#runtime);
-    for (const d of ["sock", "cache", "control"]) mkdirSync(join(this.#base, d), { recursive: true, mode: 0o700 });
+    for (const d of ["sock", "cache", "control", "run"]) mkdirSync(join(this.#base, d), { recursive: true, mode: 0o700 });
+    // A run's credential file a stopped daemon left (it is removed after every run otherwise).
+    for (const f of readdirSync(join(this.#base, "run"))) if (f.endsWith(".cred")) rmSync(join(this.#base, "run", f), { force: true });
     this.#controlPath = join(this.#base, "control", "hook.sock");
     this.#control = this.#listen(this.#controlPath, (c) => this.#onHook(c));
   }
@@ -250,7 +252,7 @@ export class GitGateway {
         if (c.destroyed) return;
         c.write("ok\n");
         await this.#serve(service, cache, c, rest, ticket, protocol);
-        if (service === "git-upload-pack" && !gone.signal.aborted) this.#host.report(sessionId, { kind: "fetch", url, ok: true, detail: `fetched from ${shownUrl(url)}` });
+        if (service === "git-upload-pack" && !gone.signal.aborted) this.#host.report(sessionId, { kind: "fetch", url, ok: true, detail: `fetched from ${shownGitUrl(url)}` });
       } finally {
         this.#tickets.delete(ticket);
       }
@@ -282,6 +284,7 @@ export class GitGateway {
       LANG: "C",
       GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CEILING_DIRECTORIES: dirname(cache),
       ...configEnv(config),
       ...(protocol && service === "git-upload-pack" ? { GIT_PROTOCOL: protocol } : {}),
       ...(service === "git-receive-pack" ? { CODEOID_GW_HOOK: this.#controlPath, CODEOID_GW_TICKET: ticket } : {}),
@@ -355,22 +358,28 @@ export class GitGateway {
     if (!t) return verdict(false);
     // Single use.
     this.#tickets.delete(req.ticket as string);
-    const updates = Array.isArray(req.updates) ? (req.updates as RefUpdate[]).filter((u) => u && typeof u.old === "string" && typeof u.new === "string" && typeof u.ref === "string") : [];
-    const dir = typeof req.objects?.dir === "string" ? req.objects.dir : "";
-    const alternates = typeof req.objects?.alternates === "string" ? req.objects.alternates : "";
-    // The pushed objects wait in git's quarantine inside the cache; nowhere else is read.
-    const objectsRoot = join(t.cache, "objects");
-    if (!dir || !within(objectsRoot, resolve(dir)) || alternates.split(":").some((a) => a && !within(t.cache, resolve(a)))) {
-      say("codeoid: the push's objects aren't where git keeps them");
-      return verdict(false);
-    }
-    const objects = { dir, alternates };
+    const claimed = Array.isArray(req.updates) ? (req.updates as RefUpdate[]).filter((u) => u && typeof u.old === "string" && typeof u.new === "string" && typeof u.ref === "string") : [];
+    // Each update's `old` is what the remote had when the gateway refreshed (the cache: receive-pack hasn't touched it
+    // yet), never the client's claim: a push claiming a branch is new when it isn't is refused.
+    const updates: RefUpdate[] = [];
+    for (const u of claimed) updates.push({ ...u, old: await cacheRef(t.cache, u.ref, u.new) });
     const refuse = (why: string) => {
       say(`codeoid refused the push: ${why}`);
       this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: false, detail: why, updates });
       verdict(false);
     };
     if (updates.length === 0) return refuse("nothing to update");
+    for (const [i, u] of updates.entries()) {
+      if (claimed[i]?.old !== u.old) return refuse(`${u.ref}: what your git said the remote has isn't what it has (fetch, then push again)`);
+      // A delete sends no objects: said as itself.
+      if (/^0+$/.test(u.new)) return refuse(`${u.ref.replace(/^refs\/heads\//, "")}: deleting a branch isn't done for agents`);
+    }
+    const dir = typeof req.objects?.dir === "string" ? req.objects.dir : "";
+    const alternates = typeof req.objects?.alternates === "string" ? req.objects.alternates : "";
+    // The pushed objects wait in git's quarantine inside the cache; nowhere else is read.
+    const objectsRoot = join(t.cache, "objects");
+    if (!dir || !within(objectsRoot, resolve(dir)) || alternates.split(":").some((a) => a && !within(t.cache, resolve(a)))) return refuse("the push's objects aren't where git keeps them");
+    const objects = { dir, alternates };
     const policy: PushPolicy = {
       protectedBranches: t.grant.protectedBranches,
       defaultBranch: t.remote.defaultBranch,
@@ -400,8 +409,8 @@ export class GitGateway {
       this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: false, detail: pushed.error, updates });
       return verdict(false);
     }
-    say(`codeoid pushed ${updates.map((u) => u.ref.replace(/^refs\/heads\//, "")).join(", ")} to ${shownUrl(t.url)}`);
-    this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: true, detail: `pushed to ${shownUrl(t.url)}`, updates });
+    say(`codeoid pushed ${updates.map((u) => u.ref.replace(/^refs\/heads\//, "")).join(", ")} to ${shownGitUrl(t.url)}`);
+    this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: true, detail: `pushed to ${shownGitUrl(t.url)}`, updates });
     verdict(true);
   }
 }
