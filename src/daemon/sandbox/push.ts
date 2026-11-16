@@ -302,7 +302,13 @@ export function pushUrlProblem(url: string): string | null {
 export function shownSetting(entry: string): string {
   const [, key = "", ...rest] = entry.split("\t");
   const value = rest.join("\t");
-  return redactCredentials(/extraheader|cookie|password|token|secret|auth|helper/i.test(key) ? `${key} = (hidden)` : `${key} = ${value}`);
+  if (/extraheader|cookie|password|token|secret|auth|helper|pushoption/i.test(key)) return redactCredentials(`${key} = (hidden)`);
+  // A command line may carry a password (`sshpass -p …`): its program only.
+  if (/^core\.sshcommand$/i.test(key)) {
+    const [program = "", ...args] = value.trim().split(/\s+/);
+    return redactCredentials(`${key} = ${program}${args.length > 0 ? " (arguments hidden)" : ""}`);
+  }
+  return redactCredentials(`${key} = ${value}`);
 }
 
 /**
@@ -312,8 +318,8 @@ export function shownSetting(entry: string): string {
  */
 export function redactCredentials(text: string): string {
   return text
-    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/`'"]*@/gi, "$1…@")
-    .replace(/(^|[\s=,(`'"])[^\s/@`'"=,()]*:[^\s/`'"]*@/g, "$1…@")
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)[^\s/]*@/gi, "$1…@")
+    .replace(/(^|[\s=,(`'"])[^\s/@`'"=,()]*:[^\s/]*@/g, "$1…@")
     .replace(/(\/\/[^\s`'"]*?)\?[^\s`'"]*/g, "$1?…");
 }
 
@@ -770,23 +776,27 @@ export function hostPathProblem(at: string, writable: readonly string[], home = 
  * (a word with a `/`, `~` expanded) is judged by {@link hostPathProblem}. Bare names resolve on {@link safePathFor}.
  */
 export function commandProblem(command: string, writable: readonly string[], home = homedir()): string | null {
-  let first = true;
-  for (const raw of command.replace(/^\s*!/, "").split(/[\s;|&()<>`"'=]+/)) {
-    if (!raw) continue;
-    const isProgram = first;
-    first = false;
+  const words = command
+    .replace(/^\s*!/, "")
+    .split(/[\s;|&()<>`"'=]+/)
+    .filter(Boolean);
+  const sshDir = join(home, ".ssh");
+  for (const [i, raw] of words.entries()) {
     if (!raw.includes("/") && !raw.startsWith("~")) continue;
     const word = raw.startsWith("~/") || raw === "~" ? join(home, raw.slice(1)) : raw;
-    // A key file, a socket and the like are the user's; only what could be run matters: an absolute or ~ path, or a relative one (refused).
     if (!isAbsolute(word)) return `${raw} is a relative path`;
-    if (/(^|\/)\.ssh(\/|$)/.test(word)) continue;
-    // The program: nowhere a session could leave one (your home included). A path it is handed (a key, a store
-    // file, a socket, or a script `sh -c` runs): yours alone, never where a session could write.
-    const bad = hostPathProblem(word, writable, home, { homeAllowed: !isProgram });
+    // Any path word may be a program (`sh <script>`, `env <prog>`, a `!f() { … }` body, `ProxyCommand=<prog>`):
+    // nowhere a session could leave one, your home included. Only a file handed in a known data position (a key,
+    // a store file, a socket, ~/.ssh's own) may be under your home, yours alone, never where a session writes.
+    const data = DATA_OPTIONS.has((words[i - 1] ?? "").toLowerCase()) || within(sshDir, word);
+    const bad = hostPathProblem(word, writable, home, { homeAllowed: data });
     if (bad) return bad;
   }
   return null;
 }
+
+/** Options whose value is a file the program reads (ssh's and git's credential helpers'), never one it runs. */
+const DATA_OPTIONS = new Set(["-i", "-s", "--file", "--socket", "identityfile", "userknownhostsfile", "globalknownhostsfile", "controlpath", "certificatefile", "identityagent"]);
 
 function programProblem(program: string, writable: readonly string[]): boolean {
   const real = physicalPathOr(program);
@@ -1034,6 +1044,8 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
         ...(o._testFileRemote ? { protocol: "file" as const } : {}),
       });
       const head = r.code === 0 ? /^ref: refs\/heads\/(\S+)\tHEAD$/m.exec(r.stdout)?.[1] : undefined;
+      // Asked, and the remote says it has no default branch yet (an empty repository: its first branch pushed becomes it).
+      const empty = r.code === 0 && !r.stdout.trim();
       if (head && head.toLowerCase() === plan.branch.toLowerCase()) {
         return { ok: false, refused: true, summary: `refused: ${plan.branch} is the remote's default branch: push your work to a branch of its own, and open a pull request`, output: "" };
       }
@@ -1042,7 +1054,9 @@ export async function runPush(plan: PushPlan, o: RunOptions): Promise<PushResult
           return {
             ok: false,
             refused: true,
-            summary: `refused: codeoid couldn't ask ${plan.shownUrl} which branch is its default, so it can't be sure ${plan.branch} isn't it: try again, or ask the owner to push`,
+            summary: empty
+              ? `refused: ${plan.shownUrl} has no default branch yet (an empty repository), and the first branch pushed there may become it: ask the owner to push its first branch; after that, agents can push theirs`
+              : `refused: codeoid couldn't ask ${plan.shownUrl} which branch is its default, so it can't be sure ${plan.branch} isn't it: try again, or ask the owner to push`,
             output: "",
           };
         }

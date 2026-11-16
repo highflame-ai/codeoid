@@ -390,6 +390,27 @@ describe("push: the plan", () => {
     expect(commandProblem("store --file ~/.git-credentials", [home], home)).toContain("may write");
   });
 
+  test("round 13: quotes in user info, a program behind a wrapper, a command line's arguments, an empty remote", async () => {
+    const { commandProblem, redactCredentials, shownSetting } = await import("../daemon/sandbox/push.js");
+    for (const t of ["http.proxy = http://u:pa'ss\"w`d@proxy:1", "`url.https://ci:to'ken@github.com/.insteadof`", "u:pa'ss@proxy:8080"]) {
+      expect([t, /pa'ss|to'ken/.test(redactCredentials(t))]).toEqual([t, false]);
+    }
+    expect(shownSetting("global\tcore.sshcommand\tsshpass -p hunter2SSH ssh")).toBe("core.sshcommand = sshpass (arguments hidden)");
+    expect(shownSetting("global\tpush.pushoption\tci.variable=KEY=value")).toBe("push.pushoption = (hidden)");
+    // Any path word may be a program: under your home only in a known data position.
+    const home = join(root, "h");
+    for (const c of ["sh ~/proj/helper.sh get", '!f() { ~/proj/helper.sh "$@"; }; f', "env ~/proj/helper.sh", "ssh -o ProxyCommand=~/proj/p", "ssh -F ~/proj/ssh_config"]) {
+      expect([c, commandProblem(c, [], home)]).toEqual([c, expect.stringContaining("under your home")]);
+    }
+    for (const c of ["store --file ~/.git-credentials", "ssh -o IdentityFile=~/keys/k", "ssh -i ~/.ssh/k -F ~/.ssh/config"]) expect([c, commandProblem(c, [], home)]).toEqual([c, null]);
+    // An empty remote: said as that, not "try again".
+    const empty = join(root, "empty.git");
+    git(root, "init", "-q", "--bare", empty);
+    const p = { ...(await planned()), url: `file://${empty}` };
+    const r = await run(p, { checkDefault: "refuse-unknown" });
+    expect(r).toMatchObject({ ok: false, refused: true, summary: expect.stringContaining("has no default branch yet") });
+  });
+
   test("round 11: a recorded writable dir that no longer resolves (a file now, unreadable) decides nothing and breaks nothing", async () => {
     const { gitBinProblem, hostPathProblem, safePathFor } = await import("../daemon/sandbox/push.js");
     const gone = join(root, "was-a-workspace");

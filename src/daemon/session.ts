@@ -4207,7 +4207,11 @@ export class Session {
    */
   async push(input: PushInput): Promise<string> {
     if (this.#pushing) return "Refused: a push for this session is still running; wait for it, then call push again if it's needed.";
-    const run = this.#push(input);
+    const run = this.#push(input).catch((err: unknown) => {
+      const why = shownName(redactCredentials(err instanceof Error ? err.message : String(err)));
+      this.#store.audit(SYSTEM_IDENTITY.sub, "session.push_refused", this.id, `push: ${why}`.slice(0, 2000));
+      return `Refused: the push couldn't be checked (${why}).`;
+    });
     this.#pushing = run;
     try {
       return await run;
@@ -4301,7 +4305,13 @@ export class Session {
     let by = SYSTEM_IDENTITY.sub;
     if (this.#mode !== "autonomous") {
       let answeredBy: string | undefined;
-      const reason = input.reason ? `\n\nThe agent's reason, in its own words:\n${input.reason.split("\n").map((l) => `> ${l}`).join("\n")}` : "";
+      // Every line of it quoted (any line break a frontend may render), nothing invisible or reordering in it.
+      const reason = input.reason
+        ? `\n\nThe agent's reason, in its own words:\n${input.reason
+            .split(/\r\n?|[\n\u0085\u2028\u2029]/)
+            .map((l) => `> ${shownName(l)}`)
+            .join("\n")}`
+        : "";
       const unknown = `\n\nThe remote's default branch is asked after you answer (a push there is refused); if it can't be asked, the push goes ahead.`;
       const PUSH = "Push";
       const TRUST = `Push, and trust ${plan.shownUrl} for this repository's agent pushes (autonomous mode too)`;

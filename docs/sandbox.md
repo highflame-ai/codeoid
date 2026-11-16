@@ -1360,7 +1360,8 @@ you've checked what is in such a place, and no session works there, clear it
 with `codeoid sandbox forget-writable <dir>`; the refusal names the command.
 The guarded card and `codeoid sandbox trust-push` list the settings of yours
 that decide the push, with every URL's user info and query, and any
-secret-looking value or credential helper, hidden. Refusals (what the agent,
+secret-looking value, credential helper and push option hidden, and
+`core.sshCommand` shown as its program alone. Refusals (what the agent,
 the transcript and the audit read) are redacted the same way, `user:pass@host`
 without a scheme included.
 
@@ -1379,6 +1380,9 @@ or after you answered the card, and from the private repository, so a remote
 you never approved is never contacted. A push there is refused. If it can't be
 asked (an error, a timeout, no `HEAD` symref), autonomous mode refuses the
 push; in guarded mode it goes ahead (you approved it), and the result says so.
+An empty remote has no default branch yet, and its first branch pushed may
+become it: autonomous mode refuses, saying so; push its first branch
+yourself.
 
 **How git runs**
 
@@ -1392,9 +1396,12 @@ It runs hardened (`git-env.ts`):
   `staff` or a shared `users` group. A session that has ended may have left a program in its
   workspace, so "under your home" is out whatever runs now. `ssh` is found on
   that PATH. An ssh command (`core.sshCommand`, `GIT_SSH_COMMAND`, `GIT_SSH`)
-  or credential helper whose program fails the same test, or is a relative
-  path, is refused. A file it is handed (`store --file ~/.git-credentials`, a
-  key, a socket) may be under your home, but never where a session could write. (Paths under `~/.ssh`, such as keys and config, are yours
+  or credential helper is refused if any path in it fails the same test (any
+  of them may be a program: `sh <script>`, `!f() { <prog> …; }`,
+  `ProxyCommand=<prog>`), or is relative. Only a file in a known data position
+  (`--file`, `--socket`, ssh's `-i`, `IdentityFile=`, `ControlPath=`, and
+  `~/.ssh` itself) may be under your home, and never where a session could
+  write. (Paths under `~/.ssh`, such as keys and config, are yours
   to name.) A git of codeoid's own under your home can't push for agents
   either.
 - With no askpass program (`GIT_ASKPASS`, `SSH_ASKPASS`): a push never prompts.
