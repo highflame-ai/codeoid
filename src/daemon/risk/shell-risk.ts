@@ -609,6 +609,7 @@ function checkSecrets(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdi
   // A wrapper's own words name files too: `xargs -a FILE`, `time -o FILE`.
   const words = [...cmd.argv.slice(1), ...(cmd.wrapped ?? []), ...cmd.redirects.map((r) => r.target).filter((t): t is ShellWord => t !== null)];
   const lists = listsOnly(cmd);
+  const namesOnly = readsNoContent(cmd);
   for (const w of words) {
     // `ls -l /proc/$$/fd` reads no file: only what reads one can read an environment.
     const procReads = !(lists && cmd.argv.includes(w));
@@ -625,11 +626,32 @@ function checkSecrets(cmd: SimpleCommand, cwd: string | null, ctx: Ctx, v: Verdi
       }
       const s = secretPathVerdict("Grep", { path: abs }, { workdir: ctx.workdir, configDir: ctx.configDir, procReads });
       if (!s) continue;
+      // A directory that only CONTAINS credentials (`/`, the home) matters to what may read files
+      // under it. `ls /`, `du -sh ~`, `echo /`, `tr / -`, `find / -name x` read none: they aren't
+      // reaching for a credential. A credential file named outright stays refused, whatever reads it.
+      if (s.action !== "deny" && namesOnly && cmd.argv.includes(w)) continue;
       if (s.action === "deny" || !v.secret) v.secret = s;
       if (s.action === "deny") v.add("high", `touches ${s.path}, which holds credentials`);
       else v.add("medium", `reaches ${s.path}, which contains credential files`);
     }
   }
+}
+
+/** `find`'s actions that read, write or run something on what it finds; without them it only prints names. */
+const FIND_ACTS = new Set(["-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"]);
+
+/** Programs that read no file's contents from their path arguments: they print, list, size, test or resolve them. */
+const NO_CONTENT = new Set(["ls", "stat", "readlink", "realpath", "du", "df", "test", "[", "pwd"]);
+
+/**
+ * A command whose path arguments are never opened for their contents: one of
+ * {@link NO_CONTENT} or NOT_FILES, or a `find` with no action that reads, writes or runs.
+ */
+function readsNoContent(cmd: SimpleCommand): boolean {
+  const prog = programOf(cmd);
+  if (prog === null) return false;
+  if (prog === "find") return !cmd.argv.slice(1).some((w) => w.value === null || FIND_ACTS.has(w.value));
+  return NO_CONTENT.has(prog) || NOT_FILES.has(prog);
 }
 
 /** Programs that only list or stat what they're given, never reading a file's contents. */
