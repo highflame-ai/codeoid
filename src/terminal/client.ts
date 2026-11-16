@@ -531,6 +531,7 @@ export class TerminalClient {
       url?: string;
       configuredUrl?: string;
       settings?: string[];
+      userSettings?: string[];
       removed?: boolean;
     };
     if (action === "list") {
@@ -550,6 +551,7 @@ export class TerminalClient {
     console.log("  A pushed branch runs the repository's CI as that branch defines it (pipeline files an agent wrote included), with the CI's secrets.");
     if (data.configuredUrl) console.log(`  (the remote's config says ${sanitizeTerminalOutput(data.configuredUrl)}; a URL rewrite in your git config sends it to the address above)`);
     for (const x of data.settings ?? []) console.log(`  repository setting: ${sanitizeTerminalOutput(x)}`);
+    for (const x of data.userSettings ?? []) console.log(`  your setting: ${sanitizeTerminalOutput(x)}`);
   }
 
   /** The daemon's sandbox providers and whether each runs here (#448). */

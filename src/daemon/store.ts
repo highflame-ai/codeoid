@@ -388,6 +388,13 @@ export class Store {
       -- repository (its git dir), the remote, its URL and what the repository's own config says that decides
       -- a push. An autonomous push goes only where this matches exactly. Not session-scoped.
       -- One owner's: it decides only that owner's sessions' pushes (a shared daemon's other users trust their own).
+      -- Every directory a sandboxed session's commands could write, ever (sandbox/push.ts): what an agent left
+      -- there outlives its session, so a host-run push never takes a program or a config file from one.
+      CREATE TABLE IF NOT EXISTS sandbox_writable (
+        path       TEXT PRIMARY KEY,
+        first_seen INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS push_trust (
         owner         TEXT NOT NULL,
         common        TEXT NOT NULL,
@@ -2333,6 +2340,18 @@ export class Store {
   }
 
   /** One owner's trust for a repository's remote, if any (a malformed row is none). */
+  /** Note directories a sandboxed session's commands may write (kept for good). */
+  noteSandboxWritable(paths: readonly string[]): void {
+    const stmt = this.#db.prepare("INSERT OR IGNORE INTO sandbox_writable (path, first_seen) VALUES (?, ?)");
+    const now = Date.now();
+    for (const p of new Set(paths.filter(Boolean))) stmt.run(p, now);
+  }
+
+  /** Every directory a sandboxed session's commands could ever write. */
+  sandboxWritableHistory(): string[] {
+    return (this.#db.prepare("SELECT path FROM sandbox_writable").all() as Array<{ path: string }>).map((r) => r.path);
+  }
+
   pushTrust(owner: string, common: string, remote: string): { common: string; remote: string; url: string; repoSettings: string[]; userSettings: string[] } | null {
     const row = this.#db.prepare("SELECT common, remote, url, repo_settings, user_settings FROM push_trust WHERE owner = ? AND common = ? AND remote = ?").get(owner, common, remote) as
       | { common: string; remote: string; url: string; repo_settings: string; user_settings: string }

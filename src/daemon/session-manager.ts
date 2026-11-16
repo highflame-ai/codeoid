@@ -22,7 +22,7 @@ import { credentialsSchema } from "./credentials/schema.js";
 import { workstreamsSchema } from "./workstreams/schema.js";
 import { registerSecretPaths } from "./secret-paths.js";
 import { type RequestDirectoryInput, type SandboxMcpMount, SandboxMcpHttp } from "./sandbox/request-directory.js";
-import { readPushTarget, shownUrl, type PushInput } from "./sandbox/push.js";
+import { readPushTarget, shownSetting, shownUrl, type PushInput } from "./sandbox/push.js";
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve, sep } from "node:path";
@@ -4559,7 +4559,8 @@ mcpHub: this.#mcpHub,
 
   /** A session's `/mcp/sandbox` mount: its own token, minted once. None without a sandbox or the endpoint. */
   /** What every live sandboxed session's commands may write (sandbox/push.ts: a file there never decides a push). */
-  readonly #allSandboxWritable = (): string[] => [...this.#sessions.values()].flatMap((s) => s.sandboxAgentWritable);
+  /** What any sandboxed session's commands may write now, or ever could (what an agent left there outlives it). */
+  readonly #allSandboxWritable = (): string[] => [...[...this.#sessions.values()].flatMap((s) => s.sandboxAgentWritable), ...(this.#store.sandboxWritableHistory?.() ?? [])];
 
   readonly #sandboxMcpFor = (sessionId: string): SandboxMcpMount | undefined => {
     if (!this.#sandboxMcpUrl || !this.#sandboxRegistry) return undefined;
@@ -10668,6 +10669,7 @@ mcpHub: this.#mcpHub,
         url: shownUrl(target.url),
         ...(target.configuredUrl ? { configuredUrl: shownUrl(target.configuredUrl) } : {}),
         settings: target.repoSettings.map((x) => x.split("\t").slice(1).join(" = ")),
+        userSettings: target.userSettings.map((x) => shownSetting(x)),
       },
     };
   }

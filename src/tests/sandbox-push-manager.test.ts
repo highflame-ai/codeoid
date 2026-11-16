@@ -98,6 +98,21 @@ describe("push, decided by the session", () => {
     expect(await m.handle({ type: "sandbox.trust_push", id: "tp2", action: "trust", path: t.workdir } as never, delegated, CLIENT)).toMatchObject({ type: "response.error", code: "forbidden" });
   });
 
+  it("round 10: a config file a destroyed session could write still decides nothing (what an agent left there outlives it)", async () => {
+    git(["remote", "add", "origin", "https://git.example.invalid/team/repo.git"], t.workdir);
+    const m = t.newManager();
+    // A session in the sibling repository (its agent could write anything there), then destroyed.
+    const other = await t.autonomous(m, { workdir: t.sibling });
+    expect(await m.handle({ type: "session.destroy", id: "d", sessionId: other.info?.id as string } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
+    // Your global config includes a file in there.
+    const inc = join(t.sibling, "team.gitconfig");
+    writeFileSync(inc, "[http]\n\tproxy = http://127.0.0.1:9\n");
+    writeFileSync(join(t.tmp, "home", ".gitconfig"), `[include]\n\tpath = ${inc}\n`);
+    const r = await m.handle({ type: "sandbox.trust_push", id: "tp", action: "trust", path: t.workdir } as never, AUTH, CLIENT);
+    expect(r).toMatchObject({ type: "response.error" });
+    expect(JSON.stringify(r)).toContain("can (or could) write");
+  });
+
   it("round 4: a trust is its owner's; it can always be taken back, whatever state the repository is in", async () => {
     git(["remote", "add", "origin", "https://git.example.invalid/team/repo.git"], t.workdir);
     const m = t.newManager();

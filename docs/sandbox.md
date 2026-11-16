@@ -1345,7 +1345,12 @@ Set those in your global config.
 
 From your global config, codeoid takes everything, including your
 `core.sshCommand` (a key per host, an agent's wrapper). It uses it both for
-the push and for asking the remote which branch is its default.
+the push and for asking the remote which branch is its default. A file your
+config includes is refused if any sandboxed session's commands may write it,
+or ever could: codeoid keeps, for good, every directory a sandboxed session
+could write (in its database), since what an agent left there outlives the
+session. The guarded card and `codeoid sandbox trust-push` list the settings
+of yours that decide the push (a secret-looking value hidden).
 
 Also refused:
 
@@ -1368,8 +1373,9 @@ push; in guarded mode it goes ahead (you approved it), and the result says so.
 It runs hardened (`git-env.ts`):
 
 - On a PATH of git's own dir and your PATH's absolute entries that are
-  outside your home, outside anything a sandboxed session may write, and not
-  writable by others. A session that has ended may have left a program in its
+  outside your home, outside anything a sandboxed session may write or ever
+  could, owned by you or root, and not writable by everyone or by a group
+  you aren't in (Homebrew's and Linuxbrew's group-writable dirs are fine). A session that has ended may have left a program in its
   workspace, so "under your home" is out whatever runs now. `ssh` is found on
   that PATH. An ssh command (`core.sshCommand`, `GIT_SSH_COMMAND`, `GIT_SSH`)
   or credential helper naming a path that fails the same test, or a relative
@@ -1377,6 +1383,9 @@ It runs hardened (`git-env.ts`):
   to name.) A git of codeoid's own under your home can't push for agents
   either.
 - With no askpass program (`GIT_ASKPASS`, `SSH_ASKPASS`): a push never prompts.
+- What git runs as a program, `core.sshCommand` and credential helpers,
+  comes only from your own `~/.gitconfig` (or `$XDG_CONFIG_HOME/git/config`)
+  or the system config, never from a file those include.
 - With your config exactly as it applies to the session's repository. The push
   runs from codeoid's own staging repository. If a conditional include
   (`includeIf "gitdir:…"`, `onbranch:`, `hasconfig:`) makes your `credential.*`,
@@ -1434,7 +1443,7 @@ running, and the stop is audited.
 
 `push` is offered only where it works: a sandboxed session, with pushing on.
 A pack role without `network: true`, or a read-only one (`write: false`),
-can't push.
+can't push, on every backend: the session refuses it, and doesn't offer it.
 That holds over `/mcp/sandbox` too.
 
 Every request, refusal (codeoid's own, before or during the push), approval,

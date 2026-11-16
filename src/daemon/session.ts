@@ -247,8 +247,9 @@ import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/v
 
 /** What is recorded of a call the user listed in `secrets.dropCommands`. */
 const NOT_STORED = "‹not stored›";
-import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
-import { bundleFromChild, gitBinProblem, planPush, runPush, shownUrl, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
+import { PUSH_TOOL_FQ, REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
+import { bundleFromChild, gitBinProblem, planPush, runPush, shownSetting, shownUrl, trustMatches, type PushInput, type PushPlan } from "./sandbox/push.js";
+import { physicalPath } from "./physical-path.js";
 import { GIT_BIN, gitEnv } from "./git-env.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -3650,6 +3651,7 @@ export class Session {
     if (sbx.resolvedFor(this.#provider.id) && sbx.info && !applyDirs) return sbx.info;
     const before = JSON.stringify(sbx.info);
     const info = await sbx.refresh(this.#provider.id);
+    this.#noteSandboxWritable();
     // Pins taken by this resolution (the workspace, a root seen first: #448 round 13) are kept with the setting.
     if (sbx.takePinsChanged()) this.#saveMetaNow();
     this.#sayDroppedDirs();
@@ -4215,6 +4217,12 @@ export class Session {
   }
 
   async #push(input: PushInput): Promise<string> {
+    // A capability role is held here, on every backend (Claude's auto-approved tools never reach the gate).
+    const roleDenies = this.#pushRoleDenies();
+    if (roleDenies) {
+      this.#store.audit(SYSTEM_IDENTITY.sub, "session.role_deny", this.id, `tool=${PUSH_TOOL_FQ} role=${this.#pack?.roleName}`);
+      return `Refused: role "${this.#pack?.roleName}": ${roleDenies}.`;
+    }
     const sbx = this.#sandbox;
     const info = sbx?.info;
     if (!sbx || !info || info.state !== "on") {
@@ -4296,6 +4304,7 @@ export class Session {
       const PUSH = "Push";
       const TRUST = `Push, and trust ${plan.shownUrl} for this repository's agent pushes (autonomous mode too)`;
       const NO = "Don't push";
+      const yours = plan.userSettings.length > 0 ? `\n\nYour git config also decides this push:\n${plan.userSettings.map((x) => `- ${shownSetting(x)}`).join("\n")}` : "";
       const firstTime = trusted
         ? ""
         : `\n\nYou haven't trusted agent pushes from this repository to this URL yet. A trust lets autonomous agents push here without asking: a pushed branch runs the repository's CI as that branch defines it (a workflow the agent wrote included), with the CI's secrets.`;
@@ -4304,7 +4313,7 @@ export class Session {
           method: "select",
           options: trusted ? [PUSH, NO] : [PUSH, TRUST, NO],
           title: `The agent asks to push ${plan.branch}`,
-          message: `"${this.name}" asks codeoid to push ${described}, with your credentials. Only this branch, as this commit; no force, no tags.${firstTime}${unknown}${reason}`,
+          message: `"${this.name}" asks codeoid to push ${described}, with your credentials. Only this branch, as this commit; no force, no tags.${firstTime}${yours}${unknown}${reason}`,
           // Closed with time left for the push itself.
           timeoutMs: Math.max(1_000, left() - reserveMs),
           signal,
@@ -4392,10 +4401,28 @@ export class Session {
     }
   }
 
-  /** Whether this session's agent is offered `push`: its sandbox on, and pushing not turned off. */
+  /** Whether this session's agent is offered `push`: its sandbox on, pushing not turned off, and its role allowing it. */
   get pushOffered(): boolean {
     const sbx = this.#sandbox;
-    return !!sbx && sbx.info?.state === "on" && sbx.config.push?.enabled !== false;
+    return !!sbx && sbx.info?.state === "on" && sbx.config.push?.enabled !== false && !this.#pushRoleDenies();
+  }
+
+  /** Why this session's capability role doesn't allow a push, or null. */
+  #pushRoleDenies(): string | null {
+    return this.#pack?.role ? roleDeniesTool(this.#pack.role, PUSH_TOOL_FQ) : null;
+  }
+
+  /** Keep, for good, what this session's sandboxed commands may write now (a host-run push never takes from there). */
+  #noteSandboxWritable(): void {
+    const sbx = this.#sandbox;
+    if (!sbx || sbx.info?.state !== "on") return;
+    try {
+      const spec = sbx.runtime?.spec;
+      const paths = [...this.sandboxAgentWritable, ...(spec ? [spec.workspace, ...spec.writable] : [])];
+      this.#store.noteSandboxWritable?.([...paths, ...paths.map((p) => physicalPath(p))]);
+    } catch {
+      /* best effort: the live list still counts */
+    }
   }
 
   /**

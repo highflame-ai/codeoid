@@ -214,14 +214,24 @@ const REPO_REFUSED = /^(?:https?\.(?!(?:[\s\S]+\.)?(?:postbuffer|version|lowspee
  * name, only from outside what the session's commands may write), codeoid's overrides, and the repository's
  * own config files while the sandbox holds them read-only — never, there, a key in {@link REPO_REFUSED}.
  */
-function originProblem(e: OriginEntry, own: readonly string[], repo: string, agentWritable: readonly string[]): string | null {
+/** Keys whose value git runs as a program on the host. */
+const RUNS_PROGRAM = /^(?:core\.sshcommand|credential\.(?:[\s\S]+\.)?helper)$/i;
+
+function originProblem(e: OriginEntry, own: readonly string[], repo: string, agentWritable: readonly string[], home?: string): string | null {
   if (e.scope === "command") return null;
   if (!e.origin.startsWith("file:")) return `\`${e.key}\` comes from ${e.origin || "an unknown place"}`;
   const raw = e.origin.slice("file:".length);
   const file = physicalPath(isAbsolute(raw) ? raw : resolve(repo, raw));
   if (USER_SCOPES.has(e.scope)) {
     // Your config's own files, and what they include from outside what the session's commands may write.
-    return agentWritable.some((w) => within(w, file)) ? `\`${e.key}\` comes from ${raw}, a file this session's agent can write` : null;
+    if (agentWritable.some((w) => within(w, file) || within(physicalPath(w), file))) return `\`${e.key}\` comes from ${raw}, a file a sandboxed session's agent can (or could) write`;
+    // What git runs as a program comes only from your own ~/.gitconfig (or XDG's) or the system's, never an include.
+    if (e.scope === "global" && RUNS_PROGRAM.test(e.key)) {
+      const h = home ?? homedir();
+      const own = [join(h, ".gitconfig"), join(process.env.XDG_CONFIG_HOME || join(h, ".config"), "git", "config")].map((f) => physicalPath(f));
+      if (!own.includes(file)) return `\`${e.key}\` comes from ${raw}, a file your config includes: set what git runs (core.sshCommand, a credential helper) in ~/.gitconfig itself`;
+    }
+    return null;
   }
   if (!own.includes(file)) {
     return `\`${e.key}\` comes from ${raw}, a file this session's agent could write (only your own config, and the repository's .git/config, decide a push)`;
@@ -245,7 +255,7 @@ function includeProblem(e: OriginEntry, repo: string, agentWritable: readonly st
   const named = e.value.startsWith("~/") ? join(h, e.value.slice(2)) : isAbsolute(e.value) ? e.value : resolve(dirname(from), e.value);
   const targets = [resolve(named), physicalPath(named)];
   if (agentWritable.some((w) => targets.some((t) => within(w, t)))) {
-    return `your git config includes ${e.value}, a file this session's agent can write (\`${e.key}\`): codeoid doesn't push with it`;
+    return `your git config includes ${e.value}, a file a sandboxed session's agent can (or could) write (\`${e.key}\`): codeoid doesn't push with it`;
   }
   return null;
 }
@@ -274,6 +284,13 @@ export function pushUrlProblem(url: string): string | null {
   // scp-like: [user@]host:path, no scheme, the host before the first colon has no slash.
   if (/^(?:[A-Za-z0-9._~-]+@)?[A-Za-z0-9.-]+:(?!\/\/)[^\s]+$/.test(url)) return null;
   return "only ssh and https remotes are pushed to";
+}
+
+/** A recorded setting (`scope\tkey\tvalue`) as shown to the owner: `key = value`, a secret-looking value hidden. */
+export function shownSetting(entry: string): string {
+  const [, key = "", ...rest] = entry.split("\t");
+  const value = rest.join("\t");
+  return /extraheader|cookie|password|token|secret|auth/i.test(key) ? `${key} = (hidden)` : `${key} = ${redactMcpUrl(value)}`;
 }
 
 /** A remote's URL, safe to show. scp-like ones have no credentials to hide but a user name, which stays. */
@@ -347,7 +364,7 @@ export async function readPushTarget(
   const entries = (await config(repo, DECIDING_GIT)).filter((e) => DECIDING.test(e.key));
   const writable = (opts.agentWritable ?? []).map((p) => physicalPath(p));
   for (const e of entries) {
-    const problem = originProblem(e, own, repo, writable) ?? includeProblem(e, repo, writable, opts.home);
+    const problem = originProblem(e, own, repo, writable, opts.home) ?? includeProblem(e, repo, writable, opts.home);
     if (problem) return refuse(problem);
     // A remote section named as a URL applies to a push to that URL: it would redirect it, whatever it says.
     const section = /^remote\.([\s\S]+)\.[^.]+$/.exec(e.key)?.[1];
@@ -608,7 +625,8 @@ export function differingKeys(planned: ReadonlyArray<[string, string]>, here: Re
  * may have been: a program an agent left there outlives its session), and so is one others may write.
  */
 export function safePathFor(writable: readonly string[], path = process.env.PATH ?? "", home = homedir()): string {
-  const out = [dirname(GIT_BIN)];
+  const out: string[] = [];
+  for (const d of [dirname(GIT_BIN), dirname(physicalPathOr(GIT_BIN))]) if (!out.includes(d) && !hostPathProblem(d, writable, home)) out.push(d);
   for (const e of path.split(":")) {
     if (!e || !isAbsolute(e) || out.includes(e)) continue;
     if (hostPathProblem(e, writable, home)) continue;
@@ -616,6 +634,17 @@ export function safePathFor(writable: readonly string[], path = process.env.PATH
   }
   return out.join(":");
 }
+
+function physicalPathOr(p: string): string {
+  try {
+    return physicalPath(p);
+  } catch {
+    return p;
+  }
+}
+
+/** The id a user namespace shows for an owner it doesn't map (root's files, inside a container or bwrap). */
+const OVERFLOW_UID = 65534;
 
 /** Why a program the push may run, or a dir it may come from, isn't trusted on the host; else null. */
 export function hostPathProblem(at: string, writable: readonly string[], home = homedir()): string | null {
@@ -627,15 +656,30 @@ export function hostPathProblem(at: string, writable: readonly string[], home = 
   }
   if (programProblem(at, writable) || programProblem(real, writable)) return `${at} is in a directory a session's commands may write`;
   if (home && (within(home, real) || within(home, at))) return `${at} is under your home, where a session's commands may write (or have written)`;
-  // Neither it nor a dir above it writable by anyone but its owner (a shared dir, a world-writable /tmp tool).
-  for (let d = real; ; d = dirname(d)) {
-    try {
-      const st = lstatSync(d);
-      if ((st.mode & 0o022) !== 0 && !(st.isDirectory() && (st.mode & 0o1000) !== 0 && d !== real)) return `${d} is writable by others`;
-    } catch {
-      /* a part that isn't there: nothing runs from it */
+  // Neither it nor a dir above it (as named, and where it really is) owned by anyone but you or root, writable by
+  // everyone, or writable by a group you aren't in.
+  const uid = typeof process.getuid === "function" ? process.getuid() : -1;
+  const groups = new Set(typeof process.getgroups === "function" ? process.getgroups() : []);
+  if (typeof process.getgid === "function") groups.add(process.getgid());
+  for (const start of new Set([real, at])) {
+    for (let d = start; ; d = dirname(d)) {
+      try {
+        const st = lstatSync(d);
+        // Root's, yours, or the kernel's overflow id (root's files seen from a user namespace): no other user's.
+        if (uid >= 0 && st.uid !== 0 && st.uid !== uid && st.uid !== OVERFLOW_UID) return `${d} belongs to another user`;
+        // A link's own mode means nothing (always 0777): whether it can be replaced is its dir's, checked next.
+        if (st.isSymbolicLink()) {
+          if (dirname(d) === d) break;
+          continue;
+        }
+        const sticky = st.isDirectory() && (st.mode & 0o1000) !== 0 && d !== start;
+        if ((st.mode & 0o002) !== 0 && !sticky) return `${d} is writable by everyone`;
+        if ((st.mode & 0o020) !== 0 && !sticky && !groups.has(st.gid)) return `${d} is writable by a group you aren't in`;
+      } catch {
+        /* a part that isn't there: nothing runs from it */
+      }
+      if (dirname(d) === d) break;
     }
-    if (dirname(d) === d) break;
   }
   return null;
 }
@@ -986,11 +1030,14 @@ async function runGit(
   // core.sshCommand (planPush took it from your global or system config only), else ssh that never waits for a
   // person (a host-key or passphrase prompt) and gives up on a dead host. The time limit bounds any of them.
   if (!env.GIT_SSH_COMMAND) {
-    // git's own order: GIT_SSH_COMMAND, then core.sshCommand, then GIT_SSH. Else ssh by its full path on that PATH.
+    // git's own order: GIT_SSH_COMMAND, then core.sshCommand, then GIT_SSH; always set here, so codeoid's base
+    // override (core.sshCommand=ssh) never decides. Else ssh by its full path on that PATH, never waiting.
     const ssh = o.path !== undefined && typeof Bun !== "undefined" ? (Bun.which("ssh", { PATH: o.path }) ?? "ssh") : "ssh";
     if (o.sshCommand) env.GIT_SSH_COMMAND = o.sshCommand;
-    else if (!env.GIT_SSH) env.GIT_SSH_COMMAND = `${ssh} -o BatchMode=yes -o ConnectTimeout=20`;
+    else if (env.GIT_SSH) env.GIT_SSH_COMMAND = `'${env.GIT_SSH.replace(/'/g, "'\\''")}'`;
+    else env.GIT_SSH_COMMAND = `${ssh} -o BatchMode=yes -o ConnectTimeout=20`;
   }
+  delete env.GIT_SSH;
   return new Promise((done) => {
     const child = spawn(GIT_BIN, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
     let stdout = "";
