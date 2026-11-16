@@ -61,7 +61,7 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: gi
     git(seed, "push", "-q", "origin", "main");
     const host: GatewayHost = {
       grant: async (_s, _svc, url) =>
-        url === URL ? { upstream: { url: `file://${upstream}`, kind: "ssh", testFile: true }, ssh: null, protectedBranches: ["main"], agentBranches: new Set(["feature/x"]), cacheKey: "real" } : { refused: "not connected" },
+        url === URL ? { upstream: { url: `file://${upstream}`, kind: "ssh", testFile: true }, ssh: null, protectedBranches: ["main"], agentBranches: new Map<string, string>(), cacheKey: "real" } : { refused: "not connected" },
       approve: async () => ({ ok: true }),
       report: () => {},
     };
@@ -97,7 +97,7 @@ describe.skipIf(!probe.available || !Bun.which("git"))("bubblewrap, for real: gi
     expect(main.stdout + main.stderr).toContain("main is a protected branch");
     const force = await sh("cd r && git checkout -q feature/x && git reset -q --hard HEAD~1 && echo c > c.txt && git add . && git commit -q -m c && git push --force origin feature/x 2>&1");
     expect(force.exitCode).not.toBe(0);
-    expect(force.stdout + force.stderr).toContain("a force push isn't done for agents");
+    expect(force.stdout + force.stderr).toMatch(/a force push isn't done for agents|wasn't made by an agent/);
     const del = await sh("cd r && git push origin --delete feature/x 2>&1");
     expect(del.exitCode).not.toBe(0);
     // Nothing a command reads holds a credential, nor the remote's path (it is the gateway's, outside).

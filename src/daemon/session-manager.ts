@@ -214,7 +214,7 @@ import {
   removeForkWorktree,
 } from "./git-worktree.js";
 import { GIT_BIN, hardenedGit, safeGit } from "./git-env.js";
-import { connectionId, GitCredentials, ownerRewrite, probeConnection } from "./git-gateway/connect.js";
+import { connectionId, GitCredentials, ownerConfigProblem, ownerPushRewrite, ownerRewrite, probeConnection } from "./git-gateway/connect.js";
 import { type GatewayHost, GitGateway } from "./git-gateway/gateway.js";
 import { hostPathProblem } from "./git-gateway/hostpath.js";
 import { redactCredentials, remoteUrlProblem, shownGitUrl } from "./git-gateway/text.js";
@@ -4676,6 +4676,8 @@ mcpHub: this.#mcpHub,
   /** Connect `url` for `owner`: their credential proved to reach it, then recorded (an https one kept, 0600). */
   async #connectGit(owner: string, url: string, by: string, token?: string): Promise<{ kind: string; auth: string } | { error: string }> {
     if (!this.#gitGatewayInstance() || !this.#gitCredentials) return { error: "the git gateway isn't available on this daemon" };
+    const ownConfig = ownerConfigProblem(this.#allSandboxWritable());
+    if (ownConfig) return { error: ownConfig };
     const probe = await probeConnection(url, { ...(token ? { token } : {}), writable: this.#allSandboxWritable(), runDir: join(getConfigDir(), "git-gateway", "run"), ...(testFileRemote(url) ? { testFile: true } : {}) });
     if ("error" in probe) return { error: probe.error };
     const id = connectionId(owner, url);
@@ -4698,6 +4700,8 @@ mcpHub: this.#mcpHub,
       const session = this.#sessions.get(sessionId);
       if (!session) return { refused: "this session is gone" };
       if (sandboxConfigOf(this.#config).git?.enabled === false) return { refused: "the git gateway is turned off here (sandbox.git.enabled)" };
+      const ownConfig = ownerConfigProblem(this.#allSandboxWritable());
+      if (ownConfig) return { refused: ownConfig };
       const problem = session.gitAccessProblem(service);
       if (problem) return { refused: problem };
       // What runs on the host for it (git's servers and the push hook): codeoid's git and runtime, never a session's.
@@ -4718,8 +4722,13 @@ mcpHub: this.#mcpHub,
         }
       }
       const owner = session.createdBy;
-      let conn = this.#store.gitConnection(owner, url);
+      let conn = this.#store.gitConnection(owner, url) ?? sameRepoSpellings(url).map((u) => this.#store.gitConnection(owner, u)).find(Boolean) ?? null;
       if (!conn) {
+        // Caught by a connected URL's prefix (git's insteadOf has no boundary): said as that.
+        const prefix = this.#store.listGitConnections(owner).find((c) => url.startsWith(c.url) && url !== c.url);
+        if (prefix && session.toInfo().sandbox?.network === "on") {
+          return { refused: `${shownGitUrl(url)} isn't connected; it reached codeoid's gateway because it starts with ${shownGitUrl(prefix.url)}, which is (connect that remote with a .git ending, or connect this one too)` };
+        }
         const kind = upstreamKind(url);
         const bad = remoteUrlProblem(url);
         const how = `\`codeoid sandbox git connect --url ${url}\` (or from the repository: \`codeoid sandbox git connect\`)`;
@@ -4731,7 +4740,7 @@ mcpHub: this.#mcpHub,
         conn = this.#store.gitConnection(owner, url);
         if (!conn) return { refused: "the connection wasn't recorded" };
       }
-      const credential = conn.kind === "https" ? this.#gitCredentials?.get(connectionId(owner, url)) : undefined;
+      const credential = conn.kind === "https" ? this.#gitCredentials?.get(connectionId(owner, conn.url)) : undefined;
       if (conn.kind === "https" && !credential) return { refused: `the credential for ${shownGitUrl(url)} is gone: the owner can connect it again` };
       let ssh: string | null = null;
       if (conn.kind === "ssh" && !testFileRemote(url)) {
@@ -4744,7 +4753,7 @@ mcpHub: this.#mcpHub,
         ssh,
         protectedBranches: session.gitProtectedBranches,
         agentBranches: this.#store.gitAgentBranches(owner, url),
-        cacheKey: connectionId(owner, url),
+        cacheKey: connectionId(owner, conn.url),
       };
     },
     approve: async (sessionId, push, signal) => {
@@ -4758,8 +4767,9 @@ mcpHub: this.#mcpHub,
     report: (sessionId, e) => {
       const session = this.#sessions.get(sessionId);
       // A branch an agent made: one it may move again later (fast-forward only).
+      // Every branch a checked push moved (a new one, or an agent's own) is the agents', as of the tip pushed.
       if (session && e.kind === "push" && e.ok) {
-        for (const u of e.updates ?? []) if (/^0+$/.test(u.old) && u.ref.startsWith("refs/heads/")) this.#store.noteGitAgentBranch(session.createdBy, e.url, u.ref.slice("refs/heads/".length));
+        for (const u of e.updates ?? []) if (u.ref.startsWith("refs/heads/")) this.#store.noteGitAgentBranch(session.createdBy, e.url, u.ref.slice("refs/heads/".length), u.new);
       }
       session?.noteGit(e);
     },
@@ -4790,8 +4800,13 @@ mcpHub: this.#mcpHub,
       return { type: "response.ok", requestId: msg.id, data: { url: shownGitUrl(used), rawUrl: used, ...(used !== url ? { writtenAs: shownGitUrl(url) } : {}), connected: !!this.#store.gitConnection(auth.sub, used) } };
     }
     if (msg.action === "disconnect") {
-      const removed = this.#store.removeGitConnection(auth.sub, url);
-      this.#gitCredentials?.remove(connectionId(auth.sub, url));
+      // From a repository: the URL as written and as the owner's git uses it (connect connected the latter).
+      const forms = msg.url ? [url] : [...new Set([url, ownerRewrite(url), ownerPushRewrite(url)])];
+      let removed = false;
+      for (const u of forms) {
+        removed = this.#store.removeGitConnection(auth.sub, u) || removed;
+        this.#gitCredentials?.remove(connectionId(auth.sub, u));
+      }
       this.#gitConnectionsChanged(auth.sub);
       this.#store.audit(auth.sub, "sandbox.git_disconnected", undefined, `${shownGitUrl(url)} removed=${removed}`);
       return { type: "response.ok", requestId: msg.id, data: { removed, url: shownGitUrl(url) } };
@@ -11362,4 +11377,10 @@ export function resolveOnEndpoint(raw: string, models: ReadonlyArray<ModelInfo>,
 /** Tests only: a local bare repository as a connected remote (file://), never under a real daemon. */
 function testFileRemote(url: string): boolean {
   return process.env.CODEOID_GIT_GATEWAY_TEST_FILE === "1" && url.startsWith("file://");
+}
+
+/** The same repository's other spellings: with or without a trailing `.git` or `/`. */
+function sameRepoSpellings(url: string): string[] {
+  const base = url.replace(/\/$/, "").replace(/\.git$/, "");
+  return [...new Set([base, `${base}.git`, `${base}/`])].filter((u) => u !== url);
 }

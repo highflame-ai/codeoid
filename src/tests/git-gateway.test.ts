@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { type GatewayHost, type GatewayPush, GitGateway } from "../daemon/git-gateway/gateway.js";
 import { refUpdateProblem } from "../daemon/git-gateway/policy.js";
@@ -19,7 +19,7 @@ let approvals: GatewayPush[];
 let reports: Array<{ kind: string; ok: boolean; detail: string }>;
 let answer: { ok: true } | { refused: string };
 let grantFor: (url: string) => boolean;
-let agentBranches: Set<string>;
+let agentBranches: Map<string, string>;
 let approveDelayMs: number;
 let lastSignal: AbortSignal | undefined;
 
@@ -62,7 +62,7 @@ beforeEach(() => {
   reports = [];
   answer = { ok: true };
   grantFor = (u) => u === URL;
-  agentBranches = new Set();
+  agentBranches = new Map();
   approveDelayMs = 0;
   lastSignal = undefined;
   const host: GatewayHost = {
@@ -79,7 +79,7 @@ beforeEach(() => {
     report: (_s, e) => {
       reports.push({ kind: e.kind, ok: e.ok, detail: e.detail });
       // As the manager does: a branch an agent made is one it may move again.
-      if (e.ok && e.kind === "push") for (const u of e.updates ?? []) if (/^0+$/.test(u.old)) agentBranches.add(u.ref.replace(/^refs\/heads\//, ""));
+      if (e.ok && e.kind === "push") for (const u of e.updates ?? []) agentBranches.set(u.ref.replace(/^refs\/heads\//, ""), u.new);
     },
   };
   gw = new GitGateway({ base: join(root, "gw"), host });
@@ -310,7 +310,7 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     const { validBranchRef } = await import("../daemon/git-gateway/policy.js");
     const z = "0".repeat(40);
     const a = "a".repeat(40);
-    const p = { protectedBranches: ["main"], defaultBranch: "main", defaultKnown: true, symrefs: new Set<string>(), agentBranches: new Set<string>() };
+    const p = { protectedBranches: ["main"], defaultBranch: "main", defaultKnown: true, symrefs: new Set<string>(), agentBranches: new Map<string, string>() };
     expect(await refUpdateProblem({ old: z, new: a, ref: "refs/heads/q:refs/heads/main" }, p, async () => true)).toContain("isn't a plain branch name");
     for (const bad of ["q:x", "a..b", "x@{1}", "x^", "x~1", "x?", "x*", "x[1]", "a\\b", "/x", "x/", "a//b", ".x", "x.lock", "x.", "@", "a/.b"]) expect([bad, validBranchRef(bad)]).toEqual([bad, false]);
     for (const good of ["feature/x", "fix-1.2", "agent/ü", "release/2026.11"]) expect([good, validBranchRef(good)]).toEqual([good, true]);
@@ -333,20 +333,44 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     const z = "0".repeat(40);
     const a = "a".repeat(40);
     const good = new CommandReader();
-    expect(good.ok(Buffer.from(pkt(`${z} ${a} refs/heads/x\0report-status\n`) + pkt(`${z} ${a} refs/heads/y\n`) + "0000"))).toBe(true);
+    expect(good.ok(Buffer.from(`${pkt(`${z} ${a} refs/heads/x\0report-status\n`) + pkt(`${z} ${a} refs/heads/y\n`)}0000`))).toBe(true);
     const split = new CommandReader();
     expect(split.ok(Buffer.from(pkt(`${z} ${a} refs/heads/a\n${z} ${a} refs/heads/b\0report-status\n`)))).toBe(false);
     expect(new CommandReader().ok(Buffer.from(pkt("push-cert\0report-status\n")))).toBe(false);
     const { gitGatewayEnv } = await import("../daemon/sandbox/policy.js");
-    const env = gitGatewayEnv({ socket: "/s", ext: "/home/Jane Doe/gw/codeoid-git-ext", binDir: "/b", runtime: "/r", urls: ["git@github.com:o/r.git"], routes: [["https://github.com/o/r.git", "git@github.com:o/r.git"]] });
+    const env = gitGatewayEnv({ socket: "/s", ext: "/home/Jane Doe/gw/codeoid-git-ext", binDir: "/b", runtime: "/r", urls: ["git@github.com:o/r.git"], routes: [{ from: "https://github.com/o/r.git", fetch: "git@github.com:o/r.git", push: "git@github.com:o/r.git" }] });
     expect(env.GIT_CONFIG_PARAMETERS).toContain("'url.ext::/home/Jane% Doe/gw/codeoid-git-ext %S git@github.com:o/r.git.insteadOf=https://github.com/o/r.git'");
+    // Round 5: a push rewrite of the owner's own (pushInsteadOf) is routed for pushes, the public fetch left direct.
+    const pushOnly = gitGatewayEnv({ socket: "/s", ext: "/gw/ext", binDir: "/b", runtime: "/r", urls: [], routes: [{ from: "https://github.com/o/app", push: "git@github.com:o/app" }] });
+    expect(pushOnly.GIT_CONFIG_PARAMETERS).toContain("%S git@github.com:o/app.pushInsteadOf=https://github.com/o/app'");
+    expect(pushOnly.GIT_CONFIG_PARAMETERS).not.toContain(".insteadOf=https://github.com/o/app'");
+    // Round 5: a ref with a space, or bytes that aren't UTF-8, never reaches git.
+    expect(new CommandReader().ok(Buffer.from(pkt(`${z} ${a} refs/heads/ok refs/heads/main\0report-status\n`)))).toBe(false);
+    expect(new CommandReader().ok(Buffer.concat([Buffer.from(`00${(4 + 82 + 18).toString(16)}${z} ${a} refs/heads/topic-`), Buffer.from([0xff]), Buffer.from("\0report-status\n")]))).toBe(false);
+    // Round 5: a session whose writable dirs hold the owner's git config gets nothing of it.
+    const { ownerConfigProblem } = await import("../daemon/git-gateway/connect.js");
+    expect(ownerConfigProblem([homedir()])).toContain(".gitconfig");
+    expect(ownerConfigProblem(["/srv/work"])).toBeNull();
+  });
+
+  test("round 5 (gateway): an agent's branch deleted and made again by someone else isn't the agent's", async () => {
+    const z = "0".repeat(40);
+    const a = "a".repeat(40);
+    const b = "b".repeat(40);
+    const c = "c".repeat(40);
+    const p = { protectedBranches: ["main"], defaultBranch: "main", defaultKnown: true, symrefs: new Set<string>(), agentBranches: new Map([["feature/x", a]]) };
+    // The remote's tip is the agent's (or descends from it): its own.
+    expect(await refUpdateProblem({ old: a, new: b, ref: "refs/heads/feature/x" }, p, async () => true)).toBeNull();
+    // Someone else's branch of that name now (its tip doesn't descend from what the agent pushed).
+    expect(await refUpdateProblem({ old: c, new: b, ref: "refs/heads/feature/x" }, p, async (old) => old !== a)).toContain("wasn't made by an agent");
+    expect(await refUpdateProblem({ old: z, new: b, ref: "refs/heads/feature/y" }, p, async () => true)).toBeNull();
   });
 
   test("the policy alone: only plain branch updates that fast-forward", async () => {
     const z = "0".repeat(40);
     const a = "a".repeat(40);
     const b = "b".repeat(40);
-    const p = { protectedBranches: ["main", "release/*"], defaultBranch: "develop", defaultKnown: true, symrefs: new Set(["refs/heads/latest"]), agentBranches: new Set(["x", "mine"]) };
+    const p = { protectedBranches: ["main", "release/*"], defaultBranch: "develop", defaultKnown: true, symrefs: new Set(["refs/heads/latest"]), agentBranches: new Map([["x", "a".repeat(40)], ["mine", "a".repeat(40)]]) };
     const ff = async () => true;
     expect(await refUpdateProblem({ old: z, new: a, ref: "refs/heads/feature/x" }, p, ff)).toBeNull();
     expect(await refUpdateProblem({ old: z, new: a, ref: "refs/heads/Release/1" }, p, ff)).toContain("protected");

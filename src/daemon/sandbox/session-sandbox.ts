@@ -22,7 +22,7 @@ import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
-import { ownerRewrite } from "../git-gateway/connect.js";
+import { ownerPushRewrite, ownerRewrite } from "../git-gateway/connect.js";
 import { buildSandboxSpec, type GitGatewaySpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
 import {
   addedDirProblem,
@@ -1134,12 +1134,16 @@ export class SessionSandbox {
     const testFile = (u: string) => process.env.CODEOID_GIT_GATEWAY_TEST_FILE === "1" && u.startsWith("file://");
     const connected = new Set(g.urls);
     // Each remote as written, and what the owner's own rewrite makes of it: the gateway is asked for that.
-    const routes: Array<readonly [string, string]> = g.urls.map((u) => [u, u] as const);
+    const routes: Array<{ from: string; fetch?: string; push?: string }> = g.urls.map((u) => ({ from: u, fetch: u, push: u }));
+    const reachable = (to: string) => connected.has(to) || kindOf(to) === "ssh" || (off && kindOf(to) === "https") || testFile(to);
     for (const w of workspaceRemoteUrls(workspace)) {
-      const to = testFile(w) ? w : ownerRewrite(w);
-      if (connected.has(to) || kindOf(to) === "ssh" || (off && kindOf(to) === "https") || testFile(to)) routes.push([w, to]);
+      // Where the owner's own git fetches and pushes it (a pushInsteadOf sends pushes elsewhere than fetches).
+      const fetch = testFile(w) ? w : ownerRewrite(w);
+      const push = testFile(w) ? w : ownerPushRewrite(w);
+      const r = { from: w, ...(reachable(fetch) ? { fetch } : {}), ...(reachable(push) ? { push } : {}) };
+      if (r.fetch || r.push) routes.push(r);
     }
-    return { ...g, urls: [...new Set(routes.map(([, to]) => to))], routes };
+    return { ...g, urls: [...new Set(routes.flatMap((r) => [r.fetch, r.push].filter((x): x is string => !!x)))], routes };
   }
 
   /** How many handles are open (tests). */

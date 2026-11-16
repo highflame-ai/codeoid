@@ -9,10 +9,21 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+import { physicalPath, within } from "../physical-path.js";
+
 import { GIT_BIN } from "../git-env.js";
 import { remoteUrlProblem } from "./text.js";
 import { gitError, type HttpsCredential, lsRemote, runGit, systemSsh, type Upstream, type UpstreamKind, upstreamKind } from "./upstream.js";
+
+function physicalPathOr(p: string): string {
+  try {
+    return physicalPath(p);
+  } catch {
+    return p;
+  }
+}
 
 /** How a connection authenticates. */
 export type ConnectionAuth = "ssh" | "git-credential" | "token";
@@ -183,4 +194,40 @@ export function ownerRewrite(url: string): string {
   } catch {
     return url;
   }
+}
+
+/**
+ * The URL the owner's git pushes `url` to: their `url.*.pushInsteadOf` (longest match), else their fetch rewrite
+ * (git applies insteadOf to a push URL no pushInsteadOf matches). Read from `/`, nothing run.
+ */
+// paths: git config read from /, which runs nothing
+export function ownerPushRewrite(url: string): string {
+  try {
+    const r = spawnSync(GIT_BIN, ["-C", "/", "config", "--null", "--get-regexp", "^url\\..*\\.pushinsteadof$"], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
+    let best: { base: string; prefix: string } | null = null;
+    for (const entry of (r.status === 0 ? r.stdout : "").split("\0")) {
+      const nl = entry.indexOf("\n");
+      if (nl < 0) continue;
+      const key = entry.slice(0, nl);
+      const prefix = entry.slice(nl + 1);
+      const base = key.slice("url.".length, -".pushinsteadof".length);
+      if (prefix && url.startsWith(prefix) && (!best || prefix.length > best.prefix.length)) best = { base, prefix };
+    }
+    return best ? best.base + url.slice(best.prefix.length) : ownerRewrite(url);
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Why the owner's own git config can't be used for the gateway now (a credential helper, a CA, a rewrite read from
+ * it, ssh's config): one of those files is in what a sandboxed session may write (a session whose workspace is the
+ * home), so what it says may be an agent's. Null: none is.
+ */
+export function ownerConfigProblem(writable: readonly string[]): string | null {
+  const home = homedir();
+  const xdg = process.env.XDG_CONFIG_HOME || join(home, ".config");
+  const files = [join(home, ".gitconfig"), join(xdg, "git", "config"), join(home, ".ssh")];
+  const hit = files.find((f) => writable.some((w) => within(w, f) || within(physicalPathOr(w), f)));
+  return hit ? `${hit} is in what a sandboxed session may write (its workspace is your home?), so codeoid doesn't use your git or ssh config for agents while it is` : null;
 }

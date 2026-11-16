@@ -25,8 +25,12 @@ export interface PushPolicy {
   defaultKnown: boolean;
   /** The remote's branches that are symbolic refs (`refs/heads/x`): a push to one moves what it points at. */
   symrefs: ReadonlySet<string>;
-  /** Branches agents made on this remote through codeoid (for the owner): the only existing ones they may move. */
-  agentBranches: ReadonlySet<string>;
+  /**
+   * Branches agents made on this remote through codeoid (for the owner), with the tip an agent last pushed: the only
+   * existing ones they may move, and only while the remote's tip is that or descends from it (deleted and made again
+   * by someone else, it isn't the agent's).
+   */
+  agentBranches: ReadonlyMap<string, string>;
 }
 
 const ZERO = /^0+$/;
@@ -77,7 +81,8 @@ export async function refUpdateProblem(u: RefUpdate, policy: PushPolicy, isAnces
   }
   if ([...policy.symrefs].some((s) => s.toLowerCase() === u.ref.toLowerCase())) return `${branch} is a symbolic ref on the remote (a push would move the branch it points at)`;
   if (!ZERO.test(u.old)) {
-    if (!policy.agentBranches.has(branch)) {
+    const mine = policy.agentBranches.get(branch);
+    if (!mine || (mine !== u.old && !(await isAncestor(mine, u.old)))) {
       return `${branch} is a branch that is already on the remote and wasn't made by an agent through codeoid (someone else's?): push your work to a new branch of its own`;
     }
     if (!(await isAncestor(u.old, u.new))) {

@@ -1274,9 +1274,14 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
 - **No credential in the URL:** a URL with any user info for https (a token as a user name included), a password,
   a query, a fragment, `=`, a `%`-escape, a `.` or `..` path segment, or more than 300 characters, can't be
   connected. Give a token with `--token user:token`. What a card shows is then exactly what git reaches.
-- **Your own URL rewrites** (`url.git@github.com:.insteadOf https://github.com/`) are applied: connecting from a
-  repository offers the URL your git really uses, and a workspace remote written one way is sent to the gateway
-  as the URL your rewrite makes of it. Cards, `ls` and the audit show the URL whole, every path segment, so you can see which repository it is.
+- **Your own URL rewrites** (`url.git@github.com:.insteadOf https://github.com/`, and `pushInsteadOf`) are
+  applied: connecting from a repository offers the URL your git really uses, and a workspace remote written one way
+  is sent to the gateway as the URL your rewrite makes of it, for fetches and pushes each. A rewrite of yours keyed
+  by exactly the same whole URL still wins over codeoid's (git takes the first of equal length).
+- **Spellings:** `…/app`, `…/app.git` and `…/app/` are the same connection. git's rewrite matches by prefix, so a
+  connected `…/app` also catches `…/app-docs`; the gateway says so rather than fetch it.
+- **A session whose workspace is your home** (its commands may write `~/.gitconfig`, or a `~/.ssh` you don't have)
+  gets no gateway. While one runs, nothing of your git or ssh config is used for agents. Cards, `ls` and the audit show the URL whole, every path segment, so you can see which repository it is.
 - **Running sessions** pick up a connection, or a disconnection, at their next turn. A process backend is
   restarted then.
 - **Workstreams:** under workstream isolation, a remote that another workstream's rules claim is never pushed from
@@ -1287,7 +1292,8 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
 **What a push may do**
 
 - One or more branches, `refs/heads/*`: a new branch, or one an agent made there through codeoid before
-  (fast-forward only). Never a branch already on the remote that no agent made, such as a teammate's
+  (fast-forward only), as long as the remote's tip is what an agent last pushed or descends from it. A branch of
+  that name deleted and made again by someone else isn't the agent's. Never a branch already on the remote that no agent made, such as a teammate's
   `develop`.
 - **Judged against the remote, not the client's word:** each update is checked against what the gateway just
   fetched. The push goes upstream with a lease on exactly that state, so a branch moved meanwhile is refused.

@@ -247,6 +247,7 @@ import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/v
 
 /** What is recorded of a call the user listed in `secrets.dropCommands`. */
 const NOT_STORED = "‹not stored›";
+import { ownerConfigProblem } from "./git-gateway/connect.js";
 import { redactCredentials, shownGitUrl, shownName } from "./git-gateway/text.js";
 import type { GitGatewaySpec } from "./sandbox/policy.js";
 import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
@@ -9280,6 +9281,9 @@ export class Session {
     if (!sbx || sbx.info?.state !== "on") return "this session's commands aren't sandboxed";
     if (this.#destroyed || this.#draining) return "the session is closing";
     if (this.createdByDelegate) return "this session was made with a delegated token: the owner's git connections are theirs alone";
+    // Its commands may write the owner's git or ssh config (a workspace that is the home): nothing of the owner's runs.
+    const ownConfig = ownerConfigProblem(this.sandboxAgentWritable);
+    if (ownConfig) return ownConfig;
     const push = service === "git-receive-pack";
     if (push && sbx.config.push?.enabled === false) return "pushing for agents is turned off here (sandbox.push.enabled): ask the owner to push";
     const role = this.#pack?.role;

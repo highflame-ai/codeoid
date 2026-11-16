@@ -86,8 +86,9 @@ const chunks = [];
 process.stdin.on("data", (d) => chunks.push(d));
 process.stdin.on("end", () => {
   const updates = Buffer.concat(chunks).toString("utf8").split("\\n").filter(Boolean).map((l) => {
-    const [old, next, ref] = l.split(" ");
-    return { old, new: next, ref };
+    const i = l.indexOf(" ");
+    const j = l.indexOf(" ", i + 1);
+    return { old: l.slice(0, i), new: l.slice(i + 1, j), ref: l.slice(j + 1) };
   });
   const conn = net.connect({ path: process.env.CODEOID_GW_HOOK || "" });
   let buf = "";

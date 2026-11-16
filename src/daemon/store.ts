@@ -402,6 +402,7 @@ export class Store {
         url        TEXT NOT NULL,
         branch     TEXT NOT NULL,
         created_at INTEGER NOT NULL,
+        tip        TEXT,
         PRIMARY KEY (owner, url, branch)
       );
 
@@ -634,6 +635,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_compare_runs_parent
         ON compare_runs(account_id, project_id, parent_session_id);
     `);
+    this.#addColumnIfMissing("git_agent_branches", "tip", "TEXT");
 
     // Per-child backend selection on spawn tasks. Additive so a database
     // written before collaborative sessions keeps its queued tasks: NULL on
@@ -2336,21 +2338,24 @@ export class Store {
     return this.#db.prepare("DELETE FROM git_connections WHERE owner = ? AND url = ?").run(owner, url).changes > 0;
   }
 
-  /** A branch an agent made on a connected remote through the gateway. */
-  noteGitAgentBranch(owner: string, url: string, branch: string): void {
-    this.#db.prepare("INSERT OR IGNORE INTO git_agent_branches (owner, url, branch, created_at) VALUES (?, ?, ?, ?)").run(owner, url, branch, Date.now());
+  /** A branch an agent made (or moved) on a connected remote through the gateway, with the tip it pushed. */
+  noteGitAgentBranch(owner: string, url: string, branch: string, tip: string): void {
+    this.#db
+      .prepare("INSERT INTO git_agent_branches (owner, url, branch, created_at, tip) VALUES (?, ?, ?, ?, ?) ON CONFLICT(owner, url, branch) DO UPDATE SET tip = excluded.tip")
+      .run(owner, url, branch, Date.now(), tip);
   }
 
   /** Forget the agents' branches the remote no longer has (one recreated later under that name is someone else's). */
   pruneGitAgentBranches(owner: string, url: string, heads: ReadonlySet<string>): void {
-    for (const b of this.gitAgentBranches(owner, url)) {
+    for (const b of this.gitAgentBranches(owner, url).keys()) {
       if (!heads.has(b)) this.#db.prepare("DELETE FROM git_agent_branches WHERE owner = ? AND url = ? AND branch = ?").run(owner, url, b);
     }
   }
 
-  /** The branches agents made on `url` for `owner`. */
-  gitAgentBranches(owner: string, url: string): Set<string> {
-    return new Set((this.#db.prepare("SELECT branch FROM git_agent_branches WHERE owner = ? AND url = ?").all(owner, url) as Array<{ branch: string }>).map((r) => r.branch));
+  /** The branches agents made on `url` for `owner`, each with the tip an agent last pushed. */
+  gitAgentBranches(owner: string, url: string): Map<string, string> {
+    const rows = this.#db.prepare("SELECT branch, tip FROM git_agent_branches WHERE owner = ? AND url = ?").all(owner, url) as Array<{ branch: string; tip: string | null }>;
+    return new Map(rows.filter((r) => r.tip).map((r) => [r.branch, r.tip as string]));
   }
 
   /** One owner's connection for a URL, if any. */

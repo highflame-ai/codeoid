@@ -429,7 +429,7 @@ export interface GitGatewaySpec {
    * Each URL as the repository writes it, and the URL the gateway is asked for (the owner's own rewrite applied, so
    * it outranks that rewrite as a whole URL). Absent: each of `urls` to itself.
    */
-  routes?: ReadonlyArray<readonly [string, string]>;
+  routes?: ReadonlyArray<{ from: string; fetch?: string; push?: string }>;
   /** The gateway's own dir: its other sessions' sockets and its control socket, denied by rule where a sandbox can. */
   root?: string;
 }
@@ -443,19 +443,20 @@ export interface GitGatewaySpec {
 export function gitGatewayEnv(g: GitGatewaySpec): Record<string, string> {
   // A space in the launcher's path is ext::'s `% `; other whitespace, `%`, `'` or `=` can't be carried.
   if (/[\t\n\r%'=]/.test(g.ext)) return {};
-  const routes = g.routes ?? g.urls.map((u) => [u, u] as const);
+  const routes = g.routes ?? g.urls.map((u) => ({ from: u, fetch: u, push: u }));
   if (routes.length === 0) return {};
   const ext = g.ext.replace(/ /g, "% ");
   // `user`, not `always`: a submodule's ext:: URL (git marks those not from the user) runs nothing.
   const entries: Array<[string, string]> = [["protocol.ext.allow", "user"]];
   const bad = (u: string) => /[\s'=%]/.test(u) || /^https?:\/\/[^/]*@/i.test(u) || /[?#]/.test(u);
   const seen = new Set<string>();
-  for (const [from, to] of routes) {
+  for (const r of routes) {
     // The old `'key=value'` form, which every git parses (the split form is git 2.31's): a URL with `=` can't be in it.
-    if (bad(from) || bad(to) || seen.has(from)) continue;
-    seen.add(from);
-    const target = `ext::${ext} %S ${to}`;
-    entries.push([`url.${target}.insteadOf`, from], [`url.${target}.pushInsteadOf`, from]);
+    if (bad(r.from) || seen.has(r.from)) continue;
+    seen.add(r.from);
+    // Fetch and push each where the owner's own git would send them (their insteadOf and pushInsteadOf applied).
+    if (r.fetch && !bad(r.fetch)) entries.push([`url.ext::${ext} %S ${r.fetch}.insteadOf`, r.from]);
+    if (r.push && !bad(r.push)) entries.push([`url.ext::${ext} %S ${r.push}.pushInsteadOf`, r.from]);
   }
   if (entries.length === 1) return {};
   return { CODEOID_GIT_GATEWAY: g.socket, GIT_CONFIG_PARAMETERS: entries.map(([k, v]) => `'${k}=${v}'`).join(" ") };

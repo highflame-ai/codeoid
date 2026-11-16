@@ -32,7 +32,7 @@ export interface GatewayGrant {
   ssh: string | null;
   protectedBranches: readonly string[];
   /** Branches agents made on this remote through the gateway (the owner's): the only existing ones they may move. */
-  agentBranches: ReadonlySet<string>;
+  agentBranches: ReadonlyMap<string, string>;
   /** Whose cache it is (one per owner and URL). */
   cacheKey: string;
 }
@@ -447,12 +447,20 @@ export class CommandReader {
       if (n < 4 || n > 65520) return false;
       if (this.#buf.length < n) return true;
       // One trailing line feed is pkt-line's own; any other control character in the ref is refused.
-      const line = this.#buf.subarray(4, n).toString("latin1").replace(/\n$/, "");
+      const raw = this.#buf.subarray(4, n);
+      const line = raw.toString("latin1").replace(/\n$/, "");
       this.#buf = this.#buf.subarray(n);
       if (line.startsWith("shallow ")) continue;
       // A signed push or anything but `old new ref[\0caps]`: not taken.
       const m = /^([0-9a-f]{40,64}) ([0-9a-f]{40,64}) ([^\0]*)(\0.*)?$/s.exec(line);
-      if (!m?.[3] || /[\x00-\x1f\x7f]/.test(m[3])) return false;
+      // The ref exactly as the hook will read it: no control character or space, valid UTF-8 (else the hook, the
+      // card and the remote would see another name than git keeps).
+      if (!m?.[3] || /[\x00-\x20\x7f]/.test(m[3])) return false;
+      try {
+        new TextDecoder("utf-8", { fatal: true }).decode(Buffer.from(m[3], "latin1"));
+      } catch {
+        return false;
+      }
     }
     return true;
   }
