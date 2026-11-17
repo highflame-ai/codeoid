@@ -102,6 +102,10 @@ describe("the git gateway, decided by the session", () => {
       await m.handle({ type: "session.ui_response", id: `u${n}`, sessionId: info?.id as string, requestId: asked[n]?.requestId as string, confirmed } as never, AUTH, CLIENT);
     };
     const pushing = agentGit(["push", "origin", "feature/g"]);
+    // Round 12: connecting is a settings change: the owner's token without settings:write can't say yes to it.
+    await until(() => asked.length > 0);
+    const noSettings = { ...AUTH, scopes: (AUTH.scopes as string[]).filter((s) => s !== "settings:write") };
+    expect(await m.handle({ type: "session.ui_response", id: "u-ns", sessionId: info?.id as string, requestId: asked[0]?.requestId as string, confirmed: true } as never, noSettings as never, CLIENT)).toMatchObject({ type: "response.error", code: "forbidden" });
     // First the connection (the remote isn't connected), then the push itself.
     await answer(0, true);
     expect(asked[0]?.title).toContain("reached for");

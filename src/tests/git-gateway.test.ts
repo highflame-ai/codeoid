@@ -5,7 +5,8 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { type GatewayHost, type GatewayPush, GitGateway } from "../daemon/git-gateway/gateway.js";
@@ -406,6 +407,65 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
       delete process.env.CODEOID_TEST_SSH_HOME;
     }
   }, 30_000);
+
+  test("round 12: a push naming an object the cache kept after the remote deleted it is refused (it never comes back)", async () => {
+    // The remote had a branch with a secret; the agent's fetch brought it into the cache; then the owner purged it.
+    const other = join(root, "other");
+    plain(root, "clone", "-q", upstream, other);
+    plain(other, "checkout", "-q", "-b", "oops");
+    writeFileSync(join(other, "secret.txt"), "TOPSECRET\n");
+    plain(other, "add", ".");
+    plain(other, "commit", "-q", "-m", "oops");
+    plain(other, "push", "-q", "origin", "oops");
+    const secret = plain(other, "rev-parse", "HEAD");
+    expect((await agent(root, "ls-remote", URL)).out).toContain(secret);
+    plain(upstream, "branch", "-D", "oops");
+    plain(upstream, "reflog", "expire", "--expire=now", "--all");
+    plain(upstream, "gc", "-q", "--prune=now");
+    expect(spawnSync("git", ["-C", upstream, "cat-file", "-e", secret]).status).not.toBe(0);
+    // A raw receive-pack request through the launcher, as git's ext:: would run it: the command names the purged
+    // commit, and the pack is empty (the agent never had its objects).
+    const s = gw.forSession("s1");
+    const p = Bun.spawn([s.ext, "git-receive-pack", URL], { env: { PATH: process.env.PATH ?? "", CODEOID_GIT_GATEWAY: s.socket }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const reader = p.stdout.getReader();
+    let got = Buffer.alloc(0);
+    while (!got.toString("latin1").endsWith("0000")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      got = Buffer.concat([got, Buffer.from(value)]);
+    }
+    const pkt = (s: string) => `${(s.length + 4).toString(16).padStart(4, "0")}${s}`;
+    const header = Buffer.from([0x50, 0x41, 0x43, 0x4b, 0, 0, 0, 2, 0, 0, 0, 0]);
+    const pack = Buffer.concat([header, createHash("sha1").update(header).digest()]);
+    p.stdin.write(`${pkt(`${"0".repeat(40)} ${secret} refs/heads/x\0report-status\n`)}0000`);
+    p.stdin.write(pack);
+    p.stdin.end();
+    let reply = got.toString("latin1");
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      reply += Buffer.from(value).toString("latin1");
+    }
+    await p.exited;
+    expect(upstreamRef("refs/heads/x")).toBe("");
+    expect(spawnSync("git", ["-C", upstream, "cat-file", "-e", secret]).status).not.toBe(0);
+    expect(reply).not.toContain("ok refs/heads/x");
+    expect(reports.some((e) => e.kind === "push" && !e.ok && /no longer has/.test(e.detail))).toBe(true);
+    // An ordinary push (its objects sent) still goes.
+    const work = await clone();
+    await agent(work, "checkout", "-q", "-b", "fine");
+    const sha = await commit(work, "fine");
+    expect((await agent(work, "push", "origin", "fine")).code).toBe(0);
+    expect(upstreamRef("refs/heads/fine")).toBe(sha);
+  });
+
+  test("round 12: a disconnected remote's cache is removed", async () => {
+    await clone();
+    const cache = gw.cachePath(`u:${URL}`);
+    expect(existsSync(cache)).toBe(true);
+    await gw.forget(`u:${URL}`);
+    expect(existsSync(cache)).toBe(false);
+  });
 
   test("the policy alone: only plain branch updates that fast-forward", async () => {
     const z = "0".repeat(40);

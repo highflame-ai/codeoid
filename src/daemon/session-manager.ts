@@ -1201,7 +1201,8 @@ export class SessionManager {
           claudeAccount: meta.claudeAccount ?? null,
           ...(meta.accounts ? { accountChoices: meta.accounts } : {}),
           ...(meta.sandbox ? { sandbox: meta.sandbox } : {}),
-          ...(meta.createdByDelegate ? { createdByDelegate: true } : {}),
+          // A meta from before codeoid recorded it: who made the session isn't known, so none of the owner's git access.
+          createdByDelegate: meta.createdByDelegate !== false,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
           existingId: meta.sessionId,
@@ -4671,6 +4672,9 @@ mcpHub: this.#mcpHub,
     return { ...g.forSession(sessionId), urls, root: g.root };
   };
 
+  /** Whose each session's gateway requests were (kept past its end: a push it started is still recorded as theirs). */
+  readonly #gitGatewayOwners = new Map<string, string>();
+
   /** What any live sandboxed session's commands may write: no program the gateway runs on the host is there. */
   readonly #allSandboxWritable = (): string[] => [...this.#sessions.values()].flatMap((s) => s.sandboxAgentWritable);
 
@@ -4723,6 +4727,7 @@ mcpHub: this.#mcpHub,
         }
       }
       const owner = session.createdBy;
+      this.#gitGatewayOwners.set(sessionId, owner);
       let conn = this.#store.gitConnection(owner, url) ?? sameRepoSpellings(url).map((u) => this.#store.gitConnection(owner, u)).find(Boolean) ?? null;
       if (!conn) {
         // Caught by a connected URL's prefix (git's insteadOf has no boundary): said as that.
@@ -4786,18 +4791,21 @@ mcpHub: this.#mcpHub,
       const session = this.#sessions.get(sessionId);
       return session ? session.decideGitPush(push, signal) : { refused: "this session is gone" };
     },
-    remoteHeads: (sessionId, url, heads) => {
-      const owner = this.#sessions.get(sessionId)?.createdBy;
-      if (owner) this.#store.pruneGitAgentBranches(owner, url, heads);
+    remoteHeads: (sessionId, url, heads, since) => {
+      const owner = this.#sessions.get(sessionId)?.createdBy ?? this.#gitGatewayOwners.get(sessionId);
+      if (owner) this.#store.pruneGitAgentBranches(owner, url, heads, since);
     },
     report: (sessionId, e) => {
       const session = this.#sessions.get(sessionId);
+      // The session may be gone (destroyed while its approved push ran): what the remote took is still recorded.
+      const owner = session?.createdBy ?? this.#gitGatewayOwners.get(sessionId);
       // A branch an agent made: one it may move again later (fast-forward only).
       // Every branch a checked push moved (a new one, or an agent's own) is the agents', as of the tip pushed.
-      if (session && e.kind === "push" && e.ok) {
-        for (const u of e.updates ?? []) if (u.ref.startsWith("refs/heads/")) this.#store.noteGitAgentBranch(session.createdBy, e.url, u.ref.slice("refs/heads/".length), u.new);
+      if (owner && e.kind === "push" && e.ok) {
+        for (const u of e.updates ?? []) if (u.ref.startsWith("refs/heads/")) this.#store.noteGitAgentBranch(owner, e.url, u.ref.slice("refs/heads/".length), u.new);
       }
-      session?.noteGit(e);
+      if (session) session.noteGit(e);
+      else if (e.kind === "push") this.#store.audit(owner ?? "system", e.ok ? "session.git_push_done" : "session.git_push_refused", sessionId, redactCredentials(`${e.detail} (the session was gone by then)`));
     },
   };
 
@@ -4845,6 +4853,8 @@ mcpHub: this.#mcpHub,
       for (const u of forms) {
         removed = this.#store.removeGitConnection(auth.sub, u) || removed;
         this.#gitCredentials?.remove(connectionId(auth.sub, u));
+        // Its cache too: nothing of the remote kept, nor reused by a later connect.
+        await this.#gitGatewayInstance()?.forget(connectionId(auth.sub, u));
       }
       this.#gitConnectionsChanged(auth.sub);
       this.#store.audit(auth.sub, "sandbox.git_disconnected", undefined, `${shownGitUrl(url)} removed=${removed}`);

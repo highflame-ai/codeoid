@@ -2342,14 +2342,16 @@ export class Store {
   /** A branch an agent made (or moved) on a connected remote through the gateway, with the tip it pushed. */
   noteGitAgentBranch(owner: string, url: string, branch: string, tip: string): void {
     this.#db
-      .prepare("INSERT INTO git_agent_branches (owner, url, branch, created_at, tip) VALUES (?, ?, ?, ?, ?) ON CONFLICT(owner, url, branch) DO UPDATE SET tip = excluded.tip")
+      .prepare("INSERT INTO git_agent_branches (owner, url, branch, created_at, tip) VALUES (?, ?, ?, ?, ?) ON CONFLICT(owner, url, branch) DO UPDATE SET tip = excluded.tip, created_at = excluded.created_at")
       .run(owner, url, branch, Date.now(), tip);
   }
 
   /** Forget the agents' branches the remote no longer has (one recreated later under that name is someone else's). */
-  pruneGitAgentBranches(owner: string, url: string, heads: ReadonlySet<string>): void {
-    for (const b of this.gitAgentBranches(owner, url).keys()) {
-      if (!heads.has(b)) this.#db.prepare("DELETE FROM git_agent_branches WHERE owner = ? AND url = ? AND branch = ?").run(owner, url, b);
+  pruneGitAgentBranches(owner: string, url: string, heads: ReadonlySet<string>, since = Date.now()): void {
+    // Only what was recorded before the remote was asked: a branch pushed meanwhile isn't in that answer.
+    const rows = this.#db.prepare("SELECT branch FROM git_agent_branches WHERE owner = ? AND url = ? AND created_at < ?").all(owner, url, since) as Array<{ branch: string }>;
+    for (const { branch } of rows) {
+      if (!heads.has(branch)) this.#db.prepare("DELETE FROM git_agent_branches WHERE owner = ? AND url = ? AND branch = ? AND created_at < ?").run(owner, url, branch, since);
     }
   }
 

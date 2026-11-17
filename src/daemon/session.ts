@@ -108,7 +108,7 @@ import { type FenceRefusal, fenceRefusal, fenceRefusalText } from "./workstreams
 import { repositoryTopOf } from "./workstreams/folders.js";
 import type { McpGrant } from "./workstreams/grant.js";
 import { LIMITS } from "../protocol/types.js";
-import { hasScope, SCOPES } from "../protocol/scopes.js";
+import { hasScope, SCOPES, type Scope } from "../protocol/scopes.js";
 import type { PendingToolApproval, SessionApproveOutcome, SessionSandboxInfo, SessionSandboxSetting } from "../protocol/types.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -1858,6 +1858,8 @@ export class Session {
       ownerOnly?: boolean;
       /** Who answered (for the audit of what it decided). */
       onAnswer?: (sub: string) => void;
+      /** A scope the answer needs besides the owner's word (connecting a remote: settings:write, as the CLI's). */
+      requiredScope?: Scope;
     }
   >();
 
@@ -2232,7 +2234,7 @@ export class Session {
         collaboration: this.collaboration,
         collaborationRole: this.collaborationRole,
         ...(this.workstreamAhead ? { workstream: this.workstreamAhead } : {}),
-        ...(this.createdByDelegate ? { createdByDelegate: true } : {}),
+        createdByDelegate: this.createdByDelegate,
         // Fire-and-forget: saveMeta's write chain owns the failure log; an
         // unconsumed rejection here would be an unhandled-rejection crash.
       }).catch(() => {});
@@ -4654,7 +4656,7 @@ export class Session {
    * info (`pendingDialog`) so any surface can see what it is waiting on. A
    * cancelled answer carries `reason`. An unattended turn never waits.
    */
-  requestUserInput(req: UiRequest, own: { ownerOnly?: boolean; onAnswer?: (sub: string) => void } = {}): Promise<UiResponse> {
+  requestUserInput(req: UiRequest, own: { ownerOnly?: boolean; onAnswer?: (sub: string) => void; requiredScope?: Scope } = {}): Promise<UiResponse> {
     if (this.#unattended > 0) return Promise.resolve({ cancelled: true, reason: "unattended" });
     if (req.signal?.aborted) return Promise.resolve({ cancelled: true, reason: "withdrawn" });
     const requestId = randomUUID();
@@ -4683,7 +4685,7 @@ export class Session {
       const withdraw = () => this.#settleUiRequest(requestId, { cancelled: true }, "withdrawn");
       signal?.addEventListener("abort", withdraw, { once: true });
       const unlisten = signal ? () => signal.removeEventListener("abort", withdraw) : undefined;
-      this.#pendingUiRequests.set(requestId, { msg, resolve, timer, ...(unlisten ? { unlisten } : {}), ...(own.ownerOnly ? { ownerOnly: true } : {}), ...(own.onAnswer ? { onAnswer: own.onAnswer } : {}) });
+      this.#pendingUiRequests.set(requestId, { msg, resolve, timer, ...(unlisten ? { unlisten } : {}), ...(own.ownerOnly ? { ownerOnly: true } : {}), ...(own.onAnswer ? { onAnswer: own.onAnswer } : {}), ...(own.requiredScope ? { requiredScope: own.requiredScope } : {}) });
       this.#broadcastToCapable(CAPABILITIES.UI_DIALOGS, msg);
       this.#broadcastInfoUpdate(); // pendingDialog
     });
@@ -4726,7 +4728,7 @@ export class Session {
   ): boolean | "forbidden" {
     const pending = this.#pendingUiRequests.get(requestId);
     if (!pending) return false;
-    if (pending.ownerOnly && (sender.sub !== this.createdBy || sender.delegationDepth > 0)) {
+    if ((pending.ownerOnly && (sender.sub !== this.createdBy || sender.delegationDepth > 0)) || (pending.requiredScope && !hasScope(sender.scopes as string[], pending.requiredScope))) {
       this.#store.audit(sender.sub, "session.ui_response_refused", this.id, `requestId=${requestId} owner-only`);
       return "forbidden";
     }
@@ -9280,7 +9282,7 @@ export class Session {
     const sbx = this.#sandbox;
     if (!sbx || sbx.info?.state !== "on") return "this session's commands aren't sandboxed";
     if (this.#destroyed || this.#draining) return "the session is closing";
-    if (this.createdByDelegate) return "this session was made with a delegated token: the owner's git connections are theirs alone";
+    if (this.createdByDelegate) return "this session was made with a delegated token, or before codeoid recorded who made it: the owner's git connections aren't used for it (start a new session)";
     // Its commands may write the owner's git or ssh config (a workspace that is the home): nothing of the owner's runs.
     const ownConfig = ownerConfigProblem(this.sandboxAgentWritable);
     if (ownConfig) return ownConfig;
@@ -9330,13 +9332,15 @@ export class Session {
       },
       {
         ownerOnly: true,
+        // Connecting a remote is a settings change (the CLI's needs settings:write): so is answering yes here.
+        requiredScope: SCOPES.SETTINGS_WRITE,
         onAnswer: (sub) => {
           answeredBy = sub;
         },
       },
     );
-    if (answer.cancelled || answer.confirmed !== true) return null;
-    return answeredBy ?? this.createdBy;
+    if (answer.cancelled || answer.confirmed !== true || !answeredBy) return null;
+    return answeredBy;
   }
 
   /**
@@ -12820,7 +12824,7 @@ export class Session {
       ...this.#accountMeta(),
       ...(this.#sandbox?.setting ? { sandbox: this.#sandbox.setting } : {}),
       ...(this.#backingFresh ? { backingFresh: true } : {}),
-      ...(this.createdByDelegate ? { createdByDelegate: true } : {}),
+      createdByDelegate: this.createdByDelegate,
       ...(this.#redactedBackings.size > 0 ? { redactedBackings: [...this.#redactedBackings] } : {}),
       forkedFrom: this.forkedFrom,
       ...this.#backgroundMeta(),

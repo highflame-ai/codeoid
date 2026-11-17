@@ -1288,11 +1288,14 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
   remote's origin only, with no redirects; it is never put in an environment or on a command line.
 - **`--token`** stores a dedicated token instead: a Bitbucket repository access token, or a GitHub fine-grained
   token. Use it for a shared daemon or a sensitive organisation.
-- **Permissions:** you need `settings:write`, and a delegated token can't connect. A connection is yours: it decides
-  only your sessions, and never one a delegated token made.
+- **Permissions:** you need `settings:write`, and a delegated token can't connect, on the command line or by
+  answering a card an agent's git raised. A connection is yours: it decides only your sessions, and never one a
+  delegated token made. A session from before this release is treated as one whose maker isn't known: it gets no
+  gateway; start a new one.
 - **No credential in the URL:** a URL with any user info for https (a token as a user name included), a password,
   a query, a fragment, `=`, a `%`-escape, a `.` or `..` path segment, or more than 300 characters, can't be
-  connected. Give a token with `--token user:token`. What a card shows is then exactly what git reaches.
+  connected. Connect with `--token` instead (you're asked for `user:token`, or the token, on the terminal; it is
+  never put on a command line). What a card shows is then exactly what git reaches.
 - **Your own URL rewrites** (`url.git@github.com:.insteadOf https://github.com/`, and `pushInsteadOf`) are
   applied: connecting from a repository offers the URL your git really uses, and a workspace remote written one way
   is sent to the gateway as the URL your rewrite makes of it, for fetches and pushes each. A rewrite of yours keyed
@@ -1306,7 +1309,11 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
   dirs still hold one (a workspace that is your home) gets no gateway, and while it runs nothing of your git or
   ssh config is used for agents. Cards, `ls` and the audit show the URL whole, every path segment, so you can see which repository it is.
 - **Running sessions** pick up a connection, or a disconnection, at their next turn. A process backend is
-  restarted then.
+  restarted then. Disconnecting also removes the daemon's copy of the remote.
+- **The daemon's copy:** each connected remote is mirrored once in codeoid's own dir, refreshed on every fetch or
+  push. The first copy of a large repository can take longer than an agent's command may run: it carries on (up to
+  an hour) after that command is stopped, so a later fetch finds it. A push may only name objects it sends or that
+  the remote's branches and tags still reach: one the remote has since deleted is never published again.
 - **Workstreams:** under workstream isolation, a remote that another workstream's rules claim is never pushed from
   a session homed elsewhere. It is fetched only as a reference whose share allows reads without asking.
 - **In guarded mode,** an agent that reaches a remote you haven't connected raises a card offering to connect it. In

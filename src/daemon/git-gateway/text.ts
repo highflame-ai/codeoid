@@ -22,8 +22,8 @@ export function shownGitUrl(url: string): string {
 export function remoteUrlProblem(url: string): string | null {
   // Never a credential in the URL itself: it would go into sandboxes as git's config does (a token for it is `--token`).
   if (/^[a-z][a-z0-9+.-]*:\/\/[^/@]*:[^/@]*@/i.test(url)) return "it holds a password: connect the URL without it, and give the token with --token";
-  // A token as an https user name is as much a credential (a user name goes with `--token user:token`).
-  if (/^https?:\/\/[^/]*@/i.test(url)) return "it holds a user name (a token, often): connect the URL without it, and give it with --token user:token";
+  // A token as an https user name is as much a credential (a user name goes with the token `--token` asks for).
+  if (/^https?:\/\/[^/]*@/i.test(url)) return "it holds a user name (a token, often): connect the URL without it, with --token (you're asked for user:token)";
   if (/[?#]/.test(url)) return "it has a query or a fragment";
   // What the card shows is what git reaches: no dot segment (git's transports resolve them), no %-escape, whole.
   if (url.length > 300) return "it is longer than codeoid shows whole (300 characters)";

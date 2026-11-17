@@ -43,6 +43,8 @@ export interface GitResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** Its output went past the cap: what was read is only part of it. */
+  truncated?: boolean;
 }
 
 /** ssh or https, from the URL's form; null for anything else. */
@@ -147,13 +149,20 @@ export async function withUpstreamEnv<T>(up: Upstream, ssh: string | null, fn: (
 
 /** git, its whole process group killed at the limit or the signal; output capped. */
 // paths: git run in the daemon's own gateway dirs (a cache repository), with the gateway's env only
-export function runGit(args: string[], cwd: string, env: Record<string, string>, timeoutMs: number, signal?: AbortSignal): Promise<GitResult> {
+export function runGit(args: string[], cwd: string, env: Record<string, string>, timeoutMs: number, signal?: AbortSignal, maxOutput = 1024 * 1024): Promise<GitResult> {
   return new Promise((done) => {
     if (signal?.aborted) return done({ code: null, stdout: "", stderr: "stopped", timedOut: false });
     const child = spawn(GIT_BIN, args, { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
     let stdout = "";
     let stderr = "";
-    const cap = (s: string, d: Buffer) => (s.length > 1024 * 1024 ? s : s + d.toString("utf8"));
+    let truncated = false;
+    const cap = (s: string, d: Buffer) => {
+      if (s.length > maxOutput) {
+        truncated = true;
+        return s;
+      }
+      return s + d.toString("utf8");
+    };
     child.stdout.on("data", (d: Buffer) => {
       stdout = cap(stdout, d);
     });
@@ -177,7 +186,7 @@ export function runGit(args: string[], cwd: string, env: Record<string, string>,
     child.on("close", (code) => {
       clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
-      done({ code, stdout, stderr, timedOut });
+      done({ code, stdout, stderr, timedOut, ...(truncated ? { truncated } : {}) });
     });
     child.on("error", (err) => {
       clearTimeout(timer);
@@ -222,23 +231,25 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
   return withUpstreamEnv(up, ssh, async (base) => {
     // Every cache git on that git dir exactly: never one git finds by walking up (a dotfiles repository above).
     const env = cacheEnv(base, cache);
-    const deadline = Date.now() + timeoutMs;
-    const left = () => Math.max(1_000, deadline - Date.now());
     sweepLocks(cache);
     if (!(await isRepo(cache, env))) {
       rmSync(cache, { recursive: true, force: true });
       const tmp = `${cache}.tmp-${randomBytes(6).toString("hex")}`;
-      const r = await runGit(["clone", "--bare", "--quiet", "--no-tags", "--", up.url, tmp], dirname(cache), { ...base, GIT_CEILING_DIRECTORIES: dirname(cache) }, left(), signal);
+      // The first clone of a large repository can outlast an agent's git (a tool's time limit): it isn't cut short when
+      // that git goes, and has a limit of its own, so a later request finds the cache made.
+      const r = await runGit(["clone", "--bare", "--quiet", "--no-tags", "--", up.url, tmp], dirname(cache), { ...base, GIT_CEILING_DIRECTORIES: dirname(cache) }, Math.max(timeoutMs, FIRST_CLONE_MS));
       if (r.code !== 0) {
         rmSync(tmp, { recursive: true, force: true });
         return { error: gitError(r, "the remote couldn't be fetched") };
       }
       renameSync(tmp, cache);
     }
+    const deadline = Date.now() + timeoutMs;
+    const left = () => Math.max(1_000, deadline - Date.now());
     const f = await runGit(["fetch", "--quiet", "--prune", "--prune-tags", "--no-write-fetch-head", "--", up.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], cache, env, left(), signal);
     if (f.code !== 0) return { error: gitError(f, "the remote couldn't be fetched") };
     // Every branch with its symref target, and HEAD (protocol v2's ls-refs symrefs).
-    const h = await runGit(["ls-remote", "--symref", "--", up.url, "HEAD", "refs/heads/*"], cache, env, Math.min(left(), 60_000), signal);
+    const h = await runGit(["ls-remote", "--symref", "--", up.url, "HEAD", "refs/heads/*"], cache, env, Math.min(left(), 60_000), signal, 256 * 1024 * 1024);
     const symrefs = new Set<string>();
     let defaultBranch: string | null = null;
     let heads = 0;
@@ -259,8 +270,71 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
     }
     if (defaultBranch) await runGit(["symbolic-ref", "HEAD", `refs/heads/${defaultBranch}`], cache, env, 10_000, signal);
     // Branches, but no HEAD said (an unborn one: renamed or deleted): which branch would become the default isn't known.
-    const defaultKnown = h.code === 0 && (defaultBranch !== null || heads === 0);
+    // A list cut short says too little (its branches, symrefs): nothing is known of it.
+    const defaultKnown = h.code === 0 && !h.truncated && (defaultBranch !== null || heads === 0);
     return { defaultBranch, defaultKnown, symrefs, empty: h.code === 0 && heads === 0, heads: names };
+  });
+}
+
+/** The first clone's own limit (it isn't tied to any one agent's git). */
+const FIRST_CLONE_MS = 60 * 60_000;
+
+/**
+ * Why a push can't take its objects from the cache: an object its new tips need, past what the remote's branches and
+ * tags reach (the cache's refs, just refreshed), that the push didn't bring (it isn't in the quarantine). The cache
+ * keeps objects the remote has since deleted; a push naming one would publish it again (and hand it to the agent).
+ * Null: every such object came with the push.
+ */
+// paths: git rev-list and cat-file on the daemon's cache and the push's quarantine, read only
+export function objectsNotSent(cache: string, objects: { dir: string; alternates: string }, tips: readonly string[]): Promise<string | null> {
+  const base = { PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_NO_REPLACE_OBJECTS: "1" };
+  const all = { ...cacheEnv(base, cache), GIT_OBJECT_DIRECTORY: objects.dir, GIT_ALTERNATE_OBJECT_DIRECTORIES: objects.alternates };
+  // The quarantine alone (it has no alternates file of its own).
+  const sent = { ...cacheEnv(base, cache), GIT_OBJECT_DIRECTORY: objects.dir, GIT_ALTERNATE_OBJECT_DIRECTORIES: "" };
+  return new Promise((done) => {
+    const rev = spawn(GIT_BIN, ["rev-list", "--objects", "--no-object-names", ...tips, "--not", "--all"], { cwd: cache, env: all, stdio: ["ignore", "pipe", "ignore"], detached: true });
+    const cat = spawn(GIT_BIN, ["cat-file", "--batch-check=%(objectname)"], { cwd: cache, env: sent, stdio: ["pipe", "pipe", "ignore"], detached: true });
+    let settled = false;
+    const kill = () => {
+      for (const p of [rev, cat]) {
+        try {
+          if (p.pid) process.kill(-p.pid, "SIGKILL");
+        } catch {
+          /* gone */
+        }
+      }
+    };
+    const finish = (r: string | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      kill();
+      done(r);
+    };
+    const timer = setTimeout(() => finish("the push's objects couldn't be checked in time"), 120_000);
+    cat.stdin.on("error", () => {});
+    rev.stdout.pipe(cat.stdin);
+    let revCode: number | null | undefined;
+    rev.on("close", (code) => {
+      revCode = code;
+    });
+    let buf = "";
+    cat.stdout.on("data", (d: Buffer) => {
+      buf += d.toString("utf8");
+      const nl = buf.lastIndexOf("\n");
+      if (nl < 0) return;
+      const lines = buf.slice(0, nl).split("\n");
+      buf = buf.slice(nl + 1);
+      const missing = lines.find((l) => l.endsWith(" missing"));
+      if (missing) finish(`${missing.split(" ")[0]?.slice(0, 12)} isn't in the push, and isn't on the remote's branches or tags (an object the remote no longer has)`);
+    });
+    cat.on("close", (code) => {
+      if (settled) return;
+      if (code !== 0 || revCode !== 0) return finish("the push's objects couldn't be checked");
+      finish(null);
+    });
+    rev.on("error", () => finish("the push's objects couldn't be checked"));
+    cat.on("error", () => finish("the push's objects couldn't be checked"));
   });
 }
 

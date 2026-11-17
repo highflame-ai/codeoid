@@ -21,7 +21,7 @@ import { within } from "../physical-path.js";
 import { type PushPolicy, type RefUpdate, refUpdateProblem } from "./policy.js";
 import { type GatewayScripts, writeGatewayScripts } from "./scripts.js";
 import { redactCredentials, shownGitUrl } from "./text.js";
-import { cacheRef, configEnv, isAncestor, pushUpstream, type RemoteState, refreshCache, type Upstream } from "./upstream.js";
+import { cacheRef, configEnv, isAncestor, objectsNotSent, pushUpstream, refreshCache, type RemoteState, type Upstream } from "./upstream.js";
 
 export type GitService = "git-upload-pack" | "git-receive-pack";
 
@@ -52,7 +52,8 @@ export interface GatewayHost {
   /** The session's word on a checked push (its role, its mode, the owner's answer); `signal`: the agent's git is gone. */
   approve(sessionId: string, push: GatewayPush, signal: AbortSignal): Promise<{ ok: true } | { refused: string }>;
   /** The remote's branches as a refresh found them (a branch agents made, gone from it, is no longer theirs). */
-  remoteHeads?(sessionId: string, url: string, heads: ReadonlySet<string>): void;
+  /** The remote's branches as of a refresh that started at `since` (records made after it aren't judged by it). */
+  remoteHeads?(sessionId: string, url: string, heads: ReadonlySet<string>, since: number): void;
   /** What happened, for the session's audit and transcript. */
   report(sessionId: string, event: { kind: "fetch" | "push"; url: string; ok: boolean; detail: string; updates?: readonly RefUpdate[] }): void;
 }
@@ -244,12 +245,13 @@ export class GitGateway {
     c.once("end", () => gone.abort());
     try {
       // The lock is the refresh's alone: serving (and an owner's card) doesn't hold up other sessions' requests.
+      const since = Date.now();
       const fresh = await this.#locked(grant.cacheKey, async () => {
         sweepQuarantines(cache);
         return refreshCache(cache, upstream, grant.ssh, this.#upstreamTimeoutMs, gone.signal);
       });
       if (gone.signal.aborted) return;
-      if (!("error" in fresh) && fresh.defaultKnown) this.#host.remoteHeads?.(sessionId, url, fresh.heads);
+      if (!("error" in fresh) && fresh.defaultKnown) this.#host.remoteHeads?.(sessionId, url, fresh.heads, since);
       if ("error" in fresh) {
         this.#host.report(sessionId, { kind: service === "git-receive-pack" ? "push" : "fetch", url, ok: false, detail: fresh.error });
         return fail(fresh.error);
@@ -357,6 +359,14 @@ export class GitGateway {
     });
   }
 
+  /** Remove a connection's cache (it was disconnected): nothing the remote had is kept, nor reused by a reconnect. */
+  // paths: the daemon's own cache repository for that connection, removed under its lock
+  async forget(cacheKey: string): Promise<void> {
+    await this.#locked(cacheKey, async () => {
+      rmSync(this.cachePath(cacheKey), { recursive: true, force: true });
+    });
+  }
+
   /** The cache's pre-receive hook asks: the updates, checked, the session's word, then the remote. */
   async #onHook(c: Socket): Promise<void> {
     const say = (line: string) => {
@@ -406,6 +416,10 @@ export class GitGateway {
       agentBranches: t.grant.agentBranches,
     };
     if (t.remote.empty) return refuse("the remote has no branch yet (an empty repository), and the first one pushed may become its default: ask the owner to push its first branch");
+    // Every object the new tips need past what the remote's refs reach came with the push: never one the cache kept
+    // after the remote deleted it.
+    const unsent = await objectsNotSent(t.cache, objects, updates.map((u) => u.new));
+    if (unsent) return refuse(unsent);
     for (const u of updates) {
       const problem = await refUpdateProblem(u, policy, (old, next) => isAncestor(t.cache, old, next, objects));
       if (problem) return refuse(problem);

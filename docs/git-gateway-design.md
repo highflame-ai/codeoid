@@ -105,7 +105,7 @@ The daemon doesn't parse or relay the pack protocol itself. It runs git's own se
      Several refs are taken when every one passes, and they are pushed upstream atomically.
    - Each update's `old` is taken from the refreshed cache, never from the client. A different claim is refused, and the upstream push carries `--force-with-lease=<ref>:<that old>` (empty for a new branch).
    - The decision is tied to the agent's connection. If it closes (a tool's time limit, an interrupt) or the session closes, the owner's card closes and nothing is pushed.
-   - In guarded mode, the owner is asked on a card first: the branch, commit, URL and the agent's reason. A role whose network isn't `true`, or is read-only, is refused.
+   - In guarded mode, the owner is asked on a card first: the branch, commit and URL (a `git push` carries no reason). A role whose network isn't `true`, or is read-only, is refused.
    - Then the hook pushes the checked commits upstream (`git push --atomic --porcelain <upstream> <new>:<ref>` with the quarantine's object env and the gateway's upstream env). The agent's push is accepted only if upstream took them. Upstream's own messages, redacted, are relayed as the hook's output.
 4. **Audit:** every request, refusal, answer and result goes to the audit log and the transcript (`session.git_*`).
 
@@ -179,7 +179,7 @@ What stays, reused: `redactCredentials`, `hostPathProblem` (for git, ssh and the
 ## 9. Open questions
 
 - Other forge APIs (open a PR) need an API credential an ssh key can't give: an Atlassian or GitHub token captured at connect, through a later HTTP adapter.
-- Cache disk use: one bare mirror per connected remote, pruned when its connection is removed.
+- Cache disk use: one bare mirror per connected remote, removed when its connection is (`GitGateway.forget`). Objects the remote deleted stay in it until then, never served (v0 only, `allowAnySHA1InWant=false`) and never pushed: the hook's `objectsNotSent` makes every object a push's new tips need past the cache's refs come from the push's own quarantine (round 12).
 
 ## 10. Toward a library
 
