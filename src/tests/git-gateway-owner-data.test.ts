@@ -6,7 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { credentialUrlMatches, fillGitCredential, safeHelper } from "../daemon/git-gateway/connect.js";
@@ -503,5 +503,32 @@ describe("round 39: the repository's config read is the very file looked at; ref
     await warmRewrites(repo, true, files);
     expect(workspaceRemoteUrls(repo).join(" ")).not.toContain("internal.example");
     expect(await repoConfigGet(files, "remote.secret.url")).toBe("");
+  });
+});
+
+describe("round 40: the git dir swapped for a link isn't followed; a config git rewrote is still read", () => {
+  test("a .git swapped for a link to a hidden repository's after the look isn't read; a rewritten config is", async () => {
+    const { warmRewrites, ownerPushRewrite, repoConfigGet } = await import("../daemon/git-gateway/connect.js");
+    const { workspaceRemoteUrls, repositoryConfigFiles } = await import("../daemon/sandbox/session-sandbox.js");
+    process.env.HOME = home;
+    const repo = join(home, "r40");
+    spawnSync("git", ["init", "-q", repo]);
+    spawnSync("git", ["-C", repo, "remote", "add", "origin", "https://github.com/acme/app.git"]);
+    const files = repositoryConfigFiles(repo);
+    // git rewrites the config (a new file renamed over it): the next refresh still reads the repository's rules.
+    spawnSync("git", ["-C", repo, "config", "url.git@github.com:me/.pushInsteadOf", "https://github.com/acme/"]);
+    await warmRewrites(repo, true, files);
+    await warmRewrites(repo, true);
+    expect(ownerPushRewrite("https://github.com/acme/app.git", repo)).toBe("git@github.com:me/app.git");
+    expect(await repoConfigGet(files, "remote.origin.url")).toBe("https://github.com/acme/app.git");
+    // .git itself swapped for a link to a hidden repository's git dir.
+    const hiddenRepo = join(home, "hidden40");
+    spawnSync("git", ["init", "-q", hiddenRepo]);
+    spawnSync("git", ["-C", hiddenRepo, "remote", "add", "secret", "ssh://bot:hunter2@internal.example/x.git"]);
+    renameSync(join(repo, ".git"), join(repo, "git-aside"));
+    symlinkSync(join(hiddenRepo, ".git"), join(repo, ".git"));
+    await warmRewrites(repo, true, files);
+    expect(await repoConfigGet(files, "remote.secret.url")).toBe("");
+    expect(workspaceRemoteUrls(repo).join(" ")).not.toContain("internal.example");
   });
 });

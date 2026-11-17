@@ -278,8 +278,9 @@ export class GitGateway {
 
   async #onClient(sessionId: string, c: Socket, sessionGone: Set<AbortController>): Promise<void> {
     let sshConfigShown: string | undefined = undefined;
+    let shownUrl = "";
     const fail = (why: string) => {
-      if (!c.destroyed) c.end(`error ${hideSsh(redactCredentials(why), sshConfigShown, url).replace(/\n/g, " ")}\n`);
+      if (!c.destroyed) c.end(`error ${hideSsh(redactCredentials(why), sshConfigShown, shownUrl).replace(/\n/g, " ")}\n`);
     };
     const limit = setTimeout(() => c.destroy(), this.#requestTimeoutMs);
     c.once("close", () => clearTimeout(limit));
@@ -314,6 +315,7 @@ export class GitGateway {
     const cache = this.cachePath(grant.cacheKey);
     const upstream: Upstream = { ...grant.upstream, runDir: join(this.#base, "run") };
     sshConfigShown = grant.upstream.sshConfig;
+    shownUrl = url;
     if (gone.signal.aborted) {
       sessionGone.delete(gone);
       this.#gone.delete(gone);

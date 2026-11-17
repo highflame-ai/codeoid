@@ -13,9 +13,9 @@
  * starts on it.
  */
 
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
 import { type CodeoidConfig, getConfigDir } from "../../config.js";
 import type { ClaudeTempDirs } from "./claude-native.js";
@@ -1604,32 +1604,35 @@ export function repositoryForRewrites(workspace: string): string | undefined {
 }
 
 /**
- * The repository's own config files for codeoid to read (its config, and its worktree's `config.worktree`): each a
- * regular file, not a link, really inside the git dir the layout vouched for. Never what a `commondir` or a link an
- * agent made would point git at (a repository the sandbox hides).
+ * The repository's own config files for codeoid to read (its config, and its worktree's `config.worktree`), each a
+ * walk from the real path of the dir holding the repository's git dir (the repository's top: its parents are outside
+ * what an agent writes) through literal parts, none followed if it is a link (openRepoFile). Never what a `commondir`
+ * or a link an agent made would point git at (a repository the sandbox hides).
  */
-// paths: a look (lstat, realpath) at the repository's config files, nothing read
+// paths: a look (realpath of the repository's top), nothing read
 export function repositoryConfigFiles(workspace: string): RepoConfigFile[] {
   const layout = gitLayoutOf(workspace);
   if (!layout?.common) return [];
-  const gitDir = layout.own ?? layout.common;
+  const top = dirname(resolve(layout.common));
+  let base: string;
+  try {
+    base = realpathSync(top);
+  } catch {
+    return [];
+  }
+  const partsOf = (dir: string, name: string): string[] | null => {
+    const rel = relative(top, resolve(dir));
+    if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null;
+    return [...rel.split(sep), name];
+  };
   const out: RepoConfigFile[] = [];
-  for (const [file, dir] of [
-    [join(layout.common, "config"), layout.common],
-    [join(gitDir, "config.worktree"), gitDir],
+  const gitDir = layout.own ?? layout.common;
+  for (const [dir, name] of [
+    [layout.common, "config"],
+    [gitDir, "config.worktree"],
   ] as const) {
-    try {
-      if (!lstatSync(file).isFile()) continue;
-      const real = realpathSync(file);
-      const root = realpathSync(dir);
-      if (dirname(real) !== root) continue;
-      // Its identity as looked at: what is read later must be this very file (a link swapped in meanwhile isn't).
-      const st = lstatSync(real);
-      if (!st.isFile()) continue;
-      out.push({ path: real, dev: st.dev, ino: st.ino });
-    } catch {
-      /* not there */
-    }
+    const parts = partsOf(dir, name);
+    if (parts && (name === "config" || existsSync(join(dir, name)))) out.push({ base, parts });
   }
   return out;
 }

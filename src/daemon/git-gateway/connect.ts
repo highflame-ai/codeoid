@@ -8,7 +8,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { physicalPath, within } from "../physical-path.js";
@@ -432,28 +432,67 @@ export function repoRemotes(dir: string): string[] | null {
   return repoRules.get(dir)?.rules?.remotes ?? null;
 }
 
-/** A repository config file as codeoid looked at it: its path, and its identity then. */
+/**
+ * A repository config file as codeoid names it: a real base dir (the repository's top: its parents are outside what
+ * an agent writes) and the components under it (`.git`, `config`), each opened without following a link, so nothing
+ * an agent swaps in on the way (a `.git` that is a link, a `config` that is one) is ever followed.
+ */
 export interface RepoConfigFile {
-  path: string;
-  dev: number;
-  ino: number;
+  base: string;
+  parts: readonly string[];
+}
+
+/**
+ * Open `f` for reading: the base dir, then each part through the dir before it (`/proc/self/fd/<n>/<part>`, no link
+ * followed; where there is no /proc, by path, each part looked at first). The fd, or null.
+ */
+// paths: opens (dirs then the file, none through a link), no write
+function openRepoFile(f: RepoConfigFile): number | null {
+  const viaProc = existsSync("/proc/self/fd");
+  let dir: number;
+  try {
+    dir = openSync(f.base, constants.O_RDONLY | constants.O_DIRECTORY);
+  } catch {
+    return null;
+  }
+  let at = f.base;
+  try {
+    for (const [i, part] of f.parts.entries()) {
+      if (!part || part === "." || part === ".." || part.includes("/")) return null;
+      at = join(at, part);
+      const last = i === f.parts.length - 1;
+      const flags = constants.O_RDONLY | constants.O_NOFOLLOW | (last ? constants.O_NONBLOCK : constants.O_DIRECTORY);
+      if (!viaProc && lstatSync(at).isSymbolicLink()) return null;
+      const next = openSync(viaProc ? `/proc/self/fd/${dir}/${part}` : at, flags);
+      closeSync(dir);
+      dir = next;
+    }
+    const fd = dir;
+    dir = -1;
+    return fd;
+  } catch {
+    return null;
+  } finally {
+    if (dir >= 0) closeSync(dir);
+  }
 }
 
 const repoFiles = new Map<string, readonly RepoConfigFile[]>();
 
 /**
- * One of the repository's own config files read by codeoid itself, and handed to git on stdin (`--file -`): opened
- * without following a link or blocking, and only if it is the very file looked at (its device and inode), so a link
- * swapped in after the look (to a file the sandbox hides) is never read. Its values, or null.
+ * One of the repository's own config files read by codeoid itself, and handed to git on stdin (`--file -`): reached
+ * from its real base with no link followed on the way (openRepoFile), never blocking, so nothing an agent swaps in
+ * (a `.git` or a `config` that is a link to a file the sandbox hides) is read. Its values, or null.
  */
 // paths: an open (no link followed, non-blocking) of a file codeoid named, and git config on stdin
 function readConfigOf(f: RepoConfigFile, args: string[], env: Record<string, string>): Promise<string | null | "hung"> {
   let text: string;
   try {
-    const fd = openSync(f.path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+    const fd = openRepoFile(f);
+    if (fd === null) return Promise.resolve(null);
     try {
       const st = fstatSync(fd);
-      if (!st.isFile() || st.dev !== f.dev || st.ino !== f.ino || st.size > 1 << 20) return Promise.resolve(null);
+      if (!st.isFile() || st.size > 1 << 20) return Promise.resolve(null);
       const buf = Buffer.alloc(st.size);
       let at = 0;
       while (at < st.size) {
