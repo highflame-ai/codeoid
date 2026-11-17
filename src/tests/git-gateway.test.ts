@@ -451,7 +451,9 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(upstreamRef("refs/heads/x")).toBe("");
     expect(spawnSync("git", ["-C", upstream, "cat-file", "-e", secret]).status).not.toBe(0);
     expect(reply).not.toContain("ok refs/heads/x");
-    expect(reports.some((e) => e.kind === "push" && !e.ok && /remote deleted it/.test(e.detail))).toBe(true);
+    // Round 15: the refresh saw the purge, so the cache dropped the object before serving (nothing to name, probe or
+    // build on).
+    expect(spawnSync("git", ["-C", gw.cachePath(`u:${URL}`), "cat-file", "-e", secret]).status).not.toBe(0);
     // An ordinary push (its objects sent) still goes.
     const work = await clone();
     await agent(work, "checkout", "-q", "-b", "fine");
@@ -563,13 +565,55 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     }
     await p.exited;
     expect(upstreamRef("refs/heads/derived")).toBe("");
-    expect(reports.some((e) => e.kind === "push" && !e.ok && /remote deleted it/.test(e.detail))).toBe(true);
+    expect(spawnSync("git", ["-C", gw.cachePath(`u:${URL}`), "cat-file", "-e", purgedBlob]).status).not.toBe(0);
     // A thin push built on what the remote has still goes.
     const work = await clone();
     await agent(work, "checkout", "-q", "-b", "thin-ok");
     writeFileSync(join(work, "a.txt"), "a\nmore\n");
     await agent(work, "commit", "-qam", "thin ok");
     expect((await agent(work, "push", "origin", "thin-ok")).code).toBe(0);
+  });
+
+  test("round 15: a push connection opened before a purge can't publish the purged object after it (nor build on it)", async () => {
+    const other = join(root, "other");
+    plain(root, "clone", "-q", upstream, other);
+    plain(other, "checkout", "-q", "-b", "oops");
+    writeFileSync(join(other, "secret.txt"), `${"TOPSECRET line\n".repeat(200)}`);
+    plain(other, "add", ".");
+    plain(other, "commit", "-q", "-m", "oops");
+    plain(other, "push", "-q", "origin", "oops");
+    const secret = plain(other, "rev-parse", "HEAD");
+    const purge = () => {
+      plain(upstream, "branch", "-D", "oops");
+      plain(upstream, "reflog", "expire", "--expire=now", "--all");
+      plain(upstream, "gc", "-q", "--prune=now");
+    };
+    // The agent opens receive-pack while the branch is there (the refresh sees nothing deleted), then the owner
+    // purges it, then the agent names it as a new branch's tip with an empty pack.
+    const s = gw.forSession("s1");
+    const p = Bun.spawn([s.ext, "git-receive-pack", URL], { env: { PATH: process.env.PATH ?? "", CODEOID_GIT_GATEWAY: s.socket }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const reader = p.stdout.getReader();
+    let got = "";
+    while (!got.endsWith("0000")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      got += Buffer.from(value).toString("latin1");
+    }
+    expect(got).toContain(secret);
+    purge();
+    const pkt = (x: string) => `${(x.length + 4).toString(16).padStart(4, "0")}${x}`;
+    const header = Buffer.from([0x50, 0x41, 0x43, 0x4b, 0, 0, 0, 2, 0, 0, 0, 0]);
+    p.stdin.write(`${pkt(`${"0".repeat(40)} ${secret} refs/heads/late\0report-status\n`)}0000`);
+    p.stdin.write(Buffer.concat([header, createHash("sha1").update(header).digest()]));
+    p.stdin.end();
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    await p.exited;
+    expect(upstreamRef("refs/heads/late")).toBe("");
+    expect(spawnSync("git", ["-C", upstream, "cat-file", "-e", secret]).status).not.toBe(0);
+    expect(reports.some((e) => e.kind === "push" && !e.ok && /remote deleted it/.test(e.detail))).toBe(true);
   });
 
   test("round 12: a disconnected remote's cache is removed", async () => {

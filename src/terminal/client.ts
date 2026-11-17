@@ -485,6 +485,8 @@ export class TerminalClient {
     const resp = await this.#request({ type: "sandbox.git_connect", id: randomUUID(), action, ...o });
     if (resp.type !== "response.ok") {
       this.#printError(resp);
+      // A connect (or a disconnect) that didn't happen is a failure to whoever runs the command (a script's `&&`).
+      process.exitCode = 1;
       return;
     }
     const data = resp.data as { connections?: Array<{ url: string; kind: string; auth: string; connectedAt: number }>; url?: string; kind?: string; auth?: string; via?: string; removed?: boolean };

@@ -21,7 +21,7 @@ import { within } from "../physical-path.js";
 import { type PushPolicy, type RefUpdate, refUpdateProblem } from "./policy.js";
 import { type GatewayScripts, writeGatewayScripts } from "./scripts.js";
 import { redactCredentials, shownGitUrl } from "./text.js";
-import { cacheRef, configEnv, isAncestor, objectsNotSent, pushUpstream, refreshCache, type RemoteState, type Upstream } from "./upstream.js";
+import { cacheHas, cacheRef, configEnv, isAncestor, objectsNotSent, pruneCache, pushUpstream, refreshCache, remoteOids, type RemoteState, type Upstream } from "./upstream.js";
 
 export type GitService = "git-upload-pack" | "git-receive-pack";
 
@@ -101,6 +101,9 @@ export class GitGateway {
   readonly #cloneStops = new Map<string, AbortController>();
   /** Aborted when the gateway stops: an upstream push in flight ends with it (said, and recorded as unknown). */
   readonly #closing = new AbortController();
+  /** Per cache: requests being served on it now; and whether it waits to be pruned (the remote deleted something). */
+  readonly #active = new Map<string, number>();
+  readonly #dirty = new Set<string>();
   readonly #generations = new Map<string, number>();
   #closed = false;
 
@@ -254,6 +257,7 @@ export class GitGateway {
     this.#gone.add(gone);
     c.once("close", () => gone.abort());
     c.once("end", () => gone.abort());
+    let counted = false;
     try {
       // The lock is the refresh's alone: serving (and an owner's card) doesn't hold up other sessions' requests.
       const since = Date.now();
@@ -269,7 +273,18 @@ export class GitGateway {
           stop = new AbortController();
           this.#cloneStops.set(grant.cacheKey, stop);
         }
-        return refreshCache(cache, upstream, grant.ssh, this.#upstreamTimeoutMs, gone.signal, stop.signal);
+        const r = await refreshCache(cache, upstream, grant.ssh, this.#upstreamTimeoutMs, gone.signal, stop.signal);
+        if ("error" in r) return r;
+        // The remote deleted or rewrote something: the cache drops it before anything more is served from it, once
+        // the requests being served on it are done (none starts meanwhile: they wait on this lock).
+        if (r.dirty) this.#dirty.add(grant.cacheKey);
+        if (this.#dirty.has(grant.cacheKey)) {
+          if (!(await this.#drained(grant.cacheKey)) || !(await pruneCache(cache))) return { error: "codeoid is clearing what the remote deleted from its copy: try again in a few minutes" };
+          this.#dirty.delete(grant.cacheKey);
+        }
+        this.#active.set(grant.cacheKey, (this.#active.get(grant.cacheKey) ?? 0) + 1);
+        counted = true;
+        return r;
       });
       if (gone.signal.aborted) return;
       if (disconnected()) return fail(`${shownGitUrl(url)} was disconnected`);
@@ -291,6 +306,11 @@ export class GitGateway {
     } finally {
       sessionGone.delete(gone);
       this.#gone.delete(gone);
+      if (counted) {
+        const n = (this.#active.get(grant.cacheKey) ?? 1) - 1;
+        if (n > 0) this.#active.set(grant.cacheKey, n);
+        else this.#active.delete(grant.cacheKey);
+      }
     }
   }
 
@@ -312,6 +332,8 @@ export class GitGateway {
       ["transfer.unpackLimit", "1"],
       ["uploadpack.allowAnySHA1InWant", "false"],
       ["uploadpack.allowFilter", "true"],
+      // A sparse filter names a blob to read as patterns: never one the client picks.
+      ["uploadpackfilter.sparse:oid.allow", "false"],
       ["core.logAllRefUpdates", "false"],
     ];
     const env: Record<string, string> = {
@@ -383,6 +405,16 @@ export class GitGateway {
         }
       });
     });
+  }
+
+  /** Wait (bounded) until no request is served on a cache: true when none is. */
+  async #drained(key: string, ms = 10 * 60_000): Promise<boolean> {
+    const until = Date.now() + ms;
+    while ((this.#active.get(key) ?? 0) > 0) {
+      if (Date.now() > until || this.#closed) return false;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    return true;
   }
 
   /** Remove a connection's cache (it was disconnected): nothing the remote had is kept, nor reused by a reconnect. */
@@ -467,6 +499,14 @@ export class GitGateway {
     }
     // The owner disconnected the remote while the card was up: nothing is pushed with what they took back.
     if (t.disconnected()) return refuse(`${shownGitUrl(t.url)} was disconnected`);
+    // The remote may have deleted something since the refresh (a connection held open, a card answered late): judged
+    // again against what it says it has now, so nothing it no longer has goes back to it.
+    const now = await remoteOids(t.grant.upstream, t.grant.ssh);
+    if ("error" in now) return refuse(now.error);
+    const known = await cacheHas(t.cache, now);
+    if ("error" in known) return refuse(known.error);
+    const late = await objectsNotSent(t.cache, objects, updates.map((u) => u.new), known);
+    if (late) return refuse(late);
     // Approved and started: it finishes (bounded by its own limit), the agent's git there or not, so what the remote
     // took is what is recorded; only the gateway stopping ends it.
     const pushed = await pushUpstream(t.cache, t.grant.upstream, t.grant.ssh, updates, objects, this.#upstreamTimeoutMs, this.#closing.signal);

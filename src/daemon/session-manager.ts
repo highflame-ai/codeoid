@@ -6500,6 +6500,8 @@ mcpHub: this.#mcpHub,
           mode: parent.mode,
           ...(parent.turnsRemaining !== undefined ? { maxTurns: parent.turnsRemaining } : {}),
         },
+        // The parent's autonomy, whoever's it was (the owner's, or the fleet's).
+        ...(parent.autonomousIsOwners ? { autonomousByOwner: true } : {}),
         // ...and its pack: a capability role's tool deny is part of that trust
         // (a fork of a read-only session must stay read-only).
         ...(forkPack ? { pack: forkPack } : {}),
@@ -8055,6 +8057,8 @@ mcpHub: this.#mcpHub,
           ...(run.contract.worker.provider ? { providerId: run.contract.worker.provider } : {}),
           ...(run.contract.worker.model ? { defaultModel: run.contract.worker.model } : {}),
           initialMode: { mode: "autonomous", maxTurns: run.contract.toolBudget },
+          // The owner started the loop (a delegated token can't): its autonomy is theirs.
+          autonomousByOwner: true,
           // Unattended: its turns need a sandbox that holds (#448).
           requireSandbox: true,
           ...(run.contract.worker.sandbox ? { sandbox: run.contract.worker.sandbox } : {}),
@@ -8161,6 +8165,8 @@ mcpHub: this.#mcpHub,
           providerId: o.provider,
           defaultModel: o.model,
           initialMode: o.approvals === "autonomous" ? { mode: "autonomous", maxTurns: o.toolBudget } : { mode: "guarded" },
+          // The owner made the routine autonomous (a delegated token can't change routines): theirs.
+          ...(o.approvals === "autonomous" ? { autonomousByOwner: true } : {}),
           // Unattended: its turns need a sandbox that holds (#448).
           requireSandbox: true,
           ...(o.sandbox ? { sandbox: o.sandbox } : {}),

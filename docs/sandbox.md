@@ -1313,13 +1313,14 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
 - **The daemon's copy:** each connected remote is mirrored once in codeoid's own dir, refreshed on every fetch or
   push. The first copy of a large repository can take longer than an agent's command may run: it carries on (up to
   an hour) after that command is stopped, so a later fetch finds it. A push may only name objects it sends or that
-  the remote's branches and tags still reach: one the remote has since deleted is never published again. The copy
-  keeps what the remote deleted until you disconnect (it is never served, but an agent that already knows a deleted
-  commit's id could learn that the copy still has it), so after purging a secret from a remote, disconnect and
-  connect it again. For the same reason a push built on what the remote deleted is refused, even your own earlier
-  work: reconnect the remote first.
-- **Autonomous mode is yours to give:** a push needs no card only when you set the session autonomous (or made it
-  so) with your own token. Set by a delegated token, or a worker the fleet started, each push asks you.
+  the remote's branches and tags still reach: one the remote has since deleted is never published again, and a push
+  is checked once more against what the remote says it has just before it is sent. When a refresh finds the remote
+  deleted or rewrote something, the copy drops it (a repack, once the requests it is serving are done), so nothing
+  the remote deleted can be fetched, probed or built on from it afterwards. In a large repository that repack can
+  take a while; requests wait for it.
+- **Who asks before a push:** a session you set autonomous with your own token pushes without a card, as do loops
+  you started and routines you made autonomous. Anything else autonomous (set by a delegated token, a worker the
+  fleet started, a collaboration's children) asks you for each push.
 - **Workstreams:** under workstream isolation, a remote that another workstream's rules claim is never pushed from
   a session homed elsewhere. It is fetched only as a reference whose share allows reads without asking.
 - **In guarded mode,** an agent that reaches a remote you haven't connected raises a card offering to connect it. In

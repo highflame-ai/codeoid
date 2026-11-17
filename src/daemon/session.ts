@@ -626,8 +626,9 @@ export interface SessionCreateOptions {
   /** Made with a delegated token (a resumed session: as its meta says). Such a session gets none of the owner's git access. */
   createdByDelegate?: boolean;
   /**
-   * Whether an autonomous initial mode is the owner's own choice (a push then needs no card). Default: unless a
-   * delegated token made the session. A dispatch worker's is the fleet's, not the owner's: false.
+   * Whether an autonomous initial mode is the owner's own choice (a push then needs no card): true only where the
+   * creation says so (a loop or routine the owner started, a fork of a session whose autonomy was theirs). Anything
+   * the daemon spawns on its own (a dispatch worker, a collaboration child) is the fleet's: its pushes ask.
    */
   autonomousByOwner?: boolean;
   /**
@@ -1208,6 +1209,11 @@ export class Session {
   readonly createdBy: string;
   /** Made with a delegated token: the owner's git connections aren't this session's to use. */
   readonly createdByDelegate: boolean;
+  /** Whether the session is autonomous by its owner's own choice (a fork carries it). */
+  get autonomousIsOwners(): boolean {
+    return this.#mode === "autonomous" && this.#autonomousByOwner;
+  }
+
   /** Whether the autonomous mode in force (if it is) is the owner's own choice (decideGitPush). */
   #autonomousByOwner = true;
   /** A dispatch worker: its autonomy is the fleet's whoever re-arms it (persisted as `fleetAutonomy`). */
@@ -1989,8 +1995,8 @@ export class Session {
     }
     this.createdBy = opts.auth.sub;
     this.createdByDelegate = opts.createdByDelegate ?? opts.auth.delegationDepth > 0;
-    this.#autonomyIsFleets = opts.autonomousByOwner === false;
-    this.#autonomousByOwner = opts.initialMode?.mode === "autonomous" ? (opts.autonomousByOwner ?? !this.createdByDelegate) : true;
+    this.#autonomyIsFleets = opts.initialMode?.mode === "autonomous" && opts.autonomousByOwner !== true;
+    this.#autonomousByOwner = opts.initialMode?.mode === "autonomous" ? opts.autonomousByOwner === true && !this.createdByDelegate : true;
     // Restored from TranscriptMeta on resume, stamped fresh only for a new
     // session. Both were previously unconditional `now`, which meant every
     // daemon restart re-dated every session: `createdAt` became the restart

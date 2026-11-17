@@ -224,6 +224,8 @@ export interface RemoteState {
   empty: boolean;
   /** Its branches (names after `refs/heads/`), when it said. */
   heads: ReadonlySet<string>;
+  /** The refresh left objects no ref reaches (the remote deleted or rewrote something): the cache needs pruning. */
+  dirty?: boolean;
 }
 
 /**
@@ -250,8 +252,23 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
     }
     const deadline = Date.now() + timeoutMs;
     const left = () => Math.max(1_000, deadline - Date.now());
+    const refsNow = async () => {
+      const r = await runGit(["for-each-ref", "--format=%(objectname)"], cache, env, 60_000, undefined, 256 * 1024 * 1024);
+      return r.code === 0 && !r.truncated ? new Set(r.stdout.split("\n").filter(Boolean)) : null;
+    };
+    const before = await refsNow();
     const f = await runGit(["fetch", "--quiet", "--prune", "--prune-tags", "--no-write-fetch-head", "--", up.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], cache, env, left(), signal);
     if (f.code !== 0) return { error: gitError(f, "the remote couldn't be fetched") };
+    // What a ref reached before and none reaches now (a deleted branch's own commits, a force push's old ones): the
+    // cache would keep them, so it is pruned (they are never served, nor used, nor probed).
+    const after = await refsNow();
+    let dirty = before === null || after === null;
+    const dropped = before && after ? [...before].filter((o) => !after.has(o)) : [];
+    if (!dirty && dropped.length > 0) {
+      const r = await gitLines(["rev-list", "--objects", "--no-object-names", "--stdin"], cache, env, [...dropped, ...[...(after ?? [])].map((o) => `^${o}`)], Math.min(left(), 120_000), () => true);
+      // Stopped at the first line: something only the old refs reached. An error: assume so.
+      dirty = "error" in r || r.stopped === true;
+    }
     // Every branch with its symref target, and HEAD (protocol v2's ls-refs symrefs).
     const h = await runGit(["ls-remote", "--symref", "--", up.url, "HEAD", "refs/heads/*"], cache, env, Math.min(left(), 60_000), signal, 256 * 1024 * 1024);
     const symrefs = new Set<string>();
@@ -276,8 +293,42 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
     // Branches, but no HEAD said (an unborn one: renamed or deleted): which branch would become the default isn't known.
     // A list cut short says too little (its branches, symrefs): nothing is known of it.
     const defaultKnown = h.code === 0 && !h.truncated && (defaultBranch !== null || heads === 0);
-    return { defaultBranch, defaultKnown, symrefs, empty: h.code === 0 && heads === 0, heads: names };
+    return { defaultBranch, defaultKnown, symrefs, empty: h.code === 0 && heads === 0, heads: names, ...(dirty ? { dirty } : {}) };
   });
+}
+
+/**
+ * Drop from the cache every object no ref reaches (what the remote deleted): a full repack and a prune. Run only with
+ * no request served on it (the gateway waits for them), under its lock. True when done.
+ */
+// paths: the daemon's own cache repository, repacked and pruned
+export async function pruneCache(cache: string): Promise<boolean> {
+  const env = cacheEnv({ PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_NO_REPLACE_OBJECTS: "1" }, cache);
+  const repack = await runGit(["-c", "pack.writeBitmapHashCache=true", "repack", "-a", "-d", "-q", "-b"], cache, env, 60 * 60_000);
+  if (repack.code !== 0) return false;
+  const prune = await runGit(["prune", "--expire=now"], cache, env, 30 * 60_000);
+  if (prune.code !== 0) return false;
+  // Nothing that names a pruned object stays (a commit graph, a multi-pack index).
+  for (const f of ["objects/info/commit-graph", "objects/info/commit-graphs", "objects/pack/multi-pack-index"]) rmSync(join(cache, f), { recursive: true, force: true });
+  return true;
+}
+
+/** The remote's refs' ids as it says them now (`ls-remote`), or why not. */
+export async function remoteOids(up: Upstream, ssh: string | null): Promise<string[] | { error: string }> {
+  return withUpstreamEnv(up, ssh, async (env) => {
+    const r = await runGit(["ls-remote", "--", up.url], "/", env, 60_000, undefined, 256 * 1024 * 1024);
+    if (r.code !== 0 || r.truncated) return { error: gitError(r, "the remote couldn't be asked what it has") };
+    return [...new Set(r.stdout.split("\n").map((l) => /^([0-9a-f]{40,64})\t/.exec(l)?.[1]).filter((x): x is string => !!x))];
+  });
+}
+
+/** Which of `ids` the cache holds (its own store), for a rev-list that names them. */
+export async function cacheHas(cache: string, ids: readonly string[]): Promise<string[] | { error: string }> {
+  if (ids.length === 0) return [];
+  const env = { ...cacheEnv({ PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, cache), GIT_OBJECT_DIRECTORY: join(cache, "objects"), GIT_ALTERNATE_OBJECT_DIRECTORIES: "" };
+  const r = await gitLines(["cat-file", "--batch-check=%(objectname) %(objecttype)"], cache, env, ids, 60_000);
+  if ("error" in r) return r;
+  return r.lines.filter((l) => !l.endsWith(" missing")).map((l) => l.split(" ")[0] ?? "");
 }
 
 /** The first clone's own limit (it isn't tied to any one agent's git). */
@@ -292,14 +343,17 @@ const FIRST_CLONE_MS = 60 * 60_000;
  * (a revert's older blob, a thin pack's base, what a bitmap client left out) is the remote's, and fine. Null: it can go.
  */
 // paths: git rev-list and cat-file on the daemon's cache and the push's quarantine, read only
-export async function objectsNotSent(cache: string, objects: { dir: string; alternates: string }, tips: readonly string[]): Promise<string | null> {
+export async function objectsNotSent(cache: string, objects: { dir: string; alternates: string }, tips: readonly string[], refs?: readonly string[]): Promise<string | null> {
   const base = { PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_NO_REPLACE_OBJECTS: "1" };
   const withPush = { ...cacheEnv(base, cache), GIT_OBJECT_DIRECTORY: objects.dir, GIT_ALTERNATE_OBJECT_DIRECTORIES: objects.alternates };
   // The cache's own store alone (never the quarantine, which is apart from it).
   const kept = { ...cacheEnv(base, cache), GIT_OBJECT_DIRECTORY: join(cache, "objects"), GIT_ALTERNATE_OBJECT_DIRECTORIES: "" };
   const deadline = Date.now() + 120_000;
   const left = () => Math.max(1_000, deadline - Date.now());
-  const candidates = await gitLines(["rev-list", "--objects", "--no-object-names", ...tips, "--not", "--all"], cache, withPush, null, left());
+  // Against the cache's refs, or (just before the upstream push) the remote's own refs as it says them now.
+  const candidates = refs
+    ? await gitLines(["rev-list", "--objects", "--no-object-names", "--stdin"], cache, withPush, [...tips, ...refs.map((r) => `^${r}`)], left())
+    : await gitLines(["rev-list", "--objects", "--no-object-names", ...tips, "--not", "--all"], cache, withPush, null, left());
   if ("error" in candidates) return candidates.error;
   // And everything in the push itself: a thin pack's delta bases are copied in from the cache (`--fix-thin`), and an
   // object built on a deleted one would carry its content out.
@@ -312,7 +366,7 @@ export async function objectsNotSent(cache: string, objects: { dir: string; alte
   const suspects = new Set(check.lines.filter((l) => !l.endsWith(" missing")).map((l) => l.split(" ")[0] ?? ""));
   if (suspects.size === 0) return null;
   // Each must be reached by one of the remote's refs.
-  const reached = await gitLines(["rev-list", "--objects", "--no-object-names", "--use-bitmap-index", "--all"], cache, kept, null, left(), (id) => {
+  const reached = await gitLines(refs ? ["rev-list", "--objects", "--no-object-names", "--stdin"] : ["rev-list", "--objects", "--no-object-names", "--use-bitmap-index", "--all"], cache, kept, refs ? [...refs] : null, left(), (id) => {
     suspects.delete(id);
     return suspects.size === 0;
   });
@@ -327,13 +381,13 @@ export async function objectsNotSent(cache: string, objects: { dir: string; alte
  * A git's output lines (its input `input`'s lines, if any), or why not; `each` may end it early (true: enough). Its
  * process group is killed at the limit or the end.
  */
-function gitLines(args: string[], cwd: string, env: Record<string, string>, input: readonly string[] | null, timeoutMs: number, each?: (line: string) => boolean): Promise<{ lines: string[] } | { error: string }> {
+function gitLines(args: string[], cwd: string, env: Record<string, string>, input: readonly string[] | null, timeoutMs: number, each?: (line: string) => boolean): Promise<{ lines: string[]; stopped?: boolean } | { error: string }> {
   return new Promise((done) => {
     const p = spawn(GIT_BIN, args, { cwd, env, stdio: [input ? "pipe" : "ignore", "pipe", "ignore"], detached: true });
     const lines: string[] = [];
     let buf = "";
     let settled = false;
-    const finish = (r: { lines: string[] } | { error: string }) => {
+    const finish = (r: { lines: string[]; stopped?: boolean } | { error: string }) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -348,7 +402,7 @@ function gitLines(args: string[], cwd: string, env: Record<string, string>, inpu
     const take = (l: string) => {
       if (!l) return;
       if (each) {
-        if (each(l)) finish({ lines: [] });
+        if (each(l)) finish({ lines: [], stopped: true });
       } else if (lines.push(l) > 5_000_000) finish({ error: "the push needs more objects than codeoid checks" });
     };
     p.stdout?.on("data", (d: Buffer) => {
