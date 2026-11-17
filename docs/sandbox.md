@@ -1264,15 +1264,20 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
   them, once, when you connect.
 - **ssh remotes** use your ssh key, through your ssh agent. When you connect, codeoid reads `~/.ssh/config` (and
   what it `Include`s) for that host's data alone: `HostName`, `User`, `Port`, `IdentityFile`, `CertificateFile`,
-  `IdentitiesOnly`, `UserKnownHostsFile`, `HostKeyAlias`, `ProxyJump`. `Match` blocks, `ProxyCommand`,
-  `LocalCommand` and the rest are never taken. Every run is the system `ssh` with `-F` on a config codeoid writes
+  `IdentitiesOnly`, `UserKnownHostsFile`, `HostKeyAlias`, `ProxyJump` (and each jump host's own). It reads the
+  config as OpenSSH does (first value wins, case-sensitive `Host`, includes in a block that doesn't apply read with
+  nothing applying). What it can't follow faithfully is refused, with the reason: a `Match` block it reaches, a
+  `ProxyCommand` for the host, `%` tokens or `${VAR}` in a file name, a relative key file. `LocalCommand` and the
+  rest are never taken. The config is read from the home OpenSSH uses (your account's, not `$HOME`), and every
+  file it is read from is judged and held read-only like your git config. Every run is the system `ssh` with `-F` on a config codeoid writes
   from that, so neither your ssh config nor the system's decides anything later; connect again after changing it.
   The connect output says where ssh goes and as whom. A key or known-hosts file in what a session may write is
   refused. A remote connected before this keeps working only after it is connected again.
 - **https remotes:** your git credential for the host is read once, now, with `git credential fill`. Only the
   helpers git and the platforms ship are run (`osxkeychain`, `libsecret`, `gnome-keyring`, `wincred`, `manager`,
-  `manager-core`, `cache`, `store` with a file no session may write), from your global and system config, never a
-  repository's; any other helper (a `!` shell snippet, a path, another name) is refused, and you connect with
+  `manager-core`, `cache`, `store` with a plain absolute file no session may write), from your global and system
+  config, never a repository's. codeoid writes each helper line itself (git runs helpers through a shell), and
+  finds a helper's program only in PATH dirs no session may write. Any other helper (a `!` shell snippet, a path, another name) is refused, and you connect with
   `--token` instead. Your `http.sslCAInfo` for the URL is kept with it, when it isn't in what a session may write. The credential lives in a 0600 file of the daemon's, which
   host-side file tools are refused. Each run hands it to git through codeoid's own credential helper, for that
   remote's origin only, with no redirects; it is never put in an environment or on a command line.

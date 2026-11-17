@@ -7,8 +7,8 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fillGitCredential } from "../daemon/git-gateway/connect.js";
-import { snapshotProblem, sshConfigText, sshHostOf, sshSnapshot } from "../daemon/git-gateway/ssh-snapshot.js";
+import { fillGitCredential, safeHelper } from "../daemon/git-gateway/connect.js";
+import { snapshotProblem, sshConfigSources, sshConfigText, sshHostOf, sshSnapshot, sshSnapshotLine, sshUrlUserPort } from "../daemon/git-gateway/ssh-snapshot.js";
 
 let home: string;
 let savedHome: string | undefined;
@@ -52,9 +52,68 @@ describe("ssh snapshot", () => {
     const s = sshSnapshot("bb", home);
     expect(s.hostName).toBe("bitbucket.org");
     const text = sshConfigText(s);
-    for (const k of ["ProxyCommand", "  LocalCommand", "KnownHostsCommand", "Match", "Include", "evil"]) expect(text).not.toContain(k);
+    for (const k of ["nc evil", "  LocalCommand", "KnownHostsCommand", "Match", "Include", "evil"]) expect(text).not.toContain(k);
     expect(text).toContain("PermitLocalCommand no");
+    expect(text).toContain("ProxyCommand none");
     expect(text).toContain("BatchMode yes");
+    // What ssh would do there can't be known: refused, never guessed.
+    expect(snapshotProblem(s, [], home)).toContain("Match");
+  });
+
+  test("a ProxyCommand for the host is refused; a ProxyJump alias is snapshotted as its own block", () => {
+    ssh(["Host bb", "  ProxyCommand nc %h %p"].join("\n"));
+    expect(snapshotProblem(sshSnapshot("bb", home), [], home)).toContain("ProxyCommand");
+    ssh(["Host bb", "  HostName bitbucket.org", "  ProxyJump bastion", "Host bastion", "  HostName bastion.corp.example", "  Port 2200", "  User jumper"].join("\n"));
+    const s = sshSnapshot("bb", home);
+    expect(snapshotProblem(s, [], home)).toBeNull();
+    const text = sshConfigText(s);
+    expect(text).toContain("Host bastion\n  HostName bastion.corp.example\n  User jumper\n  Port 2200");
+  });
+
+  test("resolves as OpenSSH does: case-sensitive hosts, includes in a block that doesn't apply, a file included twice, no dotfiles", () => {
+    mkdirSync(join(home, ".ssh", "d"));
+    ssh(["Host other", "  Include inner", "Host GH", "  HostName wrong.example", "Host *", "  Include d/*"].join("\n"));
+    ssh(["Host gh", "  HostName from-inactive.example"].join("\n"), "inner");
+    ssh(["HostName right.example"].join("\n"), "d/z");
+    ssh(["HostName dotfile.example"].join("\n"), "d/.hidden");
+    expect(sshSnapshot("gh", home).hostName).toBe("right.example");
+    ssh(["Host a", "  Include d/u", "Host gh", "  Include d/u"].join("\n"));
+    ssh(["User git"].join("\n"), "d/u");
+    expect(sshSnapshot("gh", home).user).toBe("git");
+    ssh(["Include d/[bad"].join("\n"));
+    expect(() => sshSnapshot("gh", home)).not.toThrow();
+  });
+
+  test("quoting, none, variables and relative key files", () => {
+    ssh(["Host bb", "  IdentityFile '/x/my key'", "  UserKnownHostsFile none"].join("\n"));
+    const s = sshSnapshot("bb", home);
+    expect(s.identityFiles).toEqual(["/x/my key"]);
+    expect(sshConfigText(s)).toContain("UserKnownHostsFile none");
+    ssh(["Host bb", "  IdentityFile ${HOME}/.ssh/id"].join("\n"));
+    expect(snapshotProblem(sshSnapshot("bb", home), [], home)).toContain("doesn't take");
+    ssh(["Host bb", "  IdentityFile id_rel"].join("\n"));
+    expect(snapshotProblem(sshSnapshot("bb", home), [], home)).toContain("doesn't take");
+    ssh(["Host bb", "  IdentityFile none"].join("\n"));
+    expect(sshConfigText(sshSnapshot("bb", home))).toContain("IdentityFile none");
+  });
+
+  test("a file the config is read from in what a session may write is refused, in every Include form", () => {
+    const ws = join(home, "ws");
+    mkdirSync(ws);
+    writeFileSync(join(ws, "inc"), "Host bb\n  HostName agent.example\n");
+    for (const inc of [`Include=${join(ws, "inc")}`, `Include "${join(ws, "inc")}"`, `Include ${join(ws, "*")}`]) {
+      ssh(inc);
+      const s = sshSnapshot("bb", home);
+      expect(s.sources).toContain(join(ws, "inc"));
+      expect(snapshotProblem(s, [ws], home)).not.toBeNull();
+    }
+    expect(sshConfigSources(home)).toContain(join(ws, "inc"));
+  });
+
+  test("what the owner is shown takes the URL's own user and port", () => {
+    ssh(["Host bb", "  User bob", "  Port 22"].join("\n"));
+    expect(sshUrlUserPort("ssh://alice@bb:2222/x.git")).toEqual({ user: "alice", port: "2222" });
+    expect(sshSnapshotLine({ ...sshSnapshot("bb", home), urlUser: "alice", urlPort: "2222" })).toContain("bb:2222 as alice");
   });
 
   test("refuses a value that isn't plain data, and a key a session may write", () => {
@@ -104,6 +163,19 @@ describe("credential helpers", () => {
     } finally {
       process.env.PATH = savedPath;
     }
+  });
+
+  test("a store helper carrying shell is refused, and nothing of it runs", async () => {
+    const mark = join(home, "ran");
+    for (const h of [`store --file=/usr/x|touch\${IFS}${mark}|true`, `store --file=/x$(touch ${mark})`, `store --file=/x\`touch ${mark}\``]) {
+      expect("error" in safeHelper(h, home)).toBe(true);
+      writeFileSync(join(home, ".gitconfig"), `[credential]\n\thelper = ${JSON.stringify(h)}\n`);
+      process.env.HOME = home;
+      const r = await fillGitCredential("https://host.invalid/x.git", { runDir: join(home, "run"), writable: [] }, 10_000);
+      expect("error" in r).toBe(true);
+    }
+    expect(existsSync(mark)).toBe(false);
+    expect(safeHelper("store --file ~/.git-credentials", home)).toEqual({ line: `store --file '${join(home, ".git-credentials")}'`, file: join(home, ".git-credentials") });
   });
 
   test("a store file a session may write is refused", async () => {

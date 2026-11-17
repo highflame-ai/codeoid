@@ -8,14 +8,14 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
-import { basename, dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { physicalPath, within } from "../physical-path.js";
 
 import { GIT_BIN } from "../git-env.js";
 import { hostPathProblem } from "./hostpath.js";
-import { type SshSnapshot, snapshotProblem, sshConfigText, sshHostOf, sshSnapshot } from "./ssh-snapshot.js";
+import { type SshSnapshot, snapshotProblem, sshConfigSources, sshConfigText, sshHostOf, sshSnapshot, sshUrlUserPort } from "./ssh-snapshot.js";
 import { remoteUrlProblem } from "./text.js";
 import { gitError, type HttpsCredential, lsRemote, runGit, systemSsh, type Upstream, type UpstreamKind, upstreamKind } from "./upstream.js";
 
@@ -105,7 +105,27 @@ function ownerHelperEnv(): Record<string, string> {
  * provide, by name (each a `git-credential-<name>` program in the system's dirs). Never a shell (`!…`), a path, or
  * a helper of some other name: those are refused (connect with a token instead).
  */
-const SAFE_HELPER = /^(?:osxkeychain|libsecret|gnome-keyring|wincred|manager|manager-core|cache(?: --timeout[= ]?\d+)?|store(?: --file[= ]?\S+)?)$/;
+const NAMED_HELPER = /^(?:osxkeychain|libsecret|gnome-keyring|wincred|manager|manager-core)$/;
+
+/**
+ * The helper line codeoid writes for one of the owner's (git runs a helper through the shell, so the owner's own
+ * text is never passed on): a name on the list, `cache [--timeout N]`, or `store [--file <path>]` with a plain
+ * absolute path, which codeoid quotes. Else why not.
+ */
+export function safeHelper(raw: string, home: string): { line: string; file?: string } | { error: string } {
+  const h = raw.trim();
+  if (NAMED_HELPER.test(h)) return { line: h };
+  const cache = /^cache(?: --timeout(?:=| +)(\d{1,9}))?$/.exec(h);
+  if (cache) return { line: cache[1] ? `cache --timeout ${cache[1]}` : "cache" };
+  const store = /^store(?: --file(?:=| +)(.+))?$/.exec(h);
+  if (store) {
+    if (!store[1]) return { line: "store" };
+    const named = store[1].startsWith("~/") ? join(home, store[1].slice(2)) : store[1];
+    if (!/^\/[A-Za-z0-9._/@+-]+$/.test(named)) return { error: `your credential store file ${JSON.stringify(store[1].slice(0, 60))} isn't a plain absolute path` };
+    return { line: `store --file '${named}'`, file: named };
+  }
+  return { error: `your credential helper ${JSON.stringify(h.slice(0, 60))} isn't one codeoid runs for agents (only git's and the platforms' own)` };
+}
 
 /** The owner's credential helpers for `url` (their global and system config, from `/`), in git's order. */
 // paths: git config read from /, which runs nothing
@@ -128,7 +148,7 @@ function ownerHelpers(url: string): string[] {
 
 /**
  * The owner's own credential for an https URL, as their `git push` would find it, but with only the well-known
- * helpers their config names (SAFE_HELPER): `git credential fill` from `/`, its config a file codeoid writes with
+ * helpers their config names (safeHelper): `git credential fill` from `/`, its config a file codeoid writes with
  * those helpers alone, so nothing their config (or a file it includes) names otherwise is run.
  */
 // paths: git credential fill from /, with a config codeoid writes (0600, in its own run dir), run for the owner at their request
@@ -141,13 +161,13 @@ export function fillGitCredential(url: string, o: { runDir: string; writable: re
       usable.length = 0;
       continue;
     }
-    if (!SAFE_HELPER.test(h.trim())) return Promise.resolve({ error: `your credential helper ${JSON.stringify(h.slice(0, 60))} isn't one codeoid runs for agents (only git's and the platforms' own): connect with --token` });
-    const file = /^store(?: --file[= ]?(\S+))?$/.exec(h.trim())?.[1];
-    if (file) {
-      const bad = hostPathProblem(file.startsWith("~/") ? join(process.env.HOME || homedir(), file.slice(2)) : file, o.writable, undefined, { homeAllowed: true });
+    const safe = safeHelper(h, process.env.HOME || homedir());
+    if ("error" in safe) return Promise.resolve({ error: `${safe.error}: connect with --token` });
+    if (safe.file) {
+      const bad = hostPathProblem(safe.file, o.writable, undefined, { homeAllowed: true });
       if (bad) return Promise.resolve({ error: `your credential store file can't be used: ${bad}` });
     }
-    usable.push(h.trim());
+    usable.push(safe.line);
   }
   if (usable.length === 0) return Promise.resolve({ error: `your git has no credential helper codeoid can use for ${u.host}: sign in with git once (a keychain, libsecret, the credential manager, store or cache), or connect with --token` });
   mkdirSync(o.runDir, { recursive: true, mode: 0o700 });
@@ -196,6 +216,8 @@ async function ownerCaInfo(url: string, writable: readonly string[]): Promise<st
 
 /** The home OpenSSH uses (`getpwuid`'s, never `$HOME`): where its config, keys and known hosts are. */
 export function sshHome(): string {
+  // Tests only (bun test): a fake home, as OpenSSH can't be given one.
+  if (process.env.NODE_ENV === "test" && process.env.CODEOID_TEST_SSH_HOME) return process.env.CODEOID_TEST_SSH_HOME;
   try {
     return userInfo().homedir || homedir();
   } catch {
@@ -244,7 +266,10 @@ export async function probeConnection(
     if (!host) return { error: `${url} names no host codeoid can reach by ssh` };
     // OpenSSH's home is the passwd one (it ignores $HOME): what its keys and known hosts are read from.
     const home = o.home ?? sshHome();
-    snapshot = sshSnapshot(host, home);
+    snapshot = { ...sshSnapshot(host, home), ...(() => {
+      const up = sshUrlUserPort(url);
+      return { ...(up.user ? { urlUser: up.user } : {}), ...(up.port ? { urlPort: up.port } : {}) };
+    })() };
     const bad = snapshotProblem(snapshot, o.writable, home);
     if (bad) return { error: bad };
   }
@@ -312,62 +337,24 @@ let ownerFiles: { at: number; key: string; files: string[] } | null = null;
 export function ownerConfigFiles(): string[] {
   const home = process.env.HOME || homedir();
   const xdg = process.env.XDG_CONFIG_HOME || join(home, ".config");
-  const key = `${home}\0${xdg}`;
+  const key = `${home}\0${xdg}\0${sshHome()}`;
   if (ownerFiles && ownerFiles.key === key && Date.now() - ownerFiles.at < 5_000) return ownerFiles.files;
   const out = new Set<string>();
   const add = (p: string) => {
     out.add(p);
     out.add(physicalPathOr(p));
   };
-  for (const f of [join(home, ".gitconfig"), join(xdg, "git", "config"), join(home, ".ssh"), join(home, ".ssh", "config")]) add(f);
+  for (const f of [join(home, ".gitconfig"), join(xdg, "git", "config")]) add(f);
+  // ssh's: from the home OpenSSH uses, every file and pattern dir codeoid's own snapshot parser reads (the same reading).
+  for (const f of sshConfigSources(sshHome())) add(f);
   try {
     const r = spawnSync(GIT_BIN, ["-C", "/", "config", "--global", "--list", "--show-origin", "--includes", "--null"], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
     for (const part of (r.status === 0 ? r.stdout : "").split("\0")) if (part.startsWith("file:")) add(part.slice("file:".length));
   } catch {
     /* none read */
   }
-  const sshDir = join(home, ".ssh");
-  const seen = new Set<string>();
-  const readSsh = (file: string, depth: number) => {
-    if (depth > 4 || seen.has(file)) return;
-    seen.add(file);
-    let text = "";
-    try {
-      text = readFileSync(file, "utf8");
-    } catch {
-      return;
-    }
-    for (const line of text.split("\n")) {
-      const m = /^\s*Include\s+(.+)$/i.exec(line);
-      if (!m?.[1]) continue;
-      for (const raw of m[1].trim().split(/\s+/)) {
-        const named = raw.startsWith("~/") ? join(home, raw.slice(2)) : isAbsolute(raw) ? raw : join(sshDir, raw);
-        const matches = /[*?[]/.test(named) ? globIn(named) : [named];
-        // A pattern's dir, and each match: an agent's new file there would match too.
-        if (/[*?[]/.test(named)) add(dirname(named));
-        for (const f of matches) {
-          add(f);
-          readSsh(f, depth + 1);
-        }
-      }
-    }
-  };
-  readSsh(join(sshDir, "config"), 0);
   ownerFiles = { at: Date.now(), key, files: [...out] };
   return ownerFiles.files;
-}
-
-/** The files a pattern (wildcards in its last component) matches in its dir. */
-function globIn(pattern: string): string[] {
-  const dir = dirname(pattern);
-  const re = new RegExp(`^${basename(pattern).replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".")}$`);
-  try {
-    return readdirSync(dir)
-      .filter((n) => re.test(n))
-      .map((n) => join(dir, n));
-  } catch {
-    return [];
-  }
 }
 
 /**

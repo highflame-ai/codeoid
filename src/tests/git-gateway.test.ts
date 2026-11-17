@@ -375,6 +375,7 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     mkdirSync(join(dots, "ssh"), { recursive: true });
     const saved = process.env.HOME;
     process.env.HOME = home;
+    process.env.CODEOID_TEST_SSH_HOME = home;
     const fresh = async () => {
       // The files' cache is a few seconds: wait it out between layouts.
       await new Promise((r) => setTimeout(r, 5_100));
@@ -402,6 +403,7 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
       expect(ownerConfigProblem([join(root, "elsewhere")])).toBeNull();
     } finally {
       process.env.HOME = saved;
+      delete process.env.CODEOID_TEST_SSH_HOME;
     }
   }, 30_000);
 
