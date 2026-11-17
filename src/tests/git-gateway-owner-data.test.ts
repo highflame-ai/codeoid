@@ -7,10 +7,10 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { credentialUrlMatches, fillGitCredential, safeHelper } from "../daemon/git-gateway/connect.js";
-import { resolveSshSnapshot, scanSshConfig, snapshotProblem, sshConfigSources, sshConfigText, sshHostOf, sshSnapshotLine, sshUrlUserPort } from "../daemon/git-gateway/ssh-snapshot.js";
+import { resolveSshSnapshot, scanSshConfig, sshG, snapshotProblem, sshConfigSources, sshConfigText, sshHostOf, sshSnapshotLine, sshUrlUserPort } from "../daemon/git-gateway/ssh-snapshot.js";
 
 let home: string;
 let savedHome: string | undefined;
@@ -90,6 +90,46 @@ describe("ssh snapshot", () => {
     }
     ssh(["Include $HOME/x"].join("\n"));
     expect(scanSshConfig(home).problem).toContain("Include");
+  });
+
+  test("round 10: a Match exec ssh -G reaches never runs, even one the scan didn't see (ssh's shell is false)", async () => {
+    const mark = join(home, "ran");
+    const cfg = join(home, "direct.conf");
+    writeFileSync(cfg, `Match exec "touch ${mark}"\n  User matched\nHost *\n  User plain\n`);
+    const g = await sshG(SSH, cfg, home, { host: "bb" });
+    if ("error" in g) throw new Error(g.error);
+    expect(g.get("user")?.[0]).toBe("plain");
+    expect(existsSync(mark)).toBe(false);
+  });
+
+  test("round 10: Include forms codeoid can't read exactly as ssh does are refused", () => {
+    const ws = join(home, "ws");
+    mkdirSync(ws);
+    writeFileSync(join(ws, "x.conf"), "User x\n");
+    for (const inc of [
+      `Include ~${userInfo().username}/ws/x.conf`,
+      `Include "${ws.slice(0, -1)}"${ws.slice(-1)}/x.conf`,
+      `Include ${ws}/"x".conf`,
+      `Include ${ws}/../ws/x.conf`,
+      `Include ${ws}/./x.conf`,
+      `Include ${ws}/[x].conf`,
+      `Include ${ws}/x .conf`,
+      `Include\t${ws}/x\u000b.conf`,
+    ]) {
+      ssh(inc);
+      expect(scanSshConfig(home).problem, inc).toContain("Include");
+    }
+  });
+
+  test("round 10: a file too big to read whole, and a glob over a name that isn't plain, are refused", () => {
+    const ws = join(home, "ws");
+    mkdirSync(ws);
+    writeFileSync(join(ws, "big.conf"), `${"# pad\n".repeat(200_000)}Match all\n`);
+    ssh(`Include ${join(ws, "big.conf")}`);
+    expect(scanSshConfig(home).problem).toContain("whole");
+    writeFileSync(join(ws, "a\nb.conf"), "User x\n");
+    ssh(`Include ${join(ws, "*.conf")}`);
+    expect(scanSshConfig(home).problem).toContain("pattern");
   });
 
   test("a FIFO the config includes is never read (nothing blocks), and refused", async () => {

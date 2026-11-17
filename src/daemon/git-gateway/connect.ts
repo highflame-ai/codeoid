@@ -354,6 +354,22 @@ export function ownerPushRewrite(url: string): string {
   }
 }
 
+/** A user's home by name, as git's `~user/` (getpwnam); the owner's own when it is them, else `/etc/passwd`'s, else beside theirs. */
+// paths: the system's account file, read
+function userHome(user: string, home: string): string {
+  if (user === userInfo().username) return userInfo().homedir || home;
+  try {
+    const line = readFileSync("/etc/passwd", "utf8")
+      .split("\n")
+      .find((l) => l.split(":")[0] === user);
+    const dir = line?.split(":")[5];
+    if (dir) return dir;
+  } catch {
+    /* none */
+  }
+  return join(dirname(home), user);
+}
+
 let ownerFiles: { at: number; key: string; files: string[] } | null = null;
 
 /**
@@ -392,7 +408,9 @@ export function ownerConfigFiles(): string[] {
       const nl = entry.indexOf("\n");
       const v = nl < 0 ? "" : entry.slice(nl + 1);
       if (!v) continue;
-      const target = v === "~" || v.startsWith("~/") ? join(home, v.slice(1)) : isAbsolute(v) ? v : join(dirname(file), v);
+      // git expands ~ and ~user/ (interpolate_path); never normalized lexically (a `..` after a link is the kernel's).
+      const user = /^~([^/]+)\//.exec(v)?.[1];
+      const target = v === "~" || v.startsWith("~/") ? `${home}${v.slice(1)}` : user ? `${userHome(user, home)}${v.slice(user.length + 1)}` : isAbsolute(v) ? v : `${dirname(file)}/${v}`;
       add(target);
       includes(target, depth + 1);
     }

@@ -1266,7 +1266,9 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
   `~/.ssh/config` for that host (`ssh -G`, which prints the settings and connects nowhere; the system's config is
   left out). Before that, codeoid scans every file the config can read (every `Include`, in any block, in any
   spelling) and refuses a `Match` block anywhere (its `exec` would run), an Include it can't follow, something that
-  isn't a plain file (a FIFO), or a file in what a session may write. From what ssh printed it takes the data:
+  isn't a plain file (a FIFO) or is too big to read whole, or a file in what a session may write. An Include it
+  follows is a plain path: no `~user/`, no quote inside a word, no `.` or `..`, no `[`, nothing but printable
+  ASCII. And `ssh -G` runs with a `false` program as its shell, so no `Match exec` runs even if one were missed. From what ssh printed it takes the data:
   where, as whom, which keys (`IdentitiesOnly`, `IdentityAgent`), known hosts, and each `ProxyJump` host the same
   way. A `ProxyCommand`, `KnownHostsCommand` or `CanonicalizeHostname`, `%` tokens or `${VAR}` in a file name, or
   a key file that leads into what a session may write is refused, with the reason. Every run is the system `ssh`

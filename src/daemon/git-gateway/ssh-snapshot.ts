@@ -52,47 +52,49 @@ export function sshUrlUserPort(url: string): { user?: string; port?: string } {
   return { ...(m?.[1] ? { user: m[1] } : {}), ...(m?.[2] ? { port: m[2] } : {}) };
 }
 
-/** A glob component as a regex (`*`, `?`, `[...]`), or null when codeoid can't tell what it matches. */
-function patternRe(p: string): RegExp | null {
+/** A glob component as a regex (`*` and `?` only: a `[` is refused before this), matching any name ssh's would. */
+function patternRe(p: string): RegExp {
   let out = "";
-  for (let i = 0; i < p.length; i++) {
-    const c = p[i] as string;
-    if (c === "*") out += ".*";
-    else if (c === "?") out += ".";
-    else if (c === "[") {
-      const end = p.indexOf("]", i + 2);
-      if (end < 0) return null;
-      const body = p.slice(i + 1, end);
-      if (/[\\[]/.test(body)) return null;
-      out += `[${body.startsWith("!") ? `^${body.slice(1).replace(/\^/g, "\\^")}` : body.replace(/\^/g, "\\^")}]`;
-      i = end;
-    } else out += c.replace(/[.+^${}()|[\]\\/-]/g, "\\$&");
+  for (const c of p) {
+    if (c === "*") out += "[^]*";
+    else if (c === "?") out += "[^]";
+    else out += c.replace(/[.+^${}()|[\]\\/-]/g, "\\$&");
   }
-  try {
-    return new RegExp(`^${out}$`);
-  } catch {
-    return null;
-  }
+  return new RegExp(`^${out}$`, "s");
 }
 
-/** A glob's matches (dotfiles too: over, never under) and every dir it looks in; null when it can't be told. */
+/**
+ * A glob's matches (dotfiles too: over, never under) and every dir it looks in; null when it can't be told (a name
+ * there that isn't valid UTF-8, or holds a control character: ssh may match it, codeoid can't name it for sure).
+ */
 function glob(pattern: string): { paths: string[]; dirs: string[] } | null {
   let paths = ["/"];
   const dirs: string[] = [];
+  const strict = new TextDecoder("utf-8", { fatal: true });
   for (const part of pattern.split("/").filter(Boolean)) {
-    if (!/[*?[]/.test(part)) {
-      paths = paths.map((at) => join(at, part));
+    if (!/[*?]/.test(part)) {
+      paths = paths.map((at) => `${at === "/" ? "" : at}/${part}`);
       continue;
     }
     const re = patternRe(part);
-    if (!re) return null;
     const next: string[] = [];
     for (const at of paths) {
       dirs.push(at);
+      let names: Buffer[] = [];
       try {
-        for (const n of readdirSync(at)) if (re.test(n)) next.push(join(at, n));
+        names = readdirSync(at, { encoding: "buffer" });
       } catch {
         /* nothing there */
+      }
+      for (const raw of names) {
+        let n: string;
+        try {
+          n = strict.decode(raw);
+        } catch {
+          return null;
+        }
+        if (/[\x00-\x1f\x7f]/.test(n)) return null;
+        if (re.test(n)) next.push(`${at === "/" ? "" : at}/${n}`);
       }
     }
     paths = next;
@@ -127,6 +129,30 @@ function readRegular(file: string): string | null {
   }
 }
 
+/**
+ * An Include line's arguments, when codeoid reads them exactly as ssh does (argv_split: space and tab split; a
+ * quote opens and closes only at a word's edges; `#` at a word's start ends the line), each a plain path:
+ * printable ASCII without `%`, `$`, a backtick, a backslash or `[`, no `~` but `~` or `~/` at its start, no `.` or
+ * `..` component. Else null (refused: what ssh would read can't be told for certain).
+ */
+function includeArgs(rest: string): string[] | null {
+  const args: string[] = [];
+  for (const word of rest.split(/[ \t]+/).filter(Boolean)) {
+    if (word.startsWith("#")) break;
+    let a = word;
+    const q = a[0];
+    if (q === '"' || q === "'") {
+      if (a.length < 2 || a[a.length - 1] !== q) return null;
+      a = a.slice(1, -1);
+    }
+    if (!/^[\x21-\x7e]+$/.test(a) || /["'%$`\\[\]]/.test(a)) return null;
+    if (a.startsWith("~") && a !== "~" && !a.startsWith("~/")) return null;
+    if (a.split("/").some((c) => c === "." || c === "..")) return null;
+    args.push(a);
+  }
+  return args;
+}
+
 /** ssh's maximum Include depth (READCONF_MAX_DEPTH); and a bound on files read. */
 const MAX_DEPTH = 16;
 const MAX_FILES = 256;
@@ -158,10 +184,10 @@ export function scanSshConfig(home: string): { sources: string[]; problem?: stri
     }
     const text = readRegular(file);
     if (text === null) {
-      // Something there that isn't a regular file (a FIFO, a dir): what ssh makes of it can't be told.
+      // Something there that codeoid didn't read (a FIFO, a dir, too big, unreadable): what ssh makes of it can't be told.
       try {
         lstatSync(file);
-        if (!lstatSync(realpathSync(file)).isFile()) problem ??= `${file}, which isn't a plain file`;
+        problem ??= lstatSync(realpathSync(file)).isFile() ? `${file}, which codeoid couldn't read whole` : `${file}, which isn't a plain file`;
       } catch {
         /* missing: judged as named (a session mustn't be able to create it) */
       }
@@ -176,20 +202,16 @@ export function scanSshConfig(home: string): { sources: string[]; problem?: stri
       }
       if (!/^["'\\]*i["'\\]*n["'\\]*c["'\\]*l["'\\]*u["'\\]*d["'\\]*e/.test(bare)) continue;
       const rest = raw.replace(/^[\s"'=\\]*include["'\\]*/i, "").replace(/^[\s=]+/, "");
-      if (/[%$`\\]/.test(rest) || (rest.match(/"/g)?.length ?? 0) % 2 || (rest.match(/'/g)?.length ?? 0) % 2) {
+      const args = includeArgs(rest);
+      if (!args) {
         problem ??= `an Include codeoid can't follow (${JSON.stringify(rest.slice(0, 60))})`;
         continue;
       }
-      const args: string[] = [];
-      for (const m of rest.matchAll(/"([^"]*)"|'([^']*)'|([^\s"']+)/g)) {
-        const a = m[1] ?? m[2] ?? m[3] ?? "";
-        if (m[3]?.startsWith("#")) break;
-        args.push(a);
-      }
       for (const a of args) {
-        const named = a === "~" || a.startsWith("~/") ? join(home, a.slice(1)) : a;
-        const full = isAbsolute(named) ? named : join(home, ".ssh", named);
-        if (/[*?[]/.test(full)) {
+        const named = a === "~" || a.startsWith("~/") ? `${home}${a.slice(1)}` : a;
+        // Never normalized: a `..` after a link is the kernel's to resolve, so none is taken (includeArgs).
+        const full = isAbsolute(named) ? named : `${home}/.ssh/${named}`;
+        if (/[*?]/.test(full)) {
           const g = glob(full);
           if (!g) {
             problem ??= `an Include pattern codeoid can't follow (${JSON.stringify(a.slice(0, 60))})`;
@@ -211,12 +233,17 @@ export function sshConfigSources(home: string): string[] {
   return scanSshConfig(home).sources;
 }
 
+const FALSE_BIN = ["/bin/false", "/usr/bin/false"];
+
 /** `ssh -G` for one destination: OpenSSH's own resolution of the given config, as key → values. */
-// paths: the system ssh (judged by the caller) with -G: prints its settings, connects nowhere; the scan refused any Match first
-function sshG(ssh: string, config: string, home: string, dest: { host: string; user?: string; port?: string }): Promise<Map<string, string[]> | { error: string }> {
+// paths: the system ssh (judged by the caller) with -G: prints its settings, connects nowhere; the scan refused any Match first, and SHELL=false runs none it missed
+export function sshG(ssh: string, config: string, home: string, dest: { host: string; user?: string; port?: string }): Promise<Map<string, string[]> | { error: string }> {
   const args = ["-G", "-F", config, ...(dest.port ? ["-p", dest.port] : []), ...(dest.user ? ["-l", dest.user] : []), "--", dest.host];
   return new Promise((done) => {
-    const p = spawn(ssh, args, { cwd: "/", env: { PATH: "/usr/bin:/bin", HOME: home, LANG: "C" }, stdio: ["ignore", "pipe", "pipe"] });
+    // ssh runs a Match exec as `$SHELL -c <cmd>`: with SHELL a trusted false, none runs, whatever the scan missed.
+    const shell = FALSE_BIN.find((f) => existsSync(f) && !hostPathProblem(f, [], home, { homeAllowed: false }));
+    if (!shell) return done({ error: "no trusted /bin/false or /usr/bin/false to give ssh as its shell" });
+    const p = spawn(ssh, args, { cwd: "/", env: { PATH: "/nonexistent", SHELL: shell, HOME: home, LANG: "C" }, stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     let err = "";
     p.stdout.on("data", (d: Buffer) => {
