@@ -303,6 +303,8 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(remoteUrlProblem("https://x-access-token:ghp_FAKE@github.com/o/r.git")).toContain("password");
     expect(remoteUrlProblem("https://github.com/o/r.git?tok=1")).toContain("query");
     expect(remoteUrlProblem("https://github.com/acme/infrastructure-terraform-prod.git")).toBeNull();
+    // Round 28: a lookalike letter (Cyrillic а) in the path.
+    expect(remoteUrlProblem("https://github.com/acme/\u0430pp.git")).toContain("printable ASCII");
     expect(shownGitUrl("https://github.com/acme/infrastructure-terraform-prod.git")).toBe("https://github.com/acme/infrastructure-terraform-prod.git");
     expect(shownGitUrl("https://u:secret@h/x.git")).not.toContain("secret");
     expect(shownGitUrl("git@h:o/r\u202e.git")).toContain("\\u{202e}");

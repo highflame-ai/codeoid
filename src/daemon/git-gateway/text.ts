@@ -33,6 +33,8 @@ export function remoteUrlProblem(url: string): string | null {
   if (/[\x00-\x20\x7f]/.test(url)) return "it holds spaces or control characters";
   // Shown to the owner as is: nothing invisible or reordering in it.
   if (/[\p{Cf}\p{Cc}\p{Zl}\p{Zp}\p{Co}\p{Cn}\u0085\u00a0]/u.test(url)) return "it holds invisible or reordering characters";
+  // Printable ASCII only: a lookalike letter (Cyrillic а for Latin a) would show the owner one repository's name and reach another's.
+  if (/[^\x21-\x7e]/.test(url)) return "it holds characters other than printable ASCII (a lookalike letter shows one name and reaches another)";
   if (url.startsWith("-")) return "it starts with -";
   const scheme = /^(https|ssh):\/\/([^/]*)/i.exec(url);
   if (scheme) {

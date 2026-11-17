@@ -163,22 +163,27 @@ export class GitGateway {
       const socket = join(dir, "git.sock");
       const live = new Set<Socket>();
       const gone = new Set<AbortController>();
+      // This session's over-cap connections waiting for their refusal: a few per session, so one session's flood
+      // doesn't take the answer away from another's.
+      let refusing = 0;
       const server = this.#listen(socket, (c) => {
         // A few git connections at once per session (each may hold some memory): more is a command flooding it.
         if (live.size >= 8) {
           c.on("error", () => c.destroy());
           // Answered once its header came (closed before it, the launcher would only see a broken pipe); a flood of
           // them isn't held: past a few waiting, the rest are closed at once.
-          if (this.#refusing >= 32) {
+          if (refusing >= 8 || this.#refusing >= 64) {
             c.destroy();
             return;
           }
           this.#refusing++;
+          refusing++;
           let said = false;
           const say = () => {
             if (said) return;
             said = true;
             this.#refusing--;
+            refusing--;
             c.end("error too many git connections at once from this session: let one finish\n");
           };
           c.once("data", say);

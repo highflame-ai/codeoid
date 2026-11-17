@@ -1293,7 +1293,8 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
   delegated token made. A session from before this release is treated as one whose maker isn't known: it gets no
   gateway; start a new one.
 - **No credential in the URL:** a URL with any user info for https (a token as a user name included), a password,
-  a query, a fragment, `=`, a `%`-escape, a `.` or `..` path segment, or more than 300 characters, can't be
+  a query, a fragment, `=`, a `%`-escape, a `.` or `..` path segment, anything but printable ASCII (a lookalike
+  letter), or more than 300 characters, can't be
   connected. Connect with `--token` instead (you're asked for `user:token`, or the token, on the terminal; it is
   never put on a command line). What a card shows is then exactly what git reaches.
 - **Your own URL rewrites** (`url.git@github.com:.insteadOf https://github.com/`, and `pushInsteadOf`) are
