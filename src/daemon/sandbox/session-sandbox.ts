@@ -24,6 +24,7 @@ import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
 import { ownerConfigFiles, ownerPushRewrite, ownerRewrite } from "../git-gateway/connect.js";
 import { buildSandboxSpec, type GitGatewaySpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
+import { normalizeRemote } from "../workstreams/match.js";
 import {
   addedDirProblem,
   addedDirReal,
@@ -1126,7 +1127,9 @@ export class SessionSandbox {
     if (this.#resolvedFor === "codex" && sessionNet !== "on") return undefined;
     const g = this.#gitGateway();
     if (!g) return undefined;
-    const routes = gatewayRoutes(g.urls, workspaceRemoteUrls(workspace), { off: network.mode !== "on", rewrite: ownerRewrite, pushRewrite: ownerPushRewrite });
+    // Where the owner's git, in this workspace, sends each URL (its includes and the repository's own rules count).
+    const repo = gitLayoutOf(workspace) ? workspace : undefined;
+    const routes = gatewayRoutes(g.urls, workspaceRemoteUrls(workspace), { off: network.mode !== "on", rewrite: (u) => ownerRewrite(u, repo), pushRewrite: (u) => ownerPushRewrite(u, repo) });
     return { ...g, urls: [...new Set(routes.flatMap((r) => [r.fetch, r.push].filter((x): x is string => !!x)))], routes };
   }
 
@@ -1538,7 +1541,9 @@ export function gatewayRoutes(connectedUrls: readonly string[], workspaceRemotes
     // the fetch URL instead; a push target that is only their insteadOf (the same repository) as the fetch is.
     const rewritten = testFile(w) ? w : o.rewrite(w);
     const pushTo = testFile(w) ? w : o.pushRewrite(w);
-    const fetch = connected.has(rewritten) ? rewritten : w;
+    // The rewrite connected: that; the same repository by another transport: the connected URL; another repository:
+    // the rewrite (the gateway refuses it or offers to connect it), as the owner's git would reach it.
+    const fetch = connected.has(rewritten) || !sameRepository(rewritten, w) ? rewritten : w;
     const push = pushTo === rewritten ? fetch : pushTo;
     routes.push({ from: w, fetch, push });
   }
@@ -1549,4 +1554,11 @@ export function gatewayRoutes(connectedUrls: readonly string[], workspaceRemotes
     if (r.fetch || r.push) routes.push(r);
   }
   return routes;
+}
+
+/** Whether two remote URLs name one repository (host and path as the workstreams' rules read them: ssh or https). */
+function sameRepository(a: string, b: string): boolean {
+  if (a === b) return true;
+  const na = normalizeRemote(a);
+  return !!na && na === normalizeRemote(b);
 }

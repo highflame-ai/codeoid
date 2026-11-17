@@ -242,3 +242,33 @@ describe("credential helpers", () => {
     expect("error" in r).toBe(true);
   });
 });
+
+describe("round 31: the owner's rewrites as git applies them in the repository", () => {
+  test("a pushInsteadOf in a conditional include, or in the repository's own config, counts; from / it doesn't", async () => {
+    const { ownerPushRewrite, ownerRewrite } = await import("../daemon/git-gateway/connect.js");
+    const repo = join(home, "work", "app");
+    mkdirSync(repo, { recursive: true });
+    spawnSync("git", ["init", "-q", repo]);
+    writeFileSync(join(home, "fork.gitconfig"), '[url "git@github.com:me/"]\n\tpushInsteadOf = https://github.com/acme/\n');
+    writeFileSync(join(home, ".gitconfig"), `[includeIf "gitdir:${join(home, "work")}/"]\n\tpath = ${join(home, "fork.gitconfig")}\n`);
+    process.env.HOME = home;
+    const url = "https://github.com/acme/app.git";
+    expect(ownerPushRewrite(url)).toBe(url);
+    expect(ownerPushRewrite(url, repo)).toBe("git@github.com:me/app.git");
+    expect(ownerRewrite(url, repo)).toBe(url);
+    // The repository's own rule.
+    writeFileSync(join(home, ".gitconfig"), "");
+    spawnSync("git", ["-C", repo, "config", "url.git@gitlab.com:me/.pushInsteadOf", "https://github.com/acme/"]);
+    expect(ownerPushRewrite(url, repo)).toBe("git@gitlab.com:me/app.git");
+  });
+
+  test("an insteadOf to another repository is reached as the owner's git reaches it, not as the connected URL", async () => {
+    const { gatewayRoutes } = await import("../daemon/sandbox/session-sandbox.js");
+    const connected = "https://github.com/acme/app.git";
+    const mirror = (u: string) => (u === connected ? "https://mirror.example/acme/app.git" : u);
+    expect(gatewayRoutes([connected], [], { off: false, rewrite: mirror, pushRewrite: mirror })).toEqual([{ from: connected, fetch: "https://mirror.example/acme/app.git", push: "https://mirror.example/acme/app.git" }]);
+    // The same repository by ssh (not connected): the connected URL stands for it.
+    const toSsh = (u: string) => (u === connected ? "git@github.com:acme/app.git" : u);
+    expect(gatewayRoutes([connected], [], { off: false, rewrite: toSsh, pushRewrite: toSsh })).toEqual([{ from: connected, fetch: connected, push: connected }]);
+  });
+});

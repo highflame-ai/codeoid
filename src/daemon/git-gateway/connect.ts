@@ -321,7 +321,8 @@ export async function probeConnection(
  * config, nothing run), or `url` itself. Sync: a spec is built so.
  */
 // paths: git ls-remote --get-url from /, which only reads config
-export function ownerRewrite(url: string): string {
+export function ownerRewrite(url: string, dir?: string): string {
+  if (dir) return rewriteIn(dir, url, false) ?? url;
   try {
     const r = spawnSync(GIT_BIN, ["-C", "/", "ls-remote", "--get-url", "--", url], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
     const out = r.status === 0 ? r.stdout.trim() : "";
@@ -332,11 +333,42 @@ export function ownerRewrite(url: string): string {
 }
 
 /**
+ * Where the owner's git, working in the repository at `dir`, fetches (or pushes) `url`: git's own answer there, so a
+ * rule in a conditional include (`includeIf "gitdir:…"`) or in the repository's own config counts as it does for
+ * them. Config is read, nothing run (no hook, no fsmonitor); what it says is only a destination, which the gateway's
+ * grant still judges. Null: git couldn't say.
+ */
+// paths: git config read in the session's repository (url.* rules), nothing run
+function rewriteIn(dir: string, url: string, push: boolean): string | null {
+  const run = (args: string[]) => spawnSync(GIT_BIN, ["-C", dir, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args], { cwd: dir, env: { ...ownerHelperEnv(), GIT_CEILING_DIRECTORIES: dirname(dir) }, encoding: "utf8", timeout: 5_000 });
+  try {
+    const f = run(["ls-remote", "--get-url", "--", url]);
+    const fetched = f.status === 0 ? (f.stdout.trim().split("\n")[0] ?? "") : "";
+    const fetchUrl = fetched && !/\s/.test(fetched) ? fetched : url;
+    if (!push) return fetchUrl;
+    // pushInsteadOf, the longest match, as git applies it (its includes and the repository's own config read there).
+    const r = run(["config", "--null", "--get-regexp", "^url\\..*\\.pushinsteadof$"]);
+    let best: { base: string; prefix: string } | null = null;
+    for (const entry of (r.status === 0 ? r.stdout : "").split("\0")) {
+      const nl = entry.indexOf("\n");
+      if (nl < 0) continue;
+      const base = entry.slice("url.".length, nl - ".pushinsteadof".length);
+      const prefix = entry.slice(nl + 1);
+      if (prefix && url.startsWith(prefix) && (!best || prefix.length > best.prefix.length)) best = { base, prefix };
+    }
+    return best ? best.base + url.slice(best.prefix.length) : fetchUrl;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The URL the owner's git pushes `url` to: their `url.*.pushInsteadOf` (longest match), else their fetch rewrite
  * (git applies insteadOf to a push URL no pushInsteadOf matches). Read from `/`, nothing run.
  */
 // paths: git config read from /, which runs nothing
-export function ownerPushRewrite(url: string): string {
+export function ownerPushRewrite(url: string, dir?: string): string {
+  if (dir) return rewriteIn(dir, url, true) ?? url;
   try {
     const r = spawnSync(GIT_BIN, ["-C", "/", "config", "--null", "--get-regexp", "^url\\..*\\.pushinsteadof$"], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
     let best: { base: string; prefix: string } | null = null;

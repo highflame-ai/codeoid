@@ -1297,8 +1297,8 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
   letter), or more than 300 characters, can't be
   connected. Connect with `--token` instead (you're asked for `user:token`, or the token, on the terminal; it is
   never put on a command line). What a card shows is then exactly what git reaches.
-- **Your own URL rewrites** (`url.git@github.com:.insteadOf https://github.com/`, and `pushInsteadOf`) are
-  applied: connecting from a repository offers the URL your git really uses, and a workspace remote written one way
+- **Your own URL rewrites** (`url.git@github.com:.insteadOf https://github.com/`, and `pushInsteadOf`, wherever
+  your git reads them for that repository: a conditional include, the repository's own config) are applied: connecting from a repository offers the URL your git really uses, and a workspace remote written one way
   is sent to the gateway as the URL your rewrite makes of it, for fetches and pushes each. A rewrite of yours keyed
   by exactly the same whole URL still wins over codeoid's (git takes the first of equal length).
 - **Spellings:** `…/app`, `…/app.git` and `…/app/` are the same connection once they reach the gateway, but what
