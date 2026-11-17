@@ -6,7 +6,7 @@
  * that reads it from a 0600 file in the gateway's private dir for that run only: never in an env or on a command line,
  * which other processes of the user's may read).
  */
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -227,7 +227,7 @@ export interface RemoteState {
  * by a bare clone the first time (which takes the remote's object format). Says what it learned of the remote.
  */
 // paths: the daemon's own cache repository, (re)made by a clone into a temp dir renamed into place
-export async function refreshCache(cache: string, up: Upstream, ssh: string | null, timeoutMs: number, signal?: AbortSignal): Promise<RemoteState | { error: string }> {
+export async function refreshCache(cache: string, up: Upstream, ssh: string | null, timeoutMs: number, signal?: AbortSignal, cloneSignal?: AbortSignal): Promise<RemoteState | { error: string }> {
   return withUpstreamEnv(up, ssh, async (base) => {
     // Every cache git on that git dir exactly: never one git finds by walking up (a dotfiles repository above).
     const env = cacheEnv(base, cache);
@@ -237,7 +237,7 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
       const tmp = `${cache}.tmp-${randomBytes(6).toString("hex")}`;
       // The first clone of a large repository can outlast an agent's git (a tool's time limit): it isn't cut short when
       // that git goes, and has a limit of its own, so a later request finds the cache made.
-      const r = await runGit(["clone", "--bare", "--quiet", "--no-tags", "--", up.url, tmp], dirname(cache), { ...base, GIT_CEILING_DIRECTORIES: dirname(cache) }, Math.max(timeoutMs, FIRST_CLONE_MS));
+      const r = await runGit(["clone", "--bare", "--quiet", "--no-tags", "--", up.url, tmp], dirname(cache), { ...base, GIT_CEILING_DIRECTORIES: dirname(cache) }, Math.max(timeoutMs, FIRST_CLONE_MS), cloneSignal);
       if (r.code !== 0) {
         rmSync(tmp, { recursive: true, force: true });
         return { error: gitError(r, "the remote couldn't be fetched") };
@@ -295,8 +295,9 @@ export function objectsNotSent(cache: string, objects: { dir: string; alternates
     const rev = spawn(GIT_BIN, ["rev-list", "--objects", "--no-object-names", ...tips, "--not", "--all"], { cwd: cache, env: all, stdio: ["ignore", "pipe", "ignore"], detached: true });
     const cat = spawn(GIT_BIN, ["cat-file", "--batch-check=%(objectname)"], { cwd: cache, env: sent, stdio: ["pipe", "pipe", "ignore"], detached: true });
     let settled = false;
+    const kids: ChildProcess[] = [rev, cat];
     const kill = () => {
-      for (const p of [rev, cat]) {
+      for (const p of kids) {
         try {
           if (p.pid) process.kill(-p.pid, "SIGKILL");
         } catch {
@@ -319,19 +320,42 @@ export function objectsNotSent(cache: string, objects: { dir: string; alternates
       revCode = code;
     });
     let buf = "";
+    // Objects the push didn't bring: a client may leave out what the remote's refs reach beyond the edge commits'
+    // trees (a reachability bitmap), so each is looked for there before it is refused.
+    const missing = new Set<string>();
     cat.stdout.on("data", (d: Buffer) => {
       buf += d.toString("utf8");
       const nl = buf.lastIndexOf("\n");
       if (nl < 0) return;
       const lines = buf.slice(0, nl).split("\n");
       buf = buf.slice(nl + 1);
-      const missing = lines.find((l) => l.endsWith(" missing"));
-      if (missing) finish(`${missing.split(" ")[0]?.slice(0, 12)} isn't in the push, and isn't on the remote's branches or tags (an object the remote no longer has)`);
+      for (const l of lines) if (l.endsWith(" missing")) missing.add(l.split(" ")[0] ?? "");
+      if (missing.size > 100_000) finish("the push needs more objects than it brought than codeoid checks");
     });
     cat.on("close", (code) => {
       if (settled) return;
       if (code !== 0 || revCode !== 0) return finish("the push's objects couldn't be checked");
-      finish(null);
+      if (missing.size === 0) return finish(null);
+      // Everything the remote's branches and tags reach (the cache's refs, never its unreachable objects).
+      const reach = spawn(GIT_BIN, ["rev-list", "--objects", "--no-object-names", "--use-bitmap-index", "--all"], { cwd: cache, env: cacheEnv(base, cache), stdio: ["ignore", "pipe", "ignore"], detached: true });
+      kids.push(reach);
+      let rb = "";
+      reach.stdout.on("data", (d: Buffer) => {
+        rb += d.toString("utf8");
+        const nl = rb.lastIndexOf("\n");
+        if (nl < 0) return;
+        for (const id of rb.slice(0, nl).split("\n")) missing.delete(id);
+        rb = rb.slice(nl + 1);
+        if (missing.size === 0) finish(null);
+      });
+      reach.on("close", (rc) => {
+        if (settled) return;
+        if (rb) missing.delete(rb.trim());
+        if (rc !== 0) return finish("the push's objects couldn't be checked");
+        const first = [...missing][0];
+        finish(first ? `${first.slice(0, 12)} isn't in the push, and isn't on the remote's branches or tags (an object the remote no longer has)` : null);
+      });
+      reach.on("error", () => finish("the push's objects couldn't be checked"));
     });
     rev.on("error", () => finish("the push's objects couldn't be checked"));
     cat.on("error", () => finish("the push's objects couldn't be checked"));

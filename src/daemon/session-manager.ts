@@ -4853,8 +4853,8 @@ mcpHub: this.#mcpHub,
       for (const u of forms) {
         removed = this.#store.removeGitConnection(auth.sub, u) || removed;
         this.#gitCredentials?.remove(connectionId(auth.sub, u));
-        // Its cache too: nothing of the remote kept, nor reused by a later connect.
-        await this.#gitGatewayInstance()?.forget(connectionId(auth.sub, u));
+        // Its cache too: nothing of the remote kept, nor reused by a later connect (removed in the background).
+        void this.#gitGatewayInstance()?.forget(connectionId(auth.sub, u)).catch(() => {});
       }
       this.#gitConnectionsChanged(auth.sub);
       this.#store.audit(auth.sub, "sandbox.git_disconnected", undefined, `${shownGitUrl(url)} removed=${removed}`);
@@ -8479,6 +8479,8 @@ mcpHub: this.#mcpHub,
           auth: this.#dispatchSenderAuth(task),
           // The conductor's sender identity (depth 1) attributes the worker's prompts; the worker is the owner's own.
           createdByDelegate: false,
+          // Its autonomy is the fleet's (a spawn a delegated token may have approved): its pushes ask the owner.
+          autonomousByOwner: false,
           store: this.#store,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,

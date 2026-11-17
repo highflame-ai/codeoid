@@ -626,6 +626,11 @@ export interface SessionCreateOptions {
   /** Made with a delegated token (a resumed session: as its meta says). Such a session gets none of the owner's git access. */
   createdByDelegate?: boolean;
   /**
+   * Whether an autonomous initial mode is the owner's own choice (a push then needs no card). Default: unless a
+   * delegated token made the session. A dispatch worker's is the fleet's, not the owner's: false.
+   */
+  autonomousByOwner?: boolean;
+  /**
    * Pre-built codeoid_fleet MCP server (conductor sessions only). Built by
    * the SessionManager because its tools close over the manager's tenant-
    * scoped session view; the Session just hands it to the provider.
@@ -1203,6 +1208,8 @@ export class Session {
   readonly createdBy: string;
   /** Made with a delegated token: the owner's git connections aren't this session's to use. */
   readonly createdByDelegate: boolean;
+  /** Whether the autonomous mode in force (if it is) is the owner's own choice (decideGitPush). */
+  #autonomousByOwner = true;
   readonly createdAt: string;
   /**
    * Tenancy stamps captured at session creation (or restored from disk
@@ -1980,6 +1987,7 @@ export class Session {
     }
     this.createdBy = opts.auth.sub;
     this.createdByDelegate = opts.createdByDelegate ?? opts.auth.delegationDepth > 0;
+    this.#autonomousByOwner = opts.initialMode?.mode === "autonomous" ? (opts.autonomousByOwner ?? !this.createdByDelegate) : true;
     // Restored from TranscriptMeta on resume, stamped fresh only for a new
     // session. Both were previously unconditional `now`, which meant every
     // daemon restart re-dated every session: `createdAt` became the restart
@@ -3615,6 +3623,8 @@ export class Session {
     if (this.#mode === mode && this.#turnsRemaining === maxTurns) return;
     this.#autonomousBudgetSpent = false;
     this.#mode = mode;
+    // Autonomous as the owner's own choice (their undelegated token, or the daemon's own) or someone else's.
+    if (mode === "autonomous") this.#autonomousByOwner = !sender || (sender.sub === this.createdBy && sender.delegationDepth === 0);
     this.#turnsRemaining = mode === "autonomous" ? maxTurns : undefined;
     // A fresh autonomous budget is a new attempt's: the spent flag is the old one's.
     if (mode === "autonomous") this.#budgetExhausted = false;
@@ -9352,7 +9362,9 @@ export class Session {
     this.#store.audit(SYSTEM_IDENTITY.sub, "session.git_push_request", this.id, `${what} -> ${shownGitUrl(push.url)}`.slice(0, 2000));
     const problem = this.gitAccessProblem("git-receive-pack");
     if (problem) return { refused: problem };
-    if (this.#mode === "autonomous") return { ok: true };
+    // Autonomous mode lets a push go without a card only when the owner chose it: a delegated token that set it (or
+    // the fleet that started a worker) doesn't decide what the owner's credentials push.
+    if (this.#mode === "autonomous" && this.#autonomousByOwner) return { ok: true };
     let answeredBy: string | undefined;
     const answer = await this.requestUserInput(
       {

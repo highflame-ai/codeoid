@@ -459,6 +459,34 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(upstreamRef("refs/heads/fine")).toBe(sha);
   });
 
+  test("round 13: a push that restores an older file content (its blob the remote has) goes, from a plain clone and from one with a bitmap", async () => {
+    // The remote: f = A, then f = B, then more.
+    const seed = join(root, "seed");
+    writeFileSync(join(seed, "f.txt"), "A\n");
+    plain(seed, "add", ".");
+    plain(seed, "commit", "-q", "-m", "fA");
+    writeFileSync(join(seed, "f.txt"), "B\n");
+    plain(seed, "commit", "-qam", "fB");
+    writeFileSync(join(seed, "g.txt"), "g\n");
+    plain(seed, "add", ".");
+    plain(seed, "commit", "-q", "-m", "g");
+    plain(seed, "push", "-q", "origin", "main");
+    const work = await clone();
+    for (const [branch, bitmap] of [
+      ["revert-plain", false],
+      ["revert-bitmap", true],
+    ] as const) {
+      if (bitmap) plain(work, "repack", "-q", "-adb");
+      await agent(work, "checkout", "-q", "-B", branch, "origin/main");
+      writeFileSync(join(work, "f.txt"), "A\n");
+      await agent(work, "commit", "-qam", `back to A (${branch})`);
+      const sha = plain(work, "rev-parse", "HEAD");
+      const r = await agent(work, "push", "origin", branch);
+      expect([branch, r.code]).toEqual([branch, 0]);
+      expect(upstreamRef(`refs/heads/${branch}`)).toBe(sha);
+    }
+  });
+
   test("round 12: a disconnected remote's cache is removed", async () => {
     await clone();
     const cache = gw.cachePath(`u:${URL}`);

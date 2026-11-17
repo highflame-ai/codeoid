@@ -80,6 +80,36 @@ describe("the git gateway, decided by the session", () => {
     expect(refOf(up, "refs/heads/feature/b")).toBe("");
   });
 
+  it("round 13: autonomous mode a delegated token set doesn't push with the owner's credentials unasked", async () => {
+    const up = upstreamRepo();
+    const m = t.newManager();
+    expect(await m.handle({ type: "sandbox.git_connect", id: "c1", action: "connect", path: t.workdir } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
+    const info = infoOf(await t.create(m, {}));
+    const session = m.findByName(info?.name as string, AUTH);
+    if (!session) throw new Error("no session");
+    // A teammate with the owner's delegated token makes it autonomous.
+    expect(await m.handle({ type: "session.set_mode", id: "sm", sessionId: info?.id as string, mode: "autonomous" } as never, { ...AUTH, delegationDepth: 1 }, CLIENT)).toMatchObject({ type: "response.ok" });
+    await session.ensureSandbox();
+    await session.send("go", AUTH);
+    await until(() => session.toInfo().status === "idle");
+    const asked = t.dialogs(m, info?.name as string);
+    commitOn("feature/d");
+    const pushing = agentGit(["push", "origin", "feature/d"]);
+    // The owner is asked; their no is the answer.
+    await until(() => asked.length > 0);
+    expect(asked[0]?.message).toContain("feature/d");
+    await m.handle({ type: "session.ui_response", id: "u0", sessionId: info?.id as string, requestId: asked[0]?.requestId as string, confirmed: false } as never, AUTH, CLIENT);
+    const r = await pushing;
+    expect(r.code).not.toBe(0);
+    expect(refOf(up, "refs/heads/feature/d")).toBe("");
+    // The owner's own choice of autonomous mode pushes as before.
+    expect(await m.handle({ type: "session.set_mode", id: "sm2", sessionId: info?.id as string, mode: "guarded" } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
+    expect(await m.handle({ type: "session.set_mode", id: "sm3", sessionId: info?.id as string, mode: "autonomous" } as never, AUTH, CLIENT)).toMatchObject({ type: "response.ok" });
+    commitOn("feature/e");
+    const own = await agentGit(["push", "origin", "feature/e"]);
+    expect([own.code, own.out]).toEqual([0, expect.stringContaining("codeoid pushed feature/e")]);
+  });
+
   it("guarded: an unconnected remote is offered to the owner; each push is asked; a no is a refusal the agent's git reads", async () => {
     const up = upstreamRepo();
     const m = t.newManager();

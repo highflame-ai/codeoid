@@ -95,6 +95,9 @@ export class GitGateway {
   readonly #controlPath: string;
   readonly #live = new Set<Socket>();
   readonly #gone = new Set<AbortController>();
+  /** Per cache: what stops its first clone (the gateway closing, the connection removed); and its generation. */
+  readonly #cloneStops = new Map<string, AbortController>();
+  readonly #generations = new Map<string, number>();
   #closed = false;
 
   constructor(o: GatewayOptions) {
@@ -114,6 +117,8 @@ export class GitGateway {
     for (const f of readdirSync(join(this.#base, "run"))) if (f.endsWith(".cred")) rmSync(join(this.#base, "run", f), { force: true });
     this.#controlPath = join(this.#base, "control", "hook.sock");
     this.#control = this.#listen(this.#controlPath, (c) => this.#onHook(c));
+    // A first clone a stopped daemon left half made: none runs now.
+    sweepTempClones(join(this.#base, "cache"));
   }
 
   /** The gateway's own dir (a sandbox denies its sockets by rule where it can: Seatbelt). */
@@ -159,6 +164,7 @@ export class GitGateway {
     if (this.#closed) return;
     this.#closed = true;
     for (const g of this.#gone) g.abort();
+    for (const s of this.#cloneStops.values()) s.abort();
     for (const id of [...this.#sessions.keys()]) this.closeSession(id);
     this.#control.close();
     for (const c of this.#live) c.destroy();
@@ -246,11 +252,22 @@ export class GitGateway {
     try {
       // The lock is the refresh's alone: serving (and an owner's card) doesn't hold up other sessions' requests.
       const since = Date.now();
+      const generation = this.#generations.get(grant.cacheKey) ?? 0;
+      const disconnected = () => (this.#generations.get(grant.cacheKey) ?? 0) !== generation;
       const fresh = await this.#locked(grant.cacheKey, async () => {
+        // Its agent gone while it waited (no clone started for nobody), or the connection removed meanwhile.
+        if (gone.signal.aborted) return { error: "the agent's git was gone" };
+        if (disconnected()) return { error: `${shownGitUrl(url)} was disconnected` };
         sweepQuarantines(cache);
-        return refreshCache(cache, upstream, grant.ssh, this.#upstreamTimeoutMs, gone.signal);
+        let stop = this.#cloneStops.get(grant.cacheKey);
+        if (!stop || stop.signal.aborted) {
+          stop = new AbortController();
+          this.#cloneStops.set(grant.cacheKey, stop);
+        }
+        return refreshCache(cache, upstream, grant.ssh, this.#upstreamTimeoutMs, gone.signal, stop.signal);
       });
       if (gone.signal.aborted) return;
+      if (disconnected()) return fail(`${shownGitUrl(url)} was disconnected`);
       if (!("error" in fresh) && fresh.defaultKnown) this.#host.remoteHeads?.(sessionId, url, fresh.heads, since);
       if ("error" in fresh) {
         this.#host.report(sessionId, { kind: service === "git-receive-pack" ? "push" : "fetch", url, ok: false, detail: fresh.error });
@@ -284,6 +301,10 @@ export class GitGateway {
       ["receive.advertisePushOptions", "false"],
       ["receive.advertiseAtomic", "true"],
       ["receive.autogc", "false"],
+      // The client's pack is kept whole in the quarantine (never unpacked loose, which skips objects the cache already
+      // holds): what the push brought is what objectsNotSent sees.
+      ["receive.unpackLimit", "1"],
+      ["transfer.unpackLimit", "1"],
       ["uploadpack.allowAnySHA1InWant", "false"],
       ["uploadpack.allowFilter", "true"],
       ["core.logAllRefUpdates", "false"],
@@ -361,8 +382,13 @@ export class GitGateway {
 
   /** Remove a connection's cache (it was disconnected): nothing the remote had is kept, nor reused by a reconnect. */
   // paths: the daemon's own cache repository for that connection, removed under its lock
-  async forget(cacheKey: string): Promise<void> {
-    await this.#locked(cacheKey, async () => {
+  forget(cacheKey: string): Promise<void> {
+    // Requests granted before this see their generation gone; a first clone running for it is stopped; the removal
+    // waits its turn on the lock without holding up the caller (a disconnect answers at once).
+    this.#generations.set(cacheKey, (this.#generations.get(cacheKey) ?? 0) + 1);
+    this.#cloneStops.get(cacheKey)?.abort();
+    this.#cloneStops.delete(cacheKey);
+    return this.#locked(cacheKey, async () => {
       rmSync(this.cachePath(cacheKey), { recursive: true, force: true });
     });
   }
@@ -446,6 +472,18 @@ export class GitGateway {
     this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: true, detail: `pushed to ${shownGitUrl(t.url)}`, updates });
     verdict(true);
   }
+}
+
+/** Remove the temp dirs of first clones that never finished (a daemon stopped mid-clone). */
+// paths: the daemon's own cache dir: its `*.tmp-*` entries, removed
+function sweepTempClones(dir: string): void {
+  let names: string[] = [];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const n of names) if (/\.git\.tmp-[0-9a-f]+$/.test(n)) rmSync(join(dir, n), { recursive: true, force: true });
 }
 
 /** Reads receive-pack's command pkt-lines as they stream by (to the first flush), and says whether they may go on. */

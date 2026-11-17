@@ -1313,7 +1313,12 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
 - **The daemon's copy:** each connected remote is mirrored once in codeoid's own dir, refreshed on every fetch or
   push. The first copy of a large repository can take longer than an agent's command may run: it carries on (up to
   an hour) after that command is stopped, so a later fetch finds it. A push may only name objects it sends or that
-  the remote's branches and tags still reach: one the remote has since deleted is never published again.
+  the remote's branches and tags still reach: one the remote has since deleted is never published again. The copy
+  keeps what the remote deleted until you disconnect (it is never served, but an agent that already knows a deleted
+  commit's id could learn that the copy still has it), so after purging a secret from a remote, disconnect and
+  connect it again.
+- **Autonomous mode is yours to give:** a push needs no card only when you set the session autonomous (or made it
+  so) with your own token. Set by a delegated token, or a worker the fleet started, each push asks you.
 - **Workstreams:** under workstream isolation, a remote that another workstream's rules claim is never pushed from
   a session homed elsewhere. It is fetched only as a reference whose share allows reads without asking.
 - **In guarded mode,** an agent that reaches a remote you haven't connected raises a card offering to connect it. In
