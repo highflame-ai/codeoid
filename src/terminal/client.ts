@@ -1240,7 +1240,7 @@ export class TerminalClient {
   async approveSession(
     sessionIdOrName: string,
     approved: boolean,
-    opts: { pick?: number; approvalId?: string; yes?: boolean } = {},
+    opts: { pick?: number; approvalId?: string; yes?: boolean; save?: "session" | "repository" } = {},
   ): Promise<void> {
     // Every way this can fail to answer exits non-zero — scripts gate on it.
     const fail = (...lines: string[]) => {
@@ -1333,6 +1333,8 @@ export class TerminalClient {
     // The workstream it acts in, and what approving confirms (workstreams §10), as the card says.
     if (pending.targetWorkstream?.workstream) console.log(`⌂ workstream ${oneLine(pending.targetWorkstream.workstream)}`);
     if (pending.targetWorkstream?.warning) console.log(`⚠ ${oneLine(pending.targetWorkstream.warning)}`);
+    // What --save would keep (docs/secrets-and-memory-design.md §4.1).
+    if (pending.ruleOffer) console.log(`⟲ --save session|repository keeps ${oneLine(pending.ruleOffer.rules.join(", "))}`);
     const shown = plainText(pending.input === undefined ? "" : JSON.stringify(pending.input, null, 2) ?? "");
     const cut = shown.length > APPROVE_SHOW_MAX;
     console.log(cut ? shown.slice(0, APPROVE_SHOW_MAX) : shown);
@@ -1355,6 +1357,7 @@ export class TerminalClient {
       sessionId,
       approvalId: pending.approvalId,
       approved,
+      ...(opts.save ? { save: opts.save, rules: pending.ruleOffer?.rules ?? [] } : {}),
     });
 
     if (resp.type !== "response.ok") {
@@ -1367,7 +1370,16 @@ export class TerminalClient {
       fail("That tool call was already answered or withdrawn — nothing was decided.");
       return;
     }
-    console.log(approved ? "Approved." : "Denied.");
+    const saved = (resp.data as { savedRules?: string[] } | undefined)?.savedRules;
+    console.log(
+      approved
+        ? saved?.length
+          ? `Approved, and saved ${saved.join(", ")} for this ${opts.save}.`
+          : saved
+            ? "Approved; a saved rule covers it already, so nothing more was saved."
+            : "Approved."
+        : "Denied.",
+    );
   }
 
   /**

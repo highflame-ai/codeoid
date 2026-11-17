@@ -474,6 +474,10 @@ describe("DaemonMessage routing", () => {
           return `secrets:${msg.secrets.length}`;
         case "secret.reveal.result":
           return `secret:${msg.kind}`;
+        case "approval_rules.list.result":
+          return `approval_rules:${msg.rules.length}`;
+        case "approval_rules.add.result":
+          return `approval_rule:${msg.rule.rule}`;
         case "session.turns.result":
           return `turns:${msg.turns.length}`;
         case "session.approvals.result":

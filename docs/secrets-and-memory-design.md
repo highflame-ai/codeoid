@@ -330,6 +330,139 @@ The rules that keep it safe:
 Claude's own `permissions.allow` rules keep working on Claude as today. Codeoid's rules work on every
 backend.
 
+### 4.1 S3 in detail
+
+**A rule** has a tool, a pattern, an effect (allow or deny), a scope and an owner:
+
+| Form | Matches |
+| --- | --- |
+| `Bash(npm test)` | exactly `npm test` |
+| `Bash(npm test:*)` | `npm test`, and `npm test` followed by any words |
+| `mcp__linear__list_issues` | that MCP tool |
+| `WebFetch(domain:docs.rs)` | allow: an http(s) fetch of exactly that host on its default port; deny: the host and its subdomains |
+
+A rule belongs to the user who saved it, in their tenant, and applies only to that user's sessions.
+
+- Allow rules run only in sessions a person made with their own token. A session a delegated or automation
+  token made gets none, and neither does a dispatched worker, which the conductor's identity makes.
+- Those sessions' cards offer no save.
+- This is kept in the meta (`TranscriptMeta.madeByAgent`, written true or false), since a resumed session's
+  auth doesn't carry it. A meta from before it counts as a person's, unless its owner is the conductor's identity.
+- Deny rules apply to every session made with the owner's identity.
+
+The scope is one of:
+
+- `session`: that session, until `approvals.sessionGrantHours` (8) have passed, or the session is destroyed.
+- `repository`: every session of that user in the repository, its worktrees included. The key is the session's
+  `workspaceId`, the same one memory uses: a hash of git's common dir, or of the folder outside a repository.
+- `workstream`: every session homed in that workstream.
+- `everywhere`.
+
+**A shell line runs on allow rules** only in guarded mode, and only when all of these hold:
+
+- The line is fully understood (no problems, not unreadable).
+- It has no loop, `case`, function, `declare`, `[[ … ]]` or `(( … ))`.
+- It has no variable assignment (`X=1 npm test` sets the program's environment) and no arithmetic.
+- Its level is low or medium, and it names no credential file.
+- The backend said where its shell is (a `null` shell cwd means it may have moved).
+- Every simple command is covered, by being one of these:
+  - a plain read, as low's allow-list judges one command (`tail -50` after `npm test 2>&1 |`, a read in `$(…)`);
+  - a `cd` / `pushd` / `popd` to a literal directory inside the workspace;
+  - a match for an allow rule, run plainly:
+    - no wrapper, script or input it runs for others, and nothing fed on its input (a pipe, here-document, `<`);
+    - only reading redirects;
+    - in the workspace, links followed;
+    - every word known before it runs (no variable, substitution, glob or brace expansion);
+    - every path its words name inside the workspace, links followed: an option's value (`-C..`, `--x=y`), each
+      part of `a=b,c`, an `@file`. A URL or a `file:`, `data:` or `npm:` specifier counts as outside;
+    - no option that makes a build or test tool run code it is handed, or read instructions from elsewhere
+      (`CODE_OPTIONS`: `make --eval`, `VAR=value`, `go -exec/-toolexec` with one or two dashes, `cargo --config`,
+      `npm --node-options/--script-shell/--prefix`, `docker --output/--network/--allow`, …). A long option is
+      also refused shortened, where the tool accepts that (make, npm, pnpm, yarn). A `-f`/`-C` to a file or folder
+      inside the workspace is fine: the outside-path check covers the rest;
+    - no word naming something to fetch (a URL, `npm:`/`jsr:`/`file:`, `github.com/…`, `git@host:…`);
+    - every word that names something existing where it runs (a bare `out`), and every path read with `<`,
+      judged as a path; `..` read both as text and as the kernel reads it;
+    - the rule's words literal and equal to its own (an exact rule also needs the same number of words).
+- A `cd` is followed only when it is certain: one in a subshell, `$(…)` or behind `&&`/`||`, or to a folder
+  that doesn't exist, leaves every later command in no known place.
+- A command inside `$(…)` is a simple command of its own, so it must be covered too.
+- On Codex, which hands commands over as `bash -lc '<script>'`, the script is what allow rules read; deny rules
+  read both.
+
+**What can't be an allow rule:**
+
+- A shell, `eval`, a wrapper or privilege program.
+- A builtin that changes what later words run or prints the environment (`hash`, `enable`, `shopt`, `set`,
+  `export`, `printenv`).
+- A wildcard right after the program (`Bash(git:*)`).
+- An interpreter or runner (including versioned ones such as `python3.12`) with no named script or subcommand.
+- A runner's `run`/`exec`/`dlx`/`x` with nothing named after it (`Bash(bun run:*)`).
+- A local or IP host (`localhost`, a single-label name, `127.0.0.1`).
+
+No rule word may hold a space, quote, shell character, control or invisible character. **Deny rules may name any
+program.** A stored allow rule that the rules have since come to refuse is dropped when read; a deny rule never
+is.
+
+**Deny rules** match a command's program by name, ignoring case, however it is run (`sudo /bin/npm`). They also
+match it named after a runner, a wrapper or a runner's `run`/`exec` (`npx npm …`, `uv run git push`). The rule's
+other words must appear in order after it, with anything between or after: an exact deny rule matches as a
+prefix one does.
+
+- A line that can't be read in full (a script piped to a shell, problems, too long to read) is refused when its
+  text names the rule's words in order.
+- A fetch whose host can't be read is refused while any fetch deny rule exists.
+- Deny rules are a best effort over what the line shows (an alias or a variable program escapes them). The OS
+  sandbox is the boundary.
+- They are checked at the gate in every mode, and in Claude's PreToolUse hook before the CLI's own allow rules
+  (`ProviderSessionInit.approvalRuleRefusal`).
+- Calls a backend runs without asking can't be refused: Codex in autonomous mode and its own safe commands in
+  guarded mode, Qwen's read-only commands.
+- A fetch deny rule covers a tool named `WebFetch`. A sandboxed `curl` to the host is the sandbox network's to
+  stop.
+- When the saved rules can't be read, every command, fetch and MCP call is refused (fail closed).
+
+**The card offers** "Allow once", "Allow for this session" and "Allow in this repository":
+
+- The two save buttons appear only in guarded mode, on a call a rule could run, in a session a person made.
+- The card names the rules a save would add, one per simple command not yet covered:
+  - `program verb:*` for building and checking (`test`, `build`, `lint`, `check`, `typecheck`, `fmt`, `format`,
+    `clippy`, `vet`, `bench`, `compile`);
+  - `runner run verb:*` for such a package script (`npm run lint:*`);
+  - otherwise the exact command, so approving a read never saves a rule that writes;
+  - nothing when more than 20 rules would be offered.
+- The daemon works the rules out again from the call's own input when the answer arrives.
+- The client must send back the rules its card showed (`session.approve` `rules`). A save that would now keep a
+  rule the card didn't show is refused. Fewer than it showed (another save covers part of it now) stands.
+- Saving needs the session owner's own, undelegated token. Any other approver's save is refused and the card stays
+  open; a delegated approver can still allow once.
+- A call that a rule saved since already covers saves nothing and is approved.
+
+**Settings → Approvals and `codeoid approvals ls | add | rm`** list a user's rules:
+
+- Each row shows its scope, when it was last used and how many times.
+- The user adds rules there for a repository, a workstream or everywhere (the CLI also adds them for a session),
+  and deny rules too.
+- The user removes them there.
+- Adding needs `settings:write` and an undelegated token. Listing and removing cover only the user's own rules.
+
+**Where rules apply:** in the session's gate, on every backend. They apply after every refusal (credential paths,
+the workstream fence, pinned paths, held writes, autonomous refusals).
+
+- Allow rules never run a call that always asks: high, not understood, a credential search, an unsandboxed
+  request, a held or Claude-settings write. Deny rules do refuse those.
+- Neither touches a fleet dispatch, a question, an unresolved path or a directory request.
+- **Interactive mode** ignores allow rules. **Autonomous mode** doesn't need them.
+- **MCP allow rules** hold only in a session whose MCP servers codeoid manages, and while no project file declares
+  a server (#395). They don't run Codex's MCP calls, whose tool codeoid reads from Codex's message.
+
+**Audit:**
+
+- `approval_rule.add` (only for a new rule) and `approval_rule.remove` record changes to the rules.
+- `approval_rule.save_refused` records a refused save.
+- `session.rule_allow rule=<id> scope=<kind> tool=…` records each call a rule ran.
+- `session.rule_deny` records each call a rule refused, with `at=hook` when Claude's hook refused it.
+
 ## 5. S4 — atuin as a source
 
 Atuin already captures the user's own shell history, command output, and every coding agent's

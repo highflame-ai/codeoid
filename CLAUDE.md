@@ -259,6 +259,8 @@ codeoid mcp signin <server> --credential <id>        # a named OAuth slot: a sec
 codeoid new <n> <d> --ref <workstream>[:<dir>]       # another workstream it may read (its folders read-only, its memory), by that one's share policy
 codeoid workstream ref add|rm <session> <workstream>[:<dir>] | move <session> <workstream>  # references and moves (§5.3, §7)
 codeoid secret ls | reveal <ws>:<fp> | forget <ws>:<fp> | promote <ws>:<fp> --as <id> | scrub [--dry-run]  # kept secrets; scrub older data (docs/secrets-and-memory-design.md)
+codeoid approvals ls | add <rule> (--session s | --repository d | --workstream w | --everywhere) [--deny] | rm <id>  # saved approval rules (docs/approvals.md "Saved rules")
+codeoid approve <n> --save session|repository  # approve, and keep the card's rule
 ```
 
 `/mcp/control` (off by default, `mcpControl.*`) lets external agents drive
@@ -590,6 +592,22 @@ mark), live deltas (`StreamScrubber`), the canonical history
 packs, and MCP results in the hub (`setResultScrub`, `secrets.beforeModel`).
 Detected values are dropped unless the workstream says `captureSecrets: "vault"`
 (`CapturedSecretVault`, `captured_secrets`); `secret.*` is owner-only and audited.
+
+Saved approval rules (`src/daemon/approval-rules/`, docs/approvals.md "Saved rules",
+docs/secrets-and-memory-design.md §4.1): `rules.ts` is pure (parse, match, propose;
+`commandCoverage` in shell-risk.ts says per simple command whether it is a plain read,
+a `cd` into the workspace, where it runs and whether its redirects only read);
+`ApprovalRuleService` keeps an owner's rules (`approval_rules`, per tenant and
+owner; scope session / repository = `workspaceId` / workstream / everywhere).
+`Session#ruleVerdict` runs in the gate after every refusal: deny refuses in every
+mode (`#refuseByRule`; on Claude also in the PreToolUse hook, `approvalRuleRefusal`,
+before the CLI's own allow rules), allow is one more disjunct of `autoApprove` in
+guarded mode only, for a low/medium line with no credential path and a known shell
+cwd. Cards propose `verb:*` for build/test verbs only, else the exact command;
+deny rules match words in order past options and are a best effort. The card's `ruleOffer`
+(`#ruleOffer`), and `session.approve` `save` → `Session.saveApprovalRules`
+(owner's own token, rules worked out again from the gated input) before the
+approval settles; `approval_rules.*` in `SessionManager.#approvalRulesHandle`.
 
 Routines (`src/daemon/routines/`, docs/routines.md) run sessions on a schedule
 or an API call. `RoutineService` owns the scheduler and runs; it reaches

@@ -45,7 +45,7 @@ import {
   type DispatchPreview as DispatchPreviewModel,
 } from "../../lib/dispatch-preview";
 import { sessionList } from "../../state/sessions";
-import type { CollaborationCost, SessionMessage, ToolRisk } from "../../protocol/types";
+import type { ApprovalRuleOffer, ApprovalSaveScope, CollaborationCost, SessionMessage, ToolRisk } from "../../protocol/types";
 import { formatCollaborationCost, formatToolRisk } from "../../lib/format";
 import { approvalSandboxLine, approvalSandboxWarns, DOCKER_ACCESS_WHY } from "@highflame/codeoid-core";
 
@@ -144,6 +144,7 @@ const ApprovalBar: Component = () => {
       sandboxed: s.sandboxed,
       sandboxNote: s.sandboxNote,
       sandboxDocker: s.sandboxDocker,
+      ruleOffer: s.ruleOffer,
     };
   });
 
@@ -169,11 +170,13 @@ const ApprovalBar: Component = () => {
     approvalId: string,
     approved: boolean,
     updatedInput?: Record<string, unknown>,
+    save?: ApprovalSaveScope,
+    rules?: string[],
   ): void => {
     if (busy()) return;
     setError(null);
     setBusy(true);
-    approve(sessionId, approvalId, approved, updatedInput)
+    approve(sessionId, approvalId, approved, updatedInput, save, rules)
       // Success keeps the bar disabled: it dismisses when the daemon's
       // tool-state delta lands, and re-enabling before that would let a
       // second (now stale) approve fire for the same approvalId.
@@ -208,11 +211,11 @@ const ApprovalBar: Component = () => {
         const isPlanMode = () =>
           snap().toolName === "ExitPlanMode" || snap().toolName === "exit_plan_mode";
         const isAsk = () => isAskUserQuestion(snap().toolName);
-        const safeApprove = (approved: boolean, updatedInput?: Record<string, unknown>) => {
+        const safeApprove = (approved: boolean, updatedInput?: Record<string, unknown>, save?: ApprovalSaveScope, rules?: string[]) => {
           const cur = snapshot();
           if (!cur || cur.approvalId !== snap().approvalId) return;
           if (cur.sessionId !== snap().sessionId) return;
-          dispatch(snap().sessionId, snap().approvalId, approved, updatedInput);
+          dispatch(snap().sessionId, snap().approvalId, approved, updatedInput, save, rules);
         };
         return (
           <>
@@ -238,6 +241,8 @@ const ApprovalBar: Component = () => {
                 isPlanMode={isPlanMode()}
                 busy={busy()}
                 onApprove={() => safeApprove(true)}
+                ruleOffer={snap().ruleOffer}
+                onSave={(scope) => safeApprove(true, undefined, scope, snap().ruleOffer?.rules)}
                 onRefine={() => {
                   safeApprove(false);
                   focusPromptWithHint(
@@ -335,6 +340,9 @@ const BinaryBar: Component<{
   dispatch?: DispatchPreviewModel | null;
   isPlanMode: boolean;
   busy: boolean;
+  /** The rules approving could save, and where (docs/secrets-and-memory-design.md §4.1). */
+  ruleOffer?: ApprovalRuleOffer;
+  onSave?: (scope: ApprovalSaveScope) => void;
   onApprove: () => void;
   onRefine: () => void;
   onDeny: () => void;
@@ -374,6 +382,9 @@ const BinaryBar: Component<{
         </Show>
         <RiskLine risk={props.risk} />
         <SandboxLine sandboxed={props.sandboxed} sandboxNote={props.sandboxNote} sandboxDocker={props.sandboxDocker} />
+        <Show when={props.ruleOffer}>
+          {(offer) => <RuleOfferLine offer={offer()} busy={props.busy} onSave={(scope) => props.onSave?.(scope)} />}
+        </Show>
         <Show when={props.collaborationCost}>
           {(c) => (
             <div class="mt-1 truncate font-mono text-[11px] text-warn" title="Rolled up across this collaboration's orchestrator and its live role-children">
@@ -410,6 +421,33 @@ const BinaryBar: Component<{
         {props.isPlanMode ? "cancel" : "deny"}
       </button>
     </div>
+  </div>
+);
+
+/**
+ * Approve and keep the answer: the rules it would save, and a button per
+ * scope (docs/secrets-and-memory-design.md §4.1). Only the session's owner
+ * can save; anyone else gets the daemon's refusal inline and the card stays.
+ */
+export const RuleOfferLine: Component<{ offer: ApprovalRuleOffer; busy: boolean; onSave: (scope: ApprovalSaveScope) => void }> = (props) => (
+  <div class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-fg-muted" data-testid="approval-rule-offer">
+    <span class="min-w-0 font-mono [overflow-wrap:anywhere]" title="Approving with one of these saves the rule: the next matching call runs without asking">
+      ⟲ {props.offer.rules.join(", ")}
+    </span>
+    <For each={props.offer.scopes}>
+      {(scope) => (
+        <button
+          type="button"
+          disabled={props.busy}
+          class="rounded border border-success/60 bg-bg px-2 py-0.5 font-semibold text-success transition hover:bg-success/10 disabled:cursor-not-allowed disabled:opacity-50"
+          onClick={() => props.onSave(scope)}
+          title={scope === "session" ? "Approve, and allow this for this session (it ends after a few hours)" : `Approve, and allow this in ${props.offer.repository ?? "this repository"}`}
+          data-save-scope={scope}
+        >
+          {scope === "session" ? "allow for this session" : "allow in this repository"}
+        </button>
+      )}
+    </For>
   </div>
 );
 
@@ -618,6 +656,9 @@ export function approve(
   approvalId: string,
   approved: boolean,
   updatedInput?: Record<string, unknown>,
+  save?: ApprovalSaveScope,
+  /** With save: the rules the card showed (the daemon refuses a save that would keep others). */
+  rules?: string[],
 ): Promise<unknown> {
   return request({
     type: "session.approve",
@@ -626,6 +667,7 @@ export function approve(
     approvalId,
     approved,
     ...(updatedInput ? { updatedInput } : {}),
+    ...(save ? { save, ...(rules ? { rules } : {}) } : {}),
   });
 }
 

@@ -16,6 +16,7 @@
  * arguments codex reports, and declined when that is ambiguous (#368).
  */
 
+import type { ApprovalRuleOffer } from "./approval-rules.js";
 import type { ToolRisk } from "./types.js";
 
 // ── Messages (client → daemon) ────────────────────────────────────────────────
@@ -42,6 +43,8 @@ export interface PendingToolApproval {
   sandboxNote?: string;
   /** The sandbox lets commands reach the container runtime (Docker access). */
   sandboxDocker?: boolean;
+  /** The rules an answer could save, and where (as on the card). */
+  ruleOffer?: ApprovalRuleOffer;
   /** The tool call's message: its later state updates (answered, cancelled) reference it. */
   messageId?: string;
   /** A send-class fleet call's workstream, and what approving it confirms (workstreams §10; as on the card). */

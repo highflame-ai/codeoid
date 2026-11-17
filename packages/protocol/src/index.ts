@@ -7,6 +7,7 @@ export * from "./worktree-trust.js";
 export * from "./workstreams.js";
 export * from "./turns.js";
 export * from "./approvals.js";
+export * from "./approval-rules.js";
 export * from "./compare.js";
 export * from "./claude-accounts.js";
 export * from "./accounts.js";

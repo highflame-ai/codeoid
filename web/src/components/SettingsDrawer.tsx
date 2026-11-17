@@ -45,6 +45,7 @@ import { EndpointsPanel } from "./EndpointsPanel";
 import { endpointsState, fetchEndpoints } from "../state/endpoints";
 import { WorkstreamsPanel } from "./WorkstreamsPanel";
 import { CredentialsPanel } from "./CredentialsPanel";
+import { ApprovalRulesPanel } from "./ApprovalRulesPanel";
 
 /**
  * A backend tab whose id names a backend whose OWN (daemon-wide) login codeoid
@@ -72,6 +73,7 @@ const SYNTHETIC_TABS = [
   { id: "accounts", icon: "⚿", title: "Accounts" },
   { id: "workstreams", icon: "◈", title: "Workstreams" },
   { id: "credentials", icon: "⚷", title: "Credentials" },
+  { id: "approvals", icon: "✓", title: "Approvals" },
   { id: "endpoints", icon: "⇄", title: "Model servers" },
 ] as const;
 const isSyntheticTab = (id: string) => SYNTHETIC_TABS.some((t) => t.id === id);
@@ -257,6 +259,9 @@ const SettingsDrawer: Component = () => {
               </Show>
               <Show when={activeTab() === "credentials"}>
                 <CredentialsPanel />
+              </Show>
+              <Show when={activeTab() === "approvals"}>
+                <ApprovalRulesPanel />
               </Show>
               <Show when={activeTab() === "endpoints"}>
                 <BuiltinServers tabs={(manifest()?.tabs ?? []).filter((t) => BUILTIN_SERVER_TABS.includes(t.id))} />
