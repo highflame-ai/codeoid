@@ -132,7 +132,7 @@ function readRegular(file: string): string | null {
 /**
  * An Include line's arguments, when codeoid reads them exactly as ssh does (argv_split: space and tab split; a
  * quote opens and closes only at a word's edges; `#` at a word's start ends the line), each a plain path:
- * printable ASCII without `%`, `$`, a backtick, a backslash or `[`, no `~` but `~` or `~/` at its start, no `.` or
+ * printable ASCII without `%`, `$`, a backtick, a backslash, `[` or `=`, no `~` but `~` or `~/` at its start, no `.` or
  * `..` component. Else null (refused: what ssh would read can't be told for certain).
  */
 function includeArgs(rest: string): string[] | null {
@@ -145,7 +145,7 @@ function includeArgs(rest: string): string[] | null {
       if (a.length < 2 || a[a.length - 1] !== q) return null;
       a = a.slice(1, -1);
     }
-    if (!/^[\x21-\x7e]+$/.test(a) || /["'%$`\\[\]]/.test(a)) return null;
+    if (!/^[\x21-\x7e]+$/.test(a) || /["'%$`\\[\]=]/.test(a)) return null;
     if (a.startsWith("~") && a !== "~" && !a.startsWith("~/")) return null;
     if (a.split("/").some((c) => c === "." || c === "..")) return null;
     args.push(a);
@@ -201,7 +201,8 @@ export function scanSshConfig(home: string): { sources: string[]; problem?: stri
         continue;
       }
       if (!/^["'\\]*i["'\\]*n["'\\]*c["'\\]*l["'\\]*u["'\\]*d["'\\]*e/.test(bare)) continue;
-      const rest = raw.replace(/^[\s"'=\\]*include["'\\]*/i, "").replace(/^[\s=]+/, "");
+      // As strdelim: whitespace, at most one `=`, whitespace; a further `=` is an argument's (refused in includeArgs).
+      const rest = raw.replace(/^[\s"'=\\]*include["'\\]*/i, "").replace(/^[ \t]*=?[ \t]*/, "");
       const args = includeArgs(rest);
       if (!args) {
         problem ??= `an Include codeoid can't follow (${JSON.stringify(rest.slice(0, 60))})`;

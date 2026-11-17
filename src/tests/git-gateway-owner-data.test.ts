@@ -115,6 +115,9 @@ describe("ssh snapshot", () => {
       `Include ${ws}/[x].conf`,
       `Include ${ws}/x .conf`,
       `Include\t${ws}/x\u000b.conf`,
+      // Round 11: ssh skips one `=` (strdelim); a second is the argument's.
+      `Include ==${ws}/x.conf`,
+      `Include = =${ws}/x.conf`,
     ]) {
       ssh(inc);
       expect(scanSshConfig(home).problem, inc).toContain("Include");
