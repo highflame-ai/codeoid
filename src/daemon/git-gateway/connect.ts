@@ -8,7 +8,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, constants, existsSync, fstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { physicalPath, within } from "../physical-path.js";
@@ -359,8 +359,11 @@ const hungRepos = new Map<string, number>();
  * up only this read, never the daemon), bounded at 5 s; one that didn't answer isn't read again for 10 minutes.
  */
 // paths: git config read in the session's repository (url.* rules), nothing run
-export function warmRewrites(dir: string | undefined, fresh = false, files: readonly string[] = []): Promise<void> {
+export function warmRewrites(dir: string | undefined, fresh = false, given?: readonly RepoConfigFile[]): Promise<void> {
   if (!dir) return Promise.resolve();
+  // The repository's own config files, as named the last time (a background refresh has none of its own).
+  if (given) repoFiles.set(dir, given);
+  const files = repoFiles.get(dir) ?? [];
   const have = repoRules.get(dir);
   if (!fresh && have && Date.now() - have.at < 30_000) return Promise.resolve();
   const hung = hungRepos.get(dir);
@@ -383,7 +386,7 @@ export function warmRewrites(dir: string | undefined, fresh = false, files: read
         : [
             readConfig(dir, ["--system", "--includes", "--null", "--get-regexp", urlKeys], env),
             readConfig(dir, ["--global", "--includes", "--null", "--get-regexp", urlKeys], env),
-            ...files.map((f) => readConfig("/", ["--file", f, "--no-includes", "--null", "--get-regexp", "^(url\\..*\\.(insteadof|pushinsteadof)|remote\\..*\\.(url|pushurl))$"], alone)),
+            ...files.map((f) => readConfigOf(f, ["--no-includes", "--null", "--get-regexp", "^(url\\..*\\.(insteadof|pushinsteadof)|remote\\..*\\.(url|pushurl))$"], alone)),
           ];
     const outs = await Promise.all(reads);
     reading.delete(dir);
@@ -420,7 +423,7 @@ export function warmRewrites(dir: string | undefined, fresh = false, files: read
 }
 
 /** Whether the rules at `dir` were read (or tried, and failed or hung): a synchronous read isn't the answer then. */
-function rewritesTried(dir: string): boolean {
+export function rewritesTried(dir: string): boolean {
   return repoRules.has(dir) || reading.has(dir) || (hungRepos.get(dir) ?? 0) > Date.now();
 }
 
@@ -429,14 +432,67 @@ export function repoRemotes(dir: string): string[] | null {
   return repoRules.get(dir)?.rules?.remotes ?? null;
 }
 
+/** A repository config file as codeoid looked at it: its path, and its identity then. */
+export interface RepoConfigFile {
+  path: string;
+  dev: number;
+  ino: number;
+}
+
+const repoFiles = new Map<string, readonly RepoConfigFile[]>();
+
+/**
+ * One of the repository's own config files read by codeoid itself, and handed to git on stdin (`--file -`): opened
+ * without following a link or blocking, and only if it is the very file looked at (its device and inode), so a link
+ * swapped in after the look (to a file the sandbox hides) is never read. Its values, or null.
+ */
+// paths: an open (no link followed, non-blocking) of a file codeoid named, and git config on stdin
+function readConfigOf(f: RepoConfigFile, args: string[], env: Record<string, string>): Promise<string | null | "hung"> {
+  let text: string;
+  try {
+    const fd = openSync(f.path, constants.O_RDONLY | constants.O_NONBLOCK | constants.O_NOFOLLOW);
+    try {
+      const st = fstatSync(fd);
+      if (!st.isFile() || st.dev !== f.dev || st.ino !== f.ino || st.size > 1 << 20) return Promise.resolve(null);
+      const buf = Buffer.alloc(st.size);
+      let at = 0;
+      while (at < st.size) {
+        const n = readSync(fd, buf, at, st.size - at, at);
+        if (n <= 0) break;
+        at += n;
+      }
+      text = buf.subarray(0, at).toString("utf8");
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return Promise.resolve(null);
+  }
+  return readConfig("/", ["--file", "-", ...args], env, text);
+}
+
+/** A value of one of the repository's own config files (the first that has it), read as readConfigOf does; "" if none. */
+export async function repoConfigGet(files: readonly RepoConfigFile[], key: string): Promise<string> {
+  const alone = { ...ownerHelperEnv(), GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+  for (const f of files) {
+    const out = await readConfigOf(f, ["--no-includes", "--get", key], alone);
+    if (typeof out === "string" && out.trim()) return out.trim();
+  }
+  return "";
+}
+
 /** One `git config` read in `dir`, asynchronously, bounded at 5 s: its output, null (it failed), or "hung". */
 // paths: git config read in the session's repository (or from /), nothing run
-function readConfig(dir: string, args: string[], env: Record<string, string>): Promise<string | null | "hung"> {
+function readConfig(dir: string, args: string[], env: Record<string, string>, stdin?: string): Promise<string | null | "hung"> {
   return new Promise((done) => {
-    const child = spawn(GIT_BIN, ["-C", dir, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "config", ...args], { cwd: dir, env, stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn(GIT_BIN, ["-C", dir, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "config", ...args], { cwd: dir, env, stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "ignore"] });
+    if (stdin !== undefined && child.stdin) {
+      child.stdin.on("error", () => {});
+      child.stdin.end(stdin);
+    }
     let out = "";
     let hung = false;
-    child.stdout.on("data", (d: Buffer) => {
+    child.stdout?.on("data", (d: Buffer) => {
       if (out.length < 1 << 20) out += d.toString("utf8");
     });
     const timer = setTimeout(() => {

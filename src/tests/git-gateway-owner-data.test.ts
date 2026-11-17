@@ -478,3 +478,30 @@ describe("round 38: the repository's own config files are named by codeoid, neve
     expect(env.GIT_CONFIG_PARAMETERS ?? "").not.toContain("hunter2");
   });
 });
+
+describe("round 39: the repository's config read is the very file looked at; refreshes keep it", () => {
+  test("a link swapped in after the look (to a hidden repository's config) isn't read; a refresh keeps the files; repoConfigGet", async () => {
+    const { warmRewrites, ownerPushRewrite, repoConfigGet } = await import("../daemon/git-gateway/connect.js");
+    const { workspaceRemoteUrls, repositoryConfigFiles } = await import("../daemon/sandbox/session-sandbox.js");
+    process.env.HOME = home;
+    const repo = join(home, "r39");
+    spawnSync("git", ["init", "-q", repo]);
+    spawnSync("git", ["-C", repo, "remote", "add", "origin", "https://github.com/acme/app.git"]);
+    spawnSync("git", ["-C", repo, "config", "url.git@github.com:me/.pushInsteadOf", "https://github.com/acme/"]);
+    const files = repositoryConfigFiles(repo);
+    // A refresh with no files of its own keeps the ones named.
+    await warmRewrites(repo, true, files);
+    await warmRewrites(repo, true);
+    expect(ownerPushRewrite("https://github.com/acme/app.git", repo)).toBe("git@github.com:me/app.git");
+    expect(await repoConfigGet(files, "remote.origin.url")).toBe("https://github.com/acme/app.git");
+    // The config swapped for a link to a hidden repository's after the look.
+    const hiddenRepo = join(home, "hidden39");
+    spawnSync("git", ["init", "-q", hiddenRepo]);
+    spawnSync("git", ["-C", hiddenRepo, "remote", "add", "secret", "ssh://bot:hunter2@internal.example/x.git"]);
+    rmSync(join(repo, ".git", "config"));
+    symlinkSync(join(hiddenRepo, ".git", "config"), join(repo, ".git", "config"));
+    await warmRewrites(repo, true, files);
+    expect(workspaceRemoteUrls(repo).join(" ")).not.toContain("internal.example");
+    expect(await repoConfigGet(files, "remote.secret.url")).toBe("");
+  });
+});

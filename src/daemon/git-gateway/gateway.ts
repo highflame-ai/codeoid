@@ -22,6 +22,7 @@ import { type PushPolicy, type RefUpdate, refUpdateProblem } from "./policy.js";
 import { type GatewayScripts, writeGatewayScripts } from "./scripts.js";
 import { redactCredentials, shownGitUrl } from "./text.js";
 import { advertisedNames, cacheDirty, cacheHas, cacheRef, configEnv, dropCheckRefs, fetchCheckRefs, isAncestor, objectsNotSent, pruneCache, pushUpstream, reachedFromRefs, refreshCache, remoteRefs, type RemoteState, sweepCheckRefs, type Upstream } from "./upstream.js";
+import { sshHostOf, sshUrlUserPort } from "./ssh-snapshot.js";
 import { UploadFilter } from "./upload-filter.js";
 
 export type GitService = "git-upload-pack" | "git-receive-pack";
@@ -278,7 +279,7 @@ export class GitGateway {
   async #onClient(sessionId: string, c: Socket, sessionGone: Set<AbortController>): Promise<void> {
     let sshConfigShown: string | undefined = undefined;
     const fail = (why: string) => {
-      if (!c.destroyed) c.end(`error ${hideSsh(redactCredentials(why), sshConfigShown).replace(/\n/g, " ")}\n`);
+      if (!c.destroyed) c.end(`error ${hideSsh(redactCredentials(why), sshConfigShown, url).replace(/\n/g, " ")}\n`);
     };
     const limit = setTimeout(() => c.destroy(), this.#requestTimeoutMs);
     c.once("close", () => clearTimeout(limit));
@@ -637,8 +638,9 @@ export class GitGateway {
   /** The cache's pre-receive hook asks: the updates, checked, the session's word, then the remote. */
   async #onHook(c: Socket): Promise<void> {
     let hookSsh: string | undefined = undefined;
+    let hookUrl = "";
     const say = (line: string) => {
-      if (!c.destroyed) c.write(`msg ${hideSsh(redactCredentials(line), hookSsh).replace(/\n/g, " ")}\n`);
+      if (!c.destroyed) c.write(`msg ${hideSsh(redactCredentials(line), hookSsh, hookUrl).replace(/\n/g, " ")}\n`);
     };
     const verdict = (ok: boolean): void => {
       if (!c.destroyed) c.end(ok ? "ok\n" : "no\n");
@@ -652,6 +654,7 @@ export class GitGateway {
     const t = typeof req.ticket === "string" ? this.#tickets.get(req.ticket) : undefined;
     if (!t) return verdict(false);
     hookSsh = t.grant.upstream.sshConfig;
+    hookUrl = t.url;
     // Single use.
     this.#tickets.delete(req.ticket as string);
     t.onHook?.();
@@ -807,11 +810,15 @@ function hidePaths(s: string): string {
  * A message with what the owner's ssh config says about a host (HostName, User, Port, jump hosts: from a file the
  * sandbox hides) taken out, for the agent's git (the owner's own record keeps it).
  */
-function hideSsh(s: string, sshConfig: string | undefined): string {
+function hideSsh(s: string, sshConfig: string | undefined, url: string): string {
   if (!sshConfig) return s;
+  // What the URL says itself (its host, its user, the usual port) isn't the config's to hide; the rest, as whole words.
+  const said = new Set([sshHostOf(url) ?? "", sshUrlUserPort(url).user ?? "", sshUrlUserPort(url).port ?? "", "22"]);
+  const values = [...sshConfig.matchAll(/^\s+(?:HostName|User|Port|ProxyJump|HostKeyAlias)\s+(\S+)/gm)].map((m) => m[1] as string).filter((v) => v.length >= 2 && !said.has(v));
   let out = s;
-  const values = [...sshConfig.matchAll(/^\s+(?:HostName|User|Port|ProxyJump|HostKeyAlias)\s+(\S+)/gm)].map((m) => m[1] as string).filter((v) => v.length >= 2);
-  for (const v of [...new Set(values)].sort((a, b) => b.length - a.length)) out = out.split(v).join("<from your ssh config>");
+  for (const v of [...new Set(values)].sort((a, b) => b.length - a.length)) {
+    out = out.replace(new RegExp(`(?<![\\w.-])${v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\w.-])`, "g"), "<from your ssh config>");
+  }
   return out;
 }
 

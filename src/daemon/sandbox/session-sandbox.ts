@@ -22,10 +22,10 @@ import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
-import { ownerConfigFiles, ownerPushRewrite, ownerRewrite, repoRemotes, warmOwnerConfig, warmRewrites } from "../git-gateway/connect.js";
+import { ownerConfigFiles, ownerPushRewrite, ownerRewrite, type RepoConfigFile, repoRemotes, rewritesTried, warmOwnerConfig, warmRewrites } from "../git-gateway/connect.js";
 import { buildSandboxSpec, type GitGatewaySpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
 import { normalizeRemote } from "../workstreams/match.js";
-import { readRegular } from "../git-gateway/ssh-snapshot.js";
+import { readRegularTextSync } from "../safe-read.js";
 import {
   addedDirProblem,
   addedDirReal,
@@ -1506,14 +1506,21 @@ export function workspaceRemoteUrls(workspace: string): string[] {
   const top = repositoryForRewrites(workspace);
   const parsed = top ? repoRemotes(top) : null;
   if (parsed) return [...new Set(parsed)].slice(0, 50);
+  // Read and refused (the file wasn't the one looked at, a link swapped in), or failed: none, never the plain reading.
+  if (top && rewritesTried(top)) return [];
   try {
     const layout = gitLayoutOf(workspace);
     const common = layout?.common;
     if (!common) return [];
     // Read without blocking, and only a plain file: an agent can make the config a FIFO, which a blocking read would
     // wait on for ever (the whole daemon with it).
-    const text = readRegular(join(common, "config"));
-    if (text === null) return [];
+    // The plain reading (before any read by git): never through a link (it could lead to a file the sandbox hides).
+    let text: string;
+    try {
+      text = readRegularTextSync(join(common, "config"), 1 << 20, { noFollow: true });
+    } catch {
+      return [];
+    }
     const out: string[] = [];
     let inRemote = false;
     for (const raw of text.split("\n")) {
@@ -1602,11 +1609,11 @@ export function repositoryForRewrites(workspace: string): string | undefined {
  * agent made would point git at (a repository the sandbox hides).
  */
 // paths: a look (lstat, realpath) at the repository's config files, nothing read
-export function repositoryConfigFiles(workspace: string): string[] {
+export function repositoryConfigFiles(workspace: string): RepoConfigFile[] {
   const layout = gitLayoutOf(workspace);
   if (!layout?.common) return [];
   const gitDir = layout.own ?? layout.common;
-  const out: string[] = [];
+  const out: RepoConfigFile[] = [];
   for (const [file, dir] of [
     [join(layout.common, "config"), layout.common],
     [join(gitDir, "config.worktree"), gitDir],
@@ -1616,7 +1623,10 @@ export function repositoryConfigFiles(workspace: string): string[] {
       const real = realpathSync(file);
       const root = realpathSync(dir);
       if (dirname(real) !== root) continue;
-      out.push(real);
+      // Its identity as looked at: what is read later must be this very file (a link swapped in meanwhile isn't).
+      const st = lstatSync(real);
+      if (!st.isFile()) continue;
+      out.push({ path: real, dev: st.dev, ino: st.ino });
     } catch {
       /* not there */
     }

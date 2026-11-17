@@ -213,8 +213,8 @@ import {
   mainWorktreeRoot,
   removeForkWorktree,
 } from "./git-worktree.js";
-import { GIT_BIN, hardenedGit, safeGit } from "./git-env.js";
-import { connectionId, GitCredentials, ownerConfigProblem, ownerPushRewrite, ownerRewrite, probeConnection, sshHome, warmOwnerConfig, warmRewrites } from "./git-gateway/connect.js";
+import { GIT_BIN, hardenedGit } from "./git-env.js";
+import { connectionId, GitCredentials, ownerConfigProblem, ownerPushRewrite, ownerRewrite, probeConnection, repoConfigGet, sshHome, warmOwnerConfig, warmRewrites } from "./git-gateway/connect.js";
 import { type GatewayHost, GitGateway } from "./git-gateway/gateway.js";
 import { hostPathProblem } from "./git-gateway/hostpath.js";
 import { redactCredentials, remoteUrlProblem, shownGitUrl } from "./git-gateway/text.js";
@@ -4846,12 +4846,11 @@ mcpHub: this.#mcpHub,
     if (!url) {
       if (!msg.path || !isAbsolute(msg.path)) return fail("Give the remote's URL, or the repository's absolute path.");
       const remote = msg.remote ?? "origin";
-      pushurl = (await safeGit(["config", "--local", "--get", `remote.${remote}.pushurl`], msg.path, { timeoutMs: 20_000 }).catch(() => "")).trim();
-      try {
-        url = (await safeGit(["config", "--local", "--get", `remote.${remote}.url`], msg.path, { timeoutMs: 20_000 })).trim();
-      } catch {
-        return fail(`There is no remote named ${remote} in ${msg.path}.`);
-      }
+      // From the repository's own config files as codeoid names them (never git's `--local`, which a `commondir` in the
+      // repository could point at another).
+      const files = repositoryConfigFiles(msg.path);
+      pushurl = await repoConfigGet(files, `remote.${remote}.pushurl`);
+      url = await repoConfigGet(files, `remote.${remote}.url`);
       if (!url) return fail(`There is no remote named ${remote} in ${msg.path}.`);
     }
     // What a connect from a repository would connect: the CLI shows it, and asks, first.
