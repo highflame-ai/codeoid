@@ -826,40 +826,43 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     const pack = execFileSync("git", ["-C", work, "pack-objects", "--stdout", "-q"], { input: `${objects.join("\n")}\n` });
     approveDelayMs = 3000;
     const s = gw.forSession("s1");
-    const p = Bun.spawn([s.ext, "git-receive-pack", URL], { env: { PATH: process.env.PATH ?? "", CODEOID_GIT_GATEWAY: s.socket }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
-    const reader = p.stdout.getReader();
+    // Node's spawn, whose stdin errors can be handled: the gateway cutting the pipe off is what's expected here.
+    const { spawn } = await import("node:child_process");
+    const p = spawn(s.ext, ["git-receive-pack", URL], { env: { PATH: process.env.PATH ?? "", CODEOID_GIT_GATEWAY: s.socket }, stdio: ["pipe", "pipe", "pipe"] });
+    p.stdin.on("error", () => {});
+    const exited = new Promise<void>((r) => p.on("close", () => r()));
     let got = "";
-    while (!got.endsWith("0000")) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      got += Buffer.from(value).toString("latin1");
-    }
+    await new Promise<void>((r) => {
+      p.stdout.on("data", (d: Buffer) => {
+        got += d.toString("latin1");
+        if (got.endsWith("0000")) r();
+      });
+      p.on("close", () => r());
+    });
     const pkt = (x: string) => `${(x.length + 4).toString(16).padStart(4, "0")}${x}`;
-    // The push, then far more than any push sends after its pack, while the owner is asked. (Cut off part way: the
-    // pipe breaks, which is the point.)
+    // The push, then far more than any push sends after its pack, while the owner is asked.
     const junk = Buffer.alloc(1024 * 1024, 0x41);
-    const send = async (b: string | Buffer) => {
-      try {
-        p.stdin.write(b);
-        await p.stdin.flush();
-        return true;
-      } catch {
-        return false;
-      }
-    };
+    let piping = true;
+    p.stdin.on("error", () => {
+      piping = false;
+    });
+    p.on("close", () => {
+      piping = false;
+    });
+    const send = (b: string | Buffer) =>
+      new Promise<void>((r) => {
+        if (!piping || p.stdin.destroyed) return r();
+        if (p.stdin.write(b)) r();
+        else {
+          p.stdin.once("drain", () => r());
+          p.once("close", () => r());
+        }
+      });
     await send(`${pkt(`${"0".repeat(40)} ${tip} refs/heads/flood\0report-status\n`)}0000`);
     await send(pack);
-    for (let i = 0; i < 40; i++) if (!(await send(junk))) break;
-    try {
-      p.stdin.end();
-    } catch {
-      /* the gateway ended it */
-    }
-    for (;;) {
-      const { done } = await reader.read();
-      if (done) break;
-    }
-    await p.exited;
+    for (let i = 0; i < 40 && piping; i++) await send(junk);
+    if (piping) p.stdin.end();
+    await exited;
     await new Promise((r) => setTimeout(r, 3500));
     expect(upstreamRef("refs/heads/flood")).toBe("");
     // At most a few connections at once from one session: the next is told why.

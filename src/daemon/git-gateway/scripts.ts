@@ -25,11 +25,12 @@ const fail = (m) => { process.stderr.write("fatal: codeoid git gateway: " + m + 
 if (!path) fail("this session has no git gateway (its sandbox isn't codeoid's, or it is off)");
 if (service !== "git-upload-pack" && service !== "git-receive-pack") fail("unsupported service " + JSON.stringify(service));
 const conn = net.connect({ path });
-const frame = (d) => { const h = Buffer.alloc(4); h.writeUInt32BE(d.length, 0); conn.write(h); if (d.length) conn.write(d); };
+// Copies: a read buffer may be reused once its handler returns, while a write the other end hasn't taken is queued.
+const frame = (d) => { const h = Buffer.alloc(4); h.writeUInt32BE(d.length, 0); conn.write(h); if (d.length) conn.write(Buffer.from(d)); };
 let head = Buffer.alloc(0);
 let relaying = false;
 const pending = [];
-process.stdin.on("data", (d) => { if (relaying) frame(d); else pending.push(d); });
+process.stdin.on("data", (d) => { if (relaying) frame(d); else pending.push(Buffer.from(d)); });
 process.stdin.on("end", () => { if (relaying) frame(Buffer.alloc(0)); else pending.push(null); });
 conn.on("connect", () => {
   const protocol = /^version=[0-9]$/.test(process.env.GIT_PROTOCOL || "") ? process.env.GIT_PROTOCOL : "";
@@ -44,9 +45,9 @@ const onHead = (c) => {
   const rest = head.subarray(i + 1);
   if (status !== "ok") fail(status.replace(/^error /, ""));
   relaying = true;
-  if (rest.length) process.stdout.write(rest);
+  if (rest.length) process.stdout.write(Buffer.from(rest));
   for (const d of pending) frame(d === null ? Buffer.alloc(0) : d);
-  conn.on("data", (x) => process.stdout.write(x));
+  conn.on("data", (x) => process.stdout.write(Buffer.from(x)));
 };
 conn.on("data", onHead);
 const done = () => process.stdout.end(() => process.exit(0));

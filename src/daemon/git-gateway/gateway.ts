@@ -428,7 +428,11 @@ export class GitGateway {
           c.resume();
         });
       };
-      const endStdin = () => p.stdin.end();
+      // Ended only once what is queued has gone to git (an end with writes still queued can cut the pack short).
+      const endStdin = () => {
+        if (paused || p.stdin.writableNeedDrain) p.stdin.once("drain", () => p.stdin.end());
+        else p.stdin.end();
+      };
       const t = this.#tickets.get(ticket);
       if (t) {
         t.onHook = () => {
@@ -464,8 +468,9 @@ export class GitGateway {
             c.destroy();
             return;
           }
+          // A copy: a socket's read buffer may be reused once this returns, and a write git hasn't taken yet is queued.
           if (filter) filter.push(Buffer.from(chunk));
-          else write(chunk);
+          else write(Buffer.from(chunk));
           buf = buf.subarray(4 + n);
         }
       };
