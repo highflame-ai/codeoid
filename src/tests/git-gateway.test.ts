@@ -1000,6 +1000,14 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     const asked = (args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: root, GIT_CONFIG_NOSYSTEM: "1", ...env } }).trim();
     expect(asked(["remote", "get-url", "origin"])).toBe(`ext::/gw/ext %S ${fetchUrl}`);
     expect(asked(["remote", "get-url", "--push", "origin"])).toBe(`ext::/gw/ext %S ${pushUrl}`);
+    // Round 30: the owner's push URL not connected (an https fork, network on): the push still goes there, to the
+    // gateway (which refuses or offers to connect it), never to the fetch URL.
+    const forkHttps = (u: string) => (u.startsWith("https://github.com/acme/") ? `https://github.com/me/${u.slice("https://github.com/acme/".length)}` : u);
+    expect(gatewayRoutes([fetchUrl], [], { off: false, rewrite: (u) => u, pushRewrite: forkHttps })).toEqual([{ from: fetchUrl, fetch: fetchUrl, push: "https://github.com/me/app.git" }]);
+    // An insteadOf alone (https written, ssh used, no pushInsteadOf): the same repository, so the connected URL
+    // stands for it both ways when the rewrite isn't connected.
+    const toSsh = (u: string) => (u.startsWith("https://github.com/") ? `git@github.com:${u.slice("https://github.com/".length)}` : u);
+    expect(gatewayRoutes([fetchUrl], [], { off: false, rewrite: toSsh, pushRewrite: toSsh })).toEqual([{ from: fetchUrl, fetch: fetchUrl, push: fetchUrl }]);
     // A connected URL the owner doesn't rewrite stands for itself, both ways.
     const plainRoutes = gatewayRoutes([fetchUrl], [], { off: false, rewrite: (u) => u, pushRewrite: (u) => u });
     expect(plainRoutes).toEqual([{ from: fetchUrl, fetch: fetchUrl, push: fetchUrl }]);

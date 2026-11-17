@@ -1533,11 +1533,14 @@ export function gatewayRoutes(connectedUrls: readonly string[], workspaceRemotes
   // Each remote as written, and what the owner's own rewrite makes of it (fetch and push each): the gateway is asked
   // for that. A connected URL's route first.
   for (const w of connectedUrls) {
-    // A connected URL is fetched as itself (or as the owner's rewrite of it when that is connected too), and pushed
-    // where the owner's own git pushes it (their pushInsteadOf), so never to the fetch URL when they push elsewhere.
+    // A connected URL is fetched as itself (or as the owner's rewrite of it when that is connected too). Pushed: where
+    // the owner's pushInsteadOf sends it, always (through the gateway, which refuses or offers to connect it), never
+    // the fetch URL instead; a push target that is only their insteadOf (the same repository) as the fetch is.
     const rewritten = testFile(w) ? w : o.rewrite(w);
     const pushTo = testFile(w) ? w : o.pushRewrite(w);
-    routes.push({ from: w, fetch: connected.has(rewritten) ? rewritten : w, push: pushTo !== w && reachable(pushTo) ? pushTo : w });
+    const fetch = connected.has(rewritten) ? rewritten : w;
+    const push = pushTo === rewritten ? fetch : pushTo;
+    routes.push({ from: w, fetch, push });
   }
   for (const w of workspaceRemotes) {
     const fetch = testFile(w) ? w : o.rewrite(w);
