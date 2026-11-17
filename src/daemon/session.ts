@@ -9293,7 +9293,7 @@ export class Session {
       lines.push(
         noPush
           ? `\`git fetch\` works for remotes the owner connected: codeoid reaches them for you with the owner's credentials (you never see them). Pushes are refused here: ${noPush}.`
-          : "`git fetch` and `git push` work for remotes the owner connected: codeoid reaches them for you with the owner's credentials (you never see them). Commit, then push a branch of your own; pushes to main, master or the remote's default branch, force pushes, deletes and tags are refused, and the owner may be asked first.",
+          : `\`git fetch\` and \`git push\` work for remotes the owner connected: codeoid reaches them for you with the owner's credentials (you never see them). Commit, then push a branch of your own; pushes to ${this.gitProtectedBranches.join(", ") || "protected branches"} or the remote's default branch, force pushes, deletes and tags are refused, and the owner may be asked first.`,
       );
     }
     return lines.join("\n");
@@ -9353,7 +9353,7 @@ export class Session {
         method: "confirm",
         title: `The agent's git reached for ${shownGitUrl(url)}`,
         ...(signal ? { signal } : {}),
-        message: `"${this.name}" ran git against ${shownGitUrl(url)}, which you haven't connected for agents.\n\nConnect it? Agents in your sandboxed sessions could then fetch from it, and push to branches of their own (never main, master or its default branch, never a force push, a delete or a tag), with ${how}. Your credential stays with codeoid; the agent never sees it. A pushed branch runs the repository's CI as that branch defines it, with its secrets.`,
+        message: `"${this.name}" ran git against ${shownGitUrl(url)}, which you haven't connected for agents.\n\nConnect it? Agents in your sandboxed sessions could then fetch from it, and push to branches of their own (never ${this.gitProtectedBranches.join(", ") || "a protected branch"} or its default branch, never a force push, a delete or a tag), with ${how}. Your credential stays with codeoid; the agent never sees it. A pushed branch runs the repository's CI as that branch defines it, with its secrets.`,
         timeoutMs: 100_000,
       },
       {

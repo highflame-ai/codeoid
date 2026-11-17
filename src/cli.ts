@@ -1408,7 +1408,7 @@ const sandboxGitCmd = sandboxCmd
 sandboxGitCmd
   .command("connect [dir]")
   .description(
-    "Connect a repository's remote for agents in your sandboxed sessions: they may fetch from it and push branches of their own (never main, master or its default branch, no force, no deletes, no tags), with your ssh key or your git credential for it (read once, now), or --token. Proved to work first. A pushed branch runs the repository's CI with its secrets",
+    "Connect a repository's remote for agents in your sandboxed sessions: they may fetch from it and push branches of their own (never a protected branch, main and master unless sandbox.push.protectedBranches says otherwise, nor its default branch; no force, no deletes, no tags), with your ssh key or your git credential for it (read once, now), or --token. Proved to work first. A pushed branch runs the repository's CI with its secrets",
   )
   .option("--remote <name>", "the remote (default: origin)")
   .option("--url <url>", "the remote's URL, instead of a repository and remote")

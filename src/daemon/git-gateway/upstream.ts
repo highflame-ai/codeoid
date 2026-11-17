@@ -531,13 +531,13 @@ export async function cacheDirty(cache: string, active: ReadonlySet<string> = ne
  * last check judges against them; removed after). Remembered as seen. Why not, or null.
  */
 // paths: the daemon's own cache repository: refs under its private check namespace, written
-export async function fetchCheckRefs(cache: string, up: Upstream, ssh: string | null, ns: string, names: readonly string[]): Promise<string | null> {
+export async function fetchCheckRefs(cache: string, up: Upstream, ssh: string | null, ns: string, names: readonly string[], signal?: AbortSignal): Promise<string | null> {
   if (names.length === 0) return null;
   return withUpstreamEnv(up, ssh, async (base) => {
     const env = cacheEnv(base, cache);
     const specs = names.map((n) => `+${n}:refs/codeoid-check/${ns}/${n.replace(/^refs\//, "")}`);
     markUnsettled(cache, ns);
-    const r = await runGit(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--", up.url, ...specs], cache, env, 120_000);
+    const r = await runGit(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--", up.url, ...specs], cache, env, 120_000, signal);
     if (r.code !== 0) return gitError(r, "the remote couldn't be fetched again before the push");
     if (!(await rememberRefs(cache, false))) return "codeoid couldn't read its copy of the remote";
     settle(cache, ns);
@@ -555,9 +555,9 @@ export async function dropCheckRefs(cache: string, ns: string): Promise<void> {
 }
 
 /** The remote's branches and tags as it says them now (`ls-remote`): each id and name, or why not. */
-export async function remoteRefs(up: Upstream, ssh: string | null): Promise<Array<{ oid: string; name: string }> | { error: string }> {
+export async function remoteRefs(up: Upstream, ssh: string | null, signal?: AbortSignal): Promise<Array<{ oid: string; name: string }> | { error: string }> {
   return withUpstreamEnv(up, ssh, async (env) => {
-    const r = await runGit(["ls-remote", "--refs", "--", up.url, "refs/heads/*", "refs/tags/*"], "/", env, 60_000, undefined, 256 * 1024 * 1024);
+    const r = await runGit(["ls-remote", "--refs", "--", up.url, "refs/heads/*", "refs/tags/*"], "/", env, 60_000, signal, 256 * 1024 * 1024);
     if (r.code !== 0 || r.truncated) return { error: gitError(r, "the remote couldn't be asked what it has") };
     const out: Array<{ oid: string; name: string }> = [];
     for (const l of r.stdout.split("\n")) {

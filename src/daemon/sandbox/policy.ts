@@ -449,7 +449,8 @@ export function gitGatewayEnv(g: GitGatewaySpec): Record<string, string> {
   const ext = g.ext.replace(/ /g, "% ");
   // `user`, not `always`: a submodule's ext:: URL (git marks those not from the user) runs nothing.
   const entries: Array<[string, string]> = [["protocol.ext.allow", "user"]];
-  const bad = (u: string) => /[\s'=%]/.test(u) || /^https?:\/\/[^/]*@/i.test(u) || /[?#]/.test(u);
+  // (Nor a password in any URL: `ssh://user:secret@host`.)
+  const bad = (u: string) => /[\s'=%]/.test(u) || /^https?:\/\/[^/]*@/i.test(u) || /^[a-z][a-z0-9+.-]*:\/\/[^/@]*:[^/@]*@/i.test(u) || /[?#]/.test(u);
   const seen = new Set<string>();
   for (const r of routes) {
     // The old `'key=value'` form, which every git parses (the split form is git 2.31's): a URL with `=` can't be in it.

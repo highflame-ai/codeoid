@@ -731,7 +731,14 @@ export class GitGateway {
     if (t.served) t.releaseRefUpdate();
     // The remote may have deleted something since the refresh (a connection held open, a card answered late): judged
     // again against what it says it has now, so nothing it no longer has goes back to it.
-    const now = await remoteRefs(t.grant.upstream, t.grant.ssh);
+    const stopped = () => {
+      const why = "the daemon stopped before the push started, so nothing was pushed";
+      this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: false, detail: why, updates });
+      say(why);
+      return verdict(false);
+    };
+    const now = await remoteRefs(t.grant.upstream, t.grant.ssh, this.#closing.signal);
+    if (this.#closing.signal.aborted) return stopped();
     if ("error" in now) return refuse(now.error);
     // What the remote has that the cache doesn't (a branch moved on meanwhile) is fetched first, apart, so the check
     // judges against all of it.
@@ -744,7 +751,8 @@ export class GitGateway {
       const have = new Set(known);
       const missing = now.filter((r) => !have.has(r.oid)).map((r) => r.name);
       if (missing.length > 0) {
-        const fetched = await fetchCheckRefs(t.cache, t.grant.upstream, t.grant.ssh, ns, missing);
+        const fetched = await fetchCheckRefs(t.cache, t.grant.upstream, t.grant.ssh, ns, missing, this.#closing.signal);
+        if (this.#closing.signal.aborted) return stopped();
         if (fetched) return refuse(fetched);
         known = await cacheHas(t.cache, now.map((r) => r.oid));
         if ("error" in known) return refuse(known.error);
@@ -756,6 +764,7 @@ export class GitGateway {
       await dropCheckRefs(t.cache, ns);
       this.#checking.delete(ns);
     }
+    if (this.#closing.signal.aborted) return stopped();
     if (late) return refuse(late);
     if (t.disconnected()) return refuse(`${shownGitUrl(t.url)} was disconnected`);
     // Approved and started: it finishes (bounded by its own limit), the agent's git there or not, so what the remote

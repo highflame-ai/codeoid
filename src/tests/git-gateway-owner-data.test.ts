@@ -435,3 +435,20 @@ describe("round 36: the workspace's remotes as git reads them", () => {
     expect(workspaceRemoteUrls(repo)).toEqual(["https://github.com/acme/app.git"]);
   });
 });
+
+describe("round 37: a repository's own include isn't followed for its rules or remotes", () => {
+  test("an include.path the repository's config gains (naming a file the sandbox hides) puts nothing of it in the routes", async () => {
+    const { warmRewrites, ownerRewrite } = await import("../daemon/git-gateway/connect.js");
+    const { workspaceRemoteUrls } = await import("../daemon/sandbox/session-sandbox.js");
+    process.env.HOME = home;
+    const repo = join(home, "r37");
+    spawnSync("git", ["init", "-q", repo]);
+    spawnSync("git", ["-C", repo, "remote", "add", "origin", "https://github.com/acme/app.git"]);
+    const hidden = join(home, "hidden.gitconfig");
+    writeFileSync(hidden, '[remote "secret"]\n\turl = ssh://bot:hunter2@internal.example/x.git\n[url "https://evil.example/"]\n\tinsteadOf = https://github.com/\n');
+    spawnSync("git", ["-C", repo, "config", "include.path", hidden]);
+    await warmRewrites(repo, true);
+    expect(workspaceRemoteUrls(repo)).toEqual(["https://github.com/acme/app.git"]);
+    expect(ownerRewrite("https://github.com/acme/app.git", repo)).toBe("https://github.com/acme/app.git");
+  });
+});

@@ -367,43 +367,51 @@ export function warmRewrites(dir: string | undefined, fresh = false): Promise<vo
   if (hung && hung > Date.now()) return Promise.resolve();
   const running = reading.get(dir);
   if (running) return running;
-  const done = new Promise<void>((resolveRead) => {
-    const child = spawn(GIT_BIN, ["-C", dir, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "config", "--null", "--get-regexp", "^(url\\..*\\.(insteadof|pushinsteadof)|remote\\..*\\.(url|pushurl))$"], { cwd: dir, env: { ...ownerHelperEnv(), GIT_CEILING_DIRECTORIES: dirname(dir) }, stdio: ["ignore", "pipe", "ignore"] });
-    let out = "";
-    child.stdout.on("data", (d: Buffer) => {
-      if (out.length < 1 << 20) out += d.toString("utf8");
-    });
-    const timer = setTimeout(() => {
+  const done = (async () => {
+    const env = { ...ownerHelperEnv(), GIT_CEILING_DIRECTORIES: dirname(dir) };
+    const urlKeys = "^url\\..*\\.(insteadof|pushinsteadof)$";
+    // From /: the owner's own config (system, global, and what they include). In a repository: the owner's global
+    // config with its includes (a conditional include judged for that repository), and the repository's own config
+    // without any (an include.path an agent puts there could name a file the sandbox hides, whose values would reach
+    // the sandbox's routes); the remotes from the repository's own config alone.
+    const reads =
+      dir === "/"
+        ? [readConfig(dir, ["--null", "--get-regexp", urlKeys], env)]
+        : [
+            readConfig(dir, ["--global", "--includes", "--null", "--get-regexp", urlKeys], env),
+            readConfig(dir, ["--local", "--no-includes", "--null", "--get-regexp", urlKeys], { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }),
+            readConfig(dir, ["--local", "--no-includes", "--null", "--get-regexp", "^remote\\..*\\.(url|pushurl)$"], { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }),
+          ];
+    const outs = await Promise.all(reads);
+    reading.delete(dir);
+    if (outs.some((o) => o === "hung")) {
       hungRepos.set(dir, Date.now() + 10 * 60_000);
-      child.kill("SIGKILL");
-    }, 5_000);
-    const finish = (code: number | null) => {
-      clearTimeout(timer);
-      reading.delete(dir);
-      // 1: no rule at all, which is an answer.
-      if (code !== 0 && code !== 1) repoRules.set(dir, { at: Date.now(), rules: null });
-      else {
-        const rules: RewriteRules = { insteadOf: [], pushInsteadOf: [], remotes: [] };
-        for (const entry of out.split("\0")) {
-          const nl = entry.indexOf("\n");
-          if (nl < 0) continue;
-          const key = entry.slice(0, nl);
-          const prefix = entry.slice(nl + 1);
-          if (/^remote\..*\.(url|pushurl)$/i.test(key)) {
-            if (prefix) rules.remotes.push(prefix);
-            continue;
-          }
-          const m = /^url\.(.*)\.(insteadof|pushinsteadof)$/i.exec(key);
-          if (!m?.[1] || !prefix) continue;
-          (m[2]?.toLowerCase() === "pushinsteadof" ? rules.pushInsteadOf : rules.insteadOf).push([m[1], prefix]);
+      repoRules.set(dir, { at: Date.now(), rules: null });
+      return;
+    }
+    if (outs.some((o) => o === null)) {
+      repoRules.set(dir, { at: Date.now(), rules: null });
+      return;
+    }
+    const rules: RewriteRules = { insteadOf: [], pushInsteadOf: [], remotes: [] };
+    for (const out of outs as string[]) {
+      for (const entry of out.split("\0")) {
+        const nl = entry.indexOf("\n");
+        if (nl < 0) continue;
+        const key = entry.slice(0, nl);
+        const value = entry.slice(nl + 1);
+        if (!value) continue;
+        if (/^remote\..*\.(url|pushurl)$/i.test(key)) {
+          rules.remotes.push(value);
+          continue;
         }
-        repoRules.set(dir, { at: Date.now(), rules });
+        const m = /^url\.(.*)\.(insteadof|pushinsteadof)$/i.exec(key);
+        if (!m?.[1]) continue;
+        (m[2]?.toLowerCase() === "pushinsteadof" ? rules.pushInsteadOf : rules.insteadOf).push([m[1], value]);
       }
-      resolveRead();
-    };
-    child.on("close", finish);
-    child.on("error", () => finish(null));
-  });
+    }
+    repoRules.set(dir, { at: Date.now(), rules });
+  })();
   reading.set(dir, done);
   return done;
 }
@@ -416,6 +424,32 @@ function rewritesTried(dir: string): boolean {
 /** The remotes' URLs of the repository at `dir` as git parses its config (warmRewrites read them), or null: not read. */
 export function repoRemotes(dir: string): string[] | null {
   return repoRules.get(dir)?.rules?.remotes ?? null;
+}
+
+/** One `git config` read in `dir`, asynchronously, bounded at 5 s: its output, null (it failed), or "hung". */
+// paths: git config read in the session's repository (or from /), nothing run
+function readConfig(dir: string, args: string[], env: Record<string, string>): Promise<string | null | "hung"> {
+  return new Promise((done) => {
+    const child = spawn(GIT_BIN, ["-C", dir, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "config", ...args], { cwd: dir, env, stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    let hung = false;
+    child.stdout.on("data", (d: Buffer) => {
+      if (out.length < 1 << 20) out += d.toString("utf8");
+    });
+    const timer = setTimeout(() => {
+      hung = true;
+      child.kill("SIGKILL");
+    }, 5_000);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      // 1: nothing matched, which is an answer.
+      done(hung ? "hung" : code === 0 || code === 1 ? out : null);
+    });
+    child.on("error", () => {
+      clearTimeout(timer);
+      done(null);
+    });
+  });
 }
 
 /** A rule set's rewrite of `url`: the longest matching prefix, as git picks. */
