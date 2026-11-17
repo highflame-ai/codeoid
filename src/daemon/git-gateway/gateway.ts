@@ -77,6 +77,8 @@ interface Ticket {
   remote: RemoteState;
   /** Aborted when the agent's git goes (its connection closes), the session closes or the gateway stops. */
   gone: AbortController;
+  /** Whether the connection was removed since the grant (its cache's generation moved on). */
+  disconnected: () => boolean;
 }
 
 const MAX_HEADER = 64 * 1024;
@@ -97,6 +99,8 @@ export class GitGateway {
   readonly #gone = new Set<AbortController>();
   /** Per cache: what stops its first clone (the gateway closing, the connection removed); and its generation. */
   readonly #cloneStops = new Map<string, AbortController>();
+  /** Aborted when the gateway stops: an upstream push in flight ends with it (said, and recorded as unknown). */
+  readonly #closing = new AbortController();
   readonly #generations = new Map<string, number>();
   #closed = false;
 
@@ -165,6 +169,7 @@ export class GitGateway {
     this.#closed = true;
     for (const g of this.#gone) g.abort();
     for (const s of this.#cloneStops.values()) s.abort();
+    this.#closing.abort();
     for (const id of [...this.#sessions.keys()]) this.closeSession(id);
     this.#control.close();
     for (const c of this.#live) c.destroy();
@@ -274,7 +279,7 @@ export class GitGateway {
         return fail(fresh.error);
       }
       const ticket = randomBytes(24).toString("hex");
-      if (service === "git-receive-pack") this.#tickets.set(ticket, { sessionId, grant: { ...grant, upstream }, url, cache, remote: fresh, gone });
+      if (service === "git-receive-pack") this.#tickets.set(ticket, { sessionId, grant: { ...grant, upstream }, url, cache, remote: fresh, gone, disconnected });
       try {
         if (c.destroyed) return;
         c.write("ok\n");
@@ -460,9 +465,17 @@ export class GitGateway {
       this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: false, detail: "the agent's git was gone before the push started, so nothing was pushed", updates });
       return verdict(false);
     }
+    // The owner disconnected the remote while the card was up: nothing is pushed with what they took back.
+    if (t.disconnected()) return refuse(`${shownGitUrl(t.url)} was disconnected`);
     // Approved and started: it finishes (bounded by its own limit), the agent's git there or not, so what the remote
-    // took is what is recorded.
-    const pushed = await pushUpstream(t.cache, t.grant.upstream, t.grant.ssh, updates, objects, this.#upstreamTimeoutMs);
+    // took is what is recorded; only the gateway stopping ends it.
+    const pushed = await pushUpstream(t.cache, t.grant.upstream, t.grant.ssh, updates, objects, this.#upstreamTimeoutMs, this.#closing.signal);
+    if (!pushed.ok && this.#closing.signal.aborted) {
+      const why = "the daemon stopped while the push ran: the remote may or may not have taken it (fetch to see)";
+      this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: false, detail: why, updates });
+      say(why);
+      return verdict(false);
+    }
     if (!pushed.ok) {
       say(pushed.error);
       this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: false, detail: pushed.error, updates });

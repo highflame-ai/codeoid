@@ -172,6 +172,8 @@ export interface TranscriptMeta {
   sandbox?: SessionSandboxSetting;
   /** Made with a delegated token: none of the owner's git connections (docs/git-gateway-design.md). */
   createdByDelegate?: boolean;
+  /** A dispatch worker: its autonomous mode is the fleet's, so its pushes ask the owner (docs/git-gateway-design.md). */
+  fleetAutonomy?: boolean;
   sessionId: string;
   sessionName: string;
   workdir: string;

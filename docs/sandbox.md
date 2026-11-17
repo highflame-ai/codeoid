@@ -1316,7 +1316,8 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
   the remote's branches and tags still reach: one the remote has since deleted is never published again. The copy
   keeps what the remote deleted until you disconnect (it is never served, but an agent that already knows a deleted
   commit's id could learn that the copy still has it), so after purging a secret from a remote, disconnect and
-  connect it again.
+  connect it again. For the same reason a push built on what the remote deleted is refused, even your own earlier
+  work: reconnect the remote first.
 - **Autonomous mode is yours to give:** a push needs no card only when you set the session autonomous (or made it
   so) with your own token. Set by a delegated token, or a worker the fleet started, each push asks you.
 - **Workstreams:** under workstream isolation, a remote that another workstream's rules claim is never pushed from

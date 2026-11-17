@@ -1431,7 +1431,11 @@ sandboxGitCmd
         if (await confirmOnTerminal("Connect that too? [y/N] ", o.yes, "")) await client.sandboxGitConnect("connect", { url: found.rawPushUrl });
       }
     }
-    const token = o.token ? await readSecret("Token (user:token, or the token): ") : undefined;
+    const token = o.token ? (await readSecret("Token (user:token, or the token): ")).trim() : undefined;
+    if (o.token && !token) {
+      console.error("No token given: nothing connected.");
+      process.exit(1);
+    }
     await client.sandboxGitConnect("connect", { url, ...(token ? { token } : {}) });
     client.disconnect();
   });

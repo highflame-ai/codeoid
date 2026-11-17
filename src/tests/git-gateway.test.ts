@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 import { type GatewayHost, type GatewayPush, GitGateway } from "../daemon/git-gateway/gateway.js";
 import { refUpdateProblem } from "../daemon/git-gateway/policy.js";
 import { configEnv } from "../daemon/git-gateway/upstream.js";
@@ -450,7 +451,7 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(upstreamRef("refs/heads/x")).toBe("");
     expect(spawnSync("git", ["-C", upstream, "cat-file", "-e", secret]).status).not.toBe(0);
     expect(reply).not.toContain("ok refs/heads/x");
-    expect(reports.some((e) => e.kind === "push" && !e.ok && /no longer has/.test(e.detail))).toBe(true);
+    expect(reports.some((e) => e.kind === "push" && !e.ok && /remote deleted it/.test(e.detail))).toBe(true);
     // An ordinary push (its objects sent) still goes.
     const work = await clone();
     await agent(work, "checkout", "-q", "-b", "fine");
@@ -485,6 +486,90 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
       expect([branch, r.code]).toEqual([branch, 0]);
       expect(upstreamRef(`refs/heads/${branch}`)).toBe(sha);
     }
+  });
+
+  test("round 14: a hand-made thin pack whose delta base is an object the remote deleted is refused (nothing built on it goes out)", async () => {
+    const other = join(root, "other");
+    plain(root, "clone", "-q", upstream, other);
+    plain(other, "checkout", "-q", "-b", "oops");
+    const secretText = `${"TOPSECRET line\n".repeat(200)}`;
+    writeFileSync(join(other, "secret.txt"), secretText);
+    plain(other, "add", ".");
+    plain(other, "commit", "-q", "-m", "oops");
+    plain(other, "push", "-q", "origin", "oops");
+    const purgedBlob = plain(other, "rev-parse", "HEAD:secret.txt");
+    // The agent's fetch brings it into the cache; then the owner purges it.
+    expect((await agent(root, "ls-remote", URL)).code).toBe(0);
+    plain(upstream, "branch", "-D", "oops");
+    plain(upstream, "reflog", "expire", "--expire=now", "--all");
+    plain(upstream, "gc", "-q", "--prune=now");
+    // A commit on main whose secret.txt is the purged blob plus a line: its blob sent as a REF_DELTA on the purged one
+    // (copy all of it, add a line), as an agent that knows only the id could send it.
+    plain(other, "checkout", "-q", "-B", "derived", "origin/main");
+    writeFileSync(join(other, "secret.txt"), `${secretText}x\n`);
+    plain(other, "add", ".");
+    plain(other, "commit", "-q", "-m", "derived");
+    const tip = plain(other, "rev-parse", "HEAD");
+    const tree = plain(other, "rev-parse", "HEAD^{tree}");
+    const raw = (id: string, type: string) => execFileSync("git", ["-C", other, "cat-file", type, id]);
+    const header = (type: number, size: number) => {
+      const out = [((type << 4) | (size & 0x0f)) | (size > 0x0f ? 0x80 : 0)];
+      let n = size >> 4;
+      while (n > 0) {
+        out.push((n & 0x7f) | (n > 0x7f ? 0x80 : 0));
+        n >>= 7;
+      }
+      return Buffer.from(out);
+    };
+    const varint = (value: number) => {
+      const out: number[] = [];
+      let v = value;
+      do {
+        out.push((v & 0x7f) | (v > 0x7f ? 0x80 : 0));
+        v >>= 7;
+      } while (v > 0);
+      return Buffer.from(out);
+    };
+    const src = Buffer.byteLength(secretText);
+    const delta = Buffer.concat([varint(src), varint(src + 2), Buffer.from([0x80 | 0x10 | 0x20, src & 0xff, (src >> 8) & 0xff]), Buffer.from([2]), Buffer.from("x\n")]);
+    const entries = [
+      Buffer.concat([header(1, raw(tip, "commit").length), deflateSync(raw(tip, "commit"))]),
+      Buffer.concat([header(2, raw(tree, "tree").length), deflateSync(raw(tree, "tree"))]),
+      Buffer.concat([header(7, delta.length), Buffer.from(purgedBlob, "hex"), deflateSync(delta)]),
+    ];
+    const head = Buffer.from([0x50, 0x41, 0x43, 0x4b, 0, 0, 0, 2, 0, 0, 0, entries.length]);
+    const body = Buffer.concat([head, ...entries]);
+    const pack = Buffer.concat([body, createHash("sha1").update(body).digest()]);
+    // It is thin: it doesn't stand on its own.
+    const empty = join(root, "empty.git");
+    plain(root, "init", "-q", "--bare", empty);
+    expect(spawnSync("git", ["-C", empty, "index-pack", "--stdin"], { input: pack }).status).not.toBe(0);
+    const s = gw.forSession("s1");
+    const p = Bun.spawn([s.ext, "git-receive-pack", URL], { env: { PATH: process.env.PATH ?? "", CODEOID_GIT_GATEWAY: s.socket }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const reader = p.stdout.getReader();
+    let got = "";
+    while (!got.endsWith("0000")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      got += Buffer.from(value).toString("latin1");
+    }
+    const pkt = (x: string) => `${(x.length + 4).toString(16).padStart(4, "0")}${x}`;
+    p.stdin.write(`${pkt(`${"0".repeat(40)} ${tip} refs/heads/derived\0report-status\n`)}0000`);
+    p.stdin.write(pack);
+    p.stdin.end();
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    await p.exited;
+    expect(upstreamRef("refs/heads/derived")).toBe("");
+    expect(reports.some((e) => e.kind === "push" && !e.ok && /remote deleted it/.test(e.detail))).toBe(true);
+    // A thin push built on what the remote has still goes.
+    const work = await clone();
+    await agent(work, "checkout", "-q", "-b", "thin-ok");
+    writeFileSync(join(work, "a.txt"), "a\nmore\n");
+    await agent(work, "commit", "-qam", "thin ok");
+    expect((await agent(work, "push", "origin", "thin-ok")).code).toBe(0);
   });
 
   test("round 12: a disconnected remote's cache is removed", async () => {

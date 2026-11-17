@@ -1210,6 +1210,8 @@ export class Session {
   readonly createdByDelegate: boolean;
   /** Whether the autonomous mode in force (if it is) is the owner's own choice (decideGitPush). */
   #autonomousByOwner = true;
+  /** A dispatch worker: its autonomy is the fleet's whoever re-arms it (persisted as `fleetAutonomy`). */
+  #autonomyIsFleets = false;
   readonly createdAt: string;
   /**
    * Tenancy stamps captured at session creation (or restored from disk
@@ -1987,6 +1989,7 @@ export class Session {
     }
     this.createdBy = opts.auth.sub;
     this.createdByDelegate = opts.createdByDelegate ?? opts.auth.delegationDepth > 0;
+    this.#autonomyIsFleets = opts.autonomousByOwner === false;
     this.#autonomousByOwner = opts.initialMode?.mode === "autonomous" ? (opts.autonomousByOwner ?? !this.createdByDelegate) : true;
     // Restored from TranscriptMeta on resume, stamped fresh only for a new
     // session. Both were previously unconditional `now`, which meant every
@@ -2243,6 +2246,7 @@ export class Session {
         collaborationRole: this.collaborationRole,
         ...(this.workstreamAhead ? { workstream: this.workstreamAhead } : {}),
         createdByDelegate: this.createdByDelegate,
+        ...(this.#autonomyIsFleets ? { fleetAutonomy: true } : {}),
         // Fire-and-forget: saveMeta's write chain owns the failure log; an
         // unconsumed rejection here would be an unhandled-rejection crash.
       }).catch(() => {});
@@ -3624,7 +3628,8 @@ export class Session {
     this.#autonomousBudgetSpent = false;
     this.#mode = mode;
     // Autonomous as the owner's own choice (their undelegated token, or the daemon's own) or someone else's.
-    if (mode === "autonomous") this.#autonomousByOwner = !sender || (sender.sub === this.createdBy && sender.delegationDepth === 0);
+    // The daemon's own re-arm (no sender) of a dispatch worker is still the fleet's.
+    if (mode === "autonomous") this.#autonomousByOwner = sender ? sender.sub === this.createdBy && sender.delegationDepth === 0 : !this.#autonomyIsFleets;
     this.#turnsRemaining = mode === "autonomous" ? maxTurns : undefined;
     // A fresh autonomous budget is a new attempt's: the spent flag is the old one's.
     if (mode === "autonomous") this.#budgetExhausted = false;
@@ -12837,6 +12842,7 @@ export class Session {
       ...(this.#sandbox?.setting ? { sandbox: this.#sandbox.setting } : {}),
       ...(this.#backingFresh ? { backingFresh: true } : {}),
       createdByDelegate: this.createdByDelegate,
+      ...(this.#autonomyIsFleets ? { fleetAutonomy: true } : {}),
       ...(this.#redactedBackings.size > 0 ? { redactedBackings: [...this.#redactedBackings] } : {}),
       forkedFrom: this.forkedFrom,
       ...this.#backgroundMeta(),

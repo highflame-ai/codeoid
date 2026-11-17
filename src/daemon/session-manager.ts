@@ -1203,6 +1203,7 @@ export class SessionManager {
           ...(meta.sandbox ? { sandbox: meta.sandbox } : {}),
           // A meta from before codeoid recorded it: who made the session isn't known, so none of the owner's git access.
           createdByDelegate: meta.createdByDelegate !== false,
+          ...(meta.fleetAutonomy ? { autonomousByOwner: false } : {}),
           hooks: this.#hooks,
           identityManager: this.#identityManager,
           existingId: meta.sessionId,
