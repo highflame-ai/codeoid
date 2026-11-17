@@ -259,10 +259,11 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
     if (!(await rememberRefs(cache, false))) return { error: "codeoid couldn't read its copy of the remote" };
     // Unsettled until what it fetched is recorded: a fetch cut short (killed, a crash) that stored objects under no
     // ref leaves the mark, and the cache is pruned.
-    markUnsettled(cache, "refresh");
+    const mark = `refresh-${randomBytes(6).toString("hex")}`;
+    markUnsettled(cache, mark);
     const f = await runGit(["fetch", "--quiet", "--prune", "--prune-tags", "--no-write-fetch-head", "--", up.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], cache, env, left(), signal);
     if (f.code !== 0) return { error: gitError(f, "the remote couldn't be fetched") };
-    if (await rememberRefs(cache, false)) settle(cache, "refresh");
+    if (await rememberRefs(cache, false)) settle(cache, mark);
     // Every branch with its symref target, and HEAD (protocol v2's ls-refs symrefs).
     const h = await runGit(["ls-remote", "--symref", "--", up.url, "HEAD", "refs/heads/*"], cache, env, Math.min(left(), 60_000), signal, 256 * 1024 * 1024);
     const symrefs = new Set<string>();
@@ -329,13 +330,35 @@ async function refOids(cache: string): Promise<Set<string> | null> {
 
 /** Add the refs' ids now to what the cache has seen (`fresh`: start over from them). False: they couldn't be read. */
 // paths: the daemon's own cache repository: its record of refs seen, written (0600)
-export async function rememberRefs(cache: string, fresh: boolean): Promise<boolean> {
-  const now = await refOids(cache);
-  if (!now) return false;
-  const seen = fresh ? new Set<string>() : readSeen(cache);
-  if (seen === null) return false;
-  for (const o of now) seen.add(o);
-  // Written whole or not at all (a crash or a full disk mid-write leaves the old record).
+export async function rememberRefs(cache: string, fresh: boolean, forget: readonly string[] = []): Promise<boolean> {
+  return serialized(cache, async () => {
+    const now = await refOids(cache);
+    if (!now) return false;
+    const seen = fresh ? new Set<string>() : readSeen(cache);
+    if (seen === null) return false;
+    for (const o of forget) if (!now.has(o)) seen.delete(o);
+    for (const o of now) seen.add(o);
+    return writeSeen(cache, seen);
+  });
+}
+
+const seenWrites = new Map<string, Promise<unknown>>();
+
+/** One record update at a time per cache (a check fetch's ids are never lost to a concurrent rewrite). */
+function serialized<T>(cache: string, fn: () => Promise<T>): Promise<T> {
+  const prev = seenWrites.get(cache) ?? Promise.resolve();
+  const next = prev.then(fn, fn);
+  seenWrites.set(
+    cache,
+    next.catch(() => {}),
+  );
+  return next;
+}
+
+/** Write the record whole or not at all. */
+// paths: the daemon's own cache repository: its record of refs seen, written (0600) by rename
+function writeSeen(cache: string, seen: ReadonlySet<string>): boolean {
+  // A crash or a full disk mid-write leaves the old record.
   const tmp = `${seenFile(cache)}.${randomBytes(6).toString("hex")}`;
   try {
     writeFileSync(tmp, `${[...seen].join("\n")}\n`, { mode: 0o600 });
@@ -356,10 +379,21 @@ function packsOf(cache: string): string[] {
   }
 }
 
-/** Mark an operation that stores objects as under way (`id`), with the packs before it. */
+/** How many loose objects the cache holds (a dumb-HTTP fetch stores what it brings loose). */
+function looseCount(cache: string): number {
+  let n = 0;
+  try {
+    for (const d of readdirSync(join(cache, "objects"))) if (/^[0-9a-f]{2}$/.test(d)) n += readdirSync(join(cache, "objects", d)).length;
+  } catch {
+    /* none */
+  }
+  return n;
+}
+
+/** Mark an operation that stores objects as under way (`id`), with the packs and the loose count before it. */
 // paths: the daemon's own cache repository: a mark file, written (0600)
 export function markUnsettled(cache: string, id: string): void {
-  writeFileSync(join(cache, `codeoid-unsettled-${id}`), `${packsOf(cache).join("\n")}\n`, { mode: 0o600 });
+  writeFileSync(join(cache, `codeoid-unsettled-${id}`), `loose:${looseCount(cache)}\n${packsOf(cache).join("\n")}\n`, { mode: 0o600 });
 }
 
 /** The operation `id` recorded what it stored. */
@@ -382,21 +416,60 @@ function unsettledLeft(cache: string, active: ReadonlySet<string>): boolean {
     return false;
   }
   const packs = packsOf(cache);
+  const loose = looseCount(cache);
   let left = false;
   for (const n of names) {
     const id = n.slice("codeoid-unsettled-".length);
     if (active.has(id)) continue;
     let before: Set<string>;
+    let looseBefore = Number.POSITIVE_INFINITY;
     try {
-      before = new Set(readFileSync(join(cache, n), "utf8").split("\n").filter(Boolean));
+      const lines = readFileSync(join(cache, n), "utf8").split("\n").filter(Boolean);
+      looseBefore = Number(/^loose:(\d+)$/.exec(lines[0] ?? "")?.[1] ?? Number.NaN);
+      before = new Set(lines.slice(1));
     } catch {
       left = true;
       continue;
     }
-    if (packs.some((p) => !before.has(p))) left = true;
+    if (packs.some((p) => !before.has(p)) || !(loose <= looseBefore)) left = true;
     else rmSync(join(cache, n), { force: true });
   }
   return left;
+}
+
+/** The ids of the cache's branches and tags (what upload-pack advertises), and their names. */
+async function advertised(cache: string): Promise<{ oids: string[]; names: Set<string> } | null> {
+  const env = cacheEnv({ PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, cache);
+  const r = await runGit(["for-each-ref", "--format=%(objectname) %(refname)", "refs/heads/", "refs/tags/"], cache, env, 60_000, undefined, 256 * 1024 * 1024);
+  if (r.code !== 0 || r.truncated) return null;
+  const oids = new Set<string>();
+  const names = new Set<string>();
+  for (const l of r.stdout.split("\n")) {
+    const sp = l.indexOf(" ");
+    if (sp <= 0) continue;
+    oids.add(l.slice(0, sp));
+    names.add(l.slice(sp + 1));
+  }
+  return { oids: [...oids], names };
+}
+
+/** The cache's branch and tag names (a `deepen-not` must name one). */
+export async function advertisedNames(cache: string): Promise<Set<string>> {
+  return (await advertised(cache))?.names ?? new Set();
+}
+
+/** Which of `ids` the cache's branches and tags reach (an error: none). */
+// paths: git cat-file and rev-list on the daemon's cache, read only
+export async function reachedFromRefs(cache: string, ids: readonly string[]): Promise<Set<string>> {
+  const present = await cacheHas(cache, [...new Set(ids)]);
+  if ("error" in present || present.length === 0) return new Set();
+  const refs = await advertised(cache);
+  if (!refs) return new Set();
+  const env = cacheEnv({ PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_NO_REPLACE_OBJECTS: "1" }, cache);
+  const r = await gitLines(["rev-list", "--objects", "--no-object-names", "--stdin"], cache, env, [...present, ...refs.oids.map((o) => `^${o}`)], 60_000);
+  if ("error" in r) return new Set();
+  const unreached = new Set(r.lines);
+  return new Set(present.filter((id) => !unreached.has(id)));
 }
 
 /** Remove the check refs of pushes no longer running (a daemon stopped mid-check left them). */
@@ -436,14 +509,14 @@ export async function cacheDirty(cache: string, active: ReadonlySet<string> = ne
   const present = await cacheHas(cache, dropped);
   if ("error" in present) return true;
   if (present.length === 0) {
-    await rememberRefs(cache, true);
+    await rememberRefs(cache, false, dropped);
     return false;
   }
   const r = await gitLines(["rev-list", "--objects", "--no-object-names", "--stdin"], cache, env, [...present, ...[...now].map((o) => `^${o}`)], 120_000, () => true);
   if ("error" in r) return true;
   if (r.stopped) return true;
-  // The dropped refs reach nothing the others don't (a merged branch deleted): nothing to prune.
-  await rememberRefs(cache, true);
+  // The dropped refs reach nothing the others don't (a merged branch deleted): nothing to prune; those ids are let go.
+  await rememberRefs(cache, false, dropped);
   return false;
 }
 
@@ -528,9 +601,14 @@ export async function objectsNotSent(cache: string, objects: { dir: string; alte
   if ("error" in sent) return sent.error;
   const all = [...new Set([...candidates.lines, ...sent.lines])];
   if (all.length === 0) return null;
+  // What the push brought that its new tips don't use and the cache didn't hold: kept in the shared cache, used by
+  // nothing, it isn't codeoid's to keep (it would turn another session's push of that content into a refusal).
+  const used = new Set(candidates.lines);
   const check = await gitLines(["cat-file", "--batch-check=%(objectname) %(objecttype)"], cache, kept, all, left());
   if ("error" in check) return check.error;
   const suspects = new Set(check.lines.filter((l) => !l.endsWith(" missing")).map((l) => l.split(" ")[0] ?? ""));
+  const unused = sent.lines.find((id) => !used.has(id) && !suspects.has(id));
+  if (unused) return `the push carries an object its branches don't use (${unused.slice(0, 12)}): push only what the branches hold`;
   if (suspects.size === 0) return null;
   // Each must be reached by one of the remote's refs.
   const reached = await gitLines(refs ? ["rev-list", "--objects", "--no-object-names", "--stdin"] : ["rev-list", "--objects", "--no-object-names", "--use-bitmap-index", "--all"], cache, kept, refs ? [...refs] : null, left(), (id) => {

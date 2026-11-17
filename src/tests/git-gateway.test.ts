@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import { type GatewayHost, type GatewayPush, GitGateway } from "../daemon/git-gateway/gateway.js";
 import { refUpdateProblem } from "../daemon/git-gateway/policy.js";
-import { cacheDirty, configEnv, pruneCache } from "../daemon/git-gateway/upstream.js";
+import { cacheDirty, configEnv, pruneCache, rememberRefs } from "../daemon/git-gateway/upstream.js";
 
 let root: string;
 let upstream: string;
@@ -702,6 +702,99 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(spawnSync("git", ["-C", cache, "cat-file", "-e", blob]).status).not.toBe(0);
     expect(readdirSync(cache).filter((n) => n.startsWith("codeoid-unsettled-"))).toEqual([]);
     expect(await cacheDirty(cache)).toBe(false);
+  });
+
+  test("round 18: a shallow clone and a deepen go through the gateway's reading; a push carrying an object its branch doesn't use is refused", async () => {
+    // More history, then a shallow clone and a deepen.
+    const seed = join(root, "seed");
+    for (const n of ["h1", "h2", "h3"]) {
+      writeFileSync(join(seed, `${n}.txt`), `${n}\n`);
+      plain(seed, "add", ".");
+      plain(seed, "commit", "-q", "-m", n);
+    }
+    plain(seed, "push", "-q", "origin", "main");
+    const shallow = join(root, "shallow");
+    expect((await agent(root, "clone", "-q", "--depth", "1", URL, shallow)).code).toBe(0);
+    expect(plain(shallow, "rev-list", "--count", "HEAD")).toBe("1");
+    expect((await agent(shallow, "fetch", "-q", "--deepen", "2")).code).toBe(0);
+    expect(plain(shallow, "rev-list", "--count", "HEAD")).toBe("3");
+    // A raw push of a new branch whose pack also carries an unrelated blob.
+    const work = await clone();
+    await agent(work, "checkout", "-q", "-b", "extra");
+    const tip = await commit(work, "extra");
+    const extra = execFileSync("git", ["-C", work, "hash-object", "-w", "--stdin"], { input: "an object no branch uses\n" }).toString().trim();
+    const objects = execFileSync("git", ["-C", work, "rev-list", "--objects", "--no-object-names", tip, "--not", "origin/main"]).toString().trim().split("\n");
+    const pack = execFileSync("git", ["-C", work, "pack-objects", "--stdout", "-q"], { input: `${[...objects, extra].join("\n")}\n` });
+    const s = gw.forSession("s1");
+    const p = Bun.spawn([s.ext, "git-receive-pack", URL], { env: { PATH: process.env.PATH ?? "", CODEOID_GIT_GATEWAY: s.socket }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const reader = p.stdout.getReader();
+    let got = "";
+    while (!got.endsWith("0000")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      got += Buffer.from(value).toString("latin1");
+    }
+    const pkt = (x: string) => `${(x.length + 4).toString(16).padStart(4, "0")}${x}`;
+    p.stdin.write(`${pkt(`${"0".repeat(40)} ${tip} refs/heads/extra\0report-status\n`)}0000`);
+    p.stdin.write(pack);
+    p.stdin.end();
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    await p.exited;
+    expect(upstreamRef("refs/heads/extra")).toBe("");
+    expect(reports.some((e) => e.kind === "push" && !e.ok && /doesn't use|don't use/.test(e.detail))).toBe(true);
+    // The same push, as git makes it, goes.
+    expect((await agent(work, "push", "origin", "extra")).code).toBe(0);
+    expect(upstreamRef("refs/heads/extra")).toBe(tip);
+  });
+
+  test("round 18: a shallow line naming a commit the cache holds but no ref reaches serves nothing of it (whatever the cleanup missed)", async () => {
+    const other = join(root, "other");
+    plain(root, "clone", "-q", upstream, other);
+    plain(other, "checkout", "-q", "-b", "oops");
+    writeFileSync(join(other, "secret.txt"), "TOPSECRET-R18\n");
+    plain(other, "add", ".");
+    plain(other, "commit", "-q", "-m", "oops");
+    plain(other, "rm", "-q", "secret.txt");
+    plain(other, "commit", "-q", "-m", "removed");
+    const tip = plain(other, "rev-parse", "HEAD");
+    const secretBlob = plain(other, "rev-parse", "HEAD~1:secret.txt");
+    expect((await agent(root, "ls-remote", URL)).code).toBe(0);
+    const cache = gw.cachePath(`u:${URL}`);
+    // The commits in the cache under no ref, and no record of them (a gap the cleanup didn't see).
+    plain(cache, "fetch", "-q", other, "oops:refs/tmp/x");
+    plain(cache, "update-ref", "-d", "refs/tmp/x");
+    expect(await rememberRefs(cache, true)).toBe(true);
+    expect(await cacheDirty(cache)).toBe(false);
+    const main = plain(cache, "rev-parse", "refs/heads/main");
+    const s = gw.forSession("s1");
+    const p = Bun.spawn([s.ext, "git-upload-pack", URL], { env: { PATH: process.env.PATH ?? "", CODEOID_GIT_GATEWAY: s.socket }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const reader = p.stdout.getReader();
+    let got = Buffer.alloc(0);
+    while (!got.toString("latin1").endsWith("0000")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      got = Buffer.concat([got, Buffer.from(value)]);
+    }
+    const pkt = (x: string) => `${(x.length + 4).toString(16).padStart(4, "0")}${x}`;
+    // As the round-15 report sent it: unshallow from the purged commit (its parent holds the secret).
+    p.stdin.write(`${pkt(`want ${main} shallow\n`)}${pkt(`shallow ${tip}\n`)}${pkt("deepen 2147483647\n")}0000${pkt("done\n")}`);
+    p.stdin.end();
+    let reply = Buffer.alloc(0);
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      reply = Buffer.concat([reply, Buffer.from(value)]);
+    }
+    await p.exited;
+    const at = reply.indexOf("PACK");
+    const empty = join(root, "got.git");
+    plain(root, "init", "-q", "--bare", empty);
+    if (at >= 0) spawnSync("git", ["-C", empty, "index-pack", "--stdin", "--fix-thin"], { input: reply.subarray(at) });
+    expect(spawnSync("git", ["-C", empty, "cat-file", "-e", secretBlob]).status).not.toBe(0);
+    expect(reply.toString("latin1")).not.toContain(tip);
   });
 
   test("round 12: a disconnected remote's cache is removed", async () => {

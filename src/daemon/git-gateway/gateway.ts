@@ -21,7 +21,8 @@ import { within } from "../physical-path.js";
 import { type PushPolicy, type RefUpdate, refUpdateProblem } from "./policy.js";
 import { type GatewayScripts, writeGatewayScripts } from "./scripts.js";
 import { redactCredentials, shownGitUrl } from "./text.js";
-import { cacheDirty, cacheHas, cacheRef, configEnv, dropCheckRefs, fetchCheckRefs, isAncestor, objectsNotSent, pruneCache, pushUpstream, refreshCache, remoteRefs, type RemoteState, sweepCheckRefs, type Upstream } from "./upstream.js";
+import { advertisedNames, cacheDirty, cacheHas, cacheRef, configEnv, dropCheckRefs, fetchCheckRefs, isAncestor, objectsNotSent, pruneCache, pushUpstream, reachedFromRefs, refreshCache, remoteRefs, type RemoteState, sweepCheckRefs, type Upstream } from "./upstream.js";
+import { UploadFilter } from "./upload-filter.js";
 
 export type GitService = "git-upload-pack" | "git-receive-pack";
 
@@ -264,7 +265,8 @@ export class GitGateway {
       const since = Date.now();
       const generation = this.#generations.get(grant.cacheKey) ?? 0;
       const disconnected = () => (this.#generations.get(grant.cacheKey) ?? 0) !== generation;
-      const fresh = await this.#locked(grant.cacheKey, async () => {
+      const fresh = await this.#locked(grant.cacheKey, async (): Promise<RemoteState | { error: string }> => {
+       try {
         // Its agent gone while it waited (no clone started for nobody), or the connection removed meanwhile.
         if (gone.signal.aborted) return { error: "the agent's git was gone" };
         if (disconnected()) return { error: `${shownGitUrl(url)} was disconnected` };
@@ -289,6 +291,10 @@ export class GitGateway {
           c.destroy();
         });
         return r;
+       } catch (err) {
+        // Anything that throws is an answer, never a git left waiting for one.
+        return { error: `codeoid's copy of the remote couldn't be brought up to date (${err instanceof Error ? err.message : String(err)})` };
+       }
       });
       if (gone.signal.aborted) return;
       if (disconnected()) return fail(`${shownGitUrl(url)} was disconnected`);
@@ -361,6 +367,20 @@ export class GitGateway {
       // A push's commands (pkt-lines, to the first flush) are read on the way: a ref name with a control character
       // (a line feed would make two lines of the hook's input of one command) ends the request before git sees it.
       const commands = service === "git-receive-pack" ? new CommandReader() : null;
+      // A fetch's lines are read on the way too: nothing in them names an object no ref reaches (upload-filter.ts).
+      const filter =
+        service === "git-upload-pack"
+          ? new UploadFilter(
+              (ids) => reachedFromRefs(cache, ids),
+              () => advertisedNames(cache),
+              (b) => p.stdin.write(b),
+              () => {
+                ended = true;
+                c.destroy();
+              },
+            )
+          : null;
+      const endInput = () => (filter ? filter.end(() => p.stdin.end()) : p.stdin.end());
       const take = (d: Buffer) => {
         if (ended) return;
         buf = buf.length ? Buffer.concat([buf, d]) : d;
@@ -373,7 +393,7 @@ export class GitGateway {
           }
           if (n === 0) {
             ended = true;
-            p.stdin.end();
+            endInput();
             return;
           }
           if (buf.length < 4 + n) return;
@@ -383,14 +403,15 @@ export class GitGateway {
             c.destroy();
             return;
           }
-          p.stdin.write(chunk);
+          if (filter) filter.push(Buffer.from(chunk));
+          else p.stdin.write(chunk);
           buf = buf.subarray(4 + n);
         }
       };
       c.on("data", take);
       take(Buffer.alloc(0));
       c.on("end", () => {
-        if (!ended) p.stdin.end();
+        if (!ended) endInput();
       });
       p.stdout.pipe(c, { end: false });
       const finish = (code: number | null) => {
