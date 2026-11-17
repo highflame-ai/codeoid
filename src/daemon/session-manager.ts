@@ -154,7 +154,7 @@ import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
-import { canonicalAddedDirs, effectiveSetting, openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { canonicalAddedDirs, effectiveSetting, openCheckSandbox, repositoryForRewrites, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import { checkPinned, type PinnedDir, PinnedPathError } from "./sandbox/pinned.js";
 import { sandboxRootIfMade } from "./sandbox/root.js";
 import { hiddenPathsFor, sandboxConfigOf } from "./sandbox/policy.js";
@@ -4855,11 +4855,13 @@ mcpHub: this.#mcpHub,
     }
     // What a connect from a repository would connect: the CLI shows it, and asks, first.
     // The URL git really uses there (the owner's own rewrite applied): what is shown, asked and connected.
+    // The repository's top, its files plain (its git asked where the owner's rules send the URL; a subdirectory too).
+    const repoDir = msg.url || !msg.path ? undefined : repositoryForRewrites(msg.path);
     if (msg.action === "resolve") {
       // As the owner's git in that repository would (its includes and its own rules count).
-      const used = msg.url ? url : ownerRewrite(url, msg.path);
+      const used = msg.url ? url : ownerRewrite(url, repoDir);
       // git applies insteadOf to an explicit pushurl, and pushInsteadOf only to a url used for pushing.
-      const pushUsed = msg.url ? url : pushurl ? ownerRewrite(pushurl, msg.path) : ownerPushRewrite(url, msg.path);
+      const pushUsed = msg.url ? url : pushurl ? ownerRewrite(pushurl, repoDir) : ownerPushRewrite(url, repoDir);
       return {
         type: "response.ok",
         requestId: msg.id,
@@ -4875,7 +4877,7 @@ mcpHub: this.#mcpHub,
     }
     if (msg.action === "disconnect") {
       // From a repository: the URL as written and as the owner's git uses it (connect connected the latter).
-      const written = msg.url ? [url] : [url, ownerRewrite(url, msg.path), ownerPushRewrite(url, msg.path), ...(pushurl ? [pushurl, ownerRewrite(pushurl, msg.path)] : [])];
+      const written = msg.url ? [url] : [url, ownerRewrite(url, repoDir), ownerPushRewrite(url, repoDir), ...(pushurl ? [pushurl, ownerRewrite(pushurl, repoDir)] : [])];
       const forms = [...new Set(written.flatMap((u) => [u, ...sameRepoSpellings(u)]))];
       let removed = false;
       for (const u of forms) {

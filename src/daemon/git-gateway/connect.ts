@@ -322,7 +322,10 @@ export async function probeConnection(
  */
 // paths: git ls-remote --get-url from /, which only reads config
 export function ownerRewrite(url: string, dir?: string): string {
-  if (dir) return rewriteIn(dir, url, false) ?? url;
+  if (dir) {
+    const inRepo = rewriteIn(dir, url, false);
+    if (inRepo !== null) return inRepo;
+  }
   try {
     const r = spawnSync(GIT_BIN, ["-C", "/", "ls-remote", "--get-url", "--", url], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
     const out = r.status === 0 ? r.stdout.trim() : "";
@@ -332,6 +335,8 @@ export function ownerRewrite(url: string, dir?: string): string {
   }
 }
 
+const hungRepos = new Map<string, number>();
+
 /**
  * Where the owner's git, working in the repository at `dir`, fetches (or pushes) `url`: git's own answer there, so a
  * rule in a conditional include (`includeIf "gitdir:…"`) or in the repository's own config counts as it does for
@@ -340,14 +345,25 @@ export function ownerRewrite(url: string, dir?: string): string {
  */
 // paths: git config read in the session's repository (url.* rules), nothing run
 function rewriteIn(dir: string, url: string, push: boolean): string | null {
-  const run = (args: string[]) => spawnSync(GIT_BIN, ["-C", dir, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args], { cwd: dir, env: { ...ownerHelperEnv(), GIT_CEILING_DIRECTORIES: dirname(dir) }, encoding: "utf8", timeout: 5_000 });
+  // A repository whose git once didn't answer in time (a FIFO it reads: the agent can make one) isn't asked again for
+  // a while: this run blocks the daemon, so it is short, and it isn't repeated.
+  const hung = hungRepos.get(dir);
+  if (hung && hung > Date.now()) return null;
+  const run = (args: string[]) => {
+    const r = spawnSync(GIT_BIN, ["-C", dir, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args], { cwd: dir, env: { ...ownerHelperEnv(), GIT_CEILING_DIRECTORIES: dirname(dir) }, encoding: "utf8", timeout: 1_000, killSignal: "SIGKILL" });
+    if (r.error || r.signal) hungRepos.set(dir, Date.now() + 10 * 60_000);
+    return r;
+  };
   try {
     const f = run(["ls-remote", "--get-url", "--", url]);
     const fetched = f.status === 0 ? (f.stdout.trim().split("\n")[0] ?? "") : "";
+    if (f.error || f.signal || f.status !== 0) return null;
     const fetchUrl = fetched && !/\s/.test(fetched) ? fetched : url;
     if (!push) return fetchUrl;
     // pushInsteadOf, the longest match, as git applies it (its includes and the repository's own config read there).
     const r = run(["config", "--null", "--get-regexp", "^url\\..*\\.pushinsteadof$"]);
+    // 1: none matched (no rule), which is an answer; anything else that isn't 0 isn't one.
+    if (r.error || r.signal || (r.status !== 0 && r.status !== 1)) return null;
     let best: { base: string; prefix: string } | null = null;
     for (const entry of (r.status === 0 ? r.stdout : "").split("\0")) {
       const nl = entry.indexOf("\n");
@@ -368,7 +384,10 @@ function rewriteIn(dir: string, url: string, push: boolean): string | null {
  */
 // paths: git config read from /, which runs nothing
 export function ownerPushRewrite(url: string, dir?: string): string {
-  if (dir) return rewriteIn(dir, url, true) ?? url;
+  if (dir) {
+    const inRepo = rewriteIn(dir, url, true);
+    if (inRepo !== null) return inRepo;
+  }
   try {
     const r = spawnSync(GIT_BIN, ["-C", "/", "config", "--null", "--get-regexp", "^url\\..*\\.pushinsteadof$"], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
     let best: { base: string; prefix: string } | null = null;

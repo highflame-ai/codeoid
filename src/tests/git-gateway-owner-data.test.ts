@@ -272,3 +272,36 @@ describe("round 31: the owner's rewrites as git applies them in the repository",
     expect(gatewayRoutes([connected], [], { off: false, rewrite: toSsh, pushRewrite: toSsh })).toEqual([{ from: connected, fetch: connected, push: connected }]);
   });
 });
+
+describe("round 32: the repository's files are read without blocking, and asked only when plain", () => {
+  test("a FIFO config or HEAD: nothing blocks, the repository isn't asked; a subdirectory finds its top", async () => {
+    const { workspaceRemoteUrls, repositoryForRewrites, gatewayRoutes } = await import("../daemon/sandbox/session-sandbox.js");
+    const { ownerPushRewrite } = await import("../daemon/git-gateway/connect.js");
+    process.env.HOME = home;
+    const repo = join(home, "proj");
+    mkdirSync(join(repo, "sub"), { recursive: true });
+    spawnSync("git", ["init", "-q", repo]);
+    spawnSync("git", ["-C", repo, "remote", "add", "origin", "https://github.com/acme/app.git"]);
+    spawnSync("git", ["-C", repo, "config", "url.git@github.com:me/.pushInsteadOf", "https://github.com/acme/"]);
+    // A subdirectory: its repository's top is asked, and the repository's rule applies.
+    expect(repositoryForRewrites(join(repo, "sub"))).toBe(repo);
+    expect(ownerPushRewrite("https://github.com/acme/app.git", repositoryForRewrites(join(repo, "sub")))).toBe("git@github.com:me/app.git");
+    // The config a FIFO: read at once as nothing, the repository not asked.
+    rmSync(join(repo, ".git", "config"));
+    spawnSync("mkfifo", [join(repo, ".git", "config")]);
+    const t = Date.now();
+    expect(workspaceRemoteUrls(repo)).toEqual([]);
+    expect(repositoryForRewrites(repo)).toBeUndefined();
+    expect(Date.now() - t).toBeLessThan(2_000);
+    // HEAD a FIFO: not asked either.
+    rmSync(join(repo, ".git", "config"));
+    writeFileSync(join(repo, ".git", "config"), "[core]\n\trepositoryformatversion = 0\n");
+    rmSync(join(repo, ".git", "HEAD"));
+    spawnSync("mkfifo", [join(repo, ".git", "HEAD")]);
+    expect(repositoryForRewrites(repo)).toBeUndefined();
+    // An insteadOf to an http:// mirror (the gateway reaches only ssh and https): the connected URL, as before.
+    const connected = "https://github.com/acme/app.git";
+    const httpMirror = (u: string) => (u === connected ? "http://mirror.local/acme/app.git" : u);
+    expect(gatewayRoutes([connected], [], { off: false, rewrite: httpMirror, pushRewrite: httpMirror })).toEqual([{ from: connected, fetch: connected, push: connected }]);
+  });
+});

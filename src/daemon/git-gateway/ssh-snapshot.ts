@@ -104,7 +104,7 @@ function glob(pattern: string): { paths: string[]; dirs: string[] } | null {
 
 /** A regular file's text, read without blocking (a FIFO or device is never read); null if not one. */
 // paths: the owner's ssh config files, opened non-blocking, read only when regular
-function readRegular(file: string): string | null {
+export function readRegular(file: string): string | null {
   let fd: number;
   try {
     fd = openSync(file, constants.O_RDONLY | constants.O_NONBLOCK);

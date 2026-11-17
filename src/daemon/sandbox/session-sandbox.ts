@@ -13,7 +13,7 @@
  * starts on it.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
@@ -25,6 +25,7 @@ import { CWD_FROM_CALLER } from "./docker.js";
 import { ownerConfigFiles, ownerPushRewrite, ownerRewrite } from "../git-gateway/connect.js";
 import { buildSandboxSpec, type GitGatewaySpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
 import { normalizeRemote } from "../workstreams/match.js";
+import { readRegular } from "../git-gateway/ssh-snapshot.js";
 import {
   addedDirProblem,
   addedDirReal,
@@ -1128,7 +1129,7 @@ export class SessionSandbox {
     const g = this.#gitGateway();
     if (!g) return undefined;
     // Where the owner's git, in this workspace, sends each URL (its includes and the repository's own rules count).
-    const repo = gitLayoutOf(workspace) ? workspace : undefined;
+    const repo = repositoryForRewrites(workspace);
     const routes = gatewayRoutes(g.urls, workspaceRemoteUrls(workspace), { off: network.mode !== "on", rewrite: (u) => ownerRewrite(u, repo), pushRewrite: (u) => ownerPushRewrite(u, repo) });
     return { ...g, urls: [...new Set(routes.flatMap((r) => [r.fetch, r.push].filter((x): x is string => !!x)))], routes };
   }
@@ -1501,7 +1502,10 @@ export function workspaceRemoteUrls(workspace: string): string[] {
     const layout = gitLayoutOf(workspace);
     const common = layout?.common;
     if (!common) return [];
-    const text = readFileSync(join(common, "config"), "utf8");
+    // Read without blocking, and only a plain file: an agent can make the config a FIFO, which a blocking read would
+    // wait on for ever (the whole daemon with it).
+    const text = readRegular(join(common, "config"));
+    if (text === null) return [];
     const out: string[] = [];
     let inRemote = false;
     for (const raw of text.split("\n")) {
@@ -1543,7 +1547,8 @@ export function gatewayRoutes(connectedUrls: readonly string[], workspaceRemotes
     const pushTo = testFile(w) ? w : o.pushRewrite(w);
     // The rewrite connected: that; the same repository by another transport: the connected URL; another repository:
     // the rewrite (the gateway refuses it or offers to connect it), as the owner's git would reach it.
-    const fetch = connected.has(rewritten) || !sameRepository(rewritten, w) ? rewritten : w;
+    // (A rewrite the gateway can't reach at all, an http:// or local mirror: the connected URL, as before.)
+    const fetch = connected.has(rewritten) || (!sameRepository(rewritten, w) && (kindOf(rewritten) !== null || testFile(rewritten))) ? rewritten : w;
     const push = pushTo === rewritten ? fetch : pushTo;
     routes.push({ from: w, fetch, push });
   }
@@ -1561,4 +1566,24 @@ function sameRepository(a: string, b: string): boolean {
   if (a === b) return true;
   const na = normalizeRemote(a);
   return !!na && na === normalizeRemote(b);
+}
+
+/**
+ * The top of the repository a workspace is in, for asking its git where the owner's rules send a URL; null when its
+ * own files (its HEAD, its config, a worktree's) aren't plain files (a FIFO an agent made would hold the run up).
+ */
+// paths: a look at the repository's git files (stat), nothing read or run
+export function repositoryForRewrites(workspace: string): string | undefined {
+  const layout = gitLayoutOf(workspace);
+  if (!layout?.common) return undefined;
+  const gitDir = layout.own ?? layout.common;
+  const plain = (p: string, required: boolean) => {
+    try {
+      return statSync(p).isFile();
+    } catch {
+      return !required;
+    }
+  };
+  if (!plain(join(gitDir, "HEAD"), true) || !plain(join(layout.common, "config"), true) || !plain(join(gitDir, "config.worktree"), false)) return undefined;
+  return dirname(layout.dotgit);
 }
