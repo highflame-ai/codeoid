@@ -261,7 +261,13 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
     // ref leaves the mark, and the cache is pruned.
     const mark = `refresh-${randomBytes(6).toString("hex")}`;
     markUnsettled(cache, mark);
-    const f = await runGit(["fetch", "--quiet", "--prune", "--prune-tags", "--no-write-fetch-head", "--", up.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], cache, env, left(), signal);
+    const fetchArgs = ["fetch", "--quiet", "--prune", "--prune-tags", "--no-write-fetch-head", "--", up.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"];
+    let f = await runGit(fetchArgs, cache, env, left(), signal);
+    // A ref lock another git held a moment (a stale one a killed git left is swept): tried once more.
+    if (f.code !== 0 && /cannot lock ref|unable to (?:update|lock)|Unable to create '.*\.lock'/i.test(f.stderr)) {
+      sweepLocks(cache);
+      f = await runGit(fetchArgs, cache, env, left(), signal);
+    }
     if (f.code !== 0) return { error: gitError(f, "the remote couldn't be fetched") };
     if (await rememberRefs(cache, false)) settle(cache, mark);
     // Every branch with its symref target, and HEAD (protocol v2's ls-refs symrefs).

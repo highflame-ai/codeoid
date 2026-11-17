@@ -83,6 +83,8 @@ interface Ticket {
   disconnected: () => boolean;
   /** Called when the push's hook starts (receive-pack has the whole pack): the serve reads the socket again. */
   onHook?: () => void;
+  /** Ends this push's ref-update window (called when its receive-pack exits). */
+  releaseRefUpdate?: () => void;
 }
 
 const MAX_HEADER = 64 * 1024;
@@ -299,7 +301,8 @@ export class GitGateway {
           stop = new AbortController();
           this.#cloneStops.set(grant.cacheKey, stop);
         }
-        const r = await refreshCache(cache, upstream, grant.ssh, this.#upstreamTimeoutMs, gone.signal, stop.signal);
+        // Not while a push's receive-pack updates the cache's refs (see #enterRefUpdate).
+        const r = await this.#refreshing(grant.cacheKey, () => refreshCache(cache, upstream, grant.ssh, this.#upstreamTimeoutMs, gone.signal, stop.signal));
         if ("error" in r && /timed out/.test(r.error)) this.#down.set(grant.cacheKey, { until: Date.now() + 60_000, error: r.error });
         else if (!("error" in r)) this.#down.delete(grant.cacheKey);
         // The remote deleted or rewrote something (judged from every ref the cache has had, however that refresh
@@ -312,6 +315,8 @@ export class GitGateway {
         }
         if ("error" in r) return r;
         served.leave = this.#enter(grant.cacheKey, service === "git-upload-pack" ? "fetch" : "push", () => {
+          // Stopped for a prune: said and recorded (the agent's git just sees its connection end).
+          this.#host.report(sessionId, { kind: service === "git-upload-pack" ? "fetch" : "push", url, ok: false, detail: "stopped: codeoid was clearing what the remote deleted from its copy (try again)" });
           gone.abort();
           c.destroy();
         });
@@ -428,6 +433,7 @@ export class GitGateway {
       let paused = false;
       let hookPhase = false;
       const write = (b: Buffer) => {
+        lastWrite = Date.now();
         if (p.stdin.write(b) || paused) return;
         paused = true;
         c.pause();
@@ -436,10 +442,21 @@ export class GitGateway {
           c.resume();
         });
       };
-      // git's stdin isn't ended when the client's input ends: neither service needs an EOF (a pack says where it ends,
-      // a fetch ends at its `done` or flush), and on Bun 1.3 an end right after a write can drop that write's last
-      // bytes (a large push's pack cut short: "early EOF"). It closes when git exits; the request's limit bounds the rest.
-      const endStdin = () => {};
+      // git's stdin is ended a moment after the client's input ended and its last write went out: on Bun 1.3 an end
+      // right after a write can drop that write's last bytes (a large push's pack cut short: "early EOF"), and a
+      // client whose own pack failed half way must still be answered (git waits for the rest until its input ends).
+      let lastWrite = Date.now();
+      const endStdin = () => {
+        const tryEnd = () => {
+          if (p.exitCode !== null || p.stdin.destroyed) return;
+          if (paused || p.stdin.writableLength > 0 || Date.now() - lastWrite < 1_000) {
+            setTimeout(tryEnd, 200).unref?.();
+            return;
+          }
+          p.stdin.end();
+        };
+        setTimeout(tryEnd, 200).unref?.();
+      };
       const t = this.#tickets.get(ticket);
       if (t) {
         t.onHook = () => {
@@ -488,6 +505,8 @@ export class GitGateway {
       });
       p.stdout.pipe(c, { end: false });
       const finish = (code: number | null) => {
+        t?.releaseRefUpdate?.();
+        if (t) t.releaseRefUpdate = undefined;
         c.end();
         done(code);
       };
@@ -502,6 +521,40 @@ export class GitGateway {
         }
       });
     });
+  }
+
+  /** Per cache: pushes in their ref-update window, and whether a refresh is fetching into its refs. */
+  readonly #refUpdates = new Map<string, number>();
+  readonly #fetching = new Set<string>();
+
+  /** Run a refresh's fetch once no push is updating the cache's refs; none starts until it's done. */
+  async #refreshing<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    while ((this.#refUpdates.get(key) ?? 0) > 0) await new Promise((r) => setTimeout(r, 20));
+    this.#fetching.add(key);
+    try {
+      return await fn();
+    } finally {
+      this.#fetching.delete(key);
+    }
+  }
+
+  /** Enter a push's ref-update window once no refresh is fetching; the returned function leaves it (once). */
+  async #enterRefUpdate(key: string): Promise<() => void> {
+    while (this.#fetching.has(key)) await new Promise((r) => setTimeout(r, 20));
+    this.#refUpdates.set(key, (this.#refUpdates.get(key) ?? 0) + 1);
+    let left = false;
+    // Bounded: a receive-pack that never exits doesn't hold refreshes off for ever.
+    const timer = setTimeout(() => leave(), 5 * 60_000);
+    timer.unref?.();
+    const leave = () => {
+      if (left) return;
+      left = true;
+      clearTimeout(timer);
+      const n = (this.#refUpdates.get(key) ?? 1) - 1;
+      if (n > 0) this.#refUpdates.set(key, n);
+      else this.#refUpdates.delete(key);
+    };
+    return leave;
   }
 
   /** Note what is served on a cache (a fetch, a push and its upstream push) until the returned function is called. */
@@ -649,7 +702,8 @@ export class GitGateway {
         if (fetched) return refuse(fetched);
         known = await cacheHas(t.cache, now.map((r) => r.oid));
         if ("error" in known) return refuse(known.error);
-        if (new Set(known).size < new Set(now.map((r) => r.oid)).size) return refuse("the remote changed while codeoid checked the push: push again");
+        // Still some the cache doesn't have (the remote moved on again, other pushes landing): judged against what it
+        // knows. A ref it doesn't know can only make more reachable, so nothing the remote deleted gets through this way.
       }
       late = await objectsNotSent(t.cache, objects, updates.map((u) => u.new), known);
     } finally {
@@ -674,6 +728,9 @@ export class GitGateway {
     }
     say(`codeoid pushed ${updates.map((u) => u.ref.replace(/^refs\/heads\//, "")).join(", ")} to ${shownGitUrl(t.url)}`);
     this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: true, detail: `pushed to ${shownGitUrl(t.url)}`, updates });
+    // receive-pack updates the cache's refs right after this "ok": never while a refresh fetches into them (the two
+    // would fight over the ref locks). Held until that receive-pack exits.
+    t.releaseRefUpdate = await this.#enterRefUpdate(t.grant.cacheKey);
     verdict(true);
   }
 }

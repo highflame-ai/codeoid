@@ -896,6 +896,59 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(upstreamRef("refs/heads/big")).toBe(plain(work, "rev-parse", "HEAD"));
   }, 300_000);
 
+  test("round 24: a push whose pack stops half way is answered at once (not at the request's limit), and recorded", async () => {
+    const work = await clone();
+    await agent(work, "checkout", "-q", "-b", "half");
+    const tip = await commit(work, "half");
+    const objects = execFileSync("git", ["-C", work, "rev-list", "--objects", "--no-object-names", tip, "--not", "origin/main"]).toString().trim().split("\n");
+    const pack = execFileSync("git", ["-C", work, "pack-objects", "--stdout", "-q"], { input: `${objects.join("\n")}\n` });
+    const s = gw.forSession("s1");
+    const { spawn } = await import("node:child_process");
+    const p = spawn(s.ext, ["git-receive-pack", URL], { env: { PATH: process.env.PATH ?? "", CODEOID_GIT_GATEWAY: s.socket }, stdio: ["pipe", "pipe", "pipe"] });
+    p.stdin.on("error", () => {});
+    const exited = new Promise<void>((r) => p.on("close", () => r()));
+    let got = "";
+    await new Promise<void>((r) => {
+      p.stdout.on("data", (d: Buffer) => {
+        got += d.toString("latin1");
+        if (got.endsWith("0000")) r();
+      });
+    });
+    const pkt = (x: string) => `${(x.length + 4).toString(16).padStart(4, "0")}${x}`;
+    const t0 = Date.now();
+    // As a client whose pack-objects died: the commands, half a pack, then its input ends.
+    p.stdin.write(`${pkt(`${"0".repeat(40)} ${tip} refs/heads/half\0report-status\n`)}0000`);
+    p.stdin.end(pack.subarray(0, Math.floor(pack.length / 2)));
+    await exited;
+    expect(Date.now() - t0).toBeLessThan(15_000);
+    expect(upstreamRef("refs/heads/half")).toBe("");
+    await new Promise((r) => setTimeout(r, 200));
+    expect(reports.some((e) => e.kind === "push" && !e.ok && /ended before codeoid checked it/.test(e.detail))).toBe(true);
+  }, 30_000);
+
+  test("round 24: pushes and fetches at once on one remote all go (no ref-lock fight, no prune, no fetch cut off)", async () => {
+    const works: string[] = [];
+    for (const n of ["a", "b", "c"]) {
+      const w = join(root, `work-${n}`);
+      expect((await agent(root, "clone", "-q", URL, w)).code).toBe(0);
+      works.push(w);
+    }
+    for (let round = 0; round < 3; round++) {
+      const jobs: Array<Promise<{ code: number; out: string }>> = [];
+      for (const [i, w] of works.entries()) {
+        await agent(w, "checkout", "-q", "-B", `br-${i}`);
+        writeFileSync(join(w, `f-${i}-${round}.bin`), randomBytes(512 * 1024));
+        await agent(w, "add", ".");
+        await agent(w, "commit", "-q", "-m", `r${round}`);
+        jobs.push(agent(w, "push", "-q", "origin", `br-${i}`));
+        jobs.push(agent(w, "fetch", "-q", "origin"));
+      }
+      const results = await Promise.all(jobs);
+      expect(results.map((r) => (r.code === 0 ? "" : r.out))).toEqual(results.map(() => ""));
+    }
+    expect(reports.filter((e) => !e.ok)).toEqual([]);
+  }, 120_000);
+
   test("round 12: a disconnected remote's cache is removed", async () => {
     await clone();
     const cache = gw.cachePath(`u:${URL}`);
