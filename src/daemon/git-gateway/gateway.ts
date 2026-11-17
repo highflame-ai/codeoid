@@ -81,6 +81,8 @@ interface Ticket {
   gone: AbortController;
   /** Whether the connection was removed since the grant (its cache's generation moved on). */
   disconnected: () => boolean;
+  /** Called when the push's hook starts (receive-pack has the whole pack): the serve reads the socket again. */
+  onHook?: () => void;
 }
 
 const MAX_HEADER = 64 * 1024;
@@ -411,43 +413,29 @@ export class GitGateway {
       const endInput = () => (filter ? filter.end(() => endStdin()) : endStdin());
       // What git hasn't read yet isn't read from the agent's socket (a push waiting on its card reads nothing more):
       // the daemon holds no more than a pipe's worth.
-      // What git hasn't taken yet is held (bounded) rather than the socket paused: a paused socket wouldn't say that
-      // the agent's git went. More than that held (git reads nothing while a push waits on its card) ends the request.
-      const held: Buffer[] = [];
-      let heldBytes = 0;
-      let blocked = false;
-      let endAfter = false;
-      const flushHeld = () => {
-        while (held.length > 0) {
-          const b = held.shift() as Buffer;
-          heldBytes -= b.length;
-          if (!p.stdin.write(b)) {
-            p.stdin.once("drain", flushHeld);
-            return;
-          }
-        }
-        blocked = false;
-        if (endAfter) p.stdin.end();
-      };
+      // What git hasn't read yet isn't read from the agent's socket (backpressure: the daemon holds a pipe's worth).
+      // receive-pack stops reading only once the whole pack is in and its hook runs, and a client sends nothing
+      // after its pack: from then on the socket is read again (so an agent's git that goes is seen while the owner is
+      // asked), and anything but the end of its input ends the request.
+      let paused = false;
+      let hookPhase = false;
       const write = (b: Buffer) => {
-        if (blocked) {
-          held.push(b);
-          heldBytes += b.length;
-          if (heldBytes > 16 * 1024 * 1024) {
-            ended = true;
-            c.destroy();
-          }
-          return;
-        }
-        if (!p.stdin.write(b)) {
-          blocked = true;
-          p.stdin.once("drain", flushHeld);
-        }
+        if (p.stdin.write(b) || paused) return;
+        paused = true;
+        c.pause();
+        p.stdin.once("drain", () => {
+          paused = false;
+          c.resume();
+        });
       };
-      const endStdin = () => {
-        if (blocked) endAfter = true;
-        else p.stdin.end();
-      };
+      const endStdin = () => p.stdin.end();
+      const t = this.#tickets.get(ticket);
+      if (t) {
+        t.onHook = () => {
+          hookPhase = true;
+          c.resume();
+        };
+      }
       const take = (d: Buffer) => {
         if (ended) return;
         buf = buf.length ? Buffer.concat([buf, d]) : d;
@@ -461,6 +449,12 @@ export class GitGateway {
           if (n === 0) {
             ended = true;
             endInput();
+            return;
+          }
+          if (hookPhase) {
+            // After its pack, a client sends nothing but the end of its input.
+            ended = true;
+            c.destroy();
             return;
           }
           if (buf.length < 4 + n) return;
@@ -556,6 +550,7 @@ export class GitGateway {
     if (!t) return verdict(false);
     // Single use.
     this.#tickets.delete(req.ticket as string);
+    t.onHook?.();
     // Served on its cache until the upstream push is done (the agent's git there or not): no prune runs under it.
     const leave = this.#enter(t.grant.cacheKey, "push");
     try {

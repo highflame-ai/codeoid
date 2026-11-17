@@ -5,7 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -835,16 +835,22 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
       got += Buffer.from(value).toString("latin1");
     }
     const pkt = (x: string) => `${(x.length + 4).toString(16).padStart(4, "0")}${x}`;
-    p.stdin.write(`${pkt(`${"0".repeat(40)} ${tip} refs/heads/flood\0report-status\n`)}0000`);
-    p.stdin.write(pack);
-    // Then far more than any push sends after its pack, while the owner is asked.
+    // The push, then far more than any push sends after its pack, while the owner is asked. (Cut off part way: the
+    // pipe breaks, which is the point.)
     const junk = Buffer.alloc(1024 * 1024, 0x41);
-    // (Cut off part way: the pipe breaks, which is the point.)
-    try {
-      for (let i = 0; i < 40; i++) {
-        p.stdin.write(junk);
+    const send = async (b: string | Buffer) => {
+      try {
+        p.stdin.write(b);
         await p.stdin.flush();
+        return true;
+      } catch {
+        return false;
       }
+    };
+    await send(`${pkt(`${"0".repeat(40)} ${tip} refs/heads/flood\0report-status\n`)}0000`);
+    await send(pack);
+    for (let i = 0; i < 40; i++) if (!(await send(junk))) break;
+    try {
       p.stdin.end();
     } catch {
       /* the gateway ended it */
@@ -872,6 +878,19 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(said).toContain("too many git connections");
     for (const o of open) o.destroy();
   }, 30_000);
+
+  test("round 22: a large push (a pack of tens of MiB) goes through the gateway", async () => {
+    const work = await clone();
+    await agent(work, "checkout", "-q", "-b", "big");
+    // Incompressible content, already packed locally (as a reused pack is streamed fast).
+    writeFileSync(join(work, "big.bin"), randomBytes(40 * 1024 * 1024));
+    await agent(work, "add", ".");
+    expect((await agent(work, "commit", "-q", "-m", "big")).code).toBe(0);
+    plain(work, "repack", "-q", "-a", "-d");
+    const r = await agent(work, "push", "origin", "big");
+    expect([r.code, r.out]).toEqual([0, expect.stringContaining("codeoid pushed big")]);
+    expect(upstreamRef("refs/heads/big")).toBe(plain(work, "rev-parse", "HEAD"));
+  }, 60_000);
 
   test("round 12: a disconnected remote's cache is removed", async () => {
     await clone();

@@ -4840,9 +4840,12 @@ mcpHub: this.#mcpHub,
       return { type: "response.ok", requestId: msg.id, data: { connections: this.#store.listGitConnections(auth.sub).map((c) => ({ ...c, url: shownGitUrl(c.url) })) } };
     }
     let url = msg.url;
+    // The remote's own push URL (`remote.<name>.pushurl`), if it has one: where its pushes go.
+    let pushurl = "";
     if (!url) {
       if (!msg.path || !isAbsolute(msg.path)) return fail("Give the remote's URL, or the repository's absolute path.");
       const remote = msg.remote ?? "origin";
+      pushurl = (await safeGit(["config", "--local", "--get", `remote.${remote}.pushurl`], msg.path, { timeoutMs: 20_000 }).catch(() => "")).trim();
       try {
         url = (await safeGit(["config", "--local", "--get", `remote.${remote}.url`], msg.path, { timeoutMs: 20_000 })).trim();
       } catch {
@@ -4854,7 +4857,7 @@ mcpHub: this.#mcpHub,
     // The URL git really uses there (the owner's own rewrite applied): what is shown, asked and connected.
     if (msg.action === "resolve") {
       const used = msg.url ? url : ownerRewrite(url);
-      const pushUsed = msg.url ? url : ownerPushRewrite(url);
+      const pushUsed = msg.url ? url : ownerPushRewrite(pushurl || url);
       return {
         type: "response.ok",
         requestId: msg.id,
@@ -4870,7 +4873,7 @@ mcpHub: this.#mcpHub,
     }
     if (msg.action === "disconnect") {
       // From a repository: the URL as written and as the owner's git uses it (connect connected the latter).
-      const written = msg.url ? [url] : [url, ownerRewrite(url), ownerPushRewrite(url)];
+      const written = msg.url ? [url] : [url, ownerRewrite(url), ownerPushRewrite(url), ...(pushurl ? [pushurl, ownerPushRewrite(pushurl)] : [])];
       const forms = [...new Set(written.flatMap((u) => [u, ...sameRepoSpellings(u)]))];
       let removed = false;
       for (const u of forms) {
