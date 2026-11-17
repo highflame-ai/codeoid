@@ -391,3 +391,34 @@ describe("round 34: the sandbox's own looks at a repository read without blockin
     expect(spec.readOnly).toContain(realpathSync(join(dots, "conf.d")));
   });
 });
+
+describe("round 35: placeholders only where the real dir is writable; no synchronous fallback after a failed read", () => {
+  test("an owner include under a link out of the workspace: nothing is made there", async () => {
+    const { ownerConfigFiles, warmOwnerConfig } = await import("../daemon/git-gateway/connect.js");
+    const { buildSandboxSpec } = await import("../daemon/sandbox/policy.js");
+    process.env.HOME = home;
+    const dots = join(home, "dots35");
+    const outside = join(home, "outside35");
+    mkdirSync(dots);
+    mkdirSync(outside);
+    symlinkSync(outside, join(dots, "lnk"));
+    const target = join(dots, "lnk", "sub", "x.gitconfig");
+    writeFileSync(join(home, ".gitconfig"), `[include]\n\tpath = ${target}\n`);
+    await warmOwnerConfig();
+    buildSandboxSpec({ sessionId: "r35", workspace: dots, tempDir: join(home, "t35"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" }, cache: false, ownerConfigFiles: ownerConfigFiles() });
+    expect(existsSync(join(outside, "sub"))).toBe(false);
+  });
+
+  test("the rules from / read and failed: the rewrite is none, never a synchronous git run", async () => {
+    const { warmRewrites, ownerRewrite } = await import("../daemon/git-gateway/connect.js");
+    process.env.HOME = home;
+    const dots = join(home, "dots35b");
+    mkdirSync(dots);
+    spawnSync("mkfifo", [join(dots, "slow.gitconfig")]);
+    writeFileSync(join(home, ".gitconfig"), `[url "git@github.com:"]\n\tinsteadOf = https://github.com/\n[include]\n\tpath = ${join(dots, "slow.gitconfig")}\n`);
+    await warmRewrites("/", true);
+    const t = Date.now();
+    expect(ownerRewrite("https://github.com/acme/app.git")).toBe("https://github.com/acme/app.git");
+    expect(Date.now() - t).toBeLessThan(500);
+  }, 20_000);
+});

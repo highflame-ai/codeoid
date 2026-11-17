@@ -328,10 +328,11 @@ export function ownerRewrite(url: string, dir?: string): string {
     const inRepo = rewriteIn(dir, url, false);
     if (inRepo !== null) return inRepo;
   }
-  // The rules as read from / asynchronously (warmRewrites("/")), when they were.
+  // The rules as read from / asynchronously (warmRewrites("/")), when they were; read and failed (or hung): none
+  // (never a synchronous run instead, at every spec build).
   const fromRoot = rewriteIn("/", url, false);
   if (fromRoot !== null) return fromRoot;
-  if (!ownerConfigPlain()) return url;
+  if (rewritesTried("/") || !ownerConfigPlain()) return url;
   try {
     const r = spawnSync(GIT_BIN, ["-C", "/", "ls-remote", "--get-url", "--", url], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
     const out = r.status === 0 ? r.stdout.trim() : "";
@@ -401,6 +402,11 @@ export function warmRewrites(dir: string | undefined, fresh = false): Promise<vo
   return done;
 }
 
+/** Whether the rules at `dir` were read (or tried, and failed or hung): a synchronous read isn't the answer then. */
+function rewritesTried(dir: string): boolean {
+  return repoRules.has(dir) || reading.has(dir) || (hungRepos.get(dir) ?? 0) > Date.now();
+}
+
 /** A rule set's rewrite of `url`: the longest matching prefix, as git picks. */
 function longest(rules: ReadonlyArray<readonly [string, string]>, url: string): string | null {
   let best: readonly [string, string] | null = null;
@@ -435,7 +441,7 @@ export function ownerPushRewrite(url: string, dir?: string): string {
   }
   const fromRoot = rewriteIn("/", url, true);
   if (fromRoot !== null) return fromRoot;
-  if (!ownerConfigPlain()) return url;
+  if (rewritesTried("/") || !ownerConfigPlain()) return url;
   try {
     const r = spawnSync(GIT_BIN, ["-C", "/", "config", "--null", "--get-regexp", "^url\\..*\\.pushinsteadof$"], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
     let best: { base: string; prefix: string } | null = null;

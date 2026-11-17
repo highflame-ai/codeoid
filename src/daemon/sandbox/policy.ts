@@ -1004,10 +1004,14 @@ function isLink(p: string): boolean {
 // paths: a look (does each dir exist) up to a writable root, then makeIfMissing (pinned, never through a link)
 function placeholderWithDirs(f: string, inWritable: (p: string) => boolean): string[] {
   const missing: string[] = [];
-  for (let d = dirname(f); !existsSync(d); d = dirname(d)) {
+  let d = dirname(f);
+  for (; !existsSync(d); d = dirname(d)) {
     if (d === dirname(d) || !inWritable(realOr(d))) return [];
     missing.unshift(d);
   }
+  // The nearest dir that exists, where it really is (a link in the workspace may lead anywhere): inside a writable
+  // root, or nothing is made.
+  if (!inWritable(realOr(d))) return [];
   for (const d of missing) if (!makeIfMissing(d, "dir")) return [];
   return makeIfMissing(f, "") ? [...missing, f] : [];
 }
@@ -1048,7 +1052,8 @@ function excludePlaceholders(workspace: string, home: string, names: readonly st
     const rel = relative(dirname(layout.dotgit), resolve(workspace));
     if (rel.startsWith("..") || isAbsolute(rel)) return;
     // paths: a look (the file's current text, before replaceInPinned writes it whole)
-    const have = lexists(exclude) ? readSmall(exclude) : "";
+    // Never through a link swapped in (what it read would be written back into the repository).
+    const have = lexists(exclude) ? readRegularTextSync(exclude, 1 << 20, { noFollow: true }) : "";
     const lines = have.split("\n");
     const add = names.map((n) => `/${rel ? `${rel.split(sep).join("/")}/` : ""}${n}`).filter((l) => !lines.includes(l));
     if (add.length === 0) return;

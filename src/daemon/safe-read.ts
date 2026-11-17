@@ -12,8 +12,8 @@ import { closeSync, constants, fstatSync, openSync, readSync } from "node:fs";
  * and for one that isn't a regular file or is larger than `max`.
  */
 // paths: an open (non-blocking) and a bounded read, no write
-export function readRegularSync(p: string, max = 16 << 20): Buffer {
-  const fd = openSync(p, constants.O_RDONLY | constants.O_NONBLOCK);
+export function readRegularSync(p: string, max = 16 << 20, o: { noFollow?: boolean } = {}): Buffer {
+  const fd = openSync(p, constants.O_RDONLY | constants.O_NONBLOCK | (o.noFollow ? constants.O_NOFOLLOW : 0));
   try {
     const st = fstatSync(fd);
     if (!st.isFile()) throw Object.assign(new Error(`${p} isn't a regular file`), { code: "ENOTREG" });
@@ -32,6 +32,6 @@ export function readRegularSync(p: string, max = 16 << 20): Buffer {
 }
 
 /** The text of a regular file, read as `readRegularSync` does. */
-export function readRegularTextSync(p: string, max?: number): string {
-  return readRegularSync(p, max).toString("utf8");
+export function readRegularTextSync(p: string, max?: number, o?: { noFollow?: boolean }): string {
+  return readRegularSync(p, max, o).toString("utf8");
 }

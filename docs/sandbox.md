@@ -1308,7 +1308,10 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
 - **Your git and ssh config are never an agent's:** every file they are read from is judged where it really is.
   That covers `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`, every file their includes name, `~/.ssh`,
   `~/.ssh/config` and its `Include`s, with dotfiles links resolved. Those files are held read-only in every
-  sandbox that could otherwise write them (a dotfiles repository opened as a workspace). A session whose writable
+  sandbox that could otherwise write them (a dotfiles repository opened as a workspace). A link inside such a
+  workspace (`~/dotfiles/gitconfig-work` pointing elsewhere) can't be held, though: the agent can point it somewhere
+  else, which your own git then reads (codeoid's gateway doesn't use your config while it can). Don't open your
+  dotfiles repository as a session's workspace, or keep its links out of it. A session whose writable
   dirs still hold one (a workspace that is your home) gets no gateway, and while it runs nothing of your git or
   ssh config is used for agents. Cards, `ls` and the audit show the URL whole, every path segment, so you can see which repository it is.
 - **Running sessions** pick up a connection, or a disconnection, at their next turn. A process backend is
