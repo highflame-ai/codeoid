@@ -255,13 +255,13 @@ describe("round 31: the owner's rewrites as git applies them in the repository",
     const url = "https://github.com/acme/app.git";
     expect(ownerPushRewrite(url)).toBe(url);
     // The repository's rules are read asynchronously (never on the daemon's thread), before they are used.
-    await warmRewrites(repo, true);
+    await warmRewrites(repo, true, (await import("../daemon/sandbox/session-sandbox.js")).repositoryConfigFiles(repo));
     expect(ownerPushRewrite(url, repo)).toBe("git@github.com:me/app.git");
     expect(ownerRewrite(url, repo)).toBe(url);
     // The repository's own rule.
     writeFileSync(join(home, ".gitconfig"), "");
     spawnSync("git", ["-C", repo, "config", "url.git@gitlab.com:me/.pushInsteadOf", "https://github.com/acme/"]);
-    await warmRewrites(repo, true);
+    await warmRewrites(repo, true, (await import("../daemon/sandbox/session-sandbox.js")).repositoryConfigFiles(repo));
     expect(ownerPushRewrite(url, repo)).toBe("git@gitlab.com:me/app.git");
   });
 
@@ -288,7 +288,7 @@ describe("round 32: the repository's files are read without blocking, and asked 
     spawnSync("git", ["-C", repo, "config", "url.git@github.com:me/.pushInsteadOf", "https://github.com/acme/"]);
     // A subdirectory: its repository's top is asked, and the repository's rule applies.
     expect(repositoryForRewrites(join(repo, "sub"))).toBe(repo);
-    await warmRewrites(repo, true);
+    await warmRewrites(repo, true, (await import("../daemon/sandbox/session-sandbox.js")).repositoryConfigFiles(repo));
     expect(ownerPushRewrite("https://github.com/acme/app.git", repositoryForRewrites(join(repo, "sub")))).toBe("git@github.com:me/app.git");
     // The config a FIFO: read at once as nothing, the repository not asked.
     rmSync(join(repo, ".git", "config"));
@@ -335,7 +335,7 @@ describe("round 33: nothing of an agent's repository, or of the owner's config, 
     let ticks = 0;
     const tick = setInterval(() => ticks++, 50);
     const t = Date.now();
-    await warmRewrites(repo, true);
+    await warmRewrites(repo, true, (await import("../daemon/sandbox/session-sandbox.js")).repositoryConfigFiles(repo));
     clearInterval(tick);
     // The read waited (up to its own limit), the daemon's thread didn't: timers kept firing all along.
     expect(ticks).toBeGreaterThan(Math.floor((Date.now() - t) / 50) - 5);
@@ -431,7 +431,7 @@ describe("round 36: the workspace's remotes as git reads them", () => {
     const repo = join(home, "r36");
     spawnSync("git", ["init", "-q", repo]);
     writeFileSync(join(repo, ".git", "config"), `${readFileSync(join(repo, ".git", "config"), "utf8")}[remote "origin"]\n\turl = "https://github.com/acme/app.git" ; the main one\n`);
-    await warmRewrites(repo, true);
+    await warmRewrites(repo, true, (await import("../daemon/sandbox/session-sandbox.js")).repositoryConfigFiles(repo));
     expect(workspaceRemoteUrls(repo)).toEqual(["https://github.com/acme/app.git"]);
   });
 });
@@ -447,8 +447,34 @@ describe("round 37: a repository's own include isn't followed for its rules or r
     const hidden = join(home, "hidden.gitconfig");
     writeFileSync(hidden, '[remote "secret"]\n\turl = ssh://bot:hunter2@internal.example/x.git\n[url "https://evil.example/"]\n\tinsteadOf = https://github.com/\n');
     spawnSync("git", ["-C", repo, "config", "include.path", hidden]);
-    await warmRewrites(repo, true);
+    await warmRewrites(repo, true, (await import("../daemon/sandbox/session-sandbox.js")).repositoryConfigFiles(repo));
     expect(workspaceRemoteUrls(repo)).toEqual(["https://github.com/acme/app.git"]);
     expect(ownerRewrite("https://github.com/acme/app.git", repo)).toBe("https://github.com/acme/app.git");
+  });
+});
+
+describe("round 38: the repository's own config files are named by codeoid, never what commondir points at", () => {
+  test("a commondir an agent writes, pointing at a hidden repository: nothing of that repository reaches the routes", async () => {
+    const { warmRewrites, ownerRewrite } = await import("../daemon/git-gateway/connect.js");
+    const { workspaceRemoteUrls, repositoryConfigFiles, repositoryForRewrites } = await import("../daemon/sandbox/session-sandbox.js");
+    process.env.HOME = home;
+    const hiddenRepo = join(home, "hidden38");
+    spawnSync("git", ["init", "-q", hiddenRepo]);
+    spawnSync("git", ["-C", hiddenRepo, "remote", "add", "secret", "ssh://bot:hunter2@internal.example/x.git"]);
+    spawnSync("git", ["-C", hiddenRepo, "config", "url.https://evil.example/.insteadOf", "https://github.com/"]);
+    const repo = join(home, "r38");
+    spawnSync("git", ["init", "-q", repo]);
+    spawnSync("git", ["-C", repo, "remote", "add", "origin", "https://github.com/acme/app.git"]);
+    writeFileSync(join(repo, ".git", "commondir"), `${join(hiddenRepo, ".git")}\n`);
+    const top = repositoryForRewrites(repo);
+    await warmRewrites(top ?? repo, true, repositoryConfigFiles(repo));
+    expect(workspaceRemoteUrls(repo).join(" ")).not.toContain("internal.example");
+    expect(ownerRewrite("https://github.com/acme/app.git", top)).toBe("https://github.com/acme/app.git");
+  });
+
+  test("a password in scp form never reaches the sandbox's env", async () => {
+    const { gitGatewayEnv } = await import("../daemon/sandbox/policy.js");
+    const env = gitGatewayEnv({ socket: "/s", ext: "/gw/ext", binDir: "/b", runtime: "/r", urls: [], routes: [{ from: "bot:hunter2@internal.example:x.git", fetch: "bot:hunter2@internal.example:x.git" }] });
+    expect(env.GIT_CONFIG_PARAMETERS ?? "").not.toContain("hunter2");
   });
 });

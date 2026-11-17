@@ -359,7 +359,7 @@ const hungRepos = new Map<string, number>();
  * up only this read, never the daemon), bounded at 5 s; one that didn't answer isn't read again for 10 minutes.
  */
 // paths: git config read in the session's repository (url.* rules), nothing run
-export function warmRewrites(dir: string | undefined, fresh = false): Promise<void> {
+export function warmRewrites(dir: string | undefined, fresh = false, files: readonly string[] = []): Promise<void> {
   if (!dir) return Promise.resolve();
   const have = repoRules.get(dir);
   if (!fresh && have && Date.now() - have.at < 30_000) return Promise.resolve();
@@ -374,13 +374,16 @@ export function warmRewrites(dir: string | undefined, fresh = false): Promise<vo
     // config with its includes (a conditional include judged for that repository), and the repository's own config
     // without any (an include.path an agent puts there could name a file the sandbox hides, whose values would reach
     // the sandbox's routes); the remotes from the repository's own config alone.
+    // The repository's own config files are the ones codeoid named (validated where they are: a `commondir` an agent
+    // writes could otherwise point git's `--local` at a repository the sandbox hides), each read alone, from /.
+    const alone = { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
     const reads =
       dir === "/"
         ? [readConfig(dir, ["--null", "--get-regexp", urlKeys], env)]
         : [
+            readConfig(dir, ["--system", "--includes", "--null", "--get-regexp", urlKeys], env),
             readConfig(dir, ["--global", "--includes", "--null", "--get-regexp", urlKeys], env),
-            readConfig(dir, ["--local", "--no-includes", "--null", "--get-regexp", urlKeys], { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }),
-            readConfig(dir, ["--local", "--no-includes", "--null", "--get-regexp", "^remote\\..*\\.(url|pushurl)$"], { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }),
+            ...files.map((f) => readConfig("/", ["--file", f, "--no-includes", "--null", "--get-regexp", "^(url\\..*\\.(insteadof|pushinsteadof)|remote\\..*\\.(url|pushurl))$"], alone)),
           ];
     const outs = await Promise.all(reads);
     reading.delete(dir);

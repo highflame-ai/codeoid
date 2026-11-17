@@ -13,7 +13,7 @@
  * starts on it.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
@@ -957,7 +957,7 @@ export class SessionSandbox {
     // The url.* rules git applies in the workspace's repository, read now (asynchronously: the repository is the
     // agent's to write), so the spec built below routes as the owner's git would there.
     // The owner's config files (held read-only where a session may write them) and their url.* rules, read the same way.
-    await Promise.all([warmOwnerConfig(), ...(this.#gitGateway ? [warmRewrites(repositoryForRewrites(this.#workspace())), warmRewrites("/")] : [])]);
+    await Promise.all([warmOwnerConfig(), ...(this.#gitGateway ? [warmRewrites(repositoryForRewrites(this.#workspace()), false, repositoryConfigFiles(this.#workspace())), warmRewrites("/")] : [])]);
     const open = (backendState: readonly string[] = [], o: OpenOptions = {}) => {
       if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
       return this.#spec(o.backendNetwork ? { mode: "on" } : r.network, backendState, o.readable ?? [], dockerSocket, hideLocalServices, dirs);
@@ -1594,4 +1594,32 @@ export function repositoryForRewrites(workspace: string): string | undefined {
   };
   if (!plain(join(gitDir, "HEAD"), true) || !plain(join(layout.common, "config"), true) || !plain(join(gitDir, "config.worktree"), false)) return undefined;
   return dirname(layout.dotgit);
+}
+
+/**
+ * The repository's own config files for codeoid to read (its config, and its worktree's `config.worktree`): each a
+ * regular file, not a link, really inside the git dir the layout vouched for. Never what a `commondir` or a link an
+ * agent made would point git at (a repository the sandbox hides).
+ */
+// paths: a look (lstat, realpath) at the repository's config files, nothing read
+export function repositoryConfigFiles(workspace: string): string[] {
+  const layout = gitLayoutOf(workspace);
+  if (!layout?.common) return [];
+  const gitDir = layout.own ?? layout.common;
+  const out: string[] = [];
+  for (const [file, dir] of [
+    [join(layout.common, "config"), layout.common],
+    [join(gitDir, "config.worktree"), gitDir],
+  ] as const) {
+    try {
+      if (!lstatSync(file).isFile()) continue;
+      const real = realpathSync(file);
+      const root = realpathSync(dir);
+      if (dirname(real) !== root) continue;
+      out.push(real);
+    } catch {
+      /* not there */
+    }
+  }
+  return out;
 }

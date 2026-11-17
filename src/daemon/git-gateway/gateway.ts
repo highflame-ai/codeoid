@@ -276,8 +276,9 @@ export class GitGateway {
   }
 
   async #onClient(sessionId: string, c: Socket, sessionGone: Set<AbortController>): Promise<void> {
+    let sshConfigShown: string | undefined = undefined;
     const fail = (why: string) => {
-      if (!c.destroyed) c.end(`error ${redactCredentials(why).replace(/\n/g, " ")}\n`);
+      if (!c.destroyed) c.end(`error ${hideSsh(redactCredentials(why), sshConfigShown).replace(/\n/g, " ")}\n`);
     };
     const limit = setTimeout(() => c.destroy(), this.#requestTimeoutMs);
     c.once("close", () => clearTimeout(limit));
@@ -311,6 +312,7 @@ export class GitGateway {
     url = grant.url ?? url;
     const cache = this.cachePath(grant.cacheKey);
     const upstream: Upstream = { ...grant.upstream, runDir: join(this.#base, "run") };
+    sshConfigShown = grant.upstream.sshConfig;
     if (gone.signal.aborted) {
       sessionGone.delete(gone);
       this.#gone.delete(gone);
@@ -634,8 +636,9 @@ export class GitGateway {
 
   /** The cache's pre-receive hook asks: the updates, checked, the session's word, then the remote. */
   async #onHook(c: Socket): Promise<void> {
+    let hookSsh: string | undefined = undefined;
     const say = (line: string) => {
-      if (!c.destroyed) c.write(`msg ${redactCredentials(line).replace(/\n/g, " ")}\n`);
+      if (!c.destroyed) c.write(`msg ${hideSsh(redactCredentials(line), hookSsh).replace(/\n/g, " ")}\n`);
     };
     const verdict = (ok: boolean): void => {
       if (!c.destroyed) c.end(ok ? "ok\n" : "no\n");
@@ -648,6 +651,7 @@ export class GitGateway {
     }
     const t = typeof req.ticket === "string" ? this.#tickets.get(req.ticket) : undefined;
     if (!t) return verdict(false);
+    hookSsh = t.grant.upstream.sshConfig;
     // Single use.
     this.#tickets.delete(req.ticket as string);
     t.onHook?.();
@@ -797,6 +801,18 @@ export class GitGateway {
 /** A message with the daemon's own paths (its cache, its gateway dir) taken out: what an agent may read. */
 function hidePaths(s: string): string {
   return s.replace(/\/[^\s'"]*\/git-gateway\/[^\s'"]*/g, "<codeoid's cache>");
+}
+
+/**
+ * A message with what the owner's ssh config says about a host (HostName, User, Port, jump hosts: from a file the
+ * sandbox hides) taken out, for the agent's git (the owner's own record keeps it).
+ */
+function hideSsh(s: string, sshConfig: string | undefined): string {
+  if (!sshConfig) return s;
+  let out = s;
+  const values = [...sshConfig.matchAll(/^\s+(?:HostName|User|Port|ProxyJump|HostKeyAlias)\s+(\S+)/gm)].map((m) => m[1] as string).filter((v) => v.length >= 2);
+  for (const v of [...new Set(values)].sort((a, b) => b.length - a.length)) out = out.split(v).join("<from your ssh config>");
+  return out;
 }
 
 /** Remove the temp dirs of first clones that never finished (a daemon stopped mid-clone). */
