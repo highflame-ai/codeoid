@@ -17,9 +17,10 @@ const SHALLOW = new RegExp(`^shallow (${ID})$`);
 const HAVE = new RegExp(`^have (${ID})$`);
 const DEEPEN = /^deepen [1-9][0-9]{0,9}$/;
 const DEEPEN_SINCE = /^deepen-since [0-9]{1,12}$/;
-const DEEPEN_NOT = /^deepen-not (refs\/(?:heads|tags)\/[\x21-\x7e]+)$/;
-// Filters that name no object (a `sparse:oid` reads a blob as patterns; `combine` is refused for simplicity).
-const FILTER = /^filter (?:blob:none|blob:limit=[0-9]{1,12}[kmg]?|tree:[0-9]{1,6})$/;
+const DEEPEN_NOT = /^deepen-not ([\x21-\x7e]+)$/;
+/** Bounds on one request (its lines held back, its bytes): a sandboxed command can't fill the daemon's memory. */
+const MAX_HELD = 100_000;
+const MAX_BYTES = 64 * 1024 * 1024;
 
 /**
  * A stream filter: `push` the client's bytes as they come; what may reach upload-pack is handed to `out`, in order;
@@ -32,16 +33,22 @@ export class UploadFilter {
   #wantsDone = false;
   #done = false;
   #dead = false;
+  #bytes = 0;
 
   constructor(
     private readonly judge: ReachJudge,
     private readonly refNames: () => Promise<Set<string>>,
     private readonly out: (b: Buffer) => void,
-    private readonly fail: () => void,
+    private readonly fail: (why: string) => void,
   ) {}
 
   push(chunk: Buffer): void {
-    this.#chain = this.#chain.then(() => this.#take(chunk)).catch(() => this.#die());
+    this.#bytes += chunk.length;
+    if (this.#bytes > MAX_BYTES) {
+      this.#die("the fetch request is too large");
+      return;
+    }
+    this.#chain = this.#chain.then(() => this.#take(chunk)).catch(() => this.#die("the fetch request couldn't be checked"));
   }
 
   end(then: () => void): void {
@@ -49,14 +56,14 @@ export class UploadFilter {
       () => {
         if (!this.#dead) then();
       },
-      () => this.#die(),
+      () => this.#die("the fetch request couldn't be checked"),
     );
   }
 
-  #die(): void {
+  #die(why = "codeoid doesn't pass that fetch request on"): void {
     if (this.#dead) return;
     this.#dead = true;
-    this.fail();
+    this.fail(why);
   }
 
   async #take(chunk: Buffer): Promise<void> {
@@ -65,7 +72,7 @@ export class UploadFilter {
     while (this.#buf.length >= 4) {
       if (this.#dead) return;
       const head = this.#buf.subarray(0, 4).toString("latin1");
-      if (!/^[0-9a-f]{4}$/.test(head)) return this.#die();
+      if (!/^[0-9a-f]{4}$/.test(head)) return this.#die("the fetch request isn't git's protocol");
       const n = Number.parseInt(head, 16);
       if (n === 0) {
         this.#buf = this.#buf.subarray(4);
@@ -73,29 +80,38 @@ export class UploadFilter {
         continue;
       }
       // No delim or response-end packets in v0, and no line longer than pkt-line's own limit.
-      if (n < 5 || n > 65520) return this.#die();
+      if (n < 5 || n > 65520) return this.#die("the fetch request isn't git's protocol v0 (codeoid passes only that)");
       if (this.#buf.length < n) return;
       const raw = this.#buf.subarray(4, n);
       this.#buf = this.#buf.subarray(n);
       // Lines are text: a NUL only on the first want (its capabilities, which v0 puts after a space; refused here).
       const line = raw.toString("latin1").replace(/\n$/, "");
-      if (/[\x00-\x1f\x7f]/.test(line)) return this.#die();
+      if (/[\x00-\x1f\x7f]/.test(line)) return this.#die("the fetch request holds a control character");
+      if (this.#pending.length >= MAX_HELD) return this.#die("the fetch request is too large");
       await this.#line(line);
     }
   }
 
   async #line(line: string): Promise<void> {
-    if (this.#done) return this.#die();
+    if (this.#done) return this.#die("the fetch request goes on after its end");
     if (!this.#wantsDone) {
-      if (WANT.test(line) || DEEPEN.test(line) || DEEPEN_SINCE.test(line) || FILTER.test(line) || SHALLOW.test(line)) {
+      if (WANT.test(line) || DEEPEN.test(line) || DEEPEN_SINCE.test(line) || SHALLOW.test(line)) {
         this.#pending.push(line);
         return;
       }
-      const not = DEEPEN_NOT.exec(line);
-      if (not?.[1] && (await this.refNames()).has(not[1])) {
-        this.#pending.push(line);
-        return;
+      const not = DEEPEN_NOT.exec(line)?.[1];
+      if (not) {
+        // A branch or tag the remote has, by its full name, or by a short one as git resolves it (a tag first):
+        // passed on by its full name, so git resolves nothing else (codeoid's own hidden refs least of all).
+        const names = await this.refNames();
+        const full = not.startsWith("refs/") ? (names.has(not) ? not : null) : names.has(`refs/tags/${not}`) ? `refs/tags/${not}` : names.has(`refs/heads/${not}`) ? `refs/heads/${not}` : null;
+        if (full && /^refs\/(?:heads|tags)\//.test(full)) {
+          this.#pending.push(`deepen-not ${full}`);
+          return;
+        }
+        return this.#die(`--shallow-exclude names ${JSON.stringify(not.slice(0, 80))}, which isn't a branch or tag of the remote`);
       }
+      if (line.startsWith("filter ")) return this.#die("this gateway doesn't serve partial clones: fetch without --filter");
       return this.#die();
     }
     if (HAVE.test(line)) {

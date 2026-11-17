@@ -613,7 +613,7 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     await p.exited;
     expect(upstreamRef("refs/heads/late")).toBe("");
     expect(spawnSync("git", ["-C", upstream, "cat-file", "-e", secret]).status).not.toBe(0);
-    expect(reports.some((e) => e.kind === "push" && !e.ok && /remote deleted it/.test(e.detail))).toBe(true);
+    expect(reports.some((e) => e.kind === "push" && !e.ok && /the remote deleted/.test(e.detail))).toBe(true);
   });
 
   test("round 16: a ref the cache lost without a clean refresh still makes it dirty; the prune drops kept packs too", async () => {
@@ -795,6 +795,27 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     if (at >= 0) spawnSync("git", ["-C", empty, "index-pack", "--stdin", "--fix-thin"], { input: reply.subarray(at) });
     expect(spawnSync("git", ["-C", empty, "cat-file", "-e", secretBlob]).status).not.toBe(0);
     expect(reply.toString("latin1")).not.toContain(tip);
+  });
+
+  test("round 19: a partial clone asked for is a whole clone; --shallow-exclude with a branch's short name works", async () => {
+    const seed = join(root, "seed");
+    for (const n of ["e1", "e2"]) {
+      writeFileSync(join(seed, `${n}.txt`), `${n}\n`);
+      plain(seed, "add", ".");
+      plain(seed, "commit", "-q", "-m", n);
+    }
+    plain(seed, "push", "-q", "origin", "main");
+    plain(seed, "push", "-q", "origin", "HEAD~1:refs/heads/base");
+    const partial = join(root, "partial");
+    const r = await agent(root, "clone", "-q", "--filter=blob:none", URL, partial);
+    expect(r.code).toBe(0);
+    expect(plain(partial, "rev-list", "--count", "--objects", "--missing=print", "HEAD").length).toBeGreaterThan(0);
+    expect(spawnSync("git", ["-C", partial, "fsck", "--connectivity-only"], { encoding: "utf8" }).status).toBe(0);
+    expect(plain(partial, "cat-file", "-p", "HEAD:e2.txt")).toBe("e2");
+    const excl = join(root, "excl");
+    const e = await agent(root, "clone", "-q", "--shallow-exclude=base", URL, excl);
+    expect([e.code, e.out]).toEqual([0, ""]);
+    expect(plain(excl, "rev-list", "--count", "HEAD")).toBe("1");
   });
 
   test("round 12: a disconnected remote's cache is removed", async () => {

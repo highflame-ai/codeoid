@@ -62,7 +62,14 @@ describe("the gateway's reading of a fetch", () => {
     ]) {
       expect((await run(`${pkt(`want ${A}\n`)}${pkt(bad)}0000`)).failed, bad).toBe(true);
     }
-    expect((await run(`${pkt(`want ${A}\n`)}${pkt("deepen-not refs/heads/main\n")}${pkt("filter blob:none\n")}0000${pkt("done\n")}`)).failed).toBe(false);
+    // Round 19: a short name is resolved as git does (a tag first) and passed on by its full name; no filter at all.
+    const short = await run(`${pkt(`want ${A}\n`)}${pkt("deepen-not main\n")}${pkt("deepen-not v1\n")}0000${pkt("done\n")}`);
+    expect(short).toEqual({ out: `${pkt(`want ${A}\n`)}${pkt("deepen-not refs/heads/main\n")}${pkt("deepen-not refs/tags/v1\n")}0000${pkt("done\n")}`, failed: false });
+    for (const bad of ["deepen-not codeoid-check/x/heads/main\n", "deepen-not refs/codeoid-check/x/heads/main\n", "filter blob:none\n"]) {
+      expect((await run(`${pkt(`want ${A}\n`)}${pkt(bad)}0000`)).failed, bad).toBe(true);
+    }
+    // Bounded: a request that never flushes can't grow without end.
+    expect((await run(`${pkt(`want ${A}\n`)}0000${pkt(`have ${A}\n`).repeat(100_001)}`)).failed).toBe(true);
     // A delim packet (v2's), a bad length, a line after done.
     expect((await run(`${pkt(`want ${A}\n`)}0001`)).failed).toBe(true);
     expect((await run("zzzz")).failed).toBe(true);

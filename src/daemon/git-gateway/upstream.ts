@@ -608,7 +608,7 @@ export async function objectsNotSent(cache: string, objects: { dir: string; alte
   if ("error" in check) return check.error;
   const suspects = new Set(check.lines.filter((l) => !l.endsWith(" missing")).map((l) => l.split(" ")[0] ?? ""));
   const unused = sent.lines.find((id) => !used.has(id) && !suspects.has(id));
-  if (unused) return `the push carries an object its branches don't use (${unused.slice(0, 12)}): push only what the branches hold`;
+  if (unused) return "the push carries an object its branches don't use: push only what the branches hold";
   if (suspects.size === 0) return null;
   // Each must be reached by one of the remote's refs.
   const reached = await gitLines(refs ? ["rev-list", "--objects", "--no-object-names", "--stdin"] : ["rev-list", "--objects", "--no-object-names", "--use-bitmap-index", "--all"], cache, kept, refs ? [...refs] : null, left(), (id) => {
@@ -618,7 +618,7 @@ export async function objectsNotSent(cache: string, objects: { dir: string; alte
   if ("error" in reached && suspects.size > 0) return reached.error;
   const first = [...suspects][0];
   return first
-    ? `${first.slice(0, 12)} isn't on the remote's branches or tags: the remote deleted it, and codeoid doesn't publish it again (if it is your own earlier work, the owner can disconnect the remote and connect it again)`
+    ? "the push holds something that isn't on the remote's branches or tags and that the remote deleted: codeoid doesn't publish it again (if it is your own earlier work, the owner can disconnect the remote and connect it again)"
     : null;
 }
 

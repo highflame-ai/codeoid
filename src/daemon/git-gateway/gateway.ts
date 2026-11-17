@@ -308,7 +308,7 @@ export class GitGateway {
       try {
         if (c.destroyed) return;
         c.write("ok\n");
-        const code = await this.#serve(service, cache, c, rest, ticket, protocol);
+        const code = await this.#serve(service, cache, c, rest, ticket, protocol, (why) => this.#host.report(sessionId, { kind: "fetch", url, ok: false, detail: why }));
         if (service === "git-upload-pack" && code === 0) this.#host.report(sessionId, { kind: "fetch", url, ok: true, detail: `fetched from ${shownGitUrl(url)}` });
       } finally {
         this.#tickets.delete(ticket);
@@ -321,7 +321,7 @@ export class GitGateway {
   }
 
   /** git's own server on the cache, its stdio the client's, until it exits. */
-  #serve(service: GitService, cache: string, c: Socket, rest: Buffer, ticket: string, _protocol: string): Promise<number | null> {
+  #serve(service: GitService, cache: string, c: Socket, rest: Buffer, ticket: string, _protocol: string, onRefused?: (why: string) => void): Promise<number | null> {
     const config: Array<readonly [string, string]> = [
       ["core.hooksPath", service === "git-receive-pack" ? this.#scripts.hooksDir : "/dev/null"],
       ["core.fsmonitor", "false"],
@@ -337,7 +337,9 @@ export class GitGateway {
       ["receive.unpackLimit", "1"],
       ["transfer.unpackLimit", "1"],
       ["uploadpack.allowAnySHA1InWant", "false"],
-      ["uploadpack.allowFilter", "true"],
+      // No partial clones: their lazy fetches want objects by id, which this server never serves; a client asking for
+      // a filter is told so and clones whole.
+      ["uploadpack.allowFilter", "false"],
       // A sparse filter names a blob to read as patterns: never one the client picks.
       ["uploadpackfilter.sparse:oid.allow", "false"],
       // A push's check refs are codeoid's own: never shown, fetched or pushed to.
@@ -374,9 +376,14 @@ export class GitGateway {
               (ids) => reachedFromRefs(cache, ids),
               () => advertisedNames(cache),
               (b) => p.stdin.write(b),
-              () => {
+              (why) => {
                 ended = true;
-                c.destroy();
+                // Said to the agent's git (`remote error: …`) and recorded; then the request ends.
+                const msg = Buffer.from(`ERR codeoid: ${why}`, "utf8");
+                if (!c.destroyed) c.write(Buffer.concat([Buffer.from((msg.length + 4).toString(16).padStart(4, "0")), msg]));
+                onRefused?.(why);
+                c.end();
+                setTimeout(() => c.destroy(), 1_000).unref?.();
               },
             )
           : null;
@@ -493,6 +500,12 @@ export class GitGateway {
     const leave = this.#enter(t.grant.cacheKey, "push");
     try {
       await this.#decide(t, req, say, verdict);
+    } catch (err) {
+      // Anything that throws is a refusal said to the agent's git and recorded, never a hook left waiting.
+      const why = `the push couldn't be checked (${err instanceof Error ? err.message : String(err)})`;
+      say(`codeoid refused the push: ${why}`);
+      this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: false, detail: why });
+      verdict(false);
     } finally {
       leave();
     }
