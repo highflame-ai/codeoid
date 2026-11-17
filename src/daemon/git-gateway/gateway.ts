@@ -49,7 +49,8 @@ export interface GatewayPush {
 /** The daemon's side: who may reach what, and what a session says about a push. */
 export interface GatewayHost {
   /** May `sessionId` use `service` at `url`? Resolves with the grant, or why not (what the agent reads). */
-  grant(sessionId: string, service: GitService, url: string): Promise<GatewayGrant | { refused: string }>;
+  /** `signal`: the agent's git went (a card raised for it is withdrawn). */
+  grant(sessionId: string, service: GitService, url: string, signal?: AbortSignal): Promise<GatewayGrant | { refused: string }>;
   /** The session's word on a checked push (its role, its mode, the owner's answer); `signal`: the agent's git is gone. */
   approve(sessionId: string, push: GatewayPush, signal: AbortSignal): Promise<{ ok: true } | { refused: string }>;
   /** The remote's branches as a refresh found them (a branch agents made, gone from it, is no longer theirs). */
@@ -106,6 +107,8 @@ export class GitGateway {
   readonly #serving = new Map<string, Map<symbol, { kind: "fetch" | "push"; stop: () => void }>>();
   /** The check namespaces of pushes running their last check now (their refs and marks aren't stale). */
   readonly #checking = new Set<string>();
+  /** Remotes that timed out: requests in the next minute are told so at once instead of each waiting it out. */
+  readonly #down = new Map<string, { until: number; error: string }>();
   readonly #generations = new Map<string, number>();
   #closed = false;
 
@@ -244,8 +247,17 @@ export class GitGateway {
     if ((service !== "git-upload-pack" && service !== "git-receive-pack") || typeof requested !== "string" || requested.length > 2048) return fail("not a git request");
     let url: string = requested;
     const protocol = typeof header.protocol === "string" && /^version=[0-9]$/.test(header.protocol) ? header.protocol : "";
-    const grant = await this.#host.grant(sessionId, service, url).catch((err: unknown) => ({ refused: err instanceof Error ? err.message : String(err) }));
+    // The agent's git gone (its connection closed), the session closed or the gateway stopping: nothing more is done
+    // (from the grant on: a card raised for it is withdrawn).
+    const gone = new AbortController();
+    sessionGone.add(gone);
+    this.#gone.add(gone);
+    c.once("close", () => gone.abort());
+    c.once("end", () => gone.abort());
+    const grant = await this.#host.grant(sessionId, service, url, gone.signal).catch((err: unknown) => ({ refused: err instanceof Error ? err.message : String(err) }));
     if ("refused" in grant) {
+      sessionGone.delete(gone);
+      this.#gone.delete(gone);
       this.#host.report(sessionId, { kind: service === "git-receive-pack" ? "push" : "fetch", url, ok: false, detail: grant.refused });
       return fail(grant.refused);
     }
@@ -253,12 +265,11 @@ export class GitGateway {
     url = grant.url ?? url;
     const cache = this.cachePath(grant.cacheKey);
     const upstream: Upstream = { ...grant.upstream, runDir: join(this.#base, "run") };
-    // The agent's git gone (its connection closed), the session closed or the gateway stopping: nothing more is done.
-    const gone = new AbortController();
-    sessionGone.add(gone);
-    this.#gone.add(gone);
-    c.once("close", () => gone.abort());
-    c.once("end", () => gone.abort());
+    if (gone.signal.aborted) {
+      sessionGone.delete(gone);
+      this.#gone.delete(gone);
+      return;
+    }
     const served: { leave?: () => void } = {};
     try {
       // The lock is the refresh's alone: serving (and an owner's card) doesn't hold up other sessions' requests.
@@ -269,6 +280,8 @@ export class GitGateway {
        try {
         // Its agent gone while it waited (no clone started for nobody), or the connection removed meanwhile.
         if (gone.signal.aborted) return { error: "the agent's git was gone" };
+        const down = this.#down.get(grant.cacheKey);
+        if (down && down.until > Date.now()) return { error: `${down.error} (codeoid tries it again in ${Math.ceil((down.until - Date.now()) / 1000)}s)` };
         if (disconnected()) return { error: `${shownGitUrl(url)} was disconnected` };
         sweepQuarantines(cache);
         let stop = this.#cloneStops.get(grant.cacheKey);
@@ -277,6 +290,8 @@ export class GitGateway {
           this.#cloneStops.set(grant.cacheKey, stop);
         }
         const r = await refreshCache(cache, upstream, grant.ssh, this.#upstreamTimeoutMs, gone.signal, stop.signal);
+        if ("error" in r && /timed out/.test(r.error)) this.#down.set(grant.cacheKey, { until: Date.now() + 60_000, error: r.error });
+        else if (!("error" in r)) this.#down.delete(grant.cacheKey);
         // The remote deleted or rewrote something (judged from every ref the cache has had, however that refresh
         // ended): the cache drops it before anything more is served from it, once what is served on it is done
         // (fetches are stopped; none starts meanwhile: they wait on this lock).
@@ -293,7 +308,7 @@ export class GitGateway {
         return r;
        } catch (err) {
         // Anything that throws is an answer, never a git left waiting for one.
-        return { error: `codeoid's copy of the remote couldn't be brought up to date (${err instanceof Error ? err.message : String(err)})` };
+        return { error: `codeoid's copy of the remote couldn't be brought up to date (${hidePaths(err instanceof Error ? err.message : String(err))})` };
        }
       });
       if (gone.signal.aborted) return;
@@ -375,7 +390,7 @@ export class GitGateway {
           ? new UploadFilter(
               (ids) => reachedFromRefs(cache, ids),
               () => advertisedNames(cache),
-              (b) => p.stdin.write(b),
+              (b) => write(b),
               (why) => {
                 ended = true;
                 // Said to the agent's git (`remote error: …`) and recorded; then the request ends.
@@ -388,6 +403,18 @@ export class GitGateway {
             )
           : null;
       const endInput = () => (filter ? filter.end(() => p.stdin.end()) : p.stdin.end());
+      // What git hasn't read yet isn't read from the agent's socket (a push waiting on its card reads nothing more):
+      // the daemon holds no more than a pipe's worth.
+      let paused = false;
+      const write = (b: Buffer) => {
+        if (p.stdin.write(b) || paused) return;
+        paused = true;
+        c.pause();
+        p.stdin.once("drain", () => {
+          paused = false;
+          c.resume();
+        });
+      };
       const take = (d: Buffer) => {
         if (ended) return;
         buf = buf.length ? Buffer.concat([buf, d]) : d;
@@ -411,7 +438,7 @@ export class GitGateway {
             return;
           }
           if (filter) filter.push(Buffer.from(chunk));
-          else p.stdin.write(chunk);
+          else write(chunk);
           buf = buf.subarray(4 + n);
         }
       };
@@ -502,7 +529,7 @@ export class GitGateway {
       await this.#decide(t, req, say, verdict);
     } catch (err) {
       // Anything that throws is a refusal said to the agent's git and recorded, never a hook left waiting.
-      const why = `the push couldn't be checked (${err instanceof Error ? err.message : String(err)})`;
+      const why = `the push couldn't be checked (${hidePaths(err instanceof Error ? err.message : String(err))})`;
       say(`codeoid refused the push: ${why}`);
       this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: false, detail: why });
       verdict(false);
@@ -609,6 +636,11 @@ export class GitGateway {
     this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: true, detail: `pushed to ${shownGitUrl(t.url)}`, updates });
     verdict(true);
   }
+}
+
+/** A message with the daemon's own paths (its cache, its gateway dir) taken out: what an agent may read. */
+function hidePaths(s: string): string {
+  return s.replace(/\/[^\s'"]*\/git-gateway\/[^\s'"]*/g, "<codeoid's cache>");
 }
 
 /** Remove the temp dirs of first clones that never finished (a daemon stopped mid-clone). */

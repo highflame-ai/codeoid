@@ -4667,14 +4667,38 @@ mcpHub: this.#mcpHub,
     // A session a delegated token made: none (its git isn't routed into a refusal).
     if (live?.createdByDelegate) return undefined;
     const owner = live?.createdBy ?? this.#store.getSession(sessionId)?.createdBy;
-    const urls = owner ? this.#store.listGitConnections(owner).map((c) => c.url) : [];
+    const all = owner ? this.#store.listGitConnections(owner).map((c) => c.url) : [];
     // Only for an owner who connected a remote: nothing changes for anyone else's sessions.
+    if (all.length === 0) return undefined;
+    // A fenced session's sandbox names only the connections it may fetch (another workstream's aren't its business).
+    const urls = live ? all.filter((u) => !this.#foreignRemote(live, "git-upload-pack", [u])) : all;
     if (urls.length === 0) return undefined;
     return { ...g.forSession(sessionId), urls, root: g.root };
   };
 
   /** Whose each session's gateway requests were (kept past its end: a push it started is still recorded as theirs). */
   readonly #gitGatewayOwners = new Map<string, string>();
+
+  /**
+   * Why a fenced session may not reach one of these spellings of a remote: another workstream's (a tie between
+   * workstreams counts as theirs unless this one is among them), fetched only as a reference its share allows, never
+   * pushed. Null: it may.
+   */
+  #foreignRemote(session: Session, service: string, urls: readonly string[]): string | null {
+    if (!session.hasWorkstreamFence) return null;
+    const home = session.workstream?.id;
+    for (const u of urls) {
+      const claims = this.#workstreams.remoteWorkstreams(u);
+      if (claims.length === 0 || (home && claims.includes(home))) continue;
+      const ws = claims[0] as string;
+      const referenced = claims.length === 1 && (session.workstream?.references ?? []).some((r) => r.workstream === ws);
+      const verdict = this.#workstreams.referenceVerdict(home, { workstream: ws });
+      if (service === "git-receive-pack" || !referenced || !verdict.ok || verdict.ask.length > 0) {
+        return `${shownGitUrl(u)} is workstream "${claims.join('" or "')}"'s, not this session's${service === "git-receive-pack" ? "" : " (nor a reference it may read)"}`;
+      }
+    }
+    return null;
+  }
 
   /** What any live sandboxed session's commands may write: no program the gateway runs on the host is there. */
   readonly #allSandboxWritable = (): string[] => [...this.#sessions.values()].flatMap((s) => s.sandboxAgentWritable);
@@ -4702,7 +4726,7 @@ mcpHub: this.#mcpHub,
 
   /** The gateway's host: who may reach what, the session's word on a push, what happened. */
   readonly #gitGatewayHost: GatewayHost = {
-    grant: async (sessionId, service, url) => {
+    grant: async (sessionId, service, url, signal) => {
       const session = this.#sessions.get(sessionId);
       if (!session) return { refused: "this session is gone" };
       if (sandboxConfigOf(this.#config).git?.enabled === false) return { refused: "the git gateway is turned off here (sandbox.git.enabled)" };
@@ -4718,15 +4742,9 @@ mcpHub: this.#mcpHub,
         if (bad) return { refused: `${program} can't be trusted to run with your credentials: ${bad}` };
       }
       // Another workstream's remote, under isolation: fetched only as a reference its share allows; never pushed.
-      const ws = this.#workstreams.remoteWorkstream(url);
-      const home = session.workstream?.id;
-      if (ws && ws !== home && session.hasWorkstreamFence) {
-        const referenced = (session.workstream?.references ?? []).some((r) => r.workstream === ws);
-        const verdict = this.#workstreams.referenceVerdict(home, { workstream: ws });
-        if (service === "git-receive-pack" || !referenced || !verdict.ok || verdict.ask.length > 0) {
-          return { refused: `${shownGitUrl(url)} is workstream "${ws}"'s, not this session's${service === "git-receive-pack" ? "" : " (nor a reference it may read)"}` };
-        }
-      }
+      // Judged on every spelling of it (and again on the connection's own URL, below).
+      const fenced = this.#foreignRemote(session, service, [url, ...sameRepoSpellings(url)]);
+      if (fenced) return { refused: fenced };
       const owner = session.createdBy;
       this.#gitGatewayOwners.set(sessionId, owner);
       let conn = this.#store.gitConnection(owner, url) ?? sameRepoSpellings(url).map((u) => this.#store.gitConnection(owner, u)).find(Boolean) ?? null;
@@ -4751,13 +4769,16 @@ mcpHub: this.#mcpHub,
           if (bad) return { refused: bad };
           shown = snap;
         }
-        const yes = await session.askToConnectGit(url, shown ? `your ssh key (${sshSnapshotLine(shown)})` : kind === "ssh" ? "your ssh key" : "your git credential for it");
+        const yes = await session.askToConnectGit(url, shown ? `your ssh key (${sshSnapshotLine(shown)})` : kind === "ssh" ? "your ssh key" : "your git credential for it", signal);
+        if (signal?.aborted) return { refused: "the agent's git was gone" };
         if (!yes) return { refused: `${shownGitUrl(url)} isn't connected for agents: the owner can connect it with ${how}` };
         const done = await this.#connectGit(owner, url, yes, undefined, shown);
         if ("error" in done) return { refused: done.error };
         conn = this.#store.gitConnection(owner, url);
         if (!conn) return { refused: "the connection wasn't recorded" };
       }
+      const fencedConn = this.#foreignRemote(session, service, [conn.url, ...sameRepoSpellings(conn.url)]);
+      if (fencedConn) return { refused: fencedConn };
       const credential = conn.kind === "https" ? this.#gitCredentials?.get(connectionId(owner, conn.url)) : undefined;
       if (conn.kind === "https" && !credential) return { refused: `the credential for ${shownGitUrl(url)} is gone: the owner can connect it again` };
       let ssh: string | null = null;

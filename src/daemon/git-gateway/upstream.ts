@@ -746,7 +746,8 @@ export async function pushUpstream(
     const specs = updates.map((u) => `${u.new}:${u.ref}`);
     // The remote moves only from exactly what was checked: each branch where the gateway saw it (none, for a new one).
     const leases = updates.map((u) => `--force-with-lease=${u.ref}:${/^0+$/.test(u.old) ? "" : u.old}`);
-    const r = await runGit(["push", "--atomic", "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", ...leases, "--", up.url, ...specs], cache, env, timeoutMs, signal);
+    // Atomic only when it means something (a remote that doesn't offer it refuses an atomic push outright).
+    const r = await runGit(["push", ...(specs.length > 1 ? ["--atomic"] : []), "--porcelain", "--no-verify", "--no-signed", "--no-follow-tags", "--no-recurse-submodules", ...leases, "--", up.url, ...specs], cache, env, timeoutMs, signal);
     const output = redactCredentials(shownOutput(`${r.stdout}\n${r.stderr}`));
     if (r.code === 0) {
       // Every ref the remote reports updated is one that was judged (a belt to the refspecs' braces).

@@ -75,7 +75,7 @@ export async function refUpdateProblem(u: RefUpdate, policy: PushPolicy, isAnces
   if (policy.protectedBranches.some((p) => branchMatches(p, branch))) {
     return `${branch} is a protected branch (sandbox.push.protectedBranches): push your work to a branch of its own, and open a pull request`;
   }
-  if (!policy.defaultKnown) return "codeoid couldn't ask the remote which branch is its default, so it can't be sure this isn't it: try again";
+  if (!policy.defaultKnown) return "the remote didn't say which branch is its default (it couldn't be asked, or its HEAD names no branch), so codeoid can't be sure this isn't it: try again, and if it persists ask the owner to set the remote's default branch";
   if (policy.defaultBranch && policy.defaultBranch.toLowerCase() === branch.toLowerCase()) {
     return `${branch} is the remote's default branch: push your work to a branch of its own, and open a pull request`;
   }

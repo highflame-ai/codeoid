@@ -9342,13 +9342,14 @@ export class Session {
    * A remote this session's agent reached for that its owner hasn't connected: in guarded and interactive mode the
    * owner is asked (a card), in autonomous mode never. Resolves with who said yes, or null.
    */
-  async askToConnectGit(url: string, how: string): Promise<string | null> {
+  async askToConnectGit(url: string, how: string, signal?: AbortSignal): Promise<string | null> {
     if (this.#mode === "autonomous") return null;
     let answeredBy: string | undefined;
     const answer = await this.requestUserInput(
       {
         method: "confirm",
         title: `The agent's git reached for ${shownGitUrl(url)}`,
+        ...(signal ? { signal } : {}),
         message: `"${this.name}" ran git against ${shownGitUrl(url)}, which you haven't connected for agents.\n\nConnect it? Agents in your sandboxed sessions could then fetch from it, and push to branches of their own (never main, master or its default branch, never a force push, a delete or a tag), with ${how}. Your credential stays with codeoid; the agent never sees it. A pushed branch runs the repository's CI as that branch defines it, with its secrets.`,
         timeoutMs: 100_000,
       },

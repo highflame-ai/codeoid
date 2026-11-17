@@ -34,6 +34,7 @@ export class UploadFilter {
   #done = false;
   #dead = false;
   #bytes = 0;
+  #names: Set<string> | null = null;
 
   constructor(
     private readonly judge: ReachJudge,
@@ -103,8 +104,11 @@ export class UploadFilter {
       if (not) {
         // A branch or tag the remote has, by its full name, or by a short one as git resolves it (a tag first):
         // passed on by its full name, so git resolves nothing else (codeoid's own hidden refs least of all).
-        const names = await this.refNames();
-        const full = not.startsWith("refs/") ? (names.has(not) ? not : null) : names.has(`refs/tags/${not}`) ? `refs/tags/${not}` : names.has(`refs/heads/${not}`) ? `refs/heads/${not}` : null;
+        this.#names ??= await this.refNames();
+        const names = this.#names;
+        // git's order: `refs/<n>`, `refs/tags/<n>`, `refs/heads/<n>` (a full name is the first of those).
+        const tries = not.startsWith("refs/") ? [not] : [`refs/${not}`, `refs/tags/${not}`, `refs/heads/${not}`];
+        const full = tries.find((t) => names.has(t)) ?? null;
         if (full && /^refs\/(?:heads|tags)\//.test(full)) {
           this.#pending.push(`deepen-not ${full}`);
           return;

@@ -341,6 +341,15 @@ export class WorkstreamService {
    * Whether a session homed in `home` may read `target` (a reference,
    * §7.1): `open` yes, `ask` with its owner's confirm, `closed` never.
    */
+  /** Every workstream a remote URL's rules give it: the best one, or each of those tied for it (none: no rule matches). */
+  remoteWorkstreams(url: string): string[] {
+    const aliases = (this.#reader as { sshAliases?: () => Map<string, string> }).sshAliases?.() ?? new Map<string, string>();
+    const origin = normalizeRemote(url, aliases);
+    if (!origin || !this.#matchables.some((m) => m.remotes.length > 0)) return [];
+    const m = matchFolder(this.#matchables, { paths: [], origin });
+    return m.best ? [m.best.workstream] : (m.ambiguous ?? []);
+  }
+
   /** The workstream a remote URL belongs to, by the workstreams' remote rules (none: no rule matches it). */
   remoteWorkstream(url: string): string | undefined {
     // As a folder's remotes are read: the owner's ssh Host aliases applied (a second account's `github-client`).

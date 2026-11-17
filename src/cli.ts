@@ -1417,6 +1417,12 @@ sandboxGitCmd
   .action(async (dir: string | undefined, o: { remote?: string; url?: string; token?: boolean; yes?: boolean }) => {
     const client = new TerminalClient(loadConfig());
     await client.connect();
+    // Asked first: a push URL connected below uses it too.
+    const token = o.token ? (await readSecret("Token (user:token, or the token): ")).trim() : undefined;
+    if (o.token && !token) {
+      console.error("No token given: nothing connected.");
+      process.exit(1);
+    }
     let url = o.url;
     if (!url) {
       // The URL a repository's config names is shown, and confirmed, before anything is connected.
@@ -1428,13 +1434,8 @@ sandboxGitCmd
       // Your git pushes elsewhere (pushInsteadOf): agents' pushes go there, so that is connected too, when asked.
       if (found.rawPushUrl && found.pushUrl) {
         console.log(`Your git pushes it to ${found.pushUrl} (pushInsteadOf): agents' pushes go there.`);
-        if (await confirmOnTerminal("Connect that too? [y/N] ", o.yes, "")) await client.sandboxGitConnect("connect", { url: found.rawPushUrl });
+        if (await confirmOnTerminal("Connect that too? [y/N] ", o.yes, "")) await client.sandboxGitConnect("connect", { url: found.rawPushUrl, ...(token ? { token } : {}) });
       }
-    }
-    const token = o.token ? (await readSecret("Token (user:token, or the token): ")).trim() : undefined;
-    if (o.token && !token) {
-      console.error("No token given: nothing connected.");
-      process.exit(1);
     }
     await client.sandboxGitConnect("connect", { url, ...(token ? { token } : {}) });
     client.disconnect();

@@ -1316,10 +1316,12 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
   the remote's branches and tags still reach: one the remote has since deleted is never published again, and a push
   is checked once more against what the remote says it has just before it is sent. When a refresh finds the remote
   deleted or rewrote something, the copy drops it, and an agent's fetch can't name what no branch or tag reaches
-  (codeoid reads its request before git does; an unusual one is refused, with the reason). Partial clones
-  (`--filter`) aren't served: git says so and clones the whole repository. (a repack, once the requests it is serving are done), so nothing
+  (codeoid reads its request before git does; an unusual one is refused, with the reason). (a repack, once the requests it is serving are done), so nothing
   the remote deleted can be fetched, probed or built on from it afterwards. In a large repository that repack can
-  take a while; requests wait for it.
+  take a while; requests wait for it. Partial clones (`--filter`) aren't served: git says so and clones the whole
+  repository. Submodules aren't fetched through the gateway (git refuses the gateway's transport for a submodule, which
+  is what keeps a repository's `.gitmodules` from running a command): a private submodule needs the network and
+  its own access.
 - **Who asks before a push:** a session you set autonomous with your own token pushes without a card, as do loops
   you started and routines you made autonomous. Anything else autonomous (set by a delegated token, a worker the
   fleet started, a collaboration's children) asks you for each push.

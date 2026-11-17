@@ -288,7 +288,7 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     await commit(work, "e");
     const unborn = await agent(work, "push", "origin", "HEAD:refs/heads/new-one");
     expect(unborn.code).not.toBe(0);
-    expect(unborn.out).toContain("couldn't ask the remote which branch is its default");
+    expect(unborn.out).toContain("didn't say which branch is its default");
     plain(upstream, "symbolic-ref", "HEAD", "refs/heads/main");
     // A cache dir that isn't a repository (a clone cut short): removed and cloned again, never walked up from.
     const cache = gw.cachePath(`u:${URL}`);
@@ -845,6 +845,6 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(await refUpdateProblem({ old: z, new: a, ref: "refs/heads/HEAD" }, p, ff)).toContain("HEAD isn't a branch");
     expect(await refUpdateProblem({ old: a, new: b, ref: "refs/heads/teammate" }, p, ff)).toContain("wasn't made by an agent");
     expect(await refUpdateProblem({ old: a, new: b, ref: "refs/heads/mine" }, p, ff)).toBeNull();
-    expect(await refUpdateProblem({ old: z, new: a, ref: "refs/heads/new" }, { ...p, defaultKnown: false }, ff)).toContain("couldn't ask the remote");
+    expect(await refUpdateProblem({ old: z, new: a, ref: "refs/heads/new" }, { ...p, defaultKnown: false }, ff)).toContain("didn't say which branch is its default");
   });
 });
