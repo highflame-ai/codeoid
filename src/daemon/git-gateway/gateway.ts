@@ -83,6 +83,8 @@ interface Ticket {
   disconnected: () => boolean;
   /** Called when the push's hook starts (receive-pack has the whole pack): the serve reads the socket again. */
   onHook?: () => void;
+  /** Lifts the request's own limit: from the hook on, the push's limits (the upstream push's, the window's) govern. */
+  stopLimit?: () => void;
   /** Ends this push's ref-update window (called when its receive-pack exits, or the push is refused). */
   releaseRefUpdate?: () => void;
   /** Its receive-pack has exited. */
@@ -115,6 +117,8 @@ export class GitGateway {
   readonly #serving = new Map<string, Map<symbol, { kind: "fetch" | "push"; stop: () => void }>>();
   /** The check namespaces of pushes running their last check now (their refs and marks aren't stale). */
   readonly #checking = new Set<string>();
+  /** Over-cap connections waiting for their refusal (bounded). */
+  #refusing = 0;
   /** Pushes (by ticket) whose commands came in full: one whose check never ran is recorded as such. */
   readonly #commandsSeen = new Set<string>();
   /** Remotes that timed out: requests in the next minute are told so at once instead of each waiting it out. */
@@ -163,9 +167,22 @@ export class GitGateway {
         // A few git connections at once per session (each may hold some memory): more is a command flooding it.
         if (live.size >= 8) {
           c.on("error", () => c.destroy());
-          // Answered once its header came (closed before it, the launcher would only see a broken pipe).
-          const say = () => c.end("error too many git connections at once from this session: let one finish\n");
+          // Answered once its header came (closed before it, the launcher would only see a broken pipe); a flood of
+          // them isn't held: past a few waiting, the rest are closed at once.
+          if (this.#refusing >= 32) {
+            c.destroy();
+            return;
+          }
+          this.#refusing++;
+          let said = false;
+          const say = () => {
+            if (said) return;
+            said = true;
+            this.#refusing--;
+            c.end("error too many git connections at once from this session: let one finish\n");
+          };
           c.once("data", say);
+          c.once("close", say);
           setTimeout(say, 2_000).unref?.();
           return;
         }
@@ -341,7 +358,7 @@ export class GitGateway {
         return fail(fresh.error);
       }
       const ticket = randomBytes(24).toString("hex");
-      if (service === "git-receive-pack") this.#tickets.set(ticket, { sessionId, grant: { ...grant, upstream }, url, cache, remote: fresh, gone, disconnected });
+      if (service === "git-receive-pack") this.#tickets.set(ticket, { sessionId, grant: { ...grant, upstream }, url, cache, remote: fresh, gone, disconnected, stopLimit: () => clearTimeout(limit) });
       try {
         if (c.destroyed) return;
         c.write("ok\n");
@@ -624,6 +641,9 @@ export class GitGateway {
     // Single use.
     this.#tickets.delete(req.ticket as string);
     t.onHook?.();
+    // An approved push isn't cut off by the request's limit while it goes upstream (the agent would read a failure
+    // for a push the remote took); the upstream push and the window are bounded on their own.
+    t.stopLimit?.();
     // Served on its cache until the upstream push is done (the agent's git there or not): no prune runs under it.
     const leave = this.#enter(t.grant.cacheKey, "push");
     try {
