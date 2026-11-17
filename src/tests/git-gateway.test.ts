@@ -670,6 +670,40 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(plain(gw.cachePath(`u:${URL}`), "for-each-ref", "refs/codeoid-check/")).toBe("");
   });
 
+  test("round 17: a check ref a stopped daemon left is never shown, and is swept with what only it reached; an interrupted fetch's pack is pruned", async () => {
+    const other = join(root, "other");
+    plain(root, "clone", "-q", upstream, other);
+    plain(other, "checkout", "-q", "-b", "oops");
+    writeFileSync(join(other, "secret.txt"), "TOPSECRET\n");
+    plain(other, "add", ".");
+    plain(other, "commit", "-q", "-m", "oops");
+    plain(other, "push", "-q", "origin", "oops");
+    const secret = plain(other, "rev-parse", "HEAD");
+    expect((await agent(root, "ls-remote", URL)).code).toBe(0);
+    const cache = gw.cachePath(`u:${URL}`);
+    // As a push's last check leaves it when the daemon stops mid-way: a check ref on the commit, the branch then purged.
+    plain(cache, "update-ref", "refs/codeoid-check/deadbeef/heads/oops", secret);
+    plain(upstream, "branch", "-D", "oops");
+    plain(upstream, "reflog", "expire", "--expire=now", "--all");
+    plain(upstream, "gc", "-q", "--prune=now");
+    const listed = await agent(root, "ls-remote", URL);
+    expect(listed.code).toBe(0);
+    expect(listed.out).not.toContain("codeoid-check");
+    expect(listed.out).not.toContain(secret);
+    // That request swept it, and the prune dropped the commit.
+    expect(plain(cache, "for-each-ref", "refs/codeoid-check/")).toBe("");
+    expect(spawnSync("git", ["-C", cache, "cat-file", "-e", secret]).status).not.toBe(0);
+    // An interrupted fetch: its mark left, with a pack it brought that no ref names.
+    const blob = execFileSync("git", ["-C", cache, "hash-object", "-w", "--stdin"], { input: "fetched, never under a ref\n" }).toString().trim();
+    plain(cache, "repack", "-q");
+    writeFileSync(join(cache, "codeoid-unsettled-refresh-old"), "");
+    expect(await cacheDirty(cache)).toBe(true);
+    expect(await pruneCache(cache)).toBe(true);
+    expect(spawnSync("git", ["-C", cache, "cat-file", "-e", blob]).status).not.toBe(0);
+    expect(readdirSync(cache).filter((n) => n.startsWith("codeoid-unsettled-"))).toEqual([]);
+    expect(await cacheDirty(cache)).toBe(false);
+  });
+
   test("round 12: a disconnected remote's cache is removed", async () => {
     await clone();
     const cache = gw.cachePath(`u:${URL}`);

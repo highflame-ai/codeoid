@@ -21,7 +21,7 @@ import { within } from "../physical-path.js";
 import { type PushPolicy, type RefUpdate, refUpdateProblem } from "./policy.js";
 import { type GatewayScripts, writeGatewayScripts } from "./scripts.js";
 import { redactCredentials, shownGitUrl } from "./text.js";
-import { cacheDirty, cacheHas, cacheRef, configEnv, dropCheckRefs, fetchCheckRefs, isAncestor, objectsNotSent, pruneCache, pushUpstream, refreshCache, remoteRefs, type RemoteState, type Upstream } from "./upstream.js";
+import { cacheDirty, cacheHas, cacheRef, configEnv, dropCheckRefs, fetchCheckRefs, isAncestor, objectsNotSent, pruneCache, pushUpstream, refreshCache, remoteRefs, type RemoteState, sweepCheckRefs, type Upstream } from "./upstream.js";
 
 export type GitService = "git-upload-pack" | "git-receive-pack";
 
@@ -103,6 +103,8 @@ export class GitGateway {
   readonly #closing = new AbortController();
   /** Per cache: requests being served on it now; and whether it waits to be pruned (the remote deleted something). */
   readonly #serving = new Map<string, Map<symbol, { kind: "fetch" | "push"; stop: () => void }>>();
+  /** The check namespaces of pushes running their last check now (their refs and marks aren't stale). */
+  readonly #checking = new Set<string>();
   readonly #generations = new Map<string, number>();
   #closed = false;
 
@@ -276,8 +278,10 @@ export class GitGateway {
         // The remote deleted or rewrote something (judged from every ref the cache has had, however that refresh
         // ended): the cache drops it before anything more is served from it, once what is served on it is done
         // (fetches are stopped; none starts meanwhile: they wait on this lock).
-        if (await cacheDirty(cache)) {
-          if (!(await this.#drained(grant.cacheKey)) || !(await pruneCache(cache))) return { error: "codeoid is clearing what the remote deleted from its copy: try again in a few minutes" };
+        // Check refs of pushes no longer running (a daemon stopped mid-check): removed; what they reached is then judged.
+        await sweepCheckRefs(cache, this.#checking);
+        if (await cacheDirty(cache, this.#checking)) {
+          if (!(await this.#drained(grant.cacheKey)) || !(await pruneCache(cache, this.#checking))) return { error: "codeoid is clearing what the remote deleted from its copy: try again in a few minutes" };
         }
         if ("error" in r) return r;
         served.leave = this.#enter(grant.cacheKey, service === "git-upload-pack" ? "fetch" : "push", () => {
@@ -330,6 +334,9 @@ export class GitGateway {
       ["uploadpack.allowFilter", "true"],
       // A sparse filter names a blob to read as patterns: never one the client picks.
       ["uploadpackfilter.sparse:oid.allow", "false"],
+      // A push's check refs are codeoid's own: never shown, fetched or pushed to.
+      ["uploadpack.hideRefs", "refs/codeoid-check"],
+      ["receive.hideRefs", "refs/codeoid-check"],
       ["core.logAllRefUpdates", "false"],
     ];
     const env: Record<string, string> = {
@@ -530,6 +537,7 @@ export class GitGateway {
     // judges against all of it.
     const ns = randomBytes(8).toString("hex");
     let late: string | null;
+    this.#checking.add(ns);
     try {
       let known = await cacheHas(t.cache, now.map((r) => r.oid));
       if ("error" in known) return refuse(known.error);
@@ -540,11 +548,12 @@ export class GitGateway {
         if (fetched) return refuse(fetched);
         known = await cacheHas(t.cache, now.map((r) => r.oid));
         if ("error" in known) return refuse(known.error);
-        if (known.length < new Set(now.map((r) => r.oid)).size) return refuse("the remote changed while codeoid checked the push: push again");
+        if (new Set(known).size < new Set(now.map((r) => r.oid)).size) return refuse("the remote changed while codeoid checked the push: push again");
       }
       late = await objectsNotSent(t.cache, objects, updates.map((u) => u.new), known);
     } finally {
       await dropCheckRefs(t.cache, ns);
+      this.#checking.delete(ns);
     }
     if (late) return refuse(late);
     if (t.disconnected()) return refuse(`${shownGitUrl(t.url)} was disconnected`);

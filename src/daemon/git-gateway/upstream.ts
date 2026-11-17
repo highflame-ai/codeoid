@@ -76,6 +76,8 @@ export function configEnv(entries: ReadonlyArray<readonly [string, string]>): Re
 
 /** What every gateway git is: no config of the owner's, no prompt, no program but what is named here. */
 const CLEAN_CONFIG: ReadonlyArray<readonly [string, string]> = [
+  // What a fetch brings is always kept as a pack (never loose): an interrupted one shows as a new pack.
+  ["fetch.unpackLimit", "1"],
   // A transfer slower than 1 KB/s for a minute ends (a stalled remote holds its cache's lock).
   ["http.lowSpeedLimit", "1000"],
   ["http.lowSpeedTime", "60"],
@@ -255,8 +257,12 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
     // Every ref the cache has had is remembered (on disk) before the fetch can drop one, however this refresh ends
     // (a fetch that prunes and then fails, an agent gone mid-way, a restart): `cacheDirty` judges from that record.
     if (!(await rememberRefs(cache, false))) return { error: "codeoid couldn't read its copy of the remote" };
+    // Unsettled until what it fetched is recorded: a fetch cut short (killed, a crash) that stored objects under no
+    // ref leaves the mark, and the cache is pruned.
+    markUnsettled(cache, "refresh");
     const f = await runGit(["fetch", "--quiet", "--prune", "--prune-tags", "--no-write-fetch-head", "--", up.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], cache, env, left(), signal);
     if (f.code !== 0) return { error: gitError(f, "the remote couldn't be fetched") };
+    if (await rememberRefs(cache, false)) settle(cache, "refresh");
     // Every branch with its symref target, and HEAD (protocol v2's ls-refs symrefs).
     const h = await runGit(["ls-remote", "--symref", "--", up.url, "HEAD", "refs/heads/*"], cache, env, Math.min(left(), 60_000), signal, 256 * 1024 * 1024);
     const symrefs = new Set<string>();
@@ -290,7 +296,7 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
  * no request served on it (the gateway waits for them), under its lock. True when done.
  */
 // paths: the daemon's own cache repository, repacked and pruned
-export async function pruneCache(cache: string): Promise<boolean> {
+export async function pruneCache(cache: string, activeMarks: ReadonlySet<string> = new Set()): Promise<boolean> {
   const env = cacheEnv({ PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_NO_REPLACE_OBJECTS: "1" }, cache);
   // A pack a killed fetch left kept (`.keep`) would be kept whole by the repack: nothing runs on the cache now.
   const packs = join(cache, "objects", "pack");
@@ -305,6 +311,7 @@ export async function pruneCache(cache: string): Promise<boolean> {
   if (prune.code !== 0) return false;
   // Nothing that names a pruned object stays (a commit graph, a multi-pack index).
   for (const f of ["objects/info/commit-graph", "objects/info/commit-graphs", "objects/pack/multi-pack-index"]) rmSync(join(cache, f), { recursive: true, force: true });
+  for (const n of readdirSync(cache)) if (n.startsWith("codeoid-unsettled-") && !activeMarks.has(n.slice("codeoid-unsettled-".length))) rmSync(join(cache, n), { force: true });
   return rememberRefs(cache, true);
 }
 
@@ -328,8 +335,79 @@ export async function rememberRefs(cache: string, fresh: boolean): Promise<boole
   const seen = fresh ? new Set<string>() : readSeen(cache);
   if (seen === null) return false;
   for (const o of now) seen.add(o);
-  writeFileSync(seenFile(cache), `${[...seen].join("\n")}\n`, { mode: 0o600 });
+  // Written whole or not at all (a crash or a full disk mid-write leaves the old record).
+  const tmp = `${seenFile(cache)}.${randomBytes(6).toString("hex")}`;
+  try {
+    writeFileSync(tmp, `${[...seen].join("\n")}\n`, { mode: 0o600 });
+    renameSync(tmp, seenFile(cache));
+  } catch {
+    rmSync(tmp, { force: true });
+    return false;
+  }
   return true;
+}
+
+/** The cache's pack files now. */
+function packsOf(cache: string): string[] {
+  try {
+    return readdirSync(join(cache, "objects", "pack")).filter((n) => n.endsWith(".pack")).sort();
+  } catch {
+    return [];
+  }
+}
+
+/** Mark an operation that stores objects as under way (`id`), with the packs before it. */
+// paths: the daemon's own cache repository: a mark file, written (0600)
+export function markUnsettled(cache: string, id: string): void {
+  writeFileSync(join(cache, `codeoid-unsettled-${id}`), `${packsOf(cache).join("\n")}\n`, { mode: 0o600 });
+}
+
+/** The operation `id` recorded what it stored. */
+// paths: the daemon's own cache repository: a mark file, removed
+export function settle(cache: string, id: string): void {
+  rmSync(join(cache, `codeoid-unsettled-${id}`), { force: true });
+}
+
+/**
+ * Whether an operation that stored objects ended before recording them (a mark left that isn't `active`'s) with a pack
+ * it brought still there: those objects may be under no ref, and no record names them. One that brought nothing is
+ * settled here.
+ */
+// paths: the daemon's own cache repository: its mark files, read and removed
+function unsettledLeft(cache: string, active: ReadonlySet<string>): boolean {
+  let names: string[] = [];
+  try {
+    names = readdirSync(cache).filter((n) => n.startsWith("codeoid-unsettled-"));
+  } catch {
+    return false;
+  }
+  const packs = packsOf(cache);
+  let left = false;
+  for (const n of names) {
+    const id = n.slice("codeoid-unsettled-".length);
+    if (active.has(id)) continue;
+    let before: Set<string>;
+    try {
+      before = new Set(readFileSync(join(cache, n), "utf8").split("\n").filter(Boolean));
+    } catch {
+      left = true;
+      continue;
+    }
+    if (packs.some((p) => !before.has(p))) left = true;
+    else rmSync(join(cache, n), { force: true });
+  }
+  return left;
+}
+
+/** Remove the check refs of pushes no longer running (a daemon stopped mid-check left them). */
+// paths: the daemon's own cache repository: stale refs in its private check namespace, removed
+export async function sweepCheckRefs(cache: string, active: ReadonlySet<string>): Promise<void> {
+  if (!existsSync(cache)) return;
+  const env = cacheEnv({ PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, cache);
+  const r = await runGit(["for-each-ref", "--format=%(refname)", "refs/codeoid-check/"], cache, env, 30_000, undefined, 64 * 1024 * 1024);
+  if (r.code !== 0) return;
+  const stale = r.stdout.split("\n").filter((n) => n && !active.has(n.split("/")[2] ?? ""));
+  if (stale.length > 0) await gitLines(["update-ref", "--stdin"], cache, env, stale.map((n) => `delete ${n}`), 30_000);
 }
 
 /** What the cache has seen, or null when the record is missing (a cache older than it: judged dirty once). */
@@ -345,8 +423,9 @@ function readSeen(cache: string): Set<string> | null {
  * Whether the cache holds objects no ref reaches now that a ref it had reached (the remote deleted a branch or
  * rewrote one): it must be pruned before anything more is served from it. Unknown (a record missing, an error): true.
  */
-export async function cacheDirty(cache: string): Promise<boolean> {
+export async function cacheDirty(cache: string, active: ReadonlySet<string> = new Set()): Promise<boolean> {
   if (!existsSync(cache)) return false;
+  if (unsettledLeft(cache, active)) return true;
   const seen = readSeen(cache);
   const now = await refOids(cache);
   if (!seen || !now) return true;
@@ -378,9 +457,12 @@ export async function fetchCheckRefs(cache: string, up: Upstream, ssh: string | 
   return withUpstreamEnv(up, ssh, async (base) => {
     const env = cacheEnv(base, cache);
     const specs = names.map((n) => `+${n}:refs/codeoid-check/${ns}/${n.replace(/^refs\//, "")}`);
+    markUnsettled(cache, ns);
     const r = await runGit(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--", up.url, ...specs], cache, env, 120_000);
     if (r.code !== 0) return gitError(r, "the remote couldn't be fetched again before the push");
-    return (await rememberRefs(cache, false)) ? null : "codeoid couldn't read its copy of the remote";
+    if (!(await rememberRefs(cache, false))) return "codeoid couldn't read its copy of the remote";
+    settle(cache, ns);
+    return null;
   });
 }
 
