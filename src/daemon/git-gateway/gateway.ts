@@ -83,8 +83,12 @@ interface Ticket {
   disconnected: () => boolean;
   /** Called when the push's hook starts (receive-pack has the whole pack): the serve reads the socket again. */
   onHook?: () => void;
-  /** Ends this push's ref-update window (called when its receive-pack exits). */
+  /** Ends this push's ref-update window (called when its receive-pack exits, or the push is refused). */
   releaseRefUpdate?: () => void;
+  /** Its receive-pack has exited. */
+  served?: boolean;
+  /** The hook said "ok" (receive-pack will update the cache's refs, inside the window). */
+  verdictOk?: boolean;
 }
 
 const MAX_HEADER = 64 * 1024;
@@ -505,8 +509,8 @@ export class GitGateway {
       });
       p.stdout.pipe(c, { end: false });
       const finish = (code: number | null) => {
+        if (t) t.served = true;
         t?.releaseRefUpdate?.();
-        if (t) t.releaseRefUpdate = undefined;
         c.end();
         done(code);
       };
@@ -628,6 +632,9 @@ export class GitGateway {
       verdict(false);
     } finally {
       leave();
+      // Refused (or thrown): nothing will update the cache's refs, so the window closes now; an "ok" keeps it to the
+      // serve's end (closed then, or now if that already came).
+      if (!t.verdictOk || t.served) t.releaseRefUpdate?.();
     }
   }
 
@@ -683,6 +690,11 @@ export class GitGateway {
     }
     // The owner disconnected the remote while the card was up: nothing is pushed with what they took back.
     if (t.disconnected()) return refuse(`${shownGitUrl(t.url)} was disconnected`);
+    // From here until this push's receive-pack exits, no refresh fetches into the cache's refs: one could move the
+    // pushed branch's ref after the upstream push and before receive-pack's own update, which would then fail (and the
+    // agent would read "rejected" for a push the remote took). Released on every way out (#onHook, the serve's end).
+    t.releaseRefUpdate = await this.#enterRefUpdate(t.grant.cacheKey);
+    if (t.served) t.releaseRefUpdate();
     // The remote may have deleted something since the refresh (a connection held open, a card answered late): judged
     // again against what it says it has now, so nothing it no longer has goes back to it.
     const now = await remoteRefs(t.grant.upstream, t.grant.ssh);
@@ -728,9 +740,8 @@ export class GitGateway {
     }
     say(`codeoid pushed ${updates.map((u) => u.ref.replace(/^refs\/heads\//, "")).join(", ")} to ${shownGitUrl(t.url)}`);
     this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: true, detail: `pushed to ${shownGitUrl(t.url)}`, updates });
-    // receive-pack updates the cache's refs right after this "ok": never while a refresh fetches into them (the two
-    // would fight over the ref locks). Held until that receive-pack exits.
-    t.releaseRefUpdate = await this.#enterRefUpdate(t.grant.cacheKey);
+    // receive-pack updates the cache's refs right after this "ok", inside the window (held until it exits).
+    t.verdictOk = true;
     verdict(true);
   }
 }

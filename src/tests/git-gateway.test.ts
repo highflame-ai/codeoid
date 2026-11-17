@@ -928,12 +928,12 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
 
   test("round 24: pushes and fetches at once on one remote all go (no ref-lock fight, no prune, no fetch cut off)", async () => {
     const works: string[] = [];
-    for (const n of ["a", "b", "c"]) {
+    for (const n of ["a", "b", "c", "d"]) {
       const w = join(root, `work-${n}`);
       expect((await agent(root, "clone", "-q", URL, w)).code).toBe(0);
       works.push(w);
     }
-    for (let round = 0; round < 3; round++) {
+    for (let round = 0; round < 4; round++) {
       const jobs: Array<Promise<{ code: number; out: string }>> = [];
       for (const [i, w] of works.entries()) {
         await agent(w, "checkout", "-q", "-B", `br-${i}`);
@@ -948,6 +948,34 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     }
     expect(reports.filter((e) => !e.ok)).toEqual([]);
   }, 120_000);
+
+  test("round 25: an agent killed while its push waits leaves nothing held: the next request on the remote goes at once", async () => {
+    const work = await clone();
+    await agent(work, "checkout", "-q", "-b", "killed");
+    await commit(work, "killed");
+    approveDelayMs = 1500;
+    const s = gw.forSession("s1");
+    const env = {
+      PATH: process.env.PATH ?? "",
+      HOME: join(root, "agent-home"),
+      GIT_CONFIG_NOSYSTEM: "1",
+      ...ID,
+      CODEOID_GIT_GATEWAY: s.socket,
+      ...configEnv([
+        ["protocol.ext.allow", "always"],
+        [`url.ext::${s.ext} %S ${URL}.insteadOf`, URL],
+      ]),
+    };
+    const p = Bun.spawn(["git", "push", "origin", "killed"], { cwd: work, env, stdout: "pipe", stderr: "pipe" });
+    await new Promise((r) => setTimeout(r, 600));
+    p.kill("SIGKILL");
+    await p.exited;
+    await new Promise((r) => setTimeout(r, 1500));
+    const t0 = Date.now();
+    expect((await agent(work, "fetch", "-q", "origin")).code).toBe(0);
+    expect(Date.now() - t0).toBeLessThan(10_000);
+    expect(upstreamRef("refs/heads/killed")).toBe("");
+  }, 30_000);
 
   test("round 12: a disconnected remote's cache is removed", async () => {
     await clone();
