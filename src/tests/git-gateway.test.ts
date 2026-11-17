@@ -886,14 +886,15 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     const work = await clone();
     await agent(work, "checkout", "-q", "-b", "big");
     // Incompressible content, already packed locally (as a reused pack is streamed fast).
-    writeFileSync(join(work, "big.bin"), randomBytes(40 * 1024 * 1024));
+    // CODEOID_TEST_BIG_MB: a larger pack, to run by hand (the pinned Bun's stdin race needed hundreds of MiB).
+    writeFileSync(join(work, "big.bin"), randomBytes(Number(process.env.CODEOID_TEST_BIG_MB || 40) * 1024 * 1024));
     await agent(work, "add", ".");
     expect((await agent(work, "commit", "-q", "-m", "big")).code).toBe(0);
     plain(work, "repack", "-q", "-a", "-d");
     const r = await agent(work, "push", "origin", "big");
     expect([r.code, r.out]).toEqual([0, expect.stringContaining("codeoid pushed big")]);
     expect(upstreamRef("refs/heads/big")).toBe(plain(work, "rev-parse", "HEAD"));
-  }, 60_000);
+  }, 300_000);
 
   test("round 12: a disconnected remote's cache is removed", async () => {
     await clone();

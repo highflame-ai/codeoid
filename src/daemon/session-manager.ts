@@ -4857,7 +4857,8 @@ mcpHub: this.#mcpHub,
     // The URL git really uses there (the owner's own rewrite applied): what is shown, asked and connected.
     if (msg.action === "resolve") {
       const used = msg.url ? url : ownerRewrite(url);
-      const pushUsed = msg.url ? url : ownerPushRewrite(pushurl || url);
+      // git applies insteadOf to an explicit pushurl, and pushInsteadOf only to a url used for pushing.
+      const pushUsed = msg.url ? url : pushurl ? ownerRewrite(pushurl) : ownerPushRewrite(url);
       return {
         type: "response.ok",
         requestId: msg.id,
@@ -4873,7 +4874,7 @@ mcpHub: this.#mcpHub,
     }
     if (msg.action === "disconnect") {
       // From a repository: the URL as written and as the owner's git uses it (connect connected the latter).
-      const written = msg.url ? [url] : [url, ownerRewrite(url), ownerPushRewrite(url), ...(pushurl ? [pushurl, ownerPushRewrite(pushurl)] : [])];
+      const written = msg.url ? [url] : [url, ownerRewrite(url), ownerPushRewrite(url), ...(pushurl ? [pushurl, ownerRewrite(pushurl)] : [])];
       const forms = [...new Set(written.flatMap((u) => [u, ...sameRepoSpellings(u)]))];
       let removed = false;
       for (const u of forms) {

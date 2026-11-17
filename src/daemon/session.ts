@@ -9288,9 +9288,12 @@ export class Session {
     if (added.length > 0) lines.push(`Besides the workspace, they can write ${added.map((d) => `${d}/`).join(", ")} (git structure and project settings there read-only, as in the workspace).`);
     if (this.#requestDirectoryMounted()) lines.push("To write in another directory, call the `request_directory` tool (path, reason). What it grants is writable from your next turn.");
     else lines.push("To write in another directory, ask the owner to add it (`/sandbox add <dir>`).");
-    if (sbx.runtime?.spec.gatewaySockets?.length && !this.gitAccessProblem("git-receive-pack")) {
+    if (sbx.runtime?.spec.gatewaySockets?.length && !this.gitAccessProblem("git-upload-pack")) {
+      const noPush = this.gitAccessProblem("git-receive-pack");
       lines.push(
-        "`git fetch` and `git push` work for remotes the owner connected: codeoid reaches them for you with the owner's credentials (you never see them). Commit, then push a branch of your own; pushes to main, master or the remote's default branch, force pushes, deletes and tags are refused, and the owner may be asked first.",
+        noPush
+          ? `\`git fetch\` works for remotes the owner connected: codeoid reaches them for you with the owner's credentials (you never see them). Pushes are refused here: ${noPush}.`
+          : "`git fetch` and `git push` work for remotes the owner connected: codeoid reaches them for you with the owner's credentials (you never see them). Commit, then push a branch of your own; pushes to main, master or the remote's default branch, force pushes, deletes and tags are refused, and the owner may be asked first.",
       );
     }
     return lines.join("\n");

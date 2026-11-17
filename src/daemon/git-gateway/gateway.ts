@@ -109,6 +109,8 @@ export class GitGateway {
   readonly #serving = new Map<string, Map<symbol, { kind: "fetch" | "push"; stop: () => void }>>();
   /** The check namespaces of pushes running their last check now (their refs and marks aren't stale). */
   readonly #checking = new Set<string>();
+  /** Pushes (by ticket) whose commands came in full: one whose check never ran is recorded as such. */
+  readonly #commandsSeen = new Set<string>();
   /** Remotes that timed out: requests in the next minute are told so at once instead of each waiting it out. */
   readonly #down = new Map<string, { until: number; error: string }>();
   readonly #generations = new Map<string, number>();
@@ -333,8 +335,14 @@ export class GitGateway {
         c.write("ok\n");
         const code = await this.#serve(service, cache, c, rest, ticket, protocol, (why) => this.#host.report(sessionId, { kind: "fetch", url, ok: false, detail: why }));
         if (service === "git-upload-pack" && code === 0) this.#host.report(sessionId, { kind: "fetch", url, ok: true, detail: `fetched from ${shownGitUrl(url)}` });
+        // A push whose commands came but whose check never ran: git refused it first (its pack, a connection cut), and
+        // that is recorded as well, so a failed push always leaves a trace.
+        if (service === "git-receive-pack" && this.#tickets.has(ticket) && this.#commandsSeen.has(ticket)) {
+          this.#host.report(sessionId, { kind: "push", url, ok: false, detail: "the push ended before codeoid checked it (git didn't take its pack, or the connection was cut): nothing was pushed" });
+        }
       } finally {
         this.#tickets.delete(ticket);
+        this.#commandsSeen.delete(ticket);
       }
     } finally {
       sessionGone.delete(gone);
@@ -391,7 +399,7 @@ export class GitGateway {
       let ended = false;
       // A push's commands (pkt-lines, to the first flush) are read on the way: a ref name with a control character
       // (a line feed would make two lines of the hook's input of one command) ends the request before git sees it.
-      const commands = service === "git-receive-pack" ? new CommandReader() : null;
+      const commands = service === "git-receive-pack" ? new CommandReader(() => this.#commandsSeen.add(ticket)) : null;
       // A fetch's lines are read on the way too: nothing in them names an object no ref reaches (upload-filter.ts).
       const filter =
         service === "git-upload-pack"
@@ -428,11 +436,10 @@ export class GitGateway {
           c.resume();
         });
       };
-      // Ended only once what is queued has gone to git (an end with writes still queued can cut the pack short).
-      const endStdin = () => {
-        if (paused || p.stdin.writableNeedDrain) p.stdin.once("drain", () => p.stdin.end());
-        else p.stdin.end();
-      };
+      // git's stdin isn't ended when the client's input ends: neither service needs an EOF (a pack says where it ends,
+      // a fetch ends at its `done` or flush), and on Bun 1.3 an end right after a write can drop that write's last
+      // bytes (a large push's pack cut short: "early EOF"). It closes when git exits; the request's limit bounds the rest.
+      const endStdin = () => {};
       const t = this.#tickets.get(ticket);
       if (t) {
         t.onHook = () => {
@@ -692,6 +699,9 @@ function sweepTempClones(dir: string): void {
 export class CommandReader {
   #buf: Buffer = Buffer.alloc(0);
   #done = false;
+  #commands = 0;
+  /** `onCommands`: the command list ended (at its flush) with at least one command. */
+  constructor(private readonly onCommands: () => void = () => {}) {}
   ok(chunk: Buffer): boolean {
     if (this.#done) return true;
     this.#buf = this.#buf.length ? Buffer.concat([this.#buf, chunk]) : chunk;
@@ -701,6 +711,7 @@ export class CommandReader {
       if (n === 0) {
         this.#done = true;
         this.#buf = Buffer.alloc(0);
+        if (this.#commands > 0) this.onCommands();
         return true;
       }
       if (n < 4 || n > 65520) return false;
@@ -720,6 +731,7 @@ export class CommandReader {
       } catch {
         return false;
       }
+      this.#commands++;
     }
     return true;
   }
