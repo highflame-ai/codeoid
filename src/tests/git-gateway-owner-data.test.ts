@@ -245,7 +245,7 @@ describe("credential helpers", () => {
 
 describe("round 31: the owner's rewrites as git applies them in the repository", () => {
   test("a pushInsteadOf in a conditional include, or in the repository's own config, counts; from / it doesn't", async () => {
-    const { ownerPushRewrite, ownerRewrite } = await import("../daemon/git-gateway/connect.js");
+    const { ownerPushRewrite, ownerRewrite, warmRewrites } = await import("../daemon/git-gateway/connect.js");
     const repo = join(home, "work", "app");
     mkdirSync(repo, { recursive: true });
     spawnSync("git", ["init", "-q", repo]);
@@ -254,11 +254,14 @@ describe("round 31: the owner's rewrites as git applies them in the repository",
     process.env.HOME = home;
     const url = "https://github.com/acme/app.git";
     expect(ownerPushRewrite(url)).toBe(url);
+    // The repository's rules are read asynchronously (never on the daemon's thread), before they are used.
+    await warmRewrites(repo, true);
     expect(ownerPushRewrite(url, repo)).toBe("git@github.com:me/app.git");
     expect(ownerRewrite(url, repo)).toBe(url);
     // The repository's own rule.
     writeFileSync(join(home, ".gitconfig"), "");
     spawnSync("git", ["-C", repo, "config", "url.git@gitlab.com:me/.pushInsteadOf", "https://github.com/acme/"]);
+    await warmRewrites(repo, true);
     expect(ownerPushRewrite(url, repo)).toBe("git@gitlab.com:me/app.git");
   });
 
@@ -276,7 +279,7 @@ describe("round 31: the owner's rewrites as git applies them in the repository",
 describe("round 32: the repository's files are read without blocking, and asked only when plain", () => {
   test("a FIFO config or HEAD: nothing blocks, the repository isn't asked; a subdirectory finds its top", async () => {
     const { workspaceRemoteUrls, repositoryForRewrites, gatewayRoutes } = await import("../daemon/sandbox/session-sandbox.js");
-    const { ownerPushRewrite } = await import("../daemon/git-gateway/connect.js");
+    const { ownerPushRewrite, warmRewrites } = await import("../daemon/git-gateway/connect.js");
     process.env.HOME = home;
     const repo = join(home, "proj");
     mkdirSync(join(repo, "sub"), { recursive: true });
@@ -285,6 +288,7 @@ describe("round 32: the repository's files are read without blocking, and asked 
     spawnSync("git", ["-C", repo, "config", "url.git@github.com:me/.pushInsteadOf", "https://github.com/acme/"]);
     // A subdirectory: its repository's top is asked, and the repository's rule applies.
     expect(repositoryForRewrites(join(repo, "sub"))).toBe(repo);
+    await warmRewrites(repo, true);
     expect(ownerPushRewrite("https://github.com/acme/app.git", repositoryForRewrites(join(repo, "sub")))).toBe("git@github.com:me/app.git");
     // The config a FIFO: read at once as nothing, the repository not asked.
     rmSync(join(repo, ".git", "config"));
@@ -303,5 +307,55 @@ describe("round 32: the repository's files are read without blocking, and asked 
     const connected = "https://github.com/acme/app.git";
     const httpMirror = (u: string) => (u === connected ? "http://mirror.local/acme/app.git" : u);
     expect(gatewayRoutes([connected], [], { off: false, rewrite: httpMirror, pushRewrite: httpMirror })).toEqual([{ from: connected, fetch: connected, push: connected }]);
+  });
+});
+
+describe("round 33: nothing of an agent's repository, or of the owner's config, is read on the daemon's thread blocking", () => {
+  test("a worktree whose gitdir back-link is a FIFO: gitLayoutOf answers at once", async () => {
+    const { gitLayoutOf } = await import("../daemon/sandbox/policy.js");
+    const repo = join(home, "r33");
+    spawnSync("git", ["init", "-q", repo]);
+    const wt = join(home, "r33-wt");
+    mkdirSync(join(repo, ".git", "worktrees", "w"), { recursive: true });
+    mkdirSync(wt);
+    writeFileSync(join(wt, ".git"), `gitdir: ${join(repo, ".git", "worktrees", "w")}\n`);
+    spawnSync("mkfifo", [join(repo, ".git", "worktrees", "w", "gitdir")]);
+    const t = Date.now();
+    expect(gitLayoutOf(wt, home)?.kind).not.toBe("worktree");
+    expect(Date.now() - t).toBeLessThan(2_000);
+  });
+
+  test("the repository's rules are read without holding the daemon up, a FIFO in its config included", async () => {
+    const { warmRewrites, ownerPushRewrite } = await import("../daemon/git-gateway/connect.js");
+    process.env.HOME = home;
+    const repo = join(home, "r33b");
+    spawnSync("git", ["init", "-q", repo]);
+    spawnSync("mkfifo", [join(repo, "planted")]);
+    spawnSync("git", ["-C", repo, "config", "include.path", join(repo, "planted")]);
+    let ticks = 0;
+    const tick = setInterval(() => ticks++, 50);
+    const t = Date.now();
+    await warmRewrites(repo, true);
+    clearInterval(tick);
+    // The read waited (up to its own limit), the daemon's thread didn't: timers kept firing all along.
+    expect(ticks).toBeGreaterThan(Math.floor((Date.now() - t) / 50) - 5);
+    // Not read: the rules from / stand.
+    expect(ownerPushRewrite("https://github.com/acme/app.git", repo)).toBe("https://github.com/acme/app.git");
+  }, 20_000);
+
+  test("an owner include target that is a FIFO: the rules from / aren't read; a missing one in a workspace is made empty and held", async () => {
+    const { ownerConfigPlain, ownerConfigFiles } = await import("../daemon/git-gateway/connect.js");
+    const { buildSandboxSpec } = await import("../daemon/sandbox/policy.js");
+    process.env.HOME = home;
+    const dots = join(home, "dotfiles");
+    mkdirSync(dots);
+    spawnSync("mkfifo", [join(dots, "fifo.gitconfig")]);
+    writeFileSync(join(home, ".gitconfig"), `[include]\n\tpath = ${join(dots, "fifo.gitconfig")}\n[include]\n\tpath = ${join(dots, "missing.gitconfig")}\n`);
+    // ownerConfigFiles is cached a few seconds: a fresh home key each test.
+    expect(ownerConfigFiles()).toContain(join(dots, "missing.gitconfig"));
+    expect(ownerConfigPlain()).toBe(false);
+    const spec = buildSandboxSpec({ sessionId: "r33", workspace: dots, tempDir: join(home, "t"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" }, cache: false, ownerConfigFiles: ownerConfigFiles() });
+    expect(existsSync(join(dots, "missing.gitconfig"))).toBe(true);
+    expect(spec.readOnly).toContain(realpathSync(join(dots, "missing.gitconfig")));
   });
 });

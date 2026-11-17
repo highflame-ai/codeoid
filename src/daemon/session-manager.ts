@@ -214,7 +214,7 @@ import {
   removeForkWorktree,
 } from "./git-worktree.js";
 import { GIT_BIN, hardenedGit, safeGit } from "./git-env.js";
-import { connectionId, GitCredentials, ownerConfigProblem, ownerPushRewrite, ownerRewrite, probeConnection, sshHome } from "./git-gateway/connect.js";
+import { connectionId, GitCredentials, ownerConfigProblem, ownerPushRewrite, ownerRewrite, probeConnection, sshHome, warmRewrites } from "./git-gateway/connect.js";
 import { type GatewayHost, GitGateway } from "./git-gateway/gateway.js";
 import { hostPathProblem } from "./git-gateway/hostpath.js";
 import { redactCredentials, remoteUrlProblem, shownGitUrl } from "./git-gateway/text.js";
@@ -4857,6 +4857,7 @@ mcpHub: this.#mcpHub,
     // The URL git really uses there (the owner's own rewrite applied): what is shown, asked and connected.
     // The repository's top, its files plain (its git asked where the owner's rules send the URL; a subdirectory too).
     const repoDir = msg.url || !msg.path ? undefined : repositoryForRewrites(msg.path);
+    await warmRewrites(repoDir);
     if (msg.action === "resolve") {
       // As the owner's git in that repository would (its includes and its own rules count).
       const used = msg.url ? url : ownerRewrite(url, repoDir);

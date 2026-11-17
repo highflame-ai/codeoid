@@ -8,7 +8,7 @@
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { physicalPath, within } from "../physical-path.js";
@@ -175,6 +175,8 @@ function ownerHelpers(url: string): string[] {
 // paths: git credential fill from /, with a config codeoid writes (0600, in its own run dir), run for the owner at their request
 export function fillGitCredential(url: string, o: { runDir: string; writable: readonly string[] }, timeoutMs = 60_000): Promise<HttpsCredential | { error: string }> {
   const u = new URL(url);
+  // git reads the owner's config files (and their includes) for this: never one that isn't a plain file.
+  if (!ownerConfigPlain()) return Promise.resolve({ error: "your git config, or a file it includes, isn't a plain file (a FIFO?), so codeoid doesn't read it: connect with --token" });
   const helpers = ownerHelpers(url);
   const usable: string[] = [];
   for (const h of helpers) {
@@ -326,6 +328,7 @@ export function ownerRewrite(url: string, dir?: string): string {
     const inRepo = rewriteIn(dir, url, false);
     if (inRepo !== null) return inRepo;
   }
+  if (!ownerConfigPlain()) return url;
   try {
     const r = spawnSync(GIT_BIN, ["-C", "/", "ls-remote", "--get-url", "--", url], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
     const out = r.status === 0 ? r.stdout.trim() : "";
@@ -335,47 +338,86 @@ export function ownerRewrite(url: string, dir?: string): string {
   }
 }
 
+/** The url.* rules git reads in a repository (its includes, conditional ones, its own config), as of a read. */
+interface RewriteRules {
+  insteadOf: Array<readonly [string, string]>;
+  pushInsteadOf: Array<readonly [string, string]>;
+}
+const repoRules = new Map<string, { at: number; rules: RewriteRules | null }>();
+const reading = new Map<string, Promise<void>>();
 const hungRepos = new Map<string, number>();
 
 /**
- * Where the owner's git, working in the repository at `dir`, fetches (or pushes) `url`: git's own answer there, so a
- * rule in a conditional include (`includeIf "gitdir:…"`) or in the repository's own config counts as it does for
- * them. Config is read, nothing run (no hook, no fsmonitor); what it says is only a destination, which the gateway's
- * grant still judges. Null: git couldn't say.
+ * Read (again, when older than half a minute) the url.* rules git applies in the repository at `dir`: `git config
+ * --get-regexp` run there, asynchronously (the repository is the agent's to write: a FIFO or a slow file in it holds
+ * up only this read, never the daemon), bounded at 5 s; one that didn't answer isn't read again for 10 minutes.
  */
 // paths: git config read in the session's repository (url.* rules), nothing run
-function rewriteIn(dir: string, url: string, push: boolean): string | null {
-  // A repository whose git once didn't answer in time (a FIFO it reads: the agent can make one) isn't asked again for
-  // a while: this run blocks the daemon, so it is short, and it isn't repeated.
+export function warmRewrites(dir: string | undefined, fresh = false): Promise<void> {
+  if (!dir) return Promise.resolve();
+  const have = repoRules.get(dir);
+  if (!fresh && have && Date.now() - have.at < 30_000) return Promise.resolve();
   const hung = hungRepos.get(dir);
-  if (hung && hung > Date.now()) return null;
-  const run = (args: string[]) => {
-    const r = spawnSync(GIT_BIN, ["-C", dir, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", ...args], { cwd: dir, env: { ...ownerHelperEnv(), GIT_CEILING_DIRECTORIES: dirname(dir) }, encoding: "utf8", timeout: 1_000, killSignal: "SIGKILL" });
-    if (r.error || r.signal) hungRepos.set(dir, Date.now() + 10 * 60_000);
-    return r;
-  };
-  try {
-    const f = run(["ls-remote", "--get-url", "--", url]);
-    const fetched = f.status === 0 ? (f.stdout.trim().split("\n")[0] ?? "") : "";
-    if (f.error || f.signal || f.status !== 0) return null;
-    const fetchUrl = fetched && !/\s/.test(fetched) ? fetched : url;
-    if (!push) return fetchUrl;
-    // pushInsteadOf, the longest match, as git applies it (its includes and the repository's own config read there).
-    const r = run(["config", "--null", "--get-regexp", "^url\\..*\\.pushinsteadof$"]);
-    // 1: none matched (no rule), which is an answer; anything else that isn't 0 isn't one.
-    if (r.error || r.signal || (r.status !== 0 && r.status !== 1)) return null;
-    let best: { base: string; prefix: string } | null = null;
-    for (const entry of (r.status === 0 ? r.stdout : "").split("\0")) {
-      const nl = entry.indexOf("\n");
-      if (nl < 0) continue;
-      const base = entry.slice("url.".length, nl - ".pushinsteadof".length);
-      const prefix = entry.slice(nl + 1);
-      if (prefix && url.startsWith(prefix) && (!best || prefix.length > best.prefix.length)) best = { base, prefix };
-    }
-    return best ? best.base + url.slice(best.prefix.length) : fetchUrl;
-  } catch {
-    return null;
-  }
+  if (hung && hung > Date.now()) return Promise.resolve();
+  const running = reading.get(dir);
+  if (running) return running;
+  const done = new Promise<void>((resolveRead) => {
+    const child = spawn(GIT_BIN, ["-C", dir, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "config", "--null", "--get-regexp", "^url\\..*\\.(insteadof|pushinsteadof)$"], { cwd: dir, env: { ...ownerHelperEnv(), GIT_CEILING_DIRECTORIES: dirname(dir) }, stdio: ["ignore", "pipe", "ignore"] });
+    let out = "";
+    child.stdout.on("data", (d: Buffer) => {
+      if (out.length < 1 << 20) out += d.toString("utf8");
+    });
+    const timer = setTimeout(() => {
+      hungRepos.set(dir, Date.now() + 10 * 60_000);
+      child.kill("SIGKILL");
+    }, 5_000);
+    const finish = (code: number | null) => {
+      clearTimeout(timer);
+      reading.delete(dir);
+      // 1: no rule at all, which is an answer.
+      if (code !== 0 && code !== 1) repoRules.set(dir, { at: Date.now(), rules: null });
+      else {
+        const rules: RewriteRules = { insteadOf: [], pushInsteadOf: [] };
+        for (const entry of out.split("\0")) {
+          const nl = entry.indexOf("\n");
+          if (nl < 0) continue;
+          const key = entry.slice(0, nl);
+          const prefix = entry.slice(nl + 1);
+          const m = /^url\.(.*)\.(insteadof|pushinsteadof)$/i.exec(key);
+          if (!m?.[1] || !prefix) continue;
+          (m[2]?.toLowerCase() === "pushinsteadof" ? rules.pushInsteadOf : rules.insteadOf).push([m[1], prefix]);
+        }
+        repoRules.set(dir, { at: Date.now(), rules });
+      }
+      resolveRead();
+    };
+    child.on("close", finish);
+    child.on("error", () => finish(null));
+  });
+  reading.set(dir, done);
+  return done;
+}
+
+/** A rule set's rewrite of `url`: the longest matching prefix, as git picks. */
+function longest(rules: ReadonlyArray<readonly [string, string]>, url: string): string | null {
+  let best: readonly [string, string] | null = null;
+  for (const r of rules) if (url.startsWith(r[1]) && (!best || r[1].length > best[1].length)) best = r;
+  return best ? best[0] + url.slice(best[1].length) : null;
+}
+
+/**
+ * Where the owner's git, working in the repository at `dir`, fetches (or pushes) `url`, by the rules git reads there
+ * (as `warmRewrites` last read them: a conditional include or the repository's own rule counts). Nothing is run here
+ * (a stale read is refreshed in the background). Null: not read (yet): the rules read from / are used.
+ */
+function rewriteIn(dir: string, url: string, push: boolean): string | null {
+  const have = repoRules.get(dir);
+  if (!have || Date.now() - have.at >= 30_000) void warmRewrites(dir);
+  if (!have?.rules) return null;
+  const fetchUrl = longest(have.rules.insteadOf, url) ?? url;
+  if (!push) return fetchUrl;
+  // A pushInsteadOf, the longest; else the fetch rewrite (git applies insteadOf to a push no pushInsteadOf matches).
+  return longest(have.rules.pushInsteadOf, url) ?? fetchUrl;
 }
 
 /**
@@ -388,6 +430,7 @@ export function ownerPushRewrite(url: string, dir?: string): string {
     const inRepo = rewriteIn(dir, url, true);
     if (inRepo !== null) return inRepo;
   }
+  if (!ownerConfigPlain()) return url;
   try {
     const r = spawnSync(GIT_BIN, ["-C", "/", "config", "--null", "--get-regexp", "^url\\..*\\.pushinsteadof$"], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
     let best: { base: string; prefix: string } | null = null;
@@ -421,6 +464,34 @@ function userHome(user: string, home: string): string {
   return join(dirname(home), user);
 }
 
+/** Whether `p` is a plain file (stat, following a link): never a FIFO or device a git run would wait on. */
+// paths: a look (stat), nothing read
+function plainFile(p: string): boolean {
+  try {
+    return statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether every one of the owner's git config files that exists (and each it includes) is a plain file: git run
+ * from / reads them all, and one that is a FIFO (an agent can plant one where an include points, in a workspace)
+ * would hold that run, and the daemon with it. Not plain: the rules read from / aren't used.
+ */
+// paths: a look (stat) at the owner's config files, nothing read
+export function ownerConfigPlain(): boolean {
+  for (const f of ownerConfigFiles()) {
+    try {
+      const st = statSync(f);
+      if (!st.isFile() && !st.isDirectory()) return false;
+    } catch {
+      /* missing: nothing to wait on */
+    }
+  }
+  return true;
+}
+
 let ownerFiles: { at: number; key: string; files: string[] } | null = null;
 
 /**
@@ -443,18 +514,16 @@ export function ownerConfigFiles(): string[] {
   for (const f of [join(home, ".gitconfig"), join(xdg, "git", "config")]) add(f);
   // ssh's: from the home OpenSSH uses, every file and pattern dir codeoid's own snapshot parser reads (the same reading).
   for (const f of sshConfigSources(sshHome())) add(f);
-  try {
-    const r = spawnSync(GIT_BIN, ["-C", "/", "config", "--global", "--list", "--show-origin", "--includes", "--null"], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
-    for (const part of (r.status === 0 ? r.stdout : "").split("\0")) if (part.startsWith("file:")) add(part.slice("file:".length));
-  } catch {
-    /* none read */
-  }
+  // (Not git's own `--includes` listing: it would open an include target that is a FIFO, and wait. The walk below
+  // reads each file alone, only when it is a plain file.)
   // Every include git could read, active from / or not (includeIf), there yet or not: each file's own include keys.
   const seenGit = new Set<string>();
   const includes = (file: string, depth: number) => {
     if (depth > 10 || seenGit.has(file)) return;
     seenGit.add(file);
-    const r = spawnSync(GIT_BIN, ["-C", "/", "config", "--file", file, "--null", "--get-regexp", "^include(if\\..*)?\\.path$"], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
+    if (!plainFile(file)) return;
+    // That file alone: git reads the global config (and its includes) at start even with --file, so none here.
+    const r = spawnSync(GIT_BIN, ["-C", "/", "config", "--file", file, "--no-includes", "--null", "--get-regexp", "^include(if\\..*)?\\.path$"], { cwd: "/", env: { ...ownerHelperEnv(), GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, encoding: "utf8", timeout: 5_000 });
     for (const entry of (r.status === 0 ? r.stdout : "").split("\0")) {
       const nl = entry.indexOf("\n");
       const v = nl < 0 ? "" : entry.slice(nl + 1);

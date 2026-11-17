@@ -23,7 +23,7 @@
  *   - network per policy.
  */
 
-import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CodeoidConfig } from "../../config.js";
@@ -663,10 +663,35 @@ const WORKTREE_CONTROL = ["commondir", "gitdir", "config.worktree"] as const;
 /** Made when missing, so there is something to hold read-only: empty dirs, and an empty `config.worktree` (read only where the config turns it on). */
 const GIT_PLACEHOLDER_DIRS = ["hooks", "info", "modules", "remotes", "branches", "worktrees"] as const;
 
+/**
+ * A small file of git's (a `.git` file, `gitdir`, `commondir`, a config, `info/exclude`) read without blocking, and
+ * only when it is a regular file (an agent can make any of them a FIFO, which a blocking read waits on for ever);
+ * thrown otherwise, as a read of a missing file is.
+ */
+// paths: a look (fstat) and a bounded read, no write
+function readSmall(p: string): string {
+  const fd = openSync(p, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const st = fstatSync(fd);
+    if (!st.isFile()) throw new Error(`${p} isn't a regular file`);
+    const size = Math.min(st.size, 1 << 20);
+    const buf = Buffer.alloc(size);
+    let at = 0;
+    while (at < size) {
+      const n = readSync(fd, buf, at, size - at, at);
+      if (n <= 0) break;
+      at += n;
+    }
+    return buf.subarray(0, at).toString("utf8");
+  } finally {
+    closeSync(fd);
+  }
+}
+
 // paths: a look, no write
 function readGitFile(dotgit: string): string | null {
   try {
-    const m = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotgit, "utf8"));
+    const m = /^gitdir:\s*(.+?)\s*$/m.exec(readSmall(dotgit));
     return m?.[1] ?? null;
   } catch {
     return null;
@@ -953,8 +978,8 @@ function validSubmodule(gitDir: string, dotgit: string): boolean {
   try {
     if (!lstatSync(gitDir).isDirectory() || !gitDirShape(gitDir)) return false;
     // Its own repository: no `commondir`, or the `.` placeholder (gitWorkspacePaths).
-    if (lexists(join(gitDir, "commondir")) && readFileSync(join(gitDir, "commondir"), "utf8").trim() !== ".") return false;
-    const m = /^\s*worktree\s*=\s*(.+?)\s*$/im.exec(readFileSync(join(gitDir, "config"), "utf8"));
+    if (lexists(join(gitDir, "commondir")) && readSmall(join(gitDir, "commondir")).trim() !== ".") return false;
+    const m = /^\s*worktree\s*=\s*(.+?)\s*$/im.exec(readSmall(join(gitDir, "config")));
     if (!m?.[1]) return false;
     return realpathSync(resolve(gitDir, m[1])) === realpathSync(dirname(dotgit));
   } catch {
@@ -1027,7 +1052,7 @@ function excludePlaceholders(workspace: string, home: string, names: readonly st
     const rel = relative(dirname(layout.dotgit), resolve(workspace));
     if (rel.startsWith("..") || isAbsolute(rel)) return;
     // paths: a look (the file's current text, before replaceInPinned writes it whole)
-    const have = lexists(exclude) ? readFileSync(exclude, "utf8") : "";
+    const have = lexists(exclude) ? readSmall(exclude) : "";
     const lines = have.split("\n");
     const add = names.map((n) => `/${rel ? `${rel.split(sep).join("/")}/` : ""}${n}`).filter((l) => !lines.includes(l));
     if (add.length === 0) return;
@@ -1053,7 +1078,7 @@ function listDirs(dir: string): string[] {
 // paths: a look at git's records, no write
 function gitdirTarget(worktreeGitDir: string): string | null {
   try {
-    const named = readFileSync(join(worktreeGitDir, "gitdir"), "utf8").trim();
+    const named = readSmall(join(worktreeGitDir, "gitdir")).trim();
     return named ? resolve(worktreeGitDir, named) : null;
   } catch {
     return null;
@@ -1074,7 +1099,7 @@ function submoduleCheckouts(modules: string, depth = 0, budget = { left: 200 }):
     // paths: a look at git's records, no write
     if (gitDirShape(dir)) {
       try {
-        const m = /^\s*worktree\s*=\s*(.+?)\s*$/im.exec(readFileSync(join(dir, "config"), "utf8"));
+        const m = /^\s*worktree\s*=\s*(.+?)\s*$/im.exec(readSmall(join(dir, "config")));
         if (m?.[1]) out.push(join(resolve(dir, m[1]), ".git"));
       } catch {
         /* no config: not checked out */
@@ -1094,7 +1119,7 @@ function validWorktree(gitDir: string, common: string, dotgit: string): boolean 
   try {
     if (!lstatSync(common).isDirectory() || !lstatSync(join(common, "objects")).isDirectory() || !lstatSync(join(common, "HEAD")).isFile()) return false;
     if (!lstatSync(gitDir).isDirectory()) return false;
-    const back = readFileSync(join(gitDir, "gitdir"), "utf8").trim();
+    const back = readSmall(join(gitDir, "gitdir")).trim();
     return realpathSync(resolve(gitDir, back)) === realpathSync(dotgit);
   } catch {
     return false;
@@ -1360,7 +1385,9 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   // Held read-only, by real path (#448 round 14: resolved here, once, never again at a launch); only inside
   // something writable.
   // paths: a look (does each of the owner's config files exist), no write
-  const ownerConfig = (inputs.ownerConfigFiles ?? []).filter((f) => existsSync(f));
+  // One missing inside a writable root (an include target in a dotfiles workspace) is made empty first (an empty git or
+  // ssh config says nothing), so a sandboxed command can't create it.
+  const ownerConfig = (inputs.ownerConfigFiles ?? []).filter((f) => existsSync(f) || (inWritable(realOr(f)) && existsSync(dirname(f)) && makeIfMissing(f, "")));
   const readOnly = [...new Set([...git.readOnly, ...projectConfig, ...ownerConfig].map(realOr))].filter(inWritable);
   // Held in place (no rename, still writable inside): every dir between a writable root and a hidden path in it,
   // and between two nested writable roots (pinned); the working directory and every dir between it and the
