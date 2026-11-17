@@ -879,6 +879,11 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
       extra.on("error", () => resolve(t));
     });
     expect(said).toContain("too many git connections");
+    // And what the agent's own launcher says, as the next connection: the reason, not "the daemon isn't reachable".
+    const l = Bun.spawn([s.ext, "git-upload-pack", URL], { env: { PATH: process.env.PATH ?? "", CODEOID_GIT_GATEWAY: s.socket }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const lerr = await new Response(l.stderr).text();
+    await l.exited;
+    expect(lerr).toContain("too many git connections");
     for (const o of open) o.destroy();
   }, 30_000);
 

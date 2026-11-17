@@ -163,7 +163,10 @@ export class GitGateway {
         // A few git connections at once per session (each may hold some memory): more is a command flooding it.
         if (live.size >= 8) {
           c.on("error", () => c.destroy());
-          c.end("error too many git connections at once from this session: let one finish\n");
+          // Answered once its header came (closed before it, the launcher would only see a broken pipe).
+          const say = () => c.end("error too many git connections at once from this session: let one finish\n");
+          c.once("data", say);
+          setTimeout(say, 2_000).unref?.();
           return;
         }
         live.add(c);
@@ -547,8 +550,9 @@ export class GitGateway {
     while (this.#fetching.has(key)) await new Promise((r) => setTimeout(r, 20));
     this.#refUpdates.set(key, (this.#refUpdates.get(key) ?? 0) + 1);
     let left = false;
-    // Bounded: a receive-pack that never exits doesn't hold refreshes off for ever.
-    const timer = setTimeout(() => leave(), 5 * 60_000);
+    // Bounded: a receive-pack that never exits doesn't hold refreshes off for ever. Longer than everything the window
+    // covers (the last check's ls-remote, fetch and walk, the upstream push, receive-pack's ref update).
+    const timer = setTimeout(() => leave(), 15 * 60_000);
     timer.unref?.();
     const leave = () => {
       if (left) return;
@@ -726,6 +730,11 @@ export class GitGateway {
     if (t.disconnected()) return refuse(`${shownGitUrl(t.url)} was disconnected`);
     // Approved and started: it finishes (bounded by its own limit), the agent's git there or not, so what the remote
     // took is what is recorded; only the gateway stopping ends it.
+    // The agent's git gone (killed, its session destroyed) while the last check ran: nothing is pushed for it.
+    if (t.gone.signal.aborted) {
+      this.#host.report(t.sessionId, { kind: "push", url: t.url, ok: false, detail: "the agent's git was gone before the push started, so nothing was pushed", updates });
+      return verdict(false);
+    }
     const pushed = await pushUpstream(t.cache, t.grant.upstream, t.grant.ssh, updates, objects, this.#upstreamTimeoutMs, this.#closing.signal);
     if (!pushed.ok && this.#closing.signal.aborted) {
       const why = "the daemon stopped while the push ran: the remote may or may not have taken it (fetch to see)";
