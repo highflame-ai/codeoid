@@ -1135,9 +1135,6 @@ export class SessionSandbox {
     const connected = new Set(g.urls);
     // Each remote as written, and what the owner's own rewrite makes of it: the gateway is asked for that.
     const routes: Array<{ from: string; fetch?: string; push?: string }> = g.urls.map((u) => ({ from: u, fetch: u, push: u }));
-    // `…/app.git` written as `…/app` (or `…/app/`) is the same connection: routed to it (git's prefix match on the
-    // shorter spelling catches `…/app-x` too, which the gateway then refuses as not connected).
-    for (const u of g.urls) if (/\.git$/.test(u) && !connected.has(u.slice(0, -4))) routes.push({ from: u.slice(0, -4), fetch: u, push: u });
     const reachable = (to: string) => connected.has(to) || kindOf(to) === "ssh" || (off && kindOf(to) === "https") || testFile(to);
     for (const w of workspaceRemoteUrls(workspace)) {
       // Where the owner's own git fetches and pushes it (a pushInsteadOf sends pushes elsewhere than fetches).

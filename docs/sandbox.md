@@ -1300,8 +1300,10 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
   applied: connecting from a repository offers the URL your git really uses, and a workspace remote written one way
   is sent to the gateway as the URL your rewrite makes of it, for fetches and pushes each. A rewrite of yours keyed
   by exactly the same whole URL still wins over codeoid's (git takes the first of equal length).
-- **Spellings:** `…/app`, `…/app.git` and `…/app/` are the same connection. git's rewrite matches by prefix, so a
-  connected `…/app` also catches `…/app-docs`; the gateway says so rather than fetch it.
+- **Spellings:** `…/app`, `…/app.git` and `…/app/` are the same connection once they reach the gateway, but what
+  is sent there is what git's rewrite catches, by prefix: connect the spelling your remotes use (a connected `…/app`
+  also catches `…/app.git`, `…/app/` and `…/app-docs`, the last of which the gateway refuses as not connected; a
+  connected `…/app.git` doesn't catch `…/app`).
 - **Your git and ssh config are never an agent's:** every file they are read from is judged where it really is.
   That covers `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`, every file their includes name, `~/.ssh`,
   `~/.ssh/config` and its `Include`s, with dotfiles links resolved. Those files are held read-only in every

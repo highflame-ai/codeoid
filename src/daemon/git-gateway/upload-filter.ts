@@ -20,7 +20,7 @@ const DEEPEN_SINCE = /^deepen-since [0-9]{1,12}$/;
 const DEEPEN_NOT = /^deepen-not ([\x21-\x7e]+)$/;
 /** Bounds on one request (its lines held back, its bytes): a sandboxed command can't fill the daemon's memory. */
 const MAX_HELD = 100_000;
-const MAX_BYTES = 64 * 1024 * 1024;
+const MAX_BYTES = 16 * 1024 * 1024;
 
 /**
  * A stream filter: `push` the client's bytes as they come; what may reach upload-pack is handed to `out`, in order;

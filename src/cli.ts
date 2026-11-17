@@ -1434,7 +1434,9 @@ sandboxGitCmd
       // Your git pushes elsewhere (pushInsteadOf): agents' pushes go there, so that is connected too, when asked.
       if (found.rawPushUrl && found.pushUrl) {
         console.log(`Your git pushes it to ${found.pushUrl} (pushInsteadOf): agents' pushes go there.`);
-        if (await confirmOnTerminal("Connect that too? [y/N] ", o.yes, "")) await client.sandboxGitConnect("connect", { url: found.rawPushUrl, ...(token ? { token } : {}) });
+        // Never with --token's token: it may be another host's (or an ssh URL); it's connected with its own.
+        if (token) console.log(`  Connect it with its own token: codeoid sandbox git connect --url ${found.pushUrl} --token`);
+        else if (await confirmOnTerminal("Connect that too? [y/N] ", o.yes, "")) await client.sandboxGitConnect("connect", { url: found.rawPushUrl });
       }
     }
     await client.sandboxGitConnect("connect", { url, ...(token ? { token } : {}) });

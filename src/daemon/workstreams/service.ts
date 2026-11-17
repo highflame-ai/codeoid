@@ -341,11 +341,15 @@ export class WorkstreamService {
    * Whether a session homed in `home` may read `target` (a reference,
    * §7.1): `open` yes, `ask` with its owner's confirm, `closed` never.
    */
-  /** Every workstream a remote URL's rules give it: the best one, or each of those tied for it (none: no rule matches). */
-  remoteWorkstreams(url: string): string[] {
+  /**
+   * Every workstream a remote URL's rules give it: the best one, or each of those tied for it (none: no rule matches).
+   * Null: there are remote rules, and the URL can't be read as a remote (whose it is can't be told).
+   */
+  remoteWorkstreams(url: string): string[] | null {
+    if (!this.#matchables.some((m) => m.remotes.length > 0)) return [];
     const aliases = (this.#reader as { sshAliases?: () => Map<string, string> }).sshAliases?.() ?? new Map<string, string>();
     const origin = normalizeRemote(url, aliases);
-    if (!origin || !this.#matchables.some((m) => m.remotes.length > 0)) return [];
+    if (!origin) return null;
     const m = matchFolder(this.#matchables, { paths: [], origin });
     return m.best ? [m.best.workstream] : (m.ambiguous ?? []);
   }

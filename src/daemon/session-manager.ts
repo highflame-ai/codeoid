@@ -4689,6 +4689,7 @@ mcpHub: this.#mcpHub,
     const home = session.workstream?.id;
     for (const u of urls) {
       const claims = this.#workstreams.remoteWorkstreams(u);
+      if (claims === null) return `${shownGitUrl(u)} can't be read as a remote by the workstreams' rules, so whose it is can't be told: it isn't reached from a session under isolation`;
       if (claims.length === 0 || (home && claims.includes(home))) continue;
       const ws = claims[0] as string;
       const referenced = claims.length === 1 && (session.workstream?.references ?? []).some((r) => r.workstream === ws);

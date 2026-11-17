@@ -150,6 +150,12 @@ export class GitGateway {
       const live = new Set<Socket>();
       const gone = new Set<AbortController>();
       const server = this.#listen(socket, (c) => {
+        // A few git connections at once per session (each may hold some memory): more is a command flooding it.
+        if (live.size >= 8) {
+          c.on("error", () => c.destroy());
+          c.end("error too many git connections at once from this session: let one finish\n");
+          return;
+        }
         live.add(c);
         c.once("close", () => live.delete(c));
         void this.#onClient(sessionId, c, gone);
@@ -402,18 +408,45 @@ export class GitGateway {
               },
             )
           : null;
-      const endInput = () => (filter ? filter.end(() => p.stdin.end()) : p.stdin.end());
+      const endInput = () => (filter ? filter.end(() => endStdin()) : endStdin());
       // What git hasn't read yet isn't read from the agent's socket (a push waiting on its card reads nothing more):
       // the daemon holds no more than a pipe's worth.
-      let paused = false;
+      // What git hasn't taken yet is held (bounded) rather than the socket paused: a paused socket wouldn't say that
+      // the agent's git went. More than that held (git reads nothing while a push waits on its card) ends the request.
+      const held: Buffer[] = [];
+      let heldBytes = 0;
+      let blocked = false;
+      let endAfter = false;
+      const flushHeld = () => {
+        while (held.length > 0) {
+          const b = held.shift() as Buffer;
+          heldBytes -= b.length;
+          if (!p.stdin.write(b)) {
+            p.stdin.once("drain", flushHeld);
+            return;
+          }
+        }
+        blocked = false;
+        if (endAfter) p.stdin.end();
+      };
       const write = (b: Buffer) => {
-        if (p.stdin.write(b) || paused) return;
-        paused = true;
-        c.pause();
-        p.stdin.once("drain", () => {
-          paused = false;
-          c.resume();
-        });
+        if (blocked) {
+          held.push(b);
+          heldBytes += b.length;
+          if (heldBytes > 16 * 1024 * 1024) {
+            ended = true;
+            c.destroy();
+          }
+          return;
+        }
+        if (!p.stdin.write(b)) {
+          blocked = true;
+          p.stdin.once("drain", flushHeld);
+        }
+      };
+      const endStdin = () => {
+        if (blocked) endAfter = true;
+        else p.stdin.end();
       };
       const take = (d: Buffer) => {
         if (ended) return;

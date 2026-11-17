@@ -818,6 +818,61 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(plain(excl, "rev-list", "--count", "HEAD")).toBe("1");
   });
 
+  test("round 21: an agent that floods a push while its card is up is cut off and nothing is pushed; a session's connections are bounded", async () => {
+    const work = await clone();
+    await agent(work, "checkout", "-q", "-b", "flood");
+    const tip = await commit(work, "flood");
+    const objects = execFileSync("git", ["-C", work, "rev-list", "--objects", "--no-object-names", tip, "--not", "origin/main"]).toString().trim().split("\n");
+    const pack = execFileSync("git", ["-C", work, "pack-objects", "--stdout", "-q"], { input: `${objects.join("\n")}\n` });
+    approveDelayMs = 3000;
+    const s = gw.forSession("s1");
+    const p = Bun.spawn([s.ext, "git-receive-pack", URL], { env: { PATH: process.env.PATH ?? "", CODEOID_GIT_GATEWAY: s.socket }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    const reader = p.stdout.getReader();
+    let got = "";
+    while (!got.endsWith("0000")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      got += Buffer.from(value).toString("latin1");
+    }
+    const pkt = (x: string) => `${(x.length + 4).toString(16).padStart(4, "0")}${x}`;
+    p.stdin.write(`${pkt(`${"0".repeat(40)} ${tip} refs/heads/flood\0report-status\n`)}0000`);
+    p.stdin.write(pack);
+    // Then far more than any push sends after its pack, while the owner is asked.
+    const junk = Buffer.alloc(1024 * 1024, 0x41);
+    // (Cut off part way: the pipe breaks, which is the point.)
+    try {
+      for (let i = 0; i < 40; i++) {
+        p.stdin.write(junk);
+        await p.stdin.flush();
+      }
+      p.stdin.end();
+    } catch {
+      /* the gateway ended it */
+    }
+    for (;;) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    await p.exited;
+    await new Promise((r) => setTimeout(r, 3500));
+    expect(upstreamRef("refs/heads/flood")).toBe("");
+    // At most a few connections at once from one session: the next is told why.
+    const { createConnection } = await import("node:net");
+    const open = Array.from({ length: 8 }, () => createConnection(s.socket));
+    await new Promise((r) => setTimeout(r, 200));
+    const extra = createConnection(s.socket);
+    const said = await new Promise<string>((resolve) => {
+      let t = "";
+      extra.on("data", (d) => {
+        t += d.toString("utf8");
+      });
+      extra.on("close", () => resolve(t));
+      extra.on("error", () => resolve(t));
+    });
+    expect(said).toContain("too many git connections");
+    for (const o of open) o.destroy();
+  }, 30_000);
+
   test("round 12: a disconnected remote's cache is removed", async () => {
     await clone();
     const cache = gw.cachePath(`u:${URL}`);
