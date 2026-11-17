@@ -23,7 +23,7 @@
  *   - network per policy.
  */
 
-import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, rmdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CodeoidConfig } from "../../config.js";
@@ -1001,7 +1001,7 @@ function isLink(p: string): boolean {
  * An owner config file missing inside a writable root, made empty with every dir missing on its way (each inside a
  * writable root), so none can be made by a sandboxed command: the dirs and the file, to hold. None when it can't be.
  */
-// paths: a look (does each dir exist) up to a writable root, then makeIfMissing (pinned, never through a link)
+// paths: a look (does each dir exist) up to a writable root, then makeIfMissing (pinned, never through a link); one that landed elsewhere (a link swapped in) is removed again (codeoid's own, just made, empty)
 function placeholderWithDirs(f: string, inWritable: (p: string) => boolean): string[] {
   const missing: string[] = [];
   let d = dirname(f);
@@ -1012,8 +1012,20 @@ function placeholderWithDirs(f: string, inWritable: (p: string) => boolean): str
   // The nearest dir that exists, where it really is (a link in the workspace may lead anywhere): inside a writable
   // root, or nothing is made.
   if (!inWritable(realOr(d))) return [];
-  for (const d of missing) if (!makeIfMissing(d, "dir")) return [];
-  return makeIfMissing(f, "") ? [...missing, f] : [];
+  // Each made checked where it really is after (a link swapped in on the way between the look and the make): one that
+  // landed outside every writable root is taken away again (codeoid's own, just made, empty).
+  const landed = (p: string, dir: boolean): boolean => {
+    if (inWritable(realOr(p))) return true;
+    try {
+      if (dir) rmdirSync(p);
+      else if (lstatSync(p).isFile() && lstatSync(p).size === 0) unlinkSync(p);
+    } catch {
+      /* gone already */
+    }
+    return false;
+  };
+  for (const dir of missing) if (!makeIfMissing(dir, "dir") || !landed(dir, true)) return [];
+  return makeIfMissing(f, "") && landed(f, false) ? [...missing, f] : [];
 }
 
 /** A dir (`"dir"`) or a file with `content`, made only where nothing (not even a link) is: never through one. Whether it was made. */

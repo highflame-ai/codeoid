@@ -1014,6 +1014,21 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(plainRoutes).toEqual([{ from: fetchUrl, fetch: fetchUrl, push: fetchUrl }]);
   });
 
+  test("round 36: a push the daemon's shutdown stops is said to the agent's git and recorded, before close returns", async () => {
+    const work = await clone();
+    await agent(work, "checkout", "-q", "-b", "stopped");
+    await commit(work, "stopped");
+    approveDelayMs = 1500;
+    const pushing = agent(work, "push", "origin", "stopped");
+    await new Promise((r) => setTimeout(r, 700));
+    await gw.close();
+    expect(reports.some((e) => e.kind === "push" && !e.ok && /daemon stopped/.test(e.detail))).toBe(true);
+    const r = await pushing;
+    expect(r.code).not.toBe(0);
+    expect(r.out).toContain("daemon stopped");
+    expect(upstreamRef("refs/heads/stopped")).toBe("");
+  }, 30_000);
+
   test("round 12: a disconnected remote's cache is removed", async () => {
     await clone();
     const cache = gw.cachePath(`u:${URL}`);

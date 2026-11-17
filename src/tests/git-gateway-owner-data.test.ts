@@ -6,7 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir, userInfo } from "node:os";
 import { join } from "node:path";
 import { credentialUrlMatches, fillGitCredential, safeHelper } from "../daemon/git-gateway/connect.js";
@@ -421,4 +421,17 @@ describe("round 35: placeholders only where the real dir is writable; no synchro
     expect(ownerRewrite("https://github.com/acme/app.git")).toBe("https://github.com/acme/app.git");
     expect(Date.now() - t).toBeLessThan(500);
   }, 20_000);
+});
+
+describe("round 36: the workspace's remotes as git reads them", () => {
+  test("a remote url with a comment after it (git reads the URL alone) is routed as git reads it", async () => {
+    const { warmRewrites } = await import("../daemon/git-gateway/connect.js");
+    const { workspaceRemoteUrls } = await import("../daemon/sandbox/session-sandbox.js");
+    process.env.HOME = home;
+    const repo = join(home, "r36");
+    spawnSync("git", ["init", "-q", repo]);
+    writeFileSync(join(repo, ".git", "config"), `${readFileSync(join(repo, ".git", "config"), "utf8")}[remote "origin"]\n\turl = "https://github.com/acme/app.git" ; the main one\n`);
+    await warmRewrites(repo, true);
+    expect(workspaceRemoteUrls(repo)).toEqual(["https://github.com/acme/app.git"]);
+  });
 });

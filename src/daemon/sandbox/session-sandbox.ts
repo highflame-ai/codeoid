@@ -22,7 +22,7 @@ import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
-import { ownerConfigFiles, ownerPushRewrite, ownerRewrite, warmOwnerConfig, warmRewrites } from "../git-gateway/connect.js";
+import { ownerConfigFiles, ownerPushRewrite, ownerRewrite, repoRemotes, warmOwnerConfig, warmRewrites } from "../git-gateway/connect.js";
 import { buildSandboxSpec, type GitGatewaySpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
 import { normalizeRemote } from "../workstreams/match.js";
 import { readRegular } from "../git-gateway/ssh-snapshot.js";
@@ -1502,6 +1502,10 @@ export async function openCheckSandbox(opts: {
 /** The remotes' URLs in the workspace repository's own config (read, never run: git reaches them through the gateway). */
 // paths: a read of the repository's own config file
 export function workspaceRemoteUrls(workspace: string): string[] {
+  // As git parses the config (read asynchronously with its rules); else the plain reading below.
+  const top = repositoryForRewrites(workspace);
+  const parsed = top ? repoRemotes(top) : null;
+  if (parsed) return [...new Set(parsed)].slice(0, 50);
   try {
     const layout = gitLayoutOf(workspace);
     const common = layout?.common;

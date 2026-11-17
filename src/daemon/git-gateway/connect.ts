@@ -346,6 +346,8 @@ export function ownerRewrite(url: string, dir?: string): string {
 interface RewriteRules {
   insteadOf: Array<readonly [string, string]>;
   pushInsteadOf: Array<readonly [string, string]>;
+  /** The repository's remotes' url and pushurl values, as git parses its config. */
+  remotes: string[];
 }
 const repoRules = new Map<string, { at: number; rules: RewriteRules | null }>();
 const reading = new Map<string, Promise<void>>();
@@ -366,7 +368,7 @@ export function warmRewrites(dir: string | undefined, fresh = false): Promise<vo
   const running = reading.get(dir);
   if (running) return running;
   const done = new Promise<void>((resolveRead) => {
-    const child = spawn(GIT_BIN, ["-C", dir, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "config", "--null", "--get-regexp", "^url\\..*\\.(insteadof|pushinsteadof)$"], { cwd: dir, env: { ...ownerHelperEnv(), GIT_CEILING_DIRECTORIES: dirname(dir) }, stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn(GIT_BIN, ["-C", dir, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "config", "--null", "--get-regexp", "^(url\\..*\\.(insteadof|pushinsteadof)|remote\\..*\\.(url|pushurl))$"], { cwd: dir, env: { ...ownerHelperEnv(), GIT_CEILING_DIRECTORIES: dirname(dir) }, stdio: ["ignore", "pipe", "ignore"] });
     let out = "";
     child.stdout.on("data", (d: Buffer) => {
       if (out.length < 1 << 20) out += d.toString("utf8");
@@ -381,12 +383,16 @@ export function warmRewrites(dir: string | undefined, fresh = false): Promise<vo
       // 1: no rule at all, which is an answer.
       if (code !== 0 && code !== 1) repoRules.set(dir, { at: Date.now(), rules: null });
       else {
-        const rules: RewriteRules = { insteadOf: [], pushInsteadOf: [] };
+        const rules: RewriteRules = { insteadOf: [], pushInsteadOf: [], remotes: [] };
         for (const entry of out.split("\0")) {
           const nl = entry.indexOf("\n");
           if (nl < 0) continue;
           const key = entry.slice(0, nl);
           const prefix = entry.slice(nl + 1);
+          if (/^remote\..*\.(url|pushurl)$/i.test(key)) {
+            if (prefix) rules.remotes.push(prefix);
+            continue;
+          }
           const m = /^url\.(.*)\.(insteadof|pushinsteadof)$/i.exec(key);
           if (!m?.[1] || !prefix) continue;
           (m[2]?.toLowerCase() === "pushinsteadof" ? rules.pushInsteadOf : rules.insteadOf).push([m[1], prefix]);
@@ -405,6 +411,11 @@ export function warmRewrites(dir: string | undefined, fresh = false): Promise<vo
 /** Whether the rules at `dir` were read (or tried, and failed or hung): a synchronous read isn't the answer then. */
 function rewritesTried(dir: string): boolean {
   return repoRules.has(dir) || reading.has(dir) || (hungRepos.get(dir) ?? 0) > Date.now();
+}
+
+/** The remotes' URLs of the repository at `dir` as git parses its config (warmRewrites read them), or null: not read. */
+export function repoRemotes(dir: string): string[] | null {
+  return repoRules.get(dir)?.rules?.remotes ?? null;
 }
 
 /** A rule set's rewrite of `url`: the longest matching prefix, as git picks. */

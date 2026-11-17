@@ -216,9 +216,14 @@ export class GitGateway {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
-    for (const g of this.#gone) g.abort();
     for (const s of this.#cloneStops.values()) s.abort();
+    // An upstream push in flight is stopped, and given a moment to say so to the agent's git and be recorded (the
+    // store closes after this), before the connections go.
     this.#closing.abort();
+    const until = Date.now() + 5_000;
+    const pushing = () => [...this.#serving.values()].some((m) => [...m.values()].some((e) => e.kind === "push"));
+    while (pushing() && Date.now() < until) await new Promise((r) => setTimeout(r, 50));
+    for (const g of this.#gone) g.abort();
     for (const id of [...this.#sessions.keys()]) this.closeSession(id);
     this.#control.close();
     for (const c of this.#live) c.destroy();
