@@ -21,7 +21,7 @@ import { within } from "../physical-path.js";
 import { type PushPolicy, type RefUpdate, refUpdateProblem } from "./policy.js";
 import { type GatewayScripts, writeGatewayScripts } from "./scripts.js";
 import { redactCredentials, shownGitUrl } from "./text.js";
-import { cacheHas, cacheRef, configEnv, isAncestor, objectsNotSent, pruneCache, pushUpstream, refreshCache, remoteOids, type RemoteState, type Upstream } from "./upstream.js";
+import { cacheDirty, cacheHas, cacheRef, configEnv, dropCheckRefs, fetchCheckRefs, isAncestor, objectsNotSent, pruneCache, pushUpstream, refreshCache, remoteRefs, type RemoteState, type Upstream } from "./upstream.js";
 
 export type GitService = "git-upload-pack" | "git-receive-pack";
 
@@ -102,8 +102,7 @@ export class GitGateway {
   /** Aborted when the gateway stops: an upstream push in flight ends with it (said, and recorded as unknown). */
   readonly #closing = new AbortController();
   /** Per cache: requests being served on it now; and whether it waits to be pruned (the remote deleted something). */
-  readonly #active = new Map<string, number>();
-  readonly #dirty = new Set<string>();
+  readonly #serving = new Map<string, Map<symbol, { kind: "fetch" | "push"; stop: () => void }>>();
   readonly #generations = new Map<string, number>();
   #closed = false;
 
@@ -257,7 +256,7 @@ export class GitGateway {
     this.#gone.add(gone);
     c.once("close", () => gone.abort());
     c.once("end", () => gone.abort());
-    let counted = false;
+    const served: { leave?: () => void } = {};
     try {
       // The lock is the refresh's alone: serving (and an owner's card) doesn't hold up other sessions' requests.
       const since = Date.now();
@@ -274,16 +273,17 @@ export class GitGateway {
           this.#cloneStops.set(grant.cacheKey, stop);
         }
         const r = await refreshCache(cache, upstream, grant.ssh, this.#upstreamTimeoutMs, gone.signal, stop.signal);
-        if ("error" in r) return r;
-        // The remote deleted or rewrote something: the cache drops it before anything more is served from it, once
-        // the requests being served on it are done (none starts meanwhile: they wait on this lock).
-        if (r.dirty) this.#dirty.add(grant.cacheKey);
-        if (this.#dirty.has(grant.cacheKey)) {
+        // The remote deleted or rewrote something (judged from every ref the cache has had, however that refresh
+        // ended): the cache drops it before anything more is served from it, once what is served on it is done
+        // (fetches are stopped; none starts meanwhile: they wait on this lock).
+        if (await cacheDirty(cache)) {
           if (!(await this.#drained(grant.cacheKey)) || !(await pruneCache(cache))) return { error: "codeoid is clearing what the remote deleted from its copy: try again in a few minutes" };
-          this.#dirty.delete(grant.cacheKey);
         }
-        this.#active.set(grant.cacheKey, (this.#active.get(grant.cacheKey) ?? 0) + 1);
-        counted = true;
+        if ("error" in r) return r;
+        served.leave = this.#enter(grant.cacheKey, service === "git-upload-pack" ? "fetch" : "push", () => {
+          gone.abort();
+          c.destroy();
+        });
         return r;
       });
       if (gone.signal.aborted) return;
@@ -306,11 +306,7 @@ export class GitGateway {
     } finally {
       sessionGone.delete(gone);
       this.#gone.delete(gone);
-      if (counted) {
-        const n = (this.#active.get(grant.cacheKey) ?? 1) - 1;
-        if (n > 0) this.#active.set(grant.cacheKey, n);
-        else this.#active.delete(grant.cacheKey);
-      }
+      served.leave?.();
     }
   }
 
@@ -407,10 +403,27 @@ export class GitGateway {
     });
   }
 
-  /** Wait (bounded) until no request is served on a cache: true when none is. */
-  async #drained(key: string, ms = 10 * 60_000): Promise<boolean> {
+  /** Note what is served on a cache (a fetch, a push and its upstream push) until the returned function is called. */
+  #enter(key: string, kind: "fetch" | "push", stop: () => void = () => {}): () => void {
+    let m = this.#serving.get(key);
+    if (!m) {
+      m = new Map();
+      this.#serving.set(key, m);
+    }
+    const id = Symbol(kind);
+    const mine = m;
+    mine.set(id, { kind, stop });
+    return () => {
+      mine.delete(id);
+      if (mine.size === 0 && this.#serving.get(key) === mine) this.#serving.delete(key);
+    };
+  }
+
+  /** Stop the fetches served on a cache and wait (bounded) for its pushes to end: true when nothing is served on it. */
+  async #drained(key: string, ms = 3 * 60_000): Promise<boolean> {
+    for (const e of this.#serving.get(key)?.values() ?? []) if (e.kind === "fetch") e.stop();
     const until = Date.now() + ms;
-    while ((this.#active.get(key) ?? 0) > 0) {
+    while ((this.#serving.get(key)?.size ?? 0) > 0) {
       if (Date.now() > until || this.#closed) return false;
       await new Promise((r) => setTimeout(r, 200));
     }
@@ -448,6 +461,16 @@ export class GitGateway {
     if (!t) return verdict(false);
     // Single use.
     this.#tickets.delete(req.ticket as string);
+    // Served on its cache until the upstream push is done (the agent's git there or not): no prune runs under it.
+    const leave = this.#enter(t.grant.cacheKey, "push");
+    try {
+      await this.#decide(t, req, say, verdict);
+    } finally {
+      leave();
+    }
+  }
+
+  async #decide(t: Ticket, req: { ticket?: unknown; updates?: unknown; objects?: { dir?: unknown; alternates?: unknown } }, say: (line: string) => void, verdict: (ok: boolean) => void): Promise<void> {
     const claimed = Array.isArray(req.updates) ? (req.updates as RefUpdate[]).filter((u) => u && typeof u.old === "string" && typeof u.new === "string" && typeof u.ref === "string") : [];
     // Each update's `old` is what the remote had when the gateway refreshed (the cache: receive-pack hasn't touched it
     // yet), never the client's claim: a push claiming a branch is new when it isn't is refused.
@@ -501,12 +524,30 @@ export class GitGateway {
     if (t.disconnected()) return refuse(`${shownGitUrl(t.url)} was disconnected`);
     // The remote may have deleted something since the refresh (a connection held open, a card answered late): judged
     // again against what it says it has now, so nothing it no longer has goes back to it.
-    const now = await remoteOids(t.grant.upstream, t.grant.ssh);
+    const now = await remoteRefs(t.grant.upstream, t.grant.ssh);
     if ("error" in now) return refuse(now.error);
-    const known = await cacheHas(t.cache, now);
-    if ("error" in known) return refuse(known.error);
-    const late = await objectsNotSent(t.cache, objects, updates.map((u) => u.new), known);
+    // What the remote has that the cache doesn't (a branch moved on meanwhile) is fetched first, apart, so the check
+    // judges against all of it.
+    const ns = randomBytes(8).toString("hex");
+    let late: string | null;
+    try {
+      let known = await cacheHas(t.cache, now.map((r) => r.oid));
+      if ("error" in known) return refuse(known.error);
+      const have = new Set(known);
+      const missing = now.filter((r) => !have.has(r.oid)).map((r) => r.name);
+      if (missing.length > 0) {
+        const fetched = await fetchCheckRefs(t.cache, t.grant.upstream, t.grant.ssh, ns, missing);
+        if (fetched) return refuse(fetched);
+        known = await cacheHas(t.cache, now.map((r) => r.oid));
+        if ("error" in known) return refuse(known.error);
+        if (known.length < new Set(now.map((r) => r.oid)).size) return refuse("the remote changed while codeoid checked the push: push again");
+      }
+      late = await objectsNotSent(t.cache, objects, updates.map((u) => u.new), known);
+    } finally {
+      await dropCheckRefs(t.cache, ns);
+    }
     if (late) return refuse(late);
+    if (t.disconnected()) return refuse(`${shownGitUrl(t.url)} was disconnected`);
     // Approved and started: it finishes (bounded by its own limit), the agent's git there or not, so what the remote
     // took is what is recorded; only the gateway stopping ends it.
     const pushed = await pushUpstream(t.cache, t.grant.upstream, t.grant.ssh, updates, objects, this.#upstreamTimeoutMs, this.#closing.signal);

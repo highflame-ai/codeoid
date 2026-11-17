@@ -1995,7 +1995,8 @@ export class Session {
     }
     this.createdBy = opts.auth.sub;
     this.createdByDelegate = opts.createdByDelegate ?? opts.auth.delegationDepth > 0;
-    this.#autonomyIsFleets = opts.initialMode?.mode === "autonomous" && opts.autonomousByOwner !== true;
+    // The fleet's: said so (a resumed worker or child: `fleetAutonomy`), or autonomous at creation without the owner's word.
+    this.#autonomyIsFleets = opts.autonomousByOwner === false || (opts.initialMode?.mode === "autonomous" && opts.autonomousByOwner !== true);
     this.#autonomousByOwner = opts.initialMode?.mode === "autonomous" ? opts.autonomousByOwner === true && !this.createdByDelegate : true;
     // Restored from TranscriptMeta on resume, stamped fresh only for a new
     // session. Both were previously unconditional `now`, which meant every

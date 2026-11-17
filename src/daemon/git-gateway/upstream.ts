@@ -8,7 +8,7 @@
  */
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, lstatSync, mkdirSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { GIT_BIN } from "../git-env.js";
@@ -224,8 +224,6 @@ export interface RemoteState {
   empty: boolean;
   /** Its branches (names after `refs/heads/`), when it said. */
   heads: ReadonlySet<string>;
-  /** The refresh left objects no ref reaches (the remote deleted or rewrote something): the cache needs pruning. */
-  dirty?: boolean;
 }
 
 /**
@@ -249,26 +247,16 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
         return { error: gitError(r, "the remote couldn't be fetched") };
       }
       renameSync(tmp, cache);
+      // A fresh clone holds only what its refs reach: what it has seen starts here.
+      await rememberRefs(cache, true);
     }
     const deadline = Date.now() + timeoutMs;
     const left = () => Math.max(1_000, deadline - Date.now());
-    const refsNow = async () => {
-      const r = await runGit(["for-each-ref", "--format=%(objectname)"], cache, env, 60_000, undefined, 256 * 1024 * 1024);
-      return r.code === 0 && !r.truncated ? new Set(r.stdout.split("\n").filter(Boolean)) : null;
-    };
-    const before = await refsNow();
+    // Every ref the cache has had is remembered (on disk) before the fetch can drop one, however this refresh ends
+    // (a fetch that prunes and then fails, an agent gone mid-way, a restart): `cacheDirty` judges from that record.
+    if (!(await rememberRefs(cache, false))) return { error: "codeoid couldn't read its copy of the remote" };
     const f = await runGit(["fetch", "--quiet", "--prune", "--prune-tags", "--no-write-fetch-head", "--", up.url, "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], cache, env, left(), signal);
     if (f.code !== 0) return { error: gitError(f, "the remote couldn't be fetched") };
-    // What a ref reached before and none reaches now (a deleted branch's own commits, a force push's old ones): the
-    // cache would keep them, so it is pruned (they are never served, nor used, nor probed).
-    const after = await refsNow();
-    let dirty = before === null || after === null;
-    const dropped = before && after ? [...before].filter((o) => !after.has(o)) : [];
-    if (!dirty && dropped.length > 0) {
-      const r = await gitLines(["rev-list", "--objects", "--no-object-names", "--stdin"], cache, env, [...dropped, ...[...(after ?? [])].map((o) => `^${o}`)], Math.min(left(), 120_000), () => true);
-      // Stopped at the first line: something only the old refs reached. An error: assume so.
-      dirty = "error" in r || r.stopped === true;
-    }
     // Every branch with its symref target, and HEAD (protocol v2's ls-refs symrefs).
     const h = await runGit(["ls-remote", "--symref", "--", up.url, "HEAD", "refs/heads/*"], cache, env, Math.min(left(), 60_000), signal, 256 * 1024 * 1024);
     const symrefs = new Set<string>();
@@ -293,7 +281,7 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
     // Branches, but no HEAD said (an unborn one: renamed or deleted): which branch would become the default isn't known.
     // A list cut short says too little (its branches, symrefs): nothing is known of it.
     const defaultKnown = h.code === 0 && !h.truncated && (defaultBranch !== null || heads === 0);
-    return { defaultBranch, defaultKnown, symrefs, empty: h.code === 0 && heads === 0, heads: names, ...(dirty ? { dirty } : {}) };
+    return { defaultBranch, defaultKnown, symrefs, empty: h.code === 0 && heads === 0, heads: names };
   });
 }
 
@@ -304,21 +292,118 @@ export async function refreshCache(cache: string, up: Upstream, ssh: string | nu
 // paths: the daemon's own cache repository, repacked and pruned
 export async function pruneCache(cache: string): Promise<boolean> {
   const env = cacheEnv({ PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_NO_REPLACE_OBJECTS: "1" }, cache);
+  // A pack a killed fetch left kept (`.keep`) would be kept whole by the repack: nothing runs on the cache now.
+  const packs = join(cache, "objects", "pack");
+  try {
+    for (const n of readdirSync(packs)) if (n.endsWith(".keep")) rmSync(join(packs, n), { force: true });
+  } catch {
+    /* no packs */
+  }
   const repack = await runGit(["-c", "pack.writeBitmapHashCache=true", "repack", "-a", "-d", "-q", "-b"], cache, env, 60 * 60_000);
   if (repack.code !== 0) return false;
   const prune = await runGit(["prune", "--expire=now"], cache, env, 30 * 60_000);
   if (prune.code !== 0) return false;
   // Nothing that names a pruned object stays (a commit graph, a multi-pack index).
   for (const f of ["objects/info/commit-graph", "objects/info/commit-graphs", "objects/pack/multi-pack-index"]) rmSync(join(cache, f), { recursive: true, force: true });
+  return rememberRefs(cache, true);
+}
+
+/** Where a cache records every ref id it has had since it was last pruned (`cacheDirty` judges from it). */
+function seenFile(cache: string): string {
+  return join(cache, "codeoid-refs-seen");
+}
+
+/** The ids every ref of the cache names now (branches, tags, a push's check refs), or null. */
+async function refOids(cache: string): Promise<Set<string> | null> {
+  const env = cacheEnv({ PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, cache);
+  const r = await runGit(["for-each-ref", "--format=%(objectname)"], cache, env, 60_000, undefined, 256 * 1024 * 1024);
+  return r.code === 0 && !r.truncated ? new Set(r.stdout.split("\n").filter(Boolean)) : null;
+}
+
+/** Add the refs' ids now to what the cache has seen (`fresh`: start over from them). False: they couldn't be read. */
+// paths: the daemon's own cache repository: its record of refs seen, written (0600)
+export async function rememberRefs(cache: string, fresh: boolean): Promise<boolean> {
+  const now = await refOids(cache);
+  if (!now) return false;
+  const seen = fresh ? new Set<string>() : readSeen(cache);
+  if (seen === null) return false;
+  for (const o of now) seen.add(o);
+  writeFileSync(seenFile(cache), `${[...seen].join("\n")}\n`, { mode: 0o600 });
   return true;
 }
 
-/** The remote's refs' ids as it says them now (`ls-remote`), or why not. */
-export async function remoteOids(up: Upstream, ssh: string | null): Promise<string[] | { error: string }> {
+/** What the cache has seen, or null when the record is missing (a cache older than it: judged dirty once). */
+function readSeen(cache: string): Set<string> | null {
+  try {
+    return new Set(readFileSync(seenFile(cache), "utf8").split("\n").filter((l) => /^[0-9a-f]{40,64}$/.test(l)));
+  } catch {
+    return existsSync(cache) ? null : new Set();
+  }
+}
+
+/**
+ * Whether the cache holds objects no ref reaches now that a ref it had reached (the remote deleted a branch or
+ * rewrote one): it must be pruned before anything more is served from it. Unknown (a record missing, an error): true.
+ */
+export async function cacheDirty(cache: string): Promise<boolean> {
+  if (!existsSync(cache)) return false;
+  const seen = readSeen(cache);
+  const now = await refOids(cache);
+  if (!seen || !now) return true;
+  const dropped = [...seen].filter((o) => !now.has(o));
+  if (dropped.length === 0) return false;
+  const env = cacheEnv({ PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_NO_REPLACE_OBJECTS: "1" }, cache);
+  // An id it no longer has at all (gone already) reaches nothing: only those still there are walked.
+  const present = await cacheHas(cache, dropped);
+  if ("error" in present) return true;
+  if (present.length === 0) {
+    await rememberRefs(cache, true);
+    return false;
+  }
+  const r = await gitLines(["rev-list", "--objects", "--no-object-names", "--stdin"], cache, env, [...present, ...[...now].map((o) => `^${o}`)], 120_000, () => true);
+  if ("error" in r) return true;
+  if (r.stopped) return true;
+  // The dropped refs reach nothing the others don't (a merged branch deleted): nothing to prune.
+  await rememberRefs(cache, true);
+  return false;
+}
+
+/**
+ * Fetch the remote's refs `names` (as it has them now) into the cache under `refs/codeoid-check/<ns>/` (a push's
+ * last check judges against them; removed after). Remembered as seen. Why not, or null.
+ */
+// paths: the daemon's own cache repository: refs under its private check namespace, written
+export async function fetchCheckRefs(cache: string, up: Upstream, ssh: string | null, ns: string, names: readonly string[]): Promise<string | null> {
+  if (names.length === 0) return null;
+  return withUpstreamEnv(up, ssh, async (base) => {
+    const env = cacheEnv(base, cache);
+    const specs = names.map((n) => `+${n}:refs/codeoid-check/${ns}/${n.replace(/^refs\//, "")}`);
+    const r = await runGit(["fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--", up.url, ...specs], cache, env, 120_000);
+    if (r.code !== 0) return gitError(r, "the remote couldn't be fetched again before the push");
+    return (await rememberRefs(cache, false)) ? null : "codeoid couldn't read its copy of the remote";
+  });
+}
+
+/** Remove a push's check refs. */
+// paths: the daemon's own cache repository: its private check refs, removed
+export async function dropCheckRefs(cache: string, ns: string): Promise<void> {
+  const env = cacheEnv({ PATH: "/usr/bin:/bin", HOME: "/nonexistent", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, cache);
+  const r = await runGit(["for-each-ref", "--format=delete %(refname)", `refs/codeoid-check/${ns}/`], cache, env, 30_000);
+  if (r.code !== 0 || !r.stdout.trim()) return;
+  await gitLines(["update-ref", "--stdin"], cache, env, r.stdout.split("\n").filter(Boolean), 30_000);
+}
+
+/** The remote's branches and tags as it says them now (`ls-remote`): each id and name, or why not. */
+export async function remoteRefs(up: Upstream, ssh: string | null): Promise<Array<{ oid: string; name: string }> | { error: string }> {
   return withUpstreamEnv(up, ssh, async (env) => {
-    const r = await runGit(["ls-remote", "--", up.url], "/", env, 60_000, undefined, 256 * 1024 * 1024);
+    const r = await runGit(["ls-remote", "--refs", "--", up.url, "refs/heads/*", "refs/tags/*"], "/", env, 60_000, undefined, 256 * 1024 * 1024);
     if (r.code !== 0 || r.truncated) return { error: gitError(r, "the remote couldn't be asked what it has") };
-    return [...new Set(r.stdout.split("\n").map((l) => /^([0-9a-f]{40,64})\t/.exec(l)?.[1]).filter((x): x is string => !!x))];
+    const out: Array<{ oid: string; name: string }> = [];
+    for (const l of r.stdout.split("\n")) {
+      const m = /^([0-9a-f]{40,64})\t(refs\/(?:heads|tags)\/[^\s]+)$/.exec(l);
+      if (m?.[1] && m[2]) out.push({ oid: m[1], name: m[2] });
+    }
+    return out;
   });
 }
 

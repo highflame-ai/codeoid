@@ -6,13 +6,13 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
 import { type GatewayHost, type GatewayPush, GitGateway } from "../daemon/git-gateway/gateway.js";
 import { refUpdateProblem } from "../daemon/git-gateway/policy.js";
-import { configEnv } from "../daemon/git-gateway/upstream.js";
+import { cacheDirty, configEnv, pruneCache } from "../daemon/git-gateway/upstream.js";
 
 let root: string;
 let upstream: string;
@@ -614,6 +614,60 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(upstreamRef("refs/heads/late")).toBe("");
     expect(spawnSync("git", ["-C", upstream, "cat-file", "-e", secret]).status).not.toBe(0);
     expect(reports.some((e) => e.kind === "push" && !e.ok && /remote deleted it/.test(e.detail))).toBe(true);
+  });
+
+  test("round 16: a ref the cache lost without a clean refresh still makes it dirty; the prune drops kept packs too", async () => {
+    const other = join(root, "other");
+    plain(root, "clone", "-q", upstream, other);
+    plain(other, "checkout", "-q", "-b", "oops");
+    writeFileSync(join(other, "secret.txt"), "TOPSECRET\n");
+    plain(other, "add", ".");
+    plain(other, "commit", "-q", "-m", "oops");
+    plain(other, "push", "-q", "origin", "oops");
+    const secret = plain(other, "rev-parse", "HEAD");
+    expect((await agent(root, "ls-remote", URL)).code).toBe(0);
+    const cache = gw.cachePath(`u:${URL}`);
+    expect(await cacheDirty(cache)).toBe(false);
+    // As a fetch that pruned and then failed (or was cut short) leaves it: the ref gone, its objects kept, in a kept pack.
+    plain(cache, "repack", "-q", "-a", "-d");
+    const pack = readdirSync(join(cache, "objects", "pack")).find((n) => n.endsWith(".pack"));
+    writeFileSync(join(cache, "objects", "pack", (pack ?? "").replace(/\.pack$/, ".keep")), "");
+    plain(cache, "update-ref", "-d", "refs/heads/oops");
+    expect(await cacheDirty(cache)).toBe(true);
+    expect(await pruneCache(cache)).toBe(true);
+    expect(spawnSync("git", ["-C", cache, "cat-file", "-e", secret]).status).not.toBe(0);
+    expect(await cacheDirty(cache)).toBe(false);
+    // A branch deleted after it was merged (its commits on main) leaves nothing to prune.
+    plain(other, "checkout", "-q", "-b", "merged", "origin/main");
+    writeFileSync(join(other, "m.txt"), "m\n");
+    plain(other, "add", ".");
+    plain(other, "commit", "-q", "-m", "m");
+    plain(other, "push", "-q", "origin", "merged", "merged:main");
+    expect((await agent(root, "ls-remote", URL)).code).toBe(0);
+    plain(upstream, "branch", "-D", "merged");
+    expect((await agent(root, "ls-remote", URL)).code).toBe(0);
+    expect(await cacheDirty(cache)).toBe(false);
+  });
+
+  test("round 16: a push whose card is answered after the remote's main moved on still goes", async () => {
+    const work = await clone();
+    await agent(work, "checkout", "-q", "-b", "while-moving");
+    const sha = await commit(work, "wm");
+    // While the owner's card is up, someone pushes main forward.
+    approveDelayMs = 1500;
+    const pushing = agent(work, "push", "origin", "while-moving");
+    await new Promise((r) => setTimeout(r, 500));
+    const other = join(root, "mover");
+    plain(root, "clone", "-q", upstream, other);
+    writeFileSync(join(other, "moved.txt"), "moved\n");
+    plain(other, "add", ".");
+    plain(other, "commit", "-q", "-m", "moved");
+    plain(other, "push", "-q", "origin", "main");
+    const r = await pushing;
+    expect([r.code, r.out]).toEqual([0, expect.stringContaining("codeoid pushed while-moving")]);
+    expect(upstreamRef("refs/heads/while-moving")).toBe(sha);
+    // Its check refs are gone.
+    expect(plain(gw.cachePath(`u:${URL}`), "for-each-ref", "refs/codeoid-check/")).toBe("");
   });
 
   test("round 12: a disconnected remote's cache is removed", async () => {
