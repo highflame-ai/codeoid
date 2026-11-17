@@ -984,6 +984,27 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     expect(upstreamRef("refs/heads/killed")).toBe("");
   }, 30_000);
 
+  test("round 29: with the fetch URL and the owner's push URL both connected, an agent's push goes where the owner's git pushes", async () => {
+    const { gatewayRoutes } = await import("../daemon/sandbox/session-sandbox.js");
+    const { gitGatewayEnv } = await import("../daemon/sandbox/policy.js");
+    const fetchUrl = "https://github.com/acme/app.git";
+    const pushUrl = "git@github.com:me/app.git";
+    // The owner's pushInsteadOf: pushes to acme's go to their fork, over ssh.
+    const pushRewrite = (u: string) => (u.startsWith("https://github.com/acme/") ? `git@github.com:me/${u.slice("https://github.com/acme/".length)}` : u);
+    const routes = gatewayRoutes([fetchUrl, pushUrl], [fetchUrl], { off: false, rewrite: (u) => u, pushRewrite });
+    const env = gitGatewayEnv({ socket: "/s", ext: "/gw/ext", binDir: "/b", runtime: "/r", urls: [fetchUrl, pushUrl], routes });
+    // What git inside the sandbox makes of the workspace's origin, for a fetch and for a push.
+    const repo = join(root, "routes");
+    plain(root, "init", "-q", repo);
+    plain(repo, "remote", "add", "origin", fetchUrl);
+    const asked = (args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8", env: { PATH: process.env.PATH ?? "", HOME: root, GIT_CONFIG_NOSYSTEM: "1", ...env } }).trim();
+    expect(asked(["remote", "get-url", "origin"])).toBe(`ext::/gw/ext %S ${fetchUrl}`);
+    expect(asked(["remote", "get-url", "--push", "origin"])).toBe(`ext::/gw/ext %S ${pushUrl}`);
+    // A connected URL the owner doesn't rewrite stands for itself, both ways.
+    const plainRoutes = gatewayRoutes([fetchUrl], [], { off: false, rewrite: (u) => u, pushRewrite: (u) => u });
+    expect(plainRoutes).toEqual([{ from: fetchUrl, fetch: fetchUrl, push: fetchUrl }]);
+  });
+
   test("round 12: a disconnected remote's cache is removed", async () => {
     await clone();
     const cache = gw.cachePath(`u:${URL}`);

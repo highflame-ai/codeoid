@@ -1126,23 +1126,7 @@ export class SessionSandbox {
     if (this.#resolvedFor === "codex" && sessionNet !== "on") return undefined;
     const g = this.#gitGateway();
     if (!g) return undefined;
-    const off = network.mode !== "on";
-    // Whole URLs only (a prefix would hand the rest of a URL to ext::, which reads `%` in it).
-    const kindOf = (u: string) => (/^https:\/\//i.test(u) ? "https" : /^ssh:\/\//i.test(u) || /^(?:[A-Za-z0-9._~-]+@)?[A-Za-z0-9.-]+:(?!\/\/)\S+$/.test(u) ? "ssh" : null);
-    // Only remotes the gateway can reach for it (local paths, file:// and git:// are left to git, as before).
-    // (Tests only: a local bare repository as the workspace's remote, as the gateway's file:// allowance.)
-    const testFile = (u: string) => process.env.CODEOID_GIT_GATEWAY_TEST_FILE === "1" && u.startsWith("file://");
-    const connected = new Set(g.urls);
-    // Each remote as written, and what the owner's own rewrite makes of it: the gateway is asked for that.
-    const routes: Array<{ from: string; fetch?: string; push?: string }> = g.urls.map((u) => ({ from: u, fetch: u, push: u }));
-    const reachable = (to: string) => connected.has(to) || kindOf(to) === "ssh" || (off && kindOf(to) === "https") || testFile(to);
-    for (const w of workspaceRemoteUrls(workspace)) {
-      // Where the owner's own git fetches and pushes it (a pushInsteadOf sends pushes elsewhere than fetches).
-      const fetch = testFile(w) ? w : ownerRewrite(w);
-      const push = testFile(w) ? w : ownerPushRewrite(w);
-      const r = { from: w, ...(reachable(fetch) ? { fetch } : {}), ...(reachable(push) ? { push } : {}) };
-      if (r.fetch || r.push) routes.push(r);
-    }
+    const routes = gatewayRoutes(g.urls, workspaceRemoteUrls(workspace), { off: network.mode !== "on", rewrite: ownerRewrite, pushRewrite: ownerPushRewrite });
     return { ...g, urls: [...new Set(routes.flatMap((r) => [r.fetch, r.push].filter((x): x is string => !!x)))], routes };
   }
 
@@ -1529,4 +1513,37 @@ export function workspaceRemoteUrls(workspace: string): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * The sandbox's routes to the git gateway: each remote URL (a connected one, a workspace remote) and where the owner's
+ * own git would fetch and push it (their insteadOf, their pushInsteadOf), each kept only when the gateway can reach it
+ * for agents. A connected URL's own route carries the owner's rewrites too: its plain form would otherwise stand for
+ * pushes as well, and send them to the fetch URL (another repository, in a fork workflow).
+ */
+export function gatewayRoutes(connectedUrls: readonly string[], workspaceRemotes: readonly string[], o: { off: boolean; rewrite: (u: string) => string; pushRewrite: (u: string) => string }): Array<{ from: string; fetch?: string; push?: string }> {
+  // Whole URLs only (a prefix would hand the rest of a URL to ext::, which reads `%` in it).
+  const kindOf = (u: string) => (/^https:\/\//i.test(u) ? "https" : /^ssh:\/\//i.test(u) || /^(?:[A-Za-z0-9._~-]+@)?[A-Za-z0-9.-]+:(?!\/\/)\S+$/.test(u) ? "ssh" : null);
+  // Only remotes the gateway can reach for it (local paths, file:// and git:// are left to git, as before).
+  // (Tests only: a local bare repository as the workspace's remote, as the gateway's file:// allowance.)
+  const testFile = (u: string) => process.env.CODEOID_GIT_GATEWAY_TEST_FILE === "1" && u.startsWith("file://");
+  const connected = new Set(connectedUrls);
+  const reachable = (to: string) => connected.has(to) || kindOf(to) === "ssh" || (o.off && kindOf(to) === "https") || testFile(to);
+  const routes: Array<{ from: string; fetch?: string; push?: string }> = [];
+  // Each remote as written, and what the owner's own rewrite makes of it (fetch and push each): the gateway is asked
+  // for that. A connected URL's route first.
+  for (const w of connectedUrls) {
+    // A connected URL is fetched as itself (or as the owner's rewrite of it when that is connected too), and pushed
+    // where the owner's own git pushes it (their pushInsteadOf), so never to the fetch URL when they push elsewhere.
+    const rewritten = testFile(w) ? w : o.rewrite(w);
+    const pushTo = testFile(w) ? w : o.pushRewrite(w);
+    routes.push({ from: w, fetch: connected.has(rewritten) ? rewritten : w, push: pushTo !== w && reachable(pushTo) ? pushTo : w });
+  }
+  for (const w of workspaceRemotes) {
+    const fetch = testFile(w) ? w : o.rewrite(w);
+    const push = testFile(w) ? w : o.pushRewrite(w);
+    const r = { from: w, ...(reachable(fetch) ? { fetch } : {}), ...(reachable(push) ? { push } : {}) };
+    if (r.fetch || r.push) routes.push(r);
+  }
+  return routes;
 }
