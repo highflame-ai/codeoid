@@ -22,7 +22,7 @@ import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
-import { ownerConfigFiles, ownerPushRewrite, ownerRewrite, warmRewrites } from "../git-gateway/connect.js";
+import { ownerConfigFiles, ownerPushRewrite, ownerRewrite, warmOwnerConfig, warmRewrites } from "../git-gateway/connect.js";
 import { buildSandboxSpec, type GitGatewaySpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
 import { normalizeRemote } from "../workstreams/match.js";
 import { readRegular } from "../git-gateway/ssh-snapshot.js";
@@ -956,7 +956,8 @@ export class SessionSandbox {
     const hideLocalServices = (r.info.networkRequested ?? r.info.network) !== "on";
     // The url.* rules git applies in the workspace's repository, read now (asynchronously: the repository is the
     // agent's to write), so the spec built below routes as the owner's git would there.
-    if (this.#gitGateway) await warmRewrites(repositoryForRewrites(this.#workspace()));
+    // The owner's config files (held read-only where a session may write them) and their url.* rules, read the same way.
+    await Promise.all([warmOwnerConfig(), ...(this.#gitGateway ? [warmRewrites(repositoryForRewrites(this.#workspace())), warmRewrites("/")] : [])]);
     const open = (backendState: readonly string[] = [], o: OpenOptions = {}) => {
       if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
       return this.#spec(o.backendNetwork ? { mode: "on" } : r.network, backendState, o.readable ?? [], dockerSocket, hideLocalServices, dirs);

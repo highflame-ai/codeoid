@@ -30,11 +30,12 @@
  * its own output, like the workspace.
  */
 
-import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { makeAt } from "./pinned.js";
 import type { GitLayout } from "./policy.js";
+import { readRegularTextSync } from "../safe-read.js";
 
 function within(child: string, parent: string): boolean {
   return child === parent || child.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
@@ -395,7 +396,7 @@ export function worktreeAdminsOf(common: string, limit = 500): WorktreeAdmin[] {
     const at = join(dir, n);
     let dotgit: string | null = null;
     try {
-      const named = readFileSync(join(at, "gitdir"), "utf8").trim();
+      const named = readRegularTextSync(join(at, "gitdir")).trim();
       dotgit = named ? resolve(at, named) : null;
     } catch {
       /* no gitdir: a half-made or broken worktree */

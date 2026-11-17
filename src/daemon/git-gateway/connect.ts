@@ -328,6 +328,9 @@ export function ownerRewrite(url: string, dir?: string): string {
     const inRepo = rewriteIn(dir, url, false);
     if (inRepo !== null) return inRepo;
   }
+  // The rules as read from / asynchronously (warmRewrites("/")), when they were.
+  const fromRoot = rewriteIn("/", url, false);
+  if (fromRoot !== null) return fromRoot;
   if (!ownerConfigPlain()) return url;
   try {
     const r = spawnSync(GIT_BIN, ["-C", "/", "ls-remote", "--get-url", "--", url], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
@@ -430,6 +433,8 @@ export function ownerPushRewrite(url: string, dir?: string): string {
     const inRepo = rewriteIn(dir, url, true);
     if (inRepo !== null) return inRepo;
   }
+  const fromRoot = rewriteIn("/", url, true);
+  if (fromRoot !== null) return fromRoot;
   if (!ownerConfigPlain()) return url;
   try {
     const r = spawnSync(GIT_BIN, ["-C", "/", "config", "--null", "--get-regexp", "^url\\..*\\.pushinsteadof$"], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
@@ -505,7 +510,53 @@ export function ownerConfigFiles(): string[] {
   const home = process.env.HOME || homedir();
   const xdg = process.env.XDG_CONFIG_HOME || join(home, ".config");
   const key = `${home}\0${xdg}\0${sshHome()}`;
-  if (ownerFiles && ownerFiles.key === key && Date.now() - ownerFiles.at < 5_000) return ownerFiles.files;
+  // As last read (asynchronously, by warmOwnerConfig): refreshed in the background once a few seconds old, never
+  // read again here. Only a caller that never warmed it (a test, the CLI) reads it on its own thread.
+  if (ownerFiles && ownerFiles.key === key) {
+    if (Date.now() - ownerFiles.at >= 5_000) void warmOwnerConfig();
+    return ownerFiles.files;
+  }
+  return ownerConfigFilesNow(home, xdg, key, (file) => {
+    const r = spawnSync(GIT_BIN, includeArgs(file), { cwd: "/", env: includeEnv(), encoding: "utf8", timeout: 5_000 });
+    return r.status === 0 ? r.stdout : "";
+  }) as string[];
+}
+
+/** The arguments of a read of one file's include keys, alone (git reads the global config at start even with --file). */
+function includeArgs(file: string): string[] {
+  return ["-C", "/", "config", "--file", file, "--no-includes", "--null", "--get-regexp", "^include(if\\..*)?\\.path$"];
+}
+function includeEnv(): Record<string, string> {
+  return { ...ownerHelperEnv(), GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+}
+
+let warmingOwner: Promise<void> | null = null;
+
+/**
+ * Read the owner's config files (ownerConfigFiles) asynchronously: an include target an agent can reach (a dotfiles
+ * workspace) might be swapped for a FIFO between the plain-file look and git's read, which holds only this read.
+ */
+// paths: the owner's config files, read (git config from /, one file at a time), nothing run
+export function warmOwnerConfig(): Promise<void> {
+  if (warmingOwner) return warmingOwner;
+  const home = process.env.HOME || homedir();
+  const xdg = process.env.XDG_CONFIG_HOME || join(home, ".config");
+  const key = `${home}\0${xdg}\0${sshHome()}`;
+  warmingOwner = (async () => {
+    try {
+      await ownerConfigFilesNow(home, xdg, key, async (file) => {
+        const r = await runGit(includeArgs(file), "/", includeEnv(), 5_000);
+        return r.code === 0 ? r.stdout : "";
+      });
+    } finally {
+      warmingOwner = null;
+    }
+  })();
+  return warmingOwner;
+}
+
+/** The walk itself: `read` gives one file's include keys (synchronously, or not). Sets the cache. */
+function ownerConfigFilesNow(home: string, xdg: string, key: string, read: (file: string) => string | Promise<string>): string[] | Promise<string[]> {
   const out = new Set<string>();
   const add = (p: string) => {
     out.add(p);
@@ -518,13 +569,10 @@ export function ownerConfigFiles(): string[] {
   // reads each file alone, only when it is a plain file.)
   // Every include git could read, active from / or not (includeIf), there yet or not: each file's own include keys.
   const seenGit = new Set<string>();
-  const includes = (file: string, depth: number) => {
-    if (depth > 10 || seenGit.has(file)) return;
-    seenGit.add(file);
-    if (!plainFile(file)) return;
-    // That file alone: git reads the global config (and its includes) at start even with --file, so none here.
-    const r = spawnSync(GIT_BIN, ["-C", "/", "config", "--file", file, "--no-includes", "--null", "--get-regexp", "^include(if\\..*)?\\.path$"], { cwd: "/", env: { ...ownerHelperEnv(), GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" }, encoding: "utf8", timeout: 5_000 });
-    for (const entry of (r.status === 0 ? r.stdout : "").split("\0")) {
+  // Breadth first, one file at a time (at most 64 of them, 10 deep): what each names is added and walked next.
+  const queue: Array<[string, number]> = [join(home, ".gitconfig"), join(xdg, "git", "config")].filter((f) => existsSync(f)).map((f) => [f, 0]);
+  const take = (file: string, depth: number, text: string) => {
+    for (const entry of text.split("\0")) {
       const nl = entry.indexOf("\n");
       const v = nl < 0 ? "" : entry.slice(nl + 1);
       if (!v) continue;
@@ -532,12 +580,36 @@ export function ownerConfigFiles(): string[] {
       const user = /^~([^/]+)\//.exec(v)?.[1];
       const target = v === "~" || v.startsWith("~/") ? `${home}${v.slice(1)}` : user ? `${userHome(user, home)}${v.slice(user.length + 1)}` : isAbsolute(v) ? v : `${dirname(file)}/${v}`;
       add(target);
-      includes(target, depth + 1);
+      queue.push([target, depth + 1]);
     }
   };
-  for (const f of [join(home, ".gitconfig"), join(xdg, "git", "config")]) if (existsSync(f)) includes(f, 0);
-  ownerFiles = { at: Date.now(), key, files: [...out] };
-  return ownerFiles.files;
+  const next = (): [string, number] | null => {
+    while (queue.length > 0) {
+      const [file, depth] = queue.shift() as [string, number];
+      if (depth > 10 || seenGit.has(file) || seenGit.size >= 64) continue;
+      seenGit.add(file);
+      if (plainFile(file)) return [file, depth];
+    }
+    return null;
+  };
+  const done = () => {
+    ownerFiles = { at: Date.now(), key, files: [...out] };
+    return ownerFiles.files;
+  };
+  // Synchronously when `read` is (the fallback), or awaiting each read.
+  const first = next();
+  if (!first) return done();
+  const r0 = read(first[0]);
+  if (typeof r0 === "string") {
+    take(first[0], first[1], r0);
+    for (let n = next(); n; n = next()) take(n[0], n[1], read(n[0]) as string);
+    return done();
+  }
+  return (async () => {
+    take(first[0], first[1], await r0);
+    for (let n = next(); n; n = next()) take(n[0], n[1], await read(n[0]));
+    return done();
+  })();
 }
 
 /**

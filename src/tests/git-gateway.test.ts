@@ -380,9 +380,10 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
     const saved = process.env.HOME;
     process.env.HOME = home;
     process.env.CODEOID_TEST_SSH_HOME = home;
+    const { warmOwnerConfig } = await import("../daemon/git-gateway/connect.js");
     const fresh = async () => {
-      // The files' cache is a few seconds: wait it out between layouts.
-      await new Promise((r) => setTimeout(r, 5_100));
+      // The files are read again (asynchronously, as the daemon does before building a spec) between layouts.
+      await warmOwnerConfig();
     };
     try {
       // ~/.gitconfig a link into the dotfiles repository.
@@ -392,17 +393,17 @@ p.on("exit", (c) => (process.exitCode = c ?? 1));
       // The spec for a session working there holds the link's target read-only.
       const spec = buildSandboxSpec({ sessionId: "dots", workspace: dots, tempDir: join(root, "t"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" }, cache: false, ownerConfigFiles: ownerConfigFiles() });
       expect(spec.readOnly).toContain(realpathSync(join(dots, "gitconfig")));
-      await fresh();
       // A plain ~/.gitconfig including a file there; and ~/.ssh/config including one there.
       rmSync(join(home, ".gitconfig"));
       writeFileSync(join(dots, "extra"), "[user]\n\tname = t\n");
       writeFileSync(join(home, ".gitconfig"), `[include]\n\tpath = ${join(dots, "extra")}\n`);
-      expect(ownerConfigProblem([dots])).toContain("extra");
       await fresh();
+      expect(ownerConfigProblem([dots])).toContain("extra");
       writeFileSync(join(home, ".gitconfig"), "");
       mkdirSync(join(home, ".ssh"), { recursive: true });
       writeFileSync(join(dots, "ssh", "work.conf"), "Host w\n");
       writeFileSync(join(home, ".ssh", "config"), `Include ${join(dots, "ssh")}/*.conf\n`);
+      await fresh();
       expect(ownerConfigProblem([dots])).toMatch(/dotfiles\/ssh/);
       expect(ownerConfigProblem([join(root, "elsewhere")])).toBeNull();
     } finally {

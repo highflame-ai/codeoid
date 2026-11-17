@@ -39,9 +39,10 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { chmodSync, copyFileSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, lstatSync, mkdirSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import type { SandboxHandle } from "./types.js";
+import { readRegularTextSync } from "../safe-read.js";
 
 /** How a backend's home is laid out (what of it is login, conversations, code). */
 export interface BackendHomeLayout {
@@ -302,7 +303,7 @@ function readSmallFile(p: string): string | null {
   try {
     const st = lstatSync(p);
     if (!st.isFile() || st.size > LOGIN_LIMIT) return null;
-    return readFileSync(p, "utf8");
+    return readRegularTextSync(p, LOGIN_LIMIT);
   } catch {
     return null;
   }

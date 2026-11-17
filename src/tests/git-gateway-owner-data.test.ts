@@ -359,3 +359,35 @@ describe("round 33: nothing of an agent's repository, or of the owner's config, 
     expect(spec.readOnly).toContain(realpathSync(join(dots, "missing.gitconfig")));
   });
 });
+
+describe("round 34: the sandbox's own looks at a repository read without blocking; owner config made with its dirs", () => {
+  test("a FIFO .gitattributes, a FIFO worktree gitdir: the end-of-turn snapshot and the worktree list answer at once", async () => {
+    const { gitControlSnapshot } = await import("../daemon/sandbox/git-watch.js");
+    const { worktreeAdminsOf } = await import("../daemon/sandbox/worktrees.js");
+    const repo = join(home, "r34");
+    spawnSync("git", ["init", "-q", repo]);
+    spawnSync("mkfifo", [join(repo, ".gitattributes")]);
+    mkdirSync(join(repo, ".git", "worktrees", "w"), { recursive: true });
+    spawnSync("mkfifo", [join(repo, ".git", "worktrees", "w", "gitdir")]);
+    const t = Date.now();
+    gitControlSnapshot(repo, home);
+    worktreeAdminsOf(join(repo, ".git"));
+    expect(Date.now() - t).toBeLessThan(2_000);
+  });
+
+  test("a missing owner include whose dir is missing too, in a workspace: both made, and held", async () => {
+    const { ownerConfigFiles, warmOwnerConfig } = await import("../daemon/git-gateway/connect.js");
+    const { buildSandboxSpec } = await import("../daemon/sandbox/policy.js");
+    process.env.HOME = home;
+    const dots = join(home, "dots34");
+    mkdirSync(dots);
+    const target = join(dots, "conf.d", "work.gitconfig");
+    writeFileSync(join(home, ".gitconfig"), `[include]\n\tpath = ${target}\n`);
+    await warmOwnerConfig();
+    expect(ownerConfigFiles()).toContain(target);
+    const spec = buildSandboxSpec({ sessionId: "r34", workspace: dots, tempDir: join(home, "t34"), network: { mode: "off" }, hidden: { home, configDir: join(home, ".codeoid"), env: { HOME: home }, daemonTmp: "/tmp" }, cache: false, ownerConfigFiles: ownerConfigFiles() });
+    expect(existsSync(target)).toBe(true);
+    expect(spec.readOnly).toContain(realpathSync(target));
+    expect(spec.readOnly).toContain(realpathSync(join(dots, "conf.d")));
+  });
+});

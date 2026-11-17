@@ -23,7 +23,7 @@
  *   - network per policy.
  */
 
-import { accessSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CodeoidConfig } from "../../config.js";
@@ -38,6 +38,7 @@ import { makeAt, makeInPinned, type PathPin, dirIdentity, pinDir, pinOf, pinProb
 import { controlDirProblem, nestedControl, type NestedControl, projectRootSecrets, type RootScan, rootScanKey, stillRealDir } from "./project-roots.js";
 import { isOwnWorktree, worktreeAdminsOf, worktreeFoldersOf } from "./worktrees.js";
 import type { NetworkMode, NetworkPolicy, SandboxSpec } from "./types.js";
+import { readRegularTextSync } from "../safe-read.js";
 
 export { DEFAULT_HOME_READABLE, validAllowedHost };
 
@@ -663,29 +664,9 @@ const WORKTREE_CONTROL = ["commondir", "gitdir", "config.worktree"] as const;
 /** Made when missing, so there is something to hold read-only: empty dirs, and an empty `config.worktree` (read only where the config turns it on). */
 const GIT_PLACEHOLDER_DIRS = ["hooks", "info", "modules", "remotes", "branches", "worktrees"] as const;
 
-/**
- * A small file of git's (a `.git` file, `gitdir`, `commondir`, a config, `info/exclude`) read without blocking, and
- * only when it is a regular file (an agent can make any of them a FIFO, which a blocking read waits on for ever);
- * thrown otherwise, as a read of a missing file is.
- */
-// paths: a look (fstat) and a bounded read, no write
+/** A small file of git's read without blocking, a regular file only (safe-read.ts: an agent can make any a FIFO). */
 function readSmall(p: string): string {
-  const fd = openSync(p, constants.O_RDONLY | constants.O_NONBLOCK);
-  try {
-    const st = fstatSync(fd);
-    if (!st.isFile()) throw new Error(`${p} isn't a regular file`);
-    const size = Math.min(st.size, 1 << 20);
-    const buf = Buffer.alloc(size);
-    let at = 0;
-    while (at < size) {
-      const n = readSync(fd, buf, at, size - at, at);
-      if (n <= 0) break;
-      at += n;
-    }
-    return buf.subarray(0, at).toString("utf8");
-  } finally {
-    closeSync(fd);
-  }
+  return readRegularTextSync(p, 1 << 20);
 }
 
 // paths: a look, no write
@@ -1014,6 +995,21 @@ function isLink(p: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * An owner config file missing inside a writable root, made empty with every dir missing on its way (each inside a
+ * writable root), so none can be made by a sandboxed command: the dirs and the file, to hold. None when it can't be.
+ */
+// paths: a look (does each dir exist) up to a writable root, then makeIfMissing (pinned, never through a link)
+function placeholderWithDirs(f: string, inWritable: (p: string) => boolean): string[] {
+  const missing: string[] = [];
+  for (let d = dirname(f); !existsSync(d); d = dirname(d)) {
+    if (d === dirname(d) || !inWritable(realOr(d))) return [];
+    missing.unshift(d);
+  }
+  for (const d of missing) if (!makeIfMissing(d, "dir")) return [];
+  return makeIfMissing(f, "") ? [...missing, f] : [];
 }
 
 /** A dir (`"dir"`) or a file with `content`, made only where nothing (not even a link) is: never through one. Whether it was made. */
@@ -1387,7 +1383,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   // paths: a look (does each of the owner's config files exist), no write
   // One missing inside a writable root (an include target in a dotfiles workspace) is made empty first (an empty git or
   // ssh config says nothing), so a sandboxed command can't create it.
-  const ownerConfig = (inputs.ownerConfigFiles ?? []).filter((f) => existsSync(f) || (inWritable(realOr(f)) && existsSync(dirname(f)) && makeIfMissing(f, "")));
+  const ownerConfig = (inputs.ownerConfigFiles ?? []).flatMap((f) => (existsSync(f) ? [f] : inWritable(realOr(f)) ? placeholderWithDirs(f, inWritable) : []));
   const readOnly = [...new Set([...git.readOnly, ...projectConfig, ...ownerConfig].map(realOr))].filter(inWritable);
   // Held in place (no rename, still writable inside): every dir between a writable root and a hidden path in it,
   // and between two nested writable roots (pinned); the working directory and every dir between it and the
