@@ -9977,10 +9977,16 @@ export class Session {
     // A command reaching a directory that holds credentials runs inside the
     // sandbox, which hides them (#448 round 8: `ls ~`, `echo $HOME`, `df -h /`):
     // refused only where it doesn't run inside one.
-    const reach = secret?.action === "ask" ? secret : risk?.secret?.action === "ask" && this.#sandbox?.info?.state !== "on" ? risk.secret : null;
+    const unsandboxed = risk?.secret?.action === "ask" && this.#sandbox?.info?.state !== "on";
+    const reach = secret?.action === "ask" ? secret : unsandboxed ? risk!.secret! : null;
     if (reach) {
       const what = `a ${risk ? "command" : "call"} reaching ${reach.path}, which may lead to credentials`;
-      return { kind: "credential_dir", what, reason: `Refused: autonomous mode doesn't allow ${what}; keep to the working directory instead. ${owner}` };
+      // A command is refused here only because nothing contains it: say so, and how to change that.
+      const why =
+        secret?.action !== "ask" && unsandboxed
+          ? ` This session isn't sandboxed (${this.#sandbox?.info?.state ?? "off"}${this.#sandbox?.info?.reason ? `: ${this.#sandbox.info.reason}` : ""}); in the OS sandbox it would run. Turn it on: codeoid sandbox set ${this.name} auto.`
+          : "";
+      return { kind: "credential_dir", what, reason: `Refused: autonomous mode doesn't allow ${what}; keep to the working directory instead.${why} ${owner}` };
     }
     if (isUnresolvedPathTool(toolName)) {
       const what = "a call whose path couldn't be resolved for certain";

@@ -11,6 +11,7 @@ import { createSignal } from "solid-js";
 
 import { getClient, newRequestId } from "./connection";
 import type {
+  BuiltinServerInfo,
   EndpointInfo,
   EndpointsResultMsg,
   EndpointsSetMsg,
@@ -22,10 +23,12 @@ interface State {
   loaded: boolean;
   loading: boolean;
   endpoints: EndpointInfo[];
+  /** The built-in OpenAI and llama.cpp backends, listed with the endpoints. */
+  builtins: BuiltinServerInfo[];
   error: string | null;
 }
 
-const EMPTY: State = { loaded: false, loading: false, endpoints: [], error: null };
+const EMPTY: State = { loaded: false, loading: false, endpoints: [], builtins: [], error: null };
 const [state, setState] = createSignal<State>(EMPTY);
 
 export const endpointsState = state;
@@ -43,7 +46,7 @@ async function listCall(msg: { type: "endpoints.list" | "endpoints.set" | "endpo
   const res = await getClient().request<EndpointsResultMsg>({ ...msg, id } as never, {
     waitForResult: (m) => (m.type === "endpoints.result" && m.requestId === id ? m : undefined),
   });
-  setState({ loaded: true, loading: false, endpoints: res.endpoints, error: null });
+  setState({ loaded: true, loading: false, endpoints: res.endpoints, builtins: res.builtins ?? [], error: null });
 }
 
 export async function fetchEndpoints(): Promise<void> {
