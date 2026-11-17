@@ -15,7 +15,7 @@ import { physicalPath, within } from "../physical-path.js";
 
 import { GIT_BIN } from "../git-env.js";
 import { hostPathProblem } from "./hostpath.js";
-import { type SshSnapshot, snapshotProblem, sshConfigSources, sshConfigText, sshHostOf, sshSnapshot, sshUrlUserPort } from "./ssh-snapshot.js";
+import { resolveSshSnapshot, type SshSnapshot, snapshotProblem, sshConfigSources, sshConfigText } from "./ssh-snapshot.js";
 import { remoteUrlProblem } from "./text.js";
 import { gitError, type HttpsCredential, lsRemote, runGit, systemSsh, type Upstream, type UpstreamKind, upstreamKind } from "./upstream.js";
 
@@ -127,6 +127,27 @@ export function safeHelper(raw: string, home: string): { line: string; file?: st
   return { error: `your credential helper ${JSON.stringify(h.slice(0, 60))} isn't one codeoid runs for agents (only git's and the platforms' own)` };
 }
 
+/**
+ * Whether a `credential.<pattern>.*` key applies to `u`, as git's urlmatch decides: the same scheme, host (a `*`
+ * matches one label) and port, no user in the pattern but the URL's, and a path that is the URL's or a parent of it
+ * at a `/`. A pattern that isn't a URL applies to nothing (fail closed: no credential, rather than another's).
+ */
+export function credentialUrlMatches(pattern: string, u: URL): boolean {
+  let p: URL;
+  try {
+    p = new URL(pattern);
+  } catch {
+    return false;
+  }
+  if (p.protocol !== u.protocol || p.port !== u.port || p.password) return false;
+  if (p.username && p.username !== u.username) return false;
+  const pl = p.hostname.toLowerCase().split(".");
+  const ul = u.hostname.toLowerCase().split(".");
+  if (pl.length !== ul.length || pl.some((l, i) => l !== "*" && l !== ul[i])) return false;
+  const pp = p.pathname.replace(/\/+$/, "");
+  return pp === "" || u.pathname === pp || u.pathname.startsWith(`${pp}/`);
+}
+
 /** The owner's credential helpers for `url` (their global and system config, from `/`), in git's order. */
 // paths: git config read from /, which runs nothing
 function ownerHelpers(url: string): string[] {
@@ -139,8 +160,8 @@ function ownerHelpers(url: string): string[] {
     const value = nl < 0 ? "" : entry.slice(nl + 1);
     if (!key) continue;
     const sub = key.slice("credential.".length, -".helper".length).replace(/\.$/, "");
-    // credential.helper, or credential.<url>.helper whose URL is this one's origin (or a prefix of it).
-    if (key !== "credential.helper" && !(sub && (`${u.protocol}//${u.host}${u.pathname}`.startsWith(sub) || sub === u.host))) continue;
+    // credential.helper, or credential.<url>.helper whose URL matches this one as git's urlmatch does.
+    if (key !== "credential.helper" && !credentialUrlMatches(sub, u)) continue;
     out.push(value);
   }
   return out;
@@ -166,6 +187,15 @@ export function fillGitCredential(url: string, o: { runDir: string; writable: re
     if (safe.file) {
       const bad = hostPathProblem(safe.file, o.writable, undefined, { homeAllowed: true });
       if (bad) return Promise.resolve({ error: `your credential store file can't be used: ${bad}` });
+    }
+    if (safe.line.startsWith("cache")) {
+      // git-credential-cache's socket: ~/.git-credential-cache, else $XDG_CACHE_HOME/git/credential. A session that
+      // may write either could answer in its place.
+      const home = process.env.HOME || homedir();
+      for (const d of [join(home, ".git-credential-cache"), join(process.env.XDG_CACHE_HOME || join(home, ".cache"), "git", "credential")]) {
+        const bad = hostPathProblem(d, o.writable, undefined, { homeAllowed: true });
+        if (bad) return Promise.resolve({ error: `your credential cache can't be used: ${bad}` });
+      }
     }
     usable.push(safe.line);
   }
@@ -238,6 +268,8 @@ export interface ConnectOptions {
   fill?: (url: string) => Promise<HttpsCredential | { error: string }>;
   /** Tests only: the owner's home (ssh's config). */
   home?: string;
+  /** The ssh settings the owner was shown (the connect card): what is stored, so what was shown is what runs. */
+  sshSnapshot?: SshSnapshot;
 }
 
 /**
@@ -262,14 +294,11 @@ export async function probeConnection(
     ssh = s.path;
     if (o.token) return { error: "a token is for an https remote; an ssh remote uses your ssh key" };
     // The owner's ssh setup for this host, as data (ssh-snapshot.ts): what every run uses, never their config itself.
-    const host = sshHostOf(url);
-    if (!host) return { error: `${url} names no host codeoid can reach by ssh` };
     // OpenSSH's home is the passwd one (it ignores $HOME): what its keys and known hosts are read from.
     const home = o.home ?? sshHome();
-    snapshot = { ...sshSnapshot(host, home), ...(() => {
-      const up = sshUrlUserPort(url);
-      return { ...(up.user ? { urlUser: up.user } : {}), ...(up.port ? { urlPort: up.port } : {}) };
-    })() };
+    const snap = o.sshSnapshot ?? (await resolveSshSnapshot(url, { ssh, home, writable: o.writable }));
+    if ("error" in snap) return snap;
+    snapshot = snap;
     const bad = snapshotProblem(snapshot, o.writable, home);
     if (bad) return { error: bad };
   }
@@ -353,6 +382,22 @@ export function ownerConfigFiles(): string[] {
   } catch {
     /* none read */
   }
+  // Every include git could read, active from / or not (includeIf), there yet or not: each file's own include keys.
+  const seenGit = new Set<string>();
+  const includes = (file: string, depth: number) => {
+    if (depth > 10 || seenGit.has(file)) return;
+    seenGit.add(file);
+    const r = spawnSync(GIT_BIN, ["-C", "/", "config", "--file", file, "--null", "--get-regexp", "^include(if\\..*)?\\.path$"], { cwd: "/", env: ownerHelperEnv(), encoding: "utf8", timeout: 5_000 });
+    for (const entry of (r.status === 0 ? r.stdout : "").split("\0")) {
+      const nl = entry.indexOf("\n");
+      const v = nl < 0 ? "" : entry.slice(nl + 1);
+      if (!v) continue;
+      const target = v === "~" || v.startsWith("~/") ? join(home, v.slice(1)) : isAbsolute(v) ? v : join(dirname(file), v);
+      add(target);
+      includes(target, depth + 1);
+    }
+  };
+  for (const f of [join(home, ".gitconfig"), join(xdg, "git", "config")]) if (existsSync(f)) includes(f, 0);
   ownerFiles = { at: Date.now(), key, files: [...out] };
   return ownerFiles.files;
 }

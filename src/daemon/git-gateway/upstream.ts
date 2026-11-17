@@ -109,6 +109,8 @@ export async function withUpstreamEnv<T>(up: Upstream, ssh: string | null, fn: (
     if (!up.runDir) throw new Error("no private dir for the ssh config");
     mkdirSync(up.runDir, { recursive: true, mode: 0o700 });
     sshFile = join(up.runDir, `${randomBytes(12).toString("hex")}.ssh_config`);
+    // ssh hands a jump host's ssh `-F <path>` through /bin/sh unquoted: a path it can't split wrong, or no jump.
+    if (/^\s*ProxyJump /m.test(up.sshConfig ?? "") && !/^[A-Za-z0-9._/-]+$/.test(`${sshFile}${ssh}`)) throw new Error(`a jump host can't be used from ${up.runDir} (ssh would split its path): move codeoid's config dir to a plain path`);
     writeFileSync(sshFile, up.sshConfig ?? "Host *\n  BatchMode yes\n  ConnectTimeout 20\n", { mode: 0o600 });
     entries.push(["core.sshCommand", `${ssh} -F ${sh(sshFile)} -o BatchMode=yes -o ConnectTimeout=20`]);
   }

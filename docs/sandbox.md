@@ -1262,21 +1262,24 @@ codeoid sandbox git disconnect [dir] [--remote r | --url u]
   (`--yes` without a terminal). Then connecting checks that your credential reaches the remote (`git ls-remote`).
 - **Data, never programs:** nothing your git or ssh config names is ever run by the gateway. It takes data from
   them, once, when you connect.
-- **ssh remotes** use your ssh key, through your ssh agent. When you connect, codeoid reads `~/.ssh/config` (and
-  what it `Include`s) for that host's data alone: `HostName`, `User`, `Port`, `IdentityFile`, `CertificateFile`,
-  `IdentitiesOnly`, `UserKnownHostsFile`, `HostKeyAlias`, `ProxyJump` (and each jump host's own). It reads the
-  config as OpenSSH does (first value wins, case-sensitive `Host`, includes in a block that doesn't apply read with
-  nothing applying). What it can't follow faithfully is refused, with the reason: a `Match` block it reaches, a
-  `ProxyCommand` for the host, `%` tokens or `${VAR}` in a file name, a relative key file. `LocalCommand` and the
-  rest are never taken. The config is read from the home OpenSSH uses (your account's, not `$HOME`), and every
-  file it is read from is judged and held read-only like your git config. Every run is the system `ssh` with `-F` on a config codeoid writes
-  from that, so neither your ssh config nor the system's decides anything later; connect again after changing it.
-  The connect output says where ssh goes and as whom. A key or known-hosts file in what a session may write is
-  refused. A remote connected before this keeps working only after it is connected again.
+- **ssh remotes** use your ssh key, through your ssh agent. When you connect, OpenSSH itself resolves your
+  `~/.ssh/config` for that host (`ssh -G`, which prints the settings and connects nowhere; the system's config is
+  left out). Before that, codeoid scans every file the config can read (every `Include`, in any block, in any
+  spelling) and refuses a `Match` block anywhere (its `exec` would run), an Include it can't follow, something that
+  isn't a plain file (a FIFO), or a file in what a session may write. From what ssh printed it takes the data:
+  where, as whom, which keys (`IdentitiesOnly`, `IdentityAgent`), known hosts, and each `ProxyJump` host the same
+  way. A `ProxyCommand`, `KnownHostsCommand` or `CanonicalizeHostname`, `%` tokens or `${VAR}` in a file name, or
+  a key file that leads into what a session may write is refused, with the reason. Every run is the system `ssh`
+  with `-F` on a config codeoid writes from that, so neither your ssh config nor the system's decides anything
+  later; connect again after changing it. The config is read from the home OpenSSH uses (your account's, not
+  `$HOME`), and every file it is read from is held read-only like your git config. The connect output, and the
+  card an agent's git raises, say where ssh goes, as whom and with which key; what the card showed is what is
+  kept. A remote connected before this works again once it is connected again.
 - **https remotes:** your git credential for the host is read once, now, with `git credential fill`. Only the
   helpers git and the platforms ship are run (`osxkeychain`, `libsecret`, `gnome-keyring`, `wincred`, `manager`,
   `manager-core`, `cache`, `store` with a plain absolute file no session may write), from your global and system
-  config, never a repository's. codeoid writes each helper line itself (git runs helpers through a shell), and
+  config, never a repository's, and only those scoped to the URL as git's urlmatch scopes them. A `cache` whose
+  socket dir a session may write is refused. codeoid writes each helper line itself (git runs helpers through a shell), and
   finds a helper's program only in PATH dirs no session may write. Any other helper (a `!` shell snippet, a path, another name) is refused, and you connect with
   `--token` instead. Your `http.sslCAInfo` for the URL is kept with it, when it isn't in what a session may write. The credential lives in a 0600 file of the daemon's, which
   host-side file tools are refused. Each run hands it to git through codeoid's own credential helper, for that

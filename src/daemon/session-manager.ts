@@ -218,7 +218,7 @@ import { connectionId, GitCredentials, ownerConfigProblem, ownerPushRewrite, own
 import { type GatewayHost, GitGateway } from "./git-gateway/gateway.js";
 import { hostPathProblem } from "./git-gateway/hostpath.js";
 import { redactCredentials, remoteUrlProblem, shownGitUrl } from "./git-gateway/text.js";
-import { type SshSnapshot, snapshotProblem, sshConfigText, sshSnapshotLine } from "./git-gateway/ssh-snapshot.js";
+import { resolveSshSnapshot, type SshSnapshot, snapshotProblem, sshConfigText, sshSnapshotLine } from "./git-gateway/ssh-snapshot.js";
 import { systemSsh, upstreamKind } from "./git-gateway/upstream.js";
 import type { GitGatewaySpec } from "./sandbox/policy.js";
 import {
@@ -4675,11 +4675,11 @@ mcpHub: this.#mcpHub,
   readonly #allSandboxWritable = (): string[] => [...this.#sessions.values()].flatMap((s) => s.sandboxAgentWritable);
 
   /** Connect `url` for `owner`: their credential proved to reach it, then recorded (an https one kept, 0600). */
-  async #connectGit(owner: string, url: string, by: string, token?: string): Promise<{ kind: string; auth: string; via?: string } | { error: string }> {
+  async #connectGit(owner: string, url: string, by: string, token?: string, sshSnapshot?: SshSnapshot): Promise<{ kind: string; auth: string; via?: string } | { error: string }> {
     if (!this.#gitGatewayInstance() || !this.#gitCredentials) return { error: "the git gateway isn't available on this daemon" };
     const ownConfig = ownerConfigProblem(this.#allSandboxWritable());
     if (ownConfig) return { error: ownConfig };
-    const probe = await probeConnection(url, { ...(token ? { token } : {}), writable: this.#allSandboxWritable(), runDir: join(getConfigDir(), "git-gateway", "run"), ...(testFileRemote(url) ? { testFile: true } : {}) });
+    const probe = await probeConnection(url, { ...(token ? { token } : {}), ...(sshSnapshot ? { sshSnapshot } : {}), writable: this.#allSandboxWritable(), runDir: join(getConfigDir(), "git-gateway", "run"), ...(testFileRemote(url) ? { testFile: true } : {}) });
     if ("error" in probe) return { error: probe.error };
     const id = connectionId(owner, url);
     if (probe.credential) this.#gitCredentials.set(id, probe.credential);
@@ -4734,9 +4734,20 @@ mcpHub: this.#mcpHub,
         const bad = remoteUrlProblem(url);
         const how = `\`codeoid sandbox git connect --url ${url}\` (or from the repository: \`codeoid sandbox git connect\`)`;
         if ((!kind || bad) && !testFileRemote(url)) return { refused: `${shownGitUrl(url)} can't be reached for agents${bad ? `: ${bad}` : ""}` };
-        const yes = await session.askToConnectGit(url, kind === "ssh" ? "your ssh key" : "your git credential for it");
+        // ssh: where it would go, as whom, with which key, resolved before the owner is asked (and what is kept).
+        let shown: SshSnapshot | undefined;
+        if (kind === "ssh" && !testFileRemote(url)) {
+          const s = systemSsh(this.#allSandboxWritable());
+          if ("problem" in s) return { refused: s.problem };
+          const snap = await resolveSshSnapshot(url, { ssh: s.path, home: sshHome(), writable: this.#allSandboxWritable() });
+          if ("error" in snap) return { refused: snap.error };
+          const bad = snapshotProblem(snap, this.#allSandboxWritable(), sshHome());
+          if (bad) return { refused: bad };
+          shown = snap;
+        }
+        const yes = await session.askToConnectGit(url, shown ? `your ssh key (${sshSnapshotLine(shown)})` : kind === "ssh" ? "your ssh key" : "your git credential for it");
         if (!yes) return { refused: `${shownGitUrl(url)} isn't connected for agents: the owner can connect it with ${how}` };
-        const done = await this.#connectGit(owner, url, yes);
+        const done = await this.#connectGit(owner, url, yes, undefined, shown);
         if ("error" in done) return { refused: done.error };
         conn = this.#store.gitConnection(owner, url);
         if (!conn) return { refused: "the connection wasn't recorded" };
