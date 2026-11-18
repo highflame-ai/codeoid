@@ -27,13 +27,14 @@
  * a git or project settings dir ({@link addedDirProblem}).
  */
 
-import { type Dirent, lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { type Dirent, lstatSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { hooksPathOf } from "./git-watch.js";
 import { gitDirShape, gitLayoutOf, PROJECT_CONFIG_DIRS, PROJECT_CONFIG_FILES } from "./policy.js";
 import { type DirContext, hostTempRoots, normalizeSandboxDir, PROJECT_ROOT_PARENT, projectRootProblem, sandboxDirProblem } from "./dir-rules.js";
 import { mainCheckoutOf, worktreeLocationDirs } from "./worktrees.js";
+import { readRegularTextSync } from "../safe-read.js";
 
 export { type DirContext, hostTempRoots, normalizeSandboxDir, PROJECT_ROOT_PARENT, projectRootProblem, sandboxDirProblem };
 
@@ -479,7 +480,7 @@ function smallText(file: string, max = 1 << 20): string | null {
   try {
     const st = lstatSync(file);
     if (!st.isFile() || st.size > max) return null;
-    return readFileSync(file, "utf8");
+    return readRegularTextSync(file, max);
   } catch {
     return null;
   }

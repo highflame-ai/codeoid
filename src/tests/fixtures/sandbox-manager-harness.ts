@@ -83,6 +83,7 @@ export function sandboxManagerHarness(): SandboxManagerHarness {
   let providers: MockSessionProvider[] = [];
   let runtimes: Array<() => SandboxSpec | null> = [];
   const realHome = process.env.HOME;
+  let realXdg: string | undefined;
 
   const config = (): CodeoidConfig =>
     ({
@@ -208,6 +209,9 @@ export function sandboxManagerHarness(): SandboxManagerHarness {
     tmp = realpathSync(mkdtempSync(join(parent, "codeoid-sbx-r13-")));
     process.env.HOME = join(tmp, "home");
     mkdirSync(process.env.HOME);
+    // The daemon's config dir (the git gateway's credentials and caches among it): the test's, never ~/.codeoid.
+    realXdg = process.env.XDG_CONFIG_HOME;
+    process.env.XDG_CONFIG_HOME = join(tmp, "xdg");
     for (const d of [h.workdir, h.sibling]) {
       mkdirSync(d, { recursive: true });
       git(["init", "-q", "-b", "main"], d);
@@ -237,6 +241,8 @@ export function sandboxManagerHarness(): SandboxManagerHarness {
       store?.close();
     } catch {}
     process.env.HOME = realHome;
+    if (realXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = realXdg;
     rmSync(tmp, { recursive: true, force: true });
   });
 

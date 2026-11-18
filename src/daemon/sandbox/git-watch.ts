@@ -26,11 +26,12 @@
  */
 
 import { createHash } from "node:crypto";
-import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from "node:fs";
+import { lstatSync, readdirSync, readlinkSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { hardenedGit } from "../git-env.js";
 import { gitLayoutOf } from "./policy.js";
+import { readRegularSync, readRegularTextSync } from "../safe-read.js";
 
 /** Larger files are fingerprinted by size and time only. */
 const READ_LIMIT = 1024 * 1024;
@@ -47,7 +48,7 @@ function fingerprint(p: string): string | null {
     if (st.isSymbolicLink()) return `link:${readlinkOr(p)}`;
     if (!st.isFile()) return null;
     if (st.size > READ_LIMIT) return `big:${st.size}:${st.mtimeMs}:${st.mode}`;
-    return `${createHash("sha256").update(readFileSync(p)).digest("hex")}:${st.mode & 0o111 ? "x" : "-"}`;
+    return `${createHash("sha256").update(readRegularSync(p, READ_LIMIT)).digest("hex")}:${st.mode & 0o111 ? "x" : "-"}`;
   } catch {
     return null;
   }
@@ -66,7 +67,7 @@ function readlinkOr(p: string): string {
 // paths: a look, no write
 function placeholder(p: string, name: string): boolean {
   try {
-    const text = readFileSync(p, "utf8");
+    const text = readRegularTextSync(p);
     return (name === "config.worktree" && text === "") || (name === "commondir" && text.trim() === ".");
   } catch {
     return false;
@@ -82,13 +83,13 @@ function placeholder(p: string, name: string): boolean {
 function plainWorktree(dir: string, common: string): boolean {
   try {
     if (!lstatSync(dir).isDirectory() || lstatSync(join(dir, "commondir")).isSymbolicLink()) return false;
-    const named = resolve(dir, readFileSync(join(dir, "commondir"), "utf8").trim());
+    const named = resolve(dir, readRegularTextSync(join(dir, "commondir")).trim());
     if (named !== resolve(common) && named !== realOr(common)) return false;
   } catch {
     return false;
   }
   try {
-    return readFileSync(join(dir, "config.worktree"), "utf8") === "";
+    return readRegularTextSync(join(dir, "config.worktree")) === "";
   } catch (err) {
     return (err as NodeJS.ErrnoException).code === "ENOENT";
   }
@@ -110,7 +111,7 @@ export function hooksPathOf(configs: readonly string[]): string | null {
   for (const file of configs) {
     let text = "";
     try {
-      text = readFileSync(file, "utf8");
+      text = readRegularTextSync(file);
     } catch {
       continue;
     }
@@ -171,7 +172,7 @@ function strayGitEntries(folders: readonly string[], common: string): string[] {
   // paths: a look at git's records of worktrees, no write
   for (const w of entries(join(common, "worktrees"))) {
     try {
-      const dotgit = resolve(join(common, "worktrees", w), readFileSync(join(common, "worktrees", w, "gitdir"), "utf8").trim());
+      const dotgit = resolve(join(common, "worktrees", w), readRegularTextSync(join(common, "worktrees", w, "gitdir")).trim());
       const at = realOr(dirname(dotgit));
       if (real.some((f) => within(at, f) && at !== f)) check(join(at, ".git"));
     } catch {
@@ -213,11 +214,11 @@ function realOr(p: string): string {
 // paths: a look, no write
 function namesOwnAdmin(dotgit: string, commonReal: string): boolean {
   try {
-    const m = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotgit, "utf8"));
+    const m = /^gitdir:\s*(.+?)\s*$/m.exec(readRegularTextSync(dotgit));
     if (!m?.[1]) return false;
     const admin = realOr(resolve(dirname(dotgit), m[1]));
     if (dirname(admin) !== join(commonReal, "worktrees")) return false;
-    const back = readFileSync(join(admin, "gitdir"), "utf8").trim();
+    const back = readRegularTextSync(join(admin, "gitdir")).trim();
     return realOr(resolve(admin, back)) === realOr(dotgit);
   } catch {
     return false;
@@ -264,7 +265,7 @@ export function gitControlSnapshot(workspace: string, home: string = process.env
       const dir = join(common, "worktrees", w);
       let checkout: string | null = null;
       try {
-        checkout = dirname(realOr(resolve(dir, readFileSync(join(dir, "gitdir"), "utf8").trim())));
+        checkout = dirname(realOr(resolve(dir, readRegularTextSync(join(dir, "gitdir")).trim())));
       } catch {
         /* no gitdir */
       }

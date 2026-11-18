@@ -46,9 +46,10 @@
  * (its inode): a name reused by another dir is looked at afresh.
  */
 
-import { lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readdirSync, readlinkSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { madeByCodeoid } from "./worktrees.js";
+import { readRegularTextSync } from "../safe-read.js";
 
 /** One entry found not as git makes it. */
 export interface WorktreeEntryFinding {
@@ -136,7 +137,7 @@ function readSmall(p: string): { kind: "missing" } | { kind: "file"; text: strin
   if (!st.isFile()) return { kind: "other", what: st.isDirectory() ? "a dir" : "not a file" };
   if (st.size > 64 * 1024) return { kind: "other", what: "a large file" };
   try {
-    return { kind: "file", text: readFileSync(p, "utf8") };
+    return { kind: "file", text: readRegularTextSync(p, 64 * 1024) };
   } catch {
     return { kind: "other", what: "unreadable" };
   }

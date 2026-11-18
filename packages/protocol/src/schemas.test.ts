@@ -100,6 +100,7 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "session.remove_reference": { type: "session.remove_reference", id: "r10f", sessionId: "s1", workstream: "acme" },
   "session.set_workstream": { type: "session.set_workstream", id: "r10g", sessionId: "s1", workstream: "acme" },
   "sandbox.providers": { type: "sandbox.providers", id: "r10p" },
+  "sandbox.git_connect": { type: "sandbox.git_connect", id: "gc", action: "connect", path: "/w/repo", remote: "origin" },
   "session.pin": { type: "session.pin", id: "r11", sessionId: "s1", path: "SPEC.md" },
   "session.unpin": { type: "session.unpin", id: "r12", sessionId: "s1", path: "SPEC.md" },
   "session.rotate": { type: "session.rotate", id: "r13", sessionId: "s1" },

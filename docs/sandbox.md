@@ -1233,6 +1233,186 @@ home is the workspace).
   as in the workspace (what runs after the agent touched it isn't vouched
   for).
 
+## Git fetch and push: the git gateway
+
+A sandboxed command can't reach a git host by itself, for two reasons:
+
+- **No network:** with the network off nothing gets out, and Claude's own sandbox lets commands out only through
+  its HTTP proxy, so `ssh git@bitbucket.org` never connects.
+- **No credentials:** `~/.ssh`, `SSH_AUTH_SOCK`, git's credential helpers and stores, the keychain and `gh`/`glab`
+  logins are all hidden.
+
+codeoid's **git gateway** fixes that without opening either (design: [git-gateway-design.md](git-gateway-design.md)).
+The agent runs plain `git fetch`, `git pull` and `git push`, on every backend. git reaches the gateway in the daemon
+over a socket only that session's sandbox sees, and the gateway reaches the remote with **your existing
+credentials**, which never enter the sandbox.
+
+**Connect a remote once**
+
+```bash
+codeoid sandbox git connect            # the current repository's origin
+codeoid sandbox git connect ~/code/app --remote upstream
+codeoid sandbox git connect --url git@bitbucket.org:team/repo.git
+codeoid sandbox git connect --url https://github.com/o/r.git --token   # a dedicated token instead
+codeoid sandbox git ls
+codeoid sandbox git disconnect [dir] [--remote r | --url u]
+```
+
+- **Confirmed and proved first:** from a repository, the URL its config names is shown and you confirm it
+  (`--yes` without a terminal). Then connecting checks that your credential reaches the remote (`git ls-remote`).
+- **Data, never programs:** nothing your git or ssh config names is ever run by the gateway. It takes data from
+  them, once, when you connect.
+- **ssh remotes** use your ssh key, through your ssh agent. When you connect, OpenSSH itself resolves your
+  `~/.ssh/config` for that host (`ssh -G`, which prints the settings and connects nowhere; the system's config is
+  left out). Before that, codeoid scans every file the config can read (every `Include`, in any block, in any
+  spelling) and refuses a `Match` block anywhere (its `exec` would run), an Include it can't follow, something that
+  isn't a plain file (a FIFO) or is too big to read whole, or a file in what a session may write. An Include it
+  follows is a plain path: no `~user/`, no quote inside a word, no `.` or `..`, no `[`, nothing but printable
+  ASCII. And `ssh -G` runs with a `false` program as its shell, so no `Match exec` runs even if one were missed. From what ssh printed it takes the data:
+  where, as whom, which keys (`IdentitiesOnly`, `IdentityAgent`), known hosts, and each `ProxyJump` host the same
+  way. A `ProxyCommand`, `KnownHostsCommand` or `CanonicalizeHostname`, `%` tokens or `${VAR}` in a file name, or
+  a key file that leads into what a session may write is refused, with the reason. Every run is the system `ssh`
+  with `-F` on a config codeoid writes from that, so neither your ssh config nor the system's decides anything
+  later; connect again after changing it. The config is read from the home OpenSSH uses (your account's, not
+  `$HOME`), and every file it is read from is held read-only like your git config. The connect output, and the
+  card an agent's git raises, say where ssh goes, as whom and with which key; what the card showed is what is
+  kept. A remote connected before this works again once it is connected again.
+- **https remotes:** your git credential for the host is read once, now, with `git credential fill`. Only the
+  helpers git and the platforms ship are run (`osxkeychain`, `libsecret`, `gnome-keyring`, `wincred`, `manager`,
+  `manager-core`, `cache`, `store` with a plain absolute file no session may write), from your global and system
+  config, never a repository's, and only those scoped to the URL as git's urlmatch scopes them. A `cache` whose
+  socket dir a session may write is refused. codeoid writes each helper line itself (git runs helpers through a shell), and
+  finds a helper's program only in PATH dirs no session may write. Any other helper (a `!` shell snippet, a path, another name) is refused, and you connect with
+  `--token` instead. Your `http.sslCAInfo` for the URL is kept with it, when it isn't in what a session may write. The credential lives in a 0600 file of the daemon's, which
+  host-side file tools are refused. Each run hands it to git through codeoid's own credential helper, for that
+  remote's origin only, with no redirects; it is never put in an environment or on a command line.
+- **`--token`** stores a dedicated token instead: a Bitbucket repository access token, or a GitHub fine-grained
+  token. Use it for a shared daemon or a sensitive organisation.
+- **Permissions:** you need `settings:write`, and a delegated token can't connect, on the command line or by
+  answering a card an agent's git raised. A connection is yours: it decides only your sessions, and never one a
+  delegated token made. A session from before this release is treated as one whose maker isn't known: it gets no
+  gateway; start a new one.
+- **No credential in the URL:** a URL with any user info for https (a token as a user name included), a password,
+  a query, a fragment, `=`, a `%`-escape, a `.` or `..` path segment, anything but printable ASCII (a lookalike
+  letter), or more than 300 characters, can't be
+  connected. Connect with `--token` instead (you're asked for `user:token`, or the token, on the terminal; it is
+  never put on a command line). What a card shows is then exactly what git reaches.
+- **Your own URL rewrites** (`url.git@github.com:.insteadOf https://github.com/`, and `pushInsteadOf`, wherever
+  your git reads them for that repository: a conditional include, the repository's own config) are applied: connecting from a repository offers the URL your git really uses, and a workspace remote written one way
+  is sent to the gateway as the URL your rewrite makes of it, for fetches and pushes each. A rewrite of yours keyed
+  by exactly the same whole URL still wins over codeoid's (git takes the first of equal length).
+- **Spellings:** `…/app`, `…/app.git` and `…/app/` are the same connection once they reach the gateway, but what
+  is sent there is what git's rewrite catches, by prefix: connect the spelling your remotes use (a connected `…/app`
+  also catches `…/app.git`, `…/app/` and `…/app-docs`, the last of which the gateway refuses as not connected; a
+  connected `…/app.git` doesn't catch `…/app`).
+- **Your git and ssh config are never an agent's:** every file they are read from is judged where it really is.
+  That covers `~/.gitconfig`, `$XDG_CONFIG_HOME/git/config`, every file their includes name, `~/.ssh`,
+  `~/.ssh/config` and its `Include`s, with dotfiles links resolved. Those files are held read-only in every
+  sandbox that could otherwise write them (a dotfiles repository opened as a workspace). A link inside such a
+  workspace (`~/dotfiles/gitconfig-work` pointing elsewhere) can't be held, though: the agent can point it somewhere
+  else, which your own git then reads (codeoid's gateway doesn't use your config while it can). Don't open your
+  dotfiles repository as a session's workspace, or keep its links out of it. A session whose writable
+  dirs still hold one (a workspace that is your home) gets no gateway, and while it runs nothing of your git or
+  ssh config is used for agents. Cards, `ls` and the audit show the URL whole, every path segment, so you can see which repository it is.
+- **Running sessions** pick up a connection, or a disconnection, at their next turn. A process backend is
+  restarted then. Disconnecting also removes the daemon's copy of the remote.
+- **The daemon's copy:** each connected remote is mirrored once in codeoid's own dir, refreshed on every fetch or
+  push. The first copy of a large repository can take longer than an agent's command may run: it carries on (up to
+  an hour) after that command is stopped, so a later fetch finds it. A push may only name objects it sends or that
+  the remote's branches and tags still reach: one the remote has since deleted is never published again, and a push
+  is checked once more against what the remote says it has just before it is sent. When a refresh finds the remote
+  deleted or rewrote something, the copy drops it, and an agent's fetch can't name what no branch or tag reaches
+  (codeoid reads its request before git does; an unusual one is refused, with the reason). (a repack, once the requests it is serving are done), so nothing
+  the remote deleted can be fetched, probed or built on from it afterwards. In a large repository that repack can
+  take a while; requests wait for it. Partial clones (`--filter`) aren't served: git says so and clones the whole
+  repository. Submodules aren't fetched through the gateway (git refuses the gateway's transport for a submodule, which
+  is what keeps a repository's `.gitmodules` from running a command): a private submodule needs the network and
+  its own access.
+- **Who asks before a push:** a session you set autonomous with your own token pushes without a card, as do loops
+  you started and routines you made autonomous. Anything else autonomous (set by a delegated token, a worker the
+  fleet started, a collaboration's children) asks you for each push.
+- **Workstreams:** under workstream isolation, a remote that another workstream's rules claim is never pushed from
+  a session homed elsewhere. It is fetched only as a reference whose share allows reads without asking.
+- **In guarded mode,** an agent that reaches a remote you haven't connected raises a card offering to connect it. In
+  autonomous mode it's refused, and the agent is told the command.
+
+**What a push may do**
+
+- One or more branches, `refs/heads/*`: a new branch, or one an agent made there through codeoid before
+  (fast-forward only), as long as the remote's tip is what an agent last pushed or descends from it. A branch of
+  that name deleted and made again by someone else isn't the agent's. Never a branch already on the remote that no agent made, such as a teammate's
+  `develop`.
+- **Judged against the remote, not the client's word:** each update is checked against what the gateway just
+  fetched. The push goes upstream with a lease on exactly that state, so a branch moved meanwhile is refused.
+- Never:
+  - `main`, `master` or another protected branch (`sandbox.push.protectedBranches`, case-insensitive, where a
+    trailing `*` matches a prefix);
+  - the remote's default branch (if the remote can't say what it is, nothing is pushed);
+  - a branch the remote has as a symbolic ref (a push would move what it points at), or `HEAD`;
+  - a force push, a delete, tags, notes or other refs;
+  - anything to an empty remote (its first branch may become its default: push that one yourself).
+- The gateway checks each update against a fresh copy of the remote, then pushes the checked commits itself,
+  atomically. The agent's `git push` succeeds only if the remote took them.
+- **Who decides:**
+  - guarded and interactive mode ask you per push, on an owner-only card naming the branches, commits and URL.
+    If the agent's git gives up first (a tool's time limit, an interrupt), the card closes and nothing is pushed;
+  - autonomous mode pushes;
+  - a pack role without `network: true`, or a read-only one (`write: false`), can't push, and one with
+    `network: false` can't fetch.
+- **CI:** a pushed branch runs the repository's CI as that branch defines it (GitHub Actions `on: push`,
+  `.gitlab-ci.yml`, `bitbucket-pipelines.yml`), including pipeline files the agent wrote, with the CI's secrets.
+  Connect only remotes whose CI you'd let the agent's code use, or protect the secrets there: environments that need
+  an approval, secrets for protected branches only.
+- **Server-side branch protection** stays the backstop.
+
+**How it runs**
+
+- **Only once you connect a remote:** until you do, nothing changes in your sessions.
+- **Inside the sandbox:**
+  - git's config, as `GIT_CONFIG_PARAMETERS`, sends whole URLs to `ext::<codeoid's launcher> %S <url>`, by
+    `insteadOf` and `pushInsteadOf`, so your own shorter rewrites don't bypass it. The URLs are:
+    - the remotes you connected;
+    - the workspace repository's other ssh remotes;
+    - with the network not on, its https remotes too.
+
+    Local paths, `file://` and `git://` remotes are left to git, as before.
+  - The launcher relays git's protocol over the session's own unix socket, bound into that session's sandbox
+    alone.
+  - Nothing inside holds a credential, and with the network on a public https remote is fetched directly as before.
+- **In the daemon:**
+  - The gateway keeps a private bare mirror of each connected remote (`<configDir>/git-gateway/cache`), refreshed
+    before every request.
+  - It serves git's own `upload-pack` or `receive-pack` on that mirror, hardened, with fsck on. A pre-receive hook
+    hands each push to the daemon for its checks and your word.
+- **None of your git config is used** for the gateway's own git: no global or system config, so no helpers,
+  `includeIf` files, URL rewrites, hooks or drivers. Only the system `ssh` (judged by where it is, who owns it and
+  who may write it), your ssh setup, and a stored https credential.
+- **Supported providers:** bubblewrap, Seatbelt and Claude's own sandbox. Docker sandboxes don't have it yet, since
+  the container has no runtime for the launcher.
+  - On Linux, Claude's own sandbox can't let in one unix socket alone. With a remote connected, its commands can
+    reach the other unix sockets they can see. Local database sockets stay hidden, and the host's `/tmp` is denied,
+    as with Docker access.
+  - Under Seatbelt, the gateway's other sockets are denied by rule.
+  - Codex's own sandbox refuses a unix socket's `connect` with its network off, so Codex sessions with the network
+    off or an allowlist don't get the gateway.
+- **Fetches** are served with git's protocol v0, which only gives what the remote's branches and tags reach, never
+  an object the cache keeps from before.
+- **Audit:**
+  - `sandbox.git_connected` and `sandbox.git_disconnected`;
+  - `session.git_push_request`, `session.git_push_approved` and `session.git_push_denied`;
+  - `session.git_push_done` and `session.git_push_refused`;
+  - `session.git_fetch_done` and `session.git_fetch_refused`.
+
+  A push, and every refusal, is said in the transcript, redacted.
+
+**Settings**
+
+- `sandbox.git.enabled` (default on; `CODEOID_SANDBOX_GIT`): the gateway at all. Off, no session gets it.
+- `sandbox.push.enabled` (default on; `CODEOID_SANDBOX_PUSH`): agents' pushes through the gateway. Off, fetch still
+  works.
+- `sandbox.push.protectedBranches` (`CODEOID_SANDBOX_PUSH_PROTECTED`).
+- Both are in Settings → Sandbox and `codeoid config`.
+
 ## Docker access
 
 Tests that start containers (testcontainers' MySQL or Postgres, `docker run`

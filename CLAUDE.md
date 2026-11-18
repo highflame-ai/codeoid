@@ -253,6 +253,8 @@ codeoid routine add <name> --prompt … [--cron|--every|--at] [--check <cmd>]  #
 codeoid routine add <name> --loop --prompt … --verify "id: cmd" [--test] [--attempts N] [--attempt-minutes N] [--run-minutes N] [--budget N]  # start a loop (--check = gate, --verify = its acceptance checks)
 codeoid routine ls | show | runs | run [--wait] | edit | pause | resume | rm | cancel <runId> | token | preview
 codeoid worktree trust [dir] [--off] [--yes]  # trust the setup command of a repo's .codeoid/setup.yaml, pinned to its blob (docs/CONFIGURATION.md)
+codeoid sandbox git connect [dir] [--remote r | --url u] [--token]  # agents' own git fetch/push reach this remote with your credentials (docs/git-gateway-design.md)
+codeoid sandbox git ls | disconnect [dir] [--remote r | --url u]
 codeoid workstream ls | show <id> | match [dir] [--workstream <id>] | import [--root <dir>]  # named lines of work, what a folder resolves to, a proposal from disk (docs/workstreams-design.md)
 codeoid new <n> <d> --workstream <id> [--override]  # a session's home workstream; default: the folder's, else workstreams.default
 codeoid mcp signin <server> --credential <id>        # a named OAuth slot: a second sign-in to one server (a workstream's own)
