@@ -264,8 +264,10 @@ const ApprovalsSchema = z
      * mode asks about none. Kept so a config that sets it still loads.
      */
     askOnUnknown: z.boolean().default(true),
+    /** How long an "allow for this session" rule lasts, in hours (docs/secrets-and-memory-design.md §4.1). */
+    sessionGrantHours: z.number().positive().max(24 * 30).default(8),
   })
-  .default({ autoAllowLowRisk: false, askOnUnknown: true });
+  .default({ autoAllowLowRisk: false, askOnUnknown: true, sessionGrantHours: 8 });
 
 /**
  * OS sandbox for what agents run (#448, docs/sandbox.md): on by default.
@@ -1556,7 +1558,7 @@ export interface CodeoidConfig {
    * Shell command approvals by risk (#431). Optional on the type so a
    * hand-built config literal need not carry it; the defaults apply.
    */
-  approvals?: { autoAllowLowRisk: boolean; askOnUnknown: boolean };
+  approvals?: { autoAllowLowRisk: boolean; askOnUnknown: boolean; sessionGrantHours?: number };
   /**
    * OS sandbox (#448, sandbox/policy.ts `SandboxConfig`). Optional on the
    * type so a hand-built config literal need not carry it; absent = the

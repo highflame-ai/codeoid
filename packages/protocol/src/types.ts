@@ -69,6 +69,15 @@ import type {
 import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
 import type { SessionApprovalsMsg, SessionApprovalsResultMsg } from "./approvals.js";
 import type {
+  ApprovalRuleOffer,
+  ApprovalRulesAddMsg,
+  ApprovalRulesAddResultMsg,
+  ApprovalRulesListMsg,
+  ApprovalRulesListResultMsg,
+  ApprovalRulesRemoveMsg,
+  ApprovalSaveScope,
+} from "./approval-rules.js";
+import type {
   ClaudeAccountsListMsg,
   ClaudeAccountsRemoveMsg,
   ClaudeAccountsResultMsg,
@@ -1157,6 +1166,12 @@ export interface ToolWaitingConfirmationState {
   sandboxNote?: string;
   /** It runs inside a sandbox whose commands can reach the container runtime (Docker access): said as a warning. */
   sandboxDocker?: boolean;
+  /**
+   * The rules an answer could save, and where (docs/secrets-and-memory-design.md
+   * §4.1): present only in guarded mode, on a call a rule could run. Answer
+   * with `session.approve` `save`.
+   */
+  ruleOffer?: ApprovalRuleOffer;
 }
 
 /** How risky a shell command is, and why (#431). */
@@ -1391,6 +1406,9 @@ export type ClientMessage =
   | CredentialDeleteMsg
   | CredentialSetValueMsg
   | SecretListMsg
+  | ApprovalRulesListMsg
+  | ApprovalRulesAddMsg
+  | ApprovalRulesRemoveMsg
   | SecretRevealMsg
   | SecretForgetMsg
   | SessionTurnsMsg
@@ -1850,6 +1868,15 @@ export interface SessionApproveMsg extends BaseClientMsg {
    * returning `{ behavior: "allow", updatedInput: ... }` to the SDK.
    */
   updatedInput?: Record<string, unknown>;
+  /**
+   * Allow, and save the rules the card offers for this scope
+   * (ToolWaitingConfirmationState.ruleOffer). The daemon works the rules out
+   * again from the call's own input. Only the session owner's undelegated
+   * token can save; any other is refused and the card stays open.
+   */
+  save?: ApprovalSaveScope;
+  /** With `save`: the rules the card showed. The save is refused when the daemon would now save others. */
+  rules?: string[];
 }
 
 /** Device platform for a push registration. */
@@ -3382,6 +3409,8 @@ export type DaemonMessage =
   | WorkstreamsChangedMsg
   | CredentialListResultMsg
   | SecretListResultMsg
+  | ApprovalRulesListResultMsg
+  | ApprovalRulesAddResultMsg
   | SecretRevealResultMsg
   | SessionTurnsResultMsg
   | SessionApprovalsResultMsg

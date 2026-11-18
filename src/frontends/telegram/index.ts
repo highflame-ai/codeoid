@@ -101,6 +101,10 @@ interface PendingApproval {
   answers: Record<string, string[]>;
   /** Unix ms when this approval was registered — used to prune stale entries. */
   createdAt: number;
+  /** The rules the card offered to save (secrets-and-memory-design.md §4.1). */
+  rules?: string[];
+  /** An answer is on its way to the daemon: a second tap waits for it. */
+  answering?: boolean;
 }
 
 /** Cap the pending-approval map so untapped prompts (interrupted turns, closed
@@ -1314,6 +1318,7 @@ export class TelegramFrontend implements Frontend {
         questions,
         answers: {},
         createdAt: Date.now(),
+        ...(tool.state.phase === "waiting_confirmation" && tool.state.ruleOffer ? { rules: tool.state.ruleOffer.rules } : {}),
       });
     }
 
@@ -1381,8 +1386,16 @@ export class TelegramFrontend implements Frontend {
     const kb = new InlineKeyboard()
       .text("✅ Approve", `a:${short}:y`)
       .text("❌ Deny", `a:${short}:n`);
-    // The lines under the call are what the approval is judged by, so the call gives way when the card is too long.
-    const tail = safeSlice(`${workstream}${risk}${sandbox}${cost}`, CARD_TAIL_MAX);
+    // Approve and keep the answer (docs/secrets-and-memory-design.md §4.1): the rules it saves, a button per scope.
+    const offer = tool.state.phase === "waiting_confirmation" ? tool.state.ruleOffer : undefined;
+    if (offer) {
+      kb.row();
+      for (const scope of offer.scopes) kb.text(scope === "session" ? "✅ For this session" : "✅ In this repo", `a:${short}:${scope === "session" ? "s" : "r"}`);
+    }
+    const saves = offer ? `\n⟲ saves ${offer.rules.join(", ")}` : "";
+    // The lines under the call are what the approval is judged by (the rule a button saves among them),
+    // so the call gives way when the card is too long.
+    const tail = safeSlice(`${workstream}${risk}${sandbox}${cost}${saves}`, CARD_TAIL_MAX);
     const top = `⚠️ Permission needed — ${oneLine(safeSlice(tool.name, 200))}\n${oneLine(safeSlice(String(desc), 800))}\n\n`;
     const room = CARD_MAX - top.length - tail.length;
     const shownCall = call.length > room ? `${safeSlice(call, room - 60)}\n(cut short: see the whole call in the web UI)` : call;
@@ -1559,21 +1572,40 @@ export class TelegramFrontend implements Frontend {
     };
 
     if (kind === "a") {
-      const approved = rest[0] === "y";
+      // A second tap while the first is on its way: the first one's result stands.
+      if (pending.answering) {
+        await ctx.answerCallbackQuery().catch(() => {});
+        return;
+      }
+      const save = rest[0] === "s" ? "session" : rest[0] === "r" ? "repository" : undefined;
+      const approved = rest[0] === "y" || save !== undefined;
+      pending.answering = true;
+      let res: DaemonMessage | undefined;
+      try {
+        res = await this.#manager.handle(
+          {
+            type: "session.approve",
+            id: randomUUID(),
+            sessionId: pending.sessionId,
+            approvalId: pending.approvalId,
+            approved,
+            ...(save ? { save, rules: pending.rules ?? [] } : {}),
+          },
+          state.auth,
+          client,
+        );
+      } finally {
+        pending.answering = false;
+      }
+      // A refused save leaves the call waiting: the buttons stay, and the reason is shown.
+      if (res?.type === "response.error") {
+        await ctx.answerCallbackQuery({ text: res.error.slice(0, 190), show_alert: true }).catch(() => {});
+        return;
+      }
       this.#approvals.delete(key);
-      await this.#manager.handle(
-        {
-          type: "session.approve",
-          id: randomUUID(),
-          sessionId: pending.sessionId,
-          approvalId: pending.approvalId,
-          approved,
-        },
-        state.auth,
-        client,
-      );
+      const done = save ? `✅ Approved, and allowed ${save === "session" ? "for this session" : "in this repository"}` : approved ? "✅ Approved" : "❌ Denied";
       await ctx.answerCallbackQuery({ text: approved ? "Approved" : "Denied" }).catch(() => {});
-      await ctx.editMessageText(approved ? "✅ Approved" : "❌ Denied").catch(() => {});
+      await ctx.editMessageText(done).catch(() => {});
       return;
     }
 

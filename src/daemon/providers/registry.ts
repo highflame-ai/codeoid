@@ -157,6 +157,12 @@ export interface ProviderSessionInit {
    */
   workstreamFenceRefusal?: (toolName: string, input: unknown, cwd: string | null | undefined) => string | null;
   /**
+   * A saved deny rule's refusal of a tool call (docs/secrets-and-memory-design.md
+   * §4.1), or null. Claude only, as the fence: the CLI runs calls an allow rule
+   * of its own settings covers without asking the gate. Throws fail closed.
+   */
+  approvalRuleRefusal?: (toolName: string, input: unknown, cwd: string | null | undefined) => string | null;
+  /**
    * The session's OS sandbox while it is on (#448, sandbox/session-sandbox.ts),
    * read each time the backend is started: null when it is off, unavailable,
    * or the backend runs no commands. How a backend uses it is its own
@@ -482,6 +488,7 @@ export function createDefaultProviderRegistry(
         onForeignAgentDenied: init.onForeignAgentDenied,
         ...(init.isAutonomous ? { isAutonomous: init.isAutonomous } : {}),
         ...(init.workstreamFenceRefusal ? { workstreamFenceRefusal: init.workstreamFenceRefusal } : {}),
+        ...(init.approvalRuleRefusal ? { approvalRuleRefusal: init.approvalRuleRefusal } : {}),
         sandbox: init.sandbox,
       }),
   });

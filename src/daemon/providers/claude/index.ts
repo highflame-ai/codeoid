@@ -167,6 +167,8 @@ export interface ClaudeProviderInit {
   isAutonomous?: () => boolean;
   /** The workstream fence's refusal of a call (ProviderSessionInit.workstreamFenceRefusal). */
   workstreamFenceRefusal?: (toolName: string, input: unknown, cwd: string | null | undefined) => string | null;
+  /** A saved deny rule's refusal of a call (ProviderSessionInit.approvalRuleRefusal). */
+  approvalRuleRefusal?: (toolName: string, input: unknown, cwd: string | null | undefined) => string | null;
   /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448). */
   sandbox?: () => SandboxRuntime | null;
   /** codeoid session id — used as the initial backing id and for audit/logging. */
@@ -1425,6 +1427,18 @@ export class ClaudeProvider implements SessionProvider {
                   fenced = "codeoid couldn't check this call against the session's workstream, so it was refused.";
                 }
                 if (fenced) return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const, permissionDecisionReason: fenced } };
+              }
+              // The owner's saved deny rules (secrets-and-memory-design.md §4.1): refused here,
+              // before any allow rule of the CLI's own settings (a repository's included). Fail-closed.
+              if (init.approvalRuleRefusal) {
+                let ruled: string | null;
+                try {
+                  ruled = init.approvalRuleRefusal(input.tool_name, input.tool_input, hookShellCwd(input));
+                } catch (err) {
+                  console.error(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] checking a call against the saved rules failed, refusing it: ${err instanceof Error ? err.message : String(err)}`);
+                  ruled = "codeoid couldn't check this call against your saved rules, so it was refused.";
+                }
+                if (ruled) return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const, permissionDecisionReason: ruled } };
               }
               // A shell command is judged by what it runs (#431): a risky one,
               // one the gate can't read, or one naming a credential file never

@@ -1672,8 +1672,17 @@ program
   .option("--pick <n>", "which waiting tool call, when several are (1 = the oldest)")
   .option("--id <approvalId>", "which waiting tool call, by the id shown — stable, unlike --pick, for scripts")
   .option("--yes", "approve without asking to confirm (needed without a terminal)")
-  .action(async (session: string, opts: { deny?: boolean; pick?: string; id?: string; yes?: boolean }) => {
+  .option("--save <scope>", "approve, and keep it as a rule for this session or repository (session | repository)")
+  .action(async (session: string, opts: { deny?: boolean; pick?: string; id?: string; yes?: boolean; save?: string }) => {
     const pick = opts.pick !== undefined ? Number(opts.pick) : undefined;
+    if (opts.save !== undefined && opts.save !== "session" && opts.save !== "repository") {
+      console.error("--save takes session or repository");
+      process.exit(1);
+    }
+    if (opts.save !== undefined && opts.deny) {
+      console.error("--save keeps an approval; it can't go with --deny");
+      process.exit(1);
+    }
     if (pick !== undefined && (!Number.isInteger(pick) || pick < 1)) {
       console.error("--pick takes a number (1 = the oldest waiting)");
       process.exit(1);
@@ -1694,6 +1703,7 @@ program
       ...(pick !== undefined ? { pick } : {}),
       ...(opts.id !== undefined ? { approvalId: opts.id } : {}),
       ...(opts.yes ? { yes: true } : {}),
+      ...(opts.save ? { save: opts.save as "session" | "repository" } : {}),
     });
     client.disconnect();
   });
@@ -1829,6 +1839,81 @@ async function workstreamRequest<T extends DaemonMessage["type"]>(
     client.disconnect();
   }
 }
+
+// ── Saved approval rules (docs/secrets-and-memory-design.md §4.1) ─────────
+
+const approvalsCmd = program
+  .command("approvals")
+  .description("Your saved approval rules: what runs without asking in guarded mode, and what's always refused (docs/approvals.md)");
+
+approvalsCmd
+  .command("ls")
+  .description("List your rules: where each applies, when it last ran a call")
+  .option("--json", "print the daemon's reply as JSON")
+  .action(async (o: { json?: boolean }) => {
+    await workstreamRequest({ type: "approval_rules.list", id: randomUUID() }, "approval_rules.list.result", (r) => {
+      if (o.json) return void console.log(JSON.stringify(r, null, 2));
+      if (r.rules.length === 0) return void console.log("No rules. Save one with `codeoid approve <session> --save session|repository`, or add one.");
+      for (const rule of r.rules) {
+        const where = rule.scope.kind === "everywhere" ? "everywhere" : `${rule.scope.kind} ${rule.scope.label}`;
+        const used = rule.useCount > 0 ? `used ${rule.useCount}×, last ${new Date(rule.lastUsedAt ?? rule.createdAt).toLocaleString()}` : "not used yet";
+        const ends = rule.expiresAt ? `, ends ${new Date(rule.expiresAt).toLocaleString()}` : "";
+        console.log(`${clean(rule.id)}  ${rule.effect.padEnd(5)}  ${clean(rule.rule)}  — ${clean(where)} (${used}${ends})`);
+      }
+    });
+  });
+
+approvalsCmd
+  .command("add <rule>")
+  .description("Add a rule: Bash(npm test:*), Bash(make lint), mcp__<server>__<tool>, WebFetch(domain:<host>)")
+  .option("--deny", "refuse what it matches, in every mode, instead of allowing it")
+  .option("--session <session>", "for this session only")
+  .option("--repository <dir>", "in this repository (a folder in it)")
+  .option("--workstream <id>", "in every session of this workstream")
+  .option("--everywhere", "in all your sessions")
+  .action(async (rule: string, o: { deny?: boolean; session?: string; repository?: string; workstream?: string; everywhere?: boolean }) => {
+    const picked = [o.session !== undefined, o.repository !== undefined, o.workstream !== undefined, o.everywhere === true].filter(Boolean).length;
+    if (picked !== 1) {
+      console.error("Say where it applies: one of --session, --repository, --workstream or --everywhere");
+      process.exit(1);
+    }
+    const scope = o.session !== undefined ? "session" : o.repository !== undefined ? "repository" : o.workstream !== undefined ? "workstream" : "everywhere";
+    let sessionId: string | undefined;
+    if (o.session !== undefined) {
+      const client = new TerminalClient(loadConfig());
+      await client.connect();
+      try {
+        sessionId = (await client.resolveSessionId(o.session)) ?? undefined;
+      } finally {
+        client.disconnect();
+      }
+      if (!sessionId) {
+        console.error(`No session ${clean(o.session)}`);
+        process.exit(1);
+      }
+    }
+    await workstreamRequest(
+      {
+        type: "approval_rules.add",
+        id: randomUUID(),
+        rule,
+        effect: o.deny ? "deny" : "allow",
+        scope,
+        ...(sessionId ? { sessionId } : {}),
+        ...(o.repository !== undefined ? { workdir: resolve(o.repository) } : {}),
+        ...(o.workstream !== undefined ? { workstream: o.workstream } : {}),
+      },
+      "approval_rules.add.result",
+      (r) => console.log(`Saved ${clean(r.rule.rule)} (${r.rule.effect}, ${r.rule.scope.kind === "everywhere" ? "everywhere" : `${r.rule.scope.kind} ${clean(r.rule.scope.label)}`}) as ${clean(r.rule.id)}.`),
+    );
+  });
+
+approvalsCmd
+  .command("rm <id>")
+  .description("Remove one of your rules, by the id `codeoid approvals ls` shows")
+  .action(async (id: string) => {
+    await workstreamRequest({ type: "approval_rules.remove", id: randomUUID(), ruleId: id }, "response.ok", () => console.log(`Removed ${clean(id)}.`));
+  });
 
 // ── Secrets (docs/secrets-and-memory-design.md §2) ──────────────────────
 
