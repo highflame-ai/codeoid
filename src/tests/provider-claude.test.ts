@@ -14,7 +14,7 @@
  */
 
 import { loadShellParser } from "../daemon/shell/parse.js";
-import { mock, describe, it, expect, beforeEach } from "bun:test";
+import { mock, describe, it, expect, beforeEach, afterAll } from "bun:test";
 import type { BackgroundLifecycleEvent, ProviderEvent , SessionScopedEvent } from "../daemon/providers/interface.js";
 
 // ── SDK mock ──────────────────────────────────────────────────────────────────
@@ -4006,5 +4006,64 @@ describe("ClaudeProvider — a worktree added elsewhere in the repository (#448 
       await sbx.close();
       rmSync(root, { recursive: true, force: true });
     }
+  });
+});
+
+describe("ClaudeProvider – the Claude Code CLI it runs (providers.claude.command)", () => {
+  beforeEach(() => { sdkMessages = []; sdkThrowError = null; capturedQueryOpts = null; sdkGate = null; sdkMore = null; });
+  const cliDir = mkdtempSync(join(tmpdir(), "codeoid-claude-cli-"));
+  afterAll(() => rmSync(cliDir, { recursive: true, force: true }));
+  const fake = (name: string, version: string): string => {
+    const p = join(cliDir, name);
+    writeFileSync(p, `#!/bin/sh\nprintf '%s\\n' '${version} (Claude Code)'\n`, { mode: 0o755 });
+    return p;
+  };
+  const withCommand = (command: string | undefined) =>
+    new ClaudeProvider({
+      sessionId: "cli-session",
+      initialBackingId: "cli-backing",
+      workspaceId: "ws_test",
+      config: { session: {}, providers: { claude: { command } } } as never,
+      store: {
+        audit: () => {},
+        getClaudeCodeSessionId: () => null,
+        setClaudeCodeSessionId: () => {},
+        getSkillCommandGrants: () => new Map<string, boolean>(),
+        setSkillCommandGrant: () => {},
+      } as never,
+    });
+  const done = { type: "result", subtype: "success", num_turns: 1, result: "ok", modelUsage: {} };
+  const notes = (events: ProviderEvent[]) => events.filter((e) => e.type === "custom_message").map((e) => (e as { content: string }).content);
+
+  it("unset: the bundled CLI, and nothing said", async () => {
+    sdkMessages = [done];
+    const provider = withCommand(undefined);
+    const events = await collectTurnEvents(provider);
+    expect((capturedQueryOpts?.options as Record<string, unknown>).pathToClaudeCodeExecutable).toBeUndefined();
+    expect(notes(events)).toEqual([]);
+    await provider.teardown();
+  });
+
+  it("a newer CLI runs, and the turn says once that its sandbox behaviour is untested", async () => {
+    const cli = fake("newer", "99.0.0");
+    sdkMessages = [done];
+    const provider = withCommand(cli);
+    const events = await collectTurnEvents(provider);
+    expect((capturedQueryOpts?.options as Record<string, unknown>).pathToClaudeCodeExecutable).toBe(cli);
+    expect(notes(events)).toHaveLength(1);
+    expect(notes(events)[0]).toContain("untested");
+    // The same query serves the next turn: nothing said again.
+    sdkMessages = [done];
+    expect(notes(await collectTurnEvents(provider))).toEqual([]);
+    await provider.teardown();
+  });
+
+  it("an older CLI is not run: the bundled one is, and the turn says why", async () => {
+    sdkMessages = [done];
+    const provider = withCommand(fake("older", "0.0.1"));
+    const events = await collectTurnEvents(provider);
+    expect((capturedQueryOpts?.options as Record<string, unknown>).pathToClaudeCodeExecutable).toBeUndefined();
+    expect(notes(events)[0]).toContain("older than the");
+    await provider.teardown();
   });
 });

@@ -276,6 +276,19 @@ describe("round 1 of the #448 audit: wider than the daemon's sandbox is the owne
     expect(audited("settings.set.denied").some((a) => a.detail.includes("sandbox.provider") && a.detail.includes("delegated"))).toBe(true);
   });
 
+  it("a delegated token can't change which program a backend runs (providers.*.command), and is audited", async () => {
+    const m = newManager();
+    for (const key of ["providers.claude.command", "providers.codex.command", "providers.pi.command", "providers.geminiCli.command", "providers.opencode.command", "providers.qwen.command"]) {
+      const r = await m.handle({ type: "settings.set", id: "s", patches: [{ key, value: "/tmp/evil" }] } as never, DELEGATED, { ...CLIENT, auth: DELEGATED });
+      expect(r).toMatchObject({ type: "response.error", code: "forbidden" });
+      expect((r as { error: string }).error).toContain("which program a backend runs");
+    }
+    // Mixed in with a harmless key, the batch is still refused whole.
+    const mixed = await m.handle({ type: "settings.set", id: "s", patches: [{ key: "session.defaultModel", value: "opus" }, { key: "providers.claude.command", value: "claude" }] } as never, DELEGATED, { ...CLIENT, auth: DELEGATED });
+    expect(mixed).toMatchObject({ type: "response.error", code: "forbidden" });
+    expect(audited("settings.set.denied").some((a) => a.detail.includes("providers.claude.command") && a.detail.includes("delegated"))).toBe(true);
+  });
+
   it("a session whose sandbox is off is made autonomous only by its owner's own token", async () => {
     const m = newManager();
     const id = infoOf(await create(m, { sandbox: { provider: "off" } }))?.id as string;

@@ -1016,6 +1016,19 @@ export const OPENCODE_MODEL_ID = /^[^/\s{}"\\\u0000-\u001f]+\/[^\s{}"\\\u0000-\u
 
 const ProvidersSchema = z
   .object({
+    /** Claude Code, driven in-process via `@anthropic-ai/claude-agent-sdk`. */
+    claude: z
+      .object({
+        /**
+         * Run this Claude Code CLI instead of the one bundled in the Agent
+         * SDK: a name on PATH (`claude`, the system install) or an absolute
+         * path. Omit for the bundled CLI, the version codeoid's sandbox is
+         * tested against. Used only when it reports a version no older than
+         * the bundled one (providers/claude/executable.ts).
+         */
+        command: z.string().optional(),
+      })
+      .default({}),
     /** pi coding agent (https://pi.dev) driven over `pi --mode rpc`. */
     pi: z
       .object({
@@ -1145,6 +1158,7 @@ const ProvidersSchema = z
       .default({ enabled: true, command: "opencode", hostedModels: false }),
   })
   .default({
+    claude: {},
     pi: { enabled: true, command: "pi" },
     codex: { enabled: true, command: "codex" },
     geminiCli: { enabled: true, command: "gemini" },
@@ -1749,6 +1763,11 @@ export interface CodeoidConfig {
    * configs stay minimal; loadConfig always populates it (schema defaults).
    */
   providers?: {
+    /** Optional so hand-built configs stay minimal; absent: the bundled CLI. */
+    claude?: {
+      /** A Claude Code CLI to run instead of the bundled one (providers/claude/executable.ts). */
+      command?: string;
+    };
     pi: {
       enabled: boolean;
       command: string;
