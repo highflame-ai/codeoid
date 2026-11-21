@@ -82,6 +82,7 @@ import { asksUnsandboxed, claudeNativeEnv, claudeSandboxSettings } from "../../s
 import { HOME_CREDENTIAL_PATHS, programLocations, protectedWriteTargets } from "../../sandbox/policy.js";
 import { type BackendHostFiles, hostFileBreachReason, hostFileToolBreach, hostToolBoundsFor } from "../../sandbox/host-file-tools.js";
 import { claudeHostFiles, claudeSearchExclusions } from "./host-files.js";
+import { resolveClaudeExecutable } from "./executable.js";
 import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
 import type { SandboxHandle } from "../../sandbox/types.js";
 import type { LLMCallUsage } from "../../context-math.js";
@@ -401,6 +402,17 @@ export class ClaudeProvider implements SessionProvider {
   #currentSender: AuthContext | null = null;
 
   #init: ClaudeProviderInit;
+  /** The last note about which CLI runs (executable.ts) the session was shown: each one once. */
+  #executableNote: string | null = null;
+  #pendingExecutableNote: string | null = null;
+
+  /** Show the pending note about which CLI runs, in the live turn. */
+  #flushExecutableNote(): void {
+    const note = this.#pendingExecutableNote;
+    if (!note || !this.#currentTurnQueue) return;
+    this.#pendingExecutableNote = null;
+    this.#emit({ type: "custom_message", role: "info", content: note });
+  }
 
   constructor(init: ClaudeProviderInit) {
     this.#claudeCodeSessionId = init.initialBackingId;
@@ -456,6 +468,7 @@ export class ClaudeProvider implements SessionProvider {
     this.#currentTurnQueue?.close();
     const turnQueue = new AsyncQueue<ProviderEvent>();
     this.#currentTurnQueue = turnQueue;
+    this.#flushExecutableNote();
 
     // Replay lifecycle events that arrived while no queue was live — a
     // SubagentStop hook resolving after the previous turn ended, a trailing
@@ -1248,9 +1261,19 @@ export class ClaudeProvider implements SessionProvider {
           searchExcluded: exclusions.paths,
         }
       : {};
+    // The bundled CLI unless providers.claude.command names one it may use instead (executable.ts).
+    const executable = resolveClaudeExecutable(this.#init.config?.providers?.claude?.command);
+    if (executable.note && executable.note !== this.#executableNote) {
+      this.#executableNote = executable.note;
+      console.warn(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] ${executable.note}`);
+      // Shown in the turn this query serves: the loop is built before a new turn's queue opens.
+      this.#pendingExecutableNote = executable.note;
+      if (this.#currentTurnQueue) this.#flushExecutableNote();
+    }
     this.#query = query({
       prompt: this.#inputQueue,
       options: {
+        ...(executable.path ? { pathToClaudeCodeExecutable: executable.path } : {}),
         cwd: opts.workdir,
         abortController: this.#abortController,
         // Explicit env allowlist — never inherit the daemon's full process.env

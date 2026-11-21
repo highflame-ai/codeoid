@@ -201,6 +201,32 @@ How shell commands are approved by risk (`approvals.*`) is in [approvals.md](app
 }
 ```
 
+### Claude Code CLI
+
+The Claude backend runs the Claude Code CLI bundled with the Agent SDK. codeoid pins that version, and its sandbox is tested against it (a CLI update once changed what Claude's own sandbox lets a command write, unannounced: #478). To run another, such as your system install for a model the bundled CLI doesn't support yet, set `providers.claude.command`:
+
+```json
+{ "providers": { "claude": { "command": "claude" } } }
+```
+
+- A name on the daemon's PATH (`claude`) or an absolute path. Unset: the bundled CLI.
+- It is used only when its `--version` is no older than the bundled CLI's. Otherwise, or when it isn't found or reports no version, sessions run the bundled CLI and say why.
+- A newer one runs, and each session says once that codeoid's sandbox behaviour on it is untested.
+- Read when the daemon starts: change it, then restart the daemon.
+- Only your own token can change it, or any backend's `command` (`providers.*.command`): a delegated token is refused, and every change is audited old → new (`settings.set.backend_command`). It runs as you.
+- Also in the web UI (Settings → Claude → Claude Code CLI, under advanced), and from a terminal: `codeoid settings set providers.claude.command claude` (`codeoid settings unset providers.claude.command` to go back).
+
+### Changing settings from a terminal
+
+`codeoid settings` reads and writes the same settings as the web UI's settings drawer, checked and applied the same way:
+
+```bash
+codeoid settings ls [filter] [--advanced]   # every setting, its value and where it comes from
+codeoid settings get <key>                  # one setting, and what it does
+codeoid settings set <key> <value>          # a secret is prompted for (or read from stdin), never taken from the command line
+codeoid settings unset <key>                # back to the default
+```
+
 ### opencode
 
 The opencode backend (opencode 2.2.5 or a later 2.2.x) is on by default when an `opencode` binary resolves. codeoid runs one private `opencode serve` per daemon, with its own database; docs/opencode.md has setup, credentials, and what it supports.
