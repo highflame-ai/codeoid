@@ -349,9 +349,11 @@ describe.skipIf(!ready)("Claude Code's sandbox with codeoid's policy, for real",
     expect(r.toolResult).toContain("PLANT-OK");
     expect(r.second).toBe("success");
     const runs = readFileSync(dump, "utf8").split("----\n").filter((s) => s.trim());
-    // The shim's run (its git's PATH starts with the shim's dir) is among them: it ran, in the workspace it may write.
+    // Every run was sandboxed: the planting command's own (in Claude's command sandbox), or the shim's (its git's PATH
+    // starts with the shim's dir). Claude Code 2.1.3xx blanks a repository's filter drivers on its own git calls, so
+    // at its next start the shim may run none.
     const shimRuns = runs.filter((s) => /^PATH=[^\n]*git-bin:/m.test(s));
-    expect(shimRuns.length).toBeGreaterThan(0);
+    for (const s of runs) expect(/^SANDBOX_RUNTIME=1$/m.test(s) || /^PATH=[^\n]*git-bin:/m.test(s)).toBe(true);
     // No run has the key (inside Claude's command sandbox the CLI denies it); the shim's has nothing of the CLI's own.
     for (const s of runs) expect(s).not.toContain("sk-test-not-a-real-key");
     for (const s of shimRuns) expect(s).not.toMatch(/^(?:ANTHROPIC_|CLAUDE_|CLAUDECODE=)/m);
