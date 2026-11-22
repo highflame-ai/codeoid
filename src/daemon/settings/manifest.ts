@@ -579,6 +579,18 @@ const claude: SettingsTab = {
         }),
       ],
     },
+    {
+      id: "claude-cli",
+      title: "Claude Code CLI",
+      fields: [
+        cfg(
+          "providers.claude.command",
+          "Claude Code CLI",
+          "Empty: the CLI bundled with codeoid, which its sandbox is tested against. `claude` (your system install) or an absolute path: run that one instead, e.g. for a model the bundled CLI doesn't support yet. Used only if it is no older than the bundled CLI; a newer one runs, and sessions say its sandbox behaviour is untested. It runs as you: only your own token can change it.",
+          { advanced: true, placeholder: "claude" },
+        ),
+      ],
+    },
   ],
 };
 
@@ -898,4 +910,9 @@ export function manifestFields(): SettingField[] {
 /** Look up a field by its client-facing `key`. */
 export function fieldByKey(key: string): SettingField | undefined {
   return manifestFields().find((f) => f.key === key);
+}
+
+/** `providers.<backend>.command`: which program a backend runs, as the daemon's user. */
+export function isBackendCommandKey(key: string): boolean {
+  return /^providers\.[A-Za-z0-9]+\.command$/.test(key);
 }

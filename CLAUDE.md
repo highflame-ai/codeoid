@@ -237,6 +237,7 @@ codeoid destroy <n>
 codeoid new <n> <d> --sandbox auto|bwrap|seatbelt|docker|off [--network on|off|allowlist] [--allow-host h] [--docker-socket]  # the session's OS sandbox (#448, docs/sandbox.md)
 codeoid sandbox providers | set <session> [provider] [--network …] [--[no-]docker-socket]  # what runs here; change a session's (widening asks its owner)
 codeoid sandbox add|remove <session> <dir>   # another dir its commands write, as a workspace (adding asks its owner); codeoid new … --add-dir <dir> --project-root <dir> --no-project-roots
+codeoid settings ls [filter] | get <key> | set <key> [value] | unset <key>  # the settings drawer from a terminal (docs/CONFIGURATION.md)
 codeoid mcp config [--scopes observe|operate|full]  # MCP client entry for /mcp/control
 codeoid mcp headers [--scopes …]                    # fresh bearer header (an MCP headersHelper)
 codeoid mcp reconnect <session> <server>            # redial a backend MCP server that's down (#389)

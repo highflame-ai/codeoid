@@ -71,6 +71,41 @@ jobs:
       - name: Build
         run: bun run build
 
+  # The real-sandbox tests (#448): bubblewrap, Claude Code's own sandbox and
+  # the git shim, for real. daemon-check has no bubblewrap, so there they skip
+  # themselves; here a preflight fails the job rather than let them skip. A
+  # Claude Agent SDK bump can change what Claude's sandbox allows (#478): this
+  # is the job that sees it.
+  sandbox-real:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install bubblewrap and socat
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap socat
+
+      # Ubuntu 24.04's AppArmor keeps unprivileged processes from creating user
+      # namespaces, which bubblewrap needs. The runner is a throwaway VM.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check the sandbox can run
+        run: bun scripts/check-real-sandbox.ts
+
+      - name: Real-sandbox tests
+        run: bun test src/tests/sandbox-
+
   # End-to-end suite (#429): a real daemon per test, the web UI in Chromium and
   # the CLI, against the scripted backend — no model, no credentials.
   e2e:

@@ -58,7 +58,7 @@ import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
 import { bedrockFromSettings, formatAccounts, formatClaudeAccounts, parseHeaderFlags, parseSettingFlags } from "./terminal/claude-accounts.js";
 import { formatEndpoints, formatTemplates, importPiModels, parseModelFlags, parseTokens } from "./terminal/endpoints.js";
-import type { ClientMessage, DaemonMessage, EffortLevel, EndpointFlavor, EndpointInfo, SessionInfo, SessionSandboxSetting } from "./protocol/types.js";
+import type { ClientMessage, DaemonMessage, EffortLevel, EndpointFlavor, EndpointInfo, SessionInfo, SessionSandboxSetting, SettingField, SettingValue, SettingsManifest, SettingsSnapshot } from "./protocol/types.js";
 import { sanitizeTerminalOutput } from "./tui/ansi/codes.js";
 import { parseEffort } from "@highflame/codeoid-core";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
@@ -73,6 +73,7 @@ import {
   scheduleFromFlags,
   specFromFlags,
 } from "./terminal/routine-format.js";
+import { appliesNote, findField, formatSettingValue, parseSettingValue, settingsLines } from "./terminal/settings.js";
 import { formatLoop, formatLoopRow, formatWatch, formatWatchRow, parseCheckFlag, parseCiFlag, parseTrustHeadFlag, trustHeadOption } from "./terminal/loop-format.js";
 import {
   getConfigDir,
@@ -3051,6 +3052,135 @@ program
   .action((id: string, opts: { full?: boolean }) => withClient((c) => c.evidenceShow(id, opts)));
 
 // ── Pipeline runs (docs/pipeline-run.md) ────────────────────────────────────
+
+// ── Settings (the web UI's settings drawer, from a terminal) ───────────────
+
+/** The manifest and current values, or null after printing why not. */
+async function fetchSettings(c: TerminalClient): Promise<{ manifest: SettingsManifest; snapshot: SettingsSnapshot } | null> {
+  const schema = await c.request({ type: "settings.schema", id: randomUUID() });
+  if (schema.type !== "settings.schema.result") {
+    c.printError(schema);
+    return null;
+  }
+  const got = await c.request({ type: "settings.get", id: randomUUID() });
+  if (got.type !== "settings.get.result") {
+    c.printError(got);
+    return null;
+  }
+  return { manifest: schema.manifest, snapshot: got.snapshot };
+}
+
+/** Send one patch and say what came of it. */
+async function writeSetting(c: TerminalClient, field: SettingField, value: SettingValue): Promise<void> {
+  const resp = await c.request({ type: "settings.set", id: randomUUID(), patches: [{ key: field.key, value }] });
+  if (resp.type !== "settings.set.result") {
+    c.printError(resp);
+    process.exitCode = 1;
+    return;
+  }
+  if (!resp.ok) {
+    for (const e of resp.errors) console.error(`${e.key}: ${e.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  const secret = field.secret || field.kind === "secret";
+  console.log(`${field.key} = ${secret ? (value ? "(set)" : "(unset)") : formatSettingValue(resp.snapshot.values[field.key]?.value)}`);
+  console.log(appliesNote(field, resp.restartRequired));
+}
+
+const settings = program.command("settings").description("Show and change the daemon's settings (the web UI's settings drawer)");
+
+settings
+  .command("ls [filter]")
+  .description("List settings with their values and where each comes from; filter by key, label or tab")
+  .option("--advanced", "include advanced settings")
+  .action((filter: string | undefined, opts: { advanced?: boolean }) =>
+    withClient(async (c) => {
+      const got = await fetchSettings(c);
+      if (!got) return;
+      for (const line of settingsLines(got.manifest, got.snapshot, { filter, advanced: opts.advanced })) console.log(line);
+      console.log(`\nconfig: ${got.snapshot.configPath}   env: ${got.snapshot.envPath}`);
+    }),
+  );
+
+settings
+  .command("get <key>")
+  .description("Show one setting: its value, where it comes from, and what it does")
+  .action((key: string) =>
+    withClient(async (c) => {
+      const got = await fetchSettings(c);
+      if (!got) return;
+      const field = findField(got.manifest, key);
+      if (typeof field === "string") {
+        console.error(field);
+        process.exitCode = 1;
+        return;
+      }
+      for (const line of settingsLines(got.manifest, got.snapshot, { filter: field.key, advanced: true }).filter((l) => l.startsWith(`${field.key} `))) console.log(line);
+      console.log(`  ${field.label}: ${field.help}`);
+      if (field.options?.length) console.log(`  one of: ${field.options.map((o) => o.value).join(", ")}`);
+    }),
+  );
+
+settings
+  .command("set <key> [value]")
+  .description("Change a setting. A secret is read from the terminal (or stdin), never from the command line")
+  .action((key: string, raw: string | undefined) =>
+    withClient(async (c) => {
+      const got = await fetchSettings(c);
+      if (!got) return;
+      const field = findField(got.manifest, key);
+      if (typeof field === "string") {
+        console.error(field);
+        process.exitCode = 1;
+        return;
+      }
+      if (field.secret || field.kind === "secret") {
+        if (raw !== undefined) {
+          console.error(`${field.key} is a secret: leave the value off and type it at the prompt (or pipe it in), so it stays out of your shell history.`);
+          process.exitCode = 1;
+          return;
+        }
+        const secret = await readSecret(`${field.label}: `);
+        if (!secret) {
+          console.error(`Nothing entered; nothing changed. To clear it: codeoid settings unset ${field.key}`);
+          process.exitCode = 1;
+          return;
+        }
+        await writeSetting(c, field, secret);
+        return;
+      }
+      if (raw === undefined) {
+        console.error(`Give a value: codeoid settings set ${field.key} <value>   (clear it with: codeoid settings unset ${field.key})`);
+        process.exitCode = 1;
+        return;
+      }
+      const parsed = parseSettingValue(field, raw);
+      if ("error" in parsed) {
+        console.error(parsed.error);
+        process.exitCode = 1;
+        return;
+      }
+      await writeSetting(c, field, parsed.value);
+    }),
+  );
+
+settings
+  .command("unset <key>")
+  .description("Clear a setting back to its default")
+  .action((key: string) =>
+    withClient(async (c) => {
+      const got = await fetchSettings(c);
+      if (!got) return;
+      const field = findField(got.manifest, key);
+      if (typeof field === "string") {
+        console.error(field);
+        process.exitCode = 1;
+        return;
+      }
+      await writeSetting(c, field, null);
+    }),
+  );
 
 const pipeline = program
   .command("pipeline")

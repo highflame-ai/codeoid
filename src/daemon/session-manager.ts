@@ -43,6 +43,7 @@ import type { Store } from "./store.js";
 import { createPushTransport, PushService } from "./push/index.js";
 import { hasScope, SCOPES } from "../protocol/scopes.js";
 import { applyPatches, getManifest, getSnapshot, previewPatches, readMcpServerEntry, readDotEnvValueSet, writeConfigBlock, writeCredentialValue, writeMcpServerEntry, writeWorktreeTrust } from "./settings/store.js";
+import { isBackendCommandKey } from "./settings/manifest.js";
 import { adoptability, adoptableName, adoptedEntry, adoptionRefusal, claudeMcpServers, fromRepoFile, fullUrlRequired, isSameAdoption, shellArg } from "./mcp/adopt.js";
 import { readWorkdirServers } from "./mcp/workdir-servers.js";
 import { cleanMcpError, commandSummary, MAX_SHOWN_KEYS, quotedVisible, redactMcpUrl, serverProgram, urlHasHiddenParts, shownLabel, visibleCompact, visibleVerbatim } from "./mcp/redact.js";
@@ -2711,13 +2712,18 @@ mcpHub: this.#mcpHub,
       };
     }
     // Worktree setup decides whether a repository's command runs unasked,
-    // and the OS sandbox (#448) what every session's commands can reach:
-    // an undelegated owner only, and every change audited old → new.
-    const setupPatches = msg.patches.filter((p) => p.key.startsWith("worktree.setup.") || p.key.startsWith("sandbox."));
+    // the OS sandbox (#448) what every session's commands can reach, and a
+    // backend's command which program runs as the daemon's user: an
+    // undelegated owner only, and every change audited old → new.
+    const setupPatches = msg.patches.filter((p) => p.key.startsWith("worktree.setup.") || p.key.startsWith("sandbox.") || isBackendCommandKey(p.key));
     if (setupPatches.length > 0 && auth.delegationDepth > 0) {
       this.#store.audit(auth.sub, "settings.set.denied", "", `keys=${setupPatches.map((p) => p.key).join(",")} reason=delegated`);
-      const what = setupPatches.some((p) => p.key.startsWith("sandbox.")) ? "sandbox" : "worktree setup";
-      return { type: "response.error", requestId: msg.id, error: `A delegated token can't change ${what} settings.`, code: "forbidden" };
+      const what = setupPatches.some((p) => p.key.startsWith("sandbox."))
+        ? "sandbox settings"
+        : setupPatches.some((p) => isBackendCommandKey(p.key))
+          ? "which program a backend runs"
+          : "worktree setup settings";
+      return { type: "response.error", requestId: msg.id, error: `A delegated token can't change ${what}.`, code: "forbidden" };
     }
     const setupBefore = setupPatches.length > 0 ? getSnapshot().values : undefined;
     try {
@@ -2753,7 +2759,11 @@ mcpHub: this.#mcpHub,
       );
       if (result.ok && setupBefore) {
         for (const p of setupPatches) {
-          const event = p.key.startsWith("sandbox.") ? "settings.set.sandbox" : "settings.set.worktree_setup";
+          const event = p.key.startsWith("sandbox.")
+            ? "settings.set.sandbox"
+            : isBackendCommandKey(p.key)
+              ? "settings.set.backend_command"
+              : "settings.set.worktree_setup";
           this.#store.audit(auth.sub, event, "", `key=${p.key} old=${JSON.stringify(setupBefore[p.key]?.value ?? null)} new=${JSON.stringify(p.value)}`);
           if (p.key === "worktree.setup.runCommands") {
             this.#worktreeSetupPolicy = { ...this.#worktreeSetupPolicy, runCommands: p.value === "trusted-repos" ? "trusted-repos" : "never" };
