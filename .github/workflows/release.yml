@@ -1,5 +1,14 @@
 name: Release Build - Codeoid
 
+# A `vX.Y.Z` tag publishes what main tested (docs/release-gate.md, tier 0):
+#   1. the tag is well formed and its commit is on main;
+#   2. every PR check runs again on that commit (pr-check.yml, reused), with the
+#      release gate's artifact and upgrade checks among them;
+#   3. the versions in the repository already ARE the tag's (bumped in a PR, as
+#      RELEASING.md says): the workflow checks them, it never rewrites them;
+#   4. the three packages publish, each only if new; the GitHub Release is
+#      created from the CHANGELOG section.
+
 on:
   push:
     tags:
@@ -18,7 +27,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          persist-credentials: true
+          persist-credentials: false
 
       - name: Validate Release Tag
         id: validate_tag
@@ -31,9 +40,45 @@ jobs:
             exit 1
           fi
 
+      # A tag on a branch nobody reviewed publishes nothing: releases are cut
+      # from main.
+      - name: The tagged commit is on main
+        shell: bash
+        run: |-
+          git fetch --no-tags origin main
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "$GITHUB_REF_NAME ($GITHUB_SHA) is on main"
+          else
+            echo "::error::$GITHUB_REF_NAME points at $GITHUB_SHA, which is not on main. Tag a commit on main."
+            exit 1
+          fi
+
+      # The bump lands in a PR before the tag (RELEASING.md). Checked before the
+      # long checks run, so a tag pushed without it fails in seconds.
+      - name: Versions in the repository are the tag's
+        shell: bash
+        run: |-
+          PKG="$(node -p "require('./package.json').version")"
+          if [ "v$PKG" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::package.json is $PKG, the tag is $GITHUB_REF_NAME. Bump with 'bun run version:set ${GITHUB_REF_NAME#v}' in a PR, merge it, then tag that commit (RELEASING.md)."
+            exit 1
+          fi
+
+  # Everything a PR is checked with, on the tagged commit: lint, typecheck, the
+  # unit suite, e2e, the web checks, the real-sandbox tests, and the release
+  # gate's artifact and upgrade checks.
+  checks:
+    needs:
+      - highflame-validate
+    permissions:
+      contents: 'read'
+    uses: ./.github/workflows/pr-check.yml
+    secrets: inherit
+
   highflame-release:
     needs:
       - highflame-validate
+      - checks
     permissions:
       contents: write
       id-token: write
@@ -43,48 +88,6 @@ jobs:
         uses: actions/checkout@v6
         with:
           persist-credentials: false
-
-      - name: Extract version from release
-        id: version
-        env:
-          RELEASE_NAME: ${{ github.event.release.tag_name || github.ref_name }}
-        shell: bash
-        run: |-
-          VERSION=$(echo "$RELEASE_NAME" | sed 's|^v||g')
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "Releasing version: $VERSION"
-
-      - name: Update root package.json
-        env:
-          VERSION: ${{ steps.version.outputs.VERSION }}
-        shell: bash
-        run: |-
-          jq ".version = \"${VERSION}\"" package.json > package.json.tmp
-          mv package.json.tmp package.json
-          echo "Updated root package.json:"
-          grep '"version"' package.json
-
-      - name: Update protocol package.json
-        env:
-          VERSION: ${{ steps.version.outputs.VERSION }}
-        shell: bash
-        run: |-
-          cd packages/protocol
-          jq ".version = \"${VERSION}\"" package.json > package.json.tmp
-          mv package.json.tmp package.json
-          echo "Updated protocol package.json:"
-          grep '"version"' package.json
-
-      - name: Update core package.json
-        env:
-          VERSION: ${{ steps.version.outputs.VERSION }}
-        shell: bash
-        run: |-
-          cd packages/core
-          jq ".version = \"${VERSION}\"" package.json > package.json.tmp
-          mv package.json.tmp package.json
-          echo "Updated core package.json:"
-          grep '"version"' package.json
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -108,27 +111,11 @@ jobs:
         shell: bash
         run: bun install --frozen-lockfile
 
-      - name: Update the dependencies version
-        shell: bash
-        run: |-
-          VERSION="${GITHUB_REF_NAME#v}"
-
-          jq --arg version "^${VERSION}" '
-            .dependencies["@highflame/codeoid-core"] = $version |
-            .dependencies["@highflame/codeoid-protocol"] = $version' \
-            package.json > package.json.tmp && mv package.json.tmp package.json
-
-          cd packages/core
-          jq --arg version "^${VERSION}" \
-            '.peerDependencies["@highflame/codeoid-protocol"] = $version' \
-            package.json > package.json.tmp && mv package.json.tmp package.json
-
       # Every publishable package ships at the SAME version, and the tag is that
-      # version. One gate replaces per-package version bookkeeping: if this
-      # passes, all three publishes below are known-correct and known-new.
+      # version: the three versions and the internal ranges, against the tag.
       - name: Verify workspace versions are in lockstep with the tag
         shell: bash
-        run: bun run check:versions "${{ env.GITHUB_REF_NAME }}"
+        run: bun run check:versions "$GITHUB_REF_NAME"
 
       - name: Build web UI
         shell: bash
@@ -137,54 +124,39 @@ jobs:
           bun install --frozen-lockfile
           bun run build
 
-      - name: Test
+      # Dependency order: protocol, then core (its peer), then the CLI, each only
+      # if that exact version isn't on npm yet, so a re-run is safe. Each package
+      # needs its own npm Trusted Publisher (OIDC) configured at npmjs.com.
+      - name: Publish @highflame/codeoid-protocol
         shell: bash
-        run: bun run test
+        run: scripts/publish-if-new.sh packages/protocol
 
-      - name: Verify package version matches the tag
+      - name: Publish @highflame/codeoid-core
         shell: bash
+        run: scripts/publish-if-new.sh packages/core
+
+      - name: Publish @highflame/codeoid
+        shell: bash
+        run: scripts/publish-if-new.sh .
+
+      - name: Create the GitHub Release from the CHANGELOG
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |-
-          PKG="$(node -p "require('./package.json').version")"
-          TAG="${GITHUB_REF_NAME#v}"
-          if [ "$PKG" != "$TAG" ]; then
-            echo "::error::package.json version ($PKG) does not match tag ($TAG)"
-            exit 1
+          VERSION="${GITHUB_REF_NAME#v}"
+          # The `## [X.Y.Z]` section, up to the next `## [`.
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { on = 1; next }
+            on && index($0, "## [") == 1 { exit }
+            on { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "::warning::CHANGELOG.md has no [$VERSION] section; the release points at it instead"
+            echo "See CHANGELOG.md." > release-notes.md
           fi
-
-      # @highflame/codeoid-protocol is a workspace dependency of codeoid; publish it FIRST
-      # (only when its version is new) so codeoid's published dep resolves.
-      # NOTE: requires a separate npm Trusted Publisher configured for
-      # @highflame/codeoid-protocol at npmjs.com (same OIDC setup as codeoid) before the
-      # first release that introduces a new protocol version.
-      - name: Publish @highflame/codeoid-protocol (OIDC) — only if version is new
-        shell: bash
-        run: |-
-          cd packages/protocol
-          VER="$(node -p "require('./package.json').version")"
-          if npm view "@highflame/codeoid-protocol@$VER" version >/dev/null 2>&1; then
-            echo "@highflame/codeoid-protocol@$VER already published — skipping"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists — leaving it"
           else
-            npm publish
+            gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md --verify-tag
           fi
-
-      # @highflame/codeoid-core (client transport + store semantics — consumed by the
-      # mobile app from the registry; web uses the in-repo copy). Publishes
-      # after protocol (its peer dep) and needs its own Trusted Publisher +
-      # one-time manual bootstrap publish, same as protocol.
-      - name: Publish @highflame/codeoid-core (OIDC) — only if version is new
-        shell: bash
-        run: |-
-          cd packages/core
-          VER="$(node -p "require('./package.json').version")"
-          if npm view "@highflame/codeoid-core@$VER" version >/dev/null 2>&1; then
-            echo "@highflame/codeoid-core@$VER already published — skipping"
-          else
-            npm publish
-          fi
-
-      # No NODE_AUTH_TOKEN: auth comes from the GitHub OIDC id-token via npm's
-      # Trusted Publisher (configured on the package at npmjs.com). Provenance
-      # is generated automatically from the same OIDC identity.
-      - name: Publish codeoid to npm (OIDC Trusted Publishing)
-        shell: bash
-        run: npm publish
