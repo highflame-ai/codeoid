@@ -470,6 +470,44 @@ export class TerminalClient {
   }
 
   /** Add a directory to what a session's commands write, or remove one (docs/sandbox.md, Working across repositories). */
+  /** The URL a connect from `path` would connect (its remote's, as the repository's config names it), or null (said). */
+  async sandboxGitResolve(path: string, remote?: string): Promise<{ url: string; rawUrl: string; writtenAs?: string; pushUrl?: string; rawPushUrl?: string; connected: boolean } | null> {
+    const resp = await this.#request({ type: "sandbox.git_connect", id: randomUUID(), action: "resolve", path, ...(remote ? { remote } : {}) });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return null;
+    }
+    return resp.data as { url: string; rawUrl: string; writtenAs?: string; pushUrl?: string; rawPushUrl?: string; connected: boolean };
+  }
+
+  /** The git gateway's connections (docs/git-gateway-design.md): connect, disconnect or list the caller's. */
+  async sandboxGitConnect(action: "connect" | "disconnect" | "list", o: { url?: string; path?: string; remote?: string; token?: string }): Promise<void> {
+    const resp = await this.#request({ type: "sandbox.git_connect", id: randomUUID(), action, ...o });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      // A connect (or a disconnect) that didn't happen is a failure to whoever runs the command (a script's `&&`).
+      process.exitCode = 1;
+      return;
+    }
+    const data = resp.data as { connections?: Array<{ url: string; kind: string; auth: string; connectedAt: number }>; url?: string; kind?: string; auth?: string; via?: string; removed?: boolean };
+    if (action === "list") {
+      const list = data.connections ?? [];
+      if (list.length === 0) console.log("No remote is connected for agents. Connect one: codeoid sandbox git connect [dir]");
+      for (const c of list) console.log(`  ${sanitizeTerminalOutput(c.url)}  ${c.kind}, ${c.auth === "ssh" ? "your ssh key" : c.auth === "token" ? "a token" : "your git credential"}  (since ${new Date(c.connectedAt).toISOString().slice(0, 10)})`);
+      return;
+    }
+    if (action === "disconnect") {
+      console.log(data.removed ? `Disconnected: agents' git no longer reaches ${sanitizeTerminalOutput(data.url ?? "")}.` : "It wasn't connected.");
+      return;
+    }
+    const how = data.auth === "ssh" ? "your ssh key (ssh-agent and ~/.ssh/config as git uses them)" : data.auth === "token" ? "the token you gave" : "your git credential for it (kept by codeoid, 0600)";
+    console.log(`Connected: agents in your sandboxed sessions may fetch from ${sanitizeTerminalOutput(data.url ?? "")} and push branches of their own, with ${how}.`);
+    if (data.via) console.log(`  As your ssh config says now: ${sanitizeTerminalOutput(data.via)} (taken once, as data; later changes to your ssh config don't apply until you connect again).`);
+    console.log("  Never a protected branch (sandbox.push.protectedBranches: main and master unless you set it) or the remote's default branch; no force push, no deletes, no tags. In guarded mode you're asked for each push.");
+    console.log("  A pushed branch runs the repository's CI as that branch defines it, with the CI's secrets.");
+    if (process.platform === "linux") console.log("  On Linux, Claude's own sandbox can't let in one unix socket alone: with a remote connected, its commands can reach the other unix sockets they can see (local database sockets stay hidden).");
+  }
+
   async sandboxDir(sessionIdOrName: string, action: "add" | "remove", path: string): Promise<void> {
     const sessionId = await this.#resolveSession(sessionIdOrName);
     if (!sessionId) return;

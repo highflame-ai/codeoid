@@ -152,7 +152,7 @@ export function bwrapArgs(spec: SandboxSpec, cwd: string, kind: (p: string) => P
     mounts.push({ kind: "bind", src: at, path: at });
   }
   // Container runtime sockets the owner let in (spec.dockerSockets): each bound at its own path, over a hidden dir holding it.
-  for (const p of spec.dockerSockets ?? []) {
+  for (const p of [...(spec.dockerSockets ?? []), ...(spec.gatewaySockets ?? [])]) {
     const at = realOr(p);
     if (kind(at) !== "other" || seen.has(`d:${at}`)) continue;
     seen.add(`d:${at}`);

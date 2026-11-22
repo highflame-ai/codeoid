@@ -155,7 +155,7 @@ import type { DispatchEventRow, DispatchTaskRow } from "./store.js";
 import { type MemoryEngine, type MemoryMcpMount, workspaceIdFromPath } from "./memory/index.js";
 import type { McpRegistry } from "./mcp/registry.js";
 import type { SandboxRegistry } from "./sandbox/registry.js";
-import { canonicalAddedDirs, effectiveSetting, openCheckSandbox, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
+import { canonicalAddedDirs, effectiveSetting, openCheckSandbox, repositoryConfigFiles, repositoryForRewrites, resolveSandbox, sandboxRefusalOf, sandboxSettingProblem, widens } from "./sandbox/session-sandbox.js";
 import { checkPinned, type PinnedDir, PinnedPathError } from "./sandbox/pinned.js";
 import { sandboxRootIfMade } from "./sandbox/root.js";
 import { hiddenPathsFor, sandboxConfigOf, sandboxWorkspaceOf } from "./sandbox/policy.js";
@@ -217,7 +217,14 @@ import {
   mainWorktreeRoot,
   removeForkWorktree,
 } from "./git-worktree.js";
-import { hardenedGit } from "./git-env.js";
+import { GIT_BIN, hardenedGit } from "./git-env.js";
+import { connectionId, GitCredentials, ownerConfigProblem, ownerPushRewrite, ownerRewrite, probeConnection, repoConfigGet, sshHome, warmOwnerConfig, warmRewrites } from "./git-gateway/connect.js";
+import { type GatewayHost, GitGateway } from "./git-gateway/gateway.js";
+import { hostPathProblem } from "./git-gateway/hostpath.js";
+import { redactCredentials, remoteUrlProblem, shownGitUrl } from "./git-gateway/text.js";
+import { resolveSshSnapshot, type SshSnapshot, snapshotProblem, sshConfigText, sshSnapshotLine } from "./git-gateway/ssh-snapshot.js";
+import { systemSsh, upstreamKind } from "./git-gateway/upstream.js";
+import type { GitGatewaySpec } from "./sandbox/policy.js";
 import {
   loadSetupRecipe,
   prepareWorktree,
@@ -1197,11 +1204,15 @@ export class SessionManager {
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
           claudeAccounts: this.#claudeAccounts,
           accounts: this.#accounts,
           claudeAccount: meta.claudeAccount ?? null,
           ...(meta.accounts ? { accountChoices: meta.accounts } : {}),
           ...(meta.sandbox ? { sandbox: meta.sandbox } : {}),
+          // A meta from before codeoid recorded it: who made the session isn't known, so none of the owner's git access.
+          createdByDelegate: meta.createdByDelegate !== false,
+          ...(meta.fleetAutonomy ? { autonomousByOwner: false } : {}),
           hooks: this.#hooks,
           identityManager: this.#identityManager,
           existingId: meta.sessionId,
@@ -1612,6 +1623,8 @@ mcpHub: this.#mcpHub,
         return this.#loopWorkerGuard(msg, "change the workstream of") ?? this.#sessionWorkstreamEdit(msg, auth);
       case "sandbox.providers":
         return this.#sandboxProviders(msg, auth);
+      case "sandbox.git_connect":
+        return this.#sandboxGitConnect(msg, auth);
       case "session.pin":
         return this.#pin(msg, auth);
       case "session.unpin":
@@ -2079,6 +2092,7 @@ mcpHub: this.#mcpHub,
               sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
               claudeAccounts: this.#claudeAccounts,
               hooks: this.#hooks,
               ...(this.#identityManager
@@ -2435,7 +2449,7 @@ mcpHub: this.#mcpHub,
    * keeps detected secrets.
    */
   #wireSecretService(secrets: SecretService): void {
-    registerSecretPaths({ dirs: [secretMaterialDir(getConfigDir())] });
+    registerSecretPaths({ dirs: [secretMaterialDir(getConfigDir()), join(getConfigDir(), "git-gateway")] });
     // Settled dispatch tasks and routine runs keep no secret either (§2.6).
     this.#store.scrubText = (text) => secrets.scrub(text).text;
     secrets.setCapturePolicy((ws) => (ws ? (this.#workstreams.get(ws)?.captureSecrets ?? "drop") : (this.#config?.secrets?.captureSecrets ?? "drop")));
@@ -4707,6 +4721,262 @@ mcpHub: this.#mcpHub,
    * `request_directory` never touches one, the owner's card says it
    * (#448 round 13, project-roots.ts `checkoutOverlap`).
    */
+  #gateway: GitGateway | null = null;
+  #gatewayFailed = false;
+  #gitCredentials: GitCredentials | null = null;
+
+  /** The git gateway (docs/git-gateway-design.md), made on first use; none when it can't be (said once). */
+  #gitGatewayInstance(): GitGateway | null {
+    if (this.#gateway || this.#gatewayFailed) return this.#gateway;
+    try {
+      const base = join(getConfigDir(), "git-gateway");
+      this.#gitCredentials = new GitCredentials(join(base, "credentials.json"));
+      this.#gateway = new GitGateway({ base, host: this.#gitGatewayHost });
+    } catch (err) {
+      this.#gatewayFailed = true;
+      console.error(`[codeoid] git gateway unavailable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return this.#gateway;
+  }
+
+  /** What a sandboxed session gets of the git gateway: its socket and launcher, and its owner's connected URLs. */
+  readonly #gitGatewayFor = (sessionId: string): GitGatewaySpec | undefined => {
+    const g = this.#gitGatewayInstance();
+    if (!g) return undefined;
+    if (sandboxConfigOf(this.#config).git?.enabled === false) return undefined;
+    const live = this.#sessions.get(sessionId);
+    // A session a delegated token made: none (its git isn't routed into a refusal).
+    if (live?.createdByDelegate) return undefined;
+    const owner = live?.createdBy ?? this.#store.getSession(sessionId)?.createdBy;
+    const all = owner ? this.#store.listGitConnections(owner).map((c) => c.url) : [];
+    // Only for an owner who connected a remote: nothing changes for anyone else's sessions.
+    if (all.length === 0) return undefined;
+    // A fenced session's sandbox names only the connections it may fetch (another workstream's aren't its business).
+    const urls = live ? all.filter((u) => !this.#foreignRemote(live, "git-upload-pack", [u])) : all;
+    if (urls.length === 0) return undefined;
+    return { ...g.forSession(sessionId), urls, root: g.root };
+  };
+
+  /** Whose each session's gateway requests were (kept past its end: a push it started is still recorded as theirs). */
+  readonly #gitGatewayOwners = new Map<string, string>();
+
+  /**
+   * Why a fenced session may not reach one of these spellings of a remote: another workstream's (a tie between
+   * workstreams counts as theirs unless this one is among them), fetched only as a reference its share allows, never
+   * pushed. Null: it may.
+   */
+  #foreignRemote(session: Session, service: string, urls: readonly string[]): string | null {
+    if (!session.hasWorkstreamFence) return null;
+    const home = session.workstream?.id;
+    for (const u of urls) {
+      const claims = this.#workstreams.remoteWorkstreams(u);
+      if (claims === null) return `${shownGitUrl(u)} can't be read as a remote by the workstreams' rules, so whose it is can't be told: it isn't reached from a session under isolation`;
+      if (claims.length === 0 || (home && claims.includes(home))) continue;
+      const ws = claims[0] as string;
+      const referenced = claims.length === 1 && (session.workstream?.references ?? []).some((r) => r.workstream === ws);
+      const verdict = this.#workstreams.referenceVerdict(home, { workstream: ws });
+      if (service === "git-receive-pack" || !referenced || !verdict.ok || verdict.ask.length > 0) {
+        return `${shownGitUrl(u)} is workstream "${claims.join('" or "')}"'s, not this session's${service === "git-receive-pack" ? "" : " (nor a reference it may read)"}`;
+      }
+    }
+    return null;
+  }
+
+  /** What any live sandboxed session's commands may write: no program the gateway runs on the host is there. */
+  readonly #allSandboxWritable = (): string[] => [...this.#sessions.values()].flatMap((s) => s.sandboxAgentWritable);
+
+  /** Connect `url` for `owner`: their credential proved to reach it, then recorded (an https one kept, 0600). */
+  async #connectGit(owner: string, url: string, by: string, token?: string, sshSnapshot?: SshSnapshot): Promise<{ kind: string; auth: string; via?: string } | { error: string }> {
+    if (!this.#gitGatewayInstance() || !this.#gitCredentials) return { error: "the git gateway isn't available on this daemon" };
+    const ownConfig = ownerConfigProblem(this.#allSandboxWritable());
+    if (ownConfig) return { error: ownConfig };
+    const probe = await probeConnection(url, { ...(token ? { token } : {}), ...(sshSnapshot ? { sshSnapshot } : {}), writable: this.#allSandboxWritable(), runDir: join(getConfigDir(), "git-gateway", "run"), ...(testFileRemote(url) ? { testFile: true } : {}) });
+    if ("error" in probe) return { error: probe.error };
+    const id = connectionId(owner, url);
+    if (probe.credential) this.#gitCredentials.set(id, probe.credential);
+    else this.#gitCredentials.remove(id);
+    this.#store.setGitConnection({ owner, url, kind: probe.kind, auth: probe.auth, connectedBy: by, ...(probe.sshSnapshot ? { ssh: JSON.stringify(probe.sshSnapshot) } : {}) });
+    this.#store.audit(by, "sandbox.git_connected", undefined, `${shownGitUrl(url)} ${probe.kind} ${probe.auth} owner=${owner}`);
+    this.#gitConnectionsChanged(owner);
+    return { kind: probe.kind, auth: probe.auth, ...(probe.sshSnapshot ? { via: sshSnapshotLine(probe.sshSnapshot) } : {}) };
+  }
+
+  /** An owner's connections changed: their sandboxed sessions get the gateway as it is now, between turns. */
+  #gitConnectionsChanged(owner: string): void {
+    for (const s of this.#sessions.values()) if (s.createdBy === owner) s.gitConnectionsChanged();
+  }
+
+  /** The gateway's host: who may reach what, the session's word on a push, what happened. */
+  readonly #gitGatewayHost: GatewayHost = {
+    grant: async (sessionId, service, url, signal) => {
+      const session = this.#sessions.get(sessionId);
+      if (!session) return { refused: "this session is gone" };
+      if (sandboxConfigOf(this.#config).git?.enabled === false) return { refused: "the git gateway is turned off here (sandbox.git.enabled)" };
+      await warmOwnerConfig();
+      const ownConfig = ownerConfigProblem(this.#allSandboxWritable());
+      if (ownConfig) return { refused: ownConfig };
+      const problem = session.gitAccessProblem(service);
+      if (problem) return { refused: problem };
+      // What runs on the host for it (git's servers and the push hook): codeoid's git and runtime, never a session's.
+      for (const program of [GIT_BIN, process.execPath]) {
+        // Under the home is fine (Bun's own installer puts it there; the home is read-only in every sandbox): never
+        // where a session may write, nor anyone else's or open to others.
+        const bad = hostPathProblem(program, this.#allSandboxWritable(), undefined, { homeAllowed: true });
+        if (bad) return { refused: `${program} can't be trusted to run with your credentials: ${bad}` };
+      }
+      // Another workstream's remote, under isolation: fetched only as a reference its share allows; never pushed.
+      // Judged on every spelling of it (and again on the connection's own URL, below).
+      const fenced = this.#foreignRemote(session, service, [url, ...sameRepoSpellings(url)]);
+      if (fenced) return { refused: fenced };
+      const owner = session.createdBy;
+      this.#gitGatewayOwners.set(sessionId, owner);
+      let conn = this.#store.gitConnection(owner, url) ?? sameRepoSpellings(url).map((u) => this.#store.gitConnection(owner, u)).find(Boolean) ?? null;
+      if (!conn) {
+        // Caught by a connected URL's prefix (git's insteadOf has no boundary): said as that.
+        const prefix = this.#store.listGitConnections(owner).find((c) => url.startsWith(c.url) && url !== c.url);
+        if (prefix && session.toInfo().sandbox?.network === "on") {
+          return { refused: `${shownGitUrl(url)} isn't connected; it reached codeoid's gateway because it starts with ${shownGitUrl(prefix.url)}, which is (connect that remote with a .git ending, or connect this one too)` };
+        }
+        const kind = upstreamKind(url);
+        const bad = remoteUrlProblem(url);
+        const how = `\`codeoid sandbox git connect --url ${url}\` (or from the repository: \`codeoid sandbox git connect\`)`;
+        if ((!kind || bad) && !testFileRemote(url)) return { refused: `${shownGitUrl(url)} can't be reached for agents${bad ? `: ${bad}` : ""}` };
+        // ssh: where it would go, as whom, with which key, resolved before the owner is asked (and what is kept).
+        let shown: SshSnapshot | undefined;
+        if (kind === "ssh" && !testFileRemote(url)) {
+          const s = systemSsh(this.#allSandboxWritable());
+          if ("problem" in s) return { refused: s.problem };
+          const snap = await resolveSshSnapshot(url, { ssh: s.path, home: sshHome(), writable: this.#allSandboxWritable() });
+          if ("error" in snap) return { refused: snap.error };
+          const bad = snapshotProblem(snap, this.#allSandboxWritable(), sshHome());
+          if (bad) return { refused: bad };
+          shown = snap;
+        }
+        const yes = await session.askToConnectGit(url, shown ? `your ssh key (${sshSnapshotLine(shown)})` : kind === "ssh" ? "your ssh key" : "your git credential for it", signal);
+        if (signal?.aborted) return { refused: "the agent's git was gone" };
+        if (!yes) return { refused: `${shownGitUrl(url)} isn't connected for agents: the owner can connect it with ${how}` };
+        const done = await this.#connectGit(owner, url, yes, undefined, shown);
+        if ("error" in done) return { refused: done.error };
+        conn = this.#store.gitConnection(owner, url);
+        if (!conn) return { refused: "the connection wasn't recorded" };
+      }
+      const fencedConn = this.#foreignRemote(session, service, [conn.url, ...sameRepoSpellings(conn.url)]);
+      if (fencedConn) return { refused: fencedConn };
+      const credential = conn.kind === "https" ? this.#gitCredentials?.get(connectionId(owner, conn.url)) : undefined;
+      if (conn.kind === "https" && !credential) return { refused: `the credential for ${shownGitUrl(url)} is gone: the owner can connect it again` };
+      let ssh: string | null = null;
+      let sshConfig: string | undefined;
+      if (conn.kind === "ssh" && !testFileRemote(url)) {
+        const s = systemSsh(this.#allSandboxWritable());
+        if ("problem" in s) return { refused: s.problem };
+        ssh = s.path;
+        // The connection's ssh snapshot (data taken at connect): what this run's ssh is given, never the owner's config.
+        let snap: SshSnapshot | null = null;
+        try {
+          snap = conn.ssh ? (JSON.parse(conn.ssh) as SshSnapshot) : null;
+        } catch {
+          snap = null;
+        }
+        if (!snap) return { refused: `${shownGitUrl(conn.url)} was connected before codeoid kept its ssh settings: connect it again` };
+        const bad = snapshotProblem(snap, this.#allSandboxWritable(), sshHome());
+        if (bad) return { refused: bad };
+        sshConfig = sshConfigText(snap);
+      }
+      return {
+        // Exactly the repository that was connected and proved (another spelling could be another repository).
+        upstream: { url: conn.url, kind: conn.kind, ...(credential ? { credential } : {}), ...(sshConfig ? { sshConfig } : {}), ...(testFileRemote(conn.url) ? { testFile: true } : {}) },
+        url: conn.url,
+        ssh,
+        protectedBranches: session.gitProtectedBranches,
+        agentBranches: this.#store.gitAgentBranches(owner, conn.url),
+        cacheKey: connectionId(owner, conn.url),
+      };
+    },
+    approve: async (sessionId, push, signal) => {
+      const session = this.#sessions.get(sessionId);
+      return session ? session.decideGitPush(push, signal) : { refused: "this session is gone" };
+    },
+    remoteHeads: (sessionId, url, heads, since) => {
+      const owner = this.#sessions.get(sessionId)?.createdBy ?? this.#gitGatewayOwners.get(sessionId);
+      if (owner) this.#store.pruneGitAgentBranches(owner, url, heads, since);
+    },
+    report: (sessionId, e) => {
+      const session = this.#sessions.get(sessionId);
+      // The session may be gone (destroyed while its approved push ran): what the remote took is still recorded.
+      const owner = session?.createdBy ?? this.#gitGatewayOwners.get(sessionId);
+      // A branch an agent made: one it may move again later (fast-forward only).
+      // Every branch a checked push moved (a new one, or an agent's own) is the agents', as of the tip pushed.
+      if (owner && e.kind === "push" && e.ok) {
+        for (const u of e.updates ?? []) if (u.ref.startsWith("refs/heads/")) this.#store.noteGitAgentBranch(owner, e.url, u.ref.slice("refs/heads/".length), u.new);
+      }
+      if (session) session.noteGit(e);
+      else if (e.kind === "push") this.#store.audit(owner ?? "system", e.ok ? "session.git_push_done" : "session.git_push_refused", sessionId, redactCredentials(`${e.detail} (the session was gone by then)`));
+    },
+  };
+
+  async #sandboxGitConnect(msg: Extract<ClientMessage, { type: "sandbox.git_connect" }>, auth: AuthContext): Promise<DaemonMessage> {
+    const fail = (error: string, code: "forbidden" | "invalid_request" = "invalid_request"): DaemonMessage => ({ type: "response.error", requestId: msg.id, error: redactCredentials(error), code });
+    if (!hasScope(auth.scopes as string[], SCOPES.SETTINGS_WRITE)) return fail("Missing scope: settings:write", "forbidden");
+    if (auth.delegationDepth > 0) return fail("A delegated token can't connect remotes for agents: the owner does.", "forbidden");
+    if (msg.action === "list") {
+      return { type: "response.ok", requestId: msg.id, data: { connections: this.#store.listGitConnections(auth.sub).map((c) => ({ ...c, url: shownGitUrl(c.url) })) } };
+    }
+    let url = msg.url;
+    // The remote's own push URL (`remote.<name>.pushurl`), if it has one: where its pushes go.
+    let pushurl = "";
+    if (!url) {
+      if (!msg.path || !isAbsolute(msg.path)) return fail("Give the remote's URL, or the repository's absolute path.");
+      const remote = msg.remote ?? "origin";
+      // From the repository's own config files as codeoid names them (never git's `--local`, which a `commondir` in the
+      // repository could point at another).
+      const files = repositoryConfigFiles(msg.path);
+      pushurl = await repoConfigGet(files, `remote.${remote}.pushurl`);
+      url = await repoConfigGet(files, `remote.${remote}.url`);
+      if (!url) return fail(`There is no remote named ${remote} in ${msg.path}.`);
+    }
+    // What a connect from a repository would connect: the CLI shows it, and asks, first.
+    // The URL git really uses there (the owner's own rewrite applied): what is shown, asked and connected.
+    // The repository's top, its files plain (its git asked where the owner's rules send the URL; a subdirectory too).
+    const repoDir = msg.url || !msg.path ? undefined : repositoryForRewrites(msg.path);
+    await Promise.all([warmRewrites(repoDir, false, repoDir && msg.path ? repositoryConfigFiles(msg.path) : []), warmRewrites("/"), warmOwnerConfig()]);
+    if (msg.action === "resolve") {
+      // As the owner's git in that repository would (its includes and its own rules count).
+      const used = msg.url ? url : ownerRewrite(url, repoDir);
+      // git applies insteadOf to an explicit pushurl, and pushInsteadOf only to a url used for pushing.
+      const pushUsed = msg.url ? url : pushurl ? ownerRewrite(pushurl, repoDir) : ownerPushRewrite(url, repoDir);
+      return {
+        type: "response.ok",
+        requestId: msg.id,
+        data: {
+          url: shownGitUrl(used),
+          rawUrl: used,
+          ...(used !== url ? { writtenAs: shownGitUrl(url) } : {}),
+          // Pushes go elsewhere (the owner's pushInsteadOf): that is what agents' pushes need connected.
+          ...(pushUsed !== used ? { pushUrl: shownGitUrl(pushUsed), rawPushUrl: pushUsed } : {}),
+          connected: !!this.#store.gitConnection(auth.sub, used),
+        },
+      };
+    }
+    if (msg.action === "disconnect") {
+      // From a repository: the URL as written and as the owner's git uses it (connect connected the latter).
+      const written = msg.url ? [url] : [url, ownerRewrite(url, repoDir), ownerPushRewrite(url, repoDir), ...(pushurl ? [pushurl, ownerRewrite(pushurl, repoDir)] : [])];
+      const forms = [...new Set(written.flatMap((u) => [u, ...sameRepoSpellings(u)]))];
+      let removed = false;
+      for (const u of forms) {
+        removed = this.#store.removeGitConnection(auth.sub, u) || removed;
+        this.#gitCredentials?.remove(connectionId(auth.sub, u));
+        // Its cache too: nothing of the remote kept, nor reused by a later connect (removed in the background).
+        void this.#gitGatewayInstance()?.forget(connectionId(auth.sub, u)).catch(() => {});
+      }
+      this.#gitConnectionsChanged(auth.sub);
+      this.#store.audit(auth.sub, "sandbox.git_disconnected", undefined, `${shownGitUrl(url)} removed=${removed}`);
+      return { type: "response.ok", requestId: msg.id, data: { removed, url: shownGitUrl(url) } };
+    }
+    const done = await this.#connectGit(auth.sub, url, auth.sub, msg.token);
+    if ("error" in done) return fail(`Not connected: ${done.error}`);
+    return { type: "response.ok", requestId: msg.id, data: { url: shownGitUrl(url), ...done } };
+  }
+
   readonly #sandboxCheckoutsFor = (sessionId: string): OtherCheckout[] => {
     const out: OtherCheckout[] = [];
     for (const s of this.#sessions.values()) {
@@ -4804,6 +5074,8 @@ mcpHub: this.#mcpHub,
     try {
       await this.#drain(timeoutMs);
     } finally {
+      // The git gateway's sockets go with the sessions (a request in flight ends).
+      await this.#gateway?.close();
       // Last: the gate keeps refusing opencode's credential files while sessions stop.
       if (this.#ownsProviders) this.#providers.dispose();
     }
@@ -5438,6 +5710,7 @@ mcpHub: this.#mcpHub,
       sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
       ...(sandboxSetting && Object.keys(sandboxSetting).length > 0 ? { sandbox: sandboxSetting } : {}),
       claudeAccounts: this.#claudeAccounts,
       // The Claude choice also when the session lands elsewhere: it applies if it is switched to Claude.
@@ -5506,6 +5779,7 @@ mcpHub: this.#mcpHub,
         // was attempted, and a failed spawn shouldn't refund an attempt into a
         // retry loop.
         this.#sessions.delete(session.id);
+        this.#gateway?.closeSession(session.id);
         return {
           type: "response.error",
           requestId: msg.id,
@@ -5845,6 +6119,7 @@ mcpHub: this.#mcpHub,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
           claudeAccounts: this.#claudeAccounts,
           // The collaboration runs on the accounts its lead was created on.
           claudeAccount: parent.claudeAccount,
@@ -5937,6 +6212,7 @@ mcpHub: this.#mcpHub,
       }
       this.#revokeBlackboardToken(child.id);
       this.#sessions.delete(child.id);
+      this.#gateway?.closeSession(child.id);
       this.#store.audit(
         "system:collaboration",
         "collaboration.child_destroyed",
@@ -6306,6 +6582,7 @@ mcpHub: this.#mcpHub,
         sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
         claudeAccounts: this.#claudeAccounts,
         // A fork continues the same conversation — on the same accounts,
         // thinking as hard (#417).
@@ -6334,6 +6611,8 @@ mcpHub: this.#mcpHub,
           mode: parent.mode,
           ...(parent.turnsRemaining !== undefined ? { maxTurns: parent.turnsRemaining } : {}),
         },
+        // The parent's autonomy, whoever's it was (the owner's, or the fleet's).
+        ...(parent.autonomousIsOwners ? { autonomousByOwner: true } : {}),
         // ...and its pack: a capability role's tool deny is part of that trust
         // (a fork of a read-only session must stay read-only).
         ...(forkPack ? { pack: forkPack } : {}),
@@ -6567,6 +6846,7 @@ mcpHub: this.#mcpHub,
       sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
@@ -6860,6 +7140,7 @@ mcpHub: this.#mcpHub,
       sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
       claudeAccounts: this.#claudeAccounts,
       hooks: this.#hooks,
       identityManager: this.#identityManager,
@@ -7057,6 +7338,7 @@ mcpHub: this.#mcpHub,
       };
     } catch (e) {
       this.#sessions.delete(runSession.id);
+      this.#gateway?.closeSession(runSession.id);
       try {
         await runSession.destroy(this.#dispatchSystemAuth(auth.accountId, auth.projectId));
       } catch {
@@ -7886,6 +8168,8 @@ mcpHub: this.#mcpHub,
           ...(run.contract.worker.provider ? { providerId: run.contract.worker.provider } : {}),
           ...(run.contract.worker.model ? { defaultModel: run.contract.worker.model } : {}),
           initialMode: { mode: "autonomous", maxTurns: run.contract.toolBudget },
+          // The owner started the loop (a delegated token can't): its autonomy is theirs.
+          autonomousByOwner: true,
           // Unattended: its turns need a sandbox that holds (#448).
           requireSandbox: true,
           ...(run.contract.worker.sandbox ? { sandbox: run.contract.worker.sandbox } : {}),
@@ -7898,6 +8182,7 @@ mcpHub: this.#mcpHub,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -7991,6 +8276,8 @@ mcpHub: this.#mcpHub,
           providerId: o.provider,
           defaultModel: o.model,
           initialMode: o.approvals === "autonomous" ? { mode: "autonomous", maxTurns: o.toolBudget } : { mode: "guarded" },
+          // The owner made the routine autonomous (a delegated token can't change routines): theirs.
+          ...(o.approvals === "autonomous" ? { autonomousByOwner: true } : {}),
           // Unattended: its turns need a sandbox that holds (#448).
           requireSandbox: true,
           ...(o.sandbox ? { sandbox: o.sandbox } : {}),
@@ -8002,6 +8289,7 @@ mcpHub: this.#mcpHub,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -8099,6 +8387,7 @@ mcpHub: this.#mcpHub,
         this.#forgetComparesOf(id);
         this.#forgetCompareBranch(id);
         this.#sessions.delete(id);
+        this.#gateway?.closeSession(id);
       },
       runFinished: (e) => {
         const r = e.routine;
@@ -8306,12 +8595,17 @@ mcpHub: this.#mcpHub,
           initialMode: { mode: "autonomous", maxTurns: budget },
           requireSandbox: true,
           auth: this.#dispatchSenderAuth(task),
+          // The conductor's sender identity (depth 1) attributes the worker's prompts; the worker is the owner's own.
+          createdByDelegate: false,
+          // Its autonomy is the fleet's (a spawn a delegated token may have approved): its pushes ask the owner.
+          autonomousByOwner: false,
           store: this.#store,
           transcriptStore: this.#transcriptStore,
           providers: this.#providers,
           sandboxRegistry: this.#sandboxRegistry,
       sandboxMcp: this.#sandboxMcpFor,
       sandboxCheckouts: this.#sandboxCheckoutsFor,
+      gitGateway: this.#gitGatewayFor,
           claudeAccounts: this.#claudeAccounts,
           hooks: this.#hooks,
           identityManager: this.#identityManager,
@@ -8343,6 +8637,7 @@ mcpHub: this.#mcpHub,
             // Best-effort cleanup.
           }
           this.#sessions.delete(session.id);
+          this.#gateway?.closeSession(session.id);
           throw err;
         }
         return { sessionId: session.id };
@@ -8426,6 +8721,7 @@ mcpHub: this.#mcpHub,
         // Revoke before dropping, same reason as the destroy handler.
         this.#revokeBlackboardToken(sessionId);
         this.#sessions.delete(sessionId);
+        this.#gateway?.closeSession(sessionId);
       },
 
       deliverEvents: async (
@@ -9479,6 +9775,7 @@ mcpHub: this.#mcpHub,
       for (const s of created) {
         await s.destroy(auth, { deleteBranch: true }).catch(() => {});
         this.#sessions.delete(s.id);
+        this.#gateway?.closeSession(s.id);
       }
       const reason = err instanceof Error ? err.message : String(err);
       this.#store.audit(auth.sub, "session.compare.failed", parent.id, `targets=${msg.targets.map(label).join(",")} reason=${reason.slice(0, 200)}`);
@@ -11095,6 +11392,7 @@ mcpHub: this.#mcpHub,
     // authorizing reads/writes on the goal after the session is gone.
     this.#revokeBlackboardToken(msg.sessionId);
     this.#sessions.delete(msg.sessionId);
+    this.#gateway?.closeSession(msg.sessionId);
     return { type: "response.ok", requestId: msg.id };
   }
 
@@ -11255,4 +11553,15 @@ export function resolveOnEndpoint(raw: string, models: ReadonlyArray<ModelInfo>,
   if (byLabel.length === 1) return byLabel[0]!.value;
   if (byLabel.length > 1) return null;
   return isClaudeShaped(id, providerId) ? null : id;
+}
+
+/** Tests only: a local bare repository as a connected remote (file://), never under a real daemon. */
+function testFileRemote(url: string): boolean {
+  return process.env.CODEOID_GIT_GATEWAY_TEST_FILE === "1" && url.startsWith("file://");
+}
+
+/** The same repository's other spellings: with or without a trailing `.git` or `/`. */
+function sameRepoSpellings(url: string): string[] {
+  const base = url.replace(/\/$/, "").replace(/\.git$/, "");
+  return [...new Set([base, `${base}.git`, `${base}/`])].filter((u) => u !== url);
 }

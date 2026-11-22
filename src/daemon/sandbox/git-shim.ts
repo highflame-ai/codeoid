@@ -192,9 +192,9 @@ export function gitShimSpec(spec: SandboxSpec, opts: { tempParent: string; workt
   const open = opts.worktrees?.open ?? [];
   const keep = opts.worktrees?.keep ?? [];
   const held = (p: string) => !open.some((o) => within(p, o)) || keep.some((k) => within(p, k));
-  // git reaches no container runtime, whatever the session's commands may.
-  const { dockerSockets: _sockets, ...rest } = spec;
-  const { DOCKER_HOST: _host, ...env } = spec.env ?? {};
+  // The CLI's own git reaches no remote: no container runtime, no git gateway.
+  const { dockerSockets: _sockets, gatewaySockets: _gateway, ...rest } = spec;
+  const env = Object.fromEntries(Object.entries(spec.env ?? {}).filter(([k]) => k !== "DOCKER_HOST" && k !== "CODEOID_GIT_GATEWAY" && !k.startsWith("GIT_CONFIG_")));
   return {
     ...rest,
     ...(spec.env ? { env } : {}),

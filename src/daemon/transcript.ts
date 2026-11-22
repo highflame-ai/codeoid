@@ -170,6 +170,10 @@ const DEADLINE_CHECK_EVERY = 512;
 export interface TranscriptMeta {
   /** The session's OS sandbox setting (#448); absent = the daemon's config. */
   sandbox?: SessionSandboxSetting;
+  /** Made with a delegated token: none of the owner's git connections (docs/git-gateway-design.md). */
+  createdByDelegate?: boolean;
+  /** A dispatch worker: its autonomous mode is the fleet's, so its pushes ask the owner (docs/git-gateway-design.md). */
+  fleetAutonomy?: boolean;
   sessionId: string;
   sessionName: string;
   workdir: string;

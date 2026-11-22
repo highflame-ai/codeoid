@@ -142,10 +142,13 @@ export function seatbeltProfile(
     if (isDir(s) !== true) lines.push(`(deny network-outbound (remote unix-socket (path-literal ${param(s)})))`);
   }
   if (seatbeltNetwork(spec.network.mode) === "off") lines.push("(deny network*)");
+  // The git gateway's other sockets (other sessions', its control socket): never, the network on or off. Its own
+  // socket is allowed below, after this.
+  if (spec.gatewayRoot) for (const p of new Set([spec.gatewayRoot, real(spec.gatewayRoot)])) lines.push(`(deny network-outbound (remote unix-socket (subpath ${param(p)})))`);
   // Container runtime sockets the owner let in (spec.dockerSockets), last, so they win over the rules above: the file
   // (by its own path and where it leads: Docker Desktop's `/var/run/docker.sock` links into the home), read and
   // written as a socket is, never removed or replaced, and a connection to it, the network off or not.
-  for (const s of spec.dockerSockets ?? []) {
+  for (const s of [...(spec.dockerSockets ?? []), ...(spec.gatewaySockets ?? [])]) {
     for (const p of new Set([s, real(s)])) {
       lines.push(`(allow file-read* file-write-data (literal ${param(p)}))`);
       lines.push(`(allow network-outbound (remote unix-socket (path-literal ${param(p)})))`);

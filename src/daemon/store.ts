@@ -399,6 +399,28 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_log(session_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id, project_id);
 
+      -- Remotes an owner connected for the git gateway (git-gateway/connect.ts): their sandboxed sessions' agents
+      -- may fetch and push there with the owner's credential. One owner's: it decides only that owner's sessions.
+      CREATE TABLE IF NOT EXISTS git_connections (
+        owner        TEXT NOT NULL,
+        url          TEXT NOT NULL,
+        kind         TEXT NOT NULL,
+        auth         TEXT NOT NULL,
+        connected_by TEXT NOT NULL,
+        connected_at INTEGER NOT NULL,
+        PRIMARY KEY (owner, url)
+      );
+
+      -- Branches agents made on a connected remote through the git gateway: the only existing ones they may move.
+      CREATE TABLE IF NOT EXISTS git_agent_branches (
+        owner      TEXT NOT NULL,
+        url        TEXT NOT NULL,
+        branch     TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        tip        TEXT,
+        PRIMARY KEY (owner, url, branch)
+      );
+
       CREATE TABLE IF NOT EXISTS session_pins (
         session_id  TEXT NOT NULL,
         file_path   TEXT NOT NULL,
@@ -651,6 +673,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_compare_runs_parent
         ON compare_runs(account_id, project_id, parent_session_id);
     `);
+    this.#addColumnIfMissing("git_connections", "ssh", "TEXT");
+    this.#addColumnIfMissing("git_agent_branches", "tip", "TEXT");
 
     // Per-child backend selection on spawn tasks. Additive so a database
     // written before collaborative sessions keeps its queued tasks: NULL on
@@ -2396,6 +2420,60 @@ export class Store {
       )
       .all(parentSessionId, accountId, projectId) as Array<Record<string, unknown>>;
     return rows.map(compareRowFrom);
+  }
+
+  /** Connect (replace) a remote for one owner's agents (the git gateway). */
+  setGitConnection(c: { owner: string; url: string; kind: string; auth: string; connectedBy: string; ssh?: string }): void {
+    this.#db
+      .prepare("INSERT OR REPLACE INTO git_connections (owner, url, kind, auth, connected_by, connected_at, ssh) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(c.owner, c.url, c.kind, c.auth, c.connectedBy, Date.now(), c.ssh ?? null);
+  }
+
+  /** Disconnect; whether it was connected. Its agents' branch record goes too. */
+  removeGitConnection(owner: string, url: string): boolean {
+    this.#db.prepare("DELETE FROM git_agent_branches WHERE owner = ? AND url = ?").run(owner, url);
+    return this.#db.prepare("DELETE FROM git_connections WHERE owner = ? AND url = ?").run(owner, url).changes > 0;
+  }
+
+  /** A branch an agent made (or moved) on a connected remote through the gateway, with the tip it pushed. */
+  noteGitAgentBranch(owner: string, url: string, branch: string, tip: string): void {
+    this.#db
+      .prepare("INSERT INTO git_agent_branches (owner, url, branch, created_at, tip) VALUES (?, ?, ?, ?, ?) ON CONFLICT(owner, url, branch) DO UPDATE SET tip = excluded.tip, created_at = excluded.created_at")
+      .run(owner, url, branch, Date.now(), tip);
+  }
+
+  /** Forget the agents' branches the remote no longer has (one recreated later under that name is someone else's). */
+  pruneGitAgentBranches(owner: string, url: string, heads: ReadonlySet<string>, since = Date.now()): void {
+    // Only what was recorded before the remote was asked: a branch pushed meanwhile isn't in that answer.
+    const rows = this.#db.prepare("SELECT branch FROM git_agent_branches WHERE owner = ? AND url = ? AND created_at < ?").all(owner, url, since) as Array<{ branch: string }>;
+    for (const { branch } of rows) {
+      if (!heads.has(branch)) this.#db.prepare("DELETE FROM git_agent_branches WHERE owner = ? AND url = ? AND branch = ? AND created_at < ?").run(owner, url, branch, since);
+    }
+  }
+
+  /** The branches agents made on `url` for `owner`, each with the tip an agent last pushed. */
+  gitAgentBranches(owner: string, url: string): Map<string, string> {
+    const rows = this.#db.prepare("SELECT branch, tip FROM git_agent_branches WHERE owner = ? AND url = ?").all(owner, url) as Array<{ branch: string; tip: string | null }>;
+    return new Map(rows.filter((r) => r.tip).map((r) => [r.branch, r.tip as string]));
+  }
+
+  /** One owner's connection for a URL, if any. */
+  gitConnection(owner: string, url: string): { owner: string; url: string; kind: "ssh" | "https"; auth: "ssh" | "git-credential" | "token"; connectedBy: string; connectedAt: number; ssh: string | null } | null {
+    const row = this.#db
+      .prepare("SELECT owner, url, kind, auth, connected_by AS connectedBy, connected_at AS connectedAt, ssh FROM git_connections WHERE owner = ? AND url = ?")
+      .get(owner, url) as { owner: string; url: string; kind: string; auth: string; connectedBy: string; connectedAt: number; ssh: string | null } | null;
+    if (!row || (row.kind !== "ssh" && row.kind !== "https") || !["ssh", "git-credential", "token"].includes(row.auth)) return null;
+    return row as ReturnType<Store["gitConnection"]> & object;
+  }
+
+  /** One owner's connections, newest first. */
+  listGitConnections(owner: string): Array<{ url: string; kind: string; auth: string; connectedAt: number }> {
+    return this.#db.prepare("SELECT url, kind, auth, connected_at AS connectedAt FROM git_connections WHERE owner = ? ORDER BY connected_at DESC").all(owner) as Array<{
+      url: string;
+      kind: string;
+      auth: string;
+      connectedAt: number;
+    }>;
   }
 
   audit(subject: string, action: string, sessionId?: string, detail?: string): void {

@@ -13,16 +13,19 @@
  * starts on it.
  */
 
-import { existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { SessionSandboxInfo, SessionSandboxSetting } from "../../protocol/types.js";
 import { type CodeoidConfig, getConfigDir } from "../../config.js";
 import type { ClaudeTempDirs } from "./claude-native.js";
 import { type ConfinementPlan, confinementFor, runsNoCommands } from "./confinement.js";
 import { GIT_BIN } from "../git-env.js";
 import { CWD_FROM_CALLER } from "./docker.js";
-import { buildSandboxSpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
+import { ownerConfigFiles, ownerPushRewrite, ownerRewrite, type RepoConfigFile, repoRemotes, rewritesTried, warmOwnerConfig, warmRewrites } from "../git-gateway/connect.js";
+import { buildSandboxSpec, type GitGatewaySpec, dockerSocketPaths, gitLayoutOf, gitLayoutProblem, hiddenPathsFor, networkPolicyOf, type SandboxConfig, sandboxConfigOf, sandboxWorkspaceOf, unconnectableDockerSockets, validAllowedHost } from "./policy.js";
+import { normalizeRemote } from "../workstreams/match.js";
+import { readRegularTextSync } from "../safe-read.js";
 import {
   addedDirProblem,
   addedDirReal,
@@ -603,6 +606,9 @@ export class SessionSandbox {
   readonly #onWorktreeEntries: ((common: string, findings: WorktreeEntryFinding[]) => void) | undefined;
   readonly #name: () => string;
   readonly #workstreamDirs: (() => WorkstreamDirs | undefined) | undefined;
+  readonly #gitGateway: (() => GitGatewaySpec | undefined) | undefined;
+  /** The provider the last resolution chose (its id): Docker has no runtime for the gateway's launcher. */
+  #providerId: string | null = null;
   /** The fence the last resolution was made with, to see when it changed. */
   #workstreamKeyApplied = "";
 
@@ -647,8 +653,11 @@ export class SessionSandbox {
      * Undefined result = no fence.
      */
     workstreamDirs?: () => WorkstreamDirs | undefined;
+    /** The session's git gateway (docs/git-gateway-design.md): its socket, launcher and the URLs connected for it. */
+    gitGateway?: () => GitGatewaySpec | undefined;
   }) {
     this.#workstreamDirs = opts.workstreamDirs;
+    this.#gitGateway = opts.gitGateway;
     this.#onWarning = opts.onWarning;
     this.#onWorktreeEntries = opts.onWorktreeEntries;
     this.#sessionId = opts.sessionId;
@@ -725,6 +734,11 @@ export class SessionSandbox {
     } else this.#stale = true;
     this.#setting = next;
     this.#generation += 1;
+  }
+
+  /** The owner's git connections changed: the next resolution between turns gives the gateway as it is now. */
+  gitGatewayChanged(): void {
+    this.#dirsStale = true;
   }
 
   /** Whether pins were taken (or let go) since the last call: the setting holding them is saved then (Session). */
@@ -933,12 +947,17 @@ export class SessionSandbox {
       return r.info;
     }
     const provider = r.provider;
+    this.#providerId = provider.id;
     const plan = r.plan;
     const config = this.config;
     const dockerSocket = r.info.dockerSocket === true;
     // Local services' sockets follow the network the session asked for, not a handle's (a process backend's has it on
     // for its model) nor one widened because the backend can't turn it off: hiding them needs no network rule.
     const hideLocalServices = (r.info.networkRequested ?? r.info.network) !== "on";
+    // The url.* rules git applies in the workspace's repository, read now (asynchronously: the repository is the
+    // agent's to write), so the spec built below routes as the owner's git would there.
+    // The owner's config files (held read-only where a session may write them) and their url.* rules, read the same way.
+    await Promise.all([warmOwnerConfig(), ...(this.#gitGateway ? [warmRewrites(repositoryForRewrites(this.#workspace()), false, repositoryConfigFiles(this.#workspace())), warmRewrites("/")] : [])]);
     const open = (backendState: readonly string[] = [], o: OpenOptions = {}) => {
       if (this.#closed) throw new Error(`session ${this.#sessionId} is gone`);
       return this.#spec(o.backendNetwork ? { mode: "on" } : r.network, backendState, o.readable ?? [], dockerSocket, hideLocalServices, dirs);
@@ -1098,6 +1117,27 @@ export class SessionSandbox {
     return tracked;
   }
 
+  /**
+   * What the session's sandbox gets of the git gateway (only for an owner who connected a remote): the URLs connected
+   * for them, and the workspace repository's other remotes its git couldn't reach by itself, so the gateway can say
+   * how the owner connects one: its ssh ones (no key is ever inside), and, the network not on, its https ones too (with
+   * it on, a public https remote is fetched directly as before). Never under Docker (no runtime there for the
+   * launcher).
+   */
+  #gatewayFor(workspace: string, network: NetworkPolicy): GitGatewaySpec | undefined {
+    if (!this.#gitGateway || this.#providerId === "docker") return undefined;
+    // Codex's own sandbox refuses a unix socket's connect with its network off: there the gateway can't be reached.
+    // Judged by the session's network (its commands'), not a backend process's (Codex's app-server has it on).
+    const sessionNet = this.#info?.networkRequested ?? this.#info?.network ?? network.mode;
+    if (this.#resolvedFor === "codex" && sessionNet !== "on") return undefined;
+    const g = this.#gitGateway();
+    if (!g) return undefined;
+    // Where the owner's git, in this workspace, sends each URL (its includes and the repository's own rules count).
+    const repo = repositoryForRewrites(workspace);
+    const routes = gatewayRoutes(g.urls, workspaceRemoteUrls(workspace), { off: network.mode !== "on", rewrite: (u) => ownerRewrite(u, repo), pushRewrite: (u) => ownerPushRewrite(u, repo) });
+    return { ...g, urls: [...new Set(routes.flatMap((r) => [r.fetch, r.push].filter((x): x is string => !!x)))], routes };
+  }
+
   /** How many handles are open (tests). */
   get openHandles(): number {
     return this.#handles.size;
@@ -1122,7 +1162,10 @@ export class SessionSandbox {
     const agent = new Set(this.effective().agentDirs);
     // Other workstreams' folders, as at the last resolution (a change since is a dirs change, applied between turns).
     const hiddenForWorkstream = this.#workstreamKeyApplied ? (JSON.parse(this.#workstreamKeyApplied) as WorkstreamDirs).hidden : [];
+    const gateway = this.#gatewayFor(workspace, network);
     const build = () => buildSandboxSpec({
+      ...(gateway ? { gitGateway: gateway } : {}),
+      ownerConfigFiles: ownerConfigFiles(),
       backendReadable: readable,
       sessionId: this.#sessionId,
       workspace,
@@ -1422,6 +1465,8 @@ export async function openCheckSandbox(opts: {
   try {
     const spec = buildSandboxSpec({
       sessionId: `check-${safe}`,
+      // A check runs agent-written code with its dir writable: the owner's config files there are held too.
+      ownerConfigFiles: ownerConfigFiles(),
       workspace: sandboxWorkspaceOf(opts.workspace),
       workdir: opts.workspace,
       tempDir,
@@ -1452,4 +1497,142 @@ export async function openCheckSandbox(opts: {
       rmSync(tempDir, { recursive: true, force: true });
     },
   };
+}
+
+/** The remotes' URLs in the workspace repository's own config (read, never run: git reaches them through the gateway). */
+// paths: a read of the repository's own config file
+export function workspaceRemoteUrls(workspace: string): string[] {
+  // As git parses the config (read asynchronously with its rules); else the plain reading below.
+  const top = repositoryForRewrites(workspace);
+  const parsed = top ? repoRemotes(top) : null;
+  if (parsed) return [...new Set(parsed)].slice(0, 50);
+  // Read and refused (the file wasn't the one looked at, a link swapped in), or failed: none, never the plain reading.
+  if (top && rewritesTried(top)) return [];
+  try {
+    const layout = gitLayoutOf(workspace);
+    const common = layout?.common;
+    if (!common) return [];
+    // Read without blocking, and only a plain file: an agent can make the config a FIFO, which a blocking read would
+    // wait on for ever (the whole daemon with it).
+    // The plain reading (before any read by git): never through a link (it could lead to a file the sandbox hides).
+    let text: string;
+    try {
+      text = readRegularTextSync(join(common, "config"), 1 << 20, { noFollow: true });
+    } catch {
+      return [];
+    }
+    const out: string[] = [];
+    let inRemote = false;
+    for (const raw of text.split("\n")) {
+      const line = raw.trim();
+      if (line.startsWith("[")) inRemote = /^\[remote\s+"[^"]*"\]$/.test(line);
+      else if (inRemote) {
+        const m = /^(?:url|pushurl)\s*=\s*(.+)$/i.exec(line);
+        if (m?.[1]) out.push(m[1].trim().replace(/^"(.*)"$/, "$1"));
+      }
+    }
+    return out.slice(0, 50);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The sandbox's routes to the git gateway: each remote URL (a connected one, a workspace remote) and where the owner's
+ * own git would fetch and push it (their insteadOf, their pushInsteadOf), each kept only when the gateway can reach it
+ * for agents. A connected URL's own route carries the owner's rewrites too: its plain form would otherwise stand for
+ * pushes as well, and send them to the fetch URL (another repository, in a fork workflow).
+ */
+export function gatewayRoutes(connectedUrls: readonly string[], workspaceRemotes: readonly string[], o: { off: boolean; rewrite: (u: string) => string; pushRewrite: (u: string) => string }): Array<{ from: string; fetch?: string; push?: string }> {
+  // Whole URLs only (a prefix would hand the rest of a URL to ext::, which reads `%` in it).
+  const kindOf = (u: string) => (/^https:\/\//i.test(u) ? "https" : /^ssh:\/\//i.test(u) || /^(?:[A-Za-z0-9._~-]+@)?[A-Za-z0-9.-]+:(?!\/\/)\S+$/.test(u) ? "ssh" : null);
+  // Only remotes the gateway can reach for it (local paths, file:// and git:// are left to git, as before).
+  // (Tests only: a local bare repository as the workspace's remote, as the gateway's file:// allowance.)
+  const testFile = (u: string) => process.env.CODEOID_GIT_GATEWAY_TEST_FILE === "1" && u.startsWith("file://");
+  const connected = new Set(connectedUrls);
+  const reachable = (to: string) => connected.has(to) || kindOf(to) === "ssh" || (o.off && kindOf(to) === "https") || testFile(to);
+  const routes: Array<{ from: string; fetch?: string; push?: string }> = [];
+  // Each remote as written, and what the owner's own rewrite makes of it (fetch and push each): the gateway is asked
+  // for that. A connected URL's route first.
+  for (const w of connectedUrls) {
+    // A connected URL is fetched as itself (or as the owner's rewrite of it when that is connected too). Pushed: where
+    // the owner's pushInsteadOf sends it, always (through the gateway, which refuses or offers to connect it), never
+    // the fetch URL instead; a push target that is only their insteadOf (the same repository) as the fetch is.
+    const rewritten = testFile(w) ? w : o.rewrite(w);
+    const pushTo = testFile(w) ? w : o.pushRewrite(w);
+    // The rewrite connected: that; the same repository by another transport: the connected URL; another repository:
+    // the rewrite (the gateway refuses it or offers to connect it), as the owner's git would reach it.
+    // (A rewrite the gateway can't reach at all, an http:// or local mirror: the connected URL, as before.)
+    const fetch = connected.has(rewritten) || (!sameRepository(rewritten, w) && (kindOf(rewritten) !== null || testFile(rewritten))) ? rewritten : w;
+    const push = pushTo === rewritten ? fetch : pushTo;
+    routes.push({ from: w, fetch, push });
+  }
+  for (const w of workspaceRemotes) {
+    const fetch = testFile(w) ? w : o.rewrite(w);
+    const push = testFile(w) ? w : o.pushRewrite(w);
+    const r = { from: w, ...(reachable(fetch) ? { fetch } : {}), ...(reachable(push) ? { push } : {}) };
+    if (r.fetch || r.push) routes.push(r);
+  }
+  return routes;
+}
+
+/** Whether two remote URLs name one repository (host and path as the workstreams' rules read them: ssh or https). */
+function sameRepository(a: string, b: string): boolean {
+  if (a === b) return true;
+  const na = normalizeRemote(a);
+  return !!na && na === normalizeRemote(b);
+}
+
+/**
+ * The top of the repository a workspace is in, for asking its git where the owner's rules send a URL; null when its
+ * own files (its HEAD, its config, a worktree's) aren't plain files (a FIFO an agent made would hold the run up).
+ */
+// paths: a look at the repository's git files (stat), nothing read or run
+export function repositoryForRewrites(workspace: string): string | undefined {
+  const layout = gitLayoutOf(workspace);
+  if (!layout?.common) return undefined;
+  const gitDir = layout.own ?? layout.common;
+  const plain = (p: string, required: boolean) => {
+    try {
+      return statSync(p).isFile();
+    } catch {
+      return !required;
+    }
+  };
+  if (!plain(join(gitDir, "HEAD"), true) || !plain(join(layout.common, "config"), true) || !plain(join(gitDir, "config.worktree"), false)) return undefined;
+  return dirname(layout.dotgit);
+}
+
+/**
+ * The repository's own config files for codeoid to read (its config, and its worktree's `config.worktree`), each a
+ * walk from the real path of the dir holding the repository's git dir (the repository's top: its parents are outside
+ * what an agent writes) through literal parts, none followed if it is a link (openRepoFile). Never what a `commondir`
+ * or a link an agent made would point git at (a repository the sandbox hides).
+ */
+// paths: a look (realpath of the repository's top), nothing read
+export function repositoryConfigFiles(workspace: string): RepoConfigFile[] {
+  const layout = gitLayoutOf(workspace);
+  if (!layout?.common) return [];
+  const top = dirname(resolve(layout.common));
+  let base: string;
+  try {
+    base = realpathSync(top);
+  } catch {
+    return [];
+  }
+  const partsOf = (dir: string, name: string): string[] | null => {
+    const rel = relative(top, resolve(dir));
+    if (!rel || rel.startsWith("..") || isAbsolute(rel)) return null;
+    return [...rel.split(sep), name];
+  };
+  const out: RepoConfigFile[] = [];
+  const gitDir = layout.own ?? layout.common;
+  for (const [dir, name] of [
+    [layout.common, "config"],
+    [gitDir, "config.worktree"],
+  ] as const) {
+    const parts = partsOf(dir, name);
+    if (parts && (name === "config" || existsSync(join(dir, name)))) out.push({ base, parts });
+  }
+  return out;
 }

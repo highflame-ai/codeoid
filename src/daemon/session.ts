@@ -108,7 +108,7 @@ import { type FenceRefusal, fenceRefusal, fenceRefusalText } from "./workstreams
 import { repositoryTopOf } from "./workstreams/folders.js";
 import type { McpGrant } from "./workstreams/grant.js";
 import { LIMITS } from "../protocol/types.js";
-import { hasScope, SCOPES } from "../protocol/scopes.js";
+import { hasScope, SCOPES, type Scope } from "../protocol/scopes.js";
 import type { ApprovalRuleOffer, ApprovalSaveScope, PendingToolApproval, SessionApproveOutcome, SessionSandboxInfo, SessionSandboxSetting } from "../protocol/types.js";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -249,6 +249,9 @@ import { OUTPUT_WITHHELD, type ToolVerdict, WRITTEN_WITHHELD } from "./secrets/v
 
 /** What is recorded of a call the user listed in `secrets.dropCommands`. */
 const NOT_STORED = "‹not stored›";
+import { ownerConfigProblem } from "./git-gateway/connect.js";
+import { redactCredentials, shownGitUrl, shownName } from "./git-gateway/text.js";
+import type { GitGatewaySpec } from "./sandbox/policy.js";
 import { REQUEST_DIRECTORY_SHORT_WAIT_MS, REQUEST_DIRECTORY_WAIT_MS, type RequestDirectoryInput, type SandboxMcpMount } from "./sandbox/request-directory.js";
 import {
   CLAUDE_PROVIDER_ID,
@@ -624,6 +627,16 @@ export interface SessionCreateOptions {
   sandboxMcp?: (sessionId: string) => SandboxMcpMount | undefined;
   /** The checkouts other sessions work in (SessionManager): what an autonomous `request_directory` never touches (#448 round 13). */
   sandboxCheckouts?: (sessionId: string) => OtherCheckout[];
+  /** The session's git gateway (docs/git-gateway-design.md): what its sandbox is given; absent, none. */
+  gitGateway?: (sessionId: string) => GitGatewaySpec | undefined;
+  /** Made with a delegated token (a resumed session: as its meta says). Such a session gets none of the owner's git access. */
+  createdByDelegate?: boolean;
+  /**
+   * Whether an autonomous initial mode is the owner's own choice (a push then needs no card): true only where the
+   * creation says so (a loop or routine the owner started, a fork of a session whose autonomy was theirs). Anything
+   * the daemon spawns on its own (a dispatch worker, a collaboration child) is the fleet's: its pushes ask.
+   */
+  autonomousByOwner?: boolean;
   /**
    * Pre-built codeoid_fleet MCP server (conductor sessions only). Built by
    * the SessionManager because its tools close over the manager's tenant-
@@ -1135,6 +1148,11 @@ export class Session {
   get worktree(): SessionWorktree | undefined {
     return this.#worktree;
   }
+  /** Whether workstream isolation holds this session to a fence (its home's folders, references, foreign ones hidden). */
+  get hasWorkstreamFence(): boolean {
+    return this.#workstreamFence?.() !== undefined;
+  }
+
   /** Home workstream binding (docs/workstreams-design.md G5). */
   get workstream(): WorkstreamBinding | undefined {
     return this.#workstream;
@@ -1195,6 +1213,17 @@ export class Session {
   #sandboxMcp?: (sessionId: string) => SandboxMcpMount | undefined;
   #sandboxCheckouts?: (sessionId: string) => OtherCheckout[];
   readonly createdBy: string;
+  /** Made with a delegated token: the owner's git connections aren't this session's to use. */
+  readonly createdByDelegate: boolean;
+  /** Whether the session is autonomous by its owner's own choice (a fork carries it). */
+  get autonomousIsOwners(): boolean {
+    return this.#mode === "autonomous" && this.#autonomousByOwner;
+  }
+
+  /** Whether the autonomous mode in force (if it is) is the owner's own choice (decideGitPush). */
+  #autonomousByOwner = true;
+  /** A dispatch worker: its autonomy is the fleet's whoever re-arms it (persisted as `fleetAutonomy`). */
+  #autonomyIsFleets = false;
   readonly createdAt: string;
   /**
    * Tenancy stamps captured at session creation (or restored from disk
@@ -1856,6 +1885,8 @@ export class Session {
       ownerOnly?: boolean;
       /** Who answered (for the audit of what it decided). */
       onAnswer?: (sub: string) => void;
+      /** A scope the answer needs besides the owner's word (connecting a remote: settings:write, as the CLI's). */
+      requiredScope?: Scope;
     }
   >();
 
@@ -1966,6 +1997,7 @@ export class Session {
         onWarning: (text) => this.#sandboxWarning(text, "sandbox.login_not_saved"),
         onWorktreeEntries: (common, findings) => this.#worktreeEntriesFound(common, findings),
         ...(this.#workstreamFence ? { workstreamDirs: () => this.#sandboxFence() } : {}),
+        ...(opts.gitGateway ? { gitGateway: () => opts.gitGateway?.(this.id) } : {}),
       });
     }
     this.#requireSandbox = opts.requireSandbox === true;
@@ -1975,6 +2007,10 @@ export class Session {
         opts.initialMode.mode === "autonomous" ? opts.initialMode.maxTurns : undefined;
     }
     this.createdBy = opts.auth.sub;
+    this.createdByDelegate = opts.createdByDelegate ?? opts.auth.delegationDepth > 0;
+    // The fleet's: said so (a resumed worker or child: `fleetAutonomy`), or autonomous at creation without the owner's word.
+    this.#autonomyIsFleets = opts.autonomousByOwner === false || (opts.initialMode?.mode === "autonomous" && opts.autonomousByOwner !== true);
+    this.#autonomousByOwner = opts.initialMode?.mode === "autonomous" ? opts.autonomousByOwner === true && !this.createdByDelegate : true;
     // Made by a person, not an agent (a dispatched worker, an automation or delegated token): only then do allow
     // rules run its calls and its cards offer a save. Kept in the meta: a resumed session's auth says nothing of it.
     this.#ownerIsPerson = opts.madeByAgent !== true && turnOrigin(opts.auth) === "user";
@@ -2232,6 +2268,8 @@ export class Session {
         collaboration: this.collaboration,
         collaborationRole: this.collaborationRole,
         ...(this.workstreamAhead ? { workstream: this.workstreamAhead } : {}),
+        createdByDelegate: this.createdByDelegate,
+        ...(this.#autonomyIsFleets ? { fleetAutonomy: true } : {}),
         madeByAgent: !this.#ownerIsPerson,
         // Fire-and-forget: saveMeta's write chain owns the failure log; an
         // unconsumed rejection here would be an unhandled-rejection crash.
@@ -3615,6 +3653,9 @@ export class Session {
     if (this.#mode === mode && this.#turnsRemaining === maxTurns) return;
     this.#autonomousBudgetSpent = false;
     this.#mode = mode;
+    // Autonomous as the owner's own choice (their undelegated token, or the daemon's own) or someone else's.
+    // The daemon's own re-arm (no sender) of a dispatch worker is still the fleet's.
+    if (mode === "autonomous") this.#autonomousByOwner = sender ? sender.sub === this.createdBy && sender.delegationDepth === 0 : !this.#autonomyIsFleets;
     this.#turnsRemaining = mode === "autonomous" ? maxTurns : undefined;
     // A fresh autonomous budget is a new attempt's: the spent flag is the old one's.
     if (mode === "autonomous") this.#budgetExhausted = false;
@@ -4656,7 +4697,7 @@ export class Session {
    * info (`pendingDialog`) so any surface can see what it is waiting on. A
    * cancelled answer carries `reason`. An unattended turn never waits.
    */
-  requestUserInput(req: UiRequest, own: { ownerOnly?: boolean; onAnswer?: (sub: string) => void } = {}): Promise<UiResponse> {
+  requestUserInput(req: UiRequest, own: { ownerOnly?: boolean; onAnswer?: (sub: string) => void; requiredScope?: Scope } = {}): Promise<UiResponse> {
     if (this.#unattended > 0) return Promise.resolve({ cancelled: true, reason: "unattended" });
     if (req.signal?.aborted) return Promise.resolve({ cancelled: true, reason: "withdrawn" });
     const requestId = randomUUID();
@@ -4685,7 +4726,7 @@ export class Session {
       const withdraw = () => this.#settleUiRequest(requestId, { cancelled: true }, "withdrawn");
       signal?.addEventListener("abort", withdraw, { once: true });
       const unlisten = signal ? () => signal.removeEventListener("abort", withdraw) : undefined;
-      this.#pendingUiRequests.set(requestId, { msg, resolve, timer, ...(unlisten ? { unlisten } : {}), ...(own.ownerOnly ? { ownerOnly: true } : {}), ...(own.onAnswer ? { onAnswer: own.onAnswer } : {}) });
+      this.#pendingUiRequests.set(requestId, { msg, resolve, timer, ...(unlisten ? { unlisten } : {}), ...(own.ownerOnly ? { ownerOnly: true } : {}), ...(own.onAnswer ? { onAnswer: own.onAnswer } : {}), ...(own.requiredScope ? { requiredScope: own.requiredScope } : {}) });
       this.#broadcastToCapable(CAPABILITIES.UI_DIALOGS, msg);
       this.#broadcastInfoUpdate(); // pendingDialog
     });
@@ -4728,7 +4769,7 @@ export class Session {
   ): boolean | "forbidden" {
     const pending = this.#pendingUiRequests.get(requestId);
     if (!pending) return false;
-    if (pending.ownerOnly && (sender.sub !== this.createdBy || sender.delegationDepth > 0)) {
+    if ((pending.ownerOnly && (sender.sub !== this.createdBy || sender.delegationDepth > 0)) || (pending.requiredScope && !hasScope(sender.scopes as string[], pending.requiredScope))) {
       this.#store.audit(sender.sub, "session.ui_response_refused", this.id, `requestId=${requestId} owner-only`);
       return "forbidden";
     }
@@ -9336,7 +9377,135 @@ export class Session {
     if (added.length > 0) lines.push(`Besides the workspace, they can write ${added.map((d) => `${d}/`).join(", ")} (git structure and project settings there read-only, as in the workspace).`);
     if (this.#requestDirectoryMounted()) lines.push("To write in another directory, call the `request_directory` tool (path, reason). What it grants is writable from your next turn.");
     else lines.push("To write in another directory, ask the owner to add it (`/sandbox add <dir>`).");
+    if (sbx.runtime?.spec.gatewaySockets?.length && !this.gitAccessProblem("git-upload-pack")) {
+      const noPush = this.gitAccessProblem("git-receive-pack");
+      lines.push(
+        noPush
+          ? `\`git fetch\` works for remotes the owner connected: codeoid reaches them for you with the owner's credentials (you never see them). Pushes are refused here: ${noPush}.`
+          : `\`git fetch\` and \`git push\` work for remotes the owner connected: codeoid reaches them for you with the owner's credentials (you never see them). Commit, then push a branch of your own; pushes to ${this.gitProtectedBranches.join(", ") || "protected branches"} or the remote's default branch, force pushes, deletes and tags are refused, and the owner may be asked first.`,
+      );
+    }
     return lines.join("\n");
+  }
+
+  /**
+   * Why this session's agent may not use `service` through the git gateway, or null: its sandbox must be on, and a
+   * capability role must allow the network (a push: the network and writes).
+   */
+  gitAccessProblem(service: "git-upload-pack" | "git-receive-pack"): string | null {
+    const sbx = this.#sandbox;
+    if (!sbx || sbx.info?.state !== "on") return "this session's commands aren't sandboxed";
+    if (this.#destroyed || this.#draining) return "the session is closing";
+    if (this.createdByDelegate) return "this session was made with a delegated token, or before codeoid recorded who made it: the owner's git connections aren't used for it (start a new session)";
+    // Its commands may write the owner's git or ssh config (a workspace that is the home): nothing of the owner's runs.
+    const ownConfig = ownerConfigProblem(this.sandboxAgentWritable);
+    if (ownConfig) return ownConfig;
+    const push = service === "git-receive-pack";
+    if (push && sbx.config.push?.enabled === false) return "pushing for agents is turned off here (sandbox.push.enabled): ask the owner to push";
+    const role = this.#pack?.role;
+    if (role && role.network !== true && (push || role.network === false)) {
+      return `role "${this.#pack?.roleName}" doesn't allow ${push ? "pushing" : "fetching"} (network: ${String(role.network)})`;
+    }
+    if (role && push && role.write === false) return `role "${this.#pack?.roleName}" is read-only (write: false): it doesn't push`;
+    return null;
+  }
+
+  /** The owner's git connections changed: applied between turns (a process backend restarted then). */
+  gitConnectionsChanged(): void {
+    this.#sandbox?.gitGatewayChanged();
+  }
+
+  /** The protected branches this session's pushes never reach (`sandbox.push.protectedBranches`). */
+  get gitProtectedBranches(): readonly string[] {
+    return this.#sandbox?.config.push?.protectedBranches ?? ["main", "master"];
+  }
+
+  /** What this session's sandboxed commands may write (none when it isn't sandboxed). */
+  get sandboxAgentWritable(): string[] {
+    try {
+      if (!this.#sandbox) return [];
+      return [this.sandboxWorkspace, ...this.sandboxAddedDirs(), ...this.sandboxWorktreeFolders(), ...(this.#sandbox.tempDirPath ? [this.#sandbox.tempDirPath] : [])];
+    } catch {
+      return [this.workdir];
+    }
+  }
+
+  /**
+   * A remote this session's agent reached for that its owner hasn't connected: in guarded and interactive mode the
+   * owner is asked (a card), in autonomous mode never. Resolves with who said yes, or null.
+   */
+  async askToConnectGit(url: string, how: string, signal?: AbortSignal): Promise<string | null> {
+    if (this.#mode === "autonomous") return null;
+    let answeredBy: string | undefined;
+    const answer = await this.requestUserInput(
+      {
+        method: "confirm",
+        title: `The agent's git reached for ${shownGitUrl(url)}`,
+        ...(signal ? { signal } : {}),
+        message: `"${this.name}" ran git against ${shownGitUrl(url)}, which you haven't connected for agents.\n\nConnect it? Agents in your sandboxed sessions could then fetch from it, and push to branches of their own (never ${this.gitProtectedBranches.join(", ") || "a protected branch"} or its default branch, never a force push, a delete or a tag), with ${how}. Your credential stays with codeoid; the agent never sees it. A pushed branch runs the repository's CI as that branch defines it, with its secrets.`,
+        timeoutMs: 100_000,
+      },
+      {
+        ownerOnly: true,
+        // Connecting a remote is a settings change (the CLI's needs settings:write): so is answering yes here.
+        requiredScope: SCOPES.SETTINGS_WRITE,
+        onAnswer: (sub) => {
+          answeredBy = sub;
+        },
+      },
+    );
+    if (answer.cancelled || answer.confirmed !== true || !answeredBy) return null;
+    return answeredBy;
+  }
+
+  /**
+   * The session's word on a push the gateway checked: autonomous mode pushes; guarded and interactive ask the owner
+   * (a card naming the branches, commits and URL), with an answer before the agent's git gives up waiting.
+   */
+  async decideGitPush(push: { url: string; updates: ReadonlyArray<{ old: string; new: string; ref: string }> }, signal?: AbortSignal): Promise<{ ok: true } | { refused: string }> {
+    const what = push.updates.map((u) => `${shownName(u.ref.replace(/^refs\/heads\//, ""))} (${u.new.slice(0, 12)})`).join(", ");
+    this.#store.audit(SYSTEM_IDENTITY.sub, "session.git_push_request", this.id, `${what} -> ${shownGitUrl(push.url)}`.slice(0, 2000));
+    const problem = this.gitAccessProblem("git-receive-pack");
+    if (problem) return { refused: problem };
+    // Autonomous mode lets a push go without a card only when the owner chose it: a delegated token that set it (or
+    // the fleet that started a worker) doesn't decide what the owner's credentials push.
+    if (this.#mode === "autonomous" && this.#autonomousByOwner) return { ok: true };
+    let answeredBy: string | undefined;
+    const answer = await this.requestUserInput(
+      {
+        method: "confirm",
+        title: `The agent pushes ${push.updates.length === 1 ? shownName(push.updates[0]?.ref.replace(/^refs\/heads\//, "") ?? "") : `${push.updates.length} branches`}`,
+        message: `"${this.name}" pushes ${what} to ${shownGitUrl(push.url)} with your credentials. No force, no delete, no tags; checked already.\n\nThe branch runs the repository's CI as it defines it, with its secrets.`,
+        timeoutMs: 100_000,
+        // The agent's git gone (a tool's time limit, an interrupt): the card closes, and nothing is pushed.
+        ...(signal ? { signal } : {}),
+      },
+      {
+        ownerOnly: true,
+        onAnswer: (sub) => {
+          answeredBy = sub;
+        },
+      },
+    );
+    if (answer.cancelled || answer.confirmed !== true) {
+      const why = answer.reason === "unattended" ? "nobody is there to approve it in this unattended run" : answer.cancelled ? `the owner didn't answer (${answer.reason ?? "closed"})` : "the owner declined";
+      this.#store.audit(answeredBy ?? SYSTEM_IDENTITY.sub, "session.git_push_denied", this.id, `${what}: ${why}`.slice(0, 2000));
+      return { refused: why };
+    }
+    this.#store.audit(answeredBy ?? this.createdBy, "session.git_push_approved", this.id, what.slice(0, 2000));
+    return { ok: true };
+  }
+
+  /** What the git gateway did for this session: audited, and a push (or a refusal) said in the transcript. */
+  noteGit(e: { kind: "fetch" | "push"; url: string; ok: boolean; detail: string; updates?: ReadonlyArray<{ new: string; ref: string }> }): void {
+    const detail = shownName(redactCredentials(e.detail));
+    this.#store.audit(SYSTEM_IDENTITY.sub, `session.git_${e.kind}_${e.ok ? "done" : "refused"}`, this.id, `${shownGitUrl(e.url)}: ${detail}`.slice(0, 2000));
+    if (e.kind === "fetch" && e.ok) return;
+    const branches = (e.updates ?? []).map((u) => shownName(u.ref.replace(/^refs\/heads\//, ""))).join(", ");
+    const text = e.ok ? `⬆ Pushed ${branches} → ${shownGitUrl(e.url)}` : `⬆ The agent's git ${e.kind} to ${shownGitUrl(e.url)}${branches ? ` (${branches})` : ""}: refused (${detail})`;
+    const m = this.#makeMessage("info", text, SYSTEM_IDENTITY, undefined, undefined, { event: e.ok ? "sandbox.git_pushed" : "sandbox.git_refused" });
+    this.#persistAndBuffer(m);
+    this.#broadcastRaw(m);
   }
 
   /** Whether this session's backend has the sandbox's `request_directory` (sandbox/request-directory.ts). */
@@ -12947,6 +13116,8 @@ export class Session {
       ...this.#accountMeta(),
       ...(this.#sandbox?.setting ? { sandbox: this.#sandbox.setting } : {}),
       ...(this.#backingFresh ? { backingFresh: true } : {}),
+      createdByDelegate: this.createdByDelegate,
+      ...(this.#autonomyIsFleets ? { fleetAutonomy: true } : {}),
       ...(this.#redactedBackings.size > 0 ? { redactedBackings: [...this.#redactedBackings] } : {}),
       forkedFrom: this.forkedFrom,
       ...this.#backgroundMeta(),

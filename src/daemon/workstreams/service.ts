@@ -10,6 +10,7 @@
  * enforcement (servers, credentials, env) is W1.
  */
 
+import { normalizeRemote } from "./match.js";
 import { createHash } from "node:crypto";
 import { realpathSync } from "node:fs";
 import type { SessionWorkstreamInfo, WorkstreamResolution, WorkstreamSummary } from "../../protocol/types.js";
@@ -340,6 +341,28 @@ export class WorkstreamService {
    * Whether a session homed in `home` may read `target` (a reference,
    * §7.1): `open` yes, `ask` with its owner's confirm, `closed` never.
    */
+  /**
+   * Every workstream a remote URL's rules give it: the best one, or each of those tied for it (none: no rule matches).
+   * Null: there are remote rules, and the URL can't be read as a remote (whose it is can't be told).
+   */
+  remoteWorkstreams(url: string): string[] | null {
+    if (!this.#matchables.some((m) => m.remotes.length > 0)) return [];
+    const aliases = (this.#reader as { sshAliases?: () => Map<string, string> }).sshAliases?.() ?? new Map<string, string>();
+    const origin = normalizeRemote(url, aliases);
+    if (!origin) return null;
+    const m = matchFolder(this.#matchables, { paths: [], origin });
+    return m.best ? [m.best.workstream] : (m.ambiguous ?? []);
+  }
+
+  /** The workstream a remote URL belongs to, by the workstreams' remote rules (none: no rule matches it). */
+  remoteWorkstream(url: string): string | undefined {
+    // As a folder's remotes are read: the owner's ssh Host aliases applied (a second account's `github-client`).
+    const aliases = (this.#reader as { sshAliases?: () => Map<string, string> }).sshAliases?.() ?? new Map<string, string>();
+    const origin = normalizeRemote(url, aliases);
+    if (!origin || !this.#matchables.some((m) => m.remotes.length > 0)) return undefined;
+    return matchFolder(this.#matchables, { paths: [], origin }).best?.workstream;
+  }
+
   referenceVerdict(home: string | undefined, ref: { workstream: string; paths?: readonly string[] }, recorded: readonly string[] = []): ShareVerdict {
     const ws = this.#effective.get(ref.workstream);
     if (!ws) return { ok: false, error: `Unknown workstream "${ref.workstream}"` };

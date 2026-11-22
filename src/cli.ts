@@ -1402,6 +1402,70 @@ sandboxCmd
     client.disconnect();
   });
 
+const sandboxGitCmd = sandboxCmd
+  .command("git")
+  .description("The git gateway (docs/git-gateway-design.md): agents' own git fetch and push reach remotes you connect, with your existing credentials, which never enter the sandbox");
+
+sandboxGitCmd
+  .command("connect [dir]")
+  .description(
+    "Connect a repository's remote for agents in your sandboxed sessions: they may fetch from it and push branches of their own (never a protected branch, main and master unless sandbox.push.protectedBranches says otherwise, nor its default branch; no force, no deletes, no tags), with your ssh key or your git credential for it (read once, now), or --token. Proved to work first. A pushed branch runs the repository's CI with its secrets",
+  )
+  .option("--remote <name>", "the remote (default: origin)")
+  .option("--url <url>", "the remote's URL, instead of a repository and remote")
+  .option("--token", "use a dedicated token for an https remote (user:token, or the token), read from the terminal or stdin")
+  .option("--yes", "connect a repository's remote without asking to confirm its URL (needed without a terminal)")
+  .action(async (dir: string | undefined, o: { remote?: string; url?: string; token?: boolean; yes?: boolean }) => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    // Asked first: a push URL connected below uses it too.
+    const token = o.token ? (await readSecret("Token (user:token, or the token): ")).trim() : undefined;
+    if (o.token && !token) {
+      console.error("No token given: nothing connected.");
+      process.exit(1);
+    }
+    let url = o.url;
+    if (!url) {
+      // The URL a repository's config names is shown, and confirmed, before anything is connected.
+      const found = await client.sandboxGitResolve(resolve(dir ?? "."), o.remote);
+      if (!found) return client.disconnect();
+      console.log(`This connects ${found.url}${found.writtenAs ? ` (the repository says ${found.writtenAs}; your git config rewrites it to this)` : ""}${found.connected ? " (connected already: connecting again refreshes it)" : ""} for agents in your sandboxed sessions.`);
+      if (!(await confirmOnTerminal("Connect it? [y/N] ", o.yes, "Not connected: pass --yes to connect without a terminal to confirm in, or name it with --url."))) return client.disconnect();
+      url = found.rawUrl;
+      // Your git pushes elsewhere (pushInsteadOf): agents' pushes go there, so that is connected too, when asked.
+      if (found.rawPushUrl && found.pushUrl) {
+        console.log(`Your git pushes it to ${found.pushUrl} (pushInsteadOf): agents' pushes go there.`);
+        // Never with --token's token: it may be another host's (or an ssh URL); it's connected with its own.
+        if (token) console.log(`  Connect it with its own token: codeoid sandbox git connect --url ${found.pushUrl} --token`);
+        else if (await confirmOnTerminal("Connect that too? [y/N] ", o.yes, "")) await client.sandboxGitConnect("connect", { url: found.rawPushUrl });
+      }
+    }
+    await client.sandboxGitConnect("connect", { url, ...(token ? { token } : {}) });
+    client.disconnect();
+  });
+
+sandboxGitCmd
+  .command("disconnect [dir]")
+  .description("Take a connected remote back: agents' git no longer reaches it (a kept credential is deleted)")
+  .option("--remote <name>", "the remote (default: origin)")
+  .option("--url <url>", "the remote's URL, instead of a repository and remote")
+  .action(async (dir: string | undefined, o: { remote?: string; url?: string }) => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    await client.sandboxGitConnect("disconnect", { ...(o.url ? { url: o.url } : { path: resolve(dir ?? ".") }), ...(o.remote ? { remote: o.remote } : {}) });
+    client.disconnect();
+  });
+
+sandboxGitCmd
+  .command("ls")
+  .description("List the remotes you connected for agents")
+  .action(async () => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    await client.sandboxGitConnect("list", {});
+    client.disconnect();
+  });
+
 for (const action of ["add", "remove"] as const) {
   sandboxCmd
     .command(`${action} <session> <dir>`)

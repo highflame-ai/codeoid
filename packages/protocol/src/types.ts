@@ -1362,6 +1362,7 @@ export type ClientMessage =
   | SessionRemoveReferenceMsg
   | SessionSetWorkstreamMsg
   | SandboxProvidersMsg
+  | SandboxGitConnectMsg
   | SessionPinMsg
   | SessionUnpinMsg
   | SessionRotateMsg
@@ -2041,6 +2042,22 @@ export interface SessionSandboxDirMsg extends BaseClientMsg {
 /** The sandbox providers this daemon has, and whether each runs here (#448). Needs session:create. */
 export interface SandboxProvidersMsg extends BaseClientMsg {
   type: "sandbox.providers";
+}
+
+/**
+ * Connect a remote for the git gateway (docs/git-gateway-design.md): agents in the caller's sandboxed sessions may
+ * then fetch from it and push branches of their own, with the caller's existing credential (or `token`). Needs
+ * settings:write; refused for a delegated token. `list` lists the caller's own; `disconnect` takes one back.
+ */
+export interface SandboxGitConnectMsg extends BaseClientMsg {
+  type: "sandbox.git_connect";
+  action: "connect" | "disconnect" | "list" | "resolve";
+  /** The remote's URL; or `path` (a directory in a repository) and `remote` (default `origin`). */
+  url?: string;
+  path?: string;
+  remote?: string;
+  /** A dedicated token for an https remote (`user:token` or a token), instead of the caller's own credential. */
+  token?: string;
 }
 
 /** One entry of the `sandbox.providers` reply's `data.providers`. */

@@ -180,6 +180,14 @@ export interface SandboxSpec {
    * never the client's credentials (`~/.docker/config.json` stays hidden).
    */
   dockerSockets?: readonly string[];
+  /**
+   * The session's git gateway socket (docs/git-gateway-design.md): reachable at its own path as
+   * {@link dockerSockets} are, the network off or not. Its launcher and codeoid's runtime are re-exposed read-only,
+   * and {@link env} points git's remotes for the session at it. Absent: no gateway.
+   */
+  gatewaySockets?: readonly string[];
+  /** The git gateway's own dir: what is under it (other sessions' sockets, its control socket) is never reached. */
+  gatewayRoot?: string;
   network: NetworkPolicy;
   /** Environment variables removed from what runs inside (an agent socket, a desktop bus). */
   unsetEnv: readonly string[];

@@ -23,7 +23,7 @@
  *   - network per policy.
  */
 
-import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, realpathSync, statSync } from "node:fs";
+import { accessSync, closeSync, constants, existsSync, lstatSync, mkdirSync, openSync, readSync, readdirSync, realpathSync, rmdirSync, statSync, unlinkSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { CodeoidConfig } from "../../config.js";
@@ -38,6 +38,7 @@ import { makeAt, makeInPinned, type PathPin, dirIdentity, pinDir, pinOf, pinProb
 import { controlDirProblem, nestedControl, type NestedControl, projectRootSecrets, type RootScan, rootScanKey, stillRealDir } from "./project-roots.js";
 import { isOwnWorktree, worktreeAdminsOf, worktreeFoldersOf } from "./worktrees.js";
 import type { NetworkMode, NetworkPolicy, SandboxSpec } from "./types.js";
+import { readRegularTextSync } from "../safe-read.js";
 
 export { DEFAULT_HOME_READABLE, validAllowedHost };
 
@@ -83,8 +84,16 @@ export interface SandboxConfig {
      */
     socket: boolean;
   };
+  /** The git gateway (docs/git-gateway-design.md): off, no session gets it. */
+  git?: { enabled: boolean };
+  /**
+   * Agents' pushes through the git gateway. `protectedBranches` are never pushed to (a trailing `*` matches a
+   * prefix), nor the remote's default branch.
+   */
+  push?: { enabled: boolean; protectedBranches: string[] };
 }
 
+export const DEFAULT_SANDBOX_PUSH = { enabled: true, protectedBranches: ["main", "master"] };
 
 export const DEFAULT_SANDBOX_CONFIG: SandboxConfig = {
   provider: "auto",
@@ -95,6 +104,7 @@ export const DEFAULT_SANDBOX_CONFIG: SandboxConfig = {
   worktreeRoots: [],
   projectRoots: ["@parent"],
   docker: { image: "node:22-bookworm-slim", socket: false },
+  push: { ...DEFAULT_SANDBOX_PUSH, protectedBranches: [...DEFAULT_SANDBOX_PUSH.protectedBranches] },
 };
 
 export function sandboxConfigOf(config: Pick<CodeoidConfig, "sandbox"> | undefined): SandboxConfig {
@@ -103,6 +113,8 @@ export function sandboxConfigOf(config: Pick<CodeoidConfig, "sandbox"> | undefin
     ...DEFAULT_SANDBOX_CONFIG,
     ...(s ?? {}),
     docker: { ...DEFAULT_SANDBOX_CONFIG.docker, ...(s?.docker ?? {}) },
+    push: { ...DEFAULT_SANDBOX_PUSH, ...(s?.push ?? {}) },
+    git: { enabled: true, ...(s?.git ?? {}) },
   };
 }
 
@@ -403,8 +415,65 @@ function within(child: string, parent: string): boolean {
   return child === parent || child.startsWith(parent.endsWith("/") ? parent : `${parent}/`);
 }
 
+/** A session's git gateway as its sandbox is given it (git-gateway/gateway.ts `forSession`, and what goes there). */
+export interface GitGatewaySpec {
+  socket: string;
+  /** The launcher git runs (`ext::<it> %S <url>`). */
+  ext: string;
+  /** The launcher's dir: re-exposed read-only. */
+  binDir: string;
+  /** codeoid's runtime, which the launcher runs: re-exposed read-only. */
+  runtime: string;
+  /** URLs the session's git reaches through the gateway (`url.<ext::…>.insteadOf` / `pushInsteadOf`). */
+  urls: readonly string[];
+  /**
+   * Each URL as the repository writes it, and the URL the gateway is asked for (the owner's own rewrite applied, so
+   * it outranks that rewrite as a whole URL). Absent: each of `urls` to itself.
+   */
+  routes?: ReadonlyArray<{ from: string; fetch?: string; push?: string }>;
+  /** The gateway's own dir: its other sessions' sockets and its control socket, denied by rule where a sandbox can. */
+  root?: string;
+}
+
+/**
+ * git's config that sends `urls` through the gateway's launcher (fetch and push: `insteadOf` and `pushInsteadOf`, a
+ * whole URL each, which outranks a shorter rewrite of the owner's), and the socket's path. As
+ * `GIT_CONFIG_PARAMETERS`, git's own `-c` form: a backend that drops variables named like a key (Codex drops
+ * `*KEY*`, so `GIT_CONFIG_KEY_n`) keeps it. Empty when the launcher's path can't be named in an ext:: command.
+ */
+export function gitGatewayEnv(g: GitGatewaySpec): Record<string, string> {
+  // A space in the launcher's path is ext::'s `% `; other whitespace, `%`, `'` or `=` can't be carried.
+  if (/[\t\n\r%'=]/.test(g.ext)) return {};
+  const routes = g.routes ?? g.urls.map((u) => ({ from: u, fetch: u, push: u }));
+  if (routes.length === 0) return {};
+  const ext = g.ext.replace(/ /g, "% ");
+  // `user`, not `always`: a submodule's ext:: URL (git marks those not from the user) runs nothing.
+  const entries: Array<[string, string]> = [["protocol.ext.allow", "user"]];
+  // (Nor a password in any URL: `ssh://user:secret@host`.)
+  const bad = (u: string) => /[\s'=%]/.test(u) || /^https?:\/\/[^/]*@/i.test(u) || /^[a-z][a-z0-9+.-]*:\/\/[^/@]*:[^/@]*@/i.test(u) || /^[^/@:]+:[^/@]*@[^/]*:/.test(u) || /[?#]/.test(u);
+  const seen = new Set<string>();
+  for (const r of routes) {
+    // The old `'key=value'` form, which every git parses (the split form is git 2.31's): a URL with `=` can't be in it.
+    if (bad(r.from) || seen.has(r.from)) continue;
+    seen.add(r.from);
+    // Fetch and push each where the owner's own git would send them (their insteadOf and pushInsteadOf applied).
+    if (r.fetch && !bad(r.fetch)) entries.push([`url.ext::${ext} %S ${r.fetch}.insteadOf`, r.from]);
+    if (r.push && !bad(r.push)) entries.push([`url.ext::${ext} %S ${r.push}.pushInsteadOf`, r.from]);
+  }
+  if (entries.length === 1) return {};
+  return { CODEOID_GIT_GATEWAY: g.socket, GIT_CONFIG_PARAMETERS: entries.map(([k, v]) => `'${k}=${v}'`).join(" ") };
+}
+
 export interface SpecInputs {
   sessionId: string;
+  /**
+   * The owner's git and ssh config files (connect.ts `ownerConfigFiles`: as named, resolved, and what they include):
+   * held read-only wherever the session may write them (a dotfiles repository as a workspace), as project settings
+   * are, so no sandboxed command writes what the host's git and ssh read.
+   */
+  ownerConfigFiles?: readonly string[];
+  /** The session's git gateway (docs/git-gateway-design.md); absent: git reaches remotes as the network allows. */
+  gitGateway?: GitGatewaySpec;
   /**
    * More paths hidden for this session alone: other workstreams' folders
    * under its read fence (workstreams §7.3). Never the workspace or what
@@ -596,10 +665,15 @@ const WORKTREE_CONTROL = ["commondir", "gitdir", "config.worktree"] as const;
 /** Made when missing, so there is something to hold read-only: empty dirs, and an empty `config.worktree` (read only where the config turns it on). */
 const GIT_PLACEHOLDER_DIRS = ["hooks", "info", "modules", "remotes", "branches", "worktrees"] as const;
 
+/** A small file of git's read without blocking, a regular file only (safe-read.ts: an agent can make any a FIFO). */
+function readSmall(p: string): string {
+  return readRegularTextSync(p, 1 << 20);
+}
+
 // paths: a look, no write
 function readGitFile(dotgit: string): string | null {
   try {
-    const m = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(dotgit, "utf8"));
+    const m = /^gitdir:\s*(.+?)\s*$/m.exec(readSmall(dotgit));
     return m?.[1] ?? null;
   } catch {
     return null;
@@ -886,8 +960,8 @@ function validSubmodule(gitDir: string, dotgit: string): boolean {
   try {
     if (!lstatSync(gitDir).isDirectory() || !gitDirShape(gitDir)) return false;
     // Its own repository: no `commondir`, or the `.` placeholder (gitWorkspacePaths).
-    if (lexists(join(gitDir, "commondir")) && readFileSync(join(gitDir, "commondir"), "utf8").trim() !== ".") return false;
-    const m = /^\s*worktree\s*=\s*(.+?)\s*$/im.exec(readFileSync(join(gitDir, "config"), "utf8"));
+    if (lexists(join(gitDir, "commondir")) && readSmall(join(gitDir, "commondir")).trim() !== ".") return false;
+    const m = /^\s*worktree\s*=\s*(.+?)\s*$/im.exec(readSmall(join(gitDir, "config")));
     if (!m?.[1]) return false;
     return realpathSync(resolve(gitDir, m[1])) === realpathSync(dirname(dotgit));
   } catch {
@@ -922,6 +996,37 @@ function isLink(p: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * An owner config file missing inside a writable root, made empty with every dir missing on its way (each inside a
+ * writable root), so none can be made by a sandboxed command: the dirs and the file, to hold. None when it can't be.
+ */
+// paths: a look (does each dir exist) up to a writable root, then makeIfMissing (pinned, never through a link); one that landed elsewhere (a link swapped in) is removed again (codeoid's own, just made, empty)
+function placeholderWithDirs(f: string, inWritable: (p: string) => boolean): string[] {
+  const missing: string[] = [];
+  let d = dirname(f);
+  for (; !existsSync(d); d = dirname(d)) {
+    if (d === dirname(d) || !inWritable(realOr(d))) return [];
+    missing.unshift(d);
+  }
+  // The nearest dir that exists, where it really is (a link in the workspace may lead anywhere): inside a writable
+  // root, or nothing is made.
+  if (!inWritable(realOr(d))) return [];
+  // Each made checked where it really is after (a link swapped in on the way between the look and the make): one that
+  // landed outside every writable root is taken away again (codeoid's own, just made, empty).
+  const landed = (p: string, dir: boolean): boolean => {
+    if (inWritable(realOr(p))) return true;
+    try {
+      if (dir) rmdirSync(p);
+      else if (lstatSync(p).isFile() && lstatSync(p).size === 0) unlinkSync(p);
+    } catch {
+      /* gone already */
+    }
+    return false;
+  };
+  for (const dir of missing) if (!makeIfMissing(dir, "dir") || !landed(dir, true)) return [];
+  return makeIfMissing(f, "") && landed(f, false) ? [...missing, f] : [];
 }
 
 /** A dir (`"dir"`) or a file with `content`, made only where nothing (not even a link) is: never through one. Whether it was made. */
@@ -960,7 +1065,8 @@ function excludePlaceholders(workspace: string, home: string, names: readonly st
     const rel = relative(dirname(layout.dotgit), resolve(workspace));
     if (rel.startsWith("..") || isAbsolute(rel)) return;
     // paths: a look (the file's current text, before replaceInPinned writes it whole)
-    const have = lexists(exclude) ? readFileSync(exclude, "utf8") : "";
+    // Never through a link swapped in (what it read would be written back into the repository).
+    const have = lexists(exclude) ? readRegularTextSync(exclude, 1 << 20, { noFollow: true }) : "";
     const lines = have.split("\n");
     const add = names.map((n) => `/${rel ? `${rel.split(sep).join("/")}/` : ""}${n}`).filter((l) => !lines.includes(l));
     if (add.length === 0) return;
@@ -986,7 +1092,7 @@ function listDirs(dir: string): string[] {
 // paths: a look at git's records, no write
 function gitdirTarget(worktreeGitDir: string): string | null {
   try {
-    const named = readFileSync(join(worktreeGitDir, "gitdir"), "utf8").trim();
+    const named = readSmall(join(worktreeGitDir, "gitdir")).trim();
     return named ? resolve(worktreeGitDir, named) : null;
   } catch {
     return null;
@@ -1007,7 +1113,7 @@ function submoduleCheckouts(modules: string, depth = 0, budget = { left: 200 }):
     // paths: a look at git's records, no write
     if (gitDirShape(dir)) {
       try {
-        const m = /^\s*worktree\s*=\s*(.+?)\s*$/im.exec(readFileSync(join(dir, "config"), "utf8"));
+        const m = /^\s*worktree\s*=\s*(.+?)\s*$/im.exec(readSmall(join(dir, "config")));
         if (m?.[1]) out.push(join(resolve(dir, m[1]), ".git"));
       } catch {
         /* no config: not checked out */
@@ -1027,7 +1133,7 @@ function validWorktree(gitDir: string, common: string, dotgit: string): boolean 
   try {
     if (!lstatSync(common).isDirectory() || !lstatSync(join(common, "objects")).isDirectory() || !lstatSync(join(common, "HEAD")).isFile()) return false;
     if (!lstatSync(gitDir).isDirectory()) return false;
-    const back = readFileSync(join(gitDir, "gitdir"), "utf8").trim();
+    const back = readSmall(join(gitDir, "gitdir")).trim();
     return realpathSync(resolve(gitDir, back)) === realpathSync(dotgit);
   } catch {
     return false;
@@ -1251,6 +1357,8 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   // leads to elsewhere in the home stays hidden (a project of yours, with its `.env`), and the link dangles.
   const reexposed = [
     ...(inputs.backendReadable ?? []).map((p) => resolve(p)),
+    // The git gateway's launcher and the runtime it runs, read-only (the socket is bound on its own).
+    ...(inputs.gitGateway ? [inputs.gitGateway.binDir, inputs.gitGateway.runtime, realOr(inputs.gitGateway.runtime)] : []),
     // The allowlist, less what `sandbox.hiddenPaths` hides: an explicit hide wins.
     ...allowed,
     // The worktree locations holding the session's folders, read-only: a worktree added elsewhere in one fails
@@ -1290,7 +1398,11 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   const inWritable = (p: string) => writableRoots.some((w) => within(p, w));
   // Held read-only, by real path (#448 round 14: resolved here, once, never again at a launch); only inside
   // something writable.
-  const readOnly = [...new Set([...git.readOnly, ...projectConfig].map(realOr))].filter(inWritable);
+  // paths: a look (does each of the owner's config files exist), no write
+  // One missing inside a writable root (an include target in a dotfiles workspace) is made empty first (an empty git or
+  // ssh config says nothing), so a sandboxed command can't create it.
+  const ownerConfig = (inputs.ownerConfigFiles ?? []).flatMap((f) => (existsSync(f) ? [f] : inWritable(realOr(f)) ? placeholderWithDirs(f, inWritable) : []));
+  const readOnly = [...new Set([...git.readOnly, ...projectConfig, ...ownerConfig].map(realOr))].filter(inWritable);
   // Held in place (no rename, still writable inside): every dir between a writable root and a hidden path in it,
   // and between two nested writable roots (pinned); the working directory and every dir between it and the
   // workspace (a monorepo's package dir moved aside takes its held settings with it, #448 round 14), and every
@@ -1326,6 +1438,9 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
   for (const l of git.locations) pin(pinOf(realOr(l), "a worktree location", { mayBeMissing: true, noId: true }));
   // The container runtime's sockets, when the owner opted in: reachable at their own paths, `DOCKER_HOST` the first.
   const sockets = inputs.dockerSocket ? dockerSocketPaths(home, env) : [];
+  // The git gateway: its env (none when its launcher can't be named in git's config), then its socket.
+  const gatewayEnv = inputs.gitGateway ? gitGatewayEnv(inputs.gitGateway) : {};
+  const gateway = inputs.gitGateway && Object.keys(gatewayEnv).length > 0 ? inputs.gitGateway : undefined;
   const exposed = new Set(sockets.flatMap((s) => [s, realOr(s)]));
   const spec: SandboxSpec = {
     sessionId: inputs.sessionId,
@@ -1338,7 +1453,9 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     ...(locations.length > 0 ? { worktreeFolders: locations } : {}),
     ...(roots.length > 0 ? { projectRoots: roots } : {}),
     ...(addedDirs.length > 0 ? { addedDirs } : {}),
-    ...(cache || sockets.length > 0 ? { env: { ...(cache ? toolchainCacheEnv(cache, home, env) : {}), ...(sockets[0] ? { DOCKER_HOST: `unix://${sockets[0]}` } : {}) } } : {}),
+    ...(cache || sockets.length > 0 || gateway
+      ? { env: { ...(cache ? toolchainCacheEnv(cache, home, env) : {}), ...(sockets[0] ? { DOCKER_HOST: `unix://${sockets[0]}` } : {}), ...gatewayEnv } }
+      : {}),
     pinned,
     ...(heldInPlace.length > 0 ? { heldInPlace } : {}),
     pins,
@@ -1346,6 +1463,7 @@ export function buildSandboxSpec(inputs: SpecInputs): SandboxSpec {
     containerSockets: containerSocketPaths(home, env).filter((p) => !exposed.has(p) && !exposed.has(realOr(p))),
     ...((inputs.hideLocalServices ?? inputs.network.mode !== "on") ? { serviceSockets: localServiceSocketPaths() } : {}),
     ...(sockets.length > 0 ? { dockerSockets: sockets } : {}),
+    ...(gateway ? { gatewaySockets: [gateway.socket], ...(gateway.root ? { gatewayRoot: gateway.root } : {}) } : {}),
     network: inputs.network,
     unsetEnv: sockets.length > 0 ? SANDBOX_UNSET_ENV.filter((n) => n !== "DOCKER_HOST") : SANDBOX_UNSET_ENV,
   };
