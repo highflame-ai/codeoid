@@ -42,15 +42,25 @@ const server = Bun.serve({
   async fetch(req) {
     if (!new URL(req.url).pathname.endsWith("/messages")) return Response.json({ data: [] });
     const body = (await req.json()) as { tools?: Array<{ name: string }>; messages: Array<{ role: string; content: unknown }> };
+    let searched = false;
     for (const m of body.messages) {
       if (!Array.isArray(m.content)) continue;
       for (const c of m.content as Array<{ type?: string; tool_use_id?: string; content?: unknown }>) {
         if (c.type === "tool_result" && c.tool_use_id === "toolu_wt") toolResult = typeof c.content === "string" ? c.content : JSON.stringify(c.content);
+        if (c.type === "tool_result" && c.tool_use_id === "toolu_ts") searched = true;
       }
     }
-    const call = toolResult === null && body.tools?.some((t) => t.name === "EnterWorktree");
-    const block = call ? { type: "tool_use", id: "toolu_wt", name: "EnterWorktree", input: { name: "probe" } } : { type: "text", text: "finished" };
-    return new Response(stream(block, call ? "tool_use" : "end_turn"), { headers: { "content-type": "text/event-stream" } });
+    const offered = (name: string) => body.tools?.some((t) => t.name === name) ?? false;
+    // Claude Code 2.1.3xx defers EnterWorktree behind ToolSearch: load it first, as a model would.
+    const block =
+      toolResult !== null
+        ? { type: "text", text: "finished" }
+        : offered("EnterWorktree") || searched
+          ? { type: "tool_use", id: "toolu_wt", name: "EnterWorktree", input: { name: "probe" } }
+          : offered("ToolSearch")
+            ? { type: "tool_use", id: "toolu_ts", name: "ToolSearch", input: { query: "select:EnterWorktree", max_results: 1 } }
+            : { type: "text", text: "finished" };
+    return new Response(stream(block, block.type === "tool_use" ? "tool_use" : "end_turn"), { headers: { "content-type": "text/event-stream" } });
   },
 });
 
