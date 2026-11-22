@@ -173,10 +173,17 @@ jobs:
       - name: Install Chromium
         run: bunx playwright install --with-deps chromium
 
+      # The backend journeys (e2e/specs/backends-aimock.spec.ts) run each
+      # backend's real CLI against aimock. Claude's comes with the Agent SDK;
+      # Codex's is installed, pinned.
+      - name: Install the Codex CLI
+        run: npm install -g @openai/codex@0.166.0
+
       - name: End-to-end tests
         run: bun run test:e2e
         env:
           CI: "1"
+          CODEOID_E2E_REQUIRE_BACKENDS: claude,codex
 
       - name: Upload report and traces
         if: ${{ failure() }}

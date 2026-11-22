@@ -52,6 +52,8 @@ export class Codeoid {
   readonly token = `codeoid_local_${randomBytes(32).toString("base64url")}`;
   #daemon: ChildProcess | null = null;
   #log = "";
+  /** Extra environment for the daemon and the CLI (a real backend's endpoint, aimock's). */
+  #extraEnv: Record<string, string> = {};
 
   private constructor(root: string, port: number) {
     this.root = root;
@@ -62,18 +64,32 @@ export class Codeoid {
     this.scriptPath = join(root, "script.json");
   }
 
-  static async create(rules: ScriptRule[] = []): Promise<Codeoid> {
+  /**
+   * `opts.provider`: the default backend instead of the scripted one (with its
+   * provider block enabled); `opts.env`: added to the daemon's and the CLI's
+   * environment; `opts.home`: called with the home dir before the daemon starts
+   * (a backend's own config, e.g. ~/.codex/config.toml).
+   */
+  static async create(
+    rules: ScriptRule[] = [],
+    opts: { provider?: string; env?: Record<string, string>; home?: (home: string) => void } = {},
+  ): Promise<Codeoid> {
     const c = new Codeoid(mkdtempSync(join(tmpdir(), "codeoid-e2e-")), await freePort());
+    c.#extraEnv = opts.env ?? {};
     mkdirSync(c.home, { recursive: true });
     mkdirSync(join(c.configDir, "codeoid"), { recursive: true });
+    opts.home?.(c.home);
+    const off = { enabled: false };
+    const providers: Record<string, unknown> = { pi: off, codex: off, geminiCli: off, qwen: off, opencode: off };
+    if (opts.provider && opts.provider in providers) providers[opts.provider] = { enabled: true };
     // Only the scripted backend, and nothing that reaches the network or a model.
     writeFileSync(
       join(c.configDir, "codeoid", "config.json"),
       JSON.stringify({
-        session: { defaultProvider: "scripted" },
+        session: { defaultProvider: opts.provider ?? "scripted" },
         memory: { enabled: false },
         workspaceIndex: { enabled: false },
-        providers: { pi: { enabled: false }, codex: { enabled: false }, geminiCli: { enabled: false }, qwen: { enabled: false }, opencode: { enabled: false } },
+        providers,
         // Priced like a real model, so a turn with no reported cost is estimated (#430).
         pricing: { models: { "scripted-model": { input: 1, output: 2 } } },
       }),
@@ -142,6 +158,7 @@ export class Codeoid {
       CODEOID_E2E_SCRIPT: this.scriptPath,
       CODEOID_LOCAL_TOKEN: this.token,
       CODEOID_DAEMON_URL: `ws://127.0.0.1:${this.port}`,
+      ...this.#extraEnv,
     };
   }
 
