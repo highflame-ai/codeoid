@@ -8,8 +8,8 @@
         "@anthropic-ai/claude-agent-sdk": "0.3.322",
         "@google/generative-ai": "^0.24.1",
         "@grammyjs/auto-retry": "^2.0.2",
-        "@highflame/codeoid-core": "^0.4.0",
-        "@highflame/codeoid-protocol": "^0.4.0",
+        "@highflame/codeoid-core": "^0.6.0",
+        "@highflame/codeoid-protocol": "^0.6.0",
         "@highflame/sdk": "^0.3.18",
         "@modelcontextprotocol/sdk": "^1.29.0",
         "@qwen-code/sdk": "0.1.8",
@@ -40,14 +40,14 @@
     },
     "packages/core": {
       "name": "@highflame/codeoid-core",
-      "version": "0.4.0",
+      "version": "0.6.0",
       "peerDependencies": {
-        "@highflame/codeoid-protocol": "^0.4.0",
+        "@highflame/codeoid-protocol": "^0.6.0",
       },
     },
     "packages/protocol": {
       "name": "@highflame/codeoid-protocol",
-      "version": "0.4.0",
+      "version": "0.6.0",
       "peerDependencies": {
         "zod": "^4.0.0",
       },
