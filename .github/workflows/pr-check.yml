@@ -173,10 +173,26 @@ jobs:
       - name: Install Chromium
         run: bunx playwright install --with-deps chromium
 
+      # The backend journeys (e2e/specs/backends-aimock.spec.ts) run each
+      # backend's real CLI against aimock. Claude's comes with the Agent SDK;
+      # Codex's is installed, pinned.
+      - name: Install the Codex CLI
+        run: npm install -g @openai/codex@0.166.0
+
+      # A real backend's session is sandboxed as it would be for a user: without
+      # bubblewrap it is created "with warnings" and the dialog saying so stays
+      # open over the page. Set up as in sandbox-real.
+      - name: Install bubblewrap and socat
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap socat
+
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
       - name: End-to-end tests
         run: bun run test:e2e
         env:
           CI: "1"
+          CODEOID_E2E_REQUIRE_BACKENDS: claude,codex
 
       - name: Upload report and traces
         if: ${{ failure() }}

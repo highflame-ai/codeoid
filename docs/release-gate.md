@@ -2,7 +2,8 @@
 
 Status: tiers 0 and 1 implemented (`.github/workflows/release.yml`,
 `scripts/check-artifact.ts`, `scripts/check-upgrade.ts`, the `release-gate` CI
-job); tiers 2–5 designed. Owner of the go/no-go: the release owner.
+job); tier 2 started (`e2e/specs/backends-aimock.spec.ts`: claude and codex,
+journeys 1–3 and 6); tiers 3–5 designed. Owner of the go/no-go: the release owner.
 
 codeoid has a strong per-PR gate (unit suite, e2e against a scripted backend,
 real bubblewrap and Claude-sandbox tests) and almost nothing between "main is
