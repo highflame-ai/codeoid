@@ -66,3 +66,14 @@ An allowed `Write` really writes (inside the workdir only, never through a symli
 1. Write the rules for what the backend should do.
 2. Write the spec in `e2e/specs/`: drive the UI or CLI, and assert what a user would see and what's on disk.
 3. Run it a few times (`--repeat-each 5`): a flaky end-to-end test is a bug to fix, and the suite has no retries to hide one.
+
+## Real backends against aimock
+
+`specs/backends-aimock.spec.ts` runs each backend's real CLI (the Claude Code
+CLI, Codex) in the daemon, with its model played by
+[aimock](https://github.com/CopilotKit/aimock): a local server that answers as
+the Anthropic and OpenAI APIs, from fixtures each test scripts. No credentials,
+no spend. `e2e/aimock.ts` says how each backend is pointed at it and how its
+model calls a tool. A backend whose CLI isn't installed is skipped, unless
+`CODEOID_E2E_REQUIRE_BACKENDS` names it (CI: `claude,codex`), which fails
+instead. Release gate tier 2, docs/release-gate.md.
