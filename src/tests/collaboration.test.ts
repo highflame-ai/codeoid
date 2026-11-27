@@ -437,6 +437,21 @@ const textTurn = (text: string): ProviderEvent[] => [
   { type: "turn_done", result: mockResult() } as ProviderEvent,
 ];
 
+/**
+ * Force a dispatch task terminal, bypassing the claim lifecycle. These tests
+ * exercise what is drawn or delivered once a task has settled, not how it got
+ * there — and `dispatchComplete` / `dispatchFail` now refuse a row that was
+ * never claimed (the generation fence), which is exactly right for a worker
+ * result and exactly wrong for staging one.
+ */
+function settleTask(id: string, status: "done" | "failed", digest: string): void {
+  store.database
+    .prepare(
+      "UPDATE dispatch_tasks SET status = ?, result_digest = ?, error = ?, updated_at = ? WHERE id = ?",
+    )
+    .run(status, status === "done" ? digest : null, status === "done" ? null : digest, Date.now(), id);
+}
+
 function mkConfig(over: Partial<CodeoidConfig> = {}): CodeoidConfig {
   return {
     daemonUrl: "ws://127.0.0.1:7400",
@@ -474,7 +489,15 @@ let tmp: string;
 let workdir: string;
 let store: Store;
 let transcript: TranscriptStore;
+/** Every transcript store the test made (a restart makes another), for the teardown to flush. */
+let transcripts: TranscriptStore[] = [];
 let manager: SessionManager;
+
+function newTranscriptStore(): TranscriptStore {
+  const t = new TranscriptStore(join(tmp, "transcripts"));
+  transcripts.push(t);
+  return t;
+}
 
 function run(msg: ClientMessage): Promise<DaemonMessage> {
   return manager.handle(msg, AUTH, CLIENT);
@@ -493,7 +516,8 @@ beforeEach(() => {
   workdir = join(tmp, "repo");
   mkdirSync(workdir, { recursive: true });
   store = new Store(join(tmp, "codeoid.db"));
-  transcript = new TranscriptStore(join(tmp, "transcripts"));
+  transcripts = [];
+  transcript = newTranscriptStore();
   manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
     config: mkConfig(),
     providers: makeRegistry(),
@@ -507,8 +531,9 @@ afterEach(async () => {
   // Let in-flight fire-and-forget meta writes land before the tmp dir goes
   // away. Without this, tearing down a collaboration's children races their
   // own meta writes and floods the output with ENOENT rename warnings that
-  // would mask a real failure.
-  await Bun.sleep(150);
+  // would mask a real failure. drain flushes the live manager's store; the
+  // others (a restarted test's first manager's) are flushed here.
+  await Promise.all(transcripts.map((t) => t.flush()));
   rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -2127,7 +2152,7 @@ describe("collaboration survives a daemon restart", () => {
     await Bun.sleep(150); // let in-flight meta writes land
     const next = new SessionManager(
       new Store(join(tmp, "codeoid.db")),
-      new TranscriptStore(join(tmp, "transcripts")),
+      newTranscriptStore(),
       undefined,
       undefined,
       undefined,
@@ -2199,7 +2224,7 @@ describe("collaboration survives a daemon restart", () => {
     claudeOnly.register({ id: "claude", displayName: "claude", create: () => new MockSessionProvider("claude", []) });
     const next = new SessionManager(
       new Store(join(tmp, "codeoid.db")),
-      new TranscriptStore(join(tmp, "transcripts")),
+      newTranscriptStore(),
       undefined, undefined, undefined,
       { config: mkConfig(), providers: claudeOnly },
     );
@@ -2686,7 +2711,7 @@ describe("the orchestrator's fleet surface is scoped to its own children", () =>
     // because the shared harness injects no engine at all — a mutation that
     // handed `this.#memory` straight to the orchestrator went undetected until
     // this test was written this way.
-    const stub = { marker: "memory-engine" } as unknown as MemoryEngine;
+    const stub = { marker: "memory-engine", scopeSession: () => () => {} } as unknown as MemoryEngine;
     manager.setMemory(stub);
     const mine = await createGoal("sf5");
 
@@ -3090,7 +3115,7 @@ describe("the collaboration cost roll-up", () => {
     await Bun.sleep(150);
     const next = new SessionManager(
       new Store(join(tmp, "codeoid.db")),
-      new TranscriptStore(join(tmp, "transcripts")),
+      newTranscriptStore(),
       undefined, undefined, undefined,
       { config: mkConfig(), providers: makeRegistry() },
     );
@@ -3169,13 +3194,13 @@ describe("collaboration.panels", () => {
     });
     const members = store.dispatchGroupMembers(AUTH.accountId, AUTH.projectId, groupId);
 
-    store.dispatchComplete(members[0]!.id, "one", Date.now());
+    settleTask(members[0]!.id, "done", "one");
     let p = (await panelsOf(goal.id)).panels[0]!;
     expect(p.settled).toBe(1);
     expect(p.joined).toBe(false); // 1/3 — a UI shows progress, not completion
 
-    store.dispatchComplete(members[1]!.id, "two", Date.now());
-    store.dispatchComplete(members[2]!.id, "three", Date.now());
+    settleTask(members[1]!.id, "done", "two");
+    settleTask(members[2]!.id, "done", "three");
     p = (await panelsOf(goal.id)).panels[0]!;
     expect(p.settled).toBe(3);
     expect(p.joined).toBe(true);
@@ -3193,10 +3218,10 @@ describe("collaboration.panels", () => {
       targets: kids.map((k) => k.id), prompt: "review", shape: "scout",
     });
     const members = store.dispatchGroupMembers(AUTH.accountId, AUTH.projectId, groupId);
-    store.dispatchComplete(members[0]!.id, "ok", Date.now());
-    store.dispatchComplete(members[1]!.id, "ok", Date.now());
+    settleTask(members[0]!.id, "done", "ok");
+    settleTask(members[1]!.id, "done", "ok");
     // Burn the third to blocked.
-    for (let i = 0; i < 3; i++) store.dispatchFail(members[2]!.id, "nope", Date.now(), { retryable: false });
+    settleTask(members[2]!.id, "failed", "nope");
 
     const p = (await panelsOf(goal.id)).panels[0]!;
     expect(p.members.some((m) => m.status === "failed" || m.status === "blocked")).toBe(true);

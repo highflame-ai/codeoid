@@ -11,7 +11,7 @@
 
 import type { RawMcpServerConfig } from "../../config.js";
 import { MEMORY_MCP_SERVER_NAME } from "../memory/mcp-http.js";
-import { isOAuthServer, mcpToolPrefix, type McpServerSpec, type McpTransport } from "./types.js";
+import { isDaemonOwnedEnvName, isOAuthServer, mcpToolPrefix, type McpServerSpec, type McpTransport } from "./types.js";
 
 /** Names codeoid owns internally — a user entry using one is ignored (the
  *  built-in wins) rather than silently shadowing an internal server. Compared
@@ -28,9 +28,40 @@ export function isReservedMcpName(name: string): boolean {
 export interface McpRegistryOptions {
   /** When true, inject the built-in `codeoid_memory` entry (in-process). */
   memoryEnabled: boolean;
+  /** Names imported from Claude's global config (an explicit entry of the same name isn't one). */
+  imported?: ReadonlySet<string>;
 }
 
-export class McpRegistry {
+/**
+ * What a backend reads to know its MCP servers (#395): the daemon-wide
+ * registry itself, or a session's view of it (the registry plus that
+ * session's workdir servers — mcp/session-view.ts).
+ */
+export interface McpServerView {
+  list(): McpServerSpec[];
+  get(name: string): McpServerSpec | undefined;
+  /** Enabled servers that should mount on `backendId` (honoring `backends`). */
+  forBackend(backendId: string): McpServerSpec[];
+  /** Enabled OAuth servers for `backendId` (codeoid signs in and calls them). */
+  oauthFor(backendId: string): McpServerSpec[];
+  /** External servers a native-mount backend mounts itself (no OAuth ones). */
+  forNativeMount(backendId: string): McpServerSpec[];
+  /**
+   * HTTP servers a CLI backend reaches through the daemon's relay
+   * (mcp/proxy.ts), the daemon holding the credential: OAuth servers, and
+   * under workstream isolation every server called with a credential.
+   */
+  relayFor(backendId: string): McpServerSpec[];
+  /**
+   * Workstream isolation applies (docs/workstreams-design.md §6.1): what is
+   * listed is all the session may reach, and no backend may hold a secret —
+   * Claude runs with a strict MCP config, other CLIs mount only secret-free
+   * servers natively.
+   */
+  readonly isolated: boolean;
+}
+
+export class McpRegistry implements McpServerView {
   readonly #specs = new Map<string, McpServerSpec>();
   readonly #warnings: string[] = [];
 
@@ -53,7 +84,8 @@ export class McpRegistry {
         this.#warnings.push(`mcp: ignoring reserved server name "${name}" (codeoid built-in)`);
         continue;
       }
-      this.#specs.set(name, normalizeSpec(name, raw));
+      const spec = normalizeSpec(name, raw);
+      this.#specs.set(name, opts.imported?.has(name) ? { ...spec, origin: "claude-global" } : spec);
     }
   }
 
@@ -102,19 +134,27 @@ export class McpRegistry {
   forNativeMount(backendId: string): McpServerSpec[] {
     return this.forBackend(backendId).filter((s) => !s.builtin && !isOAuthServer(s));
   }
+
+  relayFor(backendId: string): McpServerSpec[] {
+    return this.oauthFor(backendId).filter((s) => s.transport.kind === "http");
+  }
+
+  readonly isolated = false;
 }
 
 /** Raw (zod-validated) config → normalized spec. Transport is inferred from
  *  which of `command` / `url` is set (the schema's refine guarantees exactly
  *  one); `url` wins defensively if both somehow slip through. */
-function normalizeSpec(name: string, raw: RawMcpServerConfig): McpServerSpec {
+export function normalizeSpec(name: string, raw: RawMcpServerConfig): McpServerSpec {
   const transport: McpTransport =
     raw.url !== undefined
       ? {
           kind: "http",
           url: raw.url,
           headers: raw.headers,
-          bearerTokenEnv: raw.bearerTokenEnv,
+          // Never a workstream credential's variable (isDaemonOwnedEnvName):
+          // every backend reads this name from the daemon's environment.
+          bearerTokenEnv: raw.bearerTokenEnv && !isDaemonOwnedEnvName(raw.bearerTokenEnv) ? raw.bearerTokenEnv : undefined,
           ...(raw.oauth !== undefined ? { oauth: raw.oauth === true ? {} : raw.oauth } : {}),
         }
       : { kind: "stdio", command: raw.command ?? "", args: raw.args, env: raw.env };

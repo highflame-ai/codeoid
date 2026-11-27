@@ -45,8 +45,9 @@ import {
   type DispatchPreview as DispatchPreviewModel,
 } from "../../lib/dispatch-preview";
 import { sessionList } from "../../state/sessions";
-import type { CollaborationCost, SessionMessage } from "../../protocol/types";
-import { formatCollaborationCost } from "../../lib/format";
+import type { ApprovalRuleOffer, ApprovalSaveScope, CollaborationCost, SessionMessage, ToolRisk } from "../../protocol/types";
+import { formatCollaborationCost, formatToolRisk } from "../../lib/format";
+import { approvalSandboxLine, approvalSandboxWarns, DOCKER_ACCESS_WHY } from "@highflame/codeoid-core";
 
 /**
  * Repo/branch/content preview for a send-class fleet dispatch, or null for any
@@ -138,6 +139,12 @@ const ApprovalBar: Component = () => {
       input: s.input,
       toolName: m.tool.name,
       collaborationCost: s.collaborationCost,
+      targetWorkstream: s.targetWorkstream,
+      risk: s.risk,
+      sandboxed: s.sandboxed,
+      sandboxNote: s.sandboxNote,
+      sandboxDocker: s.sandboxDocker,
+      ruleOffer: s.ruleOffer,
     };
   });
 
@@ -163,11 +170,13 @@ const ApprovalBar: Component = () => {
     approvalId: string,
     approved: boolean,
     updatedInput?: Record<string, unknown>,
+    save?: ApprovalSaveScope,
+    rules?: string[],
   ): void => {
     if (busy()) return;
     setError(null);
     setBusy(true);
-    approve(sessionId, approvalId, approved, updatedInput)
+    approve(sessionId, approvalId, approved, updatedInput, save, rules)
       // Success keeps the bar disabled: it dismisses when the daemon's
       // tool-state delta lands, and re-enabling before that would let a
       // second (now stale) approve fire for the same approvalId.
@@ -202,11 +211,11 @@ const ApprovalBar: Component = () => {
         const isPlanMode = () =>
           snap().toolName === "ExitPlanMode" || snap().toolName === "exit_plan_mode";
         const isAsk = () => isAskUserQuestion(snap().toolName);
-        const safeApprove = (approved: boolean, updatedInput?: Record<string, unknown>) => {
+        const safeApprove = (approved: boolean, updatedInput?: Record<string, unknown>, save?: ApprovalSaveScope, rules?: string[]) => {
           const cur = snapshot();
           if (!cur || cur.approvalId !== snap().approvalId) return;
           if (cur.sessionId !== snap().sessionId) return;
-          dispatch(snap().sessionId, snap().approvalId, approved, updatedInput);
+          dispatch(snap().sessionId, snap().approvalId, approved, updatedInput, save, rules);
         };
         return (
           <>
@@ -223,10 +232,17 @@ const ApprovalBar: Component = () => {
                 toolName={snap().toolName}
                 description={snap().description}
                 collaborationCost={snap().collaborationCost}
+                targetWorkstream={snap().targetWorkstream}
+                risk={snap().risk}
+                sandboxed={snap().sandboxed}
+                sandboxNote={snap().sandboxNote}
+                sandboxDocker={snap().sandboxDocker}
                 dispatch={dispatchFor(snap().toolName, snap().input)}
                 isPlanMode={isPlanMode()}
                 busy={busy()}
                 onApprove={() => safeApprove(true)}
+                ruleOffer={snap().ruleOffer}
+                onSave={(scope) => safeApprove(true, undefined, scope, snap().ruleOffer?.rules)}
                 onRefine={() => {
                   safeApprove(false);
                   focusPromptWithHint(
@@ -311,10 +327,22 @@ const BinaryBar: Component<{
   description: string;
   /** Present only for a send-class fleet dispatch from a collaborative session. */
   collaborationCost?: CollaborationCost;
+  /** The workstream a send-class fleet dispatch acts in, and a warning (workstreams §10). */
+  targetWorkstream?: { workstream?: string; warning?: string };
+  /** A shell command's risk (#431). */
+  risk?: ToolRisk;
+  /** Whether it runs in the session's OS sandbox (#448). */
+  sandboxed?: boolean;
+  sandboxNote?: string;
+  /** The sandbox lets commands reach the container runtime (Docker access): a warning. */
+  sandboxDocker?: boolean;
   /** Present only for a send-class fleet dispatch — repo/branch/content (R3). */
   dispatch?: DispatchPreviewModel | null;
   isPlanMode: boolean;
   busy: boolean;
+  /** The rules approving could save, and where (docs/secrets-and-memory-design.md §4.1). */
+  ruleOffer?: ApprovalRuleOffer;
+  onSave?: (scope: ApprovalSaveScope) => void;
   onApprove: () => void;
   onRefine: () => void;
   onDeny: () => void;
@@ -342,6 +370,20 @@ const BinaryBar: Component<{
             instruction is going outranks what it has spent. */}
         <Show when={props.dispatch}>
           {(d) => <DispatchDetails preview={d()} />}
+        </Show>
+        {/* Which line of work it acts in: never approved without knowing (workstreams §10). */}
+        <Show when={props.targetWorkstream}>
+          {(t) => (
+            <div class={`mt-1 font-mono text-[11px] ${t().warning ? "text-warn" : "text-fg-muted"}`} data-testid="approval-workstream">
+              <Show when={t().workstream}>{(w) => <div class="truncate">⌂ workstream {w()}</div>}</Show>
+              <Show when={t().warning}>{(w) => <div>⚠ {w()}</div>}</Show>
+            </div>
+          )}
+        </Show>
+        <RiskLine risk={props.risk} />
+        <SandboxLine sandboxed={props.sandboxed} sandboxNote={props.sandboxNote} sandboxDocker={props.sandboxDocker} />
+        <Show when={props.ruleOffer}>
+          {(offer) => <RuleOfferLine offer={offer()} busy={props.busy} onSave={(scope) => props.onSave?.(scope)} />}
         </Show>
         <Show when={props.collaborationCost}>
           {(c) => (
@@ -380,6 +422,69 @@ const BinaryBar: Component<{
       </button>
     </div>
   </div>
+);
+
+/**
+ * Approve and keep the answer: the rules it would save, and a button per
+ * scope (docs/secrets-and-memory-design.md §4.1). Only the session's owner
+ * can save; anyone else gets the daemon's refusal inline and the card stays.
+ */
+export const RuleOfferLine: Component<{ offer: ApprovalRuleOffer; busy: boolean; onSave: (scope: ApprovalSaveScope) => void }> = (props) => (
+  <div class="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-fg-muted" data-testid="approval-rule-offer">
+    <span class="min-w-0 font-mono [overflow-wrap:anywhere]" title="Approving with one of these saves the rule: the next matching call runs without asking">
+      ⟲ {props.offer.rules.join(", ")}
+    </span>
+    <For each={props.offer.scopes}>
+      {(scope) => (
+        <button
+          type="button"
+          disabled={props.busy}
+          class="rounded border border-success/60 bg-bg px-2 py-0.5 font-semibold text-success transition hover:bg-success/10 disabled:cursor-not-allowed disabled:opacity-50"
+          onClick={() => props.onSave(scope)}
+          title={scope === "session" ? "Approve, and allow this for this session (it ends after a few hours)" : `Approve, and allow this in ${props.offer.repository ?? "this repository"}`}
+          data-save-scope={scope}
+        >
+          {scope === "session" ? "allow for this session" : "allow in this repository"}
+        </button>
+      )}
+    </For>
+  </div>
+);
+
+/** A shell command's risk, next to the decision (#431); nothing for a low-risk one. */
+export const RiskLine: Component<{ risk?: ToolRisk }> = (props) => (
+  <Show when={formatToolRisk(props.risk)}>
+    {(text) => (
+      <div
+        class={`mt-1 truncate text-[11px] font-semibold ${props.risk?.level === "medium" ? "text-warn" : "text-danger"}`}
+        title={props.risk?.reasons.join("\n")}
+        data-risk={props.risk?.level}
+      >
+        ▲ {text()}
+      </div>
+    )}
+  </Show>
+);
+
+/**
+ * Whether the call runs inside the session's OS sandbox (#448), in the same
+ * words as every other surface (approvalSandboxLine). Not sandboxed is a
+ * warning: the risk line above is guidance, the sandbox is the boundary. So
+ * is a sandbox with Docker access (it can reach the whole machine).
+ */
+export const SandboxLine: Component<{ sandboxed?: boolean; sandboxNote?: string; sandboxDocker?: boolean }> = (props) => (
+  <Show when={approvalSandboxLine(props)}>
+    {(text) => (
+      <div
+        class={`mt-1 truncate text-[11px] ${approvalSandboxWarns(props) ? "font-semibold text-warn" : "text-success"}`}
+        data-sandboxed={props.sandboxed ? "yes" : "no"}
+        data-docker={props.sandboxDocker ? "yes" : undefined}
+        title={props.sandboxDocker ? DOCKER_ACCESS_WHY : undefined}
+      >
+        {text()}
+      </div>
+    )}
+  </Show>
 );
 
 const AskUserQuestionForm: Component<{
@@ -551,6 +656,9 @@ export function approve(
   approvalId: string,
   approved: boolean,
   updatedInput?: Record<string, unknown>,
+  save?: ApprovalSaveScope,
+  /** With save: the rules the card showed (the daemon refuses a save that would keep others). */
+  rules?: string[],
 ): Promise<unknown> {
   return request({
     type: "session.approve",
@@ -559,6 +667,7 @@ export function approve(
     approvalId,
     approved,
     ...(updatedInput ? { updatedInput } : {}),
+    ...(save ? { save, ...(rules ? { rules } : {}) } : {}),
   });
 }
 

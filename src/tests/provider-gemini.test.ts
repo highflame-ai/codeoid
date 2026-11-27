@@ -178,6 +178,16 @@ describe("GeminiProvider – streaming", () => {
     });
   });
 
+  it("splits cached prompt tokens out, and bills thinking as output (#430)", async () => {
+    streamChunks = [{ text: () => "ok" }];
+    usageMetadata = { promptTokenCount: 1000, cachedContentTokenCount: 600, candidatesTokenCount: 50, thoughtsTokenCount: 200 };
+    finishReason = "STOP";
+    const events = await runProvider(new GeminiProvider({ apiKey: "fake-key" }));
+    expect(events.find((e) => e.type === "turn_done")).toMatchObject({
+      result: { inputTokens: 400, cacheReadTokens: 600, outputTokens: 250 },
+    });
+  });
+
   it("emits error event when the stream throws", async () => {
     streamError = new Error("quota exceeded");
     const provider = new GeminiProvider({ apiKey: "fake-key" });

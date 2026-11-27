@@ -1,5 +1,5 @@
 import { describe, expect, it, mock } from "bun:test";
-import { dispatchSlash, parseSlash, type SlashContext } from "./slash.js";
+import { dispatchSlash, effortChangeSummary, parseSlash, type SlashContext } from "./slash.js";
 
 function ctx(): SlashContext & { sent: unknown[] } {
   const sent: unknown[] = [];
@@ -74,6 +74,18 @@ describe("parseSlash", () => {
       model: "opus",
       fallback: "sonnet",
     });
+  });
+
+  it("parses /effort: a level, default, or the picker (#417)", () => {
+    expect(parseSlash("/effort")).toEqual({ kind: "effort-picker" });
+    expect(parseSlash("/effort High")).toEqual({ kind: "effort", effort: "high" });
+    expect(parseSlash("/effort extra-high")).toEqual({ kind: "effort", effort: "xhigh" });
+    expect(parseSlash("/effort off")).toEqual({ kind: "effort", effort: "off" });
+    expect(parseSlash("/effort default")).toEqual({ kind: "effort", effort: null });
+    expect(() => parseSlash("/effort turbo")).toThrow(/off\|minimal/);
+    expect(effortChangeSummary({ effort: "max", applies: "restart" })).toMatch(/restarts/);
+    expect(effortChangeSummary({ effort: null, applies: "next-turn" })).toBe("Thinking effort: the backend's default, from the next turn.");
+    expect(effortChangeSummary({ effort: "off", applies: "next-turn", waitsForBackground: true })).toMatch(/no background work running \(Stop ends it\)/);
   });
 
   it("bare /model opens the picker instead of erroring", () => {
@@ -215,6 +227,25 @@ describe("dispatchSlash", () => {
     });
   });
 
+  it("parses /loops and /loop with and without an objective", () => {
+    expect(parseSlash("/loops")).toEqual({ kind: "loops" });
+    expect(parseSlash("/loop")).toEqual({ kind: "loop" });
+    expect(parseSlash("/loop fix the checkout test")).toEqual({ kind: "loop", objective: "fix the checkout test" });
+  });
+
+  it("/loops and /loop invoke their hooks and emit nothing", () => {
+    const showLoops = mock();
+    const showLoopStart = mock();
+    const c = { ...ctx(), showLoops, showLoopStart };
+    dispatchSlash({ kind: "loops" }, c);
+    dispatchSlash({ kind: "loop", objective: "fix it" }, c);
+    dispatchSlash({ kind: "loop" }, c);
+    expect(showLoops).toHaveBeenCalledTimes(1);
+    expect(showLoopStart).toHaveBeenNthCalledWith(1, "fix it");
+    expect(showLoopStart).toHaveBeenNthCalledWith(2, undefined);
+    expect(c.sent).toEqual([]);
+  });
+
   it("/pipeline invokes the pipeline hook with the goal and emits nothing", () => {
     const showPipeline = mock();
     const c = { ...ctx(), showPipeline };
@@ -235,6 +266,7 @@ describe("dispatchSlash", () => {
     expect(parseSlash("/mcp reconnect slack")).toEqual({ kind: "mcp-reconnect", server: "slack" });
     expect(parseSlash("/mcp reconnect")).toEqual({ kind: "capabilities", tab: "mcp" });
     expect(parseSlash("/mcp reconnect claude.ai Gmail")).toEqual({ kind: "mcp-reconnect", server: "claude.ai Gmail" });
+    expect(parseSlash("/mcp refresh")).toEqual({ kind: "mcp-refresh" }); // #395
     expect(parseSlash("/hooks")).toEqual({ kind: "capabilities", tab: "hooks" });
     expect(parseSlash("/hook")).toEqual({ kind: "capabilities", tab: "hooks" });
   });
@@ -357,5 +389,41 @@ describe("/provider", () => {
       sessionId: c.sessionId,
       providerId: "pi",
     });
+  });
+});
+
+describe("/account", () => {
+  it("parses a name, default, or --follow-default, and requires one", () => {
+    expect(parseSlash("/account Work-Max")).toEqual({ kind: "account", account: "work-max" });
+    expect(parseSlash("/account default")).toEqual({ kind: "account", account: "default" });
+    expect(parseSlash("/account --follow-default")).toEqual({ kind: "account", account: null });
+    expect(() => parseSlash("/account")).toThrow(/\/account <name>/);
+  });
+
+  it("dispatches session.set_claude_account", () => {
+    const c = ctx();
+    dispatchSlash({ kind: "account", account: null }, c);
+    expect(c.sent[0]).toMatchObject({ type: "session.set_claude_account", sessionId: c.sessionId, account: null });
+  });
+});
+
+describe("/sandbox add|remove (working across repositories)", () => {
+  it("parses a directory to add or remove, spaces and all; the provider form is unchanged", () => {
+    expect(parseSlash("/sandbox add ~/Workspace/b")).toEqual({ kind: "sandbox-dir", action: "add", path: "~/Workspace/b" });
+    expect(parseSlash("/sandbox remove /srv/my repo")).toEqual({ kind: "sandbox-dir", action: "remove", path: "/srv/my repo" });
+    expect(parseSlash("/sandbox rm /srv/x")).toEqual({ kind: "sandbox-dir", action: "remove", path: "/srv/x" });
+    expect(() => parseSlash("/sandbox add")).toThrow("/sandbox add <dir>");
+    expect(parseSlash("/sandbox bwrap off")).toEqual({ kind: "sandbox", sandbox: { provider: "bwrap", network: "off" } });
+  });
+
+  it("sends session.sandbox_dir, and says what was done unless it was asked of the owner", async () => {
+    const c = ctx();
+    dispatchSlash({ kind: "sandbox-dir", action: "add", path: "/srv/b" }, c);
+    expect(c.sent).toEqual([{ type: "session.sandbox_dir", id: "req-1", sessionId: "s1", action: "add", path: "/srv/b" }]);
+    const reports: string[] = [];
+    const withRequest = { ...ctx(), request: async () => ({ data: { message: "/srv/b removed: not writable from the session's next turn" } }), report: (t: string) => void reports.push(t) };
+    dispatchSlash({ kind: "sandbox-dir", action: "remove", path: "/srv/b" }, withRequest as never);
+    await Bun.sleep(1);
+    expect(reports).toEqual(["/srv/b removed: not writable from the session's next turn"]);
   });
 });

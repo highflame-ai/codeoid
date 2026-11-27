@@ -6,6 +6,9 @@
  *
  *   "use-tool"      → session/request_permission (allow/reject options),
  *                     runs the tool_call only when allowed
+ *   "use-edit <path>" → session/request_permission for an edit, shaped as
+ *                     gemini-cli 0.50 sends it: no rawInput, the file in
+ *                     `locations` ({path}) and in a `diff` content block
  *   "auto-tool"     → tool_call + tool_call_update without asking
  *   "echo-prompt"   → agent_message_chunk with the full prompt
  *   "echo-mcp"      → agent_message_chunk with the last session/new mcpServers
@@ -55,6 +58,29 @@ async function runTurn(sessionId: string, prompt: string): Promise<string> {
     }
     return "end_turn";
   }
+  const edit = /use-edit (\S+)/.exec(prompt);
+  if (edit) {
+    const path = edit[1]!;
+    const resp = await serverRequest("session/request_permission", {
+      sessionId,
+      toolCall: {
+        toolCallId: "tc-3",
+        status: "pending",
+        title: `Edit ${path}`,
+        content: [{ type: "diff", path, oldText: "a", newText: "b" }],
+        locations: [{ path }],
+        kind: "edit",
+      },
+      options: [
+        { optionId: "allow-1", name: "Allow", kind: "allow_once" },
+        { optionId: "reject-1", name: "Reject", kind: "reject_once" },
+      ],
+    });
+    const outcome = (resp.result as { outcome?: { outcome?: string; optionId?: string } } | undefined)?.outcome;
+    const allowed = outcome?.outcome === "selected" && outcome.optionId === "allow-1";
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: allowed ? "Edited." : "Permission refused; skipping." } });
+    return "end_turn";
+  }
   if (prompt.includes("auto-tool")) {
     update(sessionId, { sessionUpdate: "tool_call", toolCallId: "tc-2", title: "Read file", kind: "read", rawInput: { path: "a.ts" } });
     update(sessionId, { sessionUpdate: "tool_call_update", toolCallId: "tc-2", status: "completed", content: [{ content: { type: "text", text: "export {}" } }] });
@@ -66,6 +92,33 @@ async function runTurn(sessionId: string, prompt: string): Promise<string> {
     return "end_turn";
   }
 
+  if (prompt.startsWith("read-file:")) {
+    // What this process can read at a path (the OS sandbox tests, #448).
+    let text: string;
+    try {
+      text = `CONTENT:${(await Bun.file(prompt.slice("read-file:".length).trim()).text()).trim()}`;
+    } catch (err) {
+      text = `UNREADABLE:${err instanceof Error ? err.message : String(err)}`;
+    }
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+    return "end_turn";
+  }
+  if (prompt.startsWith("write-file:")) {
+    // Whether this process can write a path (`write-file:<path>`; the OS sandbox tests, #448 round 1).
+    let text: string;
+    try {
+      await Bun.write(prompt.slice("write-file:".length).trim(), "WRITTEN-BY-BACKEND\n");
+      text = "WROTE";
+    } catch (err) {
+      text = `UNWRITABLE:${err instanceof Error ? err.message : String(err)}`;
+    }
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+    return "end_turn";
+  }
+  if (prompt.startsWith("echo-env:")) {
+    update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `ENV:${process.env[prompt.slice("echo-env:".length).trim()] ?? ""}` } });
+    return "end_turn";
+  }
   if (prompt.includes("echo-prompt")) {
     update(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `PROMPT:${prompt}` } });
     return "end_turn";

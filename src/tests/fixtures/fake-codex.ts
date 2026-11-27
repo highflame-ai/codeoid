@@ -37,6 +37,8 @@ const pendingServerReqs = new Map<number, (result: Record<string, unknown>) => v
  *  the "echo-policy" prompt so the provider's wire params can be asserted. */
 let lastThreadPolicies: Record<string, unknown> = {};
 let lastTurnPolicies: Record<string, unknown> = {};
+/** turn/start's `effort` (#417), echoed by "echo-effort". */
+let lastTurnEffort: unknown = "(absent)";
 /** thread/fork and thread/inject_items calls, in order — echoed by "echo-native" (#387). */
 const nativeCalls: Array<{ method: string; params: Record<string, unknown> }> = [];
 
@@ -50,7 +52,13 @@ function serverRequest(method: string, params: Record<string, unknown>): Promise
 function tokenUsage() {
   return { totalTokens: 165, inputTokens: 120, cachedInputTokens: 20, outputTokens: 45, reasoningOutputTokens: 0 };
 }
+/** The running total per thread, as real codex keeps it (#430). */
+const threadTotals = new Map<string, ReturnType<typeof tokenUsage>>();
 function emitUsage(threadId: string): void {
+  const last = tokenUsage();
+  const prev = threadTotals.get(threadId);
+  const total = prev ? Object.fromEntries(Object.entries(last).map(([k, v]) => [k, v + prev[k as keyof typeof last]])) as typeof last : last;
+  threadTotals.set(threadId, total);
   send({
     method: "thread/tokenUsage/updated",
     // `ThreadTokenUsage` carries THREE fields on the real wire — `last`,
@@ -60,7 +68,7 @@ function emitUsage(threadId: string): void {
     params: {
       threadId,
       turnId: "turn-1",
-      tokenUsage: { total: tokenUsage(), last: tokenUsage(), modelContextWindow: 272_000 },
+      tokenUsage: { total, last, modelContextWindow: 272_000 },
     },
   });
 }
@@ -310,6 +318,8 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
     const resp = await serverRequest("custom/unknownThing", { anything: true });
     const text = resp.__error ? "server-request-errored" : "server-request-oddly-ok";
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
+  } else if (prompt.includes("echo-effort")) {
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: JSON.stringify({ effort: lastTurnEffort }) } } });
   } else if (prompt.includes("echo-policy")) {
     const text = JSON.stringify({ thread: lastThreadPolicies, turn: lastTurnPolicies });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
@@ -317,8 +327,37 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
     // Surface the `-c mcp_servers.*` overrides + token env the provider spawned
     // us with, so the memory mount wiring can be asserted offline.
     const mcpArgs = process.argv.filter((a) => a.includes("mcp_servers"));
-    const text = JSON.stringify({ mcpArgs, token: process.env.CODEOID_MEMORY_TOKEN ?? null });
+    const text = JSON.stringify({
+      mcpArgs,
+      token: process.env.CODEOID_MEMORY_TOKEN ?? null,
+      proxyToken: process.env.CODEOID_MCP_PROXY_TOKEN ?? null,
+      shellEnvArgs: process.argv.filter((a) => a.startsWith("shell_environment_policy")),
+      argv: process.argv,
+    });
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
+  } else if (prompt.startsWith("read-file:")) {
+    // What this process can read at a path (the OS sandbox tests, #448).
+    const path = prompt.slice("read-file:".length).trim();
+    let text: string;
+    try {
+      text = `CONTENT:${(await Bun.file(path).text()).trim()}`;
+    } catch (err) {
+      text = `UNREADABLE:${err instanceof Error ? err.message : String(err)}`;
+    }
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
+  } else if (prompt.startsWith("write-file:")) {
+    // Whether this process can write a path (`write-file:<path>`; the OS sandbox tests, #448 round 1).
+    let text: string;
+    try {
+      await Bun.write(prompt.slice("write-file:".length).trim(), "WRITTEN-BY-BACKEND\n");
+      text = "WROTE";
+    } catch (err) {
+      text = `UNWRITABLE:${err instanceof Error ? err.message : String(err)}`;
+    }
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text } } });
+  } else if (prompt.includes("echo-env")) {
+    // The environment the provider spawned us with (extraEnv wiring).
+    send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: JSON.stringify(process.env) } } });
   } else if (prompt.includes("echo-native")) {
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: JSON.stringify(nativeCalls) } } });
   } else if (prompt.includes("echo-prompt")) {
@@ -330,7 +369,19 @@ async function runTurn(threadId: string, prompt: string): Promise<void> {
     send({ method: "item/completed", params: { item: { id: "m1", type: "agentMessage", text: "Hello world" } } });
   }
 
-  emitUsage(threadId);
+  if (prompt.includes("no-total")) {
+    // An older codex: per-request usage only, no running total.
+    for (let i = 0; i < 2; i++) send({ method: "thread/tokenUsage/updated", params: { threadId, turnId: "turn-1", tokenUsage: { last: tokenUsage() } } });
+  } else if (prompt.includes("multi-request")) {
+    // A turn of three model requests: `last` is each one, `total` the thread's running sum (#430).
+    const req = { totalTokens: 1100, inputTokens: 1000, cachedInputTokens: 400, outputTokens: 100, reasoningOutputTokens: 30 };
+    for (let i = 1; i <= 3; i++) {
+      const total = Object.fromEntries(Object.entries(req).map(([k, v]) => [k, v * i]));
+      send({ method: "thread/tokenUsage/updated", params: { threadId, turnId: "turn-1", tokenUsage: { total, last: req, modelContextWindow: 272_000 } } });
+    }
+  } else if (!prompt.includes("no-usage")) {
+    emitUsage(threadId);
+  }
   send({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed" } } });
 }
 
@@ -384,7 +435,7 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       const bad = sandboxPolicyError(params.sandboxPolicy);
       if (bad) return void send({ id, error: { code: -32602, message: bad } });
       lastThreadPolicies = { approvalPolicy: params.approvalPolicy, sandboxPolicy: params.sandboxPolicy };
-      send({ id, result: { thread: { id: "codex-thread-1" } } });
+      send({ id, result: { thread: { id: "codex-thread-1" }, model: "gpt-5.6-terra" } });
       send({ method: "thread/started", params: { thread: { id: "codex-thread-1" } } });
       break;
     }
@@ -404,14 +455,41 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       break;
     }
     case "thread/resume":
+      // A thread this codex home doesn't have (another account's, a pruned rollout).
+      if (String(params.threadId ?? "").startsWith("missing-")) {
+        return void send({ id, error: { code: -32600, message: "thread not found" } });
+      }
       send({ id, result: { thread: { id: String(params.threadId ?? "codex-thread-1") } } });
+      break;
+    case "config/read":
+      // The user's configured effort (#417), set by the test through the env.
+      send({
+        id,
+        result: {
+          // A project layer (read only with a cwd, as codex does) outranks the user's.
+          config: {
+            model_reasoning_effort: (params.cwd ? process.env.CODEX_FAKE_PROJECT_EFFORT : undefined) || process.env.CODEX_FAKE_CONFIG_EFFORT || null,
+            model: process.env.CODEX_FAKE_CONFIG_MODEL || null,
+          },
+          origins: {},
+          layers: null,
+        },
+      });
       break;
     case "model/list":
       send({
         id,
         result: {
           data: [
-            { id: "gpt-5.6-terra", model: "gpt-5.6-terra", displayName: "GPT-5.6-Terra", description: "Balanced agentic coding model." },
+            {
+              id: "gpt-5.6-terra",
+              model: "gpt-5.6-terra",
+              displayName: "GPT-5.6-Terra",
+              description: "Balanced agentic coding model.",
+              supportedReasoningEfforts: [{ reasoningEffort: "none" }, { reasoningEffort: "low" }, { reasoningEffort: "high" }, { reasoningEffort: "ultra" }],
+              defaultReasoningEffort: "low",
+              ...(process.env.CODEX_FAKE_LIST_DEFAULT ? { isDefault: true } : {}),
+            },
           ],
         },
       });
@@ -420,6 +498,7 @@ async function handle(frame: Record<string, unknown>): Promise<void> {
       const bad = sandboxPolicyError(params.sandboxPolicy);
       if (bad) return void send({ id, error: { code: -32602, message: bad } });
       lastTurnPolicies = { approvalPolicy: params.approvalPolicy, sandboxPolicy: params.sandboxPolicy };
+      lastTurnEffort = "effort" in params ? params.effort : "(absent)";
       send({ id, result: { turn: { id: "turn-1" } } });
       const input = params.input as Array<{ type: string; text?: string }> | undefined;
       const prompt = input?.find((i) => i.type === "text")?.text ?? "";

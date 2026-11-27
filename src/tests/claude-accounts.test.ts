@@ -43,7 +43,8 @@ describe("ClaudeAccountStore", () => {
     const store = storeAt();
     store.upsert({ name: "personal", kind: "subscription", token: "sk-ant-oat01-PERSONAL" });
     store.upsert({ name: "gw-a", kind: "gateway", token: "gw-secret", baseUrl: "https://gw.example", headers: { "x-workspace": "ws-a" } });
-    expect(statSync(join(dir, "claude-accounts.json")).mode & 0o777).toBe(0o600);
+    // Stored with every backend's accounts (accounts.ts), 0600.
+    expect(statSync(join(dir, "accounts.json")).mode & 0o777).toBe(0o600);
     const listed = JSON.stringify(store.list());
     expect(listed).not.toContain("sk-ant-oat01-PERSONAL");
     expect(listed).not.toContain("gw-secret");
@@ -85,7 +86,10 @@ describe("ClaudeAccountStore", () => {
   test("a corrupt store fails closed; an invalid hand-edited entry is ignored, never applied", () => {
     const path = join(dir, "claude-accounts.json");
     writeFileSync(path, "{not json");
-    expect(() => storeAt().list()).toThrow(ClaudeAccountError);
+    // Fails closed for Claude (not for every backend): no session runs on an
+    // account — or a default — that can't be read.
+    expect(() => storeAt().resolve(null)).toThrow(/not valid JSON/);
+    rmSync(join(dir, "accounts.json"), { force: true });
     writeFileSync(
       path,
       JSON.stringify({
@@ -98,6 +102,22 @@ describe("ClaudeAccountStore", () => {
     );
     expect(storeAt().list().map((a) => a.name)).toEqual(["ok"]);
     expect(() => storeAt().resolve("weird")).toThrow(/no longer exists/);
+  });
+
+  test("#392's claude-accounts.json is imported once, and left as it was", () => {
+    const legacy = join(dir, "claude-accounts.json");
+    const before = JSON.stringify({
+      version: 1,
+      defaultAccount: "work",
+      accounts: [{ name: "work", kind: "subscription", token: "sk-ant-oat01-WORK", createdAt: "2026-01-01T00:00:00Z", updatedAt: "2026-01-01T00:00:00Z" }],
+    });
+    writeFileSync(legacy, before);
+    expect(storeAt().getDefault()).toBe("work");
+    expect(storeAt().resolve(null)?.name).toBe("work");
+    expect(readFileSync(legacy, "utf8")).toBe(before);
+    // Imported once: a later change to the old file is not re-read.
+    writeFileSync(legacy, JSON.stringify({ version: 1, accounts: [] }));
+    expect(storeAt().get("work")?.token).toBe("sk-ant-oat01-WORK");
   });
 
   test("a literal \"default\" pins the built-in account whatever the daemon default is", () => {
@@ -122,7 +142,7 @@ describe("ClaudeAccountStore", () => {
     }
   });
 
-  test("default handling: built-in until set; removing the default account clears it", () => {
+  test("default handling: built-in until set; the default account can't be removed from under its followers", () => {
     const store = storeAt();
     expect(store.getDefault()).toBe("default");
     expect(store.resolve(null)).toBeNull(); // the daemon's own environment
@@ -130,7 +150,9 @@ describe("ClaudeAccountStore", () => {
     store.setDefault("work");
     expect(store.resolve(null)?.name).toBe("work");
     expect(() => store.setDefault("nope")).toThrow(ClaudeAccountError);
-    store.remove("work");
+    expect(() => store.remove("work")).toThrow(/set another default/);
+    store.setDefault("default");
+    expect(store.remove("work")).toBe(true);
     expect(store.getDefault()).toBe("default");
   });
 
@@ -277,7 +299,10 @@ describe("daemon surface", () => {
     expect(JSON.stringify(set)).not.toContain("sk-ant-oat01-WIRE");
     const def = await handle({ type: "claude.accounts.set_default", id: "s2", name: "work" });
     expect(def).toMatchObject({ type: "claude.accounts.result", defaultAccount: "work" });
-    const rm = await handle({ type: "claude.accounts.remove", id: "s3", name: "work" });
+    const refused = await handle({ type: "claude.accounts.remove", id: "s3", name: "work" });
+    expect(refused).toMatchObject({ type: "response.error", code: "invalid_request", error: expect.stringContaining("set another default") });
+    await handle({ type: "claude.accounts.set_default", id: "s4", name: "default" });
+    const rm = await handle({ type: "claude.accounts.remove", id: "s5", name: "work" });
     expect(rm).toMatchObject({ type: "claude.accounts.result", defaultAccount: "default", accounts: [] });
   });
 
@@ -358,11 +383,11 @@ describe("daemon surface", () => {
     expect(String((sent as { error?: string }).error)).toContain("env.ANTHROPIC_BASE_URL");
     // Model settings in the same file are fine.
     writeFileSync(join(dir, ".claude", "settings.json"), JSON.stringify({ env: { ANTHROPIC_MODEL: "claude-opus-5-5" } }));
-    expect(projectCredentialOverride(dir)).toBeNull();
+    expect(projectCredentialOverride(dir, "subscription")).toBeNull();
     writeFileSync(join(dir, ".claude", "settings.local.json"), JSON.stringify({ env: { HTTPS_PROXY: "http://evil:8080" } }));
-    expect(projectCredentialOverride(dir)?.key).toBe("env.HTTPS_PROXY");
+    expect(projectCredentialOverride(dir, "subscription")?.key).toBe("env.HTTPS_PROXY");
     writeFileSync(join(dir, ".claude", "settings.local.json"), JSON.stringify({ apiKeyHelper: "/tmp/x.sh" }));
-    expect(projectCredentialOverride(dir)?.key).toBe("apiKeyHelper");
+    expect(projectCredentialOverride(dir, "subscription")?.key).toBe("apiKeyHelper");
   });
 
   test("a session whose account was removed refuses to send — it never falls back", async () => {

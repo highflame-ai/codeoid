@@ -35,7 +35,7 @@ function say(provider: string, text: string): ProviderEvent[] {
     { type: "text_done", content: text } as ProviderEvent,
     {
       type: "turn_done",
-      result: { providerId: provider, model: "mock", inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0.01, durationMs: 7 },
+      result: { providerId: provider, model: "mock", inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0.01, costSource: "backend", durationMs: 7 },
     } as ProviderEvent,
   ];
 }

@@ -57,5 +57,11 @@ export function resolveAgainstList(
     if (m.displayName.toLowerCase() === lower) return m.value;
   }
   if (/^claude-/i.test(t)) return t;
+  // A Bedrock model id or inference-profile ARN, for a session on a Bedrock
+  // account: its catalog isn't the shared one, so these are never listed.
+  if (BEDROCK_MODEL_ID.test(t)) return t;
   return null;
 }
+
+/** `anthropic.claude-…`, with a region / `global` prefix or not, or a Bedrock ARN. */
+const BEDROCK_MODEL_ID = /^(?:arn:aws[a-z-]*:bedrock:\S+|(?:[a-z]{2,8}\.)?anthropic\.claude-\S+)$/i;

@@ -7,18 +7,34 @@
 
 import { mock, describe, it, expect, beforeEach } from "bun:test";
 import type { ProviderEvent, TurnOpts, UiRequest } from "../daemon/providers/interface.js";
+import type { EffortLevel } from "../protocol/types.js";
+import * as realOpenAIModule from "openai";
+
+/**
+ * The real SDK, captured (as a value, not a live binding) before the mock
+ * below replaces the module. `mock.module` is process-wide in bun:test, so
+ * without this every later test file that drives a REAL OpenAI-compatible
+ * server through the SDK (openai-endpoints.test.ts) would get this mock.
+ */
+const RealOpenAI = realOpenAIModule.default;
 
 // ── OpenAI mock ───────────────────────────────────────────────────────────────
 
 type ToolCallDelta = { index: number; id?: string; function?: { name?: string; arguments?: string } };
 type CompletionChunk = {
   choices: Array<{ delta?: { content?: string | null; tool_calls?: ToolCallDelta[] }; finish_reason?: string | null }>;
-  usage?: { prompt_tokens?: number; completion_tokens?: number } | null;
+  usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number } } | null;
 };
 type ModelItem = { id: string };
 
 let streamChunks: CompletionChunk[] = [];
 let streamError: Error | null = null;
+/** When set, create() itself rejects: the server refused the request (#430). */
+let createError: Error | null = null;
+/** Errors for the next create() calls, one per call, before createError (#430). */
+let createErrors: Error[] = [];
+/** The request options passed to each create() (#430). */
+const createOpts: unknown[] = [];
 let modelsResult: ModelItem[] | Error = [];
 /** When set, drives a multi-round tool-loop: each create() shifts one round. */
 let roundScript: CompletionChunk[][] | null = null;
@@ -43,20 +59,27 @@ function streamFrom(chunks: CompletionChunk[]): AsyncIterable<CompletionChunk> {
 
 mock.module("openai", () => {
   return {
-    default: class OpenAI {
-      chat = {
-        completions: {
-          create: async (body: Record<string, unknown>, _opts: unknown) => {
-            sentBodies.push(body);
-            if (roundScript) return streamFrom(roundScript.shift() ?? []);
-            return streamFrom([...streamChunks]);
+    default: function OpenAI(opts?: ConstructorParameters<typeof RealOpenAI>[0]) {
+      if (opts?.baseURL) return new RealOpenAI(opts);
+      return {
+        chat: {
+          completions: {
+            create: async (body: Record<string, unknown>, opts: unknown) => {
+              sentBodies.push(body);
+              createOpts.push(opts);
+              const next = createErrors.shift();
+              if (next) throw next;
+              if (createError) throw createError;
+              if (roundScript) return streamFrom(roundScript.shift() ?? []);
+              return streamFrom([...streamChunks]);
+            },
           },
         },
-      };
-      models = {
-        list: async () => {
-          if (modelsResult instanceof Error) throw modelsResult;
-          return { data: modelsResult };
+        models: {
+          list: async () => {
+            if (modelsResult instanceof Error) throw modelsResult;
+            return { data: modelsResult };
+          },
         },
       };
     },
@@ -120,9 +143,101 @@ describe("OpenAIProvider – streaming", () => {
   beforeEach(() => {
     streamChunks = [];
     streamError = null;
+    createError = null;
+    createErrors = [];
+    createOpts.length = 0;
     modelsResult = [];
     roundScript = null;
     sentBodies.length = 0;
+  });
+
+  it("sends the thinking effort as reasoning_effort, on OpenAI's scale (#417)", async () => {
+    const done = [{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }];
+    const effortOf = async (effort?: EffortLevel) => {
+      streamChunks = [...done];
+      sentBodies.length = 0;
+      await runProvider(new OpenAIProvider({ apiKey: "k" }), "hi", effort ? { effort } : {});
+      return sentBodies[0]?.reasoning_effort;
+    };
+    expect(await effortOf("high")).toBe("high");
+    expect(await effortOf("off")).toBe("none");
+    expect(await effortOf("max")).toBe("xhigh"); // nothing above XHigh
+    expect(await effortOf()).toBeUndefined(); // the default: nothing sent
+  });
+
+  it("splits cached prompt tokens out of prompt_tokens (#430)", async () => {
+    streamChunks = [
+      { choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] },
+      { choices: [{}], usage: { prompt_tokens: 1000, completion_tokens: 40, prompt_tokens_details: { cached_tokens: 700 } } },
+    ];
+    const events = await runProvider(new OpenAIProvider({ apiKey: "fake-key" }));
+    const done = events.find((e) => e.type === "turn_done") as Extract<ProviderEvent, { type: "turn_done" }>;
+    expect(done.result).toMatchObject({ inputTokens: 300, cacheReadTokens: 700, outputTokens: 40 });
+    expect(done.result.costSource).toBeUndefined(); // the session prices it
+  });
+
+  it("says when it sends a request, and what each request used (#430)", async () => {
+    streamChunks = [
+      { choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] },
+      { choices: [{}], usage: { prompt_tokens: 1000, completion_tokens: 40, prompt_tokens_details: { cached_tokens: 700 } } },
+    ];
+    const events = await runProvider(new OpenAIProvider({ apiKey: "fake-key" }));
+    expect(events[0]).toEqual({ type: "model_request" });
+    expect(events.find((e) => e.type === "llm_call")).toMatchObject({ isPrimary: true, usage: { inputTokens: 300, cacheReadTokens: 700, outputTokens: 40 } });
+  });
+
+  it("a request the server refuses is not counted as sent (#430)", async () => {
+    createError = Object.assign(new Error("401 invalid api key"), { status: 401 });
+    const events = await runProvider(new OpenAIProvider({ apiKey: "fake-key" }));
+    expect(events.some((e) => e.type === "model_request")).toBe(false);
+    expect(events.some((e) => e.type === "error")).toBe(true);
+  });
+
+  it("a request that failed any other way may have been billed: it counts as sent (#430)", async () => {
+    createError = Object.assign(new Error("502 bad gateway"), { status: 502 });
+    const events = await runProvider(new OpenAIProvider({ apiKey: "fake-key" }));
+    expect(events.some((e) => e.type === "model_request")).toBe(true);
+  });
+
+  it("no silent SDK retries — each attempt may be billed; a rate limit is retried here, unbilled (#430)", async () => {
+    createErrors = [Object.assign(new Error("429"), { status: 429 })];
+    streamChunks = [
+      { choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] },
+      { choices: [{}], usage: { prompt_tokens: 10, completion_tokens: 1 } },
+    ];
+    const events = await runProvider(new OpenAIProvider({ apiKey: "fake-key" }));
+    expect(createOpts.every((o) => (o as { maxRetries?: number }).maxRetries === 0)).toBe(true);
+    expect(createOpts).toHaveLength(2);
+    expect(events.filter((e) => e.type === "model_request")).toHaveLength(1); // the refused attempt spent nothing
+    expect(events.at(-1)?.type).toBe("turn_done");
+  });
+
+  it("a server that splits usage across chunks: the request's input isn't lost (#430)", async () => {
+    streamChunks = [
+      { choices: [{ delta: { content: "a" } }], usage: { prompt_tokens: 900 } },
+      { choices: [{ delta: { content: "b" }, finish_reason: "stop" }], usage: { completion_tokens: 30 } },
+    ];
+    const events = await runProvider(new OpenAIProvider({ apiKey: "fake-key" }));
+    expect(events.find((e) => e.type === "turn_done")).toMatchObject({ result: { inputTokens: 900, outputTokens: 30 } });
+  });
+
+  it("a server that repeats usage on every chunk: the request is counted once, at its last figures (#430)", async () => {
+    streamChunks = [
+      { choices: [{ delta: { content: "a" } }], usage: { prompt_tokens: 100, completion_tokens: 1 } },
+      { choices: [{ delta: { content: "b" }, finish_reason: "stop" }], usage: { prompt_tokens: 100, completion_tokens: 2 } },
+    ];
+    const events = await runProvider(new OpenAIProvider({ apiKey: "fake-key" }));
+    expect(events.filter((e) => e.type === "llm_call")).toHaveLength(1);
+    expect(events.find((e) => e.type === "turn_done")).toMatchObject({ result: { inputTokens: 100, outputTokens: 2 } });
+  });
+
+  it("a local server's turns are free (#430)", async () => {
+    streamChunks = [
+      { choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] },
+      { choices: [{}], usage: { prompt_tokens: 10, completion_tokens: 5 } },
+    ];
+    const events = await runProvider(new OpenAIProvider({ apiKey: "", free: true }));
+    expect(events.find((e) => e.type === "turn_done")).toMatchObject({ result: { costSource: "free" } });
   });
 
   it("emits text_delta + text_done + turn_done for a normal response", async () => {
@@ -281,6 +396,29 @@ describe("OpenAIProvider – a second OpenAI-compatible backend", () => {
     expect(await provider.listModels()).toEqual([
       { id: "/models/Qwen2.5-7B-Instruct-Q8_0.gguf", displayName: "Qwen2.5-7B-Instruct-Q8_0.gguf" },
     ]);
+  });
+
+  it("an empty key stays empty — the user's OPENAI_API_KEY never goes to a local server", async () => {
+    const auths: Array<string | null> = [];
+    const server = Bun.serve({
+      port: 0,
+      hostname: "127.0.0.1",
+      fetch(req) {
+        auths.push(req.headers.get("authorization"));
+        return Response.json({ data: [{ id: "local" }] });
+      },
+    });
+    const saved = process.env.OPENAI_API_KEY;
+    process.env.OPENAI_API_KEY = "sk-users-real-key";
+    try {
+      const provider = new OpenAIProvider({ apiKey: "", baseURL: `http://127.0.0.1:${server.port}/v1`, modelFilter: () => true, fallbackModels: [] });
+      await provider.listModels();
+      expect(auths).toEqual(["Bearer not-needed"]);
+    } finally {
+      if (saved === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = saved;
+      server.stop(true);
+    }
   });
 
   it("lists nothing, not GPT models, when a local server is down", async () => {

@@ -26,9 +26,10 @@ import type {
 	SessionInfo,
 	SessionMessage,
 	ToolInfo,
+	ToolRisk,
 	ToolState,
 } from "../../protocol/types.js";
-import { formatCollaborationCost, isBackgroundWake, parseBackgroundWake } from "@highflame/codeoid-core";
+import { formatCollaborationCost, formatToolRisk, isBackgroundWake, parseBackgroundWake } from "@highflame/codeoid-core";
 import { renderMarkdown, type Segment } from "../markdown.js";
 import { computeDiff, truncateToolOutput } from "../diff.js";
 import { fileUri, maybeLink } from "../osc8.js";
@@ -274,6 +275,12 @@ function renderToolRow(
 		const cost = (tool.state as { collaborationCost?: CollaborationCost })
 			.collaborationCost;
 		if (cost) lines.push(dim(`  \u25c7 ${formatCollaborationCost(cost)}`));
+		const risk = formatToolRisk((tool.state as { risk?: ToolRisk }).risk);
+		if (risk) lines.push(red(`  \u25b2 ${risk}`));
+		// The workstream a fleet dispatch acts in, and what approving confirms (workstreams §10).
+		const tw = (tool.state as { targetWorkstream?: { workstream?: string; warning?: string } }).targetWorkstream;
+		if (tw?.workstream) lines.push(dim(`  \u2302 workstream ${tw.workstream}`));
+		if (tw?.warning) lines.push(red(`  \u26a0 ${tw.warning}`));
 	}
 
 	if (isEdit) {

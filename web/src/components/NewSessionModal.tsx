@@ -22,12 +22,45 @@ import {
   onMount,
 } from "solid-js";
 
-import { authIdentity, newRequestId, refreshSessions, request } from "../state/connection";
+import { newRequestId, refreshSessions, request } from "../state/connection";
 import { fetchPacks, packsState } from "../state/packs";
 import { runPipeline } from "../state/pipelines";
 import { focusSession, mergeSession, sessionList } from "../state/sessions";
-import type { PackWire, SessionInfo } from "../protocol/types";
+import type { PackWire, SandboxProviderWire, SessionInfo } from "../protocol/types";
+
+/** The `sandbox.providers` reply's data (#448). */
+interface SandboxProvidersData {
+  enabled: boolean;
+  auto: string | null;
+  default: { provider: string; network: string; dockerSocket?: boolean; projectRoots?: string[] };
+  providers: SandboxProviderWire[];
+}
+
+/** A list typed in a field: comma- or newline-separated, trimmed. */
+function dirList(text: string): string[] {
+  return text
+    .split(/[,\n]/)
+    .map((d) => d.trim())
+    .filter(Boolean);
+}
+
+/** What the daemon's default project roots mean, in words. */
+function rootsDefaultLabel(d: SandboxProvidersData | null): string {
+  const roots = d?.default.projectRoots ?? ["@parent"];
+  if (roots.length === 0) return "none";
+  return roots.map((r) => (r === "@parent" ? "the repository's parent" : r)).join(", ");
+}
+
+function sandboxDefaultLabel(d: SandboxProvidersData | null): string {
+  if (!d) return "auto";
+  const p = d.default.provider === "auto" && d.auto ? `auto: ${d.auto}` : d.default.provider;
+  return `${p}, network ${d.default.network}${d.default.dockerSocket ? ", Docker access" : ""}`;
+}
 import DirectoryPicker from "./files/DirectoryPicker";
+import { providerIds, providerLabel } from "../state/providers";
+import { accountDetail, backendAccounts, DEFAULT_ACCOUNT, fetchAccounts } from "../state/accounts";
+import { fetchWorkstreams, homeChoices, resolveWorkstream, workstreamsState } from "../state/workstreams";
+import type { WorkstreamResolution } from "../protocol/types";
 
 /** The modal serves three flows from one dialog: a plain session, a governed
  *  pipeline run (docs/pipeline-run.md — adds a goal box + requires a pack), or
@@ -127,6 +160,62 @@ const NewSessionModal: Component = () => {
   const [pickerOpen, setPickerOpen] = createSignal(false);
   // "" = daemon default (first advertised provider).
   const [providerId, setProviderId] = createSignal("");
+  // Account for the backend the session lands on: "" = follow that backend's
+  // daemon default, "default" = pin the daemon's own login, else a named
+  // account (accounts.ts). Names are per backend, so a provider change resets it.
+  const [account, setAccount] = createSignal("");
+  // Home workstream (docs/workstreams-design.md): "" = the folder's (what
+  // `workstream.resolve` says), else an explicit choice.
+  const [workstream, setWorkstream] = createSignal("");
+  // Other workstreams the session may read (§7.2): their folders read-only, and their memory.
+  const [references, setReferences] = createSignal<string[]>([]);
+  const [resolution, setResolution] = createSignal<WorkstreamResolution | null>(null);
+  // The folder couldn't be checked (a scope, an unreadable folder): said as such, never as "none matches".
+  const [resolveFailed, setResolveFailed] = createSignal(false);
+  let workstreamSelect: HTMLSelectElement | undefined;
+  let createButton: HTMLButtonElement | undefined;
+  // A choice refused past another workstream's exclusive claim, with the token
+  // that confirms it (G3): shown with what would change, never sent unasked.
+  const [overrideOffer, setOverrideOffer] = createSignal<NonNullable<WorkstreamResolution["conflict"]> | null>(null);
+  // What the folder resolves to, as it is typed or picked (debounced).
+  createEffect(
+    on([workdir, openSignal, () => homeChoices().length, mode], ([dir, open, homes]) => {
+      setOverrideOffer(null);
+      // The last folder's answer never stands for this one, even for the debounce.
+      setResolution(null);
+      setResolveFailed(false);
+      if (!open || homes === 0 || !dir.trim()) return;
+      const timer = setTimeout(() => {
+        resolveWorkstream(dir.trim())
+          .then((r) => {
+            if (workdir() === dir) setResolution(r);
+          })
+          .catch(() => {
+            if (workdir() === dir) setResolveFailed(true);
+          });
+      }, 300);
+      onCleanup(() => clearTimeout(timer));
+    }),
+  );
+  // OS sandbox (#448): "" = the daemon's default; else auto | off | a provider id.
+  const [sandboxChoice, setSandboxChoice] = createSignal("");
+  // "" = the daemon's default network; else on | off.
+  const [sandboxNetwork, setSandboxNetwork] = createSignal("");
+  // Docker access (the container runtime's socket): off unless ticked, or the daemon's default has it.
+  const [sandboxDocker, setSandboxDocker] = createSignal(false);
+  // Working across repositories: "" = the daemon's project roots; "none" = none; else a list. Added dirs: writable too.
+  const [sandboxRoots, setSandboxRoots] = createSignal("");
+  const [sandboxAdded, setSandboxAdded] = createSignal("");
+  // The sandbox choice is opened on demand ("change"), and only then asks the
+  // daemon what it has (absent: an older daemon, or no sandboxing).
+  const [sandboxOpen, setSandboxOpen] = createSignal(false);
+  const [sandboxProviders, setSandboxProviders] = createSignal<SandboxProvidersData | null>(null);
+  function openSandboxChoice(): void {
+    setSandboxOpen(true);
+    request({ type: "sandbox.providers", id: newRequestId() })
+      .then((data) => setSandboxProviders(data as SandboxProvidersData))
+      .catch(() => setSandboxProviders(null));
+  }
   // Ambient pack activation (docs/pack-loading.md): "" = freestyle (no pack).
   const [packId, setPackId] = createSignal("");
   // Capability role declared by the chosen pack; "" = no role restriction.
@@ -180,7 +269,29 @@ const NewSessionModal: Component = () => {
 
   // Backends this daemon registered (auth.ok `providers`, default first).
   // Older daemons don't advertise — hide the picker, sessions stay claude.
-  const providers = createMemo<string[]>(() => authIdentity()?.providers ?? []);
+  const providers = createMemo<string[]>(() => providerIds());
+  // The backend the session will land on: the chosen one, else the default.
+  const effectiveProvider = () => providerId() || providers()[0] || "claude";
+  // The landing backend's accounts — only worth asking when there is more
+  // than the built-in one to choose from.
+  const providerAccounts = () => backendAccounts(effectiveProvider());
+  const showAccountPicker = () => (providerAccounts()?.accounts.length ?? 0) > 0;
+  // An account name means something only on the backend it was picked from.
+  // The landing backend can change under it without a click — the daemon's
+  // default backend moves (providers.changed) — so follow the backend, not the
+  // buttons.
+  // A memo, so it changes only when the landing backend does: a refreshed
+  // providers list (a reconnect, another client's endpoint edit) is a new
+  // array with the same backend, and must not clear the chosen account.
+  const landing = createMemo(effectiveProvider);
+  createEffect(on(landing, () => setAccount(""), { defer: true }));
+  // And a named account another client removed is no choice at all — judged
+  // only against a loaded list, never one that's being fetched again.
+  createEffect(() => {
+    const a = account();
+    const list = providerAccounts();
+    if (a && a !== DEFAULT_ACCOUNT && list && !list.accounts.some((x) => x.name === a)) setAccount("");
+  });
 
   // Installed packs from the daemon-canonical pack state. Empty when none are
   // installed OR when the fetch was rejected (e.g. the session token lacks
@@ -343,7 +454,16 @@ const NewSessionModal: Component = () => {
         // errors (it sets pack-state.error rather than rejecting), but guard
         // anyway so a rejected read can never break opening the modal.
         void fetchPacks().catch(() => {});
-        requestAnimationFrame(() => nameRef?.focus());
+        // Named accounts, for the account picker (hidden without any).
+        void fetchAccounts(true).catch(() => {});
+        // Workstreams, for the workstream picker (hidden without any).
+        void fetchWorkstreams(true).catch(() => {});
+        // Only if focus is still outside the dialog: by the next frame the user
+        // may already be typing in another field, and moving focus then would
+        // send the rest of their typing into the name.
+        requestAnimationFrame(() => {
+          if (!nameRef?.form?.contains(document.activeElement)) nameRef?.focus();
+        });
       }
     }),
   );
@@ -375,13 +495,67 @@ const NewSessionModal: Component = () => {
     setWorkdir("");
     setGoal("");
     setProviderId("");
+    setAccount("");
+    setWorkstream("");
+    setReferences([]);
+    setResolution(null);
+    setOverrideOffer(null);
     setPackId("");
     setPackRole("");
+    setSandboxChoice("");
+    setSandboxNetwork("");
+    setSandboxDocker(false);
+    setSandboxOpen(false);
     setRoles(defaultRoles());
     setWarnings([]);
   }
 
-  async function submit(ev: Event): Promise<void> {
+  /** The home the session would get: the choice, else what the folder resolves to. */
+  const homeNow = () => workstream() || resolution()?.home || "";
+  /** Workstreams it could read: not closed, not its home. Only under isolation, where a reference means something. */
+  const readable = () => (workstreamsState().isolateGlobalServers ? homeChoices().filter((w) => w.share !== "closed" && w.id !== homeNow()) : []);
+  /** What is sent: the ticked ones still offered (a home changed since drops its own). */
+  const readsSent = () => references().filter((r) => readable().some((w) => w.id === r));
+
+  /** A workstream as the picker names it. */
+  function nameOf(id: string): string {
+    const w = homeChoices().find((x) => x.id === id);
+    return w && w.name !== id ? w.name : id;
+  }
+
+  /**
+   * A create refused: past another workstream's exclusive claim, the confirm
+   * is offered (never sent unasked); no home for the folder, the picker is
+   * the way where there is one (`picker`), Settings where not — the daemon's
+   * own text names a CLI flag. Anything else is the daemon's message.
+   */
+  function showCreateError(err: unknown, picker: boolean, overrideToken?: string): void {
+    const detail = err && typeof err === "object" && "detail" in err ? (err as { detail?: { kind?: string; resolution?: WorkstreamResolution } }).detail : undefined;
+    const conflict = detail?.kind === "workstream_conflict" ? detail.resolution?.conflict : undefined;
+    if (picker && conflict?.overrideToken && !overrideToken) {
+      setOverrideOffer(conflict);
+      setError(null);
+      return;
+    }
+    setOverrideOffer(null);
+    if (detail?.kind === "workstream_required") {
+      const ambiguous = detail.resolution?.ambiguous;
+      const why =
+        ambiguous && ambiguous.length > 0
+          ? `${ambiguous.map(nameOf).join(" and ")} both match this folder${/remote/.test(err instanceof Error ? err.message : "") ? " (its repository's remote changed)" : ""}`
+          : "This folder belongs to no workstream";
+      setError(picker ? `${why}: choose a workstream.` : `${why}: set one up for it, or a default, in Settings → Workstreams.`);
+      if (picker) workstreamSelect?.focus();
+      return;
+    }
+    if (!picker && detail?.kind === "workstream_conflict" && conflict) {
+      setError(`This folder belongs to workstream "${nameOf(conflict.folder)}" (exclusive): start the run from a session there.`);
+      return;
+    }
+    setError(err instanceof Error ? err.message : String(err));
+  }
+
+  async function submit(ev: Event, overrideToken?: string): Promise<void> {
     ev.preventDefault();
     if (busy()) return;
     const n = name().trim();
@@ -415,7 +589,7 @@ const NewSessionModal: Component = () => {
         // PipelineRunner cockpit (state/pipelines carries them) — close here.
         closeAndReset();
       } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
+        showCreateError(err, false);
         setBusy(false);
       }
       return;
@@ -443,6 +617,9 @@ const NewSessionModal: Component = () => {
           // Pack ADOPTION (docs/role-model-binding.md §6): the pack — not the
           // collab machinery — defines what each role is. Omitted = free-form.
           ...(packId() ? { pack: packId() } : {}),
+          ...(workstream() ? { workstream: workstream() } : {}),
+          ...(overrideToken && workstream() ? { override: { token: overrideToken } } : {}),
+          ...(readsSent().length > 0 ? { references: readsSent().map((w) => ({ workstream: w })) } : {}),
           collaboration: {
             goal: goal().trim(),
             roles: roles().map((r) => ({
@@ -479,8 +656,9 @@ const NewSessionModal: Component = () => {
       } catch (err) {
         // The daemon's message is the useful one here — it names the exact
         // rule broken (unknown provider, non-claude orchestrator, over the
-        // child ceiling), so surface it verbatim rather than paraphrasing.
-        setError(err instanceof Error ? err.message : String(err));
+        // child ceiling), so surface it verbatim; a workstream refusal is
+        // worded for the picker.
+        showCreateError(err, true, overrideToken);
         setBusy(false);
       }
       return;
@@ -504,9 +682,30 @@ const NewSessionModal: Component = () => {
         id: newRequestId(),
         name: n,
         workdir: wd,
-        ...(providerId() ? { providerId: providerId() } : {}),
+        // An account goes with the backend it belongs to, stated explicitly:
+        // left implicit, the daemon picks the backend — a pack role's binding,
+        // say — and the name would land on a backend it wasn't chosen for.
+        ...(showAccountPicker() && account()
+          ? { providerId: effectiveProvider(), account: account() }
+          : providerId()
+            ? { providerId: providerId() }
+            : {}),
         ...(packId() ? { pack: packId() } : {}),
         ...(packRole() ? { packRole: packRole() } : {}),
+        ...(workstream() ? { workstream: workstream() } : {}),
+        ...(overrideToken && workstream() ? { override: { token: overrideToken } } : {}),
+        ...(readsSent().length > 0 ? { references: readsSent().map((w) => ({ workstream: w })) } : {}),
+        ...(sandboxChoice() || sandboxNetwork() || sandboxDocker() || sandboxRoots().trim() || sandboxAdded().trim()
+          ? {
+              sandbox: {
+                ...(sandboxChoice() ? { provider: sandboxChoice() } : {}),
+                ...(sandboxNetwork() ? { network: sandboxNetwork() as "on" | "off" } : {}),
+                ...(sandboxDocker() ? { dockerSocket: true } : {}),
+                ...(sandboxRoots().trim() ? { projectRoots: sandboxRoots().trim().toLowerCase() === "none" ? [] : dirList(sandboxRoots()) } : {}),
+                ...(dirList(sandboxAdded()).length > 0 ? { addedDirs: dirList(sandboxAdded()) } : {}),
+              },
+            }
+          : {}),
       });
       const { info, warnings: warns } = unwrapCreate(data);
       if (info) {
@@ -527,7 +726,7 @@ const NewSessionModal: Component = () => {
         closeAndReset();
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      showCreateError(err, true, overrideToken);
       setBusy(false);
     }
   }
@@ -535,14 +734,14 @@ const NewSessionModal: Component = () => {
   return (
     <Show when={openSignal()}>
       <div
-        class="fixed inset-0 z-40 flex items-start justify-center bg-bg/70 backdrop-blur-sm"
+        class="fixed inset-0 z-40 flex items-start justify-center overflow-y-auto bg-bg/70 backdrop-blur-sm"
         onClick={(e) => {
           if (e.target === e.currentTarget) setOpenSignal(false);
         }}
       >
         <form
           onSubmit={submit}
-          class="mt-[16vh] w-full max-w-md space-y-4 rounded-lg border border-border bg-bg-elev p-5 shadow-2xl"
+          class="my-[16vh] w-full max-w-md space-y-4 rounded-lg border border-border bg-bg-elev p-5 shadow-2xl"
         >
           <header class="space-y-2">
             <h2 class="text-base font-semibold tracking-tight text-fg">
@@ -851,7 +1050,10 @@ const NewSessionModal: Component = () => {
                       type="button"
                       role="radio"
                       aria-checked={providerId() === id || (!providerId() && i() === 0)}
-                      onClick={() => setProviderId(i() === 0 ? "" : id)}
+                      onClick={() => {
+                        // A change of backend drops the account (effect above).
+                        setProviderId(i() === 0 ? "" : id);
+                      }}
                       class={`rounded border px-2 py-0.5 font-mono text-[12px] transition ${
                         providerId() === id || (!providerId() && i() === 0)
                           ? "border-accent/60 bg-accent/10 text-accent"
@@ -859,12 +1061,145 @@ const NewSessionModal: Component = () => {
                       }`}
                       disabled={busy()}
                     >
-                      {id}
+                      {providerLabel(id)}
                       {i() === 0 ? " (default)" : ""}
                     </button>
                   )}
                 </For>
               </div>
+            </div>
+          </Show>
+
+          <Show when={mode() === "session" && showAccountPicker()}>
+            <label class="block space-y-1.5">
+              <span class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">
+                {providerLabel(effectiveProvider())} account
+              </span>
+              <select
+                value={account()}
+                onChange={(e) => setAccount(e.currentTarget.value)}
+                disabled={busy()}
+                aria-label="Account"
+                class="w-full rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
+              >
+                <option value="">Daemon default ({providerAccounts()?.defaultAccount ?? DEFAULT_ACCOUNT})</option>
+                <option value={DEFAULT_ACCOUNT}>default — the daemon's own login</option>
+                <For each={providerAccounts()?.accounts ?? []}>
+                  {(a) => (
+                    <option value={a.name}>
+                      {a.name} — {accountDetail(a)}
+                    </option>
+                  )}
+                </For>
+              </select>
+              <Show when={account() && packRole()}>
+                <p class="text-[11px] text-warn">
+                  A chosen account keeps the session on {providerLabel(effectiveProvider())}, even if the {packRole()} role is bound to another backend.
+                </p>
+              </Show>
+              <p class="text-[11px] text-fg-faint">
+                Which credential this session runs on and bills. You can switch it later without losing the conversation.
+              </p>
+            </label>
+          </Show>
+
+          <Show when={mode() === "session" && !sandboxOpen()}>
+            <p class="text-[11px] text-fg-faint">
+              Sandbox: the daemon's default.{" "}
+              <button type="button" class="text-accent underline-offset-2 hover:underline" onClick={openSandboxChoice} disabled={busy()}>
+                change
+              </button>
+            </p>
+          </Show>
+          <Show when={mode() === "session" && sandboxOpen()}>
+            <div class="block space-y-1.5">
+              <span class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">Sandbox</span>
+              <Show when={sandboxProviders() && !sandboxProviders()?.enabled}>
+                <p class="text-[11px] text-warn">This daemon has no OS sandbox.</p>
+              </Show>
+              <div class="flex gap-2">
+                <select
+                  value={sandboxChoice()}
+                  onChange={(e) => setSandboxChoice(e.currentTarget.value)}
+                  disabled={busy()}
+                  aria-label="Sandbox"
+                  class="flex-1 rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
+                >
+                  <option value="">Daemon default ({sandboxDefaultLabel(sandboxProviders())})</option>
+                  <option value="auto">auto{sandboxProviders()?.auto ? ` — ${sandboxProviders()?.auto}` : ""}</option>
+                  <For each={sandboxProviders()?.providers ?? []}>
+                    {(p) => (
+                      <option value={p.id} disabled={!p.available} title={p.reason}>
+                        {p.displayName}
+                        {p.available ? "" : ` — not available: ${p.reason ?? ""}`}
+                      </option>
+                    )}
+                  </For>
+                  <option value="off">off — commands run with your full rights</option>
+                </select>
+                <select
+                  value={sandboxNetwork()}
+                  onChange={(e) => setSandboxNetwork(e.currentTarget.value)}
+                  disabled={busy() || sandboxChoice() === "off"}
+                  aria-label="Sandbox network"
+                  class="rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
+                >
+                  <option value="">network: default ({sandboxProviders()?.default.network ?? "on"})</option>
+                  <option value="on">network on</option>
+                  <option value="off">network off</option>
+                </select>
+              </div>
+              <Show when={sandboxChoice() !== "off" && !sandboxProviders()?.default.dockerSocket}>
+                <label class="flex items-center gap-2 text-[11px] text-fg-muted" title="Docker access can reach the whole machine (a container can mount /)">
+                  <input
+                    type="checkbox"
+                    checked={sandboxDocker()}
+                    onChange={(e) => setSandboxDocker(e.currentTarget.checked)}
+                    disabled={busy()}
+                    aria-label="Docker access"
+                  />
+                  Docker access — for tests that start containers
+                </label>
+              </Show>
+              <Show when={sandboxDocker() && sandboxChoice() !== "off"}>
+                <p class="text-[11px] text-warn">
+                  Docker access can reach the whole machine: a command could start a container that mounts / and read or change anything, your credentials included.
+                </p>
+              </Show>
+              <Show when={sandboxChoice() === "off"}>
+                <p class="text-[11px] text-warn">
+                  Off: the agent's commands can read your credentials and change any file you can, in every mode.
+                </p>
+              </Show>
+              <Show when={sandboxChoice() !== "off"}>
+                <label class="block space-y-1">
+                  <span class="text-[11px] text-fg-muted">Readable project roots — other repositories, read-only</span>
+                  <input
+                    type="text"
+                    value={sandboxRoots()}
+                    onInput={(e) => setSandboxRoots(e.currentTarget.value)}
+                    disabled={busy()}
+                    aria-label="Project roots"
+                    placeholder={`default: ${rootsDefaultLabel(sandboxProviders())} (or "none", or dirs, comma-separated)`}
+                    class="w-full rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
+                  />
+                </label>
+                <label class="block space-y-1">
+                  <span class="text-[11px] text-fg-muted">Also writable — other repositories it may change, each as a workspace</span>
+                  <input
+                    type="text"
+                    value={sandboxAdded()}
+                    onInput={(e) => setSandboxAdded(e.currentTarget.value)}
+                    disabled={busy()}
+                    aria-label="Added directories"
+                    placeholder="none (absolute dirs, comma-separated; ~ expands)"
+                    class="w-full rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
+                  />
+                </label>
+              </Show>
+              <p class="text-[11px] text-fg-faint">
+                The workspace and a private temp dir are writable, and the project roots readable; everything else is read-only and credential stores are hidden. Change it later with /sandbox, or /sandbox add &lt;dir&gt;; the agent can ask for a directory too.
+              </p>
             </div>
           </Show>
 
@@ -929,6 +1264,105 @@ const NewSessionModal: Component = () => {
             </Show>
           </div>
 
+          <Show when={mode() !== "pipeline" && homeChoices().length > 0}>
+            <label class="block space-y-1.5">
+              <span class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">Workstream</span>
+              <select
+                ref={workstreamSelect}
+                value={workstream()}
+                onChange={(e) => {
+                  setWorkstream(e.currentTarget.value);
+                  setOverrideOffer(null);
+                }}
+                disabled={busy()}
+                aria-label="Workstream"
+                class="w-full rounded border border-border bg-bg px-3 py-1.5 font-mono text-sm text-fg focus:border-accent focus:outline-none"
+              >
+                <option value="">
+                  {resolveFailed()
+                    ? "The folder's (couldn't check it)"
+                    : !workdir().trim()
+                      ? "The folder's"
+                      : !resolution()
+                        ? "The folder's (checking…)"
+                        : resolution()?.home
+                    ? `The folder's: ${resolution()?.home}${resolution()?.source === "matched" ? ` (matched by ${resolution()?.matchedBy})` : resolution()?.source === "default" ? " (the default)" : ""}`
+                    : resolution()?.ambiguous
+                      ? `The folder's: none — ${resolution()?.ambiguous?.join(" and ")} both match`
+                      : "The folder's (none matches)"}
+                </option>
+                <For each={homeChoices()}>{(w) => <option value={w.id}>{w.name === w.id ? w.id : `${w.name} (${w.id})`}</option>}</For>
+              </select>
+            </label>
+          </Show>
+
+          <Show when={mode() !== "pipeline" && readable().length > 0}>
+            <fieldset class="space-y-1.5">
+              <legend class="text-[11px] font-medium uppercase tracking-wider text-fg-faint">Also reads</legend>
+              <div class="flex flex-wrap gap-x-4 gap-y-1">
+                <For each={readable()}>
+                  {(w) => (
+                    <label class="inline-flex items-center gap-1.5 text-[12px] text-fg-muted">
+                      <input
+                        type="checkbox"
+                        checked={references().includes(w.id)}
+                        disabled={busy()}
+                        onChange={(e) => setReferences((r) => (e.currentTarget.checked ? [...r, w.id] : r.filter((x) => x !== w.id)))}
+                      />
+                      <span>
+                        {w.name}
+                        {w.share === "ask" ? <span class="text-fg-faint"> (asks)</span> : null}
+                      </span>
+                    </label>
+                  )}
+                </For>
+              </div>
+              <p class="text-[11px] text-fg-faint">Their folders read-only, and their memory — never their servers or credentials.</p>
+            </fieldset>
+          </Show>
+
+          <Show when={overrideOffer()}>
+            {(c) => (
+              <div
+                class="space-y-2 rounded border border-warn/40 bg-warn/10 px-3 py-2 text-[12px] leading-relaxed text-warn"
+                role="alert"
+                // Shown below the fold on a phone: brought into view as it appears.
+                ref={(el) => requestAnimationFrame(() => el.scrollIntoView?.({ block: "nearest", behavior: "smooth" }))}
+              >
+                <div class="font-semibold">This folder belongs to workstream “{nameOf(c().folder)}” (exclusive).</div>
+                <div>
+                  A session here in “{nameOf(c().chosen)}” gets{" "}
+                  {c().changes && c().changes!.gains.length > 0 ? `“${c().chosen}”'s servers (${c().changes!.gains.join(", ")})` : `no MCP servers from “${c().chosen}”`}
+                  {c().changes && c().changes!.env.length > 0 ? ` and env ${c().changes!.env.join(", ")}` : ""}
+                  {c().changes?.git ? `, commits as ${c().changes!.git}` : ""}, and writes into “{c().folder}”'s code
+                  {c().changes && c().changes!.withholds.length > 0 ? `; it is not given ${c().changes!.withholds.join(", ")}` : ""}.
+                </div>
+                <div class="flex gap-2">
+                  <button
+                    type="button"
+                    class="rounded border border-border bg-bg px-2.5 py-1 text-fg"
+                    onClick={() => {
+                      setWorkstream(c().folder);
+                      setOverrideOffer(null);
+                      // The offer unmounts with its buttons: focus goes on to create.
+                      queueMicrotask(() => createButton?.focus());
+                    }}
+                  >
+                    Use “{nameOf(c().folder)}”
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded border border-warn/60 bg-bg px-2.5 py-1 text-warn"
+                    disabled={busy()}
+                    onClick={(e) => void submit(e, c().overrideToken)}
+                  >
+                    Start anyway
+                  </button>
+                </div>
+              </div>
+            )}
+          </Show>
+
           <Show when={error()}>
             <div class="rounded border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
               {error()}
@@ -975,6 +1409,7 @@ const NewSessionModal: Component = () => {
                 cancel
               </button>
               <button
+                ref={createButton}
                 type="submit"
                 class="ml-auto rounded bg-accent px-3 py-1.5 text-sm font-semibold text-bg transition hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
                 disabled={

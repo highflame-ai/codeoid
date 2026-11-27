@@ -77,21 +77,106 @@ export interface ResolvedAuth {
 /** Prefix on a codeoid local-mode token — never exchanged, presented as-is. */
 export const LOCAL_TOKEN_PREFIX = "codeoid_local_";
 
+/** Where this page keeps a local-mode token it was signed in with (a one-time link's). */
+export const STORAGE_KEY_LOCAL_TOKEN = "codeoid.localToken";
+
+/** The URL fragment key of a one-time local sign-in link (src/daemon/local-auth.ts UI_LINK_FRAGMENT). */
+export const LOCAL_LINK_FRAGMENT = "codeoid-local-code";
+
+/** Where the page exchanges that code for the token (src/frontends/web-ui/index.ts LOCAL_SESSION_PATH). */
+export const LOCAL_SESSION_PATH = "/ui/local-session";
+
 /**
- * The local-mode token the daemon injected into this page, or null.
+ * Whether the daemon serving this page runs in local mode on a loopback bind.
+ * It says so in the served `index.html` (`window.__CODEOID_LOCAL_MODE__`, no
+ * secret: the page never carries the token, #448 round 4 — a sandboxed agent
+ * command on the loopback could fetch it).
+ */
+export function isLocalModeDaemon(): boolean {
+  if (typeof window === "undefined") return false;
+  return (window as { __CODEOID_LOCAL_MODE__?: unknown }).__CODEOID_LOCAL_MODE__ === true;
+}
+
+/**
+ * The local-mode token this page was signed in with, or null.
  *
- * A daemon running `codeoid start --local` on a loopback bind publishes its
- * minted token as a synchronous global in the served `index.html` (the same
- * channel as the embed allowlist — see src/frontends/web-ui/index.ts), so the
- * UI connects with no sign-in step. Its presence is also authoritative about
- * the daemon's posture: only a local-mode daemon ever injects it, so it must
- * take precedence over any stored ZeroID credential from a previous session —
- * exchanging that key would succeed at ZeroID and then be rejected here.
+ * A one-time link (the daemon's start banner, `codeoid ui`) signs a browser
+ * in ({@link redeemLocalLink}); the token is kept in this origin's storage,
+ * so a reload or a new tab stays signed in. Used only while the daemon
+ * serving the page says it is in local mode, and then authoritative about
+ * which credential it accepts: it takes precedence over any stored ZeroID
+ * credential from a previous session, which would exchange successfully at
+ * ZeroID and then be rejected here.
  */
 export function readLocalModeToken(): string | null {
-  if (typeof window === "undefined") return null;
-  const raw = (window as { __CODEOID_LOCAL_TOKEN__?: unknown }).__CODEOID_LOCAL_TOKEN__;
-  return typeof raw === "string" && raw.length > 0 ? raw : null;
+  if (!isLocalModeDaemon()) return null;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_LOCAL_TOKEN);
+    return raw?.startsWith(LOCAL_TOKEN_PREFIX) ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Forget the stored local-mode token (the daemon refused it: it restarted with a new one). */
+export function forgetLocalModeToken(): void {
+  try {
+    localStorage.removeItem(STORAGE_KEY_LOCAL_TOKEN);
+  } catch {
+    /* no storage */
+  }
+}
+
+/**
+ * Sign this page in with a one-time local link: when the URL's fragment
+ * carries `codeoid-local-code=…`, take it out of the URL (other fragment
+ * content kept), exchange it once for the token, and keep the token
+ * ({@link readLocalModeToken}). Null when there is no code. A code the
+ * daemon refuses (spent, expired) throws, saying how to get a new one.
+ */
+export async function redeemLocalLink(fetchFn: typeof fetch = fetch): Promise<string | null> {
+  if (typeof window === "undefined" || !window.location) return null;
+  const raw = window.location.hash.startsWith("#") ? window.location.hash.slice(1) : window.location.hash;
+  if (!raw) return null;
+  let code: string | null = null;
+  const kept: string[] = [];
+  for (const segment of raw.split("&")) {
+    const eq = segment.indexOf("=");
+    const key = eq === -1 ? segment : segment.slice(0, eq);
+    if (key === LOCAL_LINK_FRAGMENT) {
+      code = eq === -1 ? "" : segment.slice(eq + 1);
+      continue;
+    }
+    kept.push(segment);
+  }
+  if (code === null) return null;
+  // Out of the address bar and history first: spent or not, it is never shown again.
+  const { pathname, search } = window.location;
+  history.replaceState(null, "", `${pathname}${search}${kept.length > 0 ? `#${kept.join("&")}` : ""}`);
+  let res: Response;
+  try {
+    res = await fetchFn(LOCAL_SESSION_PATH, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ code }) });
+  } catch (err) {
+    throw new AuthError("couldn't reach the daemon to use the sign-in link", "exchange_failed", err);
+  }
+  let body: { token?: unknown; error?: unknown } = {};
+  try {
+    body = (await res.json()) as typeof body;
+  } catch {
+    /* said below */
+  }
+  if (!res.ok || typeof body.token !== "string" || !body.token.startsWith(LOCAL_TOKEN_PREFIX)) {
+    throw new AuthError(
+      typeof body.error === "string" ? body.error : "this sign-in link has expired or was already used — run `codeoid ui` for a new one",
+      "invalid",
+    );
+  }
+  try {
+    localStorage.setItem(STORAGE_KEY_LOCAL_TOKEN, body.token);
+  } catch {
+    /* kept for this page only */
+  }
+  return body.token;
 }
 
 export class AuthError extends Error {
@@ -129,8 +214,8 @@ export async function resolveToken(opts: ResolveOptions): Promise<ResolvedAuth> 
     );
   }
   // A local-mode token is presented verbatim: there is no issuer to exchange it
-  // at. This is the manual path for a `--local` daemon on a non-loopback bind,
-  // where the token is deliberately not injected into the page.
+  // at. This is the manual path: a `--local` daemon on a non-loopback bind
+  // (no sign-in links there), or an operator who'd rather paste it.
   if (apiKey.startsWith(LOCAL_TOKEN_PREFIX)) {
     return { token: apiKey, exchanged: false };
   }

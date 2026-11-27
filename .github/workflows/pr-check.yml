@@ -11,9 +11,18 @@ on:
   merge_group:
     types:
       - checks_requested
+  # The release workflow runs every check again on the tagged commit.
+  workflow_call:
+
+# PR code runs in every job (install scripts, the daemon, the tests): its
+# token may only read the repository.
+permissions:
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref }}
+  # A release's call (no head_ref) gets its own group per tag, so it never
+  # cancels, or is cancelled by, a PR's run.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -28,7 +37,8 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Pinned (bump .bun-version on purpose): `latest` changes under us.
+          bun-version-file: .bun-version
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -65,6 +75,135 @@ jobs:
       - name: Build
         run: bun run build
 
+  # The real-sandbox tests (#448): bubblewrap, Claude Code's own sandbox and
+  # the git shim, for real. daemon-check has no bubblewrap, so there they skip
+  # themselves; here a preflight fails the job rather than let them skip. A
+  # Claude Agent SDK bump can change what Claude's sandbox allows (#478): this
+  # is the job that sees it.
+  sandbox-real:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Install bubblewrap and socat
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap socat
+
+      # Ubuntu 24.04's AppArmor keeps unprivileged processes from creating user
+      # namespaces, which bubblewrap needs. The runner is a throwaway VM.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Check the sandbox can run
+        run: bun scripts/check-real-sandbox.ts
+
+      - name: Real-sandbox tests
+        run: bun test src/tests/sandbox-
+
+  # Release gate tier 1 (docs/release-gate.md): the package users install
+  # works, and a previous release's data opens in this build. No model, no
+  # credentials: the old release's Claude turns run against aimock.
+  release-gate:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      - name: Setup Node (npm pack / install)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build web UI
+        run: bun run build:web
+
+      - name: The installed package works (npm and bun)
+        run: bun scripts/check-artifact.ts
+
+      - name: The last release's data opens in this build
+        run: bun scripts/check-upgrade.ts
+
+  # End-to-end suite (#429): a real daemon per test, the web UI in Chromium and
+  # the CLI, against the scripted backend — no model, no credentials.
+  e2e:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: .bun-version
+
+      # Playwright's runner is Node; pin it rather than take the image's.
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build web UI
+        run: bun run build:web
+
+      - name: Install Chromium
+        run: bunx playwright install --with-deps chromium
+
+      # The backend journeys (e2e/specs/backends-aimock.spec.ts) run each
+      # backend's real CLI against aimock. Claude's comes with the Agent SDK;
+      # Codex's is installed, pinned.
+      - name: Install the Codex CLI
+        run: npm install -g @openai/codex@0.166.0
+
+      # A real backend's session is sandboxed as it would be for a user: without
+      # bubblewrap it is created "with warnings" and the dialog saying so stays
+      # open over the page. Set up as in sandbox-real.
+      - name: Install bubblewrap and socat
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends bubblewrap socat
+
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: End-to-end tests
+        run: bun run test:e2e
+        env:
+          CI: "1"
+          CODEOID_E2E_REQUIRE_BACKENDS: claude,codex
+
+      - name: Upload report and traces
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
+
   web-check:
     runs-on: ubuntu-24.04
     defaults:
@@ -79,7 +218,8 @@ jobs:
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Pinned (bump .bun-version on purpose): `latest` changes under us.
+          bun-version-file: .bun-version
 
       # Web consumes @codeoid/core + @codeoid/protocol via file: deps. When
       # bun installs those as symlinks, module resolution runs from the REAL

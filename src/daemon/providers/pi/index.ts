@@ -19,6 +19,7 @@
  *   - `get_commands` → codeoid `session.commands` (slash passthrough)
  */
 
+import { REQUEST_DIRECTORY_DESCRIPTION, REQUEST_DIRECTORY_SCHEMA, REQUEST_DIRECTORY_TOOL_FQ, type RequestDirectoryInput } from "../../sandbox/request-directory.js";
 import type { McpTenant } from "../../mcp/oauth.js";
 import { randomUUID } from "node:crypto";
 import { AsyncQueue } from "../../async-queue.js";
@@ -34,9 +35,9 @@ import type {
   TurnRun,
   UiRequestFn,
 } from "../interface.js";
-import type { ProviderCommand } from "../../../protocol/types.js";
+import { EFFORT_LEVELS, type EffortLevel, type ProviderCommand } from "../../../protocol/types.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildPiEnv } from "../env.js";
+import { buildPiEnv, withExtraEnv } from "../env.js";
 import {
   APPROVAL_TITLE,
   type BridgeMcpTool,
@@ -48,12 +49,30 @@ import {
 } from "./bridge.js";
 import { memoryToolDefs, type MemoryEngine, type MemoryToolContext } from "../../memory/index.js";
 import { SessionMcpTools } from "../../mcp/tool-source.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
 import type { McpHub } from "../../mcp/hub.js";
 import { PiRpcProcess, type PiFrame } from "./rpc.js";
 import { translatePiEvent } from "./translate.js";
+import type { ResolvedAccount } from "../../accounts.js";
+import { applyPiAccount, applyPiSettingsOverlay, piAgentDirOf, piDefaultThinkingLevel } from "../../account-apply.js";
+import { realpathSync } from "node:fs";
+import { dirname } from "node:path";
+import { PI_HOME_LAYOUT, preparePrivateHome, withLoginsSynced } from "../../sandbox/backend-home.js";
+import { programLocations } from "../../sandbox/policy.js";
+import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
+import type { SandboxHandle } from "../../sandbox/types.js";
+
+function realOr(p: string): string {
+  try {
+    return realpathSync(p);
+  } catch {
+    return p;
+  }
+}
 
 export interface PiProviderInit {
+  /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448): pi starts inside it. */
+  sandbox?: () => SandboxRuntime | null;
   sessionId: string;
   /** pi session FILE from a previous run (absolute .jsonl path), or the
    *  codeoid session id on first run (nothing to resume). */
@@ -72,9 +91,22 @@ export interface PiProviderInit {
   memory?: MemoryEngine;
   /** Cross-backend MCP registry + daemon-owned client — external servers reach
    *  pi (which has no MCP client) by registering bridge tools that proxy to the hub. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   mcpHub?: McpHub;
+  /**
+   * The sandbox's `request_directory`, decided by the session
+   * (sandbox/request-directory.ts): a bridge tool, as registry servers' are.
+   */
+  requestDirectory?: (input: RequestDirectoryInput) => Promise<string>;
+  /**
+   * This session's account for the backend, resolved when the process is
+   * spawned (accounts.ts); null = the daemon's own login. Throws when the
+   * chosen account can't be used — the turn fails, never another credential.
+   */
+  resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** Caller env for the child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 interface PiSessionStats {
@@ -96,23 +128,32 @@ export class PiProvider implements SessionProvider {
   readonly displayName = "pi (pi.dev)";
 
   onRecoveryNeeded: ((content: string) => void) | undefined;
+  onHistoryLost: (() => void) | undefined;
 
   #sessionId: string;
   #backingSessionId: string;
   #command: string;
+  #resolveAccount: (() => ResolvedAccount | null) | null;
+  /** The session's OS sandbox, read each time pi starts (#448). */
+  readonly #sandbox: (() => SandboxRuntime | null) | null;
+  readonly #extraEnv: Readonly<Record<string, string>> | undefined;
   #argsPrefix: string[];
   #store: Store;
   #onModels?: PiProviderInit["onModels"];
   #workspaceId: string;
   #tenant: McpTenant | undefined;
   #memory: MemoryEngine | null;
-  #mcpRegistry: McpRegistry | null;
+  #mcpRegistry: McpServerView | null;
   #mcpHub: McpHub | null;
+  readonly #requestDirectory: ((input: RequestDirectoryInput) => Promise<string>) | null;
 
   #proc: PiRpcProcess | null = null;
   #bridgeReady = false;
   #hasQueried = false;
   #model: string | null = null;
+  /** pi's thinking level now (#417), and the user's own default, which Default returns to. */
+  #thinkingLevel: string | null = null;
+  #defaultThinkingLevel: string | null = null;
   /** Rendered transcript from seedFromHistory() — prepended to the next prompt. */
   #pendingHistorySeed: string | null = null;
 
@@ -130,6 +171,9 @@ export class PiProvider implements SessionProvider {
     this.#sessionId = init.sessionId;
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
+    this.#resolveAccount = init.resolveAccount ?? null;
+    this.#extraEnv = init.extraEnv;
+    this.#sandbox = init.sandbox ?? null;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#store = init.store;
     this.#onModels = init.onModels;
@@ -138,6 +182,7 @@ export class PiProvider implements SessionProvider {
     this.#memory = init.memory ?? null;
     this.#mcpRegistry = init.mcpRegistry ?? null;
     this.#mcpHub = init.mcpHub ?? null;
+    this.#requestDirectory = init.requestDirectory ?? null;
   }
 
   /**
@@ -174,10 +219,17 @@ export class PiProvider implements SessionProvider {
     // re-captured (and persisted) on the next turn's get_state.
     this.#proc?.send({ type: "new_session" });
     this.#hasQueried = false;
+    // pi's stats are the session file's: a new one counts from zero (#430).
+    this.#lastStats = EMPTY_STATS;
   }
 
   setHasQueried(value: boolean): void {
     this.#hasQueried = value;
+  }
+
+  async backendProcessIds(): Promise<number[]> {
+    const pid = this.#proc?.pid;
+    return pid ? [pid] : [];
   }
 
   async teardown(): Promise<void> {
@@ -246,13 +298,17 @@ export class PiProvider implements SessionProvider {
     this.#gatedToolIds.clear();
     this.#hasQueried = true;
 
-    void this.#startTurn(opts).catch((err) => {
+    // An interrupt before the prompt went out (pi still starting, its model
+    // or level being set) has nothing to abort yet: the prompt mustn't go out after it.
+    const turn = { aborted: false };
+    void this.#startTurn(opts, turn).catch((err) => {
       this.#failTurn(err instanceof Error ? err.message : String(err));
     });
 
     return {
       events: queue,
       interrupt: async () => {
+        turn.aborted = true;
         this.#proc?.send({ type: "abort" });
       },
       pushMidTurn: (content, priority) => {
@@ -267,7 +323,8 @@ export class PiProvider implements SessionProvider {
     };
   }
 
-  async #startTurn(opts: TurnOpts): Promise<void> {
+  async #startTurn(opts: TurnOpts, turn: { aborted: boolean }): Promise<void> {
+    const queue = this.#turnQueue;
     await this.#ensureProcess(opts);
 
     if (!this.#bridgeReady) {
@@ -282,7 +339,16 @@ export class PiProvider implements SessionProvider {
     if (opts.model && opts.model !== this.#model) {
       await this.#setModel(opts.model);
     }
+    // Thinking effort (#417): pi's levels are codeoid's; none = the user's own pi default.
+    const level = opts.effort ?? this.#defaultThinkingLevel;
+    if (level && level !== this.#thinkingLevel) await this.#setThinkingLevel(level);
 
+    if (turn.aborted) {
+      // Interrupted before pi had a prompt to abort: the turn ends here, its
+      // history seed kept for the next prompt.
+      if (this.#turnQueue === queue) this.#endAborted();
+      return;
+    }
     let message = opts.userMessage;
     if (this.#pendingHistorySeed) {
       message = `${this.#pendingHistorySeed}\n\n${message}`;
@@ -298,22 +364,42 @@ export class PiProvider implements SessionProvider {
     if (this.#proc?.alive) return;
 
     const mcpTools = await this.#discoverMcpTools();
-    const args: string[] = ["-e", writeBridgeExtension({ memoryTools: this.#memory != null, mcpTools })];
+    const bridge = writeBridgeExtension({ memoryTools: this.#memory != null, mcpTools });
+    const args: string[] = ["-e", bridge];
     if (opts.systemPromptAppend) {
       args.push("--append-system-prompt", opts.systemPromptAppend);
     }
 
     this.#bridgeReady = false;
+    this.#thinkingLevel = null; // a new pi reports its own (get_state, below)
+    // Allowlisted env (GHSA-38vh): pi gets its credentials (~/.pi via
+    // HOME, provider API keys), never codeoid's own secrets.
+    // pi's thinking-level writes stay in a copy of its settings (#417).
+    // Then the caller's extra env, which can't override the account (withExtraEnv).
+    let env = withExtraEnv(this.#piEnv(), this.#extraEnv);
+    // The OS sandbox (#448): pi's whole process starts inside the session's,
+    // in a private copy of its agent dir (backend-home.ts: its login
+    // read-only, its sessions the session's own), its program and codeoid's bridge readable.
+    const rt = this.#sandbox?.() ?? null;
+    let handle: SandboxHandle | null = null;
+    if (rt?.plan.wrapsBackend) {
+      const own = preparePrivateHome(piAgentDirOf(env), rt.privateHome("pi"), PI_HOME_LAYOUT, { state: rt.stateDir("pi") });
+      env = { ...env, PI_CODING_AGENT_DIR: own.home };
+      // Closed when pi exits: a login it refreshed is written back then.
+      handle = withLoginsSynced(await rt.open(own.writable, { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix), dirname(bridge)] }), own, rt.warn);
+    }
+    const opened = handle;
     this.#proc = new PiRpcProcess({
       command: this.#command,
       argsPrefix: this.#argsPrefix,
       args,
       cwd: opts.workdir,
-      // Allowlisted env (GHSA-38vh): pi gets its credentials (~/.pi via
-      // HOME, provider API keys), never codeoid's own secrets.
-      env: buildPiEnv(),
+      env,
+      ...(handle?.wrap ? { wrap: handle.wrap.bind(handle) } : {}),
       onEvent: (frame) => this.#onFrame(frame),
       onExit: ({ code, signal, stderrTail }) => {
+        // Its sandbox goes with it (#448).
+        void opened?.close();
         this.#bridgeReady = false;
         const tail = stderrTail ? ` — ${stderrTail.trim().slice(-300)}` : "";
         this.#failTurn(
@@ -333,14 +419,19 @@ export class PiProvider implements SessionProvider {
       });
       if (resp.success === false) {
         console.warn(
-          `[codeoid/pi ${this.#sessionId}] resume of ${this.#backingSessionId} failed — starting fresh`,
+          `[codeoid/pi ${this.#sessionId}] resume of ${this.#backingSessionId} failed — continuing from codeoid's history`,
         );
+        // A fresh pi session must not start the conversation over — unless
+        // the session already queued what it gets (a switch, a rewind).
+        if (this.#pendingHistorySeed === null) this.onHistoryLost?.();
       }
     }
 
     const state = await this.#proc.request({ type: "get_state" });
-    const data = state.data as { sessionFile?: string; sessionId?: string } | undefined;
-    const file = data?.sessionFile;
+    const data = state.data as { sessionFile?: string; sessionId?: string; thinkingLevel?: string } | undefined;
+    if (typeof data?.thinkingLevel === "string") this.#thinkingLevel ??= data.thinkingLevel;
+    // Where the file really is: inside the sandbox pi names it through its private home's link to its sessions dir.
+    const file = typeof data?.sessionFile === "string" && data.sessionFile.length > 0 ? realOr(data.sessionFile) : data?.sessionFile;
     if (typeof file === "string" && file.length > 0 && file !== this.#backingSessionId) {
       this.#backingSessionId = file;
       try {
@@ -382,7 +473,7 @@ export class PiProvider implements SessionProvider {
     if (!Array.isArray(data?.models)) return [];
     return data.models
       .filter(
-        (m): m is { id: string; provider: string; name?: string; contextWindow?: unknown } =>
+        (m): m is { id: string; provider: string; name?: string; contextWindow?: unknown; reasoning?: unknown; thinkingLevelMap?: unknown } =>
           !!m &&
           typeof m === "object" &&
           typeof (m as { id?: unknown }).id === "string" &&
@@ -393,7 +484,35 @@ export class PiProvider implements SessionProvider {
         displayName: typeof m.name === "string" ? m.name : m.id,
         // pi's catalog entries are full pi-ai Model objects, window included.
         ...(typeof m.contextWindow === "number" && m.contextWindow > 0 ? { contextWindow: m.contextWindow } : {}),
+        efforts: piThinkingLevels(m),
       }));
+  }
+
+  /** What Default means here (#417): the user's own pi default, once read. */
+  get defaultEffort(): EffortLevel | null {
+    const l = this.#defaultThinkingLevel;
+    return l && (EFFORT_LEVELS as readonly string[]).includes(l) ? (l as EffortLevel) : null;
+  }
+
+  /** A new thinking effort on the running pi, live (#417): it takes the next request at that level. */
+  async applyEffort(effort: EffortLevel | null): Promise<boolean> {
+    const level = effort ?? this.#defaultThinkingLevel;
+    if (!this.#proc?.alive || !level) return false;
+    if (level !== this.#thinkingLevel) await this.#setThinkingLevel(level);
+    return true;
+  }
+
+  /** pi's environment: the account's, in an overlay whose settings.json is codeoid's copy. */
+  #piEnv(): Record<string, string> {
+    const env = applyPiAccount(this.#resolveAccount?.() ?? null, buildPiEnv());
+    this.#defaultThinkingLevel = piDefaultThinkingLevel(env);
+    return applyPiSettingsOverlay(env);
+  }
+
+  async #setThinkingLevel(level: string): Promise<void> {
+    const resp = await this.#proc!.request({ type: "set_thinking_level", level });
+    if (resp.success === false) throw new Error(`pi could not set thinking level "${level}": ${String(resp.error ?? "")}`);
+    this.#thinkingLevel = level;
   }
 
   async #setModel(model: string): Promise<void> {
@@ -408,6 +527,8 @@ export class PiProvider implements SessionProvider {
       throw new Error(`pi could not switch model to "${model}": ${String(resp.error ?? "")}`);
     }
     this.#model = model;
+    // pi re-applies its own (clamped) level on a model change: send ours again (#417).
+    this.#thinkingLevel = null;
   }
 
   async #fetchStats(): Promise<PiSessionStats> {
@@ -495,6 +616,9 @@ export class PiProvider implements SessionProvider {
       cacheReadTokens: Math.max(0, stats.tokens.cacheRead - prev.tokens.cacheRead),
       cacheCreationTokens: Math.max(0, stats.tokens.cacheWrite - prev.tokens.cacheWrite),
       totalCostUsd: Math.max(0, stats.cost - prev.cost),
+      // pi prices from its model registry, where a model with no cost entry is
+      // $0: trust only a figure it actually has, else the session prices the tokens (#430).
+      ...(stats.cost - prev.cost > 0 ? { costSource: "backend" as const } : {}),
       durationMs: Date.now() - this.#turnStartedAt,
       ...(stats.contextWindow !== undefined ? { contextWindow: stats.contextWindow } : {}),
       stopReason: this.#lastStopReason,
@@ -503,6 +627,30 @@ export class PiProvider implements SessionProvider {
     queue.close();
     this.#turnQueue = null;
     this.#canUseTool = null;
+  }
+
+  /** End a turn interrupted before its prompt was sent: nothing ran, nothing was spent. */
+  #endAborted(): void {
+    const queue = this.#turnQueue;
+    if (!queue) return;
+    this.#turnQueue = null;
+    this.#canUseTool = null;
+    queue.push({
+      type: "turn_done",
+      result: {
+        providerId: this.id,
+        model: this.#model ?? "pi-default",
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheCreationTokens: 0,
+        totalCostUsd: 0,
+        costSource: "backend",
+        durationMs: Date.now() - this.#turnStartedAt,
+        stopReason: "interrupted",
+      },
+    });
+    queue.close();
   }
 
   /**
@@ -661,16 +809,35 @@ export class PiProvider implements SessionProvider {
 
   /** Discover external MCP tools to register in the bridge at spawn time. */
   async #discoverMcpTools(): Promise<BridgeMcpTool[]> {
+    // The sandbox's ask for a directory to write: served here, not by the hub.
+    const own: BridgeMcpTool[] = this.#requestDirectory
+      ? [{ name: REQUEST_DIRECTORY_TOOL_FQ, description: REQUEST_DIRECTORY_DESCRIPTION, parameters: REQUEST_DIRECTORY_SCHEMA }]
+      : [];
     const view = this.#mcpToolsView();
-    if (!view || !view.hasServers()) return [];
+    if (!view || !view.hasServers()) return own;
     const handles = await view.handles();
-    return handles.map((h) => ({ name: h.canonicalName, description: h.description, parameters: h.inputSchema }));
+    return [...own, ...handles.map((h) => ({ name: h.canonicalName, description: h.description, parameters: h.inputSchema }))];
   }
 
   /** Bridge external-MCP call: the pi-registered tool proxies here (pi has no
    *  MCP). Already gated by the tool_call hook; run it through the daemon hub. */
   async #onMcpToolRequest(id: string, frame: PiFrame): Promise<void> {
     const reply = (value: string) => this.#proc?.send({ type: "extension_ui_response", id, value });
+    const ask = this.#requestDirectory;
+    if (ask) {
+      let p: { name?: string; args?: Record<string, unknown> } = {};
+      try {
+        p = JSON.parse(String(frame.placeholder ?? "{}")) as typeof p;
+      } catch {
+        /* judged below */
+      }
+      if (p.name === REQUEST_DIRECTORY_TOOL_FQ) {
+        const path = typeof p.args?.path === "string" ? p.args.path : "";
+        const reason = typeof p.args?.reason === "string" ? p.args.reason : "";
+        reply(!path || !reason ? "Refused: give the directory's absolute path and why you need it." : await ask({ path, reason }).catch((e) => `Refused: ${e instanceof Error ? e.message : String(e)}`));
+        return;
+      }
+    }
     const view = this.#mcpToolsView();
     if (!view) {
       reply("codeoid MCP is not enabled for this session.");
@@ -763,3 +930,20 @@ export class PiProvider implements SessionProvider {
     }
   }
 }
+
+/**
+ * The thinking levels a pi model takes (#417), as pi-ai's
+ * getSupportedThinkingLevels decides them: Off alone for a model that doesn't
+ * reason; otherwise every level but one its map marks unsupported (null), and
+ * XHigh / Max only where the map names them.
+ */
+export function piThinkingLevels(m: { reasoning?: unknown; thinkingLevelMap?: unknown }): EffortLevel[] {
+  if (m.reasoning !== true) return ["off"];
+  const map = (m.thinkingLevelMap && typeof m.thinkingLevelMap === "object" ? m.thinkingLevelMap : {}) as Record<string, unknown>;
+  return EFFORT_LEVELS.filter((level) => {
+    const mapped = map[level];
+    if (mapped === null) return false;
+    return level === "xhigh" || level === "max" ? mapped !== undefined : true;
+  });
+}
+

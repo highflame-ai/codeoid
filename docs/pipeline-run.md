@@ -74,6 +74,13 @@ The only thing it saves is one auto-attach, which the client does for free.
   On a phase without `findings:` a `review` gate behaves as before (passes; the human is the reviewer).
 - **`skill` gates remain optional automated verdicts (later slice).**
   Until implemented they are simply absent, not fake.
+- **Every check a gate executes leaves evidence** (docs/loop-engineering-design.md §7).
+  `command` gates and execution probes record what ran, its result, its exit status or signal, bounded output excerpts, and the full output as files beside the daemon database (`<dbdir>/evidence/`).
+  An execution probe of type `test` (or `verify`) that exits 0 after running no tests is `inconclusive`, not a pass; a `command` gate is judged on its exit status alone.
+  A missing command is `error`; a check past its time bound is stopped with everything it spawned and recorded as a timed-out `fail`; aborting the pipeline or stopping the daemon stops its running checks.
+  Checks run with the same stripped environment as an agent's own commands (no daemon credentials), and stored excerpts are redacted; artifacts are readable only by the daemon's user and are pruned after 30 days or past 2 GiB in total.
+  The halted phase shows the latest check's output in the cockpit, `codeoid pipeline show` lists each phase's evidence ids, and `codeoid evidence <id>` prints one record.
+  Pipeline evidence names no pinned tree yet; it records what ran in the workdir, not which revision it certified.
 
 ---
 
@@ -86,7 +93,7 @@ Two layers behave differently:
   Works on claude / pi / codex / gemini / gemini-cli / openai.
 - **Per-phase capability role.**
   Hard tool-deny (a reviewer phase physically cannot Write/Edit) rides Session's `canUseTool` gate, which only lands on backends that route every tool through it under canonical tool names.
-  That is **claude only** today.
+  That is **claude and opencode** today (opencode asks codeoid about every action, in every mode, under the canonical names).
   Everywhere else the role is *advisory*: the pack constitution + role contract are delivered in the system prompt and the model is instructed to stay in role, but nothing hard-denies.
 
 | Backend | Phase execution | Role (hard tool-deny) | Constitution / role contract |
@@ -97,6 +104,7 @@ Two layers behave differently:
 | gemini (stateless) | ✅ | ⚠️ advisory | ✅ |
 | gemini-cli (ACP) | ✅ | ⚠️ advisory | ✅ (delivered as a prompt preamble — this PR fixes the prior drop) |
 | openai (stateless) | ✅ | ⚠️ advisory | ✅ |
+| opencode | ✅ | ✅ hard | ✅ (a synthetic message before the prompt) |
 
 `roleEnforcement(providerId)` classifies each backend, and `runPhaseOnSession` **logs when a phase's role is only advisory** on the bound backend — so a reviewer phase on, say, codex is never silently presented as locked down.
 Full hard enforcement on the other backends (mapping their native tool names, or using a read-only native sandbox for reviewer phases) is future work; note codex in autonomous mode never invokes `canUseTool` at all, so it needs a native-policy approach rather than tool-name mapping.

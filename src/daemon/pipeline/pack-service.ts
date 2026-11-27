@@ -27,6 +27,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { GIT_BIN, gitEnv } from "../git-env.js";
 import { dirname, join, resolve, sep } from "node:path";
 import type { AvailablePackWire, PackWire, RegistryWire } from "@highflame/codeoid-protocol";
 import { type ModelBindingConfig, resolveBinding } from "./binding";
@@ -146,7 +147,13 @@ interface PackMeta {
 const NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 
 async function defaultGit(args: string[], cwd?: string): Promise<GitResult> {
-  const proc = Bun.spawn(["git", ...args], { cwd, stdout: "ignore", stderr: "pipe" });
+  // Packs live where agents can write: no hooks, and never the daemon's environment.
+  const proc = Bun.spawn([GIT_BIN, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args], {
+    cwd,
+    env: gitEnv({}, { network: true }),
+    stdout: "ignore",
+    stderr: "pipe",
+  });
   const stderr = await new Response(proc.stderr).text();
   const code = await proc.exited;
   return { ok: code === 0, stderr: stderr.trim() };

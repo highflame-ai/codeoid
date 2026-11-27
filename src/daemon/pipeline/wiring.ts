@@ -7,6 +7,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import type { EvidenceService } from "../evidence/service";
 import { PipelineManager } from "./manager";
 import { loadPack } from "./pack";
 import type { PhaseRunner } from "./runner";
@@ -32,6 +33,8 @@ export interface PipelineWiringOptions {
   /** Share this DB handle (the daemon Store's) instead of opening a second
    *  connection to `config.dbPath`. */
   db?: Database;
+  /** Records the evidence of every check a gate executes. */
+  evidence?: EvidenceService;
 }
 
 /**
@@ -45,7 +48,7 @@ export function createPipelineManagerFromConfig(
 ): PipelineManager | undefined {
   if (!config?.pipeline?.enabled) return undefined;
   const store = opts.db ? new PipelineStore(opts.db) : new PipelineStore(config.dbPath);
-  const manager = new PipelineManager(store, { runner: opts.runner });
+  const manager = new PipelineManager(store, { runner: opts.runner, evidence: opts.evidence });
   // Install configured packs. Fail SOFT per pack: a malformed / missing pack
   // logs and is skipped rather than taking down the daemon boot.
   for (const p of config.pipeline.packs ?? []) {

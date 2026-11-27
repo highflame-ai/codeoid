@@ -1,6 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import { FLEET_READ_TOOLS, FLEET_SEND_TOOLS } from "../protocol/types.js";
-import { isElicitationTool, isSafeTool } from "../daemon/providers/tool-safety.js";
+import { isElicitationTool, isSafeTool, isUnresolvedPathTool } from "../daemon/providers/tool-safety.js";
 import { MEMORY_TOOL_NAMES } from "../daemon/memory/tools.js";
 
 describe("isSafeTool", () => {
@@ -49,6 +49,14 @@ describe("isElicitationTool", () => {
     ]) {
       expect(isElicitationTool(t)).toBe(false);
     }
+  });
+});
+
+describe("isUnresolvedPathTool", () => {
+  test("only opencode's unresolved-path card, which is never safe", () => {
+    expect(isUnresolvedPathTool("opencode_unresolved_path")).toBe(true);
+    expect(isSafeTool("opencode_unresolved_path")).toBe(false);
+    for (const t of ["Read", "opencode_external_directory", "unresolved_path"]) expect(isUnresolvedPathTool(t)).toBe(false);
   });
 });
 

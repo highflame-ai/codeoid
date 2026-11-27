@@ -48,6 +48,12 @@ describe("nodeState", () => {
     expect(nodeState(task("t", { status: "claimed" }), session("idle"))).toBe("idle");
   });
 
+  it("files a held task under awaiting — it is parked on a human, whatever its agent shows", () => {
+    expect(nodeState(task("t", { status: "held" }), session("idle"))).toBe("awaiting");
+    expect(nodeState(task("t", { status: "held" }), null)).toBe("awaiting");
+    expect(laneFor("awaiting", task("t", { status: "held" }))).toBe("needs-you");
+  });
+
   it("treats a session error as a failure of the task", () => {
     expect(nodeState(task("t"), session("error"))).toBe("failed");
   });

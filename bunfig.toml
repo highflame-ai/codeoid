@@ -2,4 +2,5 @@
 # Exclude web/ — those tests require Vitest (vi.advanceTimersByTimeAsync,
 # SolidJS reactive root, vite-plugin-solid transform).
 # Run them with: bun run test:web
-pathIgnorePatterns = ["web"]
+# Exclude e2e/ — Playwright specs; run them with: bun run test:e2e
+pathIgnorePatterns = ["web", "e2e"]

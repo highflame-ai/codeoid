@@ -12,7 +12,7 @@
  * silently doing nothing (or worse, desyncing the local store).
  */
 
-import { Component, For, Show, createEffect, createSignal, on, onCleanup } from "solid-js";
+import { Component, For, Show, createEffect, createSignal, on } from "solid-js";
 
 import {
   authIdentity,
@@ -29,13 +29,19 @@ import {
   removeSession,
 } from "../state/sessions";
 import { fetchModels, modelCatalog } from "../state/models";
+import { EFFORT_LABELS } from "@highflame/codeoid-core";
 import { effectiveMode } from "../lib/session-mode";
 import { CAPABILITIES } from "../protocol/types";
-import type { ClientMessage, SessionInfo, SessionMode } from "../protocol/types";
+import { EFFORT_LEVELS } from "../protocol/types";
+import type { ClientMessage, EffortLevel, SessionInfo, SessionMode } from "../protocol/types";
 import { openBlackboard } from "../state/blackboard";
 import { openExportModal } from "./SessionExportModal";
 import { openUndoLast } from "./RewindModal";
 import { openCompare } from "./CompareModal";
+import { providerIds, providerLabel } from "../state/providers";
+import { AccountPicker } from "./AccountPicker";
+import { openAccountsSettings } from "./SettingsDrawer";
+import { useDismissable } from "../lib/dismissable";
 
 const MODE_OPTIONS: { value: SessionMode; label: string; hint: string }[] = [
   { value: "guarded", label: "guarded", hint: "Read/Grep/Glob auto; Write/Edit/Bash ask (default)" },
@@ -113,7 +119,21 @@ const SessionControls: Component = () => {
             current={s().model}
             provider={s().providerId}
           />
+          <EffortPicker
+            sessionId={s().id}
+            current={s().effort}
+            pending={s().effortPending === true}
+            model={s().model ?? s().runningModel}
+            sessionDefault={s().defaultEffort}
+          />
           <ProviderPicker sessionId={s().id} current={s().providerId} />
+          <AccountPicker
+            sessionId={s().id}
+            backend={s().providerId ?? "claude"}
+            chosen={s().account}
+            effective={s().effectiveAccount}
+            onManage={openAccountsSettings}
+          />
           <ForkButton sessionId={s().id} current={s().providerId} />
           <ExportButton />
           <span class="ml-auto" />
@@ -303,31 +323,6 @@ const RotateButton: Component<{ sessionId: string }> = (props) => {
   );
 };
 
-/** Dismiss a dropdown on Escape or a pointer-down outside its root — the menus
- * previously closed only on `onMouseLeave`, which a keyboard/touch user can't
- * trigger, so the menu stayed open over the content. Call inside a component. */
-function useDismissable(
-  rootRef: () => HTMLElement | undefined,
-  isOpen: () => boolean,
-  close: () => void,
-): void {
-  createEffect(() => {
-    if (!isOpen()) return;
-    const onDown = (e: PointerEvent) => {
-      const el = rootRef();
-      if (el && !el.contains(e.target as Node)) close();
-    };
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
-    };
-    document.addEventListener("pointerdown", onDown);
-    document.addEventListener("keydown", onKey);
-    onCleanup(() => {
-      document.removeEventListener("pointerdown", onDown);
-      document.removeEventListener("keydown", onKey);
-    });
-  });
-}
 
 const ModePicker: Component<{
   sessionId: string;
@@ -529,7 +524,7 @@ const ProviderPicker: Component<{
   const [error, setError] = createSignal<string | null>(null);
   let rootEl: HTMLDivElement | undefined;
   useDismissable(() => rootEl, open, () => setOpen(false));
-  const providers = () => authIdentity()?.providers ?? [];
+  const providers = providerIds;
   const current = () => props.current ?? providers()[0] ?? "claude";
   return (
     <Show when={providers().length > 1}>
@@ -543,7 +538,7 @@ const ProviderPicker: Component<{
           class="flex items-center gap-1 rounded border border-border bg-bg px-2 py-1 font-mono uppercase tracking-wider text-fg-muted hover:border-accent/40 hover:text-fg"
           title="Switch this session's backend (/provider <id>)"
         >
-          backend <span class="text-fg">{current()}</span> ▾
+          backend <span class="text-fg">{providerLabel(current())}</span> ▾
         </button>
         <Show when={open()}>
           <div class="absolute right-0 top-full z-30 mt-1 w-64 rounded border border-border bg-bg-elev shadow-xl">
@@ -574,7 +569,7 @@ const ProviderPicker: Component<{
                     id === current() ? "bg-bg-active text-fg" : "text-fg-muted"
                   }`}
                 >
-                  <span class="font-mono">{id}</span>
+                  <span class="font-mono" title={id}>{providerLabel(id)}</span>
                   <Show when={id === current()}>
                     <span class="text-accent">●</span>
                   </Show>
@@ -624,7 +619,7 @@ const ForkButton: Component<{
   const canFork = () => !(forkFromBase() && baseBranch().trim().length === 0);
   let rootEl: HTMLDivElement | undefined;
   useDismissable(() => rootEl, open, () => setOpen(false));
-  const providers = () => authIdentity()?.providers ?? [];
+  const providers = providerIds;
   // Backends OTHER than the current one — the "fork onto X" targets.
   const otherBackends = () => providers().filter((p) => p !== (props.current ?? providers()[0]));
 
@@ -727,7 +722,7 @@ const ForkButton: Component<{
             class="flex w-full items-center justify-between border-t border-border px-3 py-1.5 text-left text-[12px] text-fg-muted transition hover:bg-bg-hover disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
           >
             <span>fork (same backend)</span>
-            <span class="font-mono text-fg-faint">{props.current ?? providers()[0]}</span>
+            <span class="font-mono text-fg-faint">{providerLabel(props.current ?? providers()[0])}</span>
           </button>
           <Show when={otherBackends().length > 0}>
             <div class="border-t border-border px-3 py-1 text-[10px] uppercase tracking-wider text-fg-faint">
@@ -741,7 +736,7 @@ const ForkButton: Component<{
                   disabled={!canFork()}
                   class="flex w-full items-center px-3 py-1.5 text-left text-[12px] text-fg-muted transition hover:bg-bg-hover disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
                 >
-                  <span class="font-mono">{id}</span>
+                  <span class="font-mono" title={id}>{providerLabel(id)}</span>
                 </button>
               )}
             </For>
@@ -837,3 +832,105 @@ const DestroyButton: Component<{
 };
 
 export default SessionControls;
+
+// Module-level so a bare `/effort` can open it, as `/model` opens its picker.
+const [effortPickerOpen, setEffortPickerOpen] = createSignal(false);
+/** Open the focused session's thinking-effort picker (wired to a bare `/effort`). */
+export function openEffortPicker(): void {
+  setEffortPickerOpen(true);
+}
+
+/**
+ * How hard the session's model thinks (#417). Offers the levels the current
+ * model takes when its backend says (Claude, Codex, pi); otherwise the whole
+ * scale, marked as not known to the backend — a level it refuses fails the
+ * turn with a message saying so.
+ */
+const EffortPicker: Component<{ sessionId: string; current?: EffortLevel; pending?: boolean; model?: string; sessionDefault?: EffortLevel }> = (props) => {
+  const open = effortPickerOpen;
+  const setOpen = setEffortPickerOpen;
+  const act = createAction();
+  let rootEl: HTMLDivElement | undefined;
+  useDismissable(() => rootEl, open, () => setOpen(false));
+  // The catalog row of the model in use (or the backend's default one).
+  const entry = () => modelCatalog().find((m) => m.value === props.model) ?? (props.model ? undefined : modelCatalog().find((m) => m.isDefault));
+  const known = () => entry()?.efforts;
+  const levels = (): readonly EffortLevel[] => known() ?? EFFORT_LEVELS;
+  // What Default means here — unless the model's known levels don't include it.
+  const shownDefault = () => {
+    const d = props.sessionDefault ?? entry()?.defaultEffort;
+    return d && (!known() || known()!.includes(d)) ? d : undefined;
+  };
+  const choose = (effort: EffortLevel | null) =>
+    act.run({ type: "session.set_effort", id: newRequestId(), sessionId: props.sessionId, effort }, () => setOpen(false));
+  return (
+    <div class="relative" ref={rootEl}>
+      <button
+        type="button"
+        onClick={() => {
+          setOpen(!open());
+          act.clearError();
+        }}
+        class="flex items-center gap-1 rounded border border-border bg-bg px-2 py-1 font-mono uppercase tracking-wider text-fg-muted hover:border-accent/40 hover:text-fg"
+        title="How hard the model thinks before it answers"
+      >
+        effort <span class="text-fg">{props.current ? EFFORT_LABELS[props.current] : "default"}</span>
+        <Show when={props.pending}>
+          <span class="normal-case text-fg-faint" title="Not in effect yet: it lands with the next turn — or, while background work runs, once it ends (Stop ends it)">
+            (pending)
+          </span>
+        </Show>{" "}
+        ▾
+      </button>
+      <Show when={open()}>
+        <div
+          class="absolute right-0 top-full z-30 mt-1 w-52 rounded border border-border bg-bg-elev shadow-xl"
+          onMouseLeave={() => setOpen(false)}
+        >
+          <button
+            type="button"
+            disabled={act.busy()}
+            onClick={() => choose(null)}
+            class={`flex w-full items-center justify-between px-3 py-1.5 text-left text-[12px] transition hover:bg-bg-hover disabled:opacity-50 ${
+              !props.current ? "bg-bg-active text-fg" : "text-fg-muted"
+            }`}
+            title="The backend's own default"
+          >
+            <span>
+              Default
+              <Show when={shownDefault()}>
+                {(d) => <span class="text-fg-faint"> · {EFFORT_LABELS[d()]}</span>}
+              </Show>
+            </span>
+            <Show when={!props.current}>
+              <span class="text-accent">●</span>
+            </Show>
+          </button>
+          <For each={levels()}>
+            {(level) => (
+              <button
+                type="button"
+                disabled={act.busy()}
+                onClick={() => choose(level)}
+                class={`flex w-full items-center justify-between px-3 py-1.5 text-left text-[12px] transition hover:bg-bg-hover disabled:opacity-50 ${
+                  level === props.current ? "bg-bg-active text-fg" : "text-fg-muted"
+                }`}
+              >
+                <span>{EFFORT_LABELS[level]}</span>
+                <Show when={level === props.current}>
+                  <span class="text-accent">●</span>
+                </Show>
+              </button>
+            )}
+          </For>
+          <Show when={!known()}>
+            <div class="border-t border-border px-3 py-1.5 text-[10px] text-fg-faint">
+              This backend doesn't say which levels the model takes; one it refuses fails the turn with a note.
+            </div>
+          </Show>
+          <MenuError error={act.error()} />
+        </div>
+      </Show>
+    </div>
+  );
+};

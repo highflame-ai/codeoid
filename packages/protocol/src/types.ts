@@ -30,10 +30,53 @@ import type {
   BackendLoginStartResultMsg,
   BackendLoginSubmitResultMsg,
   BackendLoginCancelResultMsg,
+  BackendLoginWaitMsg,
+  BackendLoginWaitResultMsg,
 } from "./backend-login.js";
+import type {
+  AccountsChangedMsg,
+  AccountsListMsg,
+  AccountsRemoveMsg,
+  AccountsResultMsg,
+  AccountsSetDefaultMsg,
+  AccountsSetMsg,
+  SessionSetAccountMsg,
+} from "./accounts.js";
 import type { SkillGrantMsg, SkillGrantResultMsg } from "./skill-grant.js";
+import type { WorktreeTrustMsg, WorktreeTrustResultMsg } from "./worktree-trust.js";
+import type {
+  CredentialDeleteMsg,
+  CredentialListMsg,
+  CredentialListResultMsg,
+  CredentialSetValueMsg,
+  CredentialUpsertMsg,
+  SecretForgetMsg,
+  SecretListMsg,
+  SecretListResultMsg,
+  SecretRevealMsg,
+  SecretRevealResultMsg,
+  SessionWorkstreamInfo,
+  WorkstreamDeleteMsg,
+  WorkstreamListMsg,
+  WorkstreamListResultMsg,
+  WorkstreamResolution,
+  WorkstreamResolveMsg,
+  WorkstreamResolveResultMsg,
+  WorkstreamSettingsMsg,
+  WorkstreamsChangedMsg,
+  WorkstreamUpsertMsg,
+} from "./workstreams.js";
 import type { SessionRewindMsg, SessionRewindResultMsg, SessionTurnsMsg, SessionTurnsResultMsg } from "./turns.js";
 import type { SessionApprovalsMsg, SessionApprovalsResultMsg } from "./approvals.js";
+import type {
+  ApprovalRuleOffer,
+  ApprovalRulesAddMsg,
+  ApprovalRulesAddResultMsg,
+  ApprovalRulesListMsg,
+  ApprovalRulesListResultMsg,
+  ApprovalRulesRemoveMsg,
+  ApprovalSaveScope,
+} from "./approval-rules.js";
 import type {
   ClaudeAccountsListMsg,
   ClaudeAccountsRemoveMsg,
@@ -42,6 +85,18 @@ import type {
   ClaudeAccountsSetMsg,
   SessionSetClaudeAccountMsg,
 } from "./claude-accounts.js";
+import type {
+  EndpointsListMsg,
+  EndpointsRemoveMsg,
+  EndpointsResultMsg,
+  EndpointsSetMsg,
+  EndpointsTestMsg,
+  EndpointsTestResultMsg,
+  ProviderInfo,
+  ProvidersChangedMsg,
+  ProvidersListMsg,
+  ProvidersResultMsg,
+} from "./endpoints.js";
 import type { CompareGetMsg, CompareKeepMsg, CompareListMsg, CompareListResultMsg, CompareStateMsg, SessionCompareMsg } from "./compare.js";
 import type {
   RoutineCancelRunMsg,
@@ -61,6 +116,26 @@ import type {
   RoutineTokenResultMsg,
   RoutineUpdateMsg,
 } from "./routines.js";
+import type { EvidenceGetMsg, EvidenceRecordMsg } from "./evidence.js";
+import type {
+  LoopCancelMsg,
+  LoopGetMsg,
+  LoopPauseMsg,
+  LoopResumeMsg,
+  LoopListMsg,
+  LoopListResultMsg,
+  LoopSnapshotMsg,
+  LoopStartMsg,
+  LoopSteerMsg,
+  LoopWatchCreateMsg,
+  LoopWatchDeleteMsg,
+  LoopWatchGetMsg,
+  LoopWatchListMsg,
+  LoopWatchListResultMsg,
+  LoopWatchPollMsg,
+  LoopWatchSnapshotMsg,
+  LoopWatchUpdateMsg,
+} from "./loops.js";
 import type {
   McpAdoptMsg,
   McpAdoptResultMsg,
@@ -207,6 +282,14 @@ export type Capability = (typeof CAPABILITIES)[keyof typeof CAPABILITIES];
  * `attachments` (bounded per-file, surfaced to the model as files it can
  * read selectively).
  */
+/**
+ * How hard a model thinks before it answers (#417), on one scale for every
+ * backend; each maps it to its own setting (docs/thinking-effort.md). A
+ * session with no effort set runs at the backend's own default.
+ */
+export const EFFORT_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
+
 export const LIMITS = {
   /** Max `session.send.text` length. ~1M chars ≈ hundreds of thousands of tokens. */
   SEND_TEXT_MAX: 1_000_000,
@@ -317,6 +400,106 @@ export function isActiveStatus(s: SessionStatus): boolean {
  */
 export type SessionMode = "interactive" | "guarded" | "autonomous";
 
+/**
+ * A session's OS sandbox setting (#448, docs/sandbox.md). Every field
+ * optional: what is absent follows the daemon's `sandbox.*` config.
+ */
+export interface SessionSandboxSetting {
+  /** `auto` (bubblewrap on Linux, Seatbelt on macOS), `off`, or a provider id (`bwrap`, `seatbelt`, `docker`). */
+  provider?: string;
+  /** What a sandboxed command may reach on the network. */
+  network?: SandboxNetworkMode;
+  /** Hosts allowed with `network: "allowlist"` (`example.com`, `*.example.com`). */
+  allowedHosts?: string[];
+  /**
+   * Let commands reach the host's container runtime socket (testcontainers,
+   * `docker run`): off by default (`sandbox.docker.socket`). Root on the
+   * machine: turning it on is a widening, asked of the owner.
+   */
+  dockerSocket?: boolean;
+  /**
+   * Where the session's commands read other repositories, read-only
+   * (docs/sandbox.md, "Working across repositories"): absolute paths (`~`
+   * expands) or `@parent`, the parent of the session's repository. Absent:
+   * `sandbox.projectRoots` (by default `@parent`); `[]`: none. One the
+   * daemon's default doesn't have is a widening.
+   */
+  projectRoots?: string[];
+  /**
+   * Directories the session's commands may write besides its workspace,
+   * absolute: each treated as a workspace (its git structure and project
+   * settings held, its own worktree folder). Adding one is a widening (the
+   * owner's own decision; `session.sandbox_dir`, or the agent's
+   * `request_directory`).
+   */
+  addedDirs?: string[];
+  /**
+   * Kept by the daemon, never sent by a client (the schema refuses it): the
+   * added directories the agent added itself (an autonomous
+   * `request_directory`). Credential files in one stay hidden as in a
+   * project root; in one the owner added they are the session's to use.
+   */
+  agentDirs?: string[];
+  /**
+   * Kept by the daemon, never sent by a client (the schema refuses it): what
+   * each directory the sandbox binds by name was when it was pinned (#448
+   * round 13): `workspace` (the sandbox's workspace, a monorepo's top) as
+   * found for `workdir` (another session's, a fork's, isn't used), and
+   * `ids`, by real path, `dev:ino@boot`.
+   */
+  pins?: { workdir?: string; workspace?: string; ids: Record<string, string> };
+}
+
+export type SandboxNetworkMode = "on" | "off" | "allowlist";
+
+/**
+ * Whether, and how, a session's commands run sandboxed (#448).
+ *
+ *   - `on`: they do, as `network` says (see `enforced`);
+ *   - `off`: the owner turned it off;
+ *   - `unavailable`: it was asked for and can't run here (`reason`): an
+ *     interactive session runs unsandboxed and says so on every approval
+ *     card, an autonomous one, a routine or a loop refuses to start;
+ *   - `no-shell`: the backend runs no commands (an HTTP model API).
+ */
+export interface SessionSandboxInfo {
+  /** What is set: `auto`, `off`, or a provider id. */
+  choice: string;
+  state: "on" | "off" | "unavailable" | "no-shell";
+  /** The provider in use (`bwrap`, …), when on. */
+  provider?: string;
+  providerName?: string;
+  /** Why it's off or unavailable. */
+  reason?: string;
+  /** The network commands get. */
+  network: SandboxNetworkMode;
+  /** What was asked, when it differs from `network` (an allowlist a provider can't enforce runs with the network off; a backend that needs the network to reach its model keeps it on). */
+  networkRequested?: SandboxNetworkMode;
+  allowedHosts?: string[];
+  isolation?: "os" | "kernel" | "hardware";
+  /** How this backend is put inside: its own sandbox with codeoid's policy, its whole process, or each command. */
+  confinement?: "native" | "process" | "command";
+  /** One line: how, in words ("Claude Code's sandbox (bubblewrap), codeoid's policy"). */
+  via?: string;
+  /** What isn't confined this way, in plain words. */
+  limits?: string[];
+  /** Commands can reach the container runtime's socket (the owner's opt-in): it can reach the whole machine. */
+  dockerSocket?: boolean;
+  /** The project roots commands read (read-only), resolved: other repositories, other sessions' checkouts. */
+  projectRoots?: string[];
+  /** The directories commands write besides the workspace, as the running sandbox has them. */
+  addedDirs?: string[];
+  /**
+   * Added (or removed) directories not applied yet: they take effect at the
+   * session's next turn (once no turn or background work is running).
+   */
+  pendingDirs?: { add: string[]; remove: string[] };
+  /** The workspace is the home itself: commands read and write all of it but the credentials the sandbox hides. */
+  homeWorkspace?: boolean;
+  /** Everything asked is enforced: what an autonomous session, a routine or a loop needs to start. */
+  enforced: boolean;
+}
+
 export interface SessionInfo {
   id: string;
   name: string;
@@ -358,8 +541,21 @@ export interface SessionInfo {
    * the daemon default, else `default` (the daemon's own environment).
    */
   effectiveClaudeAccount?: string;
+  /**
+   * The account this session chose for its current backend (accounts.ts).
+   * Absent = it follows that backend's daemon default.
+   */
+  account?: string;
+  /**
+   * The account it actually runs on for its current backend — its choice,
+   * else the backend's daemon default, else `default`; `"<name> (missing)"`
+   * when that account can't be used. Absent for a backend without accounts.
+   */
+  effectiveAccount?: string;
   /** Current execution mode (default "interactive"). */
   mode?: SessionMode;
+  /** Whether its commands run in an OS sandbox (#448). Absent on a daemon without sandboxing. */
+  sandbox?: SessionSandboxInfo;
   /** Active SDLC pipeline phase id when this session backs a phase. Absent = not a pipeline session. */
   phase?: string;
   /** Methodology pack/profile driving this session's phase. */
@@ -388,6 +584,11 @@ export interface SessionInfo {
    */
   managedBy?: "pipeline" | "routine";
   /**
+   * Home workstream (docs/workstreams-design.md). Absent on a daemon without
+   * workstreams configured, and on older daemons.
+   */
+  workstream?: SessionWorkstreamInfo;
+  /**
    * A prompt has been accepted but its turn has not started yet (hooks, the
    * turn checkpoint, identity registration are still running). The session can
    * read `idle` in this window, so a caller waiting for a reply must treat
@@ -396,6 +597,18 @@ export interface SessionInfo {
   turnQueued?: true;
   /** Remaining turns budget for autonomous mode (undefined = unbounded, 0 = exhausted). */
   turnsRemaining?: number;
+  /**
+   * An unattended worker (onBudgetExhausted "end_attempt") spent its
+   * autonomous tool budget: its tool calls are refused until a person sets a
+   * mode or sends a message, or its controller sets a new budget. Absent = not.
+   */
+  budgetExhausted?: true;
+  /**
+   * The autonomous tool budget ran out and the session reverted to guarded
+   * mode (the default "park"): writes and commands ask again. Cleared when a
+   * mode is set. Absent = not (and on older daemons).
+   */
+  autonomousBudgetSpent?: true;
   /** Files pinned to the session — prepended to every turn's prompt. */
   pinnedFiles?: string[];
   /** SPIFFE/WIMSE URI of the primary session agent (falls back to anonymous:session:<id>). */
@@ -443,6 +656,22 @@ export interface SessionInfo {
   model?: string;
   /** Fallback model id used on 429/529 capacity errors. */
   fallbackModel?: string;
+  /** Thinking effort set on this session (#417); absent = the backend's default. */
+  effort?: EffortLevel;
+  /**
+   * What Default means on this session right now, when the backend says
+   * (Codex: the configured effort, the project's included, else the running
+   * model's; pi: the user's default). Known once the backend has started.
+   */
+  defaultEffort?: EffortLevel;
+  /** The model the backend runs when the session names none, once known (Codex). */
+  runningModel?: string;
+  /**
+   * The effort set hasn't reached the backend yet (#417): it lands with the
+   * next turn, or — when it needs a rebuild — the first one with no
+   * background work running (Stop ends that work).
+   */
+  effortPending?: boolean;
   /**
    * Lineage for a session created via `session.fork`. Absent = not a fork.
    * Frontends surface it as a chip ("⑃ forked from <name> · turn <atTurn>")
@@ -504,6 +733,19 @@ export interface SessionWorktree {
    * worktree the user already had — codeoid never removes those.
    */
   createdByCodeoid: boolean;
+  /**
+   * The loop run whose worktree this is. Its sessions can't remove it while
+   * the run is in progress, and removing it never commits what's left in it:
+   * the run's branch holds only what the run delivered.
+   */
+  loopRun?: string;
+  /**
+   * What the repository's setup recipe put in this worktree, relative to its
+   * root: copied (ignored, often secret) files and symlinks to the primary
+   * checkout's shared directories. Kept out of checkpoints and taken back out
+   * before the worktree is removed.
+   */
+  setup?: { copied: string[]; shared: string[] };
 }
 
 /**
@@ -523,8 +765,16 @@ export interface SessionUsage {
   cacheReadTokens: number;
   /** Tokens written to the prompt cache (a premium on cache-misses). */
   cacheCreationTokens: number;
-  /** Total cost in USD across all turns, as reported by the SDK. */
+  /**
+   * Total cost in USD across all turns: what backends reported, plus estimates
+   * from tokens × list price where they report none (#430). Excludes turns
+   * whose cost is unknown — see `costUnknownTurns`.
+   */
   totalCostUsd: number;
+  /** Some of `totalCostUsd` is estimated from tokens × list price, not reported by the backend. */
+  costEstimated?: boolean;
+  /** Turns whose cost isn't known (no price for the model, or no token counts) — not in `totalCostUsd`. */
+  costUnknownTurns?: number;
   /** Number of turns (round-trips) included in these totals. */
   numTurns: number;
   /** Wall-clock duration of agent work (sum of per-turn `duration_ms`). */
@@ -595,8 +845,15 @@ export interface TurnUsage {
   cacheReadTokens: number;
   /** Cache-write tokens (billed at ~125% of full input). */
   cacheCreationTokens: number;
-  /** Total cost for the turn in USD, as reported by the SDK. */
+  /** Total cost for the turn in USD — see `costSource` (#430). */
   totalCostUsd: number;
+  /**
+   * Where the cost came from: `backend` (it said), `estimated` (tokens × list
+   * price), `free` (a model on this machine), `unknown` (no price or no token
+   * counts; `totalCostUsd` is then 0 and means nothing). Absent on turns
+   * recorded before #430: reported by the backend, or $0 if it gave nothing.
+   */
+  costSource?: "backend" | "estimated" | "free" | "unknown";
   /** Wall-clock duration in ms (agent work, not network). */
   durationMs: number;
   /** Stop reason ("end_turn", "max_tokens", "tool_use", "error", …) if known. */
@@ -859,6 +1116,10 @@ export interface CollaborationCost {
   children: number;
   /** Summed `SessionUsage.totalCostUsd` across orchestrator + children. */
   totalCostUsd: number;
+  /** Some of it is estimated from tokens (#430). */
+  costEstimated?: boolean;
+  /** Turns whose cost isn't known — not in `totalCostUsd`. */
+  costUnknownTurns?: number;
   inputTokens: number;
   outputTokens: number;
   /** Summed turns — how much agent work the goal has already consumed. */
@@ -879,6 +1140,46 @@ export interface ToolWaitingConfirmationState {
    * roll-up could not be computed.
    */
   collaborationCost?: CollaborationCost;
+  /**
+   * Present only for a send-class fleet dispatch with workstreams: the
+   * workstream the action runs in (the target session's, or the spawned
+   * worker's home), and a warning when the spawn's home is chosen past the
+   * folder's own exclusive workstream (approving the card confirms it, G3)
+   * or can't be decided (the spawn will be refused). docs/workstreams-design.md §10.
+   */
+  targetWorkstream?: { workstream?: string; warning?: string };
+  /**
+   * A shell command's risk, judged from what it runs (#431); for a file-tool
+   * write into what the OS sandbox holds read-only, that reason first
+   * ("writes the repository's git structure …"). Absent otherwise.
+   */
+  risk?: ToolRisk;
+  /**
+   * Whether this call runs inside the session's OS sandbox (#448). False for
+   * a session that isn't sandboxed, a tool that runs in the backend's own
+   * process outside it, and a request to run a command unsandboxed (asked in
+   * guarded and interactive mode, refused in autonomous mode). Absent on a
+   * daemon without sandboxing.
+   */
+  sandboxed?: boolean;
+  /** Why not, or what's asked: "not sandboxed: bubblewrap is not installed", "asks to run outside the sandbox". */
+  sandboxNote?: string;
+  /** It runs inside a sandbox whose commands can reach the container runtime (Docker access): said as a warning. */
+  sandboxDocker?: boolean;
+  /**
+   * The rules an answer could save, and where (docs/secrets-and-memory-design.md
+   * §4.1): present only in guarded mode, on a call a rule could run. Answer
+   * with `session.approve` `save`.
+   */
+  ruleOffer?: ApprovalRuleOffer;
+}
+
+/** How risky a shell command is, and why (#431). */
+export interface ToolRisk {
+  /** low: reads in the workspace; medium: changes or runs things; high: hard to undo or a way to lose data or credentials; unknown: not understood. */
+  level: "low" | "medium" | "high" | "unknown";
+  /** Most serious first; empty for low. */
+  reasons: string[];
 }
 
 export interface ToolExecutingState {
@@ -1055,13 +1356,24 @@ export type ClientMessage =
   | SessionCommandsMsg
   | SessionDestroyMsg
   | SessionSetModeMsg
+  | SessionSetSandboxMsg
+  | SessionSandboxDirMsg
+  | SessionAddReferenceMsg
+  | SessionRemoveReferenceMsg
+  | SessionSetWorkstreamMsg
+  | SandboxProvidersMsg
+  | SandboxGitConnectMsg
   | SessionPinMsg
   | SessionUnpinMsg
   | SessionRotateMsg
   | SessionSearchMsg
   | SessionSetModelMsg
+  | SessionSetEffortMsg
   | SessionSetProviderMsg
   | SessionMcpReconnectMsg
+  | SessionMcpRefreshMsg
+  | McpApproveMsg
+  | McpApprovePreviewMsg
   | SessionForkMsg
   | ScrollbackPageMsg
   | SessionRenameMsg
@@ -1081,7 +1393,24 @@ export type ClientMessage =
   | BackendLoginStartMsg
   | BackendLoginSubmitMsg
   | BackendLoginCancelMsg
+  | BackendLoginWaitMsg
   | SkillGrantMsg
+  | WorktreeTrustMsg
+  | WorkstreamListMsg
+  | WorkstreamResolveMsg
+  | WorkstreamUpsertMsg
+  | WorkstreamDeleteMsg
+  | WorkstreamSettingsMsg
+  | CredentialListMsg
+  | CredentialUpsertMsg
+  | CredentialDeleteMsg
+  | CredentialSetValueMsg
+  | SecretListMsg
+  | ApprovalRulesListMsg
+  | ApprovalRulesAddMsg
+  | ApprovalRulesRemoveMsg
+  | SecretRevealMsg
+  | SecretForgetMsg
   | SessionTurnsMsg
   | SessionApprovalsMsg
   | ClaudeAccountsListMsg
@@ -1089,6 +1418,16 @@ export type ClientMessage =
   | ClaudeAccountsRemoveMsg
   | ClaudeAccountsSetDefaultMsg
   | SessionSetClaudeAccountMsg
+  | AccountsListMsg
+  | AccountsSetMsg
+  | AccountsRemoveMsg
+  | AccountsSetDefaultMsg
+  | SessionSetAccountMsg
+  | ProvidersListMsg
+  | EndpointsListMsg
+  | EndpointsSetMsg
+  | EndpointsRemoveMsg
+  | EndpointsTestMsg
   | SessionRewindMsg
   | SessionCompareMsg
   | CompareGetMsg
@@ -1104,6 +1443,20 @@ export type ClientMessage =
   | RoutineRunsMsg
   | RoutineTokenMsg
   | RoutinePreviewMsg
+  | EvidenceGetMsg
+  | LoopStartMsg
+  | LoopListMsg
+  | LoopGetMsg
+  | LoopCancelMsg
+  | LoopPauseMsg
+  | LoopResumeMsg
+  | LoopSteerMsg
+  | LoopWatchCreateMsg
+  | LoopWatchListMsg
+  | LoopWatchGetMsg
+  | LoopWatchUpdateMsg
+  | LoopWatchDeleteMsg
+  | LoopWatchPollMsg
   | McpOAuthBeginMsg
   | McpOAuthCompleteMsg
   | McpOAuthDisconnectMsg
@@ -1256,6 +1609,12 @@ export interface SessionCreateMsg extends BaseClientMsg {
    */
   claudeAccount?: string;
   /**
+   * Account to run this session on for its backend (accounts.ts). Absent =
+   * follow that backend's daemon default. Unknown names are rejected. For
+   * Claude, `claudeAccount` is the older spelling of the same choice.
+   */
+  account?: string;
+  /**
    * Model for this session (docs/role-model-binding.md §6.2). Validated
    * provider-aware at create (a Claude alias on a non-Claude backend is
    * rejected); otherwise passed through — the live backend is the real
@@ -1264,6 +1623,10 @@ export interface SessionCreateMsg extends BaseClientMsg {
    * absent otherwise = the provider's default.
    */
   model?: string;
+  /** Thinking effort (#417). Absent = `session.defaultEffort`, else the backend's default; null = the backend's default. */
+  effort?: EffortLevel | null;
+  /** OS sandbox (#448). Absent = the daemon's `sandbox.*` config. `provider: "off"` needs session:approve. */
+  sandbox?: SessionSandboxSetting;
   /**
    * Activate an installed SDLC pack on this session (ambient mode): inject its
    * constitution, expose its skills/subagents, and — with `packRole` — run
@@ -1280,6 +1643,28 @@ export interface SessionCreateMsg extends BaseClientMsg {
    *  (read-only). Requires `pack`; rejected with `collaboration` (a collab's
    *  roles each carry their own envelope from the pack). */
   packRole?: string;
+  /**
+   * Home workstream (docs/workstreams-design.md §5). Absent = the folder's,
+   * else the configured default. A choice that differs from a workstream
+   * holding an exclusive claim on the folder is refused with
+   * `detail.kind: "workstream_conflict"`; an unknown one with
+   * `"workstream_unknown"`.
+   */
+  workstream?: string;
+  /**
+   * Confirm a choice of `workstream` past another workstream's exclusive
+   * claim on the folder (docs/workstreams-design.md §5.2, G3): the token from
+   * the `workstream_conflict` refusal. Needs `session:approve` and an
+   * undelegated token.
+   */
+  override?: { token: string };
+  /**
+   * Other workstreams the session may read (docs/workstreams-design.md §7.2):
+   * their folders read-only and their memory. Each follows the share policy
+   * of the workstream read: `open` is granted, `ask` needs `session:approve`
+   * on an undelegated token (the creator's confirm), `closed` is refused.
+   */
+  references?: WorkstreamReferenceInput[];
 }
 
 /**
@@ -1483,6 +1868,15 @@ export interface SessionApproveMsg extends BaseClientMsg {
    * returning `{ behavior: "allow", updatedInput: ... }` to the SDK.
    */
   updatedInput?: Record<string, unknown>;
+  /**
+   * Allow, and save the rules the card offers for this scope
+   * (ToolWaitingConfirmationState.ruleOffer). The daemon works the rules out
+   * again from the call's own input. Only the session owner's undelegated
+   * token can save; any other is refused and the card stays open.
+   */
+  save?: ApprovalSaveScope;
+  /** With `save`: the rules the card showed. The save is refused when the daemon would now save others. */
+  rules?: string[];
 }
 
 /** Device platform for a push registration. */
@@ -1575,6 +1969,109 @@ export interface SessionDestroyMsg extends BaseClientMsg {
   sessionId: string;
 }
 
+/**
+ * Change a session's OS sandbox (#448). Owner only. Anything that narrows it
+ * (turning it on, the network off) applies at once; anything that widens it
+ * (turning it off, the network on or wider) is an approval the owner answers
+ * on the session, in every mode, and is audited: the reply is `response.ok`
+ * with `data: { pending: true, requestId }`, and the change lands when it is
+ * approved (`session.info_update`). It reaches the backend from its next
+ * start: a session mid-turn changes after the turn.
+ */
+export interface SessionSetSandboxMsg extends BaseClientMsg {
+  type: "session.set_sandbox";
+  sessionId: string;
+  sandbox: SessionSandboxSetting;
+}
+
+/**
+ * Add a directory to what a session's commands may write, or remove one
+ * (docs/sandbox.md, "Working across repositories"). Owner only, with
+ * session:approve and an undelegated token. Removing applies at once (from
+ * the next turn); adding is a widening, asked of the owner on the session
+ * (`data: { pending: true }`), and lands on a yes. It takes effect at the
+ * session's next turn with no background work running.
+ */
+/** A reference asked for (§7.2): a workstream, and optionally folders inside it (absolute; absent = all of them). */
+export interface WorkstreamReferenceInput {
+  workstream: string;
+  paths?: string[];
+}
+
+/**
+ * Give a session read access to another workstream (§7.1, §7.2). Owner-only.
+ * `open`: granted; `ask`: granted at once when the owner asks with
+ * `session:approve` on an undelegated token, else the owner confirms on the
+ * session (`response.ok` with `pending`); `closed`: refused.
+ */
+export interface SessionAddReferenceMsg extends BaseClientMsg {
+  type: "session.add_reference";
+  sessionId: string;
+  workstream: string;
+  paths?: string[];
+}
+
+/** Take a reference away (owner-only). The session still counts as having read from it (§14 q3). */
+export interface SessionRemoveReferenceMsg extends BaseClientMsg {
+  type: "session.remove_reference";
+  sessionId: string;
+  workstream: string;
+}
+
+/**
+ * Move a session to another home workstream (§5.3): a share of its whole
+ * transcript, so it follows the share policy of its old home and of every
+ * workstream it has read from (`ask` as for a reference; `closed` refuses).
+ * Past another workstream's exclusive claim on the folder it needs
+ * `session:approve` on an undelegated token. Applied at the next turn.
+ */
+export interface SessionSetWorkstreamMsg extends BaseClientMsg {
+  type: "session.set_workstream";
+  sessionId: string;
+  workstream: string;
+}
+
+export interface SessionSandboxDirMsg extends BaseClientMsg {
+  type: "session.sandbox_dir";
+  sessionId: string;
+  action: "add" | "remove";
+  /** Absolute (`~` expands). */
+  path: string;
+}
+
+/** The sandbox providers this daemon has, and whether each runs here (#448). Needs session:create. */
+export interface SandboxProvidersMsg extends BaseClientMsg {
+  type: "sandbox.providers";
+}
+
+/**
+ * Connect a remote for the git gateway (docs/git-gateway-design.md): agents in the caller's sandboxed sessions may
+ * then fetch from it and push branches of their own, with the caller's existing credential (or `token`). Needs
+ * settings:write; refused for a delegated token. `list` lists the caller's own; `disconnect` takes one back.
+ */
+export interface SandboxGitConnectMsg extends BaseClientMsg {
+  type: "sandbox.git_connect";
+  action: "connect" | "disconnect" | "list" | "resolve";
+  /** The remote's URL; or `path` (a directory in a repository) and `remote` (default `origin`). */
+  url?: string;
+  path?: string;
+  remote?: string;
+  /** A dedicated token for an https remote (`user:token` or a token), instead of the caller's own credential. */
+  token?: string;
+}
+
+/** One entry of the `sandbox.providers` reply's `data.providers`. */
+export interface SandboxProviderWire {
+  id: string;
+  displayName: string;
+  available: boolean;
+  reason?: string;
+  isolation: "os" | "kernel" | "hardware";
+  placement: "local" | "remote";
+  workspace: "mount" | "sync";
+  network: SandboxNetworkMode[];
+}
+
 export interface SessionSetModeMsg extends BaseClientMsg {
   type: "session.set_mode";
   sessionId: string;
@@ -1649,6 +2146,89 @@ export interface SessionMcpReconnectMsg extends BaseClientMsg {
   server: string;
 }
 
+/**
+ * Re-read the session's MCP servers from Claude's config (its workdir's, and
+ * approvals since) and apply any change (#395): the backend is rebuilt and
+ * resumes the conversation. Nothing changes on its own — `claude.config`
+ * says when a refresh would (`mcpStale`). During a turn, applied before the
+ * next one. `response.ok` data is {@link McpRefreshResult}. Requires `session:send`.
+ */
+export interface SessionMcpRefreshMsg extends BaseClientMsg {
+  type: "session.mcp_refresh";
+  sessionId: string;
+}
+
+/** `response.ok` data for `session.mcp_refresh`. */
+export interface McpRefreshResult {
+  /** The servers changed (the backend is rebuilt, or will be before the next turn). */
+  changed: boolean;
+  /** A turn is running: applied before the next one. */
+  deferred: boolean;
+}
+
+/**
+ * Approve a repo's MCP server (a workdir's `.mcp.json` or project settings)
+ * for every backend in that workdir (#395) — this exact entry: a repo that
+ * edits it needs approval again. Takes effect on a refresh. Approving in
+ * Claude Code works too. Requires `settings:write` (not a delegated token),
+ * and the session must be the caller's.
+ */
+export interface McpApproveMsg extends BaseClientMsg {
+  type: "mcp.approve";
+  sessionId: string;
+  server: string;
+  /** The file it's declared in, when the name is in more than one. */
+  path?: string;
+  /** The entry's fingerprint as `claude.config` showed it: an entry changed since isn't approved. */
+  fingerprint: string;
+}
+
+/**
+ * What approving a project's MCP server would approve (#395): the entry in
+ * full — its command and every argument, its URL, its environment and header
+ * names with each `${VAR}` reference shown and every literal value masked —
+ * and the fingerprint `mcp.approve` must quote. The same rights as
+ * `mcp.approve` (it shows what a repo committed, to the one who'd consent).
+ * `response.ok` data is {@link McpApprovePreview}.
+ */
+export interface McpApprovePreviewMsg extends BaseClientMsg {
+  type: "mcp.approve.preview";
+  sessionId: string;
+  server: string;
+  /** The file it's declared in, when the name is in more than one. */
+  path?: string;
+}
+
+/** `response.ok` data for `mcp.approve.preview`. */
+export interface McpApprovePreview {
+  server: string;
+  path: string;
+  fingerprint: string;
+  command: string | null;
+  args: string[];
+  url: string | null;
+  /**
+   * Every value below is shown exactly as the repo wrote it — nothing hidden
+   * or cut; only characters that wouldn't show (bidi, zero-width, controls)
+   * are escaped as `\u{…}`, and a backslash doubled.
+   */
+  /**
+   * The whole entry as it's to be shown, one item per line — every value
+   * quoted, a run of spaces counted (`\u{20}×{400}`), a URL's host as the
+   * URL parser reads it (punycode for a look-alike) — so no layout can hide any of it.
+   * Clients show these lines as they are.
+   */
+  lines: string[];
+  /** The command line, each part shell-quoted so it reads as it runs. */
+  commandLine: string | null;
+  /** `path`, escaped for showing. */
+  shownPath: string;
+  /** Each env var as written (`${VAR}` references kept; a reference to codeoid's own secrets already removed, as it runs). */
+  env: Record<string, string>;
+  /** Each header, likewise. */
+  headers: Record<string, string>;
+}
+
 /** `response.ok` data for `session.mcp_reconnect`. */
 export interface McpReconnectResult {
   server: string;
@@ -1678,6 +2258,30 @@ export interface SessionSetModelMsg extends BaseClientMsg {
   sessionId: string;
   model: string;
   fallbackModel?: string | null;
+}
+
+/**
+ * Set how hard the session's model thinks (#417); `null` returns it to the
+ * backend's default. Kept with the session, like its model. Never cuts a
+ * running turn short: applied live where the backend can take it (Claude,
+ * Qwen, pi), otherwise from the next turn — on the Gemini CLI, whose
+ * thinking is a startup setting, by restarting its backend, which resumes
+ * the conversation. Requires `session:send`. `response.ok` data is
+ * {@link EffortChangeResult}.
+ */
+export interface SessionSetEffortMsg extends BaseClientMsg {
+  type: "session.set_effort";
+  sessionId: string;
+  effort: EffortLevel | null;
+}
+
+/** `response.ok` data for `session.set_effort`. */
+export interface EffortChangeResult {
+  effort: EffortLevel | null;
+  /** When it takes effect: now, from the next turn, or once the backend restarts (between turns). */
+  applies: "now" | "next-turn" | "restart";
+  /** It needs a rebuild that waits for the session's background work to end (Stop ends it). */
+  waitsForBackground?: boolean;
 }
 
 /**
@@ -1758,8 +2362,10 @@ export interface FsListMsg extends BaseClientMsg {
  */
 export interface FsBrowseDirMsg extends BaseClientMsg {
   type: "fs.browse_dir";
-  /** Absolute path to browse. Defaults to the daemon user's HOME. */
+  /** Path to browse: absolute, `~`-prefixed, or relative to the root. Defaults to the daemon user's HOME. */
   path?: string;
+  /** Include dot-dirs and the usual build/dependency dirs. VCS internals and protected dirs stay out. */
+  showHidden?: boolean;
 }
 
 /**
@@ -1856,6 +2462,14 @@ export interface ModelInfo {
    * the window per turn instead, and gemini, openai and acp not at all.
    */
   contextWindow?: number;
+  /**
+   * The thinking efforts this model takes (#417), when the backend reports
+   * them (Claude, Codex, pi). Absent = unknown: any level may be offered, and
+   * the backend decides; an empty list = the model doesn't think.
+   */
+  efforts?: EffortLevel[];
+  /** The backend's own default effort for this model, when it says. */
+  defaultEffort?: EffortLevel;
 }
 
 /**
@@ -1919,9 +2533,20 @@ export interface ClaudeConfigMcpServer {
   /** Absolute path to the source file that declared it
    * (`~/.claude.json`, `settings.json`, `.mcp.json`, …). */
   path: string;
-  /** stdio command, when present. */
+  /**
+   * stdio command, when present. In `claude.config` it's the program's file
+   * name only (`npx`, `node`), or "(command)" when that name isn't plain or
+   * reads as a credential — commands and args hold credentials as often as
+   * env does (#394); the full text is in the file at `path`.
+   */
   command: string | null;
+  /** Empty in `claude.config` (see `argCount`); daemon-internal readers get the args. */
   args: string[];
+  /** How many args the command has (`claude.config`; the args themselves aren't sent). */
+  argCount?: number;
+  /** Set by the daemon, never read from a file: why this row stands in for a
+   *  file's servers (e.g. the file is too large to describe). */
+  note?: string;
   /** Just the keys of the `env` block (values are secrets, never returned). */
   envKeys: string[];
   /** http URL for non-stdio servers. */
@@ -1958,6 +2583,21 @@ export interface ClaudeConfigMcpServer {
    * config, which codeoid would then sign in to (`mcp.adopt`).
    */
   adoptable?: true;
+  /** codeoid could adopt it, but only by its full URL (#394): a project's
+   *  server whose URL has parts hidden here. Adopt it from the CLI with
+   *  `--url`, copied from the file at `path`. */
+  adoptByFullUrl?: true;
+  /**
+   * For a server from Claude's config: whether it reaches this session's
+   * other backends too (#395), and if not, why — it needs approval (a repo's
+   * server), another of that name wins, it wants a sign-in (adopt it), or its
+   * name is codeoid's own.
+   */
+  /** For a workdir server: its entry's fingerprint — what `mcp.approve` binds to. */
+  fingerprint?: string;
+  otherBackends?:
+    | { reach: "all" }
+    | { reach: "claude-only"; why: "needs-approval" | "needs-refresh" | "shadowed" | "needs-sign-in" | "reserved-name" | "read-by-backend" };
   /** codeoid has adopted it: its registry signs in to this URL, and Claude
    *  sessions use that copy rather than the CLI's. */
   adopted?: true;
@@ -1976,8 +2616,12 @@ export interface ClaudeConfigHook {
   matcher: string | null;
   /** Hook kind ("command" today; future-proof). */
   kind: string;
-  /** The shell command to run. */
+  /** The shell command to run. In `claude.config`, its program's name only
+   *  ("curl …"): the full command is in the file at `path` (#394). */
   command: string;
+  /** Set by the daemon, never read from a file: why this row stands in for a
+   *  file's hooks (e.g. the file is too large to describe). */
+  note?: string;
 }
 
 export interface ClaudeConfigSnapshot {
@@ -2007,6 +2651,8 @@ export interface FsEntry {
   mtimeMs?: number;
   /** True when this entry is a symlink (kind reflects the resolved target). */
   isSymlink?: boolean;
+  /** `fs.browse_dir` only: the directory holds a `.git` (a clone or a worktree). */
+  isGitRepo?: boolean;
 }
 
 export interface FsListResultMsg {
@@ -2037,10 +2683,18 @@ export interface FsBrowseDirResultMsg {
   requestId: string;
   /** Canonical absolute path that was browsed. */
   path: string;
-  /** Configured root that bounds the browse (HOME by default). */
+  /** Configured root that bounds the browse (`CODEOID_FS_BROWSE_ROOT`, else the filesystem root). */
   root: string;
   /** Parent path (canonical) — null when `path` is at the root. */
   parent: string | null;
+  /** The daemon user's HOME (canonical), or null when it lies outside `root`. */
+  home?: string | null;
+  /** `path` itself holds a `.git`. */
+  isGitRepo?: boolean;
+  /** Directories left out because `showHidden` was off (a hint; absent when none). */
+  hiddenCount?: number;
+  /** The directory was too big to list in full; `entries` is a partial view. */
+  truncated?: boolean;
   /** Directory entries; daemon only emits directories for this verb. */
   entries: FsEntry[];
 }
@@ -2056,6 +2710,8 @@ export interface ClaudeConfigResultMsg {
   hooks: ClaudeConfigHook[];
   /** Whether this session's backend can redial its MCP servers (`session.mcp_reconnect`). */
   mcpReconnect?: boolean;
+  /** Claude's config changed since this session applied it: `session.mcp_refresh` would apply it (#395). */
+  mcpStale?: boolean;
 }
 
 /** One member of a dispatch group, as a client sees it. */
@@ -2116,9 +2772,14 @@ export interface CollaborationPanelsResultMsg {
  */
 export interface FleetTaskWire {
   id: string;
-  kind: "send" | "spawn";
+  /** `attempt` = one attempt of a loop run (docs/loop-engineering-design.md §5). */
+  kind: "send" | "spawn" | "attempt";
   shape: "ship" | "scout";
-  status: "queued" | "claimed" | "running" | "done" | "failed" | "blocked";
+  /**
+   * `held` is non-terminal: the task is parked on something outside its worker
+   * (an approval a loop's profile does not cover) and is never reclaimed.
+   */
+  status: "queued" | "claimed" | "running" | "held" | "done" | "failed" | "blocked";
   attempts: number;
   /** Epoch ms. */
   createdAt: number;
@@ -2133,6 +2794,9 @@ export interface FleetTaskWire {
   createdBy: string;
   /** Dispatch group (fan-out barrier); absent = a standalone task. */
   groupId?: string;
+  /** attempt: the loop run and attempt this task executes. Absent on send/spawn. */
+  runId?: string;
+  attemptId?: string;
   /**
    * RESERVED and never populated in P5. The daemon has no dependency model —
    * the conductor sequences in prose. Present so typed fan-in/join edges are a
@@ -2154,14 +2818,18 @@ export interface FleetEventWire {
 
 /** Fleet-wide rollup, normalized across backends so one number spans vendors. */
 export interface FleetUsage {
-  /** Tasks not yet terminal (queued + claimed + running). */
+  /** Tasks not yet terminal (queued + claimed + running + held). */
   activeTasks: number;
   /** Tasks in `blocked` — the anti-spin failure cap tripped; needs a human. */
   blockedTasks: number;
   inputTokens: number;
   outputTokens: number;
-  /** USD, summed across every backend that reports cost. */
+  /** USD, summed across every session: reported, or estimated from tokens (#430). */
   totalCostUsd: number;
+  /** Some of it is estimated from tokens × list price. */
+  costEstimated?: boolean;
+  /** Turns whose cost isn't known, across the fleet — not in `totalCostUsd`. */
+  costUnknownTurns?: number;
 }
 
 /** Everything a client needs to draw the fleet, in one payload. */
@@ -2367,8 +3035,11 @@ export interface SessionUiResolvedMsg {
   type: "session.ui_resolved";
   sessionId: string;
   requestId: string;
-  /** Why it settled. Open string — clients treat unknown values as "dismiss". */
-  reason: "answered" | "cancelled" | "timeout" | "interrupted";
+  /**
+   * Why it settled. Open string — clients treat unknown values as "dismiss".
+   * `withdrawn`: the backend settled the question itself (its call ended).
+   */
+  reason: "answered" | "cancelled" | "timeout" | "interrupted" | "withdrawn";
   timestamp: string;
 }
 
@@ -2420,6 +3091,9 @@ export interface PipelinePhaseWire {
   /** Human revise notes accumulated on this phase (newest last) — the client
    *  renders the revision history. */
   feedback?: string[];
+  /** Evidence ids recorded by this phase's gates, oldest first — read each
+   *  with `evidence.get`. Absent when no gate executed a check. */
+  evidence?: string[];
   /** The findings loop's state for a phase that declares `findings:` (the
    *  engine's review → fix → re-review loop): counts plus a markdown ledger of
    *  every round. Optional (additive) — absent on phases without the loop and
@@ -2727,10 +3401,26 @@ export type DaemonMessage =
   | BackendLoginStartResultMsg
   | BackendLoginSubmitResultMsg
   | BackendLoginCancelResultMsg
+  | BackendLoginWaitResultMsg
   | SkillGrantResultMsg
+  | WorktreeTrustResultMsg
+  | WorkstreamListResultMsg
+  | WorkstreamResolveResultMsg
+  | WorkstreamsChangedMsg
+  | CredentialListResultMsg
+  | SecretListResultMsg
+  | ApprovalRulesListResultMsg
+  | ApprovalRulesAddResultMsg
+  | SecretRevealResultMsg
   | SessionTurnsResultMsg
   | SessionApprovalsResultMsg
   | ClaudeAccountsResultMsg
+  | AccountsResultMsg
+  | AccountsChangedMsg
+  | ProvidersResultMsg
+  | ProvidersChangedMsg
+  | EndpointsResultMsg
+  | EndpointsTestResultMsg
   | SessionRewindResultMsg
   | CompareStateMsg
   | CompareListResultMsg
@@ -2740,6 +3430,11 @@ export type DaemonMessage =
   | RoutineRunsResultMsg
   | RoutineTokenResultMsg
   | RoutinePreviewResultMsg
+  | EvidenceRecordMsg
+  | LoopSnapshotMsg
+  | LoopListResultMsg
+  | LoopWatchSnapshotMsg
+  | LoopWatchListResultMsg
   | McpOAuthBeginResultMsg
   | McpOAuthCompleteResultMsg
   | McpOAuthDisconnectResultMsg
@@ -2774,6 +3469,12 @@ export interface AuthOkMsg {
    * session creation (assume claude-only).
    */
   providers?: string[];
+  /**
+   * The same backends with display names and kinds (endpoints.ts), first =
+   * the default. Absent on older daemons — fall back to `providers`. For
+   * updates after connect, send `providers.list`.
+   */
+  providerInfo?: ProviderInfo[];
   /**
    * Which issuer authenticated this connection.
    *
@@ -2811,7 +3512,27 @@ export interface ResponseErrorMsg {
   requestId: string;
   error: string;
   code: ErrorCode;
+  /** Structured facts about the refusal, for a client to act on without parsing `error`. */
+  detail?: ResponseErrorDetail;
 }
+
+/**
+ * `head_moved`: a vouch pinned to a commit (`loop.watch.* trustHead`) was
+ * refused because the branch's head is another commit now. `head` is that
+ * commit's full id: pin to it, after looking at it, to vouch again.
+ */
+export type ResponseErrorDetail =
+  | { kind: "head_moved"; branch: string; head: string; pinned: string }
+  /**
+   * `workstream_conflict`: `session.create` chose a workstream other than the
+   * one holding an exclusive claim on the folder (docs/workstreams-design.md
+   * §5.2). `resolution` says what the folder resolves to and why.
+   */
+  | { kind: "workstream_conflict"; resolution: WorkstreamResolution }
+  /** `workstream_required`: isolation is on and the folder has no workstream; choose one. */
+  | { kind: "workstream_required"; resolution: WorkstreamResolution }
+  /** `workstream_unknown`: the chosen workstream isn't configured (or is a base). */
+  | { kind: "workstream_unknown"; workstream: string };
 
 export type ErrorCode =
   | "unauthorized"
@@ -2952,6 +3673,12 @@ export interface AuthContext {
    * expired token on a long-lived connection instead of trusting the
    * handshake forever. 0/undefined means the token carried no exp. */
   exp?: number;
+  /**
+   * Set by the daemon on a sender that acts for its holder by automation (MCP
+   * control): never the person themselves, whatever the token's depth (#430).
+   * Never read from a token.
+   */
+  automation?: true;
 }
 
 /**

@@ -34,6 +34,18 @@ describe("fleetEconomics", () => {
     expect(econ.sessions).toBe(3);
   });
 
+  it("carries whether a backend's spend is estimated or partly unknown (#430)", () => {
+    const econ = fleetEconomics([
+      session("a", { providerId: "gemini-cli", usage: usage({ costUnknownTurns: 2 }) }),
+      session("b", { providerId: "codex", usage: usage({ totalCostUsd: 1, costEstimated: true }) }),
+      session("c", { providerId: "claude", usage: usage({ totalCostUsd: 2 }) }),
+    ]);
+    const by = Object.fromEntries(econ.byBackend.map((b) => [b.providerId, b]));
+    expect(by["gemini-cli"]).toMatchObject({ costUnknownTurns: 2, costEstimated: false });
+    expect(by.codex).toMatchObject({ costUnknownTurns: 0, costEstimated: true });
+    expect(by.claude).toMatchObject({ costUnknownTurns: 0, costEstimated: false });
+  });
+
   it("orders by cost descending — the view answers 'what is burning money'", () => {
     const econ = fleetEconomics([
       session("cheap", { providerId: "qwen", usage: usage({ totalCostUsd: 0.1 }) }),

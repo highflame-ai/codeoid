@@ -24,11 +24,14 @@ import {
   type SubagentStopHookInput,
   type McpServerConfig,
   type McpSdkServerConfigWithInstance,
+  type SandboxSettings,
+  type SpawnedProcess,
+  type SpawnOptions,
 } from "@anthropic-ai/claude-agent-sdk";
 import { randomUUID } from "node:crypto";
 import { readFileSync, readdirSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, resolve as resolvePath } from "node:path";
 import { AsyncQueue } from "../../async-queue.js";
 import type { AgentIdentityManager } from "../../agent-identity.js";
 import type { Store } from "../../store.js";
@@ -39,15 +42,21 @@ import {
 } from "../../memory/index.js";
 import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
 import type { McpHub } from "../../mcp/hub.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
 import { oauthServersForClaude } from "./oauth-bridge.js";
 import { mcpToolPrefix, resolveEnvMap } from "../../mcp/types.js";
 import type { CompressionRegistry } from "../../compress/index.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
+import { LOOP_MCP_SERVER_NAME, LOOP_REPORT_TOOL_FQ } from "../../loops/tools.js";
+import { buildSandboxMcpServer, REQUEST_DIRECTORY_TOOL_FQ, type RequestDirectoryInput, SANDBOX_MCP_SERVER_NAME } from "../../sandbox/request-directory.js";
 import { rewriteBashToolInput } from "../../compress/index.js";
 import { type CodeoidConfig, getConfigDir } from "../../../config.js";
+import { assessShellCommandSync } from "../../risk/shell-risk.js";
+import { heldWriteOf, heldWriteReason } from "../../held-writes.js";
 import { secretPathVerdict } from "../../secret-paths.js";
-import type { AuthContext } from "../../../protocol/types.js";
+import { FOREIGN_AGENT_DENY, FOREIGN_TASK_STOP_DENY, FORK_TEAMMATE_DENY } from "../../fork-isolation.js";
+import { isShellTool, runsNoCommand, shellCallOf } from "../../shell/tool-call.js";
+import { type AuthContext, EFFORT_LEVELS, type EffortLevel, SYSTEM_IDENTITY } from "../../../protocol/types.js";
 import type {
   BackendMcpServerState,
   SessionProvider,
@@ -62,11 +71,20 @@ import type {
   CatalogEntry,
   UiResponse,
 } from "../interface.js";
-import { removeClaudeSession, toClaudeSessionEntries, writeClaudeSession } from "./native-history.js";
+import { clearInheritedRemoteAgents, removeClaudeSession, removeForkedSession, toClaudeSessionEntries, writeClaudeSession } from "./native-history.js";
 import { BUDGET_STOP_MESSAGE, isBackgroundLifecycleEvent } from "../interface.js";
 import { isUngrantableSkillCommand, redactCommand } from "../../skill-command.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildSubprocessEnv, withGatewayCredential } from "../env.js";
+import { buildSubprocessEnv, withExtraEnv, withGatewayCredential } from "../env.js";
+import { listProcesses } from "../../process-tree.js";
+import { CLAUDE_HOME_LAYOUT, preparePrivateHome, withLoginsSynced } from "../../sandbox/backend-home.js";
+import { asksUnsandboxed, claudeNativeEnv, claudeSandboxSettings } from "../../sandbox/claude-native.js";
+import { HOME_CREDENTIAL_PATHS, programLocations, protectedWriteTargets } from "../../sandbox/policy.js";
+import { type BackendHostFiles, hostFileBreachReason, hostFileToolBreach, hostToolBoundsFor } from "../../sandbox/host-file-tools.js";
+import { claudeHostFiles, claudeSearchExclusions } from "./host-files.js";
+import { resolveClaudeExecutable } from "./executable.js";
+import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
+import type { SandboxHandle } from "../../sandbox/types.js";
 import type { LLMCallUsage } from "../../context-math.js";
 import type { PackSubagent } from "../../pipeline/subagents.js";
 
@@ -132,6 +150,28 @@ export interface ClaudeProviderInit {
    * switch takes effect on the next turn and RESUMES the same backing session.
    */
   resolveAccount?: () => ResolvedClaudeAccount | null;
+  /** Caller env for the CLI child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
+  /** Where this session began, when it is a fork (ProviderSessionInit.forkBoundary); read per query. */
+  forkBoundary?: () => string | undefined;
+  /** An agent id that is a fork's parent's (ProviderSessionInit.isForeignAgent): its every tool call is denied. */
+  isForeignAgent?: (agentId: string) => boolean;
+  /** A task id that is a fork's parent's (ProviderSessionInit.isForeignTask). */
+  isForeignTask?: (taskId: string) => boolean;
+  /** This session is a fork (ProviderSessionInit.isFork). */
+  isFork?: () => boolean;
+  /** A task id that is this session's own (ProviderSessionInit.isOwnTask): on a fork, all a stop-task call may name. */
+  isOwnTask?: (taskId: string) => boolean;
+  /** A foreign agent's tool call was denied (ProviderSessionInit.onForeignAgentDenied). */
+  onForeignAgentDenied?: (agentId: string, toolName: string) => void;
+  /** The session is in autonomous mode now (ProviderSessionInit.isAutonomous); absent: treated as so. */
+  isAutonomous?: () => boolean;
+  /** The workstream fence's refusal of a call (ProviderSessionInit.workstreamFenceRefusal). */
+  workstreamFenceRefusal?: (toolName: string, input: unknown, cwd: string | null | undefined) => string | null;
+  /** A saved deny rule's refusal of a call (ProviderSessionInit.approvalRuleRefusal). */
+  approvalRuleRefusal?: (toolName: string, input: unknown, cwd: string | null | undefined) => string | null;
+  /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448). */
+  sandbox?: () => SandboxRuntime | null;
   /** codeoid session id — used as the initial backing id and for audit/logging. */
   sessionId: string;
   /** Test seam for native continuation (#387); defaults to the real SDK. */
@@ -148,6 +188,9 @@ export interface ClaudeProviderInit {
   identityManager?: AgentIdentityManager;
   /** Codeoid memory engine — injected as an MCP server. */
   memory?: MemoryEngine;
+  /** codeoid_loop MCP server — loop worker sessions only. `loop_report` records
+   *  a request for verification and decides nothing, so it runs unprompted. */
+  loop?: McpSdkServerConfigWithInstance;
   /** codeoid_fleet MCP server — conductor sessions only (read-only fleet view). */
   fleet?: McpSdkServerConfigWithInstance;
   /**
@@ -159,9 +202,11 @@ export interface ClaudeProviderInit {
    * server list (per turn for claude), by which time it is set.
    */
   blackboardMcp?: () => { url: string; token: string } | undefined;
+  /** The sandbox's `request_directory`, decided by the session (sandbox/request-directory.ts): mounted in-process. */
+  requestDirectory?: (input: RequestDirectoryInput) => Promise<string>;
   /** Cross-backend MCP registry — external servers are mounted natively on the
    *  SDK (claude owns its own MCP client); approval flows through canUseTool. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   /** The daemon-owned MCP client — what an OAuth registry server is called
    *  through, as the session's tenant (#390). */
   mcpHub?: McpHub;
@@ -235,6 +280,12 @@ export class ClaudeProvider implements SessionProvider {
 
   // Claude-specific backing-session state
   #claudeCodeSessionId: string;
+  /** The backing id the live query's CLI was spawned with (backendProcessIds). */
+  #spawnedWithId: string | null = null;
+  /** When each foreign agent's refused call was last audited (#shouldAuditForeignDeny). */
+  #foreignDenyAudited = new Map<string, number>();
+  /** The log said a fork refuses every teammate, its team being unknowable (#teammateVerdict). */
+  #teamUnknownLogged = false;
   #hasQueried = false;
   #backingRecoveryAttempted = false;
   #lastPushedContent: string | null = null;
@@ -259,6 +310,12 @@ export class ClaudeProvider implements SessionProvider {
   #builtOAuthMcp = "";
   /** Fingerprint of the Claude account the live query loop was started with ("" = daemon env). */
   #builtAccount = "";
+  /** The thinking effort the live query loop runs at (#417); "" = the SDK's default. Off is fixed at construction. */
+  #builtEffort = "";
+  /** The OS sandbox the running query was built with (#448): rebuilt when it changes. */
+  #builtSandbox = "";
+  /** The sandbox the running query's CLI runs in, when the whole CLI is inside (#448): closed with the query. */
+  #sandboxHandle: SandboxHandle | null = null;
   /** Last TurnOpts — the retry after a skill approval rebuilds the loop with
    * these, then re-pushes #lastPushedContent into the SAME turn queue (#233). */
   #lastTurnOpts: TurnOpts | null = null;
@@ -295,6 +352,32 @@ export class ClaudeProvider implements SessionProvider {
    * double-emit for a tool that does reach the gate.
    */
   #autoApprovedTools = new Set<string>();
+  /**
+   * The cwd the PreToolUse hook reported for each call, by tool_use_id,
+   * until canUseTool takes it: Claude's Bash keeps a `cd` between calls, and
+   * the CLI resolves a shell call's relative targets and a Grep or Glob's
+   * relative `path` (or its missing one, the search root) from there, so the
+   * gate judges them from there too (shell risk, secret-paths.ts).
+   * Bounded: a call the CLI allows itself never reaches canUseTool.
+   */
+  #shellCwds = new Map<string, string>();
+  /**
+   * What the CLI's file tools must read outside the sandbox (hostReadable,
+   * #448 round 8): the dirs its skills' own files are in (the user tier's
+   * and the session's plugins', as `additionalDirectories` grants them), and
+   * where it saves this session's large tool output for the model to read.
+   */
+  #skillReadable: string[] = [];
+  #toolResultsDir: string | null = null;
+  /**
+   * What the CLI's own file tools keep outside a native sandbox as context
+   * (hostFiles, #448 round 9, host-files.ts): its memory, plans, task
+   * output; its user-tier agents, commands, rules; and the hidden paths this
+   * query's Read deny rules leave out of its searches. Set per query.
+   */
+  #hostFiles: BackendHostFiles = {};
+  /** The Read deny rules this query was built with (an autonomous one's: claudeSearchExclusions). */
+  #builtSearchDeny = "";
   /** Id-keyed lifecycle events that arrived with no live queue, replayed into
    *  the next turn. See #handleUndeliverable. */
   #carryover: ProviderEvent[] = [];
@@ -319,6 +402,17 @@ export class ClaudeProvider implements SessionProvider {
   #currentSender: AuthContext | null = null;
 
   #init: ClaudeProviderInit;
+  /** The last note about which CLI runs (executable.ts) the session was shown: each one once. */
+  #executableNote: string | null = null;
+  #pendingExecutableNote: string | null = null;
+
+  /** Show the pending note about which CLI runs, in the live turn. */
+  #flushExecutableNote(): void {
+    const note = this.#pendingExecutableNote;
+    if (!note || !this.#currentTurnQueue) return;
+    this.#pendingExecutableNote = null;
+    this.#emit({ type: "custom_message", role: "info", content: note });
+  }
 
   constructor(init: ClaudeProviderInit) {
     this.#claudeCodeSessionId = init.initialBackingId;
@@ -374,6 +468,7 @@ export class ClaudeProvider implements SessionProvider {
     this.#currentTurnQueue?.close();
     const turnQueue = new AsyncQueue<ProviderEvent>();
     this.#currentTurnQueue = turnQueue;
+    this.#flushExecutableNote();
 
     // Replay lifecycle events that arrived while no queue was live — a
     // SubagentStop hook resolving after the previous turn ended, a trailing
@@ -411,19 +506,249 @@ export class ClaudeProvider implements SessionProvider {
     return this.#makeTurnRun(turnQueue);
   }
 
-  /** Stop background tasks through the SDK; each emits a `stopped` settle. */
-  async stopBackgroundTasks(taskIds: readonly string[]): Promise<void> {
+  /**
+   * Stop background tasks through the SDK; each emits a `stopped` settle.
+   * Resolves to the ids whose stop failed. With no query there is no CLI, and
+   * so nothing running to stop. A task the CLI says isn't running (it just
+   * finished, or is already gone) is stopped as far as anyone can tell, so
+   * it isn't a failure.
+   */
+  async stopBackgroundTasks(taskIds: readonly string[]): Promise<string[]> {
     const q = this.#query;
-    if (!q) return;
+    if (!q) return [];
+    const failed: string[] = [];
     for (const id of taskIds) {
       try {
         await q.stopTask(id);
       } catch (err) {
+        if (isTaskNotRunningError(err)) continue;
+        failed.push(id);
         console.error(
           `[claude-provider ${this.#claudeCodeSessionId.slice(0, 8)}] stopTask ${id} failed: ${err instanceof Error ? err.message : String(err)}`,
         );
       }
     }
+    return failed;
+  }
+
+  /**
+   * A fork's refusal of its parent's work (fork-isolation.ts), or null for a
+   * call that isn't: one of the parent's agents (the session's denied ids,
+   * or a teammate of another team) running a tool; or a stop-task call that
+   * names anything but one of the fork's own tasks or teammates (stopping a
+   * cloud agent archives the cloud session the parent shares). Run first in
+   * the PreToolUse hook, and again in canUseTool as a second layer.
+   *
+   * Fail-closed: the verdict is reached first, and if reaching it throws the
+   * call is refused. The audit and the session's note run after, and a throw
+   * in either still refuses. The audit row is rate-limited per agent (the
+   * first refusal, then one a minute), so an agent retrying in a loop can't
+   * flood the log.
+   */
+  #refuseForeignCall(input: ForeignCallInput): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "deny"; permissionDecisionReason: string } } | null {
+    let reason: string | null;
+    try {
+      reason = this.#foreignCallVerdict(input);
+    } catch (err) {
+      console.error(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] deciding whether a call is the parent's failed, refusing it: ${err instanceof Error ? err.message : String(err)}`);
+      reason = FOREIGN_AGENT_DENY;
+    }
+    if (reason === null) return null;
+    const agent = input.agent_id ?? "main";
+    try {
+      if (this.#shouldAuditForeignDeny(agent)) {
+        this.#init.store.audit(SYSTEM_IDENTITY.sub, "session.foreign_agent_deny", this.#init.sessionId, `tool=${String(input.tool_name).slice(0, 120)} agent=${agent.slice(0, 130)}`);
+      }
+    } catch (err) {
+      console.error(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] auditing a refused call of the parent's failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    try {
+      // A row for the parent's agent; not for one of the fork's refused a stop.
+      if (input.agent_id && reason === FOREIGN_AGENT_DENY) this.#init.onForeignAgentDenied?.(input.agent_id, String(input.tool_name));
+    } catch (err) {
+      console.error(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] noting a refused call of the parent's failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const, permissionDecisionReason: reason } };
+  }
+
+  /** SessionProvider.foreignCallRefusal: #refuseForeignCall on a call Session rewrote (audited and noted the same way). */
+  /**
+   * Where the CLI saves this session's large tool output for the model to
+   * Read (`<project dir>/<session id>/tool-results`, beside the transcript
+   * the hook names), noted from each call's hook input.
+   */
+  #noteToolResultsDir(input: PreToolUseHookInput): void {
+    const transcript = (input as { transcript_path?: unknown }).transcript_path;
+    const id = (input as { session_id?: unknown }).session_id;
+    if (typeof transcript !== "string" || !isAbsolute(transcript) || typeof id !== "string" || !/^[A-Za-z0-9-]+$/.test(id)) return;
+    if (transcript.slice(transcript.lastIndexOf("/") + 1) !== `${id}.jsonl`) return;
+    this.#toolResultsDir = join(dirname(transcript), id, "tool-results");
+  }
+
+  hostReadable(): readonly string[] {
+    return [...this.#skillReadable, ...(this.#toolResultsDir ? [this.#toolResultsDir] : [])];
+  }
+
+  hostFiles(): BackendHostFiles {
+    return this.#hostFiles;
+  }
+
+  foreignCallRefusal(toolName: string, input: unknown, agentId: string | undefined): string | null {
+    return this.#refuseForeignCall({ tool_name: toolName, tool_input: input, ...(agentId ? { agent_id: agentId } : {}) })?.hookSpecificOutput.permissionDecisionReason ?? null;
+  }
+
+  /** Why a call is the parent's work, or null (#refuseForeignCall). May throw. */
+  #foreignCallVerdict(input: ForeignCallInput): string | null {
+    const init = this.#init;
+    const agent = input.agent_id;
+    if (agent) {
+      if (init.isForeignAgent?.(agent)) return FOREIGN_AGENT_DENY;
+      const teammate = this.#teammateVerdict(agent);
+      if (teammate) return teammate;
+    }
+    // An allowlist on a fork: the CLI's TaskStop takes a task id, an agent
+    // id or a name (a teammate's, a named background agent's), so anything
+    // not known to be the fork's own could be the parent's.
+    if (STOP_TASK_TOOLS.has(input.tool_name) && init.isFork?.() === true) {
+      const target = stopTaskTarget(input.tool_input);
+      const own = target !== undefined && (target.includes("@") ? this.#teammateVerdict(target) === null : init.isOwnTask?.(target) === true);
+      if (!own) return FOREIGN_TASK_STOP_DENY;
+    }
+    return null;
+  }
+
+  /**
+   * On a fork, a teammate's (`name@team`) refusal, or null for one of the
+   * fork's own team. Best effort, and likely inert under the SDK (the CLI
+   * doesn't set up teams in non-interactive mode; fork-isolation.ts). The
+   * CLI's default team for a session is named after its id
+   * (`session-<first 8>`), so any other team is the parent's. With
+   * CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME set the team is that name in parent
+   * and fork alike, so no teammate can be told to be the fork's: all are
+   * refused.
+   */
+  #teammateVerdict(agentId: string): string | null {
+    if (!agentId.includes("@") || this.#init.isFork?.() !== true) return null;
+    if (process.env.CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME) {
+      if (!this.#teamUnknownLogged) {
+        this.#teamUnknownLogged = true;
+        console.error(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME is set, so this fork's team can't be told from its parent's: every teammate is refused here`);
+      }
+      return FORK_TEAMMATE_DENY;
+    }
+    const at = agentId.lastIndexOf("@");
+    return at > 0 && agentId.slice(at + 1) === this.#ownTeamName() ? null : FOREIGN_AGENT_DENY;
+  }
+
+  /** The CLI's default name for this session's team (#teammateVerdict). */
+  #ownTeamName(): string {
+    return `session-${(this.#spawnedWithId ?? this.#claudeCodeSessionId).slice(0, 8)}`;
+  }
+
+  /** The first refused call of an agent is audited, then at most one a minute (bounded). */
+  #shouldAuditForeignDeny(agent: string): boolean {
+    const now = Date.now();
+    const last = this.#foreignDenyAudited.get(agent);
+    if (last !== undefined && now - last < FOREIGN_DENY_AUDIT_INTERVAL_MS) return false;
+    this.#foreignDenyAudited.delete(agent);
+    this.#foreignDenyAudited.set(agent, now);
+    if (this.#foreignDenyAudited.size > 1024) this.#foreignDenyAudited.delete(this.#foreignDenyAudited.keys().next().value!);
+    return true;
+  }
+
+  /**
+   * The PreToolUse hook's secret-path decision (secret-paths.ts), or null
+   * for a call the rule doesn't cover. Fail-closed, as #refuseForeignCall
+   * is: a throw reaching the verdict denies the call, since the CLI takes a
+   * hook that throws as having no opinion and would run it. The audit has
+   * its own try, and the verdict is returned whatever it does.
+   */
+  #secretPathDecision(
+    input: PreToolUseHookInput,
+    workdir: string,
+  ): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "deny" | "ask"; permissionDecisionReason: string } } | null {
+    const tag = `[claude-provider ${this.#init.sessionId.slice(0, 8)}]`;
+    let action: "deny" | "ask";
+    let reason: string;
+    try {
+      // A relative path (a Grep or Glob's `path`, or none: the search root) is the CLI's persisted cwd's.
+      const secret = secretPathVerdict(input.tool_name, input.tool_input, { workdir, configDir: getConfigDir(), cwd: hookShellCwd(input) });
+      if (!secret) return null;
+      action = secret.action;
+      reason =
+        secret.action === "deny"
+          ? `${secret.path} holds credentials — agents can't read it. Manage it through codeoid instead.`
+          : `${secret.path} contains credential files — this search needs the owner's approval.`;
+    } catch (err) {
+      console.error(`${tag} checking a call against the credential paths failed, refusing it: ${err instanceof Error ? err.message : String(err)}`);
+      action = "deny";
+      reason = "codeoid couldn't check this call against the paths that hold credentials, so it was refused.";
+    }
+    if (action === "deny") {
+      try {
+        this.#init.store.audit(this.#currentSender?.sub ?? "unknown", "session.secret_path_deny", this.#init.sessionId, `tool=${input.tool_name}`);
+      } catch (err) {
+        console.error(`${tag} auditing a refused credential-path call failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: action, permissionDecisionReason: reason } };
+  }
+
+  /**
+   * The PreToolUse hook's shell-risk decision (#431), or null for a call that
+   * isn't a shell command or that the rule lets the CLI decide. A risky
+   * command, one the parser can't read, or one naming a credential file is
+   * handed to canUseTool (`ask`); one reading a credential file is refused.
+   * Fail-closed, as #secretPathDecision is: a throw asks.
+   */
+  /** Keep the cwd the hook reports for a call, for canUseTool (#shellCwds). */
+  #rememberShellCwd(input: PreToolUseHookInput): void {
+    const cwd = hookShellCwd(input);
+    if (!cwd || !input.tool_use_id) return;
+    this.#shellCwds.set(input.tool_use_id, cwd);
+    if (this.#shellCwds.size > 256) this.#shellCwds.delete(this.#shellCwds.keys().next().value!);
+  }
+
+  #shellRiskDecision(
+    input: PreToolUseHookInput,
+    workdir: string,
+  ): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "deny" | "ask"; permissionDecisionReason: string } } | null {
+    const tag = `[claude-provider ${this.#init.sessionId.slice(0, 8)}]`;
+    let action: "deny" | "ask";
+    let reason: string;
+    try {
+      const shell = shellCallOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>);
+      if (!shell && isShellTool(input.tool_name) && !runsNoCommand(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>)) {
+        return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: "unknown risk: the shell command in the request can't be read" } };
+      }
+      if (!shell) return null;
+      const risk = assessShellCommandSync(shell.command, {
+        cwd: resolvePath(hookShellCwd(input) ?? workdir, shell.cwd ?? "."),
+        workdir,
+        configDir: getConfigDir(),
+      });
+      if (risk.secret?.action === "deny") {
+        action = "deny";
+        reason = `${risk.secret.path} holds credentials — agents can't read it. Manage it through codeoid instead.`;
+      } else if (risk.level === "high" || risk.level === "unknown" || risk.secret) {
+        action = "ask";
+        reason = `${risk.level} risk: ${risk.reasons[0] ?? "a credential directory"}`;
+      } else {
+        return null;
+      }
+    } catch (err) {
+      console.error(`${tag} judging a shell command's risk failed, asking the owner: ${err instanceof Error ? err.message : String(err)}`);
+      action = "ask";
+      reason = "codeoid couldn't judge this shell command's risk, so it needs the owner's approval.";
+    }
+    if (action === "deny") {
+      try {
+        this.#init.store.audit(this.#currentSender?.sub ?? "unknown", "session.secret_path_deny", this.#init.sessionId, `tool=${input.tool_name}`);
+      } catch (err) {
+        console.error(`${tag} auditing a refused credential-path call failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: action, permissionDecisionReason: reason } };
   }
 
   /** The TurnRun handle over one turn queue — shared by prompted and adopted turns. */
@@ -553,22 +878,44 @@ export class ClaudeProvider implements SessionProvider {
     const sdk = this.#init.nativeSdk ?? { forkSession, getSessionMessages };
     const tag = `[claude-provider ${this.#init.sessionId.slice(0, 8)}]`;
     if (req.forkFrom) {
+      const source = req.forkFrom.backingId;
+      const cwds = [req.workdir, ...(req.forkFrom.dir ? [req.forkFrom.dir] : [])];
+      let forked: string | undefined;
       try {
         // With the source's project dir, the SDK looks there only, never across
         // every project on the machine.
-        const { sessionId } = await sdk.forkSession(req.forkFrom.backingId, {
+        const { sessionId } = await sdk.forkSession(source, {
           upToMessageId: req.forkFrom.ref,
           ...(req.forkFrom.dir ? { dir: req.forkFrom.dir } : {}),
         });
+        forked = sessionId;
         // Read it back the way the CLI will look for it (any project dir):
         // adopting a session resume can't find would lose the conversation.
         const read = await sdk.getSessionMessages(sessionId);
         if (read.length === 0) throw new Error(`the forked session ${sessionId.slice(0, 8)} reads back empty`);
+        // A fork: the parent's cloud agents must not come back with the copy
+        // (fork-isolation.ts). Before the first resume, which is what reads them.
+        const boundary = this.#init.forkBoundary?.();
+        if (boundary) {
+          const removed = await clearInheritedRemoteAgents(sessionId, {
+            sourceSessionId: source,
+            cwds,
+            boundaryMs: Date.parse(boundary),
+            isForeign: (taskId) => this.#init.isForeignTask?.(taskId) === true,
+          });
+          if (removed.length > 0) console.error(`${tag} cleared ${removed.length} cloud agent registration(s) the fork inherited`);
+        }
         this.#adoptBacking(sessionId);
         return { via: "fork", backingId: sessionId };
       } catch (err) {
         // The source session may be gone (cleaned up, another machine): build it instead.
-        console.error(`${tag} native fork of ${req.forkFrom.backingId.slice(0, 8)} failed, building history instead: ${err instanceof Error ? err.message : String(err)}`);
+        console.error(`${tag} native fork of ${source.slice(0, 8)} failed, building history instead: ${err instanceof Error ? err.message : String(err)}`);
+        // A copy made and then refused (it couldn't be cleared): nobody resumes it, so it goes.
+        if (forked) {
+          await removeForkedSession(forked, { sourceSessionId: source, cwds }).catch((e: unknown) => {
+            console.error(`${tag} removing the abandoned fork ${forked!.slice(0, 8)} failed: ${e instanceof Error ? e.message : String(e)}`);
+          });
+        }
       }
     }
     if (req.history.length === 0 || req.allowHistory === false) return null;
@@ -621,8 +968,38 @@ export class ClaudeProvider implements SessionProvider {
     }
   }
 
+  /**
+   * A new thinking effort on the running query, live (#417) — except to or
+   * from Off, which the SDK fixes when the query is built, and back to the
+   * default: the SDK's live "no level" is the model's default, not the user's
+   * own Claude settings, which only a fresh query reads. Those rebuild the
+   * query before the next turn (it resumes the same conversation).
+   */
+  async applyEffort(effort: EffortLevel | null): Promise<boolean> {
+    const query$ = this.#query;
+    if (!query$ || !this.#consumerTask || effort === null || effort === "off" || this.#builtEffort === "off") return false;
+    await query$.applyFlagSettings({ effortLevel: claudeEffort(effort) });
+    this.#builtEffort = effort;
+    // A retry or recovery later in this turn rebuilds from these: at the new effort.
+    if (this.#lastTurnOpts) this.#lastTurnOpts = { ...this.#lastTurnOpts, effort };
+    return true;
+  }
+
   async dispose(): Promise<void> {
     await this.teardown();
+  }
+
+  /**
+   * The Claude Code CLI this provider's query runs in. The SDK spawns it
+   * (spawnClaudeCodeProcess is not used: replacing the SDK's spawn would drop
+   * its stderr diagnostics), so it is found as a direct child of this process
+   * whose argv names this provider's backing session as an exact token
+   * (argvNamesSession — ids are UUIDs, unique per session).
+   */
+  async backendProcessIds(): Promise<number[]> {
+    if (!this.#query) return [];
+    const id = this.#spawnedWithId ?? this.#claudeCodeSessionId;
+    return (await listProcesses()).filter((p) => p.ppid === process.pid && argvNamesSession(p.args, id)).map((p) => p.pid);
   }
 
   async teardown(): Promise<void> {
@@ -631,6 +1008,9 @@ export class ClaudeProvider implements SessionProvider {
     if (this.#consumerTask) {
       try { await this.#consumerTask; } catch { /* consumer handles its own errors */ }
     }
+    // The CLI's sandbox, when the whole CLI ran inside one (#448).
+    void this.#sandboxHandle?.close();
+    this.#sandboxHandle = null;
     this.#currentTurnQueue?.close();
     this.#currentTurnQueue = null;
     this.#inputQueue = null;
@@ -657,7 +1037,11 @@ export class ClaudeProvider implements SessionProvider {
       // and merges it into the next querying message (sdk.d.ts SDKUserMessage).
       shouldQuery,
     };
-    this.#lastPushedContent = content;
+    // The prompt a recovery re-sends is the last one that queried: a message
+    // merged into the running turn (a "later" push: a fork's reminder, the
+    // repeat-tool advisory) isn't one, and re-sending it alone would drop the
+    // prompt the model never ran.
+    if (shouldQuery) this.#lastPushedContent = content;
     try {
       this.#inputQueue.push(msg);
     } catch (err) {
@@ -677,7 +1061,9 @@ export class ClaudeProvider implements SessionProvider {
     // stall watchdog so the SDK signals first.
     const mcpToolTimeoutMs = init.config?.session.mcpToolTimeoutMs ?? 120_000;
     // A server codeoid now signs in to is codeoid's (mounted below), not the CLI's.
-    const userServers = withoutServers((init.userMcpServers ?? loadUserMcpServers)(opts.workdir), oauthMcp.deniedUrls);
+    // Under workstream isolation none of the user's own: the CLI runs strict,
+    // and every server it may reach is one of codeoid's bridges (G1).
+    const userServers = oauthMcp.strict ? {} : withoutServers((init.userMcpServers ?? loadUserMcpServers)(opts.workdir), oauthMcp.deniedUrls);
     // ...but never in place of the user's own server of that name at another
     // address — in this workdir's config, which adopting (from another
     // workdir, perhaps) couldn't see. Theirs stays; codeoid's isn't mounted here.
@@ -696,7 +1082,12 @@ export class ClaudeProvider implements SessionProvider {
       ...withMcpToolTimeout(userServers, mcpToolTimeoutMs),
       // Registry servers — mounted natively on the SDK (claude owns its client);
       // tool calls surface as `mcp__<server>__<tool>` and gate via canUseTool.
-      ...withMcpToolTimeout(registryServersForClaude(init.mcpRegistry), mcpToolTimeoutMs),
+      // Strict (isolated): only the stdio servers needing no secret are the
+      // CLI's to run (forNativeMount keeps to those); every HTTP one is a bridge.
+      ...withMcpToolTimeout(
+        oauthMcp.strict ? stdioOnly(registryServersForClaude(init.mcpRegistry)) : registryServersForClaude(init.mcpRegistry),
+        mcpToolTimeoutMs,
+      ),
       // Registry OAuth servers the tenant has signed in to — in-process, in
       // front of the daemon-owned client, which holds the token (#390). The
       // hub applies its own per-call timeout.
@@ -712,6 +1103,9 @@ export class ClaudeProvider implements SessionProvider {
       // Conductor sessions only — the read-only fleet view (P3). In-process,
       // so the external-server timeout doesn't apply.
       ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
+      ...(init.loop ? { [LOOP_MCP_SERVER_NAME]: init.loop } : {}),
+      // The sandbox's ask for a directory to write (sandbox/request-directory.ts): in-process, no token.
+      ...(init.requestDirectory ? { [SANDBOX_MCP_SERVER_NAME]: buildSandboxMcpServer(init.sessionId, (_id, input) => (init.requestDirectory as (i: RequestDirectoryInput) => Promise<string>)(input)) } : {}),
       // Collaboration children only — the role-scoped goal blackboard. Mounted
       // over HTTP rather than in-process precisely so the SAME surface works on
       // gemini/codex; claude deliberately gets no privileged path here (#245).
@@ -733,6 +1127,14 @@ export class ClaudeProvider implements SessionProvider {
     });
     const account = this.#init.resolveAccount?.() ?? null;
     const desiredAccount = account ? `${account.name}:${account.fingerprint}` : "";
+    // The session's OS sandbox (#448), read per build: a change reaches the next query.
+    const sandbox = this.#init.sandbox?.() ?? null;
+    const desiredSandbox = sandboxFingerprint(sandbox);
+    this.#skillReadable = sandbox ? skillReadableDirs(opts.pluginDirs) : [];
+    // Autonomous mode holds the CLI's searches to the sandbox's bounds (#448 round 9): what is hidden
+    // inside them is left out of its Grep and Glob by Read deny rules, fixed at the query's start.
+    const exclusions = sandbox?.plan.kind === "native" && opts.mode === "autonomous" ? claudeSearchExclusions(sandbox.spec, sandbox.claudeTemp().commands) : { paths: [], rules: [] };
+    const desiredSearchDeny = exclusions.rules.join("\n");
 
     // Exact tool names we hand the SDK as pre-approved. Kept as its own list
     // (rather than inlined into `allowedTools`) because the PreToolUse hook has
@@ -745,6 +1147,9 @@ export class ClaudeProvider implements SessionProvider {
       // is FLEET_TOOL_NAMES (the READ set) only: the send-class verbs are
       // deliberately absent so they still ride the owner's approval flow.
       ...(this.#init.fleet ? FLEET_TOOL_NAMES.map((t) => `mcp__codeoid_fleet__${t}`) : []),
+      ...(this.#init.loop ? [LOOP_REPORT_TOOL_FQ] : []),
+      // An ask itself: the session decides it (owner's confirm, or the project roots in autonomous mode).
+      ...(this.#init.requestDirectory ? [REQUEST_DIRECTORY_TOOL_FQ] : []),
     ];
     this.#autoApprovedTools = new Set(autoApprovedToolNames);
     if (this.#consumerTask && this.#inputQueue && !this.#inputQueue.closed) {
@@ -753,7 +1158,10 @@ export class ClaudeProvider implements SessionProvider {
         this.#builtSkillAllowRules === desiredGrants &&
         this.#builtPluginDirs === desiredPlugins &&
         this.#builtOAuthMcp === oauthMcp.fingerprint &&
-        this.#builtAccount === desiredAccount
+        this.#builtAccount === desiredAccount &&
+        this.#builtEffort === (opts.effort ?? "") &&
+        this.#builtSandbox === desiredSandbox &&
+        this.#builtSearchDeny === desiredSearchDeny
       ) {
         return;
       }
@@ -776,7 +1184,13 @@ export class ClaudeProvider implements SessionProvider {
               ? "session-scoped skill plugins changed"
               : this.#builtOAuthMcp !== oauthMcp.fingerprint
                 ? "OAuth MCP servers changed"
-                : `Claude account changed (now ${account?.name ?? "default"})`;
+                : this.#builtAccount !== desiredAccount
+                  ? `Claude account changed (now ${account?.name ?? "default"})`
+                  : this.#builtSandbox !== desiredSandbox
+                    ? "OS sandbox changed"
+                    : this.#builtSearchDeny !== desiredSearchDeny
+                      ? "the sandbox's search exclusions changed (an autonomous mode switch)"
+                      : `thinking effort changed (now ${opts.effort ?? "default"})`;
       console.log(
         `[claude-provider ${this.#init.sessionId.slice(0, 8)}] ${reason} — rebuilding query loop`,
       );
@@ -800,12 +1214,17 @@ export class ClaudeProvider implements SessionProvider {
     this.#builtPluginDirs = desiredPlugins;
     this.#builtOAuthMcp = oauthMcp.fingerprint;
     this.#builtAccount = desiredAccount;
+    this.#builtEffort = opts.effort ?? "";
+    this.#builtSandbox = desiredSandbox;
+    this.#builtSearchDeny = desiredSearchDeny;
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
     const sessionOpts = this.#hasQueried
       ? { resume: this.#claudeCodeSessionId }
       : { sessionId: this.#claudeCodeSessionId };
+    // What this query's CLI was started with — its argv names it (backendProcessIds).
+    this.#spawnedWithId = this.#claudeCodeSessionId;
 
     const merged = this.#mcpServerSet(opts, oauthMcp);
     const mcpServers = Object.keys(merged).length > 0 ? merged : undefined;
@@ -815,9 +1234,46 @@ export class ClaudeProvider implements SessionProvider {
     // A rebuilt loop starts a new stream; an anchor from the old one (a turn
     // that ended without a result) must not be paired with the next result.
     this.#translateState.lastChainUuid = null;
+    const queryEnv = withForkBoundary(
+      withShellBasics(withExtraEnv(
+        account
+          ? account.apply(buildAgentEnv(process.env))
+          : buildAgentEnv(process.env, {
+              gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
+            }),
+        init.extraEnv,
+      )),
+      init.forkBoundary?.(),
+    );
+    // The OS sandbox (#448): Claude Code's own with codeoid's policy (and its
+    // temp dirs in the env), or the whole CLI inside the session's sandbox.
+    // The last query's sandbox goes with it.
+    void this.#sandboxHandle?.close();
+    this.#sandboxHandle = null;
+    const { env: sandboxEnv, ...sandboxOptions } = claudeSandboxOptions(sandbox, queryEnv, opts.workdir, (h) => {
+      this.#sandboxHandle = h;
+    });
+    // The CLI's own context files, where this query's CLI keeps them (its config dir, its temp dir).
+    const cliEnv = sandboxEnv ?? queryEnv;
+    this.#hostFiles = sandbox?.plan.fileTools === false
+      ? {
+          ...claudeHostFiles({ configDir: cliEnv.CLAUDE_CONFIG_DIR || join(cliEnv.HOME || homedir(), ".claude"), cliTempDir: cliEnv.CLAUDE_CODE_TMPDIR ?? null, workdir: opts.workdir }),
+          searchExcluded: exclusions.paths,
+        }
+      : {};
+    // The bundled CLI unless providers.claude.command names one it may use instead (executable.ts).
+    const executable = resolveClaudeExecutable(this.#init.config?.providers?.claude?.command);
+    if (executable.note && executable.note !== this.#executableNote) {
+      this.#executableNote = executable.note;
+      console.warn(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] ${executable.note}`);
+      // Shown in the turn this query serves: the loop is built before a new turn's queue opens.
+      this.#pendingExecutableNote = executable.note;
+      if (this.#currentTurnQueue) this.#flushExecutableNote();
+    }
     this.#query = query({
       prompt: this.#inputQueue,
       options: {
+        ...(executable.path ? { pathToClaudeCodeExecutable: executable.path } : {}),
         cwd: opts.workdir,
         abortController: this.#abortController,
         // Explicit env allowlist — never inherit the daemon's full process.env
@@ -836,11 +1292,13 @@ export class ClaudeProvider implements SessionProvider {
         // applyAccountEnv). The forge gateway re-point applies only to the
         // daemon's own environment: a named account carries the user's own
         // gateway token, which must never be swapped for an agent identity.
-        env: account
-          ? account.apply(buildAgentEnv(process.env))
-          : buildAgentEnv(process.env, {
-              gatewayCredential: init.identityManager?.getGatewayCredential(init.sessionId),
-            }),
+        //
+        // The caller's extra env (a loop worker's) goes on last; withExtraEnv
+        // refuses every ANTHROPIC_/CLAUDE_ and credential-shaped key, so it
+        // can never undo the account or the gateway re-point.
+        //
+        // A fork's boundary goes on after all of it (withForkBoundary).
+        env: sandboxEnv ?? queryEnv,
         allowedTools: [
           // Every EXACT TOOL NAME here is auto-approved by the SDK BEFORE
           // canUseTool is consulted, so it never reaches our gate — the SDK
@@ -871,10 +1329,15 @@ export class ClaudeProvider implements SessionProvider {
         // way — the tokens were already spent, we just weren't being shown
         // anything for them. (The raw chain of thought is never exposed on any
         // model; this is a summary of it.)
-        thinking: { type: "adaptive" as const, display: "summarized" as const },
-        ...(opts.model ? { model: opts.model } : {}),
-        ...(opts.fallbackModel ? { fallbackModel: opts.fallbackModel } : {}),
+        // Thinking effort (#417): Off disables thinking; any other level rides
+        // on adaptive thinking.
+        ...claudeEffortOptions(opts.effort),
+        // An account may name models its own way (a Bedrock account's mappings).
+        ...modelOptions(opts.model, opts.fallbackModel, account),
         ...(opts.maxBudgetUsd !== undefined ? { maxBudgetUsd: opts.maxBudgetUsd } : {}),
+        // The OS sandbox (#448): Claude Code's own with codeoid's policy, or
+        // the whole CLI started inside the session's (Docker).
+        ...sandboxOptions,
         stderr: (data: string) => {
           process.stderr.write(`[claude-subprocess ${sessionId.slice(0, 8)}] ${data}`);
         },
@@ -911,11 +1374,21 @@ export class ClaudeProvider implements SessionProvider {
         // mode this also surfaces the user's own skills, which is the intended
         // behaviour.
         settingSources: ["project", "user"],
+        // Workstream isolation (G1): only the servers codeoid passes — no
+        // `~/.claude.json`, no `.mcp.json`, no plugin's, no agent's own.
+        ...(oauthMcp.strict ? { strictMcpConfig: true } : {}),
         // The CLI must not connect its own copy of a server codeoid signs in
         // to (from ~/.claude.json, a .mcp.json): the flag-settings denylist,
         // by URL, keeps it from dialing it at all (#390).
-        ...(oauthMcp.deniedUrls.length > 0
-          ? { settings: { deniedMcpServers: oauthMcp.deniedUrls.map((serverUrl) => ({ serverUrl })) } }
+        // And in autonomous mode a sandboxed CLI's Grep and Glob leave out what the sandbox hides
+        // inside what its commands see (#448 round 9, claudeSearchExclusions).
+        ...(oauthMcp.deniedUrls.length > 0 || exclusions.rules.length > 0
+          ? {
+              settings: {
+                ...(oauthMcp.deniedUrls.length > 0 ? { deniedMcpServers: oauthMcp.deniedUrls.map((serverUrl) => ({ serverUrl })) } : {}),
+                ...(exclusions.rules.length > 0 ? { permissions: { deny: exclusions.rules } } : {}),
+              },
+            }
           : {}),
         skills: "all",
         // Permission to RUN a skill's command is not permission to READ the
@@ -927,36 +1400,93 @@ export class ClaudeProvider implements SessionProvider {
           join(opts.workdir, ".claude", "skills"),
           ...pluginSkillDirs(opts.pluginDirs),
         ]),
+        // (The same grant, less the workspace's own tier, is what the gate lets its file tools read outside a sandbox: hostReadable.)
 
         hooks: {
           PreToolUse: [{
             hooks: [async (rawInput) => {
               const input = rawInput as PreToolUseHookInput;
+              // A fork's parent's work, still reaching this backend: decided
+              // before anything else, and fail-closed (#refuseForeignCall).
+              // HERE, not only in Session's gate: the CLI runs some calls
+              // without asking canUseTool (reads inside the workdir,
+              // `permissions.allow` rules, the pre-approved tools below), and
+              // this hook sees every call.
+              const foreign = this.#refuseForeignCall(input);
+              if (foreign) return foreign;
+              // The CLI's own worktrees aren't sandboxed (#448 round 6): its
+              // EnterWorktree (which it runs without asking canUseTool) and
+              // ExitWorktree are refused while the session is.
+              const worktree = cliWorktreeDecision(input.tool_name, sandbox !== null);
+              if (worktree) return worktree;
+              // A command the model asks to run outside the OS sandbox (#448)
+              // never runs on an allow rule: canUseTool, where codeoid asks
+              // the owner (refuses it in autonomous mode).
+              if (sandbox?.plan.kind === "native" && asksUnsandboxed(input.tool_input)) {
+                return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask" as const, permissionDecisionReason: "asks to run outside the sandbox" } };
+              }
+              // Where the CLI says this call runs (its shell's persisted cwd,
+              // which a Grep or Glob's relative path is resolved from too), for
+              // the gate's own judgement in canUseTool (#shellCwds).
+              this.#rememberShellCwd(input);
               // The secret-path rule (secret-paths.ts) is enforced HERE too,
               // not only in Session's canUseTool gate: the CLI allows some calls
               // itself without asking canUseTool (reads inside the workdir in
               // default mode, `permissions.allow` rules, pre-approved tools), and
               // this hook sees every call whatever its permission outcome. `ask`
               // hands the call to canUseTool, where the owner decides.
-              const secret = secretPathVerdict(input.tool_name, input.tool_input, {
-                workdir: opts.workdir,
-                configDir: getConfigDir(),
-              });
-              if (secret) {
-                if (secret.action === "deny") {
-                  init.store.audit(this.#currentSender?.sub ?? "unknown", "session.secret_path_deny", sessionId, `tool=${input.tool_name}`);
+              // Fail-closed too (#secretPathDecision).
+              const secret = this.#secretPathDecision(input, opts.workdir);
+              if (secret) return secret;
+              // The workstream fence (workstreams §7.3): a call in another
+              // workstream's folders is refused here, before any allow rule.
+              // Fail-closed: a throw refuses.
+              if (init.workstreamFenceRefusal) {
+                let fenced: string | null;
+                try {
+                  fenced = init.workstreamFenceRefusal(input.tool_name, input.tool_input, hookShellCwd(input));
+                } catch (err) {
+                  console.error(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] checking a call against the workstream fence failed, refusing it: ${err instanceof Error ? err.message : String(err)}`);
+                  fenced = "codeoid couldn't check this call against the session's workstream, so it was refused.";
                 }
-                return {
-                  hookSpecificOutput: {
-                    hookEventName: "PreToolUse" as const,
-                    permissionDecision: secret.action,
-                    permissionDecisionReason:
-                      secret.action === "deny"
-                        ? `${secret.path} holds credentials — agents can't read it. Manage it through codeoid instead.`
-                        : `${secret.path} contains credential files — this search needs the owner's approval.`,
-                  },
-                };
+                if (fenced) return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const, permissionDecisionReason: fenced } };
               }
+              // The owner's saved deny rules (secrets-and-memory-design.md §4.1): refused here,
+              // before any allow rule of the CLI's own settings (a repository's included). Fail-closed.
+              if (init.approvalRuleRefusal) {
+                let ruled: string | null;
+                try {
+                  ruled = init.approvalRuleRefusal(input.tool_name, input.tool_input, hookShellCwd(input));
+                } catch (err) {
+                  console.error(`[claude-provider ${this.#init.sessionId.slice(0, 8)}] checking a call against the saved rules failed, refusing it: ${err instanceof Error ? err.message : String(err)}`);
+                  ruled = "codeoid couldn't check this call against your saved rules, so it was refused.";
+                }
+                if (ruled) return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const, permissionDecisionReason: ruled } };
+              }
+              // A shell command is judged by what it runs (#431): a risky one,
+              // one the gate can't read, or one naming a credential file never
+              // runs on an allow rule — it goes to canUseTool, which decides.
+              // Fail-closed (#shellRiskDecision).
+              const shellRisk = this.#shellRiskDecision(input, opts.workdir);
+              if (shellRisk) return shellRisk;
+              // While sandboxed (#448) a file tool writing the repository's git structure or the
+              // project settings (read-only to commands; this tool runs outside the sandbox) goes
+              // to codeoid's gate (asked, or refused in autonomous mode): never on an allow rule. Fail-closed.
+              if (sandbox?.plan.fileTools === false) {
+                const held = heldWriteDecision(input, opts.workdir, sandbox.spec.addedDirs ?? []);
+                if (held) return held;
+                // And in autonomous mode any file tool beyond what the sandbox allows its commands
+                // (#448 rounds 8, 9): to the gate, which refuses it, never on an allow rule. Fail-closed.
+                // Guarded and interactive mode leave it to the CLI and the gate, as without a sandbox.
+                this.#noteToolResultsDir(input);
+                if (init.isAutonomous?.() ?? true) {
+                  const outside = hostFileDecision(input, opts.workdir, sandbox, this.hostReadable(), this.#hostFiles);
+                  if (outside) return outside;
+                }
+              }
+              // Past this point a throw fails OPEN: the CLI takes a hook that
+              // errors as having no opinion (its createHookCallback returns {}),
+              // so a call it would allow itself goes ahead.
               // Stand in for canUseTool on the tools the SDK pre-approved.
               // Those never reach the gate, and the gate is the only place this
               // provider emits tool_start — so without this every memory recall
@@ -1050,6 +1580,19 @@ export class ClaudeProvider implements SessionProvider {
             return { behavior: "deny" as const, message: "Unable to correlate tool use id" };
           }
           const sdkAgentId = options?.agentID;
+          // A fork's refusal of its parent's work, again (#refuseForeignCall):
+          // the PreToolUse hook decides first, so this only catches a call it
+          // didn't. Before tool_start, so nothing of it is shown.
+          const foreign = this.#refuseForeignCall({ tool_name: toolName, tool_input: input, ...(sdkAgentId ? { agent_id: sdkAgentId } : {}) });
+          if (foreign) return { behavior: "deny" as const, message: foreign.hookSpecificOutput.permissionDecisionReason };
+          // The CLI's own worktree tools, again (cliWorktreeDecision).
+          const worktree = cliWorktreeDecision(toolName, sandbox !== null);
+          if (worktree) return { behavior: "deny" as const, message: worktree.hookSpecificOutput.permissionDecisionReason };
+
+          // A shell call is judged from where the CLI's Bash is now, as its
+          // PreToolUse hook reported; not known (null) when it didn't.
+          const shellCwd = this.#shellCwds.get(sdkToolUseId) ?? null;
+          this.#shellCwds.delete(sdkToolUseId);
 
           // Emit tool_start — Session creates the SessionMessage.
           this.#emit({
@@ -1060,12 +1603,13 @@ export class ClaudeProvider implements SessionProvider {
             name: toolName,
             input: inputObj,
             approvalId,
+            ...(shellCwd !== undefined ? { shellCwd } : {}),
           });
 
           // Call Session's approval gate (may block until user responds).
           const canUse = this.#currentCanUseTool;
           if (!canUse) return { behavior: "deny" as const, message: "provider not ready" };
-          const result = await canUse(toolId, approvalId, toolName, inputObj, options?.signal);
+          const result = await canUse(toolId, approvalId, toolName, inputObj, options?.signal, sdkAgentId, shellCwd);
           if (result.behavior === "allow") {
             return { behavior: "allow", updatedInput: result.updatedInput as Record<string, unknown> | undefined };
           }
@@ -1076,11 +1620,13 @@ export class ClaudeProvider implements SessionProvider {
 
     this.#hasQueried = true;
 
-    // Fetch the live model catalog best-effort.
-    if (init.onModels) {
+    // Fetch the live model catalog best-effort. Not from a Bedrock account:
+    // its catalog lists that endpoint's ids, and the cache is every Claude
+    // session's, whatever its account.
+    if (init.onModels && account?.kind !== "bedrock") {
       void this.#query
         .supportedModels()
-        .then((m) => init.onModels?.(m))
+        .then((m) => init.onModels?.(m.map(claudeCatalogEntry)))
         .catch(() => {});
     }
 
@@ -1187,6 +1733,11 @@ export class ClaudeProvider implements SessionProvider {
   #adoptTurn(event: ProviderEvent): boolean {
     const onSessionEvent = this.onSessionEvent;
     if (!onSessionEvent || !opensAdoptedTurn(event)) return false;
+    // No prompt was pushed for this turn: the last one belongs to a turn that
+    // already ended, so no recovery (a zero-turn re-send, a backing recovery,
+    // a skill grant's retry) may send it again here. A prompt pushed into
+    // this turn later sets it as usual.
+    this.#lastPushedContent = null;
     const turnQueue = new AsyncQueue<ProviderEvent>();
     this.#currentTurnQueue = turnQueue;
     turnQueue.push(event);
@@ -1466,6 +2017,7 @@ export class ClaudeProvider implements SessionProvider {
         cacheReadTokens: 0,
         cacheCreationTokens: 0,
         totalCostUsd: 0,
+        costSource: "free", // no model call was made
         durationMs: 0,
         isError: true,
         errorMessage: `Skill command not run — ${reason}${detail}`,
@@ -1538,6 +2090,22 @@ export interface TranslateState {
 }
 
 /**
+ * Whether a Claude CLI command line names backing session `id` as an EXACT
+ * argv token — the forms the SDK emits (`--resume=<id>`, `--session-id=<id>`,
+ * SDK 0.3.281) and their two-token spelling. A substring match would also hit
+ * a process that merely mentions the id (a prompt, a log path). Exported for tests.
+ */
+export function argvNamesSession(args: string, id: string): boolean {
+  const argv = args.split(/\s+/);
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === `--resume=${id}` || a === `--session-id=${id}`) return true;
+    if ((a === "--resume" || a === "--session-id") && argv[i + 1] === id) return true;
+  }
+  return false;
+}
+
+/**
  * Translate one SDKMessage from the Claude Agent SDK into zero or more
  * ProviderEvents.  Pure function — no I/O, no side-effects beyond calling
  * `emit` and updating the caller-owned `state`.  Extracted so it can be
@@ -1562,6 +2130,7 @@ export function translateSDKMessage(
         // Per-call LLM usage — split primary vs subagent for accurate ctx tracking.
         const assistantMsg = msg as unknown as {
           message: {
+            id?: string;
             content: unknown;
             usage?: {
               input_tokens?: number;
@@ -1580,7 +2149,15 @@ export function translateSDKMessage(
             cacheCreationTokens: perCall.cache_creation_input_tokens ?? 0,
             outputTokens: perCall.output_tokens ?? 0,
           };
-          emit({ type: "llm_call", usage: callUsage, isPrimary: assistantMsg.parent_tool_use_id === null });
+          // One message per content block, all of the same request: its id says so (#430).
+          const requestId = assistantMsg.message.id;
+          emit({
+            type: "llm_call",
+            usage: callUsage,
+            isPrimary: assistantMsg.parent_tool_use_id === null,
+            parentToolUseId: assistantMsg.parent_tool_use_id ?? null,
+            ...(requestId ? { requestId } : {}),
+          });
         }
 
         // Text content (tool_use blocks are handled via canUseTool → tool_start).
@@ -1623,6 +2200,11 @@ export function translateSDKMessage(
         if (event.type === "content_block_start" && event.content_block?.type === "thinking") {
           // Signal a new thinking block — Session creates the message.
           emit({ type: "thinking_delta", content: "", blockIndex: event.index, parentToolUseId });
+          break;
+        }
+        // Any other block (a tool call's input streams no text): the request's usage is still to come (#430).
+        if (event.type === "content_block_start") {
+          emit({ type: "model_output", parentToolUseId });
           break;
         }
 
@@ -1700,6 +2282,13 @@ export function translateSDKMessage(
           cacheReadTokens: r.usage?.cache_read_input_tokens ?? 0,
           cacheCreationTokens: r.usage?.cache_creation_input_tokens ?? 0,
           totalCostUsd: r.total_cost_usd ?? 0,
+          // The SDK prices its own turns; without a figure the session prices the tokens (#430).
+          // A $0 with tokens spent isn't a price (a gateway or a model the CLI can't price): the session prices those (#430).
+          ...(typeof r.total_cost_usd === "number" &&
+          (r.total_cost_usd > 0 ||
+            (r.usage?.input_tokens ?? 0) + (r.usage?.output_tokens ?? 0) + (r.usage?.cache_read_input_tokens ?? 0) + (r.usage?.cache_creation_input_tokens ?? 0) === 0)
+            ? { costSource: "backend" as const }
+            : {}),
           durationMs: r.duration_ms ?? 0,
           ...(typeof reportedWindow === "number" && reportedWindow > 0 ? { contextWindow: reportedWindow } : {}),
           stopReason: r.stop_reason ?? undefined,
@@ -1715,6 +2304,11 @@ export function translateSDKMessage(
           // Only a turn that completed is a point to fork at: an errored one
           // (a context overflow) would carry the failure into the fork, and an
           // interrupted one can end mid tool call.
+          // A turn the CLI ends "successfully" but flagged as an error carries
+          // its notice (a usage limit, "API Error: …") as the result text.
+          ...(r.is_error && r.subtype === "success" && typeof r.result === "string" && r.result
+            ? { resultText: r.result }
+            : {}),
           ...(sessionId && chainEnd && !zeroTurn && r.subtype === "success" && !r.is_error
             ? { nativeRef: { backingId: sessionId, ref: chainEnd, ...(state.cwd ? { dir: state.cwd } : {}) } }
             : {}),
@@ -1786,7 +2380,7 @@ export function translateSDKMessage(
           // session listener, never the turn queue: it can fire between turns,
           // when the queue has no reader and would drop it unread.
           const r = msg as {
-            tasks?: Array<{ task_id?: string; task_type?: string; description?: string; status?: string }>;
+            tasks?: Array<{ task_id?: string; task_type?: string; description?: string; status?: string; ambient?: boolean }>;
           };
           emitSession?.({
             type: "background_tasks",
@@ -1797,6 +2391,7 @@ export function translateSDKMessage(
                 kind: t.task_type ?? "task",
                 description: t.description ?? "",
                 status: t.status ?? "running",
+                ...(t.ambient ? { ambient: true } : {}),
               })),
           });
         } else if (subtype === "task_notification") {
@@ -1850,6 +2445,38 @@ export function translateSDKMessage(
         emit({ type: "tool_progress", toolName: p.tool_name, elapsedSeconds: p.elapsed_time_seconds });
         break;
       }
+
+      case "rate_limit_event": {
+        // SDKRateLimitInfo.resetsAt is epoch SECONDS (the CLI renders it with
+        // `new Date(resetsAt * 1000)`); ProviderEvent carries milliseconds.
+        const info = (msg as {
+          rate_limit_info?: {
+            status?: string;
+            resetsAt?: number;
+            rateLimitType?: string;
+            isUsingOverage?: boolean;
+            overageInUse?: boolean;
+            overageStatus?: string;
+          };
+        }).rate_limit_info;
+        const status = info?.status;
+        if (status !== "allowed" && status !== "allowed_warning" && status !== "rejected") break;
+        // The plan window is spent but extra usage (overage) is carrying the
+        // requests: not a limit that stops the turn.
+        const overage =
+          info?.isUsingOverage === true ||
+          info?.overageInUse === true ||
+          info?.overageStatus === "allowed" ||
+          info?.overageStatus === "allowed_warning";
+        emit({
+          type: "rate_limit",
+          status,
+          ...(overage ? { overage: true } : {}),
+          ...(typeof info?.resetsAt === "number" && info.resetsAt > 0 ? { resetsAt: info.resetsAt * 1000 } : {}),
+          ...(info?.rateLimitType ? { limitType: info.rateLimitType } : {}),
+        });
+        break;
+      }
     }
 }
 
@@ -1860,6 +2487,15 @@ export function translateSDKMessage(
  *  project tiers when a pack is activated under `skillScope: "session"`. */
 export function pluginSkillDirs(pluginDirs?: readonly string[]): string[] {
   return (pluginDirs ?? []).map((d) => join(d, "skills"));
+}
+
+/**
+ * The directory a PreToolUse hook input says the call runs in, when it is
+ * absolute: Claude's Bash keeps its cwd between calls (a `cd` in one call
+ * moves the next), and the hook's `cwd` is where it is now. Null otherwise.
+ */
+export function hookShellCwd(input: { cwd?: unknown }): string | null {
+  return typeof input.cwd === "string" && isAbsolute(input.cwd) ? input.cwd : null;
 }
 
 /**
@@ -2045,6 +2681,8 @@ function skillNoAnswer(reason: NonNullable<UiResponse["reason"]>, command: strin
       return "the approval timed out";
     case "interrupted":
       return "the turn was interrupted before it was approved";
+    case "withdrawn":
+      return "the approval was withdrawn before it was answered";
     case "unattended":
       // Like `claude -p`: an unattended run (a pipeline phase) never prompts,
       // so a command must be allowed before the run (#348).
@@ -2063,7 +2701,7 @@ function shellQuote(value: string): string {
  *  McpServerConfigs — a native mount, since claude's SDK owns its MCP client.
  *  `${VAR}` env refs and a `bearerTokenEnv` are resolved against the daemon env
  *  here so secrets never live in config; tool calls gate via canUseTool. */
-export function registryServersForClaude(registry: McpRegistry | undefined): Record<string, McpServerConfig> {
+export function registryServersForClaude(registry: McpServerView | undefined): Record<string, McpServerConfig> {
   if (!registry) return {};
   const out: Record<string, McpServerConfig> = {};
   for (const spec of registry.forNativeMount("claude")) {
@@ -2084,6 +2722,11 @@ export function registryServersForClaude(registry: McpRegistry | undefined): Rec
     }
   }
   return out;
+}
+
+/** The stdio entries of a server map (a strict, isolated Claude bridges every HTTP one). */
+function stdioOnly(servers: Record<string, McpServerConfig>): Record<string, McpServerConfig> {
+  return Object.fromEntries(Object.entries(servers).filter(([, cfg]) => typeof (cfg as { command?: unknown }).command === "string"));
 }
 
 /** User servers minus those codeoid owns now — by URL: a server of the same
@@ -2167,6 +2810,22 @@ export function parseMcpServerConfig(value: unknown): McpServerConfig | null {
  *
  * Pure + exported for unit testing.
  */
+/**
+ * The model and fallback to hand the CLI, through the account's own naming.
+ * Two ids can name one model there (a Bedrock account maps a whole family to
+ * one alias), and the SDK refuses a fallback equal to the model — so then the
+ * fallback is dropped: it would be the same model anyway.
+ */
+export function modelOptions(
+  model: string | undefined,
+  fallbackModel: string | undefined,
+  account: { model(m: string): string } | null,
+): { model?: string; fallbackModel?: string } {
+  const m = model ? (account ? account.model(model) : model) : undefined;
+  const f = fallbackModel ? (account ? account.model(fallbackModel) : fallbackModel) : undefined;
+  return { ...(m ? { model: m } : {}), ...(f && f !== m ? { fallbackModel: f } : {}) };
+}
+
 export function buildAgentEnv(
   base: Record<string, string | undefined> = process.env,
   opts: { gatewayCredential?: string } = {},
@@ -2177,6 +2836,84 @@ export function buildAgentEnv(
   const env = buildSubprocessEnv({ prefixes: ["ANTHROPIC_", "CLAUDE_", "LC_"] }, base);
   return withGatewayCredential(env, opts.gatewayCredential);
 }
+
+/**
+ * `CDPATH=` (empty: bash then looks a bare name up in the cwd only) on the
+ * CLI's env, after everything else: its Bash tool inherits it, and the shell
+ * snapshot it sources carries functions, options and aliases, not
+ * variables. So `cd .codeoid && cat config.json` goes where the shell
+ * reader (#431) places it, under the cwd, and a credential read is judged
+ * where it really is. A project's `.claude/settings.json` `env` can still
+ * set one: shell judgement is best effort (#448).
+ */
+export function withShellBasics(env: Record<string, string>): Record<string, string> {
+  return { ...env, CDPATH: "" };
+}
+
+/**
+ * The CLI's own "this session is a fork of one still running" signal, set
+ * on a codeoid fork's queries and removed from every other session's.
+ *
+ * Resuming a session, the CLI reconciles the background work it records.
+ * Under the SDK an agent launched with no completion on record is reported:
+ * its result delivered to the model if one was saved, or the model told to
+ * relaunch it. A fork's session holds the PARENT's launches (a native fork
+ * copies them, toolUseResult and all), so the fork took the parent's agents
+ * over. With `CLAUDE_CODE_RESUME_SOURCE_ALIVE` set, the CLI reconciles only
+ * what was recorded after the boundary it carries — the fork's own work.
+ * A project's `.claude/settings.json` `env` can still set or clear it
+ * (fork-isolation.ts names that limit).
+ *
+ * The boundary-only form (just the ISO time), not the CLI's
+ * `<sessionId>|<boundary>|<parentSessionId>` one: without a session id it
+ * applies to whichever session the query resumes, and a rewind or switch
+ * inside the fork resumes a NEW backing (a native re-fork) that still holds
+ * the parent's launches, all from before the boundary. It also makes the CLI
+ * skip copying its file-history backups to the resumed session, which codeoid
+ * doesn't use (it has its own checkpoints).
+ *
+ * Removed when there is no boundary: CLAUDE_* passes through from the
+ * daemon's environment, and a daemon started inside a forked Claude Code
+ * session would otherwise hand that session's boundary to every session.
+ */
+export function withForkBoundary(env: Record<string, string>, boundaryAt: string | undefined): Record<string, string> {
+  const { CLAUDE_CODE_RESUME_SOURCE_ALIVE: _inherited, ...rest } = env;
+  return boundaryAt ? { ...rest, CLAUDE_CODE_RESUME_SOURCE_ALIVE: boundaryAt } : rest;
+}
+
+/**
+ * The CLI refused a stopTask because the task isn't running: "Task <id> is
+ * not running (status: completed)" once it finished, "No task found with ID:
+ * <id>" once it's gone. Only a terminal status counts: one still on its way
+ * (pending, or any status this list doesn't know) may yet run.
+ */
+export function isTaskNotRunningError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /\bis not running \(status: (?:completed|failed|killed|stopped)\)/.test(msg) || /\bNo task found with ID: /.test(msg);
+}
+
+/** What a fork's refusal reads of a tool call (#refuseForeignCall): the hook's input, or canUseTool's. */
+type ForeignCallInput = Pick<PreToolUseHookInput, "tool_name" | "tool_input" | "agent_id">;
+
+/** The tools that stop a background task: TaskStop, and the names it had before. */
+const STOP_TASK_TOOLS: ReadonlySet<string> = new Set(["TaskStop", "KillShell", "KillBash"]);
+
+/**
+ * The task a stop-task call names (`task_id`, or the older `shell_id`), or
+ * undefined for none: empty, or with whitespace around it. Never trimmed: the
+ * id checked must be the id the CLI acts on, and what the CLI makes of a
+ * padded one isn't known, so a fork refuses it.
+ */
+export function stopTaskTarget(input: unknown): string | undefined {
+  if (typeof input !== "object" || input === null) return undefined;
+  const { task_id, shell_id } = input as { task_id?: unknown; shell_id?: unknown };
+  const target = typeof task_id === "string" ? task_id : typeof shell_id === "string" ? shell_id : undefined;
+  if (!target || target !== target.trim()) return undefined;
+  return target;
+}
+
+/** How often a foreign agent's refused calls are audited after its first (#shouldAuditForeignDeny). */
+const FOREIGN_DENY_AUDIT_INTERVAL_MS = 60_000;
 
 export function extractToolResultText(content: unknown): string {
   if (typeof content === "string") return content;
@@ -2194,3 +2931,193 @@ export function extractToolResultText(content: unknown): string {
   return parts.join("\n");
 }
 
+
+/** codeoid's effort scale on the Agent SDK's (#417): it has no Minimal, so that is Low. */
+function claudeEffort(effort: Exclude<EffortLevel, "off">): "low" | "medium" | "high" | "xhigh" | "max" {
+  return effort === "minimal" ? "low" : effort;
+}
+
+/**
+ * The query options for a thinking effort (#417). Thinking stays adaptive,
+ * with readable summaries (see the comment where it's used); Off disables it.
+ */
+export function claudeEffortOptions(effort: EffortLevel | undefined): {
+  thinking: { type: "adaptive"; display: "summarized" } | { type: "disabled" };
+  effort?: "low" | "medium" | "high" | "xhigh" | "max";
+} {
+  if (effort === "off") return { thinking: { type: "disabled" } };
+  const thinking = { type: "adaptive" as const, display: "summarized" as const };
+  return effort ? { thinking, effort: claudeEffort(effort) } : { thinking };
+}
+
+/** One of the SDK's model rows as a catalog entry, with the efforts the model takes (#417). */
+export function claudeCatalogEntry(m: {
+  value: string;
+  displayName: string;
+  description?: string;
+  supportsEffort?: boolean;
+  supportedEffortLevels?: string[];
+}): CatalogEntry {
+  // Off (thinking disabled) is always there; the levels are the model's own.
+  // A model that doesn't say which levels it takes leaves them unknown.
+  const levels = m.supportedEffortLevels?.filter((l): l is EffortLevel => (EFFORT_LEVELS as readonly string[]).includes(l));
+  const efforts: EffortLevel[] | undefined = m.supportsEffort === false ? ["off"] : levels ? ["off", ...levels] : undefined;
+  return {
+    value: m.value,
+    displayName: m.displayName,
+    ...(m.description ? { description: m.description } : {}),
+    ...(efforts ? { efforts } : {}),
+  };
+}
+
+/**
+ * The PreToolUse hook's decision for a file-tool write into what the OS
+ * sandbox holds read-only (#448: held-writes.ts `heldWriteOf`): `ask`,
+ * so it reaches codeoid's gate past any allow rule; null for one that
+ * writes none. A judgement that throws asks.
+ */
+export function heldWriteDecision(
+  input: PreToolUseHookInput,
+  workdir: string,
+  addedDirs: readonly string[] = [],
+): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "ask"; permissionDecisionReason: string } } | null {
+  let reason: string;
+  try {
+    const held = heldWriteOf(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, workdir, protectedWriteTargets(workdir, undefined, addedDirs));
+    if (!held) return null;
+    reason = heldWriteReason(held);
+  } catch {
+    reason = "codeoid couldn't tell whether this write reaches what the sandbox holds read-only, so it needs the owner's approval.";
+  }
+  return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: reason } };
+}
+
+/**
+ * The dirs a sandboxed session's file tools may read for its skills (#448
+ * round 8, hostReadable): the user tier's and the session plugins' skills
+ * (`skillSandboxDirs`: where each links to), never one in a credential
+ * store. The workspace's own tier is readable already, and a link there is
+ * the repository's to plant.
+ */
+export function skillReadableDirs(pluginDirs?: readonly string[]): string[] {
+  const home = homedir();
+  const stores = HOME_CREDENTIAL_PATHS.map((rel) => join(home, rel));
+  return skillSandboxDirs([join(home, ".claude", "skills"), ...pluginSkillDirs(pluginDirs)]).filter(
+    (d) => !stores.some((c) => d === c || d.startsWith(`${c}/`)),
+  );
+}
+
+/**
+ * The PreToolUse hook's decision for a file tool beyond what the session's
+ * sandbox allows its commands (#448 rounds 8, 9, sandbox/host-file-tools.ts),
+ * taken in autonomous mode: `ask`, so it reaches codeoid's gate past any
+ * allow rule (the CLI allows a read in the workdir or an added dir itself),
+ * which refuses it; null for one within, the CLI's own context files
+ * (`own`, host-files.ts) included. A judgement that throws asks.
+ */
+export function hostFileDecision(
+  input: PreToolUseHookInput,
+  workdir: string,
+  sandbox: Pick<SandboxRuntime, "spec" | "plan" | "claudeTemp" | "provider">,
+  readable: readonly string[],
+  own: BackendHostFiles = {},
+): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "ask"; permissionDecisionReason: string } } | null {
+  let reason: string;
+  try {
+    const breach = hostFileToolBreach(input.tool_name, (input.tool_input ?? {}) as Record<string, unknown>, {
+      bounds: hostToolBoundsFor(sandbox, "claude", readable, own),
+      workdir,
+      cwd: hookShellCwd(input),
+    });
+    if (!breach) return null;
+    reason = hostFileBreachReason(breach);
+  } catch {
+    reason = "codeoid couldn't tell whether this call stays within what the session's sandbox allows.";
+  }
+  return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "ask", permissionDecisionReason: reason } };
+}
+
+/**
+ * The Claude CLI's own worktree tools (#448 round 6). EnterWorktree checks a
+ * worktree out from HEAD under `.claude/worktrees/` and moves the session
+ * there, re-rooting the CLI's project settings at it; HEAD may carry settings
+ * (hooks) an agent committed from inside the sandbox. ExitWorktree moves the
+ * session back to where it was before it entered, which can be another
+ * worktree.
+ */
+export const CLI_WORKTREE_TOOLS: ReadonlySet<string> = new Set(["EnterWorktree", "ExitWorktree"]);
+
+export const CLI_WORKTREE_DENY =
+  "Refused in a sandboxed session: use codeoid's --worktree; the CLI's own worktrees aren't sandboxed " +
+  "(a worktree checked out from HEAD carries whatever project settings were committed, hooks included).";
+
+/**
+ * The PreToolUse hook's (and canUseTool's) refusal of the CLI's own worktree
+ * tools while the session is sandboxed (#448 round 6), or null. The CLI runs
+ * EnterWorktree without asking canUseTool, so the hook is where it's stopped.
+ */
+export function cliWorktreeDecision(
+  toolName: unknown,
+  sandboxed: boolean,
+): { hookSpecificOutput: { hookEventName: "PreToolUse"; permissionDecision: "deny"; permissionDecisionReason: string } } | null {
+  if (!sandboxed || typeof toolName !== "string" || !CLI_WORKTREE_TOOLS.has(toolName)) return null;
+  return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny", permissionDecisionReason: CLI_WORKTREE_DENY } };
+}
+
+/** What the running query's OS sandbox was built from (#448): a change rebuilds it. */
+export function sandboxFingerprint(rt: SandboxRuntime | null): string {
+  if (!rt) return "";
+  const { sessionId: _id, ...spec } = rt.spec;
+  return JSON.stringify({ provider: rt.provider.id, kind: rt.plan.kind, spec });
+}
+
+/**
+ * The query options that put a session's commands in its OS sandbox (#448):
+ * the SDK's `sandbox` (Claude Code's own, codeoid's policy) on a local OS
+ * provider, its CLI and its commands each with temp dirs of their own
+ * and the toolchains' caches in the sandbox's cache dir for its sandboxed
+ * commands only (`env`: claudeNativeEnv); or a spawner that starts the whole CLI inside the
+ * session's sandbox (Docker) in a private copy of its config dir
+ * (backend-home.ts), the handle it opens given to `track` (the caller
+ * closes it when the query is replaced). Nothing when the sandbox is off or
+ * unavailable: Session says so, and refuses an autonomous or unattended turn.
+ */
+export function claudeSandboxOptions(
+  rt: SandboxRuntime | null,
+  env: Record<string, string | undefined>,
+  workdir: string,
+  track?: (handle: SandboxHandle) => void,
+): { sandbox?: SandboxSettings; spawnClaudeCodeProcess?: (o: SpawnOptions) => SpawnedProcess; env?: Record<string, string | undefined> } {
+  if (!rt) return {};
+  if (rt.plan.kind === "native") {
+    const temp = rt.claudeTemp();
+    // The CLI's own git (its `git status` at every start) runs inside the sandbox too (git-shim.ts).
+    return { sandbox: claudeSandboxSettings(rt, env, temp), env: claudeNativeEnv(rt.spec, temp, env, rt.gitShim("the Claude CLI")) };
+  }
+  if (rt.plan.kind !== "process") return {};
+  let handle: SandboxHandle | null = null;
+  let configDir = "";
+  return {
+    spawnClaudeCodeProcess: (o: SpawnOptions): SpawnedProcess => {
+      if (!handle) {
+        const home = o.env.HOME || homedir();
+        const source = o.env.CLAUDE_CONFIG_DIR || join(home, ".claude");
+        // With CLAUDE_CONFIG_DIR set the CLI reads `.claude.json` from there: the user's own, copied in.
+        const own = preparePrivateHome(source, rt.privateHome("claude"), CLAUDE_HOME_LAYOUT, {
+          state: rt.stateDir("claude"),
+          ...(o.env.CLAUDE_CONFIG_DIR ? {} : { extraFiles: { ".claude.json": join(home, ".claude.json") } }),
+        });
+        configDir = own.home;
+        // Closed when the query is replaced or torn down: a login the CLI refreshed is written back then.
+        handle = withLoginsSynced(rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(o.command, [])] }), own, rt.warn);
+        track?.(handle);
+      }
+      const childEnv: Record<string, string> = {};
+      for (const [k, v] of Object.entries(o.env)) if (v !== undefined) childEnv[k] = v;
+      childEnv.CLAUDE_CONFIG_DIR = configDir;
+      const child = handle.spawn(o.command, o.args, { cwd: o.cwd ?? workdir, env: childEnv });
+      o.signal?.addEventListener("abort", () => child.kill("SIGTERM"), { once: true });
+      return child;
+    },
+  };
+}

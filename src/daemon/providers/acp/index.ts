@@ -24,6 +24,7 @@
  * agent can become a backend by reusing this shape with a different binary.
  */
 
+import { SANDBOX_MCP_SERVER_NAME, type SandboxMcpMount } from "../../sandbox/request-directory.js";
 import type { McpTenant } from "../../mcp/oauth.js";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
@@ -38,14 +39,26 @@ import type {
   CatalogEntry,
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildGeminiCliEnv } from "../env.js";
+import { buildGeminiCliEnv, withExtraEnv } from "../env.js";
 import { StdioJsonRpcProcess } from "../jsonrpc-stdio.js";
 import { MEMORY_MCP_SERVER_NAME, type MemoryMcpMount } from "../../memory/mcp-http.js";
 import { BLACKBOARD_MCP_SERVER_NAME } from "../../blackboard/mcp-http.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
+import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
+import type { ResolvedAccount } from "../../accounts.js";
+import { applyGeminiCliAccount, applyGeminiCliEffort, defaultGeminiCliRoot } from "../../account-apply.js";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { GEMINI_CLI_HOME_LAYOUT, preparePrivateHome, withLoginsSynced } from "../../sandbox/backend-home.js";
+import { programLocations } from "../../sandbox/policy.js";
+import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
+import type { SandboxHandle } from "../../sandbox/types.js";
+import { effortRejectionHint } from "../effort.js";
 
 export interface GeminiAcpProviderInit {
+  /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448): the CLI starts inside it. */
+  sandbox?: () => SandboxRuntime | null;
   sessionId: string;
   /** ACP sessionId from a previous run, or the codeoid session id on first run. */
   initialBackingId: string;
@@ -62,6 +75,9 @@ export interface GeminiAcpProviderInit {
    * store on demand — the precondition for the Verbatim Working Set strategy.
    */
   memoryMcp?: MemoryMcpMount;
+  /** The daemon's OAuth MCP relay (#396): how this backend reaches the
+   *  registry's OAuth servers without holding their tokens. */
+  mcpProxy?: McpProxyMount;
   /**
    * Role-scoped goal-blackboard mount, resolved LAZILY.
    *
@@ -71,11 +87,21 @@ export interface GeminiAcpProviderInit {
    * server list (per turn for claude), by which time it is set.
    */
   blackboardMcp?: () => { url: string; token: string } | undefined;
+  /** The sandbox's `request_directory` over the daemon's `/mcp/sandbox` (sandbox/request-directory.ts). */
+  sandboxMcp?: () => SandboxMcpMount | undefined;
 
   /** Cross-backend MCP registry — external servers mount on session/new
    *  (gemini-cli owns its client); approval flows through canUseTool. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
+  /**
+   * This session's account for the backend, resolved when the process is
+   * spawned (accounts.ts); null = the daemon's own login. Throws when the
+   * chosen account can't be used — the turn fails, never another credential.
+   */
+  resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** Caller env for the child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 export class GeminiAcpProvider implements SessionProvider {
@@ -86,6 +112,8 @@ export class GeminiAcpProvider implements SessionProvider {
   readonly appliesToolInputRewrite = false;
   readonly id = "gemini-cli";
   readonly displayName = "Gemini CLI (Google)";
+  /** Its thinking is a settings value, read at startup: a change rebuilds it (#417). */
+  readonly effortChange = "restart" as const;
 
   onRecoveryNeeded: ((content: string) => void) | undefined;
 
@@ -93,11 +121,16 @@ export class GeminiAcpProvider implements SessionProvider {
   #backingSessionId: string;
   #command: string;
   #argsPrefix: string[];
+  #resolveAccount: (() => ResolvedAccount | null) | null;
+  readonly #extraEnv: Readonly<Record<string, string>> | undefined;
+  /** The session's OS sandbox, read each time the CLI starts (#448). */
+  readonly #sandbox: (() => SandboxRuntime | null) | null;
   #workspaceId: string;
   #memoryMcp: MemoryMcpMount | null;
   /** Role-scoped blackboard mount; token minted+revoked by the SessionManager. */
   readonly #blackboardMcp: (() => { url: string; token: string } | undefined) | null;
-  #mcpRegistry: McpRegistry | null;
+  readonly #sandboxMcp: (() => SandboxMcpMount | undefined) | null;
+  #mcpRegistry: McpServerView | null;
   /** Live scoped token for the mounted memory endpoint; revoked on teardown. */
   #memoryToken: string | null = null;
 
@@ -127,12 +160,23 @@ export class GeminiAcpProvider implements SessionProvider {
     this.#sessionId = init.sessionId;
     this.#backingSessionId = init.initialBackingId;
     this.#command = init.command;
+    this.#resolveAccount = init.resolveAccount ?? null;
+    this.#extraEnv = init.extraEnv;
+    this.#sandbox = init.sandbox ?? null;
     this.#argsPrefix = init.argsPrefix ?? [];
     this.#workspaceId = init.workspaceId ?? init.sessionId;
     this.#memoryMcp = init.memoryMcp ?? null;
     this.#blackboardMcp = init.blackboardMcp ?? null;
+    this.#sandboxMcp = init.sandboxMcp ?? null;
     this.#mcpRegistry = init.mcpRegistry ?? null;
+    this.#proxy = new McpProxyLease(
+      init.mcpProxy,
+      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id, ...(init.mcpRegistry ? { view: init.mcpRegistry } : {}) } : null,
+    );
   }
+
+  /** This backend's proxy token for the registry's OAuth servers. */
+  readonly #proxy: McpProxyLease;
 
   /**
    * True when the shared memory endpoint is mounted for this session, so
@@ -192,9 +236,10 @@ export class GeminiAcpProvider implements SessionProvider {
     this.#hasQueried = true;
 
     void this.#runPrompt(opts).catch((err: unknown) => {
+      const text = err instanceof Error ? err.message : String(err);
       this.#push({
         type: "error",
-        message: `gemini-cli: ${err instanceof Error ? err.message : String(err)}`,
+        message: `gemini-cli: ${text}${opts.effort ? effortRejectionHint(text, opts.effort) : ""}`,
       });
       queue.close();
     });
@@ -223,6 +268,11 @@ export class GeminiAcpProvider implements SessionProvider {
     await this.teardown();
   }
 
+  async backendProcessIds(): Promise<number[]> {
+    const pid = this.#proc?.pid;
+    return pid ? [pid] : [];
+  }
+
   async teardown(): Promise<void> {
     this.#turnQueue?.close();
     this.#turnQueue = null;
@@ -233,6 +283,7 @@ export class GeminiAcpProvider implements SessionProvider {
       this.#memoryMcp?.endpoint.revoke(this.#memoryToken);
       this.#memoryToken = null;
     }
+    this.#proxy.revoke();
   }
 
   // ── Internal ──────────────────────────────────────────────────────────
@@ -271,6 +322,7 @@ export class GeminiAcpProvider implements SessionProvider {
       cacheReadTokens: 0,
       cacheCreationTokens: 0,
       totalCostUsd: 0,
+      costSource: "unknown", // ACP carries no tokens to price (#430)
       durationMs: Date.now() - this.#turnStartedAt,
       stopReason: result.stopReason,
     };
@@ -282,15 +334,39 @@ export class GeminiAcpProvider implements SessionProvider {
     if (this.#proc?.alive && this.#acpSessionId) return;
 
     if (!this.#proc?.alive) {
+      // The account's own GEMINI_CLI_HOME (an overlay selecting its auth type).
+      // ...and, for a thinking effort, an overlay of that whose settings set it (#417).
+      // Then the caller's extra env, which can't override either (withExtraEnv).
+      let env = withExtraEnv(
+        applyGeminiCliEffort(opts.effort, applyGeminiCliAccount(this.#resolveAccount?.() ?? null, buildGeminiCliEnv())),
+        this.#extraEnv,
+      );
+      // The OS sandbox (#448): the CLI's whole process starts inside the
+      // session's, in a private copy of its ~/.gemini (backend-home.ts: its
+      // login a private copy written back, its chats the session's own), its program readable.
+      const rt = this.#sandbox?.() ?? null;
+      let handle: SandboxHandle | null = null;
+      if (rt?.plan.wrapsBackend) {
+        const root = rt.privateHome("gemini-cli");
+        mkdirSync(join(root, ".gemini"), { mode: 0o700 });
+        const own = preparePrivateHome(join(defaultGeminiCliRoot(env), ".gemini"), join(root, ".gemini"), GEMINI_CLI_HOME_LAYOUT, { state: rt.stateDir("gemini-cli") });
+        env = { ...env, GEMINI_CLI_HOME: root };
+        // Closed when the CLI exits: a login it refreshed is written back then.
+        handle = withLoginsSynced(await rt.open([root, ...own.writable], { readable: [...own.readable, ...programLocations(this.#command, this.#argsPrefix)] }), own, rt.warn);
+      }
+      const opened = handle;
       this.#proc = new StdioJsonRpcProcess({
         name: "gemini-cli",
         command: this.#command,
-        args: [...this.#argsPrefix, "--acp"],
+        args: [...this.#argsPrefix, ...this.#isolationArgs(), "--acp"],
         cwd: opts.workdir,
-        env: buildGeminiCliEnv(),
+        env,
+        ...(handle?.wrap ? { wrap: handle.wrap.bind(handle) } : {}),
         onNotification: (method, params) => this.#onNotification(method, params),
         onServerRequest: (method, params) => this.#onServerRequest(method, params),
         onExit: ({ code, signal, stderrTail }) => {
+          // Its sandbox goes with it (#448).
+          void opened?.close();
           const queue = this.#turnQueue;
           if (queue && !queue.closed) {
             this.#push({
@@ -387,6 +463,16 @@ export class GeminiAcpProvider implements SessionProvider {
         headers: [{ name: "Authorization", value: `Bearer ${bb.token}` }],
       });
     }
+    // The sandbox's ask for a directory to write (sandbox/request-directory.ts): the session's token.
+    const sbx = this.#sandboxMcp?.();
+    if (sbx) {
+      servers.push({
+        type: "http",
+        name: SANDBOX_MCP_SERVER_NAME,
+        url: sbx.url,
+        headers: [{ name: "Authorization", value: `Bearer ${sbx.token}` }],
+      });
+    }
     // Registry servers — native mount (gemini-cli owns its MCP client). ACP's
     // McpServer shape: http → {type,url,headers[]}; stdio → {command,args,env[]}
     // (env/headers are {name,value} pairs, mirroring the memory http mount).
@@ -407,7 +493,38 @@ export class GeminiAcpProvider implements SessionProvider {
         }
       }
     }
+    // OAuth registry servers, through the daemon's relay (#396): the proxy
+    // token rides in the ACP request's headers, in-process — never in an env
+    // var the agent's shell would inherit. Re-minted per backing session.
+    const proxied = this.#proxy.renew();
+    for (const server of proxied?.servers ?? []) {
+      servers.push({
+        type: "http",
+        name: server.name,
+        url: server.url,
+        headers: [{ name: "Authorization", value: `Bearer ${proxied!.token}` }],
+      });
+    }
     return servers;
+  }
+
+  /**
+   * Workstream isolation (G1): the Gemini CLI also loads MCP servers from its
+   * own settings (`~/.gemini/settings.json`, a project's `.gemini/`) and its
+   * extensions. `--allowed-mcp-server-names` keeps it to the names codeoid
+   * mounts (session/new's list: built-ins, native mounts, the relay's) — an
+   * empty list would mean "no filter", so none mounted names one that isn't.
+   */
+  #isolationArgs(): string[] {
+    const reg = this.#mcpRegistry;
+    if (!reg?.isolated) return [];
+    const names = new Set<string>();
+    if (this.#memoryMcp) names.add(MEMORY_MCP_SERVER_NAME);
+    if (this.#blackboardMcp?.()) names.add(BLACKBOARD_MCP_SERVER_NAME);
+    if (this.#sandboxMcp?.()) names.add(SANDBOX_MCP_SERVER_NAME);
+    for (const s of reg.forNativeMount(this.id)) names.add(s.name);
+    for (const s of reg.relayFor(this.id)) names.add(s.name);
+    return ["--allowed-mcp-server-names", ...allowedMcpNames(names)];
   }
 
   #push(event: ProviderEvent): void {
@@ -445,7 +562,7 @@ export class GeminiAcpProvider implements SessionProvider {
           toolId: id,
           sdkToolUseId: id,
           name: acpToolName(update),
-          input: (update.rawInput as Record<string, unknown>) ?? { title: update.title ?? "" },
+          input: acpToolInput(update),
           approvalId: `acp-${id}`,
         });
         break;
@@ -491,16 +608,11 @@ export class GeminiAcpProvider implements SessionProvider {
           toolId: id,
           sdkToolUseId: id,
           name: acpToolName(toolCall),
-          input: (toolCall.rawInput as Record<string, unknown>) ?? { title: toolCall.title ?? "" },
+          input: acpToolInput(toolCall),
           approvalId: `acp-${id}`,
         });
       }
-      const verdict = await canUseTool(
-        id,
-        `acp-${id}`,
-        acpToolName(toolCall),
-        (toolCall.rawInput as Record<string, unknown>) ?? {},
-      );
+      const verdict = await canUseTool(id, `acp-${id}`, acpToolName(toolCall), acpToolInput(toolCall, false));
       if (verdict.behavior === "allow") {
         return { outcome: { outcome: "selected", optionId: allow.optionId } };
       }
@@ -512,6 +624,28 @@ export class GeminiAcpProvider implements SessionProvider {
     // refused rather than guessed (fail closed).
     throw new Error(`codeoid does not handle ACP request: ${method}`);
   }
+}
+
+/**
+ * What the gate (and the card) is shown of an ACP tool call: its `rawInput`
+ * (the Gemini CLI sends none), plus the files the call says it touches —
+ * its `locations` (`{path, line?}`) and its diffs' `path` — as `locations`,
+ * so an edit is judged by where it writes (held-writes.ts). A call with
+ * neither names no path.
+ */
+function acpToolInput(toolCall: Record<string, unknown>, withTitle = true): Record<string, unknown> {
+  const raw = toolCall.rawInput && typeof toolCall.rawInput === "object" ? (toolCall.rawInput as Record<string, unknown>) : null;
+  const paths: string[] = [];
+  const pathOf = (v: unknown) => {
+    const p = v && typeof v === "object" ? (v as { path?: unknown }).path : undefined;
+    if (typeof p === "string" && p.length > 0 && !paths.includes(p)) paths.push(p);
+  };
+  if (Array.isArray(toolCall.locations)) for (const l of toolCall.locations) pathOf(l);
+  if (Array.isArray(toolCall.content)) for (const c of toolCall.content) if ((c as { type?: unknown } | null)?.type === "diff") pathOf(c);
+  const base = raw ?? (withTitle ? { title: toolCall.title ?? "" } : {});
+  if (paths.length === 0) return base;
+  const own = Array.isArray(base.locations) ? base.locations : [];
+  return { ...base, locations: [...own, ...paths] };
 }
 
 /** ACP tool kinds ("execute", "edit", "read", …) → codeoid tool names. */
@@ -543,3 +677,14 @@ function toolCallOutput(update: Record<string, unknown>): string {
   }
   return "";
 }
+
+/**
+ * The names a CLI with an MCP allowlist (the Gemini CLI, Qwen) is started
+ * with under workstream isolation: exactly codeoid's, sorted. Never empty —
+ * an empty list means "no filter" to them — so none gives one no server has.
+ */
+export function allowedMcpNames(names: Iterable<string>): string[] {
+  const list = [...new Set(names)].sort();
+  return list.length > 0 ? list : ["codeoid-isolated-none"];
+}
+

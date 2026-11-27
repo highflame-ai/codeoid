@@ -19,7 +19,7 @@
 import { Bot, type Context, InlineKeyboard } from "grammy";
 import { autoRetry } from "@grammyjs/auto-retry";
 import { randomUUID } from "node:crypto";
-import { formatCollaborationCost } from "@highflame/codeoid-core";
+import { approvalSandboxLine, EFFORT_LABELS, effortChangeSummary, formatCollaborationCost, formatToolRisk, mcpRefreshSummary, parseEffort } from "@highflame/codeoid-core";
 import { getManifest, getSnapshot } from "../../daemon/settings/store.js";
 import { ALL_SCOPES_STRING } from "../../protocol/scopes.js";
 import type { Frontend, FrontendContext } from "../types.js";
@@ -39,8 +39,9 @@ import type {
   ToolInfo,
   UiRequestMethod,
 } from "../../protocol/types.js";
-import { CAPABILITIES } from "../../protocol/types.js";
+import { CAPABILITIES, EFFORT_LEVELS, type EffortChangeResult, type EffortLevel } from "../../protocol/types.js";
 import type { AttachedClient } from "../../daemon/session.js";
+import { callParts, cutNote, safeSlice } from "../call.js";
 import {
   StreamRelay,
   escCode,
@@ -48,6 +49,30 @@ import {
   formatSessionLine,
   type RelayApi,
 } from "./stream.js";
+
+/**
+ * Most characters of a call a card shows. A Telegram message holds 4096; this
+ * leaves room for the description (cut at 800) and the other lines.
+ */
+export const CALL_SHOWN = 2_400;
+
+/** What a tool call would do (see callParts), as plain text, cut only with a note saying so. */
+export function callText(input: unknown, toolName = ""): string {
+  const { head, body, rest } = callParts(input, toolName);
+  const cut = body.length > CALL_SHOWN;
+  // The other inputs come before the body, so cutting a long card never drops them.
+  return `${head ? `${head}\n` : ""}${rest ? `also: ${rest}\n` : ""}${safeSlice(body, CALL_SHOWN)}${cut ? `\n${cutNote(CALL_SHOWN, body.length)}` : ""}`;
+}
+
+/** Longest approval card sent; a Telegram message holds 4096. */
+const CARD_MAX = 4_000;
+/** Most characters of the daemon's own lines under a card's call. */
+const CARD_TAIL_MAX = 1_500;
+
+/** `s` on one line: a model-authored name or description can't pass for a card's own lines. */
+function oneLine(s: string): string {
+  return s.replace(/[\r\n\u2028\u2029]+/g, " ");
+}
 
 /** One AskUserQuestion question as it arrives in the tool input. */
 interface AskQuestion {
@@ -76,6 +101,10 @@ interface PendingApproval {
   answers: Record<string, string[]>;
   /** Unix ms when this approval was registered — used to prune stale entries. */
   createdAt: number;
+  /** The rules the card offered to save (secrets-and-memory-design.md §4.1). */
+  rules?: string[];
+  /** An answer is on its way to the daemon: a second tap waits for it. */
+  answering?: boolean;
 }
 
 /** Cap the pending-approval map so untapped prompts (interrupted turns, closed
@@ -211,6 +240,7 @@ export class TelegramFrontend implements Frontend {
         { command: "interrupt", description: "Stop the current turn" },
         { command: "mode", description: "Set mode: interactive | guarded | autonomous" },
         { command: "model", description: "Show or switch the model" },
+        { command: "effort", description: "How hard the model thinks: off … max, or default" },
         { command: "provider", description: "Show or switch the backend: /provider <id>" },
         { command: "fork", description: "Branch this session: /fork [backend]" },
         { command: "rotate", description: "Fresh context (memory kept)" },
@@ -272,6 +302,7 @@ export class TelegramFrontend implements Frontend {
     this.#bot.command("rotate", (ctx) => this.#handleRotate(ctx));
     this.#bot.command("mode", (ctx) => this.#handleMode(ctx));
     this.#bot.command("model", (ctx) => this.#handleModel(ctx));
+    this.#bot.command("effort", (ctx) => this.#handleEffort(ctx));
     this.#bot.command("provider", (ctx) => this.#handleProvider(ctx));
     this.#bot.command("fork", (ctx) => this.#handleFork(ctx));
     this.#bot.command("who", (ctx) => this.#handleWho(ctx));
@@ -279,7 +310,8 @@ export class TelegramFrontend implements Frontend {
     // Capabilities discovery — mirror the web /agents /skills /mcp /hooks.
     this.#bot.command("agents", (ctx) => this.#handleCapabilities(ctx, "agents"));
     this.#bot.command("skills", (ctx) => this.#handleCapabilities(ctx, "skills"));
-    this.#bot.command("mcp", (ctx) => this.#handleCapabilities(ctx, "mcp"));
+    // `/mcp refresh` applies Claude's current MCP config to the attached session (#395).
+    this.#bot.command("mcp", (ctx) => (/^\s*refresh\b/i.test(String(ctx.match ?? "")) ? this.#handleMcpRefresh(ctx) : this.#handleCapabilities(ctx, "mcp")));
     this.#bot.command("hooks", (ctx) => this.#handleCapabilities(ctx, "hooks"));
 
     // Inline-keyboard taps (tool approvals + AskUserQuestion answers).
@@ -798,6 +830,36 @@ export class TelegramFrontend implements Frontend {
     await ctx.reply(`Mode → *${escMd(mode)}*\\.`, { parse_mode: "MarkdownV2" });
   }
 
+  /** `/effort [level]` — show or set the attached session's thinking effort (#417). */
+  async #handleEffort(ctx: Context): Promise<void> {
+    const state = this.#requireAuth(ctx);
+    if (!state || !state.attachedSessionId) {
+      await ctx.reply("Not attached. Use /attach <name>.");
+      return;
+    }
+    const arg = ctx.message?.text?.split(/\s+/)[1];
+    if (!arg) {
+      const info = state.attachedSessionName ? this.#manager.findByName(state.attachedSessionName, state.auth!)?.toInfo() : undefined;
+      const current = info?.effort;
+      const pending = info?.effortPending ? " (pending: it lands with the next turn, or once background work ends)" : "";
+      await ctx.reply(`Thinking effort: ${current ? EFFORT_LABELS[current] : "the backend's default"}${pending}.\nSet it with /effort ${EFFORT_LEVELS.join("|")}|default`);
+      return;
+    }
+    let effort: EffortLevel | null;
+    try {
+      effort = parseEffort(arg);
+    } catch (e) {
+      await ctx.reply(`Usage: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    const resp = await this.#manager.handle(
+      { type: "session.set_effort", id: randomUUID(), sessionId: state.attachedSessionId, effort },
+      state.auth!,
+      this.#makeClient(state, ctx),
+    );
+    await ctx.reply(resp.type === "response.ok" ? effortChangeSummary(resp.data as EffortChangeResult) : resp.type === "response.error" ? resp.error : "Could not set the effort.");
+  }
+
   async #handleModel(ctx: Context): Promise<void> {
     const state = this.#requireAuth(ctx);
     if (!state || !state.attachedSessionId) {
@@ -996,6 +1058,25 @@ export class TelegramFrontend implements Frontend {
     }
   }
 
+  async #handleMcpRefresh(ctx: Context): Promise<void> {
+    const state = this.#requireAuth(ctx);
+    if (!state || !state.attachedSessionId) {
+      await ctx.reply("Not attached. Use /attach <name>.");
+      return;
+    }
+    const resp = await this.#manager.handle(
+      { type: "session.mcp_refresh", id: randomUUID(), sessionId: state.attachedSessionId },
+      state.auth!,
+      this.#makeClient(state, ctx),
+    );
+    if (resp.type !== "response.ok") {
+      await ctx.reply(resp.type === "response.error" ? resp.error : "Refresh failed.");
+      return;
+    }
+    const r = resp.data as { changed: boolean; deferred: boolean };
+    await ctx.reply(mcpRefreshSummary(r));
+  }
+
   async #handleCapabilities(
     ctx: Context,
     tab: "agents" | "skills" | "mcp" | "hooks",
@@ -1022,12 +1103,12 @@ export class TelegramFrontend implements Frontend {
       lines = cfg.skills.map((s) => `• *${escMd(s.name)}* — ${escMd(s.description ?? "")}`);
     } else if (tab === "mcp") {
       lines = cfg.mcpServers.map(
-        (m) => `• *${escMd(m.name)}* — ${escMd(m.command ?? m.scope)}`,
+        (m) => `• *${escMd(m.name)}* — ${escMd(m.note ?? m.command ?? m.scope)}`,
       );
     } else {
       // Inside a MarkdownV2 code span only ` and \ are special — escMd here
       // rendered literal backslashes that broke copy-paste of the command.
-      lines = cfg.hooks.map((h) => `• \`${escCode(h.command)}\``);
+      lines = cfg.hooks.map((h) => (h.note ? `• ${escMd(h.note)}` : `• \`${escCode(h.command || "(empty)")}\``));
     }
     const title = { agents: "Subagents", skills: "Skills", mcp: "MCP servers", hooks: "Hooks" }[tab];
     await ctx.reply(
@@ -1237,6 +1318,7 @@ export class TelegramFrontend implements Frontend {
         questions,
         answers: {},
         createdAt: Date.now(),
+        ...(tool.state.phase === "waiting_confirmation" && tool.state.ruleOffer ? { rules: tool.state.ruleOffer.rules } : {}),
       });
     }
 
@@ -1290,16 +1372,48 @@ export class TelegramFrontend implements Frontend {
       "collaborationCost" in tool.state && tool.state.collaborationCost
         ? `\n◇ ${formatCollaborationCost(tool.state.collaborationCost)}`
         : "";
+    // The workstream it acts in (workstreams §10): an approval is never made without knowing which line of work.
+    const tw = "targetWorkstream" in tool.state ? tool.state.targetWorkstream : undefined;
+    const workstream = tw ? `${tw.workstream ? `\n⌂ workstream ${tw.workstream}` : ""}${tw.warning ? `\n⚠ ${tw.warning}` : ""}` : "";
+    // A shell command's risk (#431), in the same words as every other surface.
+    const riskText = "risk" in tool.state ? formatToolRisk(tool.state.risk) : "";
+    const risk = riskText ? `\n▲ ${riskText}` : "";
+    // Whether it runs in the session's OS sandbox (#448), as every surface says it.
+    const sandboxText = tool.state.phase === "waiting_confirmation" ? approvalSandboxLine(tool.state) : null;
+    const sandbox = sandboxText ? `\n${sandboxText}` : "";
+    // What runs, from its input: the description only names the tool and its arguments.
+    const call = callText(tool.state.input, tool.name);
     const kb = new InlineKeyboard()
       .text("✅ Approve", `a:${short}:y`)
       .text("❌ Deny", `a:${short}:n`);
+    // Approve and keep the answer (docs/secrets-and-memory-design.md §4.1): the rules it saves, a button per scope.
+    const offer = tool.state.phase === "waiting_confirmation" ? tool.state.ruleOffer : undefined;
+    if (offer) {
+      kb.row();
+      for (const scope of offer.scopes) kb.text(scope === "session" ? "✅ For this session" : "✅ In this repo", `a:${short}:${scope === "session" ? "s" : "r"}`);
+    }
+    const saves = offer ? `\n⟲ saves ${offer.rules.join(", ")}` : "";
+    // The lines under the call are what the approval is judged by (the rule a button saves among them),
+    // so the call gives way when the card is too long.
+    const tail = safeSlice(`${workstream}${risk}${sandbox}${cost}${saves}`, CARD_TAIL_MAX);
+    const top = `⚠️ Permission needed — ${oneLine(safeSlice(tool.name, 200))}\n${oneLine(safeSlice(String(desc), 800))}\n\n`;
+    const room = CARD_MAX - top.length - tail.length;
+    const shownCall = call.length > room ? `${safeSlice(call, room - 60)}\n(cut short: see the whole call in the web UI)` : call;
+    // The call is a code block (an entity, so no markup to escape): what the
+    // model wrote can't pass for the daemon's own lines around it.
+    const entities = [{ type: "pre", offset: top.length, length: shownCall.length }];
     this.#bot.api
-      .sendMessage(
-        chatId,
-        `⚠️ Permission needed — ${tool.name}\n${String(desc).slice(0, 800)}${cost}`,
-        { reply_markup: kb } as Record<string, unknown>,
-      )
-      .catch(() => {});
+      .sendMessage(chatId, `${top}${shownCall}${tail}`, { reply_markup: kb, entities } as Record<string, unknown>)
+      .catch(() =>
+        // Never leave the turn waiting on a card nobody can see. No buttons:
+        // what would be approved isn't shown here.
+        this.#bot.api
+          .sendMessage(
+            chatId,
+            `⚠️ Approval prompt failed to render — approval ${short} is pending (${safeSlice(tool.name, 200)}); answer it in the web UI or with codeoid approve, or reply /interrupt to abort`,
+          )
+          .catch(() => {}),
+      );
   }
 
   /** Handle an inline-keyboard tap (approval decision / question answer). */
@@ -1458,21 +1572,40 @@ export class TelegramFrontend implements Frontend {
     };
 
     if (kind === "a") {
-      const approved = rest[0] === "y";
+      // A second tap while the first is on its way: the first one's result stands.
+      if (pending.answering) {
+        await ctx.answerCallbackQuery().catch(() => {});
+        return;
+      }
+      const save = rest[0] === "s" ? "session" : rest[0] === "r" ? "repository" : undefined;
+      const approved = rest[0] === "y" || save !== undefined;
+      pending.answering = true;
+      let res: DaemonMessage | undefined;
+      try {
+        res = await this.#manager.handle(
+          {
+            type: "session.approve",
+            id: randomUUID(),
+            sessionId: pending.sessionId,
+            approvalId: pending.approvalId,
+            approved,
+            ...(save ? { save, rules: pending.rules ?? [] } : {}),
+          },
+          state.auth,
+          client,
+        );
+      } finally {
+        pending.answering = false;
+      }
+      // A refused save leaves the call waiting: the buttons stay, and the reason is shown.
+      if (res?.type === "response.error") {
+        await ctx.answerCallbackQuery({ text: res.error.slice(0, 190), show_alert: true }).catch(() => {});
+        return;
+      }
       this.#approvals.delete(key);
-      await this.#manager.handle(
-        {
-          type: "session.approve",
-          id: randomUUID(),
-          sessionId: pending.sessionId,
-          approvalId: pending.approvalId,
-          approved,
-        },
-        state.auth,
-        client,
-      );
+      const done = save ? `✅ Approved, and allowed ${save === "session" ? "for this session" : "in this repository"}` : approved ? "✅ Approved" : "❌ Denied";
       await ctx.answerCallbackQuery({ text: approved ? "Approved" : "Denied" }).catch(() => {});
-      await ctx.editMessageText(approved ? "✅ Approved" : "❌ Denied").catch(() => {});
+      await ctx.editMessageText(done).catch(() => {});
       return;
     }
 

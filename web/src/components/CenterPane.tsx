@@ -7,7 +7,7 @@ import { Component, Show } from "solid-js";
 
 import {
   ctxWindowColorClass,
-  formatCostUsd,
+  formatSessionCost,
   formatDuration,
   formatPercent,
   formatTokens,
@@ -23,6 +23,9 @@ import ApprovalBar from "./transcript/ApprovalBar";
 import UiRequestBar from "./transcript/UiRequestBar";
 import PromptBox from "./prompt/PromptBox";
 import SessionControls from "./SessionControls";
+import { AccountChip } from "./AccountChip";
+import { SandboxChip } from "./SandboxChip";
+import { WorkstreamChip } from "./WorkstreamChip";
 import Transcript from "./transcript/Transcript";
 import FleetRail from "./FleetRail";
 import WorkerIndicator from "./transcript/WorkerIndicator";
@@ -117,6 +120,9 @@ const SessionHeader: Component = () => (
                 {s().model}
               </span>
             </Show>
+            <WorkstreamChip session={s()} editable />
+            <AccountChip session={s()} />
+            <SandboxChip session={s()} />
             <span class="ml-auto font-mono text-[11px] text-fg-faint">
               created {relativeTime(s().createdAt, nowTick())}
             </span>
@@ -180,8 +186,8 @@ const CollapsedHeader: Component = () => (
                 {formatTokens(u().outputTokens)}
               </span>
               <span class="text-fg-faint">·</span>
-              <span class="font-mono font-semibold text-accent">
-                {formatCostUsd(u().totalCostUsd)}
+              <span class="font-mono font-semibold text-accent" title={formatSessionCost(u()).title}>
+                {formatSessionCost(u()).text}
               </span>
             </>
           )}
@@ -251,9 +257,9 @@ const UsageStrip: Component = () => (
         />
         <Stat
           label="Cost"
-          value={formatCostUsd(u().totalCostUsd)}
+          value={formatSessionCost(u()).text}
           accent
-          hint="SDK-reported, daemon-canonical"
+          hint={formatSessionCost(u()).title}
         />
       </div>
     )}

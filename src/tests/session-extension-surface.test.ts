@@ -10,6 +10,7 @@
  *   U2  timeoutMs auto-cancels (daemon-enforced) with reason "timeout".
  *   U3  interrupt() cancels pending dialogs with reason "interrupted".
  *   U4  attach re-delivers pending requests to capable clients only.
+ *   U5  the provider's signal withdraws a dialog with reason "withdrawn".
  *
  *   C1  custom_message provider events land as persisted info messages with
  *       parts + provider.message metadata.
@@ -182,6 +183,41 @@ describe("provider dialogs (session.ui_request)", () => {
     expect(resolved).toEqual({ cancelled: true, reason: "timeout" });
     expect(uiResolvedIn(client.received)[0]!.reason).toBe("timeout");
     expect(session.pendingUiRequestCount).toBe(0);
+
+    await session.destroy(TEST_AUTH);
+  });
+
+  it("U5: the provider's signal withdraws a dialog with reason withdrawn", async () => {
+    const provider = new MockSessionProvider("mock");
+    const session = makeSession(provider);
+    const client = makeClient([CAPABILITIES.UI_DIALOGS]);
+    session.attach(client);
+
+    const withdraw = new AbortController();
+    const answer = session.requestUserInput({ method: "select", title: "Pick", options: ["a"], signal: withdraw.signal });
+    expect(session.pendingUiRequestCount).toBe(1);
+    const req = uiRequestsIn(client.received)[0]!;
+    withdraw.abort();
+    expect(await answer).toEqual({ cancelled: true, reason: "withdrawn" });
+    expect(uiResolvedIn(client.received).map((m) => [m.requestId, m.reason])).toEqual([[req.requestId, "withdrawn"]]);
+    expect(session.pendingUiRequestCount).toBe(0);
+    // An answer arriving after it goes nowhere.
+    expect(session.resolveUiRequestFromClient(req.requestId, { value: "a" }, TEST_AUTH)).toBe(false);
+
+    // Withdrawn before it was raised: never shown.
+    const gone = new AbortController();
+    gone.abort();
+    expect(await session.requestUserInput({ method: "confirm", title: "Late?", signal: gone.signal })).toEqual({ cancelled: true, reason: "withdrawn" });
+    expect(uiRequestsIn(client.received)).toHaveLength(1);
+
+    // Answered first: a later abort changes nothing.
+    const late = new AbortController();
+    const answered = session.requestUserInput({ method: "confirm", title: "Now?", signal: late.signal });
+    const second = uiRequestsIn(client.received)[1]!;
+    session.resolveUiRequestFromClient(second.requestId, { confirmed: true }, TEST_AUTH);
+    expect(await answered).toEqual({ confirmed: true, cancelled: false });
+    late.abort();
+    expect(uiResolvedIn(client.received).map((m) => m.reason)).toEqual(["withdrawn", "answered"]);
 
     await session.destroy(TEST_AUTH);
   });

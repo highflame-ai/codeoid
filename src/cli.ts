@@ -17,35 +17,50 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
+import { homedir } from "node:os";
 import { randomUUID } from "node:crypto";
 import { type Command, program } from "commander";
 // Single source of truth for the CLI version — bun inlines this JSON at build,
 // so `codeoid --version` always matches the published package (no hand-synced
 // string to drift). release-smoke asserts these two stay equal.
 import pkg from "../package.json" with { type: "json" };
+import { acquireDaemonLocks, type DaemonLocks, DataDirLockError, daemonOwnedDirs } from "./daemon/data-lock.js";
+import { sandboxConfigOf } from "./daemon/sandbox/policy.js";
+import { createDefaultSandboxRegistry } from "./daemon/sandbox/registry.js";
+import { sandboxRoot } from "./daemon/sandbox/root.js";
 import { DaemonServer } from "./daemon/server.js";
 import { DefaultProviderError } from "./daemon/providers/registry.js";
+import { clearStaleOpencodeCredentials } from "./daemon/providers/opencode/credentials.js";
+import { opencodeSecretLocations } from "./daemon/providers/opencode/resolve.js";
 import { parseRoleSpec } from "./daemon/collaboration.js";
 import { type ModelBinding, roleBindingsFromSpecs } from "./daemon/pipeline/binding.js";
 import {
   assertLocalBindAllowed,
   isLoopbackHost,
   LOCAL_TOKEN_ENV,
+  LocalUiLinks,
   mintLocalToken,
   removeLocalTokenFile,
+  UI_LINK_START_TTL_MS,
+  uiLinkUrl,
 } from "./daemon/local-auth.js";
 import {
   CAPABILITIES,
   type CollaborationConfig,
   type RoutineScheduleWire,
   type RoutineSpecWire,
+  ENDPOINT_TEMPLATES,
+  endpointTemplate,
   routineFirePath,
 } from "./protocol/types.js";
 import { ALL_SCOPES_STRING } from "./protocol/scopes.js";
 import { TerminalClient } from "./terminal/client.js";
-import { formatClaudeAccounts, parseHeaderFlags } from "./terminal/claude-accounts.js";
-import type { ClientMessage, DaemonMessage, SessionInfo } from "./protocol/types.js";
+import { bedrockFromSettings, formatAccounts, formatClaudeAccounts, parseHeaderFlags, parseSettingFlags } from "./terminal/claude-accounts.js";
+import { formatEndpoints, formatTemplates, importPiModels, parseModelFlags, parseTokens } from "./terminal/endpoints.js";
+import type { ClientMessage, DaemonMessage, EffortLevel, EndpointFlavor, EndpointInfo, SessionInfo, SessionSandboxSetting, SettingField, SettingValue, SettingsManifest, SettingsSnapshot } from "./protocol/types.js";
+import { sanitizeTerminalOutput } from "./tui/ansi/codes.js";
+import { parseEffort } from "@highflame/codeoid-core";
 import { mcpConfig, mcpHeaders } from "./terminal/mcp-control-cli.js";
 import { cleartextOffHost, controlUrl, MCP_SCOPE_PRESETS, TokenError } from "./terminal/token.js";
 import { parseTargets } from "./terminal/compare.js";
@@ -58,6 +73,8 @@ import {
   scheduleFromFlags,
   specFromFlags,
 } from "./terminal/routine-format.js";
+import { appliesNote, findField, formatSettingValue, parseSettingValue, settingsLines } from "./terminal/settings.js";
+import { formatLoop, formatLoopRow, formatWatch, formatWatchRow, parseCheckFlag, parseCiFlag, parseTrustHeadFlag, trustHeadOption } from "./terminal/loop-format.js";
 import {
   getConfigDir,
   getLocalTokenPath,
@@ -80,6 +97,7 @@ program
   .option("-p, --port <port>", "Port to listen on", "7400")
   .option("--host <host>", "Host to bind to", "127.0.0.1")
   .option("--no-telegram", "Disable Telegram bot")
+  .option("--no-slack", "Disable the Slack frontend")
   .option("--no-web", "Disable Web UI")
   .option(
     "--local",
@@ -124,9 +142,40 @@ program
       };
     }
 
+    // One daemon per data directory: before anything is opened or cleaned
+    // up (the store, boot recovery, opencode's key files), lock each one
+    // this daemon owns, or say who holds it and stop (data-lock.ts).
+    let dataLock: DaemonLocks;
+    try {
+      // CODEOID_DATA_LOCK_CHECK_MS: how often the daemon checks its locks are still its own (tests; default a minute).
+      const checkMs = Number(process.env.CODEOID_DATA_LOCK_CHECK_MS) || undefined;
+      dataLock = acquireDaemonLocks(daemonOwnedDirs(config), { port: bindPort, ...(checkMs ? { checkMs } : {}) });
+    } catch (err) {
+      if (!(err instanceof DataDirLockError)) throw err;
+      console.error(`\n[codeoid] the daemon couldn't start: ${err.message}\n`);
+      process.exit(1);
+    }
+
+    // The OS sandbox agents' commands run in (#448): on by default. The
+    // daemon's private temp root first: every sandbox hides it, so what the
+    // daemon makes there later (a sign-in's home) is hidden from each.
+    sandboxRoot();
+    const sandboxConfig = sandboxConfigOf(config);
+    const sandboxRegistry = createDefaultSandboxRegistry(sandboxConfig);
+    void sandboxRegistry.resolve(sandboxConfig.provider).then((r) => {
+      if (r.kind === "off") console.warn("[codeoid] sandbox: off (sandbox.provider) — agents' commands run with your full rights");
+      else if (r.kind === "unknown") console.warn(`[codeoid] sandbox: ${r.reason}`);
+      else if (r.probe.available) console.log(`[codeoid] sandbox: ${r.provider.displayName}, network ${sandboxConfig.network}`);
+      else console.warn(`[codeoid] sandbox: ${r.provider.displayName} can't run here (${r.probe.reason}) — interactive sessions run unsandboxed and say so; autonomous ones, routines and loops won't start`);
+    });
+
     let daemon: DaemonServer;
     try {
       daemon = new DaemonServer({
+        dataLock,
+        sandboxRegistry,
+        // What sessions store is scrubbed of secrets (docs/secrets-and-memory-design.md §2).
+        secretsConfigDir: getConfigDir(),
         port: bindPort,
         host: bindHost,
         dbPath: config.dbPath,
@@ -157,22 +206,21 @@ program
       console.error(`\n[codeoid] ${err.message}\n`);
       process.exit(1);
     }
-
     // ── Register frontends ────────────────────────────────────────
 
     // Web UI (always enabled unless --no-web) — the SolidJS app at /ui,
     // single-origin so one HTTPS tunnel also serves as a Telegram Mini App.
+    // In local mode on a loopback bind, a one-time link signs a browser in:
+    // the banner's, then `codeoid ui`'s. The page itself never carries the
+    // token (a sandboxed command on the loopback could fetch it, #448 round 4).
+    // On a wide bind there is no link: the operator pastes the token.
+    let uiLinks: LocalUiLinks | undefined;
     if (opts.web !== false) {
       const { WebUiFrontend } = await import("./frontends/web-ui/index.js");
-      // In local mode on a loopback bind, hand the browser the token directly so
-      // /ui needs no sign-in at all. On a wide bind we deliberately do NOT — the
-      // HTML would be readable by anything that can reach the port — so the
-      // operator pastes the token into the sign-in box instead.
-      const injectToken =
-        localMode && isLoopbackHost(bindHost) ? localMode.token : undefined;
+      if (localMode && isLoopbackHost(bindHost)) uiLinks = new LocalUiLinks();
       // Thread the embed-SSO allowlist so the served index.html publishes it to
       // the web UI's trusted-framing-origin gate. Empty ⇒ hash handoff disabled.
-      daemon.use(new WebUiFrontend(config.embed?.allowedOrigins ?? [], injectToken));
+      daemon.use(new WebUiFrontend(config.embed?.allowedOrigins ?? [], localMode && uiLinks ? { token: localMode.token, links: uiLinks } : undefined));
     }
 
     // Telegram (enabled when TELEGRAM_BOT_TOKEN is set)
@@ -200,7 +248,34 @@ program
       }
     }
 
-    await daemon.start();
+    // Slack (enabled when CODEOID_SLACK_APP_TOKEN and CODEOID_SLACK_BOT_TOKEN are set; docs/slack.md)
+    if (opts.slack !== false) {
+      const appToken = process.env.CODEOID_SLACK_APP_TOKEN;
+      const botToken = process.env.CODEOID_SLACK_BOT_TOKEN;
+      const allowed = (process.env.CODEOID_SLACK_ALLOWED_USER_IDS ?? "")
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if ((appToken || botToken) && localMode) {
+        // Reached through Slack's servers: a remote surface, which local mode's trust model doesn't cover.
+        console.warn("[codeoid] local mode: Slack frontend NOT started (it needs ZeroID identities). Run `codeoid login` and start without --local to use it.");
+      } else if (appToken && botToken && allowed.length > 0) {
+        const { SlackFrontend } = await import("./frontends/slack/index.js");
+        const teamId = process.env.CODEOID_SLACK_TEAM_ID?.trim();
+        daemon.use(new SlackFrontend(appToken, botToken, allowed, teamId ? { teamId } : {}));
+      } else if (appToken || botToken) {
+        console.log("[codeoid] Slack needs CODEOID_SLACK_APP_TOKEN, CODEOID_SLACK_BOT_TOKEN and CODEOID_SLACK_ALLOWED_USER_IDS — skipping Slack");
+      }
+    }
+
+    try {
+      await daemon.start();
+    } catch (err) {
+      // Its port taken (another daemon runs there), or anything else: not started.
+      console.error(`\n[codeoid] the daemon couldn't start: ${err instanceof Error ? err.message : String(err)}\n`);
+      await daemon.abortStart();
+      process.exit(1);
+    }
 
     // ZeroID mode: sweep a stale local-mode token for THIS port. Reaching here
     // means we successfully bound it, so no local-mode daemon can be listening
@@ -212,6 +287,11 @@ program
     if (!localMode) {
       removeLocalTokenFile(getLocalTokenPath(bindPort));
     }
+    // opencode key files a daemon that's gone left — with opencode since
+    // disabled or gone, or its dbPath moved — don't stay on disk. A running
+    // daemon's (another port, or the one whose port we'd have taken) are
+    // its own: its server reads them again as it loads each new location.
+    clearStaleOpencodeCredentials(opencodeSecretLocations(config).dirs);
 
     const displayHost = bindHost === "0.0.0.0" || bindHost === "::" ? "localhost" : bindHost;
     if (opts.web !== false) {
@@ -226,6 +306,7 @@ program
         port: String(opts.port),
         loopback: isLoopbackHost(bindHost),
         web: opts.web !== false,
+        ...(uiLinks ? { link: uiLinkUrl(`http://${displayHost}:${opts.port}`, uiLinks.mint(UI_LINK_START_TTL_MS)) } : {}),
       });
     }
   });
@@ -245,6 +326,8 @@ function printLocalModeBanner(o: {
   port: string;
   loopback: boolean;
   web: boolean;
+  /** The one-time link that signs a browser in (loopback local mode). */
+  link?: string;
 }): void {
   const lines: string[] = [
     "",
@@ -257,8 +340,8 @@ function printLocalModeBanner(o: {
   ];
   if (o.web) {
     lines.push(
-      o.loopback
-        ? `  Or open the web UI — already signed in:  http://${o.host}:${o.port}/ui/`
+      o.link
+        ? `  Or open the web UI — this link signs one browser in (once, within ${Math.round(UI_LINK_START_TTL_MS / 60_000)} minutes):\n      ${o.link}\n    later, a new link:  codeoid ui`
         : `  Or open the web UI and paste the token below:  http://${o.host}:${o.port}/ui/`,
       "",
     );
@@ -367,6 +450,33 @@ function writeConfigKeys(updates: Record<string, unknown>): string {
 }
 
 program
+  .command("ui")
+  .description("Open the web UI; on a local-mode daemon, with a one-time link that signs this browser in")
+  .option("--no-open", "print the link, don't open a browser")
+  .action(async (opts) => {
+    const { browserOpener, webUiLink } = await import("./terminal/ui-link.js");
+    const link = await webUiLink(loadConfig().daemonUrl);
+    if ("error" in link) {
+      console.error(`codeoid ui: ${link.error}`);
+      process.exit(1);
+    }
+    console.log(link.url);
+    if (link.signsIn) console.log(`  (signs one browser in, once, within ${Math.round((link.expiresInMs ?? 0) / 1000)} seconds)`);
+    if (opts.open === false) return;
+    // Never with the code in a program's argv where a sandboxed command could read it (browserOpener).
+    const opener = browserOpener(link.url);
+    if (!opener) return;
+    try {
+      const proc = Bun.spawn(opener.argv, { stdin: opener.stdin !== undefined ? Buffer.from(opener.stdin) : "ignore", stdout: "ignore", stderr: "ignore" });
+      // What reads the link from stdin is waited for (briefly), so it gets all of it; a browser xdg-open runs isn't.
+      if (opener.stdin !== undefined) await Promise.race([proc.exited, Bun.sleep(10_000)]);
+      proc.unref();
+    } catch {
+      /* the link is printed */
+    }
+  });
+
+program
   .command("login [apiKey]")
   .description(
     "Authenticate with a ZeroID key (mint one in Studio's Code Agents screen). Stores it in ~/.codeoid/config.json.",
@@ -458,11 +568,13 @@ program
     client.disconnect();
   });
 
-// ── Claude accounts (several subscriptions / gateways — claude-accounts.ts) ──
+// ── Accounts for every backend (accounts.ts; Claude's — claude-accounts.ts) ──
 
 const account = program
   .command("account")
-  .description("Claude accounts: several subscriptions or gateway tokens, a default, and a per-session choice");
+  .description(
+    "Accounts for every backend: several credentials per backend (Claude subscriptions, ChatGPT sign-ins, API keys…), a default per backend, and a per-session choice",
+  );
 
 /** Run one account request against the daemon and print the result. */
 async function accountRequest(build: (id: string) => ClientMessage, onOk?: (resp: DaemonMessage) => void): Promise<void> {
@@ -477,43 +589,123 @@ async function accountRequest(build: (id: string) => ClientMessage, onOk?: (resp
     return;
   }
   if (resp.type === "claude.accounts.result") console.log(formatClaudeAccounts(resp.accounts, resp.defaultAccount));
+  if (resp.type === "accounts.result") console.log(formatAccounts(resp.backends));
   onOk?.(resp);
 }
 
+const backendOption = "--backend <id>";
+const backendHelp = "the backend the account is for: claude, codex, gemini-cli, openai, gemini, qwen, pi, llamacpp, or oai:<endpoint> (default: claude)";
+
 account
   .command("ls")
-  .description("List Claude accounts and the daemon default")
-  .action(() => accountRequest((id) => ({ type: "claude.accounts.list", id })));
+  .description("List accounts and defaults — every backend, or one")
+  .option(backendOption, "only this backend")
+  .action((o: { backend?: string }) => accountRequest((id) => ({ type: "accounts.list", id, ...(o.backend ? { backend: o.backend } : {}) })));
 
 account
   .command("login <name>")
-  .description("Sign a Claude Pro/Max subscription in as account <name> (runs claude setup-token; never touches your own claude login)")
-  .action(async (name: string) => {
+  .description(
+    "Sign in as account <name>: a Claude Pro/Max subscription (claude setup-token), or a ChatGPT account for codex (device code). Never touches your own login.",
+  )
+  .option(backendOption, "claude (default) or codex")
+  .option("--replace", "replace an existing account of that name")
+  .action(async (name: string, o: { backend?: string; replace?: boolean }) => {
+    const backend = (o.backend ?? "claude") as "claude" | "codex";
     const config = loadConfig();
     const client = new TerminalClient(config);
     await client.connect();
-    const started = await client.request({ type: "backend.login.start", id: randomUUID(), backend: "claude", account: name });
+    const started = await client.request({ type: "backend.login.start", id: randomUUID(), backend, account: name, ...(o.replace ? { replace: true } : {}) });
     if (started.type !== "backend.login.start.result") {
       client.disconnect();
       console.error(`Error: ${started.type === "response.error" ? started.error : started.type}`);
       process.exit(1);
     }
-    console.log(`\nOpen this URL in a browser signed in to the account you want as "${name}":\n\n  ${started.login.verificationUrl}\n`);
-    console.log(started.login.codeHint);
-    const code = await readSecret("Code: ");
-    const done = await client.request({ type: "backend.login.submit", id: randomUUID(), loginId: started.login.loginId, code });
-    client.disconnect();
-    if (done.type === "backend.login.submit.result" && done.ok) {
-      console.log(`Signed in. Claude account "${name}" is ready — use it with: codeoid account use <session> ${name}`);
+    const { login } = started;
+    let done: DaemonMessage;
+    if (login.mode === "device") {
+      console.log(`\nOpen this link in a browser and sign in to the account you want as "${name}":\n\n  ${login.verificationUrl}\n\nThen enter this code there:  ${login.userCode}\n`);
+      console.log("Waiting for you to approve…");
+      // As long as the attempt lives (minutes), not the usual 30s.
+      const waitMs = Math.max(60_000, login.expiresAt - Date.now() + 30_000);
+      try {
+        done = await client.request({ type: "backend.login.wait", id: randomUUID(), loginId: login.loginId }, waitMs);
+      } catch (err) {
+        client.disconnect();
+        console.error(`Error: ${(err as Error).message} — if you approved, the account appears in \`codeoid account ls --backend ${backend}\``);
+        process.exit(1);
+      }
     } else {
-      console.error(`Error: ${done.type === "backend.login.submit.result" ? (done.error ?? "sign-in failed") : done.type === "response.error" ? done.error : done.type}`);
+      console.log(`\nOpen this URL in a browser signed in to the account you want as "${name}":\n\n  ${login.verificationUrl}\n`);
+      console.log(login.codeHint);
+      const code = await readSecret("Code: ");
+      done = await client.request({ type: "backend.login.submit", id: randomUUID(), loginId: login.loginId, code });
+    }
+    client.disconnect();
+    if ((done.type === "backend.login.submit.result" || done.type === "backend.login.wait.result") && done.ok) {
+      console.log(`Signed in. The ${backend} account "${name}" is ready — use it with: codeoid account use <session> ${name}`);
+    } else {
+      const error =
+        done.type === "backend.login.submit.result" || done.type === "backend.login.wait.result"
+          ? (done.error ?? "sign-in failed")
+          : done.type === "response.error"
+            ? done.error
+            : done.type;
+      console.error(`Error: ${error}`);
       process.exit(1);
     }
   });
 
 account
+  .command("add-key <name>")
+  .description(
+    "Add an API-key account for a backend — the key is asked for without echo (or read from stdin), never taken from the command line. pi takes --key-var per provider key; an endpoint may take headers instead of, or with, a key.",
+  )
+  .requiredOption(backendOption, backendHelp)
+  .option("--base-url <url>", "qwen: the endpoint — a preset (dashscope-intl, dashscope-cn, bailian-plan-intl) or an https URL")
+  .option("--header <header>", 'endpoint accounts: extra request header, repeatable: "Name" (value asked for without echo) or "Name: value"', (v: string, prev: string[] = []) => [...prev, v], [] as string[])
+  .option("--no-key", "endpoint accounts: headers only, no API key")
+  .option("--key-var <name>", "pi: a provider key variable to set (e.g. OPENROUTER_API_KEY), repeatable; its value is asked for", (v: string, prev: string[] = []) => [...prev, v], [] as string[])
+  .option("--replace", "replace an existing account of that name")
+  .action(
+    async (
+      name: string,
+      o: { backend: string; baseUrl?: string; header: string[]; key: boolean; keyVar: string[]; replace?: boolean },
+    ) => {
+      try {
+        const parsed = parseHeaderFlags(o.header ?? []);
+        const secretsAsked = parsed.ask.length + (o.keyVar?.length ?? 0) + (o.key && !o.keyVar?.length ? 1 : 0);
+        if (secretsAsked > 1 && !process.stdin.isTTY) {
+          throw new Error('With piped input only one secret can be read; pass non-secret headers as "Name: value".');
+        }
+        const headers = parsed.headers;
+        for (const h of parsed.ask) headers[h] = (await readSecret(`Value for header ${h}: `)).trim();
+        const env: Record<string, string> = {};
+        for (const v of o.keyVar ?? []) env[v] = (await readSecret(`${v}: `)).trim();
+        const isPi = (o.keyVar?.length ?? 0) > 0;
+        const token = !isPi && o.key ? (await readSecret("API key: ")).trim() : undefined;
+        if (!isPi && o.key && !token) throw new Error("no API key entered");
+        await accountRequest((id) => ({
+          type: "accounts.set",
+          id,
+          backend: o.backend,
+          name,
+          kind: isPi ? "api-keys" : "api-key",
+          ...(token ? { token } : {}),
+          ...(o.baseUrl ? { baseUrl: o.baseUrl } : {}),
+          ...(Object.keys(headers).length > 0 ? { headers } : {}),
+          ...(isPi ? { env } : {}),
+          ...(o.replace ? { replace: true } : {}),
+        }));
+      } catch (err) {
+        console.error(`Error: ${(err as Error).message}`);
+        process.exitCode = 1;
+      }
+    },
+  );
+
+account
   .command("add-gateway <name>")
-  .description("Add an Anthropic-compatible gateway account (its token is read from a prompt or stdin, never the command line)")
+  .description("Claude: add an Anthropic-compatible gateway account (its token is read from a prompt or stdin, never the command line)")
   .requiredOption("--base-url <url>", "the gateway's base URL (https)")
   .option("--header <header>", 'extra request header, repeatable: "Name" (value asked for without echo — keeps it out of shell history and ps) or "Name: value" for a non-secret one', (v: string, prev: string[] = []) => [...prev, v], [] as string[])
   .action(async (name: string, o: { baseUrl: string; header: string[] }) => {
@@ -543,8 +735,69 @@ account
   });
 
 account
+  .command("add-bedrock <name>")
+  .description(
+    "Claude: add an Amazon Bedrock account — a bearer token for AWS or a Bedrock-compatible endpoint, with its region, model mappings and telemetry settings. The token is read from a prompt or stdin, or --from-settings, never the command line.",
+  )
+  .option("--base-url <url>", "a Bedrock-compatible endpoint (https); omit for AWS itself")
+  .option(
+    "--set <setting>",
+    'a setting, repeatable: "NAME=value", or "NAME" to be asked for its value without echo (e.g. OTEL_EXPORTER_OTLP_HEADERS). Names: AWS_REGION, ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL[_NAME], ANTHROPIC_MODEL, CLAUDE_CODE_SKIP_BEDROCK_AUTH, CLAUDE_CODE_ENABLE_TELEMETRY, OTEL_*, …',
+    (v: string, prev: string[] = []) => [...prev, v],
+    [] as string[],
+  )
+  .option("--from-settings <file>", "take the token, endpoint and settings from a Claude settings file's env block (e.g. ~/.claude/settings.json); --base-url and --set override it")
+  .option("--replace", "replace an existing account of that name")
+  .action(async (name: string, o: { baseUrl?: string; set: string[]; fromSettings?: string; replace?: boolean }) => {
+    try {
+      let fromFile: ReturnType<typeof bedrockFromSettings> = { env: {}, ignored: [] };
+      if (o.fromSettings) {
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(readFileSync(o.fromSettings, "utf8"));
+        } catch (err) {
+          // Never the parser's message: it quotes the text around the error,
+          // which in this file is likely to be a token.
+          const code = (err as NodeJS.ErrnoException).code;
+          throw new Error(code ? `can't read ${o.fromSettings} (${code})` : `${o.fromSettings} isn't valid JSON`);
+        }
+        fromFile = bedrockFromSettings(parsed);
+        if (fromFile.ignored.length > 0) console.error(`Not taken from ${o.fromSettings} (not Bedrock settings): ${fromFile.ignored.join(", ")}`);
+      }
+      const parsed = parseSettingFlags(o.set ?? []);
+      const secretsAsked = parsed.ask.length + (fromFile.token ? 0 : 1);
+      if (secretsAsked > 1 && !process.stdin.isTTY) {
+        throw new Error('With piped input only the token can be read; pass the other settings as "NAME=value".');
+      }
+      const env = { ...fromFile.env, ...parsed.env };
+      for (const n of parsed.ask) env[n] = (await readSecret(`${n}: `)).trim();
+      const token = fromFile.token ?? (await readSecret("Bedrock bearer token: ")).trim();
+      if (!token) throw new Error("no token entered");
+      const baseUrl = o.baseUrl ?? fromFile.baseUrl;
+      await accountRequest((id) => ({
+        type: "accounts.set",
+        id,
+        backend: "claude",
+        name,
+        kind: "bedrock",
+        token,
+        ...(baseUrl ? { baseUrl } : {}),
+        ...(Object.keys(env).length > 0 ? { env } : {}),
+        ...(o.replace ? { replace: true } : {}),
+      }));
+      // Only the user's own settings file applies to every session.
+      if (!process.exitCode && o.fromSettings && resolve(o.fromSettings) === join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), ".claude"), "settings.json")) {
+        console.log(`The same settings in ${o.fromSettings} still apply to every Claude session, whatever its account — remove them from its env block so only "${name}" uses Bedrock.`);
+      }
+    } catch (err) {
+      console.error(`Error: ${(err as Error).message}`);
+      process.exitCode = 1;
+    }
+  });
+
+account
   .command("add-token <name>")
-  .description("Add an account from a token you already have: a subscription token (sk-ant-oat01-…, from claude setup-token) or, with --api-key, an Anthropic API key. Read from a prompt or stdin.")
+  .description("Claude: add an account from a token you already have: a subscription token (sk-ant-oat01-…, from claude setup-token) or, with --api-key, an Anthropic API key. Read from a prompt or stdin.")
   .option("--api-key", "the token is an Anthropic API key, not a subscription token")
   .action(async (name: string, o: { apiKey?: boolean }) => {
     const token = (await readSecret(o.apiKey ? "Anthropic API key: " : "Subscription token (sk-ant-oat01-…): ")).trim();
@@ -553,21 +806,24 @@ account
 
 account
   .command("rm <name>")
-  .description("Remove a Claude account (sessions on it refuse to run until switched)")
-  .action((name: string) => accountRequest((id) => ({ type: "claude.accounts.remove", id, name })));
+  .description("Remove an account (sessions on it refuse to run until switched)")
+  .option(backendOption, backendHelp)
+  .action((name: string, o: { backend?: string }) => accountRequest((id) => ({ type: "accounts.remove", id, backend: o.backend ?? "claude", name })));
 
 account
   .command("default <name>")
-  .description('Set the daemon default account — every session that hasn\'t chosen its own switches on its next turn ("default" = the daemon\'s own environment)')
-  .action((name: string) => accountRequest((id) => ({ type: "claude.accounts.set_default", id, name })));
+  .description('Set a backend\'s default account — every session on that backend that hasn\'t chosen its own switches on its next turn ("default" = the daemon\'s own environment)')
+  .option(backendOption, backendHelp)
+  .action((name: string, o: { backend?: string }) => accountRequest((id) => ({ type: "accounts.set_default", id, backend: o.backend ?? "claude", name })));
 
 account
   .command("use <session> [name]")
   .description(
-    'Switch a session to account <name> from its next turn, keeping the conversation ("default" = your own login, whatever the daemon default is; --follow-default = track the daemon default)',
+    'Switch a session to account <name> from its next turn, keeping the conversation — for the backend it is on now, or --backend ("default" = the daemon\'s own login; --follow-default = track the backend default)',
   )
-  .option("--follow-default", "follow the daemon default instead of pinning an account (omit <name>)")
-  .action(async (session: string, name: string | undefined, o: { followDefault?: boolean }) => {
+  .option("--follow-default", "follow the backend default instead of pinning an account (omit <name>)")
+  .option(backendOption, "the backend whose choice to set (default: the session's current backend)")
+  .action(async (session: string, name: string | undefined, o: { followDefault?: boolean; backend?: string }) => {
     if ((name === undefined) === !o.followDefault) {
       console.error("Give an account name, or --follow-default — not both.");
       process.exit(1);
@@ -581,10 +837,11 @@ account
       process.exit(1);
     }
     const resp = await client.request({
-      type: "session.set_claude_account",
+      type: "session.set_account",
       id: randomUUID(),
       sessionId,
       account: o.followDefault ? null : (name as string),
+      ...(o.backend ? { backend: o.backend } : {}),
     });
     client.disconnect();
     if (resp.type === "response.error") {
@@ -592,9 +849,280 @@ account
       process.exit(1);
     }
     const info = (resp as { data?: SessionInfo }).data;
-    console.log(
-      `Session "${session}" runs on Claude account "${info?.effectiveClaudeAccount ?? name}"${o.followDefault ? " (following the daemon default)" : ""} from its next turn.`,
+    const on = o.backend ?? info?.providerId ?? "its backend";
+    const effective = o.backend && o.backend !== info?.providerId ? (name ?? "the default") : (info?.effectiveAccount ?? name);
+    console.log(`Session "${session}" runs on the ${on} account "${effective}"${o.followDefault ? " (following the default)" : ""} from its next turn${o.backend && o.backend !== info?.providerId ? ` on ${o.backend}` : ""}.`);
+  });
+
+// ── OpenAI-compatible endpoints (local LLMs, gateways — openai-endpoints.ts) ──
+
+const endpoint = program
+  .command("endpoint")
+  .description("OpenAI-compatible model servers (OpenRouter, Groq, Ollama, LM Studio, llama.cpp, vLLM, gateways): each is a backend, oai:<name>; `ls` lists the built-in openai and llamacpp backends with them");
+
+/** The stored endpoint `name`, or undefined when there is none (or the list can't be read: the set then reports why). */
+async function storedEndpoint(name: string): Promise<EndpointInfo | undefined> {
+  const client = new TerminalClient(loadConfig());
+  try {
+    await client.connect();
+    const resp = await client.request({ type: "endpoints.list", id: randomUUID() });
+    return resp.type === "endpoints.result" ? resp.endpoints.find((e) => e.name === name) : undefined;
+  } catch {
+    return undefined;
+  } finally {
+    client.disconnect();
+  }
+}
+
+/** Run one endpoint request against the daemon; print the list it answers with. */
+async function endpointRequest(build: (id: string) => ClientMessage, opts?: { builtins?: boolean }): Promise<DaemonMessage | undefined> {
+  const config = loadConfig();
+  const client = new TerminalClient(config);
+  await client.connect();
+  const resp = await client.request(build(randomUUID()));
+  client.disconnect();
+  if (resp.type === "response.error") {
+    console.error(`Error: ${resp.error}`);
+    process.exitCode = 1;
+    return undefined;
+  }
+  if (resp.type === "endpoints.result") console.log(formatEndpoints(resp.endpoints, opts?.builtins ? (resp.builtins ?? []) : []));
+  return resp;
+}
+
+function printTestResult(resp: DaemonMessage | undefined): void {
+  if (!resp || resp.type !== "endpoints.test.result") return;
+  if (!resp.ok) {
+    console.error(`✗ ${resp.error ?? "the endpoint did not answer"}`);
+    process.exitCode = 1;
+    return;
+  }
+  const notChat = new Set(resp.notChat ?? []);
+  const models = (resp.models ?? []).filter((m) => !notChat.has(m));
+  console.log(`✓ answered in ${resp.latencyMs ?? "?"} ms — ${models.length} chat model${models.length === 1 ? "" : "s"}${resp.contextWindow ? `, context ${resp.contextWindow} tokens` : ""}`);
+  for (const m of models.slice(0, 30)) console.log(`    ${m}`);
+  if (models.length > 30) console.log(`    … and ${models.length - 30} more`);
+  if (notChat.size) console.log(`  not for chat (not offered): ${[...notChat].join(", ")}`);
+  if (resp.notServed?.length) {
+    console.log(`  configured, not listed by the server: ${resp.notServed.join(", ")}`);
+    console.log("    still offered, marked (a gateway can serve an alias it doesn't list); remove any it no longer serves: codeoid endpoint set <name> … --model <id>");
+  }
+}
+
+const collect = (v: string, prev: string[] = []) => [...prev, v];
+const TRUST_HEAD_HELP = (when: string) =>
+  `${when}you vouch for each watched branch's head as it is now — it and everything beneath it are trusted, so later merges by trusted logins are judged from it (recorded in the watch's history and the audit log, with who put the head there). <branch>=<sha> (repeatable, the commit's full id: a prefix is refused) vouches for that branch only while its head is still that commit, and for nothing if it moved — the refusal names the full id the head is now`;
+
+endpoint
+  .command("templates")
+  .description("The servers --template knows: base URL, key, notes")
+  .action(() => {
+    console.log(formatTemplates(ENDPOINT_TEMPLATES));
+  });
+
+endpoint
+  .command("ls")
+  .description("List endpoints (never a key or header value)")
+  .action(async () => {
+    await endpointRequest((id) => ({ type: "endpoints.list", id }), { builtins: true });
+  });
+
+endpoint
+  .command("set <name>")
+  .alias("add")
+  .description(
+    "Add an endpoint, or change one. Fields you leave out keep their stored values — the key and headers only while the base URL stays on the same server (scheme, host, port); moving it elsewhere needs --key/--clear-key and --header/--clear-headers. Key and header values are asked for without echo, never taken from the command line",
+  )
+  .option("--template <id>", "start a NEW endpoint from a known server: openai, openrouter, groq, together, deepseek, fireworks, mistral, ollama, lmstudio, llamacpp, vllm (see: codeoid endpoint templates)")
+  .option("--base-url <url>", "the OpenAI-compatible base URL, usually ending in /v1 (https, or http for localhost / a private network); a --template gives one, and an existing endpoint keeps its own")
+  .option("--display-name <label>", "label in pickers")
+  .option("--flavor <flavor>", "openai | llamacpp (llama-server: live context window from /props, strict tool schemas)")
+  .option("--model <id[:context[:maxTokens]]>", "a model to offer first, with its settings, repeatable (e.g. qwen3-coder:128k): a context window and output cap by id. Pickers also offer every other chat model the server lists", collect, [] as string[])
+  .option("--default-model <id>", "the model new sessions use")
+  .option("--context <tokens>", "context window for models without their own (e.g. 32k)")
+  .option("--key", "set the API key (asked for without echo, or read from stdin)")
+  .option("--clear-key", "remove the stored API key")
+  .option("--header <header>", 'extra request header, repeatable: "Name" (value asked for without echo) or "Name: value" for a non-secret one; replaces all stored headers', collect, [] as string[])
+  .option("--clear-headers", "remove all stored headers")
+  .option("--mcp <servers>", "external MCP servers offered: all | none | name,name")
+  .option("--no-stream-usage", "don't send stream_options.include_usage (for servers that reject it)")
+  .option("--strict-tools", "make tool schemas strict (default for llamacpp)")
+  .option("--no-strict-tools", "send tool schemas unchanged")
+  .option("--max-tokens-field <field>", "max_tokens | max_completion_tokens")
+  .action(
+    async (
+      name: string,
+      o: {
+        template?: string;
+        baseUrl?: string;
+        displayName?: string;
+        flavor?: string;
+        model: string[];
+        defaultModel?: string;
+        context?: string;
+        key?: boolean;
+        clearKey?: boolean;
+        header: string[];
+        clearHeaders?: boolean;
+        mcp?: string;
+        streamUsage?: boolean;
+        strictTools?: boolean;
+        maxTokensField?: string;
+      },
+    ) => {
+      try {
+        const template = o.template === undefined ? undefined : endpointTemplate(o.template);
+        if (o.template !== undefined && !template) {
+          throw new Error(`no template "${o.template}": ${ENDPOINT_TEMPLATES.map((t) => t.id).join(", ")}`);
+        }
+        // A template fills a NEW endpoint; an existing one keeps what is stored unless a flag says otherwise.
+        const existing = await storedEndpoint(name);
+        if (existing && template) {
+          console.log(`"${name}" exists: --template only fills a new endpoint, so its stored settings are kept (pass flags to change them).`);
+        }
+        const fill = existing ? undefined : template;
+        const baseUrl = o.baseUrl ?? existing?.baseUrl ?? (fill?.baseUrl || undefined);
+        if (!baseUrl) throw new Error(fill ? `the ${fill.name} template needs --base-url` : "give --base-url, or --template");
+        const flavor = (o.flavor as EndpointFlavor | undefined) ?? fill?.flavor;
+        // A flavor change brings that flavor's defaults with it, as the web editor does: llama-server
+        // rejects loose tool schemas, and a small local context can't carry every MCP server.
+        const flavorMoved = !!existing && flavor !== undefined && flavor !== existing.flavor;
+        if (o.key && o.clearKey) throw new Error("--key and --clear-key don't go together");
+        if (o.header?.length && o.clearHeaders) throw new Error("--header and --clear-headers don't go together");
+        if (o.flavor !== undefined && o.flavor !== "openai" && o.flavor !== "llamacpp") throw new Error("--flavor is openai or llamacpp");
+        if (o.maxTokensField !== undefined && o.maxTokensField !== "max_tokens" && o.maxTokensField !== "max_completion_tokens") {
+          throw new Error("--max-tokens-field is max_tokens or max_completion_tokens");
+        }
+        const models = parseModelFlags(o.model ?? []);
+        const parsedHeaders = parseHeaderFlags(o.header ?? []);
+        if ((parsedHeaders.ask.length > 0 || o.key) && !process.stdin.isTTY && parsedHeaders.ask.length + (o.key ? 1 : 0) > 1) {
+          throw new Error('With piped input only one secret can be read (the key); pass non-secret headers as "Name: value".');
+        }
+        const headers = parsedHeaders.headers;
+        for (const h of parsedHeaders.ask) headers[h] = (await readSecret(`Value for header ${h}: `)).trim();
+        const apiKey = o.key ? (await readSecret("API key: ")).trim() : o.clearKey ? null : undefined;
+        if (o.key && !apiKey) throw new Error("no API key entered — use --clear-key to remove one");
+        const mcpServers =
+          o.mcp === undefined ? undefined : o.mcp === "all" ? ("all" as const) : o.mcp === "none" ? [] : o.mcp.split(",").map((x) => x.trim()).filter(Boolean);
+        const resp = await endpointRequest((id) => ({
+          type: "endpoints.set",
+          id,
+          name,
+          baseUrl,
+          ...(o.displayName !== undefined ? { displayName: o.displayName } : fill && fill.id !== "custom" ? { displayName: fill.name } : {}),
+          ...(flavor ? { flavor } : {}),
+          ...(apiKey !== undefined ? { apiKey } : {}),
+          ...(o.header?.length ? { headers } : o.clearHeaders ? { headers: {} } : {}),
+          ...(models.length ? { models } : {}),
+          ...(o.defaultModel ? { defaultModel: o.defaultModel } : {}),
+          ...(o.context ? { contextWindow: parseTokens(o.context) } : {}),
+          ...(mcpServers !== undefined ? { mcpServers } : flavorMoved && flavor === "llamacpp" ? { mcpServers: [] } : {}),
+          ...(o.streamUsage === false ? { streamUsage: false } : {}),
+          ...(o.strictTools !== undefined ? { strictToolSchemas: o.strictTools } : flavorMoved ? { strictToolSchemas: flavor === "llamacpp" } : {}),
+          ...(o.maxTokensField
+            ? { maxTokensField: o.maxTokensField as "max_tokens" | "max_completion_tokens" }
+            : fill?.maxTokensField
+              ? { maxTokensField: fill.maxTokensField }
+              : {}),
+        }));
+        if (!process.exitCode) {
+          const saved = resp?.type === "endpoints.result" ? resp.endpoints.find((e) => e.name === name) : undefined;
+          if (fill?.key === "required" && saved && !saved.hasApiKey) {
+            console.log(`${fill.name} needs an API key: codeoid endpoint set ${name} --key${fill.keyUrl ? `  (get one at ${fill.keyUrl})` : ""}`);
+          }
+          console.log(`Use it with: codeoid new <session> <dir> --provider oai:${name}`);
+        }
+      } catch (err) {
+        console.error(`Error: ${(err as Error).message}`);
+        process.exitCode = 1;
+      }
+    },
+  );
+
+endpoint
+  .command("rm <name>")
+  .description("Remove an endpoint (sessions on it refuse to run until switched to another backend)")
+  .action(async (name: string) => {
+    await endpointRequest((id) => ({ type: "endpoints.remove", id, name }));
+  });
+
+endpoint
+  .command("test [name]")
+  .description("Check an endpoint answers and list its models — a stored one, or a draft with --base-url")
+  .option("--base-url <url>", "test this URL (with a stored endpoint's key and headers when <name> is given and the URL is on the same server)")
+  .option("--key", "test with an API key (asked for without echo)")
+  .option("--no-stored-key", "test without the stored API key")
+  .option("--no-stored-headers", "test without the stored headers")
+  .action(async (name: string | undefined, o: { baseUrl?: string; key?: boolean; storedKey?: boolean; storedHeaders?: boolean }) => {
+    if (!name && !o.baseUrl) {
+      console.error("Give an endpoint name, or --base-url.");
+      process.exitCode = 1;
+      return;
+    }
+    const apiKey = o.key ? (await readSecret("API key: ")).trim() : o.storedKey === false ? null : undefined;
+    printTestResult(
+      await endpointRequest((id) => ({
+        type: "endpoints.test",
+        id,
+        ...(name ? { name } : {}),
+        ...(o.baseUrl ? { baseUrl: o.baseUrl } : {}),
+        ...(apiKey !== undefined && apiKey !== "" ? { apiKey } : {}),
+        // Explicit, so a draft on another server can be tested (stored ones stay home).
+        ...(o.storedHeaders === false ? { headers: {} } : {}),
+      })),
     );
+  });
+
+endpoint
+  .command("import-pi")
+  .description("Add the OpenAI-compatible providers from pi's models.json as endpoints ($VAR keys are resolved from this shell; !command keys are not run)")
+  .option("--file <path>", "models.json to read (default: $PI_CODING_AGENT_DIR/models.json, else ~/.pi/agent/models.json)")
+  .option("--replace", "overwrite endpoints that already exist with the same name")
+  .option("--dry-run", "show what would be imported, change nothing")
+  .action(async (o: { file?: string; replace?: boolean; dryRun?: boolean }) => {
+    const file = o.file ?? join(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"), "models.json");
+    let json: unknown;
+    try {
+      json = JSON.parse(readFileSync(file, "utf8"));
+    } catch (err) {
+      console.error(`Error: can't read ${file}: ${(err as Error).message}`);
+      process.exitCode = 1;
+      return;
+    }
+    const { entries, skipped } = importPiModels(json, process.env);
+    for (const s of skipped) console.log(`  skip ${s.provider}: ${s.reason}`);
+    if (entries.length === 0) {
+      console.log(`No OpenAI-compatible providers in ${file}.`);
+      return;
+    }
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    try {
+      const listed = await client.request({ type: "endpoints.list", id: randomUUID() });
+      const existing = new Set(listed.type === "endpoints.result" ? listed.endpoints.map((e) => e.name) : []);
+      for (const { endpoint: e, warnings } of entries) {
+        const label = `${e.name} → ${e.baseUrl} (${e.models?.length ?? 0} models)`;
+        if (existing.has(e.name) && !o.replace) {
+          console.log(`  keep ${label}: already exists (--replace to overwrite)`);
+          continue;
+        }
+        for (const w of warnings) console.log(`  ! ${e.name}: ${w}`);
+        if (o.dryRun) {
+          console.log(`  would add ${label}`);
+          continue;
+        }
+        const resp = await client.request({ type: "endpoints.set", id: randomUUID(), ...e });
+        if (resp.type === "response.error") {
+          console.error(`  ✗ ${e.name}: ${resp.error}`);
+          process.exitCode = 1;
+        } else {
+          console.log(`  ✓ ${label}`);
+        }
+      }
+    } finally {
+      client.disconnect();
+    }
   });
 
 program
@@ -618,11 +1146,36 @@ program
   )
   .option(
     "--account <name>",
-    "Claude account to run this session on (see `codeoid account ls`). Default: the daemon default account.",
+    "Account to run this session on, for its backend (see `codeoid account ls`). Default: that backend's default account.",
   )
   .option(
     "--model <id>",
     "Model for this session (validated against --provider). Omitted with --pack/--pack-role, the model resolves through the role's binding chain (config override → role pin → tier map).",
+  )
+  .option(
+    "--effort <level>",
+    "Thinking effort: off | minimal | low | medium | high | xhigh | max, or default for the backend's own (omitted: session.defaultEffort, else the backend's own). Change it later with /effort.",
+  )
+  .option(
+    "--sandbox <provider>",
+    "OS sandbox for its commands: auto (bubblewrap on Linux, Seatbelt on macOS) | bwrap | seatbelt | docker | off. Default: sandbox.provider. off needs session:approve.",
+  )
+  .option("--network <mode>", "What a sandboxed command may reach: on | off | allowlist (with --allow-host). Default: sandbox.network.")
+  .option("--allow-host <host>", "A host the allowlist lets through, repeatable (example.com, *.example.com).", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .option("--docker-socket", "Let the session's sandboxed commands reach the container runtime (testcontainers, docker run). Docker access can reach the whole machine; needs session:approve. Default: sandbox.docker.socket.")
+  .option("--add-dir <dir>", "Another directory its sandboxed commands may write (a second repository), repeatable; treated as a workspace. Needs session:approve (docs/sandbox.md, Working across repositories).", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .option("--project-root <dir>", "Where its sandboxed commands may read other repositories, read-only, repeatable; replaces sandbox.projectRoots (@parent = the repository's parent, the default).", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .option("--no-project-roots", "No project root: its commands read only the workspace (and the toolchains the sandbox shows)")
+  .option(
+    "--workstream <id>",
+    "Home workstream (docs/workstreams-design.md): decides the session's servers, credentials and defaults. Default: the folder's (`codeoid workstream match <dir>`), else the configured default.",
+  )
+  .option("--override", "with --workstream: confirm it past the folder's own exclusive workstream without asking (needs session:approve)")
+  .option(
+    "--ref <workstream[:dir]>",
+    "Another workstream the session may read: its folders read-only (or only <dir>) and its memory, repeatable. By its share policy: open, ask (needs session:approve), closed (refused).",
+    (v: string, p: string[] = []) => [...p, v],
+    [] as string[],
   )
   .option(
     "--pack <id>",
@@ -653,13 +1206,42 @@ program
         provider?: string;
         account?: string;
         model?: string;
+        effort?: string;
         pack?: string;
         packRole?: string;
         collaborate?: string;
         role: string[];
+        sandbox?: string;
+        network?: string;
+        allowHost: string[];
+        dockerSocket?: boolean;
+        addDir: string[];
+        projectRoot: string[];
+        projectRoots?: boolean;
+        workstream?: string;
+        override?: boolean;
+        ref: string[];
       },
     ) => {
       const config = loadConfig();
+      let references: Array<{ workstream: string; paths?: string[] }>;
+      try {
+        references = referenceFlags(opts.ref);
+      } catch (e) {
+        console.error(e instanceof Error ? e.message : String(e));
+        process.exit(1);
+      }
+      if (opts.override && !opts.workstream) {
+        console.error("--override confirms a --workstream choice; give one (codeoid workstream match <dir> shows the folder's).");
+        process.exit(1);
+      }
+      let sandbox: SessionSandboxSetting | undefined;
+      try {
+        sandbox = sandboxSettingFromFlags(opts);
+      } catch (e) {
+        console.error(e instanceof Error ? e.message : String(e));
+        process.exit(1);
+      }
       let resolvedWorkdir = workdir;
       if (opts.worktree) {
         const { createWorktree } = await import("./worktree.js");
@@ -702,19 +1284,203 @@ program
         process.exit(1);
       }
 
+      let effort: EffortLevel | null | undefined;
+      if (opts.effort) {
+        try {
+          effort = parseEffort(opts.effort); // "default" = the backend's own, not session.defaultEffort
+        } catch (e) {
+          console.error(`--effort: ${e instanceof Error ? e.message : String(e)}`);
+          process.exit(1);
+        }
+      }
       const client = new TerminalClient(config);
       await client.connect();
       await client.createSession(name, resolvedWorkdir, {
         providerId: opts.provider,
         model: opts.model,
-        claudeAccount: opts.account,
+        ...(effort !== undefined ? { effort } : {}),
+        account: opts.account,
         pack: opts.pack,
         packRole: opts.packRole,
         collaboration,
+        ...(sandbox ? { sandbox } : {}),
+        ...(opts.workstream ? { workstream: opts.workstream } : {}),
+        ...(references.length > 0 ? { references } : {}),
+        confirmOverride: async (warning: string) => {
+          console.error(warning);
+          return confirmOnTerminal("Start it anyway? [y/N] ", opts.override, "Not started: pass --override to confirm without a terminal.");
+        },
       });
       client.disconnect();
     },
   );
+
+/** `--ref acme`, `--ref acme:~/Workspace/acme-api` → references, one per workstream (folders gathered). */
+export function referenceFlags(flags: readonly string[]): Array<{ workstream: string; paths?: string[] }> {
+  const out = new Map<string, { workstream: string; paths?: string[]; whole: boolean }>();
+  for (const f of flags) {
+    const at = f.indexOf(":");
+    const workstream = (at < 0 ? f : f.slice(0, at)).trim();
+    const dir = at < 0 ? "" : f.slice(at + 1).trim();
+    if (!workstream) throw new Error(`--ref ${f}: name a workstream (--ref <workstream>[:<dir>])`);
+    const cur = out.get(workstream) ?? { workstream, whole: false };
+    if (!dir) cur.whole = true;
+    else cur.paths = [...(cur.paths ?? []), dirFlag(dir)];
+    out.set(workstream, cur);
+  }
+  return [...out.values()].map((r) => (r.whole || !r.paths ? { workstream: r.workstream } : { workstream: r.workstream, paths: r.paths }));
+}
+
+/** A directory as the daemon keeps it: `~` left to it (its home), a relative one this shell's. */
+function dirFlag(d: string): string {
+  return d === "~" || d.startsWith("~/") || isAbsolute(d) ? d : resolve(process.cwd(), d);
+}
+
+/**
+ * A session's sandbox setting from `--sandbox` / `--network` / `--allow-host` / `--[no-]docker-socket`
+ * (#448) and `--add-dir` / `--project-root` / `--no-project-roots`; undefined when none is given.
+ */
+function sandboxSettingFromFlags(o: { sandbox?: string; network?: string; allowHost?: string[]; dockerSocket?: boolean; addDir?: string[]; projectRoot?: string[]; projectRoots?: boolean }): SessionSandboxSetting | undefined {
+  const out: SessionSandboxSetting = {};
+  if (o.addDir && o.addDir.length > 0) out.addedDirs = o.addDir.map(dirFlag);
+  if (o.projectRoots === false) {
+    if (o.projectRoot && o.projectRoot.length > 0) throw new Error("--no-project-roots and --project-root don't go together");
+    out.projectRoots = [];
+  } else if (o.projectRoot && o.projectRoot.length > 0) {
+    out.projectRoots = o.projectRoot.map((r) => (r === "@parent" ? r : dirFlag(r)));
+  }
+  if (o.sandbox) out.provider = o.sandbox;
+  if (o.network) {
+    if (o.network !== "on" && o.network !== "off" && o.network !== "allowlist") throw new Error("--network is on, off or allowlist");
+    out.network = o.network;
+  }
+  if (o.allowHost && o.allowHost.length > 0) {
+    if (out.network && out.network !== "allowlist") throw new Error("--allow-host goes with --network allowlist");
+    out.network = "allowlist";
+    out.allowedHosts = o.allowHost;
+  }
+  if (o.dockerSocket !== undefined) out.dockerSocket = o.dockerSocket;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+const sandboxCmd = program
+  .command("sandbox")
+  .description("The OS sandbox agents' commands run in (docs/sandbox.md): see what this daemon has, or change a session's");
+
+sandboxCmd
+  .command("providers")
+  .description("List the sandbox providers, whether each runs here, and the default")
+  .action(async () => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    await client.sandboxProviders();
+    client.disconnect();
+  });
+
+sandboxCmd
+  .command("set <session> [provider]")
+  .description("Change a session's sandbox: auto | bwrap | seatbelt | docker | off, and/or --network, --docker-socket. Turning it off or widening it (Docker access included) is asked of the owner on the session")
+  .option("--network <mode>", "on | off | allowlist")
+  .option("--allow-host <host>", "a host the allowlist lets through, repeatable", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .option("--docker-socket", "let its commands reach the container runtime (Docker access can reach the whole machine)")
+  .option("--no-docker-socket", "take Docker access away")
+  .action(async (session: string, provider: string | undefined, o: { network?: string; allowHost: string[]; dockerSocket?: boolean }) => {
+    let setting: SessionSandboxSetting | undefined;
+    try {
+      setting = sandboxSettingFromFlags({ ...(provider ? { sandbox: provider } : {}), ...o });
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
+    if (!setting) {
+      console.error("Give a provider (auto | bwrap | seatbelt | docker | off), --network or --[no-]docker-socket.");
+      process.exit(1);
+    }
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    await client.setSandbox(session, setting);
+    client.disconnect();
+  });
+
+const sandboxGitCmd = sandboxCmd
+  .command("git")
+  .description("The git gateway (docs/git-gateway-design.md): agents' own git fetch and push reach remotes you connect, with your existing credentials, which never enter the sandbox");
+
+sandboxGitCmd
+  .command("connect [dir]")
+  .description(
+    "Connect a repository's remote for agents in your sandboxed sessions: they may fetch from it and push branches of their own (never a protected branch, main and master unless sandbox.push.protectedBranches says otherwise, nor its default branch; no force, no deletes, no tags), with your ssh key or your git credential for it (read once, now), or --token. Proved to work first. A pushed branch runs the repository's CI with its secrets",
+  )
+  .option("--remote <name>", "the remote (default: origin)")
+  .option("--url <url>", "the remote's URL, instead of a repository and remote")
+  .option("--token", "use a dedicated token for an https remote (user:token, or the token), read from the terminal or stdin")
+  .option("--yes", "connect a repository's remote without asking to confirm its URL (needed without a terminal)")
+  .action(async (dir: string | undefined, o: { remote?: string; url?: string; token?: boolean; yes?: boolean }) => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    // Asked first: a push URL connected below uses it too.
+    const token = o.token ? (await readSecret("Token (user:token, or the token): ")).trim() : undefined;
+    if (o.token && !token) {
+      console.error("No token given: nothing connected.");
+      process.exit(1);
+    }
+    let url = o.url;
+    if (!url) {
+      // The URL a repository's config names is shown, and confirmed, before anything is connected.
+      const found = await client.sandboxGitResolve(resolve(dir ?? "."), o.remote);
+      if (!found) return client.disconnect();
+      console.log(`This connects ${found.url}${found.writtenAs ? ` (the repository says ${found.writtenAs}; your git config rewrites it to this)` : ""}${found.connected ? " (connected already: connecting again refreshes it)" : ""} for agents in your sandboxed sessions.`);
+      if (!(await confirmOnTerminal("Connect it? [y/N] ", o.yes, "Not connected: pass --yes to connect without a terminal to confirm in, or name it with --url."))) return client.disconnect();
+      url = found.rawUrl;
+      // Your git pushes elsewhere (pushInsteadOf): agents' pushes go there, so that is connected too, when asked.
+      if (found.rawPushUrl && found.pushUrl) {
+        console.log(`Your git pushes it to ${found.pushUrl} (pushInsteadOf): agents' pushes go there.`);
+        // Never with --token's token: it may be another host's (or an ssh URL); it's connected with its own.
+        if (token) console.log(`  Connect it with its own token: codeoid sandbox git connect --url ${found.pushUrl} --token`);
+        else if (await confirmOnTerminal("Connect that too? [y/N] ", o.yes, "")) await client.sandboxGitConnect("connect", { url: found.rawPushUrl });
+      }
+    }
+    await client.sandboxGitConnect("connect", { url, ...(token ? { token } : {}) });
+    client.disconnect();
+  });
+
+sandboxGitCmd
+  .command("disconnect [dir]")
+  .description("Take a connected remote back: agents' git no longer reaches it (a kept credential is deleted)")
+  .option("--remote <name>", "the remote (default: origin)")
+  .option("--url <url>", "the remote's URL, instead of a repository and remote")
+  .action(async (dir: string | undefined, o: { remote?: string; url?: string }) => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    await client.sandboxGitConnect("disconnect", { ...(o.url ? { url: o.url } : { path: resolve(dir ?? ".") }), ...(o.remote ? { remote: o.remote } : {}) });
+    client.disconnect();
+  });
+
+sandboxGitCmd
+  .command("ls")
+  .description("List the remotes you connected for agents")
+  .action(async () => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    await client.sandboxGitConnect("list", {});
+    client.disconnect();
+  });
+
+for (const action of ["add", "remove"] as const) {
+  sandboxCmd
+    .command(`${action} <session> <dir>`)
+    .description(
+      action === "add"
+        ? "Let a session's sandboxed commands write another directory (a second repository), as its workspace: asked of its owner on the session; from its next turn"
+        : "Take a directory the session was given to write away again (from its next turn)",
+    )
+    .action(async (session: string, dir: string) => {
+      const client = new TerminalClient(loadConfig());
+      await client.connect();
+      await client.sandboxDir(session, action, dirFlag(dir));
+      client.disconnect();
+    });
+}
 
 program
   .command("attach <session>")
@@ -907,8 +1673,17 @@ program
   .option("--pick <n>", "which waiting tool call, when several are (1 = the oldest)")
   .option("--id <approvalId>", "which waiting tool call, by the id shown — stable, unlike --pick, for scripts")
   .option("--yes", "approve without asking to confirm (needed without a terminal)")
-  .action(async (session: string, opts: { deny?: boolean; pick?: string; id?: string; yes?: boolean }) => {
+  .option("--save <scope>", "approve, and keep it as a rule for this session or repository (session | repository)")
+  .action(async (session: string, opts: { deny?: boolean; pick?: string; id?: string; yes?: boolean; save?: string }) => {
     const pick = opts.pick !== undefined ? Number(opts.pick) : undefined;
+    if (opts.save !== undefined && opts.save !== "session" && opts.save !== "repository") {
+      console.error("--save takes session or repository");
+      process.exit(1);
+    }
+    if (opts.save !== undefined && opts.deny) {
+      console.error("--save keeps an approval; it can't go with --deny");
+      process.exit(1);
+    }
     if (pick !== undefined && (!Number.isInteger(pick) || pick < 1)) {
       console.error("--pick takes a number (1 = the oldest waiting)");
       process.exit(1);
@@ -929,6 +1704,7 @@ program
       ...(pick !== undefined ? { pick } : {}),
       ...(opts.id !== undefined ? { approvalId: opts.id } : {}),
       ...(opts.yes ? { yes: true } : {}),
+      ...(opts.save ? { save: opts.save as "session" | "repository" } : {}),
     });
     client.disconnect();
   });
@@ -942,6 +1718,530 @@ program
     await client.connect();
     await client.destroySession(session);
     client.disconnect();
+  });
+
+// ── Worktree setup recipe trust (src/daemon/workspace-setup.ts) ────────────
+
+const worktreeCmd = program
+  .command("worktree")
+  .description("Worktrees codeoid creates (forks, compare, routines): trust a repository's setup recipe, .codeoid/setup.yaml");
+
+/** Ask y/N on the terminal; off a terminal, only --yes says yes. EOF is "no". */
+async function confirmOnTerminal(
+  question: string,
+  yes: boolean | undefined,
+  noTerminal = "Not trusted: pass --yes to trust without a terminal to confirm in.",
+): Promise<boolean> {
+  if (yes) return true;
+  if (!process.stdin.isTTY) {
+    console.error(noTerminal);
+    return false;
+  }
+  const { createInterface } = await import("node:readline");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  const answer = await new Promise<string>((done) => {
+    rl.once("close", () => done(""));
+    rl.question(question, done);
+  });
+  rl.close();
+  return /^y(es)?$/i.test(answer.trim());
+}
+
+worktreeCmd
+  .command("trust [dir]")
+  .description(
+    "Review the setup command in the repository's committed .codeoid/setup.yaml and let it run in new worktrees — pinned to that exact recipe: a changed recipe runs nothing until trusted again",
+  )
+  .option("--off", "stop trusting this repository's setup command")
+  .option("--yes", "trust without asking to confirm (needed without a terminal)")
+  .action(async (dir: string | undefined, o: { off?: boolean; yes?: boolean }) => {
+    const target = resolve(dir ?? process.cwd());
+    const config = loadConfig();
+    const client = new TerminalClient(config);
+    await client.connect();
+    const fail = (resp: DaemonMessage): void => {
+      console.error(`Error: ${resp.type === "response.error" ? resp.error : `unexpected reply ${resp.type}`}`);
+      process.exitCode = 1;
+    };
+    try {
+      const ask = await client.request({ type: "worktree.trust", id: randomUUID(), dir: target, ...(o.off ? { off: true } : { dryRun: true }) });
+      if (ask.type !== "worktree.trust.result") return fail(ask);
+      if (o.off) {
+        console.log(ask.changed ? `No longer trusting the setup command of ${ask.path}.` : `${ask.path} had no trusted setup command.`);
+        return;
+      }
+      if (!ask.recipeHash) {
+        console.error(`There is no .codeoid/setup.yaml at the committed HEAD of ${ask.path}.`);
+        process.exitCode = 1;
+        return;
+      }
+      if (!ask.command) {
+        console.log(`The recipe in ${ask.path} has no setup command — nothing to trust (its copy/share steps need no trust).`);
+        return;
+      }
+      console.log(
+        [
+          `Repository: ${ask.path}`,
+          `Recipe:     .codeoid/setup.yaml at HEAD (blob ${ask.recipeHash.slice(0, 12)})`,
+          "Command:",
+          ...ask.command.split("\n").map((l) => `  ${l}`),
+          "",
+          "It runs, as you, in every new worktree codeoid creates for this repository — together with",
+          "any script it invokes from the committed tree (package.json lifecycle scripts, a Makefile, …).",
+          "Prefer a command that runs no repository scripts, e.g. `bun install --ignore-scripts`.",
+        ].join("\n"),
+      );
+      if (ask.trusted) {
+        console.log("\nAlready trusted.");
+        return;
+      }
+      if (!(await confirmOnTerminal("\nTrust this setup command? [y/N] ", o.yes))) {
+        if (process.stdin.isTTY) console.error("Not trusted.");
+        process.exitCode = 1;
+        return;
+      }
+      const res = await client.request({ type: "worktree.trust", id: randomUUID(), dir: target, recipeHash: ask.recipeHash });
+      if (res.type !== "worktree.trust.result") return fail(res);
+      console.log(`Trusted: new worktrees of ${res.path} run this setup command while the recipe stays as it is.`);
+      if (res.runCommands !== "trusted-repos") {
+        console.log("Note: worktree.setup.runCommands is \"never\" — set it to \"trusted-repos\" (Settings, or config.json) for the command to run.");
+      }
+    } finally {
+      client.disconnect();
+    }
+  });
+
+// ── Workstreams (docs/workstreams-design.md) ────────────────────────────────
+
+const workstreamCmd = program
+  .command("workstream")
+  .description("Named lines of work: which folders belong to which, and what their sessions get (docs/workstreams-design.md)");
+
+/** Daemon-supplied text, made safe for the terminal. */
+const clean = (s: string): string => sanitizeTerminalOutput(s);
+
+/** Run one request against the daemon and hand the reply to `show`; exits non-zero on an error reply. */
+async function workstreamRequest<T extends DaemonMessage["type"]>(
+  msg: ClientMessage,
+  want: T,
+  show: (reply: Extract<DaemonMessage, { type: T }>) => void,
+): Promise<void> {
+  const client = new TerminalClient(loadConfig());
+  await client.connect();
+  try {
+    const reply = await client.request(msg);
+    if (reply.type !== want) {
+      console.error(`Error: ${clean(reply.type === "response.error" ? reply.error : `unexpected reply ${reply.type}`)}`);
+      process.exitCode = 1;
+      return;
+    }
+    show(reply as Extract<DaemonMessage, { type: T }>);
+  } finally {
+    client.disconnect();
+  }
+}
+
+// ── Saved approval rules (docs/secrets-and-memory-design.md §4.1) ─────────
+
+const approvalsCmd = program
+  .command("approvals")
+  .description("Your saved approval rules: what runs without asking in guarded mode, and what's always refused (docs/approvals.md)");
+
+approvalsCmd
+  .command("ls")
+  .description("List your rules: where each applies, when it last ran a call")
+  .option("--json", "print the daemon's reply as JSON")
+  .action(async (o: { json?: boolean }) => {
+    await workstreamRequest({ type: "approval_rules.list", id: randomUUID() }, "approval_rules.list.result", (r) => {
+      if (o.json) return void console.log(JSON.stringify(r, null, 2));
+      if (r.rules.length === 0) return void console.log("No rules. Save one with `codeoid approve <session> --save session|repository`, or add one.");
+      for (const rule of r.rules) {
+        const where = rule.scope.kind === "everywhere" ? "everywhere" : `${rule.scope.kind} ${rule.scope.label}`;
+        const used = rule.useCount > 0 ? `used ${rule.useCount}×, last ${new Date(rule.lastUsedAt ?? rule.createdAt).toLocaleString()}` : "not used yet";
+        const ends = rule.expiresAt ? `, ends ${new Date(rule.expiresAt).toLocaleString()}` : "";
+        console.log(`${clean(rule.id)}  ${rule.effect.padEnd(5)}  ${clean(rule.rule)}  — ${clean(where)} (${used}${ends})`);
+      }
+    });
+  });
+
+approvalsCmd
+  .command("add <rule>")
+  .description("Add a rule: Bash(npm test:*), Bash(make lint), mcp__<server>__<tool>, WebFetch(domain:<host>)")
+  .option("--deny", "refuse what it matches, in every mode, instead of allowing it")
+  .option("--session <session>", "for this session only")
+  .option("--repository <dir>", "in this repository (a folder in it)")
+  .option("--workstream <id>", "in every session of this workstream")
+  .option("--everywhere", "in all your sessions")
+  .action(async (rule: string, o: { deny?: boolean; session?: string; repository?: string; workstream?: string; everywhere?: boolean }) => {
+    const picked = [o.session !== undefined, o.repository !== undefined, o.workstream !== undefined, o.everywhere === true].filter(Boolean).length;
+    if (picked !== 1) {
+      console.error("Say where it applies: one of --session, --repository, --workstream or --everywhere");
+      process.exit(1);
+    }
+    const scope = o.session !== undefined ? "session" : o.repository !== undefined ? "repository" : o.workstream !== undefined ? "workstream" : "everywhere";
+    let sessionId: string | undefined;
+    if (o.session !== undefined) {
+      const client = new TerminalClient(loadConfig());
+      await client.connect();
+      try {
+        sessionId = (await client.resolveSessionId(o.session)) ?? undefined;
+      } finally {
+        client.disconnect();
+      }
+      if (!sessionId) {
+        console.error(`No session ${clean(o.session)}`);
+        process.exit(1);
+      }
+    }
+    await workstreamRequest(
+      {
+        type: "approval_rules.add",
+        id: randomUUID(),
+        rule,
+        effect: o.deny ? "deny" : "allow",
+        scope,
+        ...(sessionId ? { sessionId } : {}),
+        ...(o.repository !== undefined ? { workdir: resolve(o.repository) } : {}),
+        ...(o.workstream !== undefined ? { workstream: o.workstream } : {}),
+      },
+      "approval_rules.add.result",
+      (r) => console.log(`Saved ${clean(r.rule.rule)} (${r.rule.effect}, ${r.rule.scope.kind === "everywhere" ? "everywhere" : `${r.rule.scope.kind} ${clean(r.rule.scope.label)}`}) as ${clean(r.rule.id)}.`),
+    );
+  });
+
+approvalsCmd
+  .command("rm <id>")
+  .description("Remove one of your rules, by the id `codeoid approvals ls` shows")
+  .action(async (id: string) => {
+    await workstreamRequest({ type: "approval_rules.remove", id: randomUUID(), ruleId: id }, "response.ok", () => console.log(`Removed ${clean(id)}.`));
+  });
+
+// ── Secrets (docs/secrets-and-memory-design.md §2) ──────────────────────
+
+const secretCmd = program
+  .command("secret")
+  .description("Secrets in what codeoid stores: the ones workstreams keep, and scrubbing older data (docs/secrets-and-memory-design.md)");
+
+/** `<workstream>:<fingerprint>`, or a bare fingerprint (a session with no workstream), or `‹secret:kind:fp›` as copied. */
+function keptRef(ref: string, workstream?: string): { workstream: string; fingerprint: string } | null {
+  const copied = /^‹secret:[a-z0-9-]+:([0-9a-f]{8})›$/.exec(ref.trim());
+  if (copied) return { workstream: workstream ?? "", fingerprint: copied[1]! };
+  const m = /^(?:([a-z0-9][a-z0-9-]{0,63}):)?([0-9a-f]{8})$/.exec(ref.trim());
+  return m ? { workstream: workstream ?? m[1] ?? "", fingerprint: m[2]! } : null;
+}
+
+secretCmd
+  .command("ls")
+  .description("List the detected secrets workstreams keep (captureSecrets: vault) — never their values")
+  .option("--workstream <id>", "only this workstream's")
+  .option("--json", "print the daemon's reply as JSON")
+  .action(async (o: { workstream?: string; json?: boolean }) => {
+    await workstreamRequest({ type: "secret.list", id: randomUUID(), ...(o.workstream ? { workstream: o.workstream } : {}) }, "secret.list.result", (r) => {
+      if (o.json) return void console.log(JSON.stringify(r, null, 2));
+      if (!r.enabled) console.log("Secret handling is off in this daemon (secrets.enabled).");
+      if (r.secrets.length === 0) {
+        console.log("No kept secrets. A workstream keeps detected secrets only with captureSecrets: \"vault\"; the default drops them.");
+        return;
+      }
+      for (const k of r.secrets) {
+        const ref = `${k.workstream ? `${clean(k.workstream)}:` : ""}${k.fingerprint}`;
+        console.log(`${ref.padEnd(32)} ${clean(k.kind).padEnd(20)} last seen ${new Date(k.lastSeen).toISOString()}${k.sessionId ? `  session ${clean(k.sessionId.slice(0, 8))}` : ""}`);
+      }
+    });
+  });
+
+secretCmd
+  .command("reveal <ref>")
+  .description("Print a kept secret's value (<workstream>:<fingerprint>, or as copied: ‹secret:kind:fingerprint›). Your own token only; audited")
+  .option("--workstream <id>", "the workstream that keeps it")
+  .action(async (ref: string, o: { workstream?: string }) => {
+    const k = keptRef(ref, o.workstream);
+    if (!k) {
+      console.error("Error: give <workstream>:<fingerprint>, a fingerprint, or the reference as copied");
+      process.exitCode = 1;
+      return;
+    }
+    await workstreamRequest({ type: "secret.reveal", id: randomUUID(), ...k }, "secret.reveal.result", (r) => {
+      // The value itself, unaltered: it is what was asked for.
+      console.log(r.value);
+    });
+  });
+
+secretCmd
+  .command("forget <ref>")
+  .description("Forget a kept secret")
+  .option("--workstream <id>", "the workstream that keeps it")
+  .action(async (ref: string, o: { workstream?: string }) => {
+    const k = keptRef(ref, o.workstream);
+    if (!k) {
+      console.error("Error: give <workstream>:<fingerprint>, a fingerprint, or the reference as copied");
+      process.exitCode = 1;
+      return;
+    }
+    await workstreamRequest({ type: "secret.forget", id: randomUUID(), ...k }, "response.ok", () => console.log(`Forgot ${k.workstream ? `${k.workstream}:` : ""}${k.fingerprint}.`));
+  });
+
+secretCmd
+  .command("promote <ref>")
+  .description("Make a kept secret a declared credential (an env credential), so it is matched by name from now on")
+  .requiredOption("--as <id>", "the credential's id (lowercase letters, digits, dashes)")
+  .option("--workstream <id>", "the workstream that keeps it")
+  .action(async (ref: string, o: { as: string; workstream?: string }) => {
+    const k = keptRef(ref, o.workstream);
+    if (!k) {
+      console.error("Error: give <workstream>:<fingerprint>, a fingerprint, or the reference as copied");
+      process.exitCode = 1;
+      return;
+    }
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    try {
+      const fail = (reply: DaemonMessage): boolean => {
+        if (reply.type !== "response.error") return false;
+        console.error(`Error: ${clean(reply.error)}`);
+        process.exitCode = 1;
+        return true;
+      };
+      const revealed = await client.request({ type: "secret.reveal", id: randomUUID(), ...k });
+      if (fail(revealed) || revealed.type !== "secret.reveal.result") return;
+      if (fail(await client.request({ type: "credential.upsert", id: randomUUID(), item: { id: o.as, kind: "env", description: `promoted from ${revealed.kind} ${k.fingerprint}` } }))) return;
+      if (fail(await client.request({ type: "credential.set_value", id: randomUUID(), credential: o.as, value: revealed.value }))) return;
+      if (fail(await client.request({ type: "secret.forget", id: randomUUID(), ...k }))) return;
+      console.log(`Credential "${o.as}" now holds it; from now on it shows as ‹credential:${o.as}›. Give it to a workstream's env to use it.`);
+    } finally {
+      client.disconnect();
+    }
+  });
+
+secretCmd
+  .command("scrub")
+  .description("Rewrite what was stored before secret handling (transcripts, memory, dispatch tasks) with secrets replaced by references. Stop the daemon first")
+  .option("--dry-run", "say what would change, change nothing")
+  .action(async (o: { dryRun?: boolean }) => {
+    const config = loadConfig();
+    const { acquireDaemonLocks: acquire, daemonOwnedDirs: owned, DataDirLockError: LockError } = await import("./daemon/data-lock.js");
+    let locks: { release(): void };
+    try {
+      locks = acquire(owned(config), { log: () => {} });
+    } catch (err) {
+      if (err instanceof LockError) {
+        console.error(`Error: the daemon is running (${clean(err.message)}). Stop it first: scrubbing rewrites what it writes to.`);
+        process.exitCode = 1;
+        return;
+      }
+      throw err;
+    }
+    try {
+      const { Store: DaemonStore } = await import("./daemon/store.js");
+      const { SecretService, addDaemonKnownSources } = await import("./daemon/secrets/service.js");
+      const { createSecretStore } = await import("./daemon/credentials/store.js");
+      const { AccountStore } = await import("./daemon/accounts.js");
+      const { EndpointStore } = await import("./daemon/openai-endpoints.js");
+      const { scrubTranscripts, scrubMemoryDb, scrubDispatchTasks } = await import("./daemon/secrets/scrub-stored.js");
+      const store = new DaemonStore(config.dbPath);
+      try {
+        // No vault: a scrub of old data keeps nothing, whatever the workstreams say.
+        let unchecked = 0;
+        const secrets = new SecretService({
+          ...(config.secrets ? { config: { ...config.secrets, captureSecrets: "drop" } } : {}),
+          configDir: getConfigDir(),
+          offline: true,
+          onUnchecked: () => void unchecked++,
+        });
+        addDaemonKnownSources(secrets, {
+          credentials: () => config.credentials ?? [],
+          secretStore: createSecretStore(config.credentialStore),
+          accounts: new AccountStore(),
+          endpoints: new EndpointStore(),
+          store,
+        });
+        const scrub = <T,>(v: T) => secrets.scrubValue(v);
+        const t = scrubTranscripts(config.transcriptDir, scrub, !!o.dryRun);
+        const episodes = config.memory?.dbPath ? scrubMemoryDb(config.memory.dbPath, scrub, !!o.dryRun) : 0;
+        store.close();
+        const tasks = scrubDispatchTasks(config.dbPath, scrub, !!o.dryRun);
+        const verb = o.dryRun ? "would change" : "changed";
+        console.log(`Transcripts: ${t.filesChanged} of ${t.files} files ${verb} (${t.linesChanged} lines).`);
+        console.log(`Memory: ${episodes} episode bodies ${verb}.`);
+        console.log(`Dispatch tasks: ${tasks} ${verb}.`);
+        if (unchecked > 0) console.log(`${unchecked} text(s) were too large to check and were left as they are.`);
+        if (!o.dryRun && t.filesChanged + episodes + tasks > 0) console.log("Done. A backend's own copy (Claude Code's ~/.claude/projects, Codex's sessions) is its own, and isn't changed.");
+      } finally {
+        try {
+          store.close();
+        } catch {}
+      }
+    } finally {
+      locks.release();
+    }
+  });
+
+workstreamCmd
+  .command("ls")
+  .description("List the configured workstreams")
+  .option("--json", "print the daemon's reply as JSON")
+  .action(async (o: { json?: boolean }) => {
+    await workstreamRequest({ type: "workstream.list", id: randomUUID() }, "workstream.list.result", (r) => {
+      if (o.json) return void console.log(JSON.stringify(r, null, 2));
+      if (r.workstreams.length === 0) {
+        console.log("No workstreams configured. Add a `workstreams` block to config.json (docs/workstreams-design.md §4).");
+        return;
+      }
+      for (const w of r.workstreams) {
+        const tags = [w.abstract ? "base" : w.claim, `share:${w.share}`, ...(r.default === w.id ? ["default"] : [])];
+        const rules = w.match.paths.length + w.match.remotes.length;
+        console.log(
+          `${clean(w.id).padEnd(20)} ${clean(w.name).padEnd(24)} ${tags.join(", ").padEnd(32)} ${rules} rule${rules === 1 ? "" : "s"}, ${w.servers.length} server${w.servers.length === 1 ? "" : "s"}`,
+        );
+      }
+      console.log(`\nServer isolation: ${r.isolateGlobalServers ? "on" : "off — every session still gets every server"} · revision ${r.revision}`);
+    });
+  });
+
+workstreamCmd
+  .command("show <id>")
+  .description("Show one workstream, its bases merged in")
+  .option("--json", "print it as JSON")
+  .action(async (id: string, o: { json?: boolean }) => {
+    await workstreamRequest({ type: "workstream.list", id: randomUUID() }, "workstream.list.result", (r) => {
+      const w = r.workstreams.find((x) => x.id === id);
+      if (!w) {
+        console.error(`No workstream "${id}" — see \`codeoid workstream ls\`.`);
+        process.exitCode = 1;
+        return;
+      }
+      if (o.json) return void console.log(JSON.stringify(w, null, 2));
+      const line = (k: string, v: string): void => console.log(`${k.padEnd(14)} ${clean(v)}`);
+      line("id", w.id);
+      line("name", w.name);
+      if (w.abstract) line("kind", "base (no folders or sessions of its own)");
+      if (w.extends.length > 0) line("extends", w.extends.join(", "));
+      line("claim", w.claim === "exclusive" ? `exclusive${w.allowOverride ? "" : " (no override)"}` : "suggest");
+      line("share", w.share);
+      for (const p of w.match.paths) line("path", p);
+      for (const rr of w.match.remotes) line("remote", rr);
+      for (const s of w.servers) line("server", `${s.server}${s.credential ? ` (credential ${s.credential})` : ""}${s.from !== w.id ? ` — from ${s.from}` : ""}`);
+      for (const [backend, account] of Object.entries(w.accounts)) line("account", `${backend}: ${account}`);
+      for (const [k, v] of Object.entries(w.defaults)) if (v) line("default", `${k}: ${v}`);
+      for (const e of w.env) line("env", e);
+      if (w.git?.name || w.git?.email) line("git", [w.git.name, w.git.email && `<${w.git.email}>`].filter(Boolean).join(" "));
+      for (const d of w.skillDirs) line("skills", d);
+    });
+  });
+
+workstreamCmd
+  .command("move <session> <workstream>")
+  .description("Move a session to another home workstream: its whole conversation goes with it, so the share policy of its old home (and of each workstream it read) decides; applied at its next turn")
+  .action(async (session: string, workstream: string) => {
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    try {
+      await client.sessionWorkstream(session, { kind: "set_workstream", workstream });
+    } finally {
+      client.disconnect();
+    }
+  });
+
+workstreamCmd
+  .command("ref <action> <session> <workstream[:dir]>")
+  .description("add | rm: let a session read another workstream (its folders read-only, or only <dir>, and its memory), or stop")
+  .action(async (action: string, session: string, target: string) => {
+    if (action !== "add" && action !== "rm") {
+      console.error("codeoid workstream ref add|rm <session> <workstream>[:<dir>]");
+      process.exit(1);
+    }
+    let ref: { workstream: string; paths?: string[] };
+    try {
+      [ref] = referenceFlags([target]) as [{ workstream: string; paths?: string[] }];
+    } catch (e) {
+      console.error(e instanceof Error ? e.message : String(e));
+      process.exit(1);
+    }
+    const client = new TerminalClient(loadConfig());
+    await client.connect();
+    try {
+      await client.sessionWorkstream(session, action === "add" ? { kind: "add_reference", ...ref } : { kind: "remove_reference", workstream: ref.workstream });
+    } finally {
+      client.disconnect();
+    }
+  });
+
+workstreamCmd
+  .command("match [dir]")
+  .description("Which workstream a folder belongs to, and why — what a new session there would get")
+  .option("--workstream <id>", "check an explicit choice against the folder")
+  .option("--json", "print the resolution as JSON")
+  .action(async (dir: string | undefined, o: { workstream?: string; json?: boolean }) => {
+    const target = dir ? dirFlag(dir) : process.cwd();
+    await workstreamRequest(
+      { type: "workstream.resolve", id: randomUUID(), workdir: target, ...(o.workstream ? { workstream: o.workstream } : {}) },
+      "workstream.resolve.result",
+      (r) => {
+        if (o.json) return void console.log(JSON.stringify(r, null, 2));
+        const res = r.resolution;
+        console.log(`Folder:     ${clean(r.workdir)}`);
+        if (res.home) {
+          const how = res.source === "matched" ? `matched by ${res.matchedBy}` : res.source === "default" ? "the default (no rule matched)" : res.source;
+          console.log(`Workstream: ${clean(res.home)} — ${clean(how)}`);
+        } else if (res.ambiguous) {
+          console.log(`Workstream: none — ${clean(res.ambiguous.join(" and "))} both match. Choose one with --workstream, or make one rule more specific.`);
+        } else {
+          console.log("Workstream: none — no rule matches and no default is set.");
+        }
+        if (res.conflict) {
+          const c = res.conflict;
+          console.log(
+            `\n⚠ This folder belongs to "${clean(c.folder)}" (exclusive). A session here in "${clean(c.chosen)}" would ${
+              c.overridable ? "need a confirmed override" : "be refused: that workstream allows no override"
+            }.`,
+          );
+        }
+        if (res.candidates.length > 0) {
+          console.log("\nMatching rules, best first:");
+          for (const m of res.candidates) {
+            console.log(`  ${clean(m.workstream).padEnd(20)} ${m.kind === "remote" ? `remote ${clean(m.rule)}${m.via === "upstream" ? " (upstream)" : ""}` : clean(m.rule)}  [${m.claim}]`);
+          }
+        }
+      },
+    );
+  });
+
+workstreamCmd
+  .command("import")
+  .description(
+    "Propose workstreams from what is on disk — your repositories grouped by their remote's owner, and the MCP servers in Claude's global config — as a config block to review. Writes nothing.",
+  )
+  .option("--root <dir>", "a folder whose subfolders are your repositories (repeatable; default ~/Workspace, else this folder)", (v: string, p: string[] = []) => [...p, v], [] as string[])
+  .option("--json", "print the proposal as JSON")
+  .action(async (o: { root: string[]; json?: boolean }) => {
+    const { existsSync } = await import("node:fs");
+    const { homedir } = await import("node:os");
+    const { proposeWorkstreams } = await import("./daemon/workstreams/import.js");
+    const { readGlobalServers } = await import("./daemon/mcp/workdir-servers.js");
+    const defaultRoot = join(homedir(), "Workspace");
+    const roots = o.root.length > 0 ? o.root.map(dirFlag) : [existsSync(defaultRoot) ? defaultRoot : process.cwd()];
+    const global = Object.keys((await readGlobalServers()) ?? {});
+    const p = proposeWorkstreams(roots, global);
+    if (o.json) return void console.log(JSON.stringify(p, null, 2));
+    if (p.items.length === 0) {
+      console.log(`No repositories with a remote under ${roots.join(", ")}.`);
+      return;
+    }
+    console.log("Proposed workstreams (one per remote owner). Review, rename, merge, then add to config.json:\n");
+    const block = {
+      workstreams: {
+        isolateGlobalServers: false,
+        items: p.items.map(({ id, name, match }) => ({ id, name, claim: "suggest", match, mcpServers: [] as string[] })),
+      },
+    };
+    console.log(JSON.stringify(block, null, 2));
+    console.log("\nFolders each would match:");
+    for (const it of p.items) console.log(`  ${clean(it.id)}: ${it.folders.length} — ${clean(it.folders.slice(0, 4).join(", "))}${it.folders.length > 4 ? ", …" : ""}`);
+    if (p.unmatched.length > 0) console.log(`\nNo remote (add a path rule, or leave them to a default): ${clean(p.unmatched.join(", "))}`);
+    if (p.globalServers.length > 0) {
+      console.log(`\nClaude's global MCP servers, reaching every session today: ${clean(p.globalServers.join(", "))}`);
+      console.log("Add each to the mcpServers of the workstreams that should reach it. Isolation stays off until you set isolateGlobalServers: true.");
+    }
   });
 
 // ── Outward control plane (/mcp/control — docs/mcp-control.md) ─────────────
@@ -1008,12 +2308,25 @@ mcp
   .command("signin <server>")
   .description("Sign in to an OAuth MCP server in codeoid's registry (one you adopted, or configured with oauth)")
   .option("--callback-url <url>", "finish a sign-in from the address the browser landed on")
-  .action((server: string, opts: { callbackUrl?: string }) => withClient((c) => c.mcpSignin(server, opts.callbackUrl)));
+  .option("--credential <id>", "sign in to one of the server's named OAuth credentials (a workstream's own sign-in) instead of its default")
+  .action((server: string, opts: { callbackUrl?: string; credential?: string }) => withClient((c) => c.mcpSignin(server, opts.callbackUrl, opts.credential)));
 
 mcp
   .command("reconnect <session> <server>")
   .description("Redial one of a session's MCP servers that's down — e.g. one that failed when the session started and has since been fixed")
   .action((session: string, server: string) => withClient((c) => c.mcpReconnect(session, server)));
+
+mcp
+  .command("refresh <session>")
+  .description("Use MCP servers added or changed in Claude's config in a session (its backend restarts and resumes the conversation)")
+  .action((session: string) => withClient((c) => c.mcpRefresh(session)));
+
+mcp
+  .command("approve <session> <server>")
+  .description("Approve a project's MCP server (from its .mcp.json or project settings) for every backend in the session's workdir")
+  .option("--path <file>", "the file it's declared in, when more than one declares it")
+  .option("--yes <fingerprint>", "approve the entry you reviewed (its fingerprint, as the review printed it); without it, the entry is only shown")
+  .action((session: string, server: string, opts: { path?: string; yes?: string }) => withClient((c) => c.mcpApprove(session, server, opts)));
 
 // ── Packs (dynamic pack loading — docs/pack-loading.md) ─────────────────────
 
@@ -1044,6 +2357,10 @@ function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
     .option("--check-timeout <s>", "check timeout in seconds (default 60)")
     .option("--provider <id>", "backend: claude, codex, gemini, qwen, …")
     .option("--model <name>", "model for the backend")
+    .option("--sandbox <provider>", "OS sandbox for its runs: auto | bwrap | seatbelt | docker | off (default: sandbox.provider); a run whose sandbox can't run here doesn't start")
+    .option("--network <mode>", "what a sandboxed command may reach: on | off | allowlist")
+    .option("--allow-host <host>", "a host the allowlist lets through (repeatable)", collect, [])
+    .option("--docker-socket", "let its runs' commands reach the container runtime (Docker access can reach the whole machine; needs session:approve)")
     .option("--guarded", "every non-read tool waits for your approval")
     .option("--autonomous", "tools auto-approve within --tool-budget (default)")
     .option("--tool-budget <n>", "autonomous tool calls per run (default 50)")
@@ -1059,14 +2376,22 @@ function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
     .option("--notify <policy>", "on_change (default), always, or never")
     .option("--keep <n>", "run sessions to keep (default 5)")
     .option("--api", "enable the routine's API trigger (prints its token once)")
-    .option("--failure-pause <n>", "pause after N consecutive failures (default 3, 0 = never)");
+    .option("--failure-pause <n>", "pause after N consecutive failures (default 3, 0 = never)")
+    .option("--loop", "start a loop run instead of a session: the prompt is its objective, --verify its acceptance checks (docs/routines.md)")
+    .option("--verify <check>", "loop: a check its run must make pass, as `cmd` or `id: cmd` (repeatable; --check is the gate before it)", collect, [])
+    .option("--test", "loop: the --verify checks are test runs (running no tests does not pass)")
+    .option("--attempts <n>", "loop: worker attempts, including the first (default 3)")
+    .option("--attempt-minutes <n>", "loop: wall time per attempt (default 10)")
+    .option("--run-minutes <n>", "loop: active time across the run (default 30)")
+    .option("--budget <n>", "loop: autonomous tool calls per attempt (default 60)");
   if (mode === "edit") {
     cmd
       .option("--no-schedule", "remove the schedule (run on demand only)")
       .option("--no-check", "remove the check")
       .option("--no-worktree", "stop using a worktree")
       .option("--no-catch-up", "don't catch up missed fires")
-      .option("--no-api", "turn the API trigger off (revokes its token)");
+      .option("--no-api", "turn the API trigger off (revokes its token)")
+      .option("--no-loop", "run a session again instead of starting a loop");
   }
   return cmd;
 }
@@ -1075,7 +2400,408 @@ function routineSpecOptions(cmd: Command, mode: "add" | "edit"): Command {
 function printRoutineToken(token: string, routineId: string): void {
   const base = loadConfig().daemonUrl.replace(/^ws/, "http").replace(/\/+$/, "");
   console.log(`\n  API token (shown once — store it now):\n    ${token}`);
-  console.log(`\n  Fire it:\n    curl -X POST ${base}${routineFirePath(routineId)} \\\n      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \\\n      -d '{"text": "optional payload for {{payload}}"}'\n`);
+  console.log(`\n  Fire it:\n    curl -X POST ${base}${routineFirePath(routineId)} \\\n      -H "Authorization: Bearer ${token}" -H "Content-Type: application/json" \\\n      -d '{"text": "optional payload: data for the run"}'\n`);
+}
+
+// ── Loops (docs/loop-engineering-design.md) ─────────────────────────────────
+
+const loop = program
+  .command("loop")
+  .description("Pursue an objective in its own worktree until the daemon's own checks pass (docs/loops.md)");
+
+
+loop
+  .command("start <objective>")
+  .description("Start a repair run: reproduce failing checks, repair in an isolated worktree, verify, commit to the run's branch")
+  .requiredOption("--workdir <dir>", "The git repository to repair (it is never modified; the run works in its own worktree)")
+  .option("--check <cmd>", "A check that must pass, as `cmd` or `id: cmd` (repeatable)", collect, [])
+  .option("--test", "The checks are test runs: exiting 0 after running no tests does not pass")
+  .option("--attempts <n>", "Worker attempts, including the first (default 3)")
+  .option("--attempt-minutes <n>", "Wall time per attempt (default 10)")
+  .option("--run-minutes <n>", "Active time across the run (default 30)")
+  .option("--budget <n>", "Autonomous tool calls per attempt (default 60)")
+  .option("--provider <id>", "Backend for the worker (default: the daemon's)")
+  .option("--model <id>", "Model for the worker")
+  .option("--sandbox <provider>", "The worker's OS sandbox: auto | bwrap | seatbelt | docker | off (default: sandbox.provider); the run is refused where it can't run")
+  .option("--network <mode>", "What the worker's commands may reach: on | off | allowlist")
+  .option("--allow-host <host>", "A host the allowlist lets through (repeatable)", collect, [])
+  .option("--docker-socket", "Let the worker's commands and the checks reach the container runtime (tests that start containers). Docker access can reach the whole machine")
+  .option("--wait", "Follow the run until it ends")
+  .action(
+    (
+      objective: string,
+      f: {
+        workdir: string;
+        check: string[];
+        test?: boolean;
+        attempts?: string;
+        attemptMinutes?: string;
+        runMinutes?: string;
+        budget?: string;
+        provider?: string;
+        model?: string;
+        sandbox?: string;
+        network?: string;
+        allowHost: string[];
+        dockerSocket?: boolean;
+        wait?: boolean;
+      },
+    ) =>
+      withClient(async (c) => {
+        let sandbox: SessionSandboxSetting | undefined;
+        try {
+          sandbox = sandboxSettingFromFlags(f);
+        } catch (e) {
+          console.error(e instanceof Error ? e.message : String(e));
+          process.exitCode = 1;
+          return;
+        }
+        if (f.check.length === 0) {
+          console.error("Give at least one --check: the command that must pass.");
+          process.exitCode = 1;
+          return;
+        }
+        const int = (v: string | undefined) => (v === undefined ? undefined : Number.parseInt(v, 10));
+        const limits = {
+          ...(f.attempts ? { attempts: int(f.attempts) } : {}),
+          ...(f.attemptMinutes ? { attemptMinutes: int(f.attemptMinutes) } : {}),
+          ...(f.runMinutes ? { runMinutes: int(f.runMinutes) } : {}),
+        };
+        const res = await c.request({
+          type: "loop.start",
+          id: randomUUID(),
+          objective,
+          workdir: resolve(f.workdir),
+          checks: f.check.map((raw) => ({ ...parseCheckFlag(raw), ...(f.test ? { expectTests: true } : {}) })),
+          ...(f.provider ? { provider: f.provider } : {}),
+          ...(f.model ? { model: f.model } : {}),
+          ...(sandbox ? { sandbox } : {}),
+          ...(f.budget ? { toolBudget: int(f.budget) } : {}),
+          ...(Object.keys(limits).length > 0 ? { limits: limits as never } : {}),
+        });
+        if (res.type !== "loop.snapshot") return c.printError(res);
+        console.log(formatLoop(res.run, res.attempts).join("\n"));
+        if (f.wait) await followLoop(c, res.run.id);
+      }),
+  );
+
+loop
+  .command("ls")
+  .description("Your loop runs, newest first")
+  .action(() =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "loop.list", id: randomUUID() });
+      if (res.type !== "loop.list.result") return c.printError(res);
+      if (res.runs.length === 0) console.log("No loop runs.");
+      for (const r of res.runs) console.log(formatLoopRow(r));
+    }),
+  );
+
+loop
+  .command("show <runId>")
+  .description("A run's contract, attempts, evidence, and (with --events) its history")
+  .option("--events", "Include the run's event history")
+  .option("--wait", "Follow the run until it ends")
+  .action((runId: string, f: { events?: boolean; wait?: boolean }) =>
+    withClient(async (c) => {
+      const id = await resolveLoopId(c, runId);
+      if (!id) return;
+      const res = await c.request({ type: "loop.get", id: randomUUID(), runId: id, events: f.events === true });
+      if (res.type !== "loop.snapshot") return c.printError(res);
+      console.log(formatLoop(res.run, res.attempts, res.events).join("\n"));
+      if (f.wait) await followLoop(c, id);
+    }),
+  );
+
+for (const verb of ["cancel", "pause", "resume"] as const) {
+  loop
+    .command(`${verb} <runId>`)
+    .description(
+      verb === "cancel"
+        ? "Stop the run now"
+        : verb === "pause"
+          ? "Stop at the next attempt boundary (a running attempt finishes)"
+          : "Continue a paused run",
+    )
+    .action((runId: string) =>
+      withClient(async (c) => {
+        const id = await resolveLoopId(c, runId);
+        if (!id) return;
+        const res = await c.request({ type: `loop.${verb}`, id: randomUUID(), runId: id });
+        if (res.type !== "loop.snapshot") return c.printError(res);
+        console.log(formatLoopRow(res.run));
+      }),
+    );
+}
+
+loop
+  .command("steer <runId> <text>")
+  .description("Guidance for the next attempt, or the answer to the worker's question")
+  .action((runId: string, text: string) =>
+    withClient(async (c) => {
+      const id = await resolveLoopId(c, runId);
+      if (!id) return;
+      const res = await c.request({ type: "loop.steer", id: randomUUID(), runId: id, text });
+      if (res.type !== "loop.snapshot") return c.printError(res);
+      console.log(formatLoopRow(res.run));
+    }),
+  );
+
+// ── Loop watches: repository events start repair runs (docs/loops.md) ───────
+
+const watch = loop
+  .command("watch")
+  .description("Start repair runs from failing CI checks and review comments on your branches (docs/loops.md#watches)");
+
+watch
+  .command("add")
+  .description("Watch a repository's branches (or your open PRs) for failing CI checks, and optionally review comments")
+  .requiredOption("--workdir <dir>", "The repository; its origin remote must be on github.com")
+  .option("--branch <b>", "A branch to watch (repeatable)", collect, [])
+  .option("--my-prs", "Watch the heads of your open pull requests instead")
+  .option(
+    "--ci <map>",
+    "`<check name>: <command>` — a CI check (exact or glob) and the local command that reproduces it; `<name>@<app>: …` for a check another GitHub App reports (default github-actions) (repeatable)",
+    collect,
+    [],
+  )
+  .option("--test", "The mapped commands are test runs: running no tests does not pass")
+  .option("--review", "Also start a run for a PR comment that mentions codeoid")
+  .option("--allow <login>", "GitHub login whose comments count (repeatable; default: you, as gh is signed in)", collect, [])
+  .option("--mention <token>", "The token a comment must contain (default @codeoid)")
+  .option("--trust <login>", "Another GitHub login whose commits may be on a head the watch runs; list everyone who merges to a watched branch. A bot as name[bot] trusts anyone who can make that bot push (repeatable; you are always trusted)", collect, [])
+  .addOption(trustHeadOption(TRUST_HEAD_HELP("With --branch: ")))
+  .option("--per-hour <n>", "Runs the watch may start per hour (default 6)")
+  .option("--attempts <n>", "Worker attempts per run (default 3)")
+  .option("--budget <n>", "Autonomous tool calls per attempt (default 60)")
+  .option("--provider <id>", "Backend for the runs' workers")
+  .option("--model <id>", "Model for the runs' workers")
+  .action(
+    (f: {
+      workdir: string;
+      branch: string[];
+      myPrs?: boolean;
+      ci: string[];
+      test?: boolean;
+      review?: boolean;
+      allow: string[];
+      mention?: string;
+      trust: string[];
+      trustHead?: string[];
+      perHour?: string;
+      attempts?: string;
+      budget?: string;
+      provider?: string;
+      model?: string;
+    }) =>
+      withClient(async (c) => {
+        const fail = (m: string): void => {
+          console.error(m);
+          process.exitCode = 1;
+        };
+        if ((f.branch.length > 0) === (f.myPrs === true)) return fail("Give --branch (one or more) or --my-prs, not both.");
+        if (f.trustHead && f.myPrs) return fail("--trust-head vouches for watched branches' heads; give it with --branch.");
+        const trustHead = parseTrustHeadFlag(f.trustHead);
+        if (typeof trustHead === "string") return fail(trustHead);
+        if (f.ci.length === 0) return fail('Give at least one --ci "<check name>: <command>".');
+        const ci = [];
+        for (const raw of f.ci) {
+          const m = parseCiFlag(raw);
+          if (!m) return fail(`--ci ${JSON.stringify(raw)}: expected "<check name>: <command>".`);
+          ci.push({ ...m, ...(f.test ? { expectTests: true } : {}) });
+        }
+        const int = (v: string) => Number.parseInt(v, 10);
+        const res = await c.request({
+          type: "loop.watch.create",
+          id: randomUUID(),
+          spec: {
+            workdir: resolve(f.workdir),
+            ...(f.myPrs ? { myPrs: true } : { branches: f.branch }),
+            ci,
+            ...(f.review || f.allow.length > 0 || f.mention
+              ? { review: { enabled: true, ...(f.allow.length > 0 ? { allow: f.allow } : {}), ...(f.mention ? { mention: f.mention } : {}) } }
+              : {}),
+            ...(f.trust.length > 0 ? { trust: f.trust } : {}),
+            ...(f.perHour ? { maxRunsPerHour: int(f.perHour) } : {}),
+            ...(f.attempts ? { limits: { attempts: int(f.attempts) } } : {}),
+            ...(f.budget ? { toolBudget: int(f.budget) } : {}),
+            ...(f.provider ? { provider: f.provider } : {}),
+            ...(f.model ? { model: f.model } : {}),
+          },
+          ...(trustHead ? { trustHead } : {}),
+        });
+        if (res.type !== "loop.watch.snapshot") return c.printError(res);
+        console.log(formatWatch(res.watch, res.triggers).join("\n"));
+      }),
+  );
+
+watch
+  .command("ls")
+  .description("Your loop watches")
+  .action(() =>
+    withClient(async (c) => {
+      const res = await c.request({ type: "loop.watch.list", id: randomUUID() });
+      if (res.type !== "loop.watch.list.result") return c.printError(res);
+      if (res.watches.length === 0) console.log("No loop watches.");
+      for (const w of res.watches) console.log(formatWatchRow(w));
+    }),
+  );
+
+watch
+  .command("show <watchId>")
+  .description("A watch's rules, its last poll, and the events it acted on")
+  .action((ref: string) =>
+    withClient(async (c) => {
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({ type: "loop.watch.get", id: randomUUID(), watchId: id });
+      if (res.type !== "loop.watch.snapshot") return c.printError(res);
+      console.log(formatWatch(res.watch, res.triggers).join("\n"));
+    }),
+  );
+
+watch
+  .command("pause <watchId>")
+  .description("Stop polling (runs it started carry on)")
+  .action((ref: string) =>
+    withClient(async (c) => {
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({ type: "loop.watch.update", id: randomUUID(), watchId: id, enabled: false });
+      if (res.type !== "loop.watch.snapshot") return c.printError(res);
+      console.log(formatWatchRow(res.watch));
+    }),
+  );
+
+watch
+  .command("resume <watchId>")
+  .description("Start polling again")
+  .addOption(trustHeadOption(TRUST_HEAD_HELP("For a watch of branches: ")))
+  .action((ref: string, f: { trustHead?: string[] }) =>
+    withClient(async (c) => {
+      const trustHead = parseTrustHeadFlag(f.trustHead);
+      if (typeof trustHead === "string") {
+        console.error(trustHead);
+        process.exitCode = 1;
+        return;
+      }
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({ type: "loop.watch.update", id: randomUUID(), watchId: id, enabled: true, ...(trustHead ? { trustHead } : {}) });
+      if (res.type !== "loop.watch.snapshot") return c.printError(res);
+      console.log(f.trustHead ? formatWatch(res.watch, res.triggers).join("\n") : formatWatchRow(res.watch));
+    }),
+  );
+
+watch
+  .command("update <watchId>")
+  .description("Change who a watch trusts, or vouch for its branches' heads as they are now")
+  .option(
+    "--trust <login>",
+    "Replace the trusted logins with these (repeatable; you are always trusted). Judges the heads it refused again; the heads it trusted are kept when the new list only adds logins",
+    collect,
+    [],
+  )
+  .option("--trust-none", "Trust no one but you: empty the list of trusted logins")
+  .addOption(trustHeadOption(TRUST_HEAD_HELP("For a watch of branches: ")))
+  .action((ref: string, f: { trust: string[]; trustNone?: boolean; trustHead?: string[] }) =>
+    withClient(async (c) => {
+      const fail = (m: string): void => {
+        console.error(m);
+        process.exitCode = 1;
+      };
+      if (f.trust.length === 0 && !f.trustNone && !f.trustHead) return fail("Give --trust <login> (one or more), --trust-none, or --trust-head.");
+      if (f.trust.length > 0 && f.trustNone) return fail("Give --trust or --trust-none, not both.");
+      const trustHead = parseTrustHeadFlag(f.trustHead);
+      if (typeof trustHead === "string") return fail(trustHead);
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({
+        type: "loop.watch.update",
+        id: randomUUID(),
+        watchId: id,
+        ...(f.trust.length > 0 || f.trustNone ? { spec: { trust: f.trustNone ? [] : f.trust } } : {}),
+        ...(trustHead ? { trustHead } : {}),
+      });
+      if (res.type !== "loop.watch.snapshot") return c.printError(res);
+      console.log(formatWatch(res.watch, res.triggers).join("\n"));
+    }),
+  );
+
+watch
+  .command("rm <watchId>")
+  .description("Delete a watch (runs it started carry on)")
+  .action((ref: string) =>
+    withClient(async (c) => {
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({ type: "loop.watch.delete", id: randomUUID(), watchId: id });
+      if (res.type !== "response.ok") return c.printError(res);
+      console.log(`Deleted ${id}.`);
+    }),
+  );
+
+watch
+  .command("poll <watchId>")
+  .description("Poll now instead of at the next interval")
+  .action((ref: string) =>
+    withClient(async (c) => {
+      const id = await resolveWatchId(c, ref);
+      if (!id) return;
+      const res = await c.request({ type: "loop.watch.poll", id: randomUUID(), watchId: id });
+      if (res.type !== "loop.watch.snapshot") return c.printError(res);
+      const started = res.poll?.started ?? [];
+      console.log(started.length === 0 ? "No run started." : `Started ${started.join(", ")} (codeoid loop show <id>).`);
+      for (const s of res.poll?.skipped ?? []) console.log(`  skipped: ${s}`);
+    }),
+  );
+
+/** A watch id from a full id or an unambiguous prefix of the owner's watches. */
+async function resolveWatchId(c: Parameters<Parameters<typeof withClient>[0]>[0], ref: string): Promise<string | null> {
+  if (/^lw_[0-9a-f-]{36}$/.test(ref)) return ref;
+  const res = await c.request({ type: "loop.watch.list", id: randomUUID() });
+  if (res.type !== "loop.watch.list.result") {
+    c.printError(res);
+    return null;
+  }
+  const hits = res.watches.filter((w) => w.id.startsWith(ref) || w.id.startsWith(`lw_${ref}`));
+  if (hits.length === 1) return hits[0]!.id;
+  console.error(hits.length === 0 ? `No loop watch matches "${ref}".` : `"${ref}" matches ${hits.length} watches; give more of the id.`);
+  process.exitCode = 1;
+  return null;
+}
+
+/** A run id from a full id or an unambiguous prefix of the owner's runs. */
+async function resolveLoopId(c: Parameters<Parameters<typeof withClient>[0]>[0], ref: string): Promise<string | null> {
+  if (/^loop_[0-9a-f-]{36}$/.test(ref)) return ref;
+  const res = await c.request({ type: "loop.list", id: randomUUID(), limit: 200 });
+  if (res.type !== "loop.list.result") {
+    c.printError(res);
+    return null;
+  }
+  const hits = res.runs.filter((r) => r.id.startsWith(ref) || r.id.startsWith(`loop_${ref}`));
+  if (hits.length === 1) return hits[0]!.id;
+  console.error(hits.length === 0 ? `No loop run matches "${ref}".` : `"${ref}" matches ${hits.length} runs; give more of the id.`);
+  process.exitCode = 1;
+  return null;
+}
+
+/** Print each status change until the run ends. */
+async function followLoop(c: Parameters<Parameters<typeof withClient>[0]>[0], runId: string): Promise<void> {
+  let last = "";
+  for (;;) {
+    const res = await c.request({ type: "loop.get", id: randomUUID(), runId });
+    if (res.type !== "loop.snapshot") return c.printError(res);
+    const line = formatLoopRow(res.run) + (res.run.reason ? ` — ${res.run.reason}` : "");
+    if (line !== last) console.log(line);
+    last = line;
+    if (["completed", "budget_exhausted", "blocked", "failed", "cancelled"].includes(res.run.status)) {
+      console.log(formatLoop(res.run, res.attempts).join("\n"));
+      if (res.run.status !== "completed") process.exitCode = 1;
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 2_000));
+  }
 }
 
 const routine = program
@@ -1156,7 +2882,7 @@ routine
 routine
   .command("run <name>")
   .description("Run a routine now")
-  .option("--payload <text>", "text for the prompt's {{payload}}")
+  .option("--payload <text>", "data for the run: a session routine's prompt gets it as {{payload}}; a loop routine hands it to the loop's worker as data")
   .option("--wait", "wait for the run to finish and print its outcome")
   .action((name: string, o: { payload?: string; wait?: boolean }) =>
     withClient(async (c) => {
@@ -1317,7 +3043,144 @@ pack
   .description("Uninstall a pack")
   .action((id: string) => withClient((c) => c.packRemove(id)));
 
+// ── Evidence (docs/loop-engineering-design.md §7) ───────────────────────────
+
+program
+  .command("evidence <id>")
+  .description("Show one evidence record: what a check ran, on which tree, and what it found")
+  .option("--full", "Print the whole stored excerpt instead of its last 40 lines")
+  .action((id: string, opts: { full?: boolean }) => withClient((c) => c.evidenceShow(id, opts)));
+
 // ── Pipeline runs (docs/pipeline-run.md) ────────────────────────────────────
+
+// ── Settings (the web UI's settings drawer, from a terminal) ───────────────
+
+/** The manifest and current values, or null after printing why not. */
+async function fetchSettings(c: TerminalClient): Promise<{ manifest: SettingsManifest; snapshot: SettingsSnapshot } | null> {
+  const schema = await c.request({ type: "settings.schema", id: randomUUID() });
+  if (schema.type !== "settings.schema.result") {
+    c.printError(schema);
+    return null;
+  }
+  const got = await c.request({ type: "settings.get", id: randomUUID() });
+  if (got.type !== "settings.get.result") {
+    c.printError(got);
+    return null;
+  }
+  return { manifest: schema.manifest, snapshot: got.snapshot };
+}
+
+/** Send one patch and say what came of it. */
+async function writeSetting(c: TerminalClient, field: SettingField, value: SettingValue): Promise<void> {
+  const resp = await c.request({ type: "settings.set", id: randomUUID(), patches: [{ key: field.key, value }] });
+  if (resp.type !== "settings.set.result") {
+    c.printError(resp);
+    process.exitCode = 1;
+    return;
+  }
+  if (!resp.ok) {
+    for (const e of resp.errors) console.error(`${e.key}: ${e.message}`);
+    process.exitCode = 1;
+    return;
+  }
+  const secret = field.secret || field.kind === "secret";
+  console.log(`${field.key} = ${secret ? (value ? "(set)" : "(unset)") : formatSettingValue(resp.snapshot.values[field.key]?.value)}`);
+  console.log(appliesNote(field, resp.restartRequired));
+}
+
+const settings = program.command("settings").description("Show and change the daemon's settings (the web UI's settings drawer)");
+
+settings
+  .command("ls [filter]")
+  .description("List settings with their values and where each comes from; filter by key, label or tab")
+  .option("--advanced", "include advanced settings")
+  .action((filter: string | undefined, opts: { advanced?: boolean }) =>
+    withClient(async (c) => {
+      const got = await fetchSettings(c);
+      if (!got) return;
+      for (const line of settingsLines(got.manifest, got.snapshot, { filter, advanced: opts.advanced })) console.log(line);
+      console.log(`\nconfig: ${got.snapshot.configPath}   env: ${got.snapshot.envPath}`);
+    }),
+  );
+
+settings
+  .command("get <key>")
+  .description("Show one setting: its value, where it comes from, and what it does")
+  .action((key: string) =>
+    withClient(async (c) => {
+      const got = await fetchSettings(c);
+      if (!got) return;
+      const field = findField(got.manifest, key);
+      if (typeof field === "string") {
+        console.error(field);
+        process.exitCode = 1;
+        return;
+      }
+      for (const line of settingsLines(got.manifest, got.snapshot, { filter: field.key, advanced: true }).filter((l) => l.startsWith(`${field.key} `))) console.log(line);
+      console.log(`  ${field.label}: ${field.help}`);
+      if (field.options?.length) console.log(`  one of: ${field.options.map((o) => o.value).join(", ")}`);
+    }),
+  );
+
+settings
+  .command("set <key> [value]")
+  .description("Change a setting. A secret is read from the terminal (or stdin), never from the command line")
+  .action((key: string, raw: string | undefined) =>
+    withClient(async (c) => {
+      const got = await fetchSettings(c);
+      if (!got) return;
+      const field = findField(got.manifest, key);
+      if (typeof field === "string") {
+        console.error(field);
+        process.exitCode = 1;
+        return;
+      }
+      if (field.secret || field.kind === "secret") {
+        if (raw !== undefined) {
+          console.error(`${field.key} is a secret: leave the value off and type it at the prompt (or pipe it in), so it stays out of your shell history.`);
+          process.exitCode = 1;
+          return;
+        }
+        const secret = await readSecret(`${field.label}: `);
+        if (!secret) {
+          console.error(`Nothing entered; nothing changed. To clear it: codeoid settings unset ${field.key}`);
+          process.exitCode = 1;
+          return;
+        }
+        await writeSetting(c, field, secret);
+        return;
+      }
+      if (raw === undefined) {
+        console.error(`Give a value: codeoid settings set ${field.key} <value>   (clear it with: codeoid settings unset ${field.key})`);
+        process.exitCode = 1;
+        return;
+      }
+      const parsed = parseSettingValue(field, raw);
+      if ("error" in parsed) {
+        console.error(parsed.error);
+        process.exitCode = 1;
+        return;
+      }
+      await writeSetting(c, field, parsed.value);
+    }),
+  );
+
+settings
+  .command("unset <key>")
+  .description("Clear a setting back to its default")
+  .action((key: string) =>
+    withClient(async (c) => {
+      const got = await fetchSettings(c);
+      if (!got) return;
+      const field = findField(got.manifest, key);
+      if (typeof field === "string") {
+        console.error(field);
+        process.exitCode = 1;
+        return;
+      }
+      await writeSetting(c, field, null);
+    }),
+  );
 
 const pipeline = program
   .command("pipeline")

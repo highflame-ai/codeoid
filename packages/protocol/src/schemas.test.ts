@@ -38,6 +38,11 @@ test("every ClientMessage variant has a schema and vice versa (compile-time)", (
   expect(covered).toBe(true);
 });
 
+test("endpoint overrides can be explicitly removed without stripping nulls", () => {
+  const message: ClientMessage = { type: "endpoints.set", id: "clear", name: "box", baseUrl: "http://localhost:8000/v1", defaultModel: null, contextWindow: null };
+  expect(parseClientMessage(message)).toEqual({ ok: true, value: message });
+});
+
 // ── 2. Fidelity: one valid sample per variant, keyed so adding a variant
 //      without a sample is a compile error ─────────────────────────────────────
 
@@ -89,12 +94,23 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "session.commands": { type: "session.commands", id: "r27", sessionId: "s1" },
   "session.destroy": { type: "session.destroy", id: "r9", sessionId: "s1" },
   "session.set_mode": { type: "session.set_mode", id: "r10", sessionId: "s1", mode: "autonomous", maxTurns: 5 },
+  "session.set_sandbox": { type: "session.set_sandbox", id: "r10s", sessionId: "s1", sandbox: { provider: "bwrap", network: "allowlist", allowedHosts: ["github.com"] } },
+  "session.sandbox_dir": { type: "session.sandbox_dir", id: "r10d", sessionId: "s1", action: "add", path: "/home/u/Workspace/b" },
+  "session.add_reference": { type: "session.add_reference", id: "r10e", sessionId: "s1", workstream: "acme", paths: ["/w/acme-api"] },
+  "session.remove_reference": { type: "session.remove_reference", id: "r10f", sessionId: "s1", workstream: "acme" },
+  "session.set_workstream": { type: "session.set_workstream", id: "r10g", sessionId: "s1", workstream: "acme" },
+  "sandbox.providers": { type: "sandbox.providers", id: "r10p" },
+  "sandbox.git_connect": { type: "sandbox.git_connect", id: "gc", action: "connect", path: "/w/repo", remote: "origin" },
   "session.pin": { type: "session.pin", id: "r11", sessionId: "s1", path: "SPEC.md" },
   "session.unpin": { type: "session.unpin", id: "r12", sessionId: "s1", path: "SPEC.md" },
   "session.rotate": { type: "session.rotate", id: "r13", sessionId: "s1" },
   "session.search": { type: "session.search", id: "r14", query: "auth bug", scope: "all", limit: 5 },
   "session.set_model": { type: "session.set_model", id: "r15", sessionId: "s1", model: "opus", fallbackModel: null },
+  "session.set_effort": { type: "session.set_effort", id: "r15e", sessionId: "s1", effort: "high" },
   "session.mcp_reconnect": { type: "session.mcp_reconnect", id: "r28m", sessionId: "s1", server: "slack" },
+  "session.mcp_refresh": { type: "session.mcp_refresh", id: "r28r", sessionId: "s1" },
+  "mcp.approve.preview": { type: "mcp.approve.preview", id: "r28p", sessionId: "s1", server: "db" },
+  "mcp.approve": { type: "mcp.approve", id: "r28a", sessionId: "s1", server: "db", path: "/w/.mcp.json", fingerprint: "0123456789abcdef0123456789abcdef" },
   "session.set_provider": {
     type: "session.set_provider",
     id: "r28",
@@ -135,6 +151,7 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
     loginId: "11111111-2222-3333-4444-555555555555",
     code: "abc123#state",
   },
+  "backend.login.wait": { type: "backend.login.wait", id: "lw1", loginId: "l1" },
   "backend.login.cancel": {
     type: "backend.login.cancel",
     id: "r27",
@@ -149,13 +166,47 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "mcp.oauth.disconnect": { type: "mcp.oauth.disconnect", id: "r92", server: "notion" },
   "mcp.adopt": { type: "mcp.adopt", id: "r93", server: "notion", sessionId: "s1" },
   "skill.grant": { type: "skill.grant", id: "r93", workdir: "/tmp/w", command: "./probe.sh", allowed: true },
+  "worktree.trust": { type: "worktree.trust", id: "wt1", dir: "/tmp/repo", recipeHash: "0123456789abcdef0123456789abcdef01234567" },
+  "workstream.list": { type: "workstream.list", id: "ws1" },
+  "workstream.resolve": { type: "workstream.resolve", id: "ws2", workdir: "/tmp/repo", workstream: "acme" },
+  "workstream.upsert": { type: "workstream.upsert", id: "ws3", item: { id: "acme" } },
+  "workstream.delete": { type: "workstream.delete", id: "ws4", workstream: "acme" },
+  "workstream.settings": { type: "workstream.settings", id: "ws5", isolateGlobalServers: true, default: null },
+  "credential.list": { type: "credential.list", id: "c1" },
+  "credential.upsert": { type: "credential.upsert", id: "c2", item: { id: "gh", kind: "env" } },
+  "credential.delete": { type: "credential.delete", id: "c3", credential: "gh" },
+  "credential.set_value": { type: "credential.set_value", id: "c4", credential: "gh", value: "x" },
+  "secret.list": { type: "secret.list", id: "sc1" },
+  "secret.reveal": { type: "secret.reveal", id: "sc2", workstream: "acme", fingerprint: "3f9a2c1b" },
+  "secret.forget": { type: "secret.forget", id: "sc3", workstream: "", fingerprint: "3f9a2c1b" },
+  "approval_rules.list": { type: "approval_rules.list", id: "ar1" },
+  "approval_rules.add": { type: "approval_rules.add", id: "ar2", rule: "Bash(npm test:*)", effect: "allow", scope: "repository", sessionId: "s1" },
+  "approval_rules.remove": { type: "approval_rules.remove", id: "ar3", ruleId: "r1" },
   "session.turns": { type: "session.turns", id: "r94", sessionId: "s1" },
   "session.approvals": { type: "session.approvals", id: "r94a", sessionId: "s1" },
   "claude.accounts.list": { type: "claude.accounts.list", id: "ca1" },
   "claude.accounts.set": { type: "claude.accounts.set", id: "ca2", name: "work", kind: "gateway", token: "t", baseUrl: "https://gw.example", headers: { "x-workspace": "w1" } },
   "claude.accounts.remove": { type: "claude.accounts.remove", id: "ca3", name: "work" },
   "claude.accounts.set_default": { type: "claude.accounts.set_default", id: "ca4", name: "work" },
+  "providers.list": { type: "providers.list", id: "pl1" },
+  "endpoints.list": { type: "endpoints.list", id: "ep1" },
+  "endpoints.set": {
+    type: "endpoints.set",
+    id: "ep2",
+    name: "vllm",
+    baseUrl: "http://gpu-box:8000/v1",
+    apiKey: null,
+    models: [{ id: "qwen3-coder", contextWindow: 131072 }],
+    mcpServers: ["github"],
+  },
+  "endpoints.remove": { type: "endpoints.remove", id: "ep3", name: "vllm" },
+  "endpoints.test": { type: "endpoints.test", id: "ep4", name: "vllm", baseUrl: "http://gpu-box:8001/v1" },
   "session.set_claude_account": { type: "session.set_claude_account", id: "ca5", sessionId: "s1", account: null },
+  "accounts.list": { type: "accounts.list", id: "ac1", backend: "codex" },
+  "accounts.set": { type: "accounts.set", id: "ac2", backend: "pi", name: "team", kind: "api-keys", env: { OPENROUTER_API_KEY: "k" }, replace: true },
+  "accounts.remove": { type: "accounts.remove", id: "ac3", backend: "codex", name: "work" },
+  "accounts.set_default": { type: "accounts.set_default", id: "ac4", backend: "oai:qwen", name: "team" },
+  "session.set_account": { type: "session.set_account", id: "ac5", sessionId: "s1", account: "work", backend: "codex" },
   "session.compare": { type: "session.compare", id: "r96", sessionId: "s1", prompt: "go", targets: [{ providerId: "claude" }, { providerId: "codex", model: "gpt-5" }] },
   "compare.get": { type: "compare.get", id: "r97", compareId: "c1" },
   "compare.list": { type: "compare.list", id: "r98", sessionId: "s1" },
@@ -169,6 +220,31 @@ const samples: { [T in ClientTypes]: Extract<ClientMessage, { type: T }> } = {
   "routine.delete": { type: "routine.delete", id: "rt3", routine: "nightly" },
   "routine.list": { type: "routine.list", id: "rt4" },
   "routine.get": { type: "routine.get", id: "rt5", routine: "nightly", runs: 5 },
+  "evidence.get": { type: "evidence.get", id: "ev1", evidenceId: "ev_123" },
+  "loop.start": {
+    type: "loop.start",
+    id: "lp1",
+    objective: "fix the checkout test",
+    workdir: "/tmp/repo",
+    checks: [{ id: "test", command: "bun test", timeoutSec: 600, expectTests: true }],
+    limits: { attempts: 3 },
+  },
+  "loop.list": { type: "loop.list", id: "lp2", limit: 10 },
+  "loop.get": { type: "loop.get", id: "lp3", runId: "loop_1", events: true },
+  "loop.cancel": { type: "loop.cancel", id: "lp4", runId: "loop_1" },
+  "loop.pause": { type: "loop.pause", id: "lp5", runId: "loop_1" },
+  "loop.resume": { type: "loop.resume", id: "lp6", runId: "loop_1" },
+  "loop.steer": { type: "loop.steer", id: "lp7", runId: "loop_1", text: "keep the old API" },
+  "loop.watch.create": {
+    type: "loop.watch.create",
+    id: "lw1",
+    spec: { workdir: "/tmp/repo", myPrs: true, ci: [{ ciName: "test (*)", command: "bun test", expectTests: true }, { ciName: "lint", app: "circleci-checks", command: "bun run lint" }], review: { enabled: true, allow: ["octocat"] }, trust: ["hubot"] },
+  },
+  "loop.watch.list": { type: "loop.watch.list", id: "lw2" },
+  "loop.watch.get": { type: "loop.watch.get", id: "lw3", watchId: "lw_1" },
+  "loop.watch.update": { type: "loop.watch.update", id: "lw4", watchId: "lw_1", enabled: false, spec: { maxRunsPerHour: 2 } },
+  "loop.watch.delete": { type: "loop.watch.delete", id: "lw5", watchId: "lw_1" },
+  "loop.watch.poll": { type: "loop.watch.poll", id: "lw6", watchId: "lw_1" },
   "routine.run": { type: "routine.run", id: "rt6", routine: "nightly", payload: "PR #12" },
   "routine.cancel_run": { type: "routine.cancel_run", id: "rt7", runId: "run-1" },
   "routine.runs": { type: "routine.runs", id: "rt8", routine: "nightly", limit: 20, before: "2026-10-16T00:00:00.000Z" },
@@ -550,5 +626,67 @@ describe("session.ui_response payload exclusivity", () => {
       });
       expect(result.ok).toBe(true);
     }
+  });
+});
+
+describe("loop.watch trustHead", () => {
+  test("true, or branches each pinned to a commit by its full id (never a prefix): a compare-and-set", () => {
+    const update = (trustHead: unknown) => parseClientMessage({ type: "loop.watch.update", id: "u1", watchId: "lw_1", trustHead });
+    expect(update(true).ok).toBe(true);
+    expect(update({ main: "0123456789abcdef0123456789abcdef01234567" }).ok).toBe(true);
+    expect(update({ main: "0123456789ABCDEF0123456789ABCDEF01234567", release: "f".repeat(64) }).ok).toBe(true);
+    expect(update({ main: "0123456789ab" }).ok).toBe(false);
+    expect(update({ main: "f".repeat(39) }).ok).toBe(false);
+    expect(update({ main: "f".repeat(41) }).ok).toBe(false);
+    expect(update({ main: "g".repeat(40) }).ok).toBe(false);
+    expect(update({}).ok).toBe(false);
+    expect(update("main").ok).toBe(false);
+    const create = parseClientMessage({ type: "loop.watch.create", id: "c1", spec: { workdir: "/r", branches: ["main"], ci: [{ ciName: "t", command: "t" }] }, trustHead: { main: "0123456789abcdef0123456789abcdef01234567" } });
+    expect(create.ok).toBe(true);
+  });
+});
+
+describe("routine loop (a routine that starts a loop)", () => {
+  const spec = (loop: unknown) => ({ name: "flaky", prompt: "Fix the flaky tests.", workdir: "/r", loop });
+  const create = (loop: unknown) => parseClientMessage({ type: "routine.create", id: "c1", spec: spec(loop) });
+  const update = (loop: unknown) => parseClientMessage({ type: "routine.update", id: "u1", routine: "flaky", spec: { loop } });
+
+  test("a loop round-trips through create unchanged", () => {
+    const msg = {
+      type: "routine.create",
+      id: "c1",
+      spec: spec({
+        checks: [{ id: "unit", command: "bun test", timeoutSec: 900, expectTests: true }],
+        toolBudget: 40,
+        limits: { attempts: 4, attemptMinutes: 15, runMinutes: 60 },
+      }),
+    };
+    expect(parseClientMessage(msg)).toEqual({ ok: true, value: msg as ClientMessage });
+  });
+
+  test("bounds match loop.start: 1–10 checks, attempts 1–10, attemptMinutes 1–240, runMinutes 1–1440, toolBudget 1–1000", () => {
+    const check = { command: "bun test" };
+    expect(create({ checks: [check] }).ok).toBe(true);
+    expect(create({ checks: [] }).ok).toBe(false);
+    expect(create({}).ok).toBe(false);
+    expect(create({ checks: Array.from({ length: 11 }, () => check) }).ok).toBe(false);
+    expect(create({ checks: [{ command: "" }] }).ok).toBe(false);
+    expect(create({ checks: [{ command: "x".repeat(4_001) }] }).ok).toBe(false);
+    expect(create({ checks: [{ command: "a", timeoutSec: 3_601 }] }).ok).toBe(false);
+    expect(create({ checks: [{ id: "x".repeat(41), command: "a" }] }).ok).toBe(false);
+    expect(create({ checks: [check], limits: { attempts: 11 } }).ok).toBe(false);
+    expect(create({ checks: [check], limits: { attemptMinutes: 241 } }).ok).toBe(false);
+    expect(create({ checks: [check], limits: { runMinutes: 1_441 } }).ok).toBe(false);
+    expect(create({ checks: [check], toolBudget: 0 }).ok).toBe(false);
+    expect(create({ checks: [check], toolBudget: 1_001 }).ok).toBe(false);
+  });
+
+  test("an update may leave the checks out (merged over the current loop), or clear the loop with null", () => {
+    expect(update({ limits: { attempts: 5 } }).ok).toBe(true);
+    expect(update({ checks: [{ command: "bun test" }] }).ok).toBe(true);
+    expect(update(null).ok).toBe(true);
+    expect(update({ checks: [] }).ok).toBe(false);
+    const parsed = update({ toolBudget: 30 });
+    expect(parsed.ok && (parsed.value as { spec?: { loop?: unknown } }).spec?.loop).toEqual({ toolBudget: 30 });
   });
 });

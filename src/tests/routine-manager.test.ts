@@ -12,11 +12,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
 import { HookBus } from "../daemon/hooks/bus.js";
-import type { ProviderEvent } from "../daemon/providers/interface.js";
+import { AsyncQueue } from "../daemon/async-queue.js";
+import type { ProviderEvent, TurnOpts, TurnRun } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { handleRoutineFire } from "../daemon/routines/http.js";
 import { SessionManager } from "../daemon/session-manager.js";
+import { DRAIN_SETTLE_MS } from "../daemon/session.js";
+import { readSetupRecipe } from "../daemon/workspace-setup.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES, OPERATOR_SCOPES, SCOPES, WATCHER_SCOPES } from "../protocol/scopes.js";
@@ -45,7 +48,7 @@ const reply = (text: string, cost = 0.05): ProviderEvent[] => [
   { type: "text_done", content: text } as ProviderEvent,
   {
     type: "turn_done",
-    result: { providerId: "claude", model: "mock", inputTokens: 40, outputTokens: 9, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: cost, durationMs: 3 },
+    result: { providerId: "claude", model: "mock", inputTokens: 40, outputTokens: 9, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: cost, costSource: "backend", durationMs: 3 },
   } as ProviderEvent,
 ];
 /** A turn that asks to run a shell command — parks unless auto-approved. */
@@ -53,7 +56,7 @@ const shell: ProviderEvent[] = [
   { type: "tool_start", toolId: "t1", sdkToolUseId: "u1", name: "Bash", input: { command: "rm -rf build" }, approvalId: "a1" } as ProviderEvent,
 ];
 
-function mkConfig(tmp: string): CodeoidConfig {
+function mkConfig(tmp: string, session: Record<string, unknown> = {}): CodeoidConfig {
   return {
     daemonUrl: "ws://127.0.0.1:7400",
     dbPath: join(tmp, "codeoid.db"),
@@ -65,7 +68,7 @@ function mkConfig(tmp: string): CodeoidConfig {
     labeling: {},
     telemetry: { osc8: "auto" },
     autoRotate: { enabled: false, warnPct: 0.6, rotatePct: 0.8, hardRotatePct: 0.9, minTurnsBeforeRotate: 3, strategy: "task-anchor" },
-    session: {},
+    session,
     conductor: { enabled: false, name: "conductor", provider: "claude" },
     routines: { enabled: true, tickMs: 600_000, maxConcurrentRuns: 2, minIntervalSeconds: 60, apiFiresPerHour: 30, missedGraceSeconds: 120 },
   } as CodeoidConfig;
@@ -78,7 +81,42 @@ let transcript: TranscriptStore;
 let manager: SessionManager;
 let providers: MockSessionProvider[];
 let nextScript: ProviderEvent[][];
+/** The next backend's stream goes silent after its script (a hung provider). */
+let nextStall = false;
 let hookFile: string;
+let registry: ProviderRegistry;
+/** Set: the next backend works until interrupted, its result (spend included) following that many ms after. */
+let nextLateResult: number | null = null;
+
+/** Works until interrupted; acknowledges at once and ends the turn, $0.42 spent, `late` ms after. */
+class LateResultProvider extends MockSessionProvider {
+  constructor(private readonly late: number) {
+    super("claude");
+  }
+
+  override runTurn(opts: TurnOpts): TurnRun {
+    this.capturedOpts.push(opts);
+    const queue = new AsyncQueue<ProviderEvent>();
+    void Promise.resolve().then(() => queue.push({ type: "text_delta", content: "working" } as ProviderEvent));
+    return {
+      events: queue,
+      interrupt: async () => {
+        setTimeout(() => {
+          try {
+            queue.push({
+              type: "turn_done",
+              result: { providerId: "claude", model: "mock", inputTokens: 1000, outputTokens: 200, cacheReadTokens: 0, cacheCreationTokens: 0, totalCostUsd: 0.42, costSource: "backend", durationMs: 1, isError: true, errorMessage: "interrupted" },
+            } as ProviderEvent);
+          } catch {
+            // closed
+          }
+          queue.close();
+        }, this.late);
+      },
+      endTurn: () => queue.close(),
+    };
+  }
+}
 
 const CLIENT = (auth: AuthContext) => ({ id: `c-${auth.sub}`, auth, send: () => {} });
 const call = (msg: Record<string, unknown>, auth: AuthContext = OWNER): Promise<DaemonMessage> =>
@@ -108,13 +146,15 @@ beforeEach(() => {
   transcript = new TranscriptStore(join(tmp, "transcripts"));
   providers = [];
   nextScript = [reply("Found 2 stale PRs: #12, #15.")];
+  nextStall = false;
+  nextLateResult = null;
   hookFile = join(tmp, "hook.json");
-  const registry = new ProviderRegistry("claude");
+  registry = new ProviderRegistry("claude");
   registry.register({
     id: "claude",
     displayName: "claude",
     create: () => {
-      const p = new MockSessionProvider("claude", nextScript.map((t) => [...t]));
+      const p = nextLateResult !== null ? new LateResultProvider(nextLateResult) : new MockSessionProvider("claude", nextScript.map((t) => [...t]), { stall: nextStall });
       providers.push(p);
       return p;
     },
@@ -153,6 +193,7 @@ describe("routine lifecycle through the protocol", () => {
     const [run] = got.runs!;
     expect(run).toMatchObject({ trigger: "manual", status: "succeeded", summary: "Found 2 stale PRs: #12, #15.", costUsd: 0.05 });
     expect(got.routine.lastRun?.id).toBe(run!.id);
+    expect(got.routine.lastOutcome?.id).toBe(run!.id);
 
     // The run's session is real, the owner's, and the prompt is attributed to the routine.
     const page = (await call({ type: "scrollback.page", sessionId: run!.sessionId })) as ScrollbackPageResultMsg;
@@ -170,6 +211,33 @@ describe("routine lifecycle through the protocol", () => {
     const audits = store.database.query("SELECT subject, action FROM audit_log WHERE action LIKE 'routine.%' ORDER BY id").all() as Array<{ subject: string; action: string }>;
     expect(audits.map((a) => a.action)).toEqual(["routine.create", "routine.fire", "routine.run.queued", "routine.run.started", "routine.run.finished"]);
     expect(audits.at(-1)!.subject).toBe(`routine:${created.routine.id}`);
+  });
+
+  it("a capped run whose real turn fails mid-way: the run carries the real error and its spend, unknown here (#430)", async () => {
+    // The model worked (a text delta), then the backend failed with no result: what it spent is unknown.
+    nextScript = [[{ type: "text_delta", content: "working…" } as ProviderEvent, { type: "error", message: "stream reset by peer" } as ProviderEvent]];
+    await create({ name: "capped", maxCostUsd: 1 });
+    await call({ type: "routine.run", routine: "capped" });
+    await settled();
+    const got = (await call({ type: "routine.get", routine: "capped" })) as RoutineSnapshotMsg;
+    expect(got.runs![0]).toMatchObject({ status: "failed", reason: "stream reset by peer", costUnknown: true });
+    expect(manager.routines!.store.getRun(got.runs![0]!.id)!.costUnknown).toBe(true);
+  });
+
+  it("a run whose backend stalls and is recovered still carries that turn's spend, unknown here (#430)", async () => {
+    // A backend that streams, then goes silent: the session recovers the stalled turn.
+    await manager.drain(2_000).catch(() => {});
+    manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(tmp, { turnStallTimeoutMs: 150 }),
+      providers: registry,
+    });
+    nextStall = true;
+    nextScript = [[{ type: "text_delta", content: "working…" } as ProviderEvent]];
+    await create({ name: "stalls", dailyCostUsd: 5 });
+    await call({ type: "routine.run", routine: "stalls" });
+    await settled();
+    const got = (await call({ type: "routine.get", routine: "stalls" })) as RoutineSnapshotMsg;
+    expect(manager.routines!.store.getRun(got.runs![0]!.id)!.costUnknown).toBe(true);
   });
 
   it("lists, pages runs, previews, pauses, and deletes", async () => {
@@ -207,6 +275,19 @@ describe("routine lifecycle through the protocol", () => {
     expect(s?.managedBy).toBeUndefined();
   });
 
+  it("a parked run the owner approves, whose turn then fails mid-way, records that turn's unknown cost (#430)", async () => {
+    nextScript = [[...shell, { type: "text_delta", content: "running it" } as ProviderEvent, { type: "error", message: "backend died" } as ProviderEvent]];
+    await create({ approvals: "guarded" });
+    await call({ type: "routine.run", routine: "triage" });
+    await settled();
+    const run = ((await call({ type: "routine.get", routine: "triage" })) as RoutineSnapshotMsg).runs![0]!;
+    expect(run.status).toBe("needs_attention");
+    await call({ type: "session.approve", sessionId: run.sessionId, approvalId: "a1", decision: "allow" });
+    const rows = manager.routines!.store;
+    for (let i = 0; i < 100 && !rows.getRun(run.id)!.costUnknown; i++) await new Promise((r) => setTimeout(r, 20));
+    expect(rows.getRun(run.id)!.costUnknown).toBe(true);
+  });
+
   it("an in-flight run's session is marked managedBy=routine", async () => {
     const { routine } = await create({});
     const sessionId = (await call({ type: "session.create", name: "x", workdir: repo })) as { data?: { id: string } };
@@ -230,6 +311,8 @@ describe("routine lifecycle through the protocol", () => {
       reason: null,
       checkOutput: null,
       payload: null,
+      loopRunId: null,
+      loopStatus: null,
     });
     const list = await call({ type: "session.list" });
     expect(list.type === "session.list.result" && list.sessions.find((s) => s.id === id)?.managedBy).toBe("routine");
@@ -242,6 +325,50 @@ describe("routine lifecycle through the protocol", () => {
     const got = (await call({ type: "routine.get", routine: "triage" })) as RoutineSnapshotMsg;
     expect(got.runs![0]).toMatchObject({ status: "silent", costUsd: 0 });
     expect(providers).toHaveLength(0);
+  });
+});
+
+describe("a routine run at shutdown", () => {
+  /** A routine run mid-turn; then the daemon's order: routines stop, the dispatcher stops, sessions drain, the store closes. */
+  async function shutDownMidRun(late: number) {
+    nextLateResult = late;
+    await create({ name: "long" });
+    const fired = (await call({ type: "routine.run", routine: "long" })) as RoutineRunResultMsg;
+    const svc = manager.routines!;
+    let sessionId: string | null = null;
+    for (let i = 0; i < 200; i++) {
+      sessionId = svc.store.getRun(fired.run.id)?.sessionId ?? null;
+      if (sessionId && manager._sessionForTest(sessionId)?.status === "thinking") break;
+      await Bun.sleep(10);
+    }
+    expect(manager._sessionForTest(sessionId!)?.status).toBe("thinking");
+    const started = performance.now();
+    manager.stopRoutines();
+    manager.stopDispatcher();
+    await manager.drain(10_000);
+    const took = performance.now() - started;
+    // What the store holds now is what it keeps.
+    const row = svc.store.getRun(fired.run.id)!;
+    return { row, took };
+  }
+
+  // 1300 and 1800: past the ~1.1 s a run used to wait, within the 2 s drain waits for the turn.
+  for (const late of [0, 100, 300, 1300, 1800]) {
+    it(`records its end and its spend before the store closes (the turn's result ${late} ms after the interrupt)`, async () => {
+      const { row, took } = await shutDownMidRun(late);
+      expect(row.status).toBe("interrupted");
+      expect(row.costUsd).toBeCloseTo(0.42);
+      expect(row.costUnknown).toBeFalsy();
+      expect(took).toBeLessThan(late + 1_000);
+    });
+  }
+
+  it("records its end at once, the cost unknown, when drain gives up on its turn", async () => {
+    // Past the backend's settle bound (DRAIN_SETTLE_MS): the turn is left, the run isn't.
+    const { row, took } = await shutDownMidRun(DRAIN_SETTLE_MS + 2_000);
+    expect(row.status).toBe("interrupted");
+    expect(row.costUnknown).toBe(true);
+    expect(took).toBeLessThan(DRAIN_SETTLE_MS + 1_000);
   });
 });
 
@@ -411,5 +538,64 @@ describe("budgets and isolation", () => {
     expect(s?.worktree?.branch).toMatch(/^codeoid\/triage-/);
     expect(s?.workdir).not.toBe(repo);
     expect(providers[0]!.capturedOpts[0]!.workdir).toBe(s!.workdir);
+  });
+
+  const commitRecipe = (yaml: string) => {
+    const git = (...a: string[]) => execFileSync("git", a, { cwd: repo });
+    mkdirSync(join(repo, ".codeoid"), { recursive: true });
+    writeFileSync(join(repo, ".codeoid", "setup.yaml"), yaml);
+    writeFileSync(join(repo, ".gitignore"), ".env\n");
+    git("add", ".");
+    git("commit", "-qm", "recipe");
+  };
+
+  it("a worktree run gets the repository's setup recipe applied before the agent starts", async () => {
+    commitRecipe("copy: [.env]\n");
+    writeFileSync(join(repo, ".env"), "K=v\n");
+    await create({ worktree: true });
+    await call({ type: "routine.run", routine: "triage" });
+    await settled();
+    const run = ((await call({ type: "routine.get", routine: "triage" })) as RoutineSnapshotMsg).runs![0]!;
+    expect(run.status).toBe("succeeded");
+    const list = await call({ type: "session.list" });
+    const s = list.type === "session.list.result" ? list.sessions.find((x) => x.id === run.sessionId)! : undefined;
+    expect(s?.worktree?.setup?.copied).toEqual([".env"]);
+    expect(readFileSync(join(s!.worktree!.path, ".env"), "utf8")).toBe("K=v\n");
+  });
+
+  it("a trusted setup command runs on the committed tree; the checkout's uncommitted edit is carried after it", async () => {
+    commitRecipe("command: cat README.md > .seen\n");
+    writeFileSync(join(repo, ".gitignore"), ".env\n.seen\n");
+    execFileSync("git", ["commit", "-qam", "ignore"], { cwd: repo });
+    const recipeHash = (await readSetupRecipe(repo))!.recipeHash;
+    writeFileSync(join(repo, "README.md"), "hi\nuncommitted\n");
+    await manager.drain(2_000).catch(() => {});
+    manager = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: { ...mkConfig(tmp), worktree: { setup: { runCommands: "trusted-repos", trustedRepos: [{ path: repo, recipeHash }] } } } as CodeoidConfig,
+      providers: registry,
+    });
+    await create({ worktree: true });
+    await call({ type: "routine.run", routine: "triage" });
+    await settled();
+    const run = ((await call({ type: "routine.get", routine: "triage" })) as RoutineSnapshotMsg).runs![0]!;
+    expect(run.status).toBe("succeeded");
+    const list = await call({ type: "session.list" });
+    const s = list.type === "session.list.result" ? list.sessions.find((x) => x.id === run.sessionId)! : undefined;
+    expect(readFileSync(join(s!.worktree!.path, ".seen"), "utf8")).toBe("hi\n");
+    expect(readFileSync(join(s!.worktree!.path, "README.md"), "utf8")).toBe("hi\nuncommitted\n");
+  });
+
+  it("a setup recipe that fails is the run's infrastructure error — the agent never starts, the checkout is untouched", async () => {
+    commitRecipe("copy: [../outside]\n");
+    await create({ worktree: true });
+    await call({ type: "routine.run", routine: "triage" });
+    await settled();
+    const run = ((await call({ type: "routine.get", routine: "triage" })) as RoutineSnapshotMsg).runs![0]!;
+    expect(run.status).toBe("failed");
+    expect(run.reason).toMatch(/^workspace setup failed \(an infrastructure error; the agent never started\): .*\.\. segment/);
+    expect(providers).toHaveLength(0);
+    // Its fresh worktree was removed; the repository has no leftover branch.
+    expect(execFileSync("git", ["branch", "--list", "codeoid/*"], { cwd: repo }).toString().trim()).toBe("");
+    expect(existsSync(join(repo, "README.md"))).toBe(true);
   });
 });

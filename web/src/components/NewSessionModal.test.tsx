@@ -46,6 +46,9 @@ import NewSessionModal, {
   openPipelineModal,
 } from "./NewSessionModal";
 import { _resetSessionsForTest } from "../state/sessions";
+import { _resetProvidersForTest, ingestAuthProviders } from "../state/providers";
+import { _resetAccountsForTest, _setAccountsForTest } from "../state/accounts";
+import { accountKindsFor } from "../protocol/types";
 
 /** Minimal installed PackWire for the modal's pack/role selectors. */
 function pack(p: Partial<PackWire> & Pick<PackWire, "id" | "name">): PackWire {
@@ -63,17 +66,22 @@ function pack(p: Partial<PackWire> & Pick<PackWire, "id" | "name">): PackWire {
 }
 
 function authOk(providers?: string[]) {
-  return {
+  const ok = {
     type: "auth.ok",
     identity: { sub: "u", type: "human" },
     scopes: [],
     ...(providers ? { providers } : {}),
   };
+  // The pickers read the providers store, which connection.ts feeds from auth.ok.
+  ingestAuthProviders(ok);
+  return ok;
 }
 
 afterEach(() => {
   cleanup();
+  _resetAccountsForTest();
   _resetSessionsForTest();
+  _resetProvidersForTest();
   requestMock.mockReset();
   authMock.mockReset();
   fetchPacksMock.mockClear();
@@ -122,6 +130,151 @@ describe("NewSessionModal provider picker", () => {
         expect.objectContaining({ type: "session.create", providerId: "pi" }),
       ),
     );
+  });
+});
+
+describe("NewSessionModal account picker", () => {
+  const seed = () =>
+    _setAccountsForTest([
+      { backend: "claude", displayName: "Claude", defaultAccount: "default", accounts: [], kinds: accountKindsFor("claude") },
+      {
+        backend: "pi",
+        displayName: "pi",
+        defaultAccount: "default",
+        accounts: [{ backend: "pi", name: "team-keys", kind: "api-keys", envNames: ["OPENAI_API_KEY"], createdAt: "", updatedAt: "" }],
+        kinds: accountKindsFor("pi"),
+      },
+    ]);
+
+  it("asks for the account of the selected provider, not only Claude, and sends `account`", async () => {
+    authMock.mockReturnValue(authOk(["claude", "pi"]));
+    seed();
+    requestMock.mockResolvedValue({ id: "s-new", name: "n", workdir: "/w" });
+    const { getByText, getByPlaceholderText, getByLabelText, queryByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    // Claude has no named accounts here: nothing to ask.
+    expect(queryByLabelText("Account")).toBeNull();
+    fireEvent.click(getByText("pi"));
+    const select = getByLabelText("Account") as HTMLSelectElement;
+    expect([...select.options].map((o) => o.value)).toEqual(["", "default", "team-keys"]);
+    fireEvent.change(select, { target: { value: "team-keys" } });
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "pi-session" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() =>
+      expect(requestMock).toHaveBeenCalledWith(expect.objectContaining({ type: "session.create", providerId: "pi", account: "team-keys" })),
+    );
+    const sent = requestMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect("claudeAccount" in sent).toBe(false);
+  });
+
+  it("a provider change drops the account chosen for the previous one", async () => {
+    authMock.mockReturnValue(authOk(["claude", "pi"]));
+    seed();
+    requestMock.mockResolvedValue({ id: "s-new", name: "n", workdir: "/w" });
+    const { getByText, getByPlaceholderText, getByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.click(getByText("pi"));
+    fireEvent.change(getByLabelText("Account"), { target: { value: "team-keys" } });
+    fireEvent.click(getByText("claude (default)"));
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "c" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    expect("account" in (requestMock.mock.calls[0]![0] as Record<string, unknown>)).toBe(false);
+  });
+
+  const withClaudeAccount = () =>
+    _setAccountsForTest([
+      {
+        backend: "claude",
+        displayName: "Claude",
+        defaultAccount: "default",
+        accounts: [{ backend: "claude", name: "work", kind: "subscription", createdAt: "", updatedAt: "" }],
+        kinds: accountKindsFor("claude"),
+      },
+      { backend: "pi", displayName: "pi", defaultAccount: "default", accounts: [], kinds: accountKindsFor("pi") },
+    ]);
+
+  it("an account on the default backend is sent with that backend, so a pack role can't move it to another", async () => {
+    authMock.mockReturnValue(authOk(["claude", "pi"]));
+    withClaudeAccount();
+    requestMock.mockResolvedValue({ id: "s-new", name: "n", workdir: "/w" });
+    const { getByText, getByPlaceholderText, getByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.change(getByLabelText("Account"), { target: { value: "work" } });
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "c" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() =>
+      expect(requestMock).toHaveBeenCalledWith(expect.objectContaining({ type: "session.create", providerId: "claude", account: "work" })),
+    );
+  });
+
+  it("a refreshed providers list with the same default backend keeps the chosen account", async () => {
+    authMock.mockReturnValue(authOk(["claude", "pi"]));
+    withClaudeAccount();
+    const { getByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.change(getByLabelText("Account"), { target: { value: "work" } });
+    // A reconnect (or another client's endpoint edit) re-sends the same list.
+    authOk(["claude", "pi"]);
+    expect((getByLabelText("Account") as HTMLSelectElement).value).toBe("work");
+  });
+
+  it("an account another client removed is dropped, not sent", async () => {
+    authMock.mockReturnValue(authOk(["claude", "pi"]));
+    withClaudeAccount();
+    requestMock.mockResolvedValue({ id: "s-new", name: "n", workdir: "/w" });
+    const { getByText, getByPlaceholderText, getByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.change(getByLabelText("Account"), { target: { value: "work" } });
+    // accounts.changed → refetch: "work" is gone, another account remains.
+    _setAccountsForTest([
+      {
+        backend: "claude",
+        displayName: "Claude",
+        defaultAccount: "default",
+        accounts: [{ backend: "claude", name: "other", kind: "subscription", createdAt: "", updatedAt: "" }],
+        kinds: accountKindsFor("claude"),
+      },
+    ]);
+    expect((getByLabelText("Account") as HTMLSelectElement).value).toBe("");
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "c" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    const sent = requestMock.mock.calls[0]![0] as Record<string, unknown>;
+    expect("account" in sent).toBe(false);
+    expect("providerId" in sent).toBe(false);
+  });
+
+  it("the daemon's default backend changing under the dialog drops the account", async () => {
+    authMock.mockReturnValue(authOk(["claude", "pi"]));
+    _setAccountsForTest([
+      {
+        backend: "claude",
+        displayName: "Claude",
+        defaultAccount: "default",
+        accounts: [{ backend: "claude", name: "work", kind: "subscription", createdAt: "", updatedAt: "" }],
+        kinds: accountKindsFor("claude"),
+      },
+      {
+        backend: "pi",
+        displayName: "pi",
+        defaultAccount: "default",
+        // Same name on another backend: still not the one that was picked.
+        accounts: [{ backend: "pi", name: "work", kind: "api-keys", createdAt: "", updatedAt: "" }],
+        kinds: accountKindsFor("pi"),
+      },
+    ]);
+    requestMock.mockResolvedValue({ id: "s-new", name: "n", workdir: "/w" });
+    const { getByText, getByPlaceholderText, getByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.change(getByLabelText("Account"), { target: { value: "work" } });
+    // providers.changed: pi is the default now.
+    authOk(["pi", "claude"]);
+    expect((getByLabelText("Account") as HTMLSelectElement).value).toBe("");
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "c" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    expect("account" in (requestMock.mock.calls[0]![0] as Record<string, unknown>)).toBe(false);
   });
 });
 
@@ -668,5 +821,92 @@ describe("NewSessionModal — three modes", () => {
     expect(runPipelineMock).toHaveBeenCalledWith(
       expect.objectContaining({ pack: "sdlc", goal: "ship the thing" }),
     );
+  });
+});
+
+describe("NewSessionModal sandbox choice (#448)", () => {
+  const providersReply = {
+    enabled: true,
+    auto: "bwrap",
+    default: { provider: "auto", network: "on", allowedHosts: [] },
+    providers: [
+      { id: "bwrap", displayName: "bubblewrap", available: true, isolation: "os", placement: "local", workspace: "mount", network: ["on", "off"] },
+      { id: "docker", displayName: "Docker", available: false, reason: "the Docker daemon isn't reachable", isolation: "os", placement: "local", workspace: "mount", network: ["on", "off"] },
+    ],
+  };
+
+  it("asks the daemon nothing until changed, and sends no sandbox by default", async () => {
+    authMock.mockReturnValue(authOk(["claude"]));
+    requestMock.mockResolvedValue({ id: "s-new", name: "n", workdir: "/w" });
+    const { getByText, getByPlaceholderText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    expect(getByText(/Sandbox: the daemon's default/)).toBeTruthy();
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "demo" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalled());
+    expect(requestMock.mock.calls.map((c) => (c[0] as { type: string }).type)).toEqual(["session.create"]);
+    expect("sandbox" in (requestMock.mock.calls[0]![0] as object)).toBe(false);
+  });
+
+  it("change: lists what the daemon has (an unavailable one disabled, with why) and sends the choice", async () => {
+    authMock.mockReturnValue(authOk(["claude"]));
+    requestMock.mockImplementation(async (m: { type: string }) => (m.type === "sandbox.providers" ? providersReply : { id: "s-new", name: "n", workdir: "/w" }));
+    const { getByText, getByLabelText, getByPlaceholderText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.click(getByText("change"));
+    await waitFor(() => expect(getByText(/Docker — not available: the Docker daemon isn't reachable/)).toBeTruthy());
+    expect((getByText(/Docker — not available/) as HTMLOptionElement).disabled).toBe(true);
+    fireEvent.change(getByLabelText("Sandbox"), { target: { value: "bwrap" } });
+    fireEvent.change(getByLabelText("Sandbox network"), { target: { value: "off" } });
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "demo" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() =>
+      expect(requestMock).toHaveBeenCalledWith(expect.objectContaining({ type: "session.create", sandbox: { provider: "bwrap", network: "off" } })),
+    );
+  });
+
+  it("Docker access (#448 follow-up): a box, warned about, sent as dockerSocket; not offered with the sandbox off", async () => {
+    authMock.mockReturnValue(authOk(["claude"]));
+    requestMock.mockImplementation(async (m: { type: string }) => (m.type === "sandbox.providers" ? providersReply : { id: "s-new", name: "n", workdir: "/w" }));
+    const { getByText, getByLabelText, queryByLabelText, getByPlaceholderText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.click(getByText("change"));
+    await waitFor(() => expect(getByLabelText("Docker access")).toBeTruthy());
+    fireEvent.click(getByLabelText("Docker access"));
+    expect(getByText(/Docker access can reach the whole machine/)).toBeTruthy();
+    fireEvent.change(getByLabelText("Sandbox"), { target: { value: "off" } });
+    expect(queryByLabelText("Docker access")).toBeNull();
+    fireEvent.change(getByLabelText("Sandbox"), { target: { value: "" } });
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "demo" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() => expect(requestMock).toHaveBeenCalledWith(expect.objectContaining({ type: "session.create", sandbox: { dockerSocket: true } })));
+  });
+
+  it("project roots and added directories (working across repositories): the default shown, sent as projectRoots and addedDirs; none is []", async () => {
+    authMock.mockReturnValue(authOk(["claude"]));
+    requestMock.mockImplementation(async (m: { type: string }) => (m.type === "sandbox.providers" ? providersReply : { id: "s-new", name: "n", workdir: "/w" }));
+    const { getByText, getByLabelText, getByPlaceholderText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.click(getByText("change"));
+    await waitFor(() => expect(getByLabelText("Project roots")).toBeTruthy());
+    expect((getByLabelText("Project roots") as HTMLInputElement).placeholder).toContain("default: the repository's parent");
+    fireEvent.input(getByLabelText("Project roots"), { target: { value: "@parent, ~/src" } });
+    fireEvent.input(getByLabelText("Added directories"), { target: { value: "~/Workspace/b,\n/srv/c" } });
+    fireEvent.input(getByPlaceholderText("e.g. shield-refactor"), { target: { value: "demo" } });
+    fireEvent.click(getByText("create"));
+    await waitFor(() =>
+      expect(requestMock).toHaveBeenCalledWith(expect.objectContaining({ type: "session.create", sandbox: { projectRoots: ["@parent", "~/src"], addedDirs: ["~/Workspace/b", "/srv/c"] } })),
+    );
+  });
+
+  it("off says what it means", async () => {
+    authMock.mockReturnValue(authOk(["claude"]));
+    requestMock.mockResolvedValue(providersReply);
+    const { getByText, getByLabelText } = render(() => <NewSessionModal />);
+    openNewSessionModal();
+    fireEvent.click(getByText("change"));
+    await waitFor(() => expect(getByLabelText("Sandbox")).toBeTruthy());
+    fireEvent.change(getByLabelText("Sandbox"), { target: { value: "off" } });
+    expect(getByText(/can read your credentials and change any file you can/)).toBeTruthy();
   });
 });

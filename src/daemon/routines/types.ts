@@ -5,7 +5,9 @@
  * posture, and a delivery rule.
  */
 
+import type { LoopCheck, LoopLimits, LoopStatus } from "../loops/types.js";
 import type { RoutineSchedule } from "./schedule.js";
+import type { SessionSandboxSetting } from "../../protocol/types.js";
 
 export type ApprovalPosture = "autonomous" | "guarded";
 export type SessionStrategy = "fresh" | "persistent";
@@ -41,6 +43,8 @@ export interface RoutineSpec {
   session: SessionStrategy;
   /** Run in a fresh git worktree (fresh sessions) so the run never touches the checkout you work in. */
   worktree: boolean;
+  /** OS sandbox for its sessions (#448); absent = the daemon's `sandbox.*`. A run whose sandbox can't hold doesn't start. */
+  sandbox?: SessionSandboxSetting;
   overlap: OverlapPolicy;
   /** After downtime that missed a scheduled fire, run once on recovery. */
   catchUp: boolean;
@@ -53,6 +57,22 @@ export interface RoutineSpec {
   api: boolean;
   /** Pause the routine after this many consecutive failed runs (0 = never). */
   failurePauseAfter: number;
+  /**
+   * Start a loop instead of a session (docs/routines.md "Routines that start
+   * a loop"): the prompt is the loop's objective, these are its acceptance
+   * checks and budget. The session-run fields (toolBudget, maxMinutes,
+   * keepSessions) don't apply; normalizeSpec refuses the ones a loop can't
+   * honour.
+   */
+  loop?: RoutineLoopSpec;
+}
+
+/** A loop routine's run contract, stored validated and filled. */
+export interface RoutineLoopSpec {
+  checks: LoopCheck[];
+  /** Autonomous tool calls per attempt. */
+  toolBudget: number;
+  limits: LoopLimits;
 }
 
 export type RunTrigger = "schedule" | "catchup" | "api" | "manual";
@@ -92,6 +112,13 @@ export const ACTIVE_RUN_STATUSES: readonly RunStatus[] = ["queued", "checking", 
 
 /** Runs that count toward the failure auto-pause. */
 export const FAILURE_RUN_STATUSES: readonly RunStatus[] = ["failed", "timed_out", "over_budget"];
+
+/**
+ * Statuses that are a run's real outcome — they move "last run", the failure
+ * streak, and a routine's `lastOutcome`. A run that never got to do its work
+ * (skipped, cancelled, interrupted) is not one.
+ */
+export const OUTCOME_RUN_STATUSES: readonly RunStatus[] = ["succeeded", "silent", "needs_attention", "failed", "timed_out", "over_budget"];
 
 export interface RoutineRow {
   id: string;
@@ -136,4 +163,14 @@ export interface RunRow {
   reason: string | null;
   checkOutput: string | null;
   payload: string | null;
+  /**
+   * The loop run this run started (loop routines). While it is in progress
+   * the routine run stays `running` without holding a run slot; it ends with
+   * the loop's outcome.
+   */
+  loopRunId: string | null;
+  /** The loop run's status as last seen; terminal once the routine run ended. */
+  loopStatus: LoopStatus | null;
+  /** The run spent an amount nobody can count: a turn of unknown cost (#430). */
+  costUnknown?: boolean;
 }

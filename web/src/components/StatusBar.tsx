@@ -12,20 +12,24 @@ import { Component, Show } from "solid-js";
 
 import AttentionInbox from "./AttentionInbox";
 import HomeToggle from "./HomeToggle";
+import { showLoops } from "./LoopsPanel";
 
 import {
   ctxWindowColorClass,
   elapsedSince,
-  formatCostUsd,
+  formatSessionCost,
   formatDuration,
   formatPercent,
   formatTokens,
+  formatTurnCost,
 } from "../lib/format";
 import { identityLabel, identityColorClass } from "../lib/identity";
 import { authIdentity, connectionStatus, disconnect } from "../state/connection";
 import { nowTick } from "../state/clock";
 import { isMobile, toggleNav } from "../state/layout";
 import { focusedSession } from "../state/sessions";
+import { loopsState } from "../state/loops";
+import { isTerminalLoop } from "../lib/loops";
 import { forgetApiKey } from "../lib/auth";
 import { openIdentityDrawer } from "./IdentityDrawer";
 import { openSettings } from "./SettingsDrawer";
@@ -57,6 +61,7 @@ const StatusBar: Component = () => {
       <span class="ml-auto flex items-center gap-3">
         {/* Ambient — §8 wants the count always visible, the queue one click away. */}
         <AttentionInbox />
+        <LoopsButton />
         <SessionMetrics />
         <SearchHotkey />
         <SettingsButton />
@@ -179,8 +184,8 @@ const SessionMetrics: Component = () => {
               <span class="text-fg-faint">⇡</span>{" "}
               <span>{formatTokens(usage()?.outputTokens)}</span>
             </span>
-            <span class="font-semibold text-accent" title="Estimated cost (SDK-reported)">
-              {formatCostUsd(usage()?.totalCostUsd)}
+            <span class="font-semibold text-accent" title={formatSessionCost(usage()).title}>
+              {formatSessionCost(usage()).text}
             </span>
             <Show when={s().model}>
               <span class="rounded border border-border px-1.5 py-0.5 text-[10px] uppercase tracking-wider text-fg-muted">
@@ -189,7 +194,7 @@ const SessionMetrics: Component = () => {
             </Show>
             <Show when={usage()?.lastTurnCostUsd != null}>
               <span class="text-fg-faint" title="Last turn cost / latency">
-                last {formatCostUsd(usage()?.lastTurnCostUsd)} ·{" "}
+                last {formatTurnCost(usage()?.lastTurnCostUsd, usage()?.recentTurns?.[0]?.costSource)} ·{" "}
                 {formatDuration(usage()?.recentTurns?.[0]?.durationMs)}
               </span>
             </Show>
@@ -244,6 +249,25 @@ const SearchHotkey: Component = () => (
     <span class="font-mono">Ctrl K</span>
   </button>
 );
+
+/** Opens the automation drawer (loop runs, watches, routines); counts the runs still going. */
+const LoopsButton: Component = () => {
+  const live = () => loopsState().runs.filter((r) => !isTerminalLoop(r.status)).length;
+  return (
+    <button
+      type="button"
+      onClick={showLoops}
+      class="flex items-center gap-1 rounded border border-border bg-bg px-1.5 py-0.5 font-mono text-[11px] text-fg-muted hover:border-accent/40 hover:text-fg"
+      title="Automation — loop runs, watches and routines (/loops)"
+    >
+      <span class="hidden sm:inline">automation</span>
+      <span class="sm:hidden">auto</span>
+      <Show when={live() > 0}>
+        <span class="text-accent">{live()}</span>
+      </Show>
+    </button>
+  );
+};
 
 const SettingsButton: Component = () => (
   <button

@@ -8,17 +8,23 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { Database } from "bun:sqlite";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
+import { AsyncQueue } from "../daemon/async-queue.js";
 import { canonicalFromTranscript } from "../daemon/canonical-restore.js";
+import { HookBus } from "../daemon/hooks/bus.js";
 import { listCheckpoints, shadowRepoPath } from "../daemon/checkpoints.js";
-import { SendStoppedError } from "../daemon/session.js";
-import type { ProviderEvent } from "../daemon/providers/interface.js";
+import { DaemonStoppingError, SendStoppedError } from "../daemon/session.js";
+import type { ProviderEvent, TurnOpts, TurnRun } from "../daemon/providers/interface.js";
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
-import { SessionManager } from "../daemon/session-manager.js";
+import { LocalSandboxHandle } from "../daemon/sandbox/local-handle.js";
+import { SandboxRegistry } from "../daemon/sandbox/registry.js";
+import type { SandboxProvider, SandboxSpec } from "../daemon/sandbox/types.js";
+import { SessionManager, TURN_END_SETTLE_MS } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
@@ -365,6 +371,464 @@ describe("a Stop while a send prepares its turn", () => {
     expect(await sending).toBeInstanceOf(SendStoppedError);
     expect(providers.at(-1)!.capturedOpts).toHaveLength(0);
     expect(s.status).toBe("idle");
+  });
+
+  it("drain() returns as soon as the work it stopped has settled, not after a fixed half second", async () => {
+    const m = newManager();
+    const id = await create(m);
+    const s = m._sessionForTest(id)!;
+    const sending = s.send("go", AUTH).catch((e) => e);
+    // When the work itself has settled: the stopped send, then the writes it made.
+    const settled = sending.then(() => transcript.flush()).then(() => performance.now());
+    await m.drain(2_000);
+    const returned = performance.now();
+    // drain used to wait 500 ms before looking again, however soon the stop
+    // settled; it looks again within 50 ms now. Measured from the work's own
+    // end, so a slow stop under load doesn't count against it.
+    expect(returned - (await settled)).toBeLessThan(300);
+    expect(await sending).toBeInstanceOf(SendStoppedError);
+  });
+});
+
+/**
+ * A backend whose interrupt is acknowledged at once while the turn's result
+ * follows `late` ms after it, as real ones do: Claude's result after the
+ * interrupt receipt, Codex's turn/completed after turn/interrupt, opencode's
+ * feed or read-back after its interrupt call.
+ */
+class LateResultProvider extends MockSessionProvider {
+  /** `clean`: the stopped turn's result is no error (the session ends idle, where a wake is delivered). */
+  constructor(
+    private readonly late: number,
+    private readonly clean = false,
+  ) {
+    super("claude");
+  }
+
+  override runTurn(opts: TurnOpts): TurnRun {
+    this.capturedOpts.push(opts);
+    const queue = new AsyncQueue<ProviderEvent>();
+    void Promise.resolve().then(() => queue.push({ type: "text_delta", content: "working on it" } as ProviderEvent));
+    let interrupted = false;
+    return {
+      events: queue,
+      interrupt: async () => {
+        if (interrupted) return;
+        interrupted = true;
+        setTimeout(() => {
+          try {
+            queue.push({ type: "text_done", content: "working on it, cut short" } as ProviderEvent);
+            queue.push({
+              type: "turn_done",
+              result: {
+                providerId: "mock",
+                model: "mock",
+                inputTokens: 1000,
+                outputTokens: 200,
+                cacheReadTokens: 0,
+                cacheCreationTokens: 0,
+                totalCostUsd: 0.42,
+                costSource: "backend",
+                durationMs: 1,
+                ...(this.clean ? {} : { isError: true, errorMessage: "interrupted" }),
+              },
+            } as ProviderEvent);
+          } catch {
+            // closed
+          }
+          queue.close();
+        }, this.late);
+      },
+      endTurn: () => queue.close(),
+    };
+  }
+}
+
+describe("drain() at shutdown", () => {
+  for (const late of [0, 20, 100, 300, 600]) {
+    it(`records an interrupted turn whose result comes ${late} ms after the interrupt, before it returns`, async () => {
+      const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+        config: mkConfig(tmp),
+        _testProviderFactory: () => new LateResultProvider(late),
+      });
+      const id = await create(m);
+      const s = m._sessionForTest(id)!;
+      const sending = s.send("go", AUTH).catch((e) => e);
+      for (let i = 0; i < 200 && s.status !== "thinking"; i++) await Bun.sleep(5);
+      expect(s.status).toBe("thinking");
+
+      const errors: string[] = [];
+      const consoleError = console.error;
+      console.error = (...args: unknown[]) => {
+        errors.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(" "));
+      };
+      try {
+        const started = performance.now();
+        await m.drain(10_000);
+        const took = performance.now() - started;
+        // What is on disk now is what the daemon leaves: the store closes next, then the process exits.
+        const persisted = store.getSession(id)?.status;
+        store.close();
+        const canonical = readFileSync(transcript.canonicalPath(id), "utf8");
+        const lines = readFileSync(join(tmp, "transcripts", `${id}.jsonl`), "utf8");
+        const usage = s.toInfo().usage!;
+
+        expect(s.turnInFlight).toBe(false);
+        expect(canonical.split("\n").filter((l) => l.includes('"assistant"'))).toHaveLength(1);
+        expect(lines).toContain("working on it, cut short");
+        expect(usage.numTurns).toBe(1);
+        expect(usage.totalCostUsd).toBeCloseTo(0.42);
+        expect(persisted).toBe(s.status);
+        // As soon as the turn has ended, not after a fixed wait.
+        expect(took).toBeLessThan(late + 400);
+
+        await Bun.sleep(50);
+        expect(errors.filter((e) => /closed database|persist failed/i.test(e))).toEqual([]);
+      } finally {
+        console.error = consoleError;
+      }
+      await sending;
+    });
+  }
+
+  /** A manager on `provider`, its session mid-turn. */
+  async function midTurn(provider: () => MockSessionProvider): Promise<{ m: SessionManager; id: string; sending: Promise<unknown> }> {
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(tmp),
+      _testProviderFactory: () => {
+        const p = provider();
+        providers.push(p);
+        return p;
+      },
+    });
+    const id = await create(m);
+    const s = m._sessionForTest(id)!;
+    const sending = s.send("go", AUTH).catch((e) => e);
+    for (let i = 0; i < 200 && s.status !== "thinking"; i++) await Bun.sleep(5);
+    expect(s.status).toBe("thinking");
+    return { m, id, sending };
+  }
+
+  /** Errors logged while `fn` runs, and a moment after (a write that lands once the store closed). */
+  async function errorsDuring(fn: () => Promise<void>): Promise<string[]> {
+    const errors: string[] = [];
+    const consoleError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(" "));
+    };
+    try {
+      await fn();
+      await Bun.sleep(50);
+    } finally {
+      console.error = consoleError;
+    }
+    return errors;
+  }
+
+  it("waits for a turn stopped just before shutdown began, whose end is still on its way", async () => {
+    const { m, id, sending } = await midTurn(() => new LateResultProvider(300));
+    const s = m._sessionForTest(id)!;
+    // The owner's Stop: acknowledged at once, so the session reads idle, its result 300 ms away.
+    await s.interrupt(AUTH);
+    expect(s.status).toBe("idle");
+    expect(s.turnInFlight).toBe(true);
+
+    const errors = await errorsDuring(async () => {
+      const started = performance.now();
+      await m.drain(10_000);
+      const took = performance.now() - started;
+      store.close();
+      const canonical = readFileSync(transcript.canonicalPath(id), "utf8");
+      expect(s.turnInFlight).toBe(false);
+      expect(canonical.split("\n").filter((l) => l.includes('"assistant"'))).toHaveLength(1);
+      expect(s.toInfo().usage!.totalCostUsd).toBeCloseTo(0.42);
+      expect(took).toBeGreaterThanOrEqual(250);
+      expect(took).toBeLessThan(300 + 1_000);
+    });
+    expect(errors.filter((e) => /closed database|persist failed/i.test(e))).toEqual([]);
+    await sending;
+  });
+
+  it("interrupts a turn the backend starts on its own after drain's interrupt, and waits for it", async () => {
+    // The interrupted turn ends 50 ms after the interrupt; as the session lets
+    // go of it, the backend starts one of its own (the Claude CLI answering a
+    // background agent that settled).
+    class SelfStarting extends LateResultProvider {
+      own = 0;
+      override runTurn(opts: TurnOpts): TurnRun {
+        const run = super.runTurn(opts);
+        return {
+          ...run,
+          endTurn: () => {
+            run.endTurn?.();
+            if (this.own++ > 0) return;
+            queueMicrotask(() => this.startOwnTurn([{ type: "text_delta", content: "carrying on" } as ProviderEvent]));
+          },
+        };
+      }
+    }
+    const { m, id, sending } = await midTurn(() => new SelfStarting(50));
+    const s = m._sessionForTest(id)!;
+    const provider = providers.at(-1) as SelfStarting;
+    await m.drain(10_000);
+    expect(provider.own).toBe(1);
+    // Stopped as it started, and its end recorded before drain returned.
+    expect(provider.ownTurnInterrupts).toBe(1);
+    expect(s.status).toBe("idle");
+    expect(s.turnInFlight).toBe(false);
+    await sending;
+  });
+
+  it("starts no background wake once drain has begun", async () => {
+    // Background work settles as the interrupted turn ends: the session would wake itself.
+    class SettlesOnStop extends LateResultProvider {
+      override runTurn(opts: TurnOpts): TurnRun {
+        const run = super.runTurn(opts);
+        return {
+          ...run,
+          interrupt: async () => {
+            this.onSessionEvent?.({ type: "background_task_settled", taskId: "task-1", status: "completed", summary: "done" } as never);
+            await run.interrupt();
+          },
+        };
+      }
+    }
+    const { m, id, sending } = await midTurn(() => new SettlesOnStop(20, true));
+    const s = m._sessionForTest(id)!;
+    await m.drain(10_000);
+    await Bun.sleep(100);
+    // Only the prompted turn ever reached the backend.
+    expect(providers.at(-1)!.capturedOpts).toHaveLength(1);
+    expect(s.status).toBe("idle");
+    expect(s.preparingTurn).toBe(false);
+    expect(s.turnInFlight).toBe(false);
+    await sending;
+  });
+
+  it("refuses a send once drain has begun", async () => {
+    const m = newManager();
+    const id = await create(m);
+    const s = m._sessionForTest(id)!;
+    await m.drain(2_000);
+    await expect(s.send("late", AUTH)).rejects.toBeInstanceOf(DaemonStoppingError);
+    const r = await m.handle({ type: "session.send", id: "s1", sessionId: id, text: "late", clientMsgId: "cm-late" } as never, AUTH, {
+      id: "cli",
+      auth: AUTH,
+      send: () => {},
+    });
+    expect(r.type).toBe("response.error");
+    // Refused, so its id isn't marked as seen: this is its first mark.
+    expect(s.markClientMsgSeen("cm-late")).toBe(false);
+    expect(providers.at(-1)!.capturedOpts).toHaveLength(0);
+  });
+
+  it("waits for a turn that never ends only its backend's settle bound, for every session at once", async () => {
+    // Acknowledges the interrupt, or never answers it, and never ends the turn.
+    class Wedged extends MockSessionProvider {
+      readonly interruptSettleMs = 300;
+      constructor(private readonly ack: boolean) {
+        super("claude");
+      }
+      override runTurn(opts: TurnOpts): TurnRun {
+        this.capturedOpts.push(opts);
+        const queue = new AsyncQueue<ProviderEvent>();
+        void Promise.resolve().then(() => queue.push({ type: "text_delta", content: "working" } as ProviderEvent));
+        return {
+          events: queue,
+          interrupt: () => (this.ack ? Promise.resolve() : new Promise<void>(() => {})),
+          endTurn: () => queue.close(),
+        };
+      }
+    }
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(tmp),
+      // Every other one never answers the interrupt.
+      _testProviderFactory: () => new Wedged(providers.push(new MockSessionProvider("claude")) % 2 === 0),
+    });
+    managers.push(m);
+    const sends: Promise<unknown>[] = [];
+    const ids: string[] = [];
+    for (let i = 0; i < 4; i++) {
+      const id = await create(m);
+      ids.push(id);
+      const s = m._sessionForTest(id)!;
+      sends.push(s.send("go", AUTH).catch((e) => e));
+      for (let j = 0; j < 200 && s.status !== "thinking"; j++) await Bun.sleep(5);
+    }
+    const warned: string[] = [];
+    const consoleWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warned.push(args.map(String).join(" "));
+    };
+    let took = 0;
+    try {
+      const started = performance.now();
+      await m.drain(10_000);
+      took = performance.now() - started;
+    } finally {
+      console.warn = consoleWarn;
+    }
+    // One bound, not four in a row, and nowhere near the deadline.
+    expect(took).toBeGreaterThanOrEqual(290);
+    expect(took).toBeLessThan(300 + 1_500);
+    for (const id of ids) expect(warned.some((w) => w.includes(id.slice(0, 8)) && /didn't end its turn/.test(w))).toBe(true);
+  });
+});
+
+describe("drain() and the work a turn's end starts", () => {
+  /** A sandbox provider that wraps nothing: enough for the session's #448 git check to run. */
+  function fakeSandboxes(): SandboxRegistry {
+    const open = (spec: SandboxSpec) => new LocalSandboxHandle("bwrap", spec, (argv, o) => ({ argv: [...argv], env: o.env }));
+    const reg = new SandboxRegistry("linux", (n) => `/usr/bin/${n}`);
+    reg.register({
+      id: "bwrap",
+      displayName: "bwrap",
+      capabilities: { isolation: "os", placement: "local", workspace: "mount", stdioProcess: true, commands: true, wrapsArgv: true, network: ["on", "off"], platforms: ["linux"] },
+      probe: async () => ({ available: true }),
+      open: async (spec) => open(spec),
+      openSync: open,
+    } as SandboxProvider);
+    return reg;
+  }
+
+  /** The agent commits a project settings file during its turn (what #checkSettingsCommits exists to catch). */
+  class SettingsCommitter extends LateResultProvider {
+    override runTurn(opts: TurnOpts): TurnRun {
+      mkdirSync(join(repo, ".claude"), { recursive: true });
+      writeFileSync(join(repo, ".claude", "settings.json"), "{}\n");
+      git("add", ".claude");
+      git("commit", "-qm", "settings");
+      return super.runTurn(opts);
+    }
+  }
+
+  /** A manager on `provider`, its session mid-turn; drained, then the store closed: what is on disk is what the daemon leaves. */
+  async function drainMidTurn(provider: () => MockSessionProvider, extra: { sandboxRegistry?: SandboxRegistry; hooks?: HookBus } = {}) {
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(tmp),
+      _testProviderFactory: provider,
+      ...extra,
+    });
+    const id = await create(m);
+    const s = m._sessionForTest(id)!;
+    const sending = s.send("go", AUTH).catch((e) => e);
+    // A large workspace's start snapshot holds the turn back up to its 2 s wait.
+    for (let i = 0; i < 1_000 && s.status !== "thinking"; i++) await Bun.sleep(5);
+    expect(s.status).toBe("thinking");
+    const errors: string[] = [];
+    const warned: string[] = [];
+    const consoleError = console.error;
+    const consoleWarn = console.warn;
+    console.error = (...args: unknown[]) => void errors.push(args.map((a) => (a instanceof Error ? a.message : String(a))).join(" "));
+    console.warn = (...args: unknown[]) => void warned.push(args.map(String).join(" "));
+    let took = 0;
+    // Read synchronously right after the store closes: nothing still running gets a turn first.
+    let snapshots: string[] = [];
+    let lines = "";
+    try {
+      const started = performance.now();
+      await m.drain(10_000);
+      took = performance.now() - started;
+      store.close();
+      lines = readFileSync(join(tmp, "transcripts", `${id}.jsonl`), "utf8");
+      snapshots = existsSync(shadowRepoPath(ckptRoot(), id))
+        ? execFileSync("git", ["--git-dir", shadowRepoPath(ckptRoot(), id), "for-each-ref", "--format=%(refname)", "refs/turns/"], { encoding: "utf8" })
+            .split("\n")
+            .filter(Boolean)
+        : [];
+      await Bun.sleep(50);
+    } finally {
+      console.error = consoleError;
+      console.warn = consoleWarn;
+    }
+    await sending;
+    const db = new Database(join(tmp, "codeoid.db"), { readonly: true });
+    const audit = (db.query("SELECT action FROM audit_log WHERE session_id = ?").all(id) as Array<{ action: string }>).map((r) => r.action);
+    db.close();
+    return { id, took, errors, warned, lines, snapshots, audit };
+  }
+
+  const closedStore = (errors: string[]) => errors.filter((e) => /closed database|persist failed|audit write failed/i.test(e));
+
+  /** A repository with a 3000-commit history, a tag on each: git takes longer than drain's poll slack. */
+  function deepHistory(): void {
+    const head = git("rev-parse", "HEAD").trim();
+    let script = "";
+    for (let i = 0; i < 3000; i++) {
+      script += `commit refs/heads/main\nmark :${i + 1}\ncommitter t <t@e> ${1_700_000_000 + i} +0000\ndata 2\nc\n${i === 0 ? `from ${head}\n` : ""}M 644 inline f${i % 50}.txt\ndata 2\n${i % 10}\n\nreset refs/tags/t${i}\nfrom :${i + 1}\n\n`;
+    }
+    execFileSync("git", ["fast-import", "--quiet"], { cwd: repo, input: script });
+    git("checkout", "-q", "-f", "main");
+  }
+
+  it("records the turn end's settings-commit check (audit row, warning line) before the store closes", async () => {
+    const r = await drainMidTurn(() => new SettingsCommitter(20), { sandboxRegistry: fakeSandboxes() });
+    expect(r.audit).toContain("session.settings_committed");
+    expect(r.lines).toContain("sandbox.settings_committed");
+    expect(closedStore(r.errors)).toEqual([]);
+  });
+
+  for (const late of [20, 100, 300]) {
+    it(`records it in a repository with a 3000-commit history, the result ${late} ms after the interrupt`, async () => {
+      deepHistory();
+      const r = await drainMidTurn(() => new SettingsCommitter(late), { sandboxRegistry: fakeSandboxes() });
+      expect(r.audit).toContain("session.settings_committed");
+      expect(r.lines).toContain("sandbox.settings_committed");
+      expect(closedStore(r.errors)).toEqual([]);
+    }, 30_000);
+  }
+
+  it("takes the interrupted turn's end snapshot of a large workspace before it returns", async () => {
+    mkdirSync(join(repo, "src"));
+    for (let i = 0; i < 20_000; i++) writeFileSync(join(repo, "src", `f${i}.txt`), `file ${i}\n`.repeat(20));
+    const r = await drainMidTurn(() => new LateResultProvider(20));
+    // The start snapshot and the end one: a rewind past this turn has the files it ended with.
+    expect(r.snapshots).toHaveLength(2);
+    expect(r.snapshots.filter((ref) => ref.endsWith("-end"))).toHaveLength(1);
+    expect(closedStore(r.errors)).toEqual([]);
+  }, 30_000);
+
+  it("lets an after_turn hook finish", async () => {
+    const out = join(tmp, "after-turn.json");
+    const hooks = new HookBus([{ event: "after_turn", type: "command", command: `sleep 0.3; cat > "${out}"` }]);
+    const r = await drainMidTurn(() => new LateResultProvider(20), { hooks });
+    expect(existsSync(out)).toBe(true);
+    expect(r.took).toBeGreaterThanOrEqual(250);
+  });
+
+  it("waits for a turn end's work at most its bound, and names the session", async () => {
+    const out = join(tmp, "never.json");
+    // A hook that outlives the bound: shutdown goes on without it.
+    const hooks = new HookBus([{ event: "after_turn", type: "command", command: `sleep 7; cat > "${out}"`, timeoutMs: 10_000 }]);
+    const r = await drainMidTurn(() => new LateResultProvider(20), { hooks });
+    expect(r.took).toBeGreaterThanOrEqual(TURN_END_SETTLE_MS - 100);
+    expect(r.took).toBeLessThan(TURN_END_SETTLE_MS + 1_500);
+    expect(r.warned.some((w) => w.includes(r.id.slice(0, 8)) && /didn't finish its turn's end/.test(w))).toBe(true);
+  }, 15_000);
+});
+
+describe("a stopped turn's last reply", () => {
+  it("is shown whole, not typed out frame by frame, so the turn ends as its result arrives", async () => {
+    const m = new SessionManager(store, transcript, undefined, undefined, undefined, {
+      config: mkConfig(tmp),
+      _testProviderFactory: () => new LateResultProvider(0),
+    });
+    managers.push(m);
+    const id = await create(m);
+    const s = m._sessionForTest(id)!;
+    const seen: DaemonMessage[] = [];
+    s.attach({ id: "w", auth: AUTH, send: (msg: DaemonMessage) => { seen.push(msg); } });
+    const sending = s.send("go", AUTH).catch((e) => e);
+    for (let i = 0; i < 200 && s.status !== "thinking"; i++) await Bun.sleep(5);
+    await s.interrupt(AUTH);
+    await s.turnDrained(5_000);
+    await sending;
+
+    const last = seen.filter(
+      (x): x is SessionMessage & DaemonMessage => x.type === "session.message" && x.role === "assistant" && x.content === "working on it, cut short",
+    );
+    expect(last).toHaveLength(1);
+    expect(seen.some((x) => x.type === "session.message.delta" && x.messageId === last[0]!.messageId)).toBe(false);
   });
 });
 

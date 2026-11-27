@@ -11,7 +11,15 @@
  * they need no reactive root.
  */
 
-import type { FleetTaskWire, SessionInfo, SessionUiRequestMsg } from "../protocol/types";
+import { loopQuestion, loopWaitKind, objectiveTitle } from "./loops";
+import { isFailingRun, routineRunStatusStyle } from "./routines";
+import { isRateLimited, isSelfPaused } from "./watches";
+
+/** How long a blocked loop run stays in the inbox after it ended. */
+export const LOOP_BLOCKED_ATTENTION_MS = 24 * 60 * 60 * 1000;
+/** How long a routine's failed last run stays in the inbox after it ended. */
+export const ROUTINE_FAILED_ATTENTION_MS = 24 * 60 * 60 * 1000;
+import type { FleetTaskWire, LoopRunWire, LoopWatchWire, RoutineWire, SessionInfo, SessionUiRequestMsg } from "../protocol/types";
 
 export type AttentionKind = "question" | "approval" | "blocked" | "failed";
 
@@ -21,6 +29,12 @@ export interface AttentionItem {
   kind: AttentionKind;
   /** The session to open. Null for a task whose session is gone or not yet spawned. */
   sessionId: string | null;
+  /** A loop run's item opens the run, not a session. */
+  runId?: string;
+  /** A watch's item opens the watch. */
+  watchId?: string;
+  /** A routine's item opens the routine. */
+  routineId?: string;
   /** What to show as the row's subject — a session name, or a task id. */
   label: string;
   detail: string;
@@ -70,6 +84,12 @@ export interface AttentionSources {
   tasks: readonly FleetTaskWire[];
   /** Resolve a task to its session, when it still has one. */
   taskSession: (task: FleetTaskWire) => SessionInfo | null;
+  /** The owner's loop runs; a question or a block contributes (docs/loops.md). */
+  loops?: readonly LoopRunWire[];
+  /** The owner's loop watches; a failing poll, a back-off, or a self-pause contributes. */
+  watches?: readonly LoopWatchWire[];
+  /** The owner's routines; an auto-pause or a recently failed last run contributes (docs/routines.md). */
+  routines?: readonly RoutineWire[];
 }
 
 /**
@@ -125,8 +145,10 @@ export function collectAttention(src: AttentionSources, now: number): AttentionI
   // listed for that session: they are the same stoppage, and showing both
   // would double-count one interruption in a queue whose whole job is to say
   // how many things need you.
+  const approvals = new Set<string>();
   for (const s of src.sessions) {
     if (s.status !== "waiting_approval" || asked.has(s.id)) continue;
+    approvals.add(s.id);
     items.push({
       key: `approval:${s.id}`,
       kind: "approval",
@@ -139,8 +161,23 @@ export function collectAttention(src: AttentionSources, now: number): AttentionI
 
   // Stopped dispatch tasks.
   for (const task of src.tasks) {
-    if (task.status !== "blocked" && task.status !== "failed") continue;
     const session = src.taskSession(task);
+    if (task.status === "held") {
+      // Parked on a decision outside the worker (a loop's out-of-profile
+      // approval). Same stoppage as its session's approval when that is
+      // already listed, so it is not counted twice.
+      if (session && (asked.has(session.id) || approvals.has(session.id))) continue;
+      items.push({
+        key: `task:${task.id}`,
+        kind: "approval",
+        sessionId: session?.id ?? null,
+        label: session?.name ?? `${task.kind} ${task.id.slice(0, 8)}`,
+        detail: task.error ?? "held: waiting on a decision",
+        since: task.createdAt,
+      });
+      continue;
+    }
+    if (task.status !== "blocked" && task.status !== "failed") continue;
     items.push({
       key: `task:${task.id}`,
       kind: task.status,
@@ -148,6 +185,103 @@ export function collectAttention(src: AttentionSources, now: number): AttentionI
       label: session?.name ?? `${task.kind} ${task.id.slice(0, 8)}`,
       detail: task.error ?? (task.status === "blocked" ? "hit the failure limit" : "task failed"),
       since: task.createdAt,
+    });
+  }
+
+  // Loop runs waiting on your answer, or blocked without you. A run waiting
+  // on an approval is left out: its worker session is `waiting_approval`, so
+  // the approval row above already stands for it and opens where it is
+  // answered. `listedLoops` holds every loop run that has a row of its own
+  // either way, so a routine following one doesn't list it a second time.
+  const listedLoops = new Set<string>();
+  for (const run of src.loops ?? []) {
+    const wait = loopWaitKind(run);
+    if (wait === "approval" && run.workerSessionId && (approvals.has(run.workerSessionId) || asked.has(run.workerSessionId))) {
+      listedLoops.add(run.id);
+    }
+    // A blocked run is over; it asks for attention for a day, not forever.
+    const recentlyBlocked =
+      run.status === "blocked" && run.endedAt !== null && now - Date.parse(run.endedAt) < LOOP_BLOCKED_ATTENTION_MS;
+    if (wait !== "question" && !recentlyBlocked) continue;
+    listedLoops.add(run.id);
+    items.push({
+      key: `loop:${run.id}`,
+      kind: wait === "question" ? "question" : "blocked",
+      sessionId: null,
+      runId: run.id,
+      label: `loop · ${objectiveTitle(run.objective, 60)}`,
+      detail: wait === "question" ? loopQuestion(run.waitingOn) : (run.reason ?? "blocked"),
+      since: sinceFor(run.updatedAt, now),
+    });
+  }
+
+  // Watches whose poll couldn't finish (or that paused themselves): until
+  // someone looks, they start no runs. A paused watch is otherwise quiet.
+  for (const w of src.watches ?? []) {
+    const selfPaused = isSelfPaused(w);
+    if (!w.lastError || (!w.enabled && !selfPaused)) continue;
+    items.push({
+      key: `watch:${w.id}`,
+      kind: selfPaused ? "blocked" : "failed",
+      sessionId: null,
+      watchId: w.id,
+      label: `watch · ${w.repo}`,
+      detail: isRateLimited(w.lastError) ? `backing off: ${w.lastError}` : w.lastError,
+      since: sinceFor(w.lastPolledAt ?? w.updatedAt, now),
+    });
+  }
+
+  // Routines that paused themselves, or whose last outcome failed recently (a
+  // loop routine's loop that ended blocked included) — the outcome, not the
+  // last run: fires skipped behind a loop say nothing about how it went. A
+  // run waiting on an approval is left out: its session is
+  // `waiting_approval`, so the approval row above already stands for it. A
+  // loop routine whose loop waits on you (a question, or paused) holds every
+  // later fire back, so it is listed as "waiting on its loop", opening the
+  // routine — unless that loop already has its own row above.
+  for (const r of src.routines ?? []) {
+    const following = r.activeLoopRun?.loop;
+    const waitingOnLoop =
+      following && (following.status === "waiting" || following.status === "paused") && !listedLoops.has(following.runId)
+        ? `waiting on its loop (${following.status === "paused" ? "paused" : "it waits on you"}): later fires are skipped until it ends`
+        : null;
+    if (!r.enabled && r.pausedReason) {
+      // Its own pause first: resuming is what it needs from you.
+      items.push({
+        key: `routine:${r.id}`,
+        kind: "blocked",
+        sessionId: null,
+        routineId: r.id,
+        label: `routine · ${r.name}`,
+        detail: waitingOnLoop ? `${r.pausedReason}; ${waitingOnLoop}` : r.pausedReason,
+        since: sinceFor(r.updatedAt, now),
+      });
+      continue;
+    }
+    if (waitingOnLoop) {
+      items.push({
+        key: `routine:${r.id}`,
+        kind: "blocked",
+        sessionId: null,
+        routineId: r.id,
+        label: `routine · ${r.name}`,
+        detail: waitingOnLoop,
+        since: sinceFor(r.activeLoopRun!.startedAt ?? r.activeLoopRun!.createdAt, now),
+      });
+      continue;
+    }
+    const last = r.lastOutcome;
+    if (!last || !isFailingRun(last.status, last.loop)) continue;
+    const ended = sinceFor(last.endedAt ?? last.createdAt, now);
+    if (now - ended >= ROUTINE_FAILED_ATTENTION_MS) continue;
+    items.push({
+      key: `routine:${r.id}`,
+      kind: "failed",
+      sessionId: null,
+      routineId: r.id,
+      label: `routine · ${r.name}`,
+      detail: `${routineRunStatusStyle(last).label}${last.reason ? `: ${last.reason}` : ""}`,
+      since: ended,
     });
   }
 

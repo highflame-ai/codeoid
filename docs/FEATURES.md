@@ -38,6 +38,54 @@ Like every Claude session codeoid runs, a session it writes or forks for Claude 
 `session.nativeContinuation: false` (or `CODEOID_NATIVE_CONTINUATION=false`) keeps everything on the transcript.
 Native continuation is tried before the `CODEOID_CONTEXT_STRATEGY` seed (`transcript` or `vws`), which still applies to every backend it doesn't cover.
 
+#### A fork leaves the parent's background work with the parent
+
+Background agents and shells the parent started before the fork keep running in the parent and report only there.
+The fork works on its own instruction and never waits for them, reports them, or counts them as its own.
+Each fork records the moment it began, and its Claude backend is started with `CLAUDE_CODE_RESUME_SOURCE_ALIVE` set to that time, so Claude Code doesn't report background work recorded before it (deliver its result, or tell the model to relaunch it).
+Background work the fork starts itself comes after that moment, and Claude Code recovers it after a restart as it would for any session.
+The `env` of a project's `.claude/settings.json` or of your own `~/.claude/settings.json` can set or clear that variable; the rest of this section doesn't depend on it.
+Claude Code keeps its cloud agents' registrations next to the session, and polls every one it finds there when the session is resumed.
+Before a fork's copy of the parent's Claude session is first resumed, codeoid removes any registration of the parent's from the copy, so the fork never polls the parent's cloud agents; the parent's own session is left as it was.
+If the copy's directories aren't plain directories of the copy's own (a symlink, say), or can't be read, codeoid doesn't use the copy: it removes it and builds the fork's Claude session from codeoid's history instead.
+Task ids the parent knew of are the parent's: if the fork's backend reports one anyway, the fork stops it in its own process (the parent's copy runs on) and doesn't wake on it.
+If that stop fails, or the task is still there three updates or 30 seconds after the stop, it stays in the fork's background list as the parent's, being stopped, until it's gone, the fork's scrollback says so once (even across a restart), and Stop still stops it.
+A task that had already finished when it was asked to stop counts as stopped.
+A cloud agent of the parent's is never stopped from the fork, because stopping one archives the cloud session it runs in, which would end it for the parent too.
+It is listed in the fork as the parent's (cloud), not stopped from here, and the fork doesn't wait on it, report it, or stop it on Stop.
+No agent of the fork can stop a task of the parent's either.
+Claude Code's stop-task tool takes a task id, an agent id or a name, so in a fork it is allowed only for a task or agent the fork's own backend has listed, or a teammate of the fork's own team (`name@team`), and refused for anything else.
+An id with spaces around it is refused rather than trimmed, and a stop-task call a codeoid hook rewrites is checked again as rewritten.
+When one of the parent's tasks finishes in the fork's backend, Claude Code may hand its result to the fork's model: in the turn that's running, in a turn it starts on its own, or with the next prompt.
+Whichever of those comes first carries a one-shot reminder that the result belongs to the original session and isn't to be acted on, continued or relaunched in the fork.
+That holds for an agent the fork stopped too, since Claude Code tells the model a stopped agent's partial result; a background shell the fork stopped needs no reminder, because Claude Code says nothing about it.
+The reminder goes out exactly once, even when the task finishes, or Claude Code starts a turn, while a prompt of yours is on its way to the backend.
+The reminder is saved with the fork until it has gone out, so a restart doesn't lose it, and it is kept in the fork's history, so a later backend or fork sees it too.
+The fork's scrollback shows `A background task of the parent session finished; its result stays with the parent.` once for each such task, even across a restart.
+Nothing is stopped or refused for it: the fork's own turns and agents carry on as usual.
+The result itself stays in Claude Code's own copy of the conversation, which codeoid can't edit; the reminder is what tells the model it isn't the fork's.
+Every tool call made in the fork by a parent's agent that wasn't known to have finished is refused, including the ones Claude Code would allow without asking (reads inside the working directory, `permissions.allow` rules, codeoid's memory and fleet tools), so it can't start agents of its own there either.
+Teammates are handled on a best-effort basis, and this likely never comes into play: Claude Code doesn't set up teams when codeoid runs it.
+Where a teammate does run, one of a team other than the fork's own is taken as the parent's, since Claude Code names a session's team after the session by default.
+With `CLAUDE_INTERNAL_ASSISTANT_TEAM_NAME` set in the daemon's environment, every session's team has that name, so a fork refuses every teammate, and says so once in the daemon's log.
+A team named in Claude Code's settings (`existingTeamName`) can't be seen by codeoid at all.
+A parent's agent that had finished isn't refused, since nothing of it runs in the fork, but it is still stopped if the fork's backend ever runs it.
+Claude Code keeps an agent's transcript with the session that ran it, so the fork can't continue it, and can't change the parent's copy.
+The refusal is decided before anything else and fails closed: an error while handling it still refuses the call.
+It is checked again when Claude Code asks codeoid to approve a call, in case the first check was skipped.
+Refusals are audited as `session.foreign_agent_deny`, the first for each agent and then at most one a minute, and the fork's scrollback says once per agent (even across a restart) that an agent of the parent session tried to use a tool and was refused; the agent's activity itself isn't shown.
+Two limits remain.
+A sandbox network request carries no agent id, so one from a parent's agent asks you like any other.
+A teammate that runs as a separate Claude Code process (in a terminal pane) runs its own hooks, which the fork never sees.
+When the parent had unfinished background work, the fork's first prompt tells the model, on every backend, that the work belongs to the original session and can't be continued from the fork, and the fork's scrollback shows `Background work the parent was running stays with the parent`.
+A fork from an earlier turn counts only the work the parent had launched by that turn, where its history shows when that was.
+A fork of a fork is told about its grandparent's work too, unless the history it starts from holds the prompt that carried its parent's own note.
+A note an older ancestor gave doesn't count, because it covers only the work launched before that earlier fork.
+The note is spent only when a prompt carrying it reaches the backend, and going back to before that prompt brings it back for the next one.
+Every session remembers its own background tasks and which ones finished, across a restart, so a fork made later still finds that work in a long history.
+All of this is saved with the fork, so it holds across a daemon restart, and a fork of a fork also holds its grandparent's tasks as foreign.
+A rewind or backend switch inside a session that isn't a fork is unchanged: that session owns its background work.
+
 Memory, identity, attachments, the multi-frontend clients, and device handoff are all provider-agnostic. A few features lean on Claude Code internals and so apply only to the `claude` harness: backing-session [auto-rotation](#context-reduction-stack), Claude Code slash-command [pass-through](#terminal-client), and `.claude/commands` workspace commands.
 
 ### Terminal client
@@ -139,10 +187,12 @@ Claude
 
 Codeoid records every tool call, result, and reasoning block as an **episode** — stored verbatim, never summarized or truncated, retrievable via hybrid search. Every backend gets four tools:
 
-- `recall(query)` — semantic + keyword search across all prior sessions in this workspace
+- `recall(query)` — semantic + keyword search across all prior sessions in this workspace. A quoted query, a command, a path or an identifier gets the episodes holding it exactly first. `only_failed`, `backend`, `origin` and `cwd` narrow it: `recall("tests", only_failed: true)` finds what failed last time, with its output.
 - `recall_file(path)` — past episodes that touched a file
 - `timeline(limit)` — chronological list of recent activity across sessions
-- `get_episode(id)` — the full verbatim content of one episode, paged for long ones
+- `get_episode(id)` — the full verbatim content of one episode, paged for long ones, or by line ranges: `lines: [[-80, -1]]` returns the end first, where an error is
+
+Each tool call is stored with its exit code (when the backend reports or prints one), the directory it ran in and how long it took, and every episode with the backend, model and whose turn it was (the owner's, another person's, the agent's own background work, a dispatched worker's). The conductor's `fleet_recall` takes the same `only_failed`, `backend` and `origin`.
 
 **Nothing is cut.** A tool result of any size is kept whole, zstd-compressed (a 10 MiB build log stores in about 5 ms at ~5% of its size). What gets full-text indexed and embedded is a bounded view of it — the head, the tail, and the error/warning lines from the middle — so a huge output never stalls the daemon while SQLite indexes it. When [output compression](#context-reduction-stack) shortens a command's output for the agent, memory stores the uncompressed original.
 
@@ -407,6 +457,12 @@ Every run is a normal session you can open, approve, continue or fork from any f
 Each routine can carry its own revocable API token for monitors and deploy scripts, and the `routine_end` hook carries each outcome to Slack or a pager.
 Full guide: [routines.md](routines.md).
 
+### MCP servers on every backend
+
+An MCP server you add through Claude Code reaches every backend in the session, not just Claude: your global servers in every session, your local-scope ones (`claude mcp add`) in sessions in that directory, and a project's own (`.mcp.json`, project settings) once approved — in Claude Code, or with the drawer's **Approve** (`codeoid mcp approve`), which binds to that exact entry.
+The capabilities drawer says, for each, whether it reaches the other backends and why not; changes apply when you choose **Refresh MCP servers** (`/mcp refresh`, `codeoid mcp refresh`), which restarts the backend and resumes the conversation.
+Full rules: [mcp-backends.md](mcp-backends.md).
+
 ### When an MCP server is down
 
 A backend connects its MCP servers when its session starts.
@@ -431,8 +487,8 @@ In codeoid's registry (`"oauth": true`) codeoid signs in itself, from any fronte
 
 **Adopting** moves a server from the first to the second: the same URL, in codeoid's registry, signed in by codeoid.
 
-- **Web:** "Sign in with codeoid" next to a server that needs a sign-in, in the capabilities drawer, adopts it after a confirmation and starts the sign-in.
-- **CLI:** `codeoid mcp adopt <server> [--session <s>] [--url <url>]`, then `codeoid mcp signin <server>`. `--session` also looks in that session's workdir (a `.mcp.json`, project servers); `--url` says which server is meant when two share the name, and is required for a project's own server. The sign-in prints an address to open, and finishes from the address the browser lands on, pasted back (or `--callback-url`).
+- **Web:** "Sign in with codeoid" next to a server that needs a sign-in, in the capabilities drawer, adopts it after a confirmation and starts the sign-in. A project's server whose URL has parts hidden in the drawer (an id or key in its path, a query) isn't offered there: the drawer says to adopt it from the CLI with its full URL, copied from the file.
+- **CLI:** `codeoid mcp adopt <server> [--session <s>] [--url <url>]`, then `codeoid mcp signin <server>`. `--session` also looks in that session's workdir (a `.mcp.json`, project servers); `--url` says which server is meant when two share the name, and is required for a project's own server — in full, copied from the file, when the drawer hides parts of it. The sign-in prints an address to open, and finishes from the address the browser lands on, pasted back (or `--callback-url`).
 
 A server that needs a sign-in points at adopting it (for someone who may adopt), with the command that finds it, in its reconnect answer.
 Once adopted and signed in, Claude sessions use codeoid's copy from their next turn (until then, the CLI's copy is only denied): it is mounted in-process in front of codeoid's own MCP client, so the token never reaches the agent, and the CLI is told not to connect its own copy (by URL), so the server isn't connected twice.
@@ -444,13 +500,14 @@ What can be adopted, and why:
 
 - **Remote streamable-HTTP servers** at an ASCII `https` URL (plain `http` only on this machine; an international domain in its `xn--` form), with no credentials or wildcard in the URL, and no headers in Claude's config (they're often its authorization, and adopting would drop them): codeoid holds the token.
 - **A plain name** (letters, digits, `-`, `_`; no `__`, not starting with `-`), never one of codeoid's own servers in any spelling.
-- **A project's own server** (from a repo's `.mcp.json` or `.claude/` settings) only with its URL named: the repo chose that address, and a codeoid session's Claude connects it without asking, so naming it is the consent. The drawer names it in its confirmation.
+- **A project's own server** (from a repo's `.mcp.json` or `.claude/` settings) only with its URL named: the repo chose that address, and a codeoid session's Claude connects it without asking, so naming it is the consent. The drawer names it in its confirmation. Where the drawer shows the URL with parts hidden, only the full URL is consent: `https://host/…/mcp` doesn't say which tenant or query the repo put behind the `…`.
 - **Never over another server:** not over a codeoid entry of the same name at another URL, nor one whose tools would get the same names; and a project's server never stands in for your own server of that name (or a look-alike) at another address, in any workdir — where your own config has one, codeoid's copy isn't mounted there.
 - **Every entry at that address adoptable:** adopting denies the CLI's copy at that URL whatever it's called, so an entry there that can't be adopted (authorized by headers, say) blocks it.
 
 Adopting is daemon-wide and lasting: the server is in codeoid's registry for every session, as any registry server is. It needs `settings:write`, a token's own (not a delegated one), and every attempt is audited with the file the URL came from.
 A claude.ai connector is signed in from claude.ai's connector settings instead.
-OAuth servers reach the daemon-run backends and Claude; Codex, the Gemini CLI and Qwen don't get them yet.
+OAuth servers reach every backend: the daemon-run ones through codeoid's own MCP client, Claude through an in-process server in front of it, and Codex, the Gemini CLI and Qwen through a loopback relay on the daemon with a per-session token (#396).
+The server's token stays in the daemon either way; a backend never holds it.
 
 ### Driven by other agents (MCP)
 
@@ -497,10 +554,11 @@ Thinking content and sub-agent tool calls surface as separate italic messages. S
 | Pattern | What it does |
 |---|---|
 | **Retry with fallback model** | Exponential backoff with jitter, 429/529/5xx categorization, falls back to cheaper model after 3 capacity failures. |
-| **Graceful shutdown** | LIFO cleanup registry with 30s grace. SIGTERM / SIGINT / SIGHUP handlers drain sessions before closing the store. |
+| **Graceful shutdown** | LIFO cleanup registry with 30s grace. SIGTERM / SIGINT / SIGHUP handlers drain sessions before closing the store: no new turn starts once the drain begins, and every turn still ending (interrupted by the drain, or stopped just before it) has its late result (its last reply, its cost), what its end starts (the sandbox's git and settings-commit check, the end snapshot, `after_turn` hooks; at most 5 s), a routine run's final row with its spend, and its transcript writes recorded first. A backend that never ends its turn holds the shutdown only its settle bound (2 s; opencode 3 s), every session at once, and is named in the log. |
 | **Session resume** | JSONL transcripts per session; user prompts written BEFORE API calls. On daemon restart, sessions rebuild from transcript; `#hasQueried` flag ensures Claude Code's own session store is reused via `resume` instead of re-creating. |
 | **Session limits** | **None by default** — running many sessions in parallel is the point. `rateLimit.maxSessionsPerUser` / `rateLimit.maxCreationsPerHour` default to `0` (unlimited); set either for a shared multi-user daemon. Automated spawning is bounded at its source by `dispatch.maxConcurrentWorkers`. |
 | **Tool approval correlation** | Each approval request has a unique `approvalId`; first response wins; multiple concurrent approvals supported. |
+| **Saved approval rules** | Answer a guarded-mode card once for this session or this repository (`Bash(npm test:*)`, an MCP tool, a fetch host). Every command in a line must be covered, and nothing rated high, not understood or touching credentials runs on a rule. Deny rules refuse in every mode. Listed in Settings → Approvals and `codeoid approvals`; see [approvals.md](approvals.md#saved-rules). |
 | **Subprocess stderr capture** | Claude Code subprocess stderr is piped into the daemon log so SDK-level failures are debuggable. |
 | **Keep-warm interrupt** | Interrupt (Esc / `⏹` / `Ctrl-X`) stops the in-flight turn via the SDK's `Query.interrupt()` — it reaps the running tool but keeps the backing session alive, so your next message continues on the same context. No re-`query()`, no resume handshake. Claude Code parity. |
 | **Never-lose user messages** | A sent message is persisted to the transcript the instant it's accepted — before attachment resolution, rotation, or the SDK call. A failure afterward surfaces a visible `⚠️` row (never a silent drop), and frontends render send rejections instead of swallowing them. |

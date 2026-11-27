@@ -135,3 +135,38 @@ describe("memory tool registry", () => {
     expect(typeof r).toBe("string");
   });
 });
+
+describe("workstream scoping (workstreams §6.4)", () => {
+  async function scoped() {
+    const store = new SqliteEpisodeStore(":memory:");
+    const engine = new MemoryEngine({ store, embedder: new FakeEmbedder() });
+    await engine.init();
+    const ids = {
+      acme: engine.ingest(ep("wsA", "s1", "acme unicorn", "unicorn acme deploy", { workstreamId: "acme" })).id,
+      hf: engine.ingest(ep("wsA", "s2", "hf unicorn", "unicorn hf deploy", { workstreamId: "hf" })).id,
+      legacy: engine.ingest(ep("wsA", "s3", "old unicorn", "unicorn old deploy")).id,
+    };
+    await engine.drain();
+    return { engine, ids };
+  }
+
+  test("episodes keep their workstream; a scoped session reads its home's and the untagged, never another's", async () => {
+    const { engine, ids } = await scoped();
+    expect(engine.getEpisodeScoped(ids.acme, "wsA")?.workstreamId).toBe("acme");
+    const off = engine.scopeSession("me", () => ["acme"]);
+    const ctx: MemoryToolContext = { engine, workspaceId: "wsA", sessionId: "me" };
+    const recall = await defs().recall!.run({ query: "unicorn deploy", limit: 10 }, ctx);
+    expect(recall).toContain("acme unicorn");
+    expect(recall).toContain("old unicorn");
+    expect(recall).not.toContain("hf unicorn");
+    const timeline = await defs().timeline!.run({ limit: 10 }, ctx);
+    expect(timeline).not.toContain("hf unicorn");
+    expect(timeline).toContain("acme unicorn");
+    expect(await defs().get_episode!.run({ episode_id: ids.hf }, ctx)).toContain("not found");
+    // A reference widens it; unscoped (isolation off), everything as before.
+    off();
+    engine.scopeSession("me", () => ["acme", "hf"]);
+    expect(await defs().recall!.run({ query: "unicorn deploy", limit: 10 }, ctx)).toContain("hf unicorn");
+    expect(await defs().recall!.run({ query: "unicorn deploy", limit: 10 }, { ...ctx, sessionId: "other" })).toContain("hf unicorn");
+  });
+});

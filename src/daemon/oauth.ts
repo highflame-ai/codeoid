@@ -21,6 +21,15 @@ export interface OAuthConfig {
   zeroidTokenEndpoint: string;
   /** Registered OAuth client_id (used to identify this codeoid instance) */
   clientId: string;
+  /**
+   * client_id codeoid authenticates as at ZeroID's id_token exchange. ZeroID
+   * (v1.12+) requires an authenticated client and only accepts an ID token
+   * issued to that client (aud/azp), so this is the IdP client the ID token
+   * names: the Google OAuth client id by default.
+   */
+  zeroidClientId: string;
+  /** Secret for zeroidClientId (client_secret_post). Unset sends no secret. */
+  zeroidClientSecret?: string;
   /** Google OAuth client ID — passed to GoogleOAuthProvider */
   googleClientId: string;
   /** Google OAuth client secret — passed to GoogleOAuthProvider */
@@ -266,11 +275,14 @@ export class OAuthHandler {
       grant_type: "urn:ietf:params:oauth:grant-type:token-exchange",
       subject_token_type: "urn:ietf:params:oauth:token-type:id_token",
       subject_token: user.rawIdToken,
-      client_id: this.#config.clientId,
+      client_id: this.#config.zeroidClientId,
       account_id: this.#config.accountId,
       project_id: this.#config.projectId,
       scope,
     });
+    if (this.#config.zeroidClientSecret) {
+      body.set("client_secret", this.#config.zeroidClientSecret);
+    }
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10_000);
@@ -288,7 +300,11 @@ export class OAuthHandler {
 
     if (!resp.ok) {
       const text = await resp.text().catch(() => "");
-      throw new Error(`ZeroID token exchange failed (${resp.status}): ${text.slice(0, 200)}`);
+      const hint =
+        resp.status === 401 && !this.#config.zeroidClientSecret
+          ? " — ZeroID requires client authentication for the id_token exchange; set CODEOID_ZEROID_CLIENT_SECRET"
+          : "";
+      throw new Error(`ZeroID token exchange failed (${resp.status}): ${text.slice(0, 200)}${hint}`);
     }
 
     const data = (await resp.json()) as { access_token?: string };

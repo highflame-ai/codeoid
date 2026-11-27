@@ -16,6 +16,9 @@
  * arguments codex reports, and declined when that is ambiguous (#368).
  */
 
+import type { ApprovalRuleOffer } from "./approval-rules.js";
+import type { ToolRisk } from "./types.js";
+
 // ── Messages (client → daemon) ────────────────────────────────────────────────
 
 /** List the tool calls a session is waiting on, oldest first. Scope: `session:watch`. */
@@ -33,6 +36,19 @@ export interface PendingToolApproval {
   toolName: string;
   /** The input the approval gate received — what runs if approved, within the limits above. */
   input: unknown;
+  /** A shell command's risk (#431). */
+  risk?: ToolRisk;
+  /** Whether it runs inside the session's OS sandbox, and why not (#448; as on the card). */
+  sandboxed?: boolean;
+  sandboxNote?: string;
+  /** The sandbox lets commands reach the container runtime (Docker access). */
+  sandboxDocker?: boolean;
+  /** The rules an answer could save, and where (as on the card). */
+  ruleOffer?: ApprovalRuleOffer;
+  /** The tool call's message: its later state updates (answered, cancelled) reference it. */
+  messageId?: string;
+  /** A send-class fleet call's workstream, and what approving it confirms (workstreams §10; as on the card). */
+  targetWorkstream?: { workstream?: string; warning?: string };
 }
 
 export interface SessionApprovalsResultMsg {

@@ -201,3 +201,25 @@ describe("fork from here (#356)", () => {
     expect(u.getByText(/go back to here/)).toBeTruthy();
   });
 });
+
+describe("tool phase badge (#429)", () => {
+  it("follows the tool's state as it changes in place, as the live store changes it", async () => {
+    const { createStore, produce } = await import("solid-js/store");
+    const [msg, setMsg] = createStore({
+      type: "session.message",
+      sessionId: "s",
+      messageId: "t1",
+      role: "tool_call",
+      content: "Bash(command)",
+      identity: { sub: "x", name: "a", type: "agent" },
+      timestamp: "2026-05-04T08:00:00Z",
+      tool: { toolId: "tool-1", name: "Bash", input: { command: "ls" }, state: { phase: "executing", input: { command: "ls" } } },
+    } as unknown as SessionMessage);
+    const { container } = render(() => <MessageRow msg={msg} />);
+    expect(container.textContent).toContain("executing");
+    // The store mutates the message where it is (applyDelta → mergeDeltaInto).
+    setMsg(produce((m) => { m.tool!.state = { phase: "completed", success: true, output: "ok" } as never; }));
+    expect(container.textContent).toContain("completed");
+    expect(container.textContent).not.toContain("executing");
+  });
+});

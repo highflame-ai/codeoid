@@ -20,7 +20,8 @@
  *      the parent was.
  *
  * Untracked/ignored files are NOT carried (git stash create only snapshots
- * tracked content) — a documented follow-up. Everything here runs the local
+ * tracked content); the repository's setup recipe (workspace-setup.ts) copies
+ * the ignored files it names and shares its dependency dirs. Everything here runs the local
  * `git` binary via execFile (the daemon is co-located with the repo); there is
  * no remote-host tunnel.
  *
@@ -30,21 +31,32 @@
  */
 
 import { execFile } from "node:child_process";
-import { lstatSync, mkdirSync, realpathSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, realpathSync, type Stats, unlinkSync } from "node:fs";
 import path from "node:path";
 import { promisify } from "node:util";
+import { GIT_BIN, hardenedGit, safeGitEnv } from "./git-env.js";
+import { noteCodeoidWorktree } from "./sandbox/worktrees.js";
 
 const execFileP = promisify(execFile);
 
 /**
- * Run git in `cwd`. Generous buffer for large `worktree list` output. Hooks
- * and fsmonitor are off: the daemon runs these on the user's behalf, and a
- * repo the agent can write to must not get code run by them (a
- * `post-checkout` hook would fire on every fork).
+ * Run git in `cwd`. Generous buffer for large `worktree list` output. Nothing
+ * the repository's config names runs (git-env.ts `safeGitEnv`): the daemon
+ * runs these on the user's behalf, and a repo the agent can write to must
+ * not get code run by them — a `post-checkout` hook on every fork, a filter
+ * driver or fsmonitor when a session is destroyed and its work snapshotted.
  */
 async function git(args: string[], cwd: string): Promise<string> {
-  const { stdout } = await execFileP("git", ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", ...args], {
+  return plainGit(args, cwd);
+}
+
+async function plainGit(args: string[], cwd: string): Promise<string> {
+  const { stdout } = await execFileP(GIT_BIN, args, {
     cwd,
+    // An agent's config can make git run a command (a filter on checkout): none
+    // does, and git gets an agent's environment, never the daemon's. A remote
+    // over https or ssh only (a base branch fetched, a partial clone's objects).
+    env: await safeGitEnv(cwd, { network: true }),
     timeout: 120_000,
     maxBuffer: 64 * 1024 * 1024,
   });
@@ -99,8 +111,8 @@ function slug(label: string): string {
  * linked worktree we ask from — so new worktrees anchor beside the main repo
  * (`<repo>-worktrees/<name>`), never nested inside another worktree.
  */
-async function mainWorktreeRoot(workdir: string): Promise<string> {
-  const out = await git(["worktree", "list", "--porcelain"], workdir);
+export async function mainWorktreeRoot(workdir: string, opts: { hardened?: boolean } = {}): Promise<string> {
+  const out = opts.hardened ? await hardenedGit(["worktree", "list", "--porcelain"], workdir) : await git(["worktree", "list", "--porcelain"], workdir);
   const line = out.split("\n").find((l) => l.startsWith("worktree "));
   if (!line) throw new WorktreeError("could not resolve the repo's main worktree");
   return line.slice("worktree ".length).trim();
@@ -127,6 +139,18 @@ export interface ForkWorktree {
    * the parent's workdir then don't line up with the fork's.
    */
   subdirMapped: boolean;
+  /**
+   * With `deferCarry`: the parent's uncommitted tracked state, not yet in the
+   * worktree (which is a clean checkout of `head`). Apply it with
+   * {@link applyCarriedState} once setup has run.
+   */
+  carry?: CarriedState;
+}
+
+/** A parent's uncommitted tracked state (`git stash create`) and the HEAD it sits on. */
+export interface CarriedState {
+  snapshot: string;
+  head: string;
 }
 
 /**
@@ -134,11 +158,16 @@ export interface ForkWorktree {
  * locally resolvable. Rejects a ref that looks like a git flag. Returns the ref
  * (validated to resolve) to hand to `worktree add`.
  */
-async function resolveBaseRef(mainRoot: string, ref: string, opts: { fetch?: boolean } = {}): Promise<string> {
+async function resolveBaseRef(
+  mainRoot: string,
+  ref: string,
+  opts: { fetch?: boolean; git?: (args: string[], cwd: string) => Promise<string> } = {},
+): Promise<string> {
   if (!ref || ref.startsWith("-")) throw new WorktreeError(`invalid base ref: ${JSON.stringify(ref)}`);
+  const run = opts.git ?? git;
   const resolves = async (): Promise<boolean> => {
     try {
-      await git(["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`], mainRoot);
+      await run(["rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`], mainRoot);
       return true;
     } catch {
       return false;
@@ -176,8 +205,23 @@ export async function createForkWorktree(opts: {
    * (an untracked directory isn't carried), so the fork still opens in it.
    */
   ensureSubdir?: boolean;
+  /**
+   * Check out the parent's HEAD clean and hand the uncommitted state back as
+   * `carry` instead of applying it — so a setup command runs against
+   * committed content only, never the parent's (agent-written) edits.
+   */
+  deferCarry?: boolean;
+  /**
+   * git runs as `hardenedGit` does — no filter driver, no network — for a
+   * repository whose config an earlier agent may have written to run one
+   * (a loop's). The repository must not depend on filters.
+   */
+  hardened?: boolean;
+  /** Told the worktree's path before it is made (a loop claims it first). */
+  onPath?: (worktreePath: string) => void;
 }): Promise<ForkWorktree> {
-  const mainRoot = await mainWorktreeRoot(opts.workdir);
+  const mainRoot = await mainWorktreeRoot(opts.workdir, { hardened: opts.hardened === true });
+  const git = opts.hardened ? (args: string[], cwd: string) => hardenedGit(args, cwd) : plainGit;
 
   const name = `${slug(opts.label)}-${opts.shortId}`;
   const branch = `codeoid/${name}`;
@@ -191,23 +235,34 @@ export async function createForkWorktree(opts: {
   let base: string;
   let parentHead: string | null = null;
   let carriedSnapshot = false;
+  let deferred: CarriedState | undefined;
   if (opts.baseCommit) {
     if (!/^[0-9a-f]{40,64}$/.test(opts.baseCommit)) throw new WorktreeError("invalid base commit");
     // Local when it was recorded: a miss means it's gone (gc'd), not remote.
-    base = await resolveBaseRef(mainRoot, opts.baseCommit, { fetch: false });
+    base = await resolveBaseRef(mainRoot, opts.baseCommit, { fetch: false, git });
   } else if (opts.baseBranch) {
     base = await resolveBaseRef(mainRoot, opts.baseBranch);
   } else {
     try {
       parentHead = (await git(["rev-parse", "HEAD"], opts.workdir)).trim();
-    } catch {
+    } catch (err) {
+      // Hardened git refuses some repositories outright; say why.
+      if (err instanceof Error && err.message.includes("refusing to run git")) throw new WorktreeError(err.message);
       throw new WorktreeError("repository has no commits yet (unborn HEAD)");
     }
     const snapshot = (await git(["stash", "create"], opts.workdir)).trim();
-    base = snapshot || parentHead;
-    carriedSnapshot = snapshot.length > 0;
+    if (snapshot && opts.deferCarry) {
+      base = parentHead;
+      deferred = { snapshot, head: parentHead };
+    } else {
+      base = snapshot || parentHead;
+      carriedSnapshot = snapshot.length > 0;
+    }
   }
 
+  opts.onPath?.(worktreePath);
+  // codeoid's own: a session's sandbox holds it like the user's, even one started before it was made (sandbox/worktrees.ts).
+  noteCodeoidWorktree(worktreePath);
   try {
     // --end-of-options: treat `base` as a rev, never a flag, so a value
     // starting with '-' can't inject a git option.
@@ -259,7 +314,43 @@ export async function createForkWorktree(opts: {
     subdirMapped = false;
   }
 
-  return { path: worktreePath, workdir, branch, subdirMapped };
+  return { path: worktreePath, workdir, branch, subdirMapped, ...(deferred ? { carry: deferred } : {}) };
+}
+
+/**
+ * Apply a deferred {@link CarriedState} to a worktree: its tracked files
+ * become the snapshot's (edits and deletions included) as UNCOMMITTED
+ * changes — the index stays at HEAD, exactly as the immediate path's
+ * `reset --mixed` leaves it. Untracked and ignored files (what a setup recipe
+ * put there) are left alone. Throws {@link WorktreeError}.
+ */
+export async function applyCarriedState(worktreePath: string, carry: CarriedState, opts: { hardened?: boolean } = {}): Promise<void> {
+  if (!/^[0-9a-f]{40,64}$/.test(carry.snapshot)) throw new WorktreeError("invalid carried snapshot");
+  const git = opts.hardened ? (args: string[], cwd: string) => hardenedGit(args, cwd) : plainGit;
+  try {
+    await git(["restore", `--source=${carry.snapshot}`, "--worktree", "--", "."], worktreePath);
+  } catch (err) {
+    const why = err instanceof Error ? err.message : String(err);
+    // Never leave a half-carried tree: put the tracked files back to HEAD
+    // and take out the files the carry added.
+    let added: string[] = [];
+    try {
+      added = (await git(["diff", "--name-only", "-z", "--no-renames", "--diff-filter=A", carry.head, carry.snapshot], worktreePath)).split("\0").filter(Boolean);
+    } catch {
+      // the snapshot is unreadable, so the restore wrote nothing of it
+    }
+    try {
+      await git(["restore", "--source=HEAD", "--worktree", "--", "."], worktreePath);
+      removeSetupArtifacts(worktreePath, { copied: added });
+    } catch (rollbackErr) {
+      throw new WorktreeError(
+        `couldn't carry the uncommitted changes (${why}), and putting the worktree back to its last commit failed too, so they may be partially applied: ${
+          rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr)
+        }`,
+      );
+    }
+    throw new WorktreeError(`couldn't carry the uncommitted changes (${why}); the worktree was put back to its last commit`);
+  }
 }
 
 /**
@@ -301,8 +392,24 @@ export async function removeForkWorktree(opts: {
   worktreePath: string;
   branch?: string;
   deleteBranch?: boolean;
+  /**
+   * What the workspace setup recipe put in the worktree (worktree-relative,
+   * see workspace-setup.ts). Taken out BEFORE the WIP snapshot: a copied
+   * secret must never land in a commit (even if the agent un-ignored it), and
+   * a shared directory's symlink is the primary checkout's, not the fork's work.
+   */
+  setup?: { copied?: readonly string[]; shared?: readonly string[] };
+  /** Commit what's left in the worktree to the kept branch first (default
+   *  true). A loop's worktree turns it off: its branch holds only what the
+   *  run delivered, never what a worker left behind. */
+  snapshot?: boolean;
+  /** git runs as `hardenedGit` (a loop's worktree; see createForkWorktree). */
+  hardened?: boolean;
 }): Promise<void> {
-  const mainRoot = await mainWorktreeRoot(opts.workdir).catch(() => opts.workdir);
+  const mainRoot = await mainWorktreeRoot(opts.workdir, { hardened: opts.hardened === true }).catch(() => opts.workdir);
+  const admin = opts.hardened ? (args: string[], cwd: string) => hardenedGit(args, cwd) : git;
+
+  if (opts.setup) removeSetupArtifacts(opts.worktreePath, opts.setup);
 
   // Preserve uncommitted work on the KEPT branch before the forced removal —
   // otherwise `worktree remove --force` silently discards it, and "the branch
@@ -311,7 +418,7 @@ export async function removeForkWorktree(opts: {
   // and hermetic: a pinned identity means it works with no user git config;
   // `add -A` also sweeps in untracked files. On any failure we just proceed to
   // remove (no worse than before).
-  if (!opts.deleteBranch) {
+  if (!opts.deleteBranch && opts.snapshot !== false && existsSync(opts.worktreePath)) {
     try {
       const dirty = (await git(["status", "--porcelain"], opts.worktreePath)).trim();
       if (dirty) {
@@ -324,23 +431,69 @@ export async function removeForkWorktree(opts: {
             "user.name=codeoid",
             "commit",
             "--no-verify",
+            // codeoid's own commit: never waits on a signing key it may not reach.
+            "--no-gpg-sign",
             "-m",
             "codeoid: WIP snapshot saved on session destroy",
           ],
           opts.worktreePath,
         );
       }
-    } catch {
-      // No commit identity / hook refusal / already-clean race — fall through.
+    } catch (err) {
+      // Work that couldn't be saved is never thrown away: the worktree stays.
+      // Unknown counts as dirty: work is never discarded on a guess.
+      const still = await git(["status", "--porcelain"], opts.worktreePath).catch(() => "?");
+      if (still.trim()) {
+        console.error(
+          `[codeoid/worktree] kept ${opts.worktreePath}: its uncommitted work couldn't be saved to ${opts.branch ?? "its branch"} (${err instanceof Error ? err.message : String(err)})`,
+        );
+        return;
+      }
     }
   }
 
-  await git(["worktree", "remove", "--force", opts.worktreePath], mainRoot).catch(() => {});
+  await admin(["worktree", "remove", "--force", opts.worktreePath], mainRoot).catch(() => {});
   // Prune any dangling administrative entry even if the dir was already gone.
-  await git(["worktree", "prune"], mainRoot).catch(() => {});
+  await admin(["worktree", "prune"], mainRoot).catch(() => {});
   if (opts.deleteBranch && opts.branch) {
-    await git(["branch", "-D", opts.branch], mainRoot).catch(() => {});
+    await admin(["branch", "-D", opts.branch], mainRoot).catch(() => {});
   }
+}
+
+/**
+ * Take the setup recipe's files back out of a worktree: copied files (plain
+ * files only) and shared-directory symlinks (only while still symlinks — a
+ * directory the agent put there instead is its work). Best-effort, never
+ * throws, and never follows a symlink: a path whose parent is one is left
+ * alone, so this can only ever unlink an entry inside `root`.
+ */
+function removeSetupArtifacts(root: string, setup: { copied?: readonly string[]; shared?: readonly string[] }): void {
+  const entry = (rel: string): string | null => {
+    const parts = rel.split("/");
+    if (!rel || path.isAbsolute(rel) || parts.some((p) => !p || p === "." || p === "..")) return null;
+    let at = root;
+    for (const part of parts.slice(0, -1)) {
+      at = path.join(at, part);
+      try {
+        const st = lstatSync(at);
+        if (st.isSymbolicLink() || !st.isDirectory()) return null;
+      } catch {
+        return null;
+      }
+    }
+    return path.join(root, rel);
+  };
+  const unlinkIf = (rel: string, ok: (st: Stats) => boolean) => {
+    const at = entry(rel);
+    if (!at) return;
+    try {
+      if (ok(lstatSync(at))) unlinkSync(at);
+    } catch {
+      // already gone
+    }
+  };
+  for (const rel of setup.shared ?? []) unlinkIf(rel, (st) => st.isSymbolicLink());
+  for (const rel of setup.copied ?? []) unlinkIf(rel, (st) => st.isFile() || st.isSymbolicLink());
 }
 
 /** Current branch of a workdir (for bind mode), or null when detached/non-repo. */

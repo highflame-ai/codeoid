@@ -14,13 +14,23 @@
  *      the parsed config, not env vars, so we can mock cleanly in tests.
  */
 
+import type { ModelPrice } from "./daemon/pricing/index.js";
+import type { SandboxConfig } from "./daemon/sandbox/policy.js";
+import { DEFAULT_HOME_READABLE } from "./daemon/sandbox/home-readable.js";
+import { validAllowedHost } from "./daemon/sandbox/hosts.js";
+import { PROJECT_ROOT_PARENT, projectRootProblem } from "./daemon/sandbox/dir-rules.js";
+import { worktreeRootProblem } from "./daemon/sandbox/worktrees.js";
+import { workstreamsSchema, type WorkstreamsConfig } from "./daemon/workstreams/schema.js";
+import { credentialProblems, credentialsSchema, secretStoreSchema, type CredentialDecl, type SecretStoreConfig } from "./daemon/credentials/schema.js";
 import { existsSync, readFileSync, mkdirSync, writeFileSync, renameSync, chmodSync, rmSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { join, isAbsolute, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
 import { z } from "zod";
+import { EFFORT_LEVELS, type EffortLevel } from "./protocol/types.js";
 import type { AuthConfig } from "./daemon/auth.js";
 import type { OAuthConfig } from "./daemon/oauth.js";
+import type { WorktreeSetupPolicy } from "./daemon/workspace-setup.js";
 import {
   isLoopbackHost,
   LOCAL_TOKEN_ENV,
@@ -141,6 +151,16 @@ export function isLoopbackUrl(url: string): boolean {
  * optional surrounding single/double quotes are stripped. Intentionally
  * minimal — not a full dotenv dialect (no interpolation, no multiline).
  */
+const shadowedDotEnv = new Set<string>();
+
+/**
+ * Whether `.env` sets `key` but the daemon's real environment set it first,
+ * so the file's value isn't the one in use (recorded by `loadDotEnv`).
+ */
+export function dotEnvShadowed(key: string): boolean {
+  return shadowedDotEnv.has(key);
+}
+
 export function loadDotEnv(): string[] {
   const envPath = join(getConfigDir(), ".env");
   if (!existsSync(envPath)) return [];
@@ -159,7 +179,10 @@ export function loadDotEnv(): string[] {
     const key = line.slice(0, eq).trim();
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) continue;
     // Real environment wins — file is the fallback, not an override.
-    if (process.env[key] !== undefined) continue;
+    if (process.env[key] !== undefined) {
+      shadowedDotEnv.add(key);
+      continue;
+    }
     let value = line.slice(eq + 1).trim();
     if (
       value.length >= 2 &&
@@ -223,6 +246,142 @@ export function resolveZeroidUrl(value: string): string {
  * passed through so future additions don't break older loaders. Required
  * fields are minimal (nothing) — defaults cover everything.
  */
+/**
+ * How the approval gate treats shell commands by risk (#431). High-risk
+ * commands always ask, in every mode; these settings cover the rest.
+ */
+const ApprovalsSchema = z
+  .object({
+    /**
+     * In guarded mode, run low-risk commands without asking. Low is a strict
+     * allow-list (vetted read-only programs, every path in the workspace, no
+     * `cd`, variables or writing redirects); anything else is at least medium.
+     */
+    autoAllowLowRisk: z.boolean().default(false),
+    /**
+     * No effect since autonomous mode relies on the OS sandbox (#448):
+     * guarded mode asks about every command that isn't low, and autonomous
+     * mode asks about none. Kept so a config that sets it still loads.
+     */
+    askOnUnknown: z.boolean().default(true),
+    /** How long an "allow for this session" rule lasts, in hours (docs/secrets-and-memory-design.md §4.1). */
+    sessionGrantHours: z.number().positive().max(24 * 30).default(8),
+  })
+  .default({ autoAllowLowRisk: false, askOnUnknown: true, sessionGrantHours: 8 });
+
+/**
+ * OS sandbox for what agents run (#448, docs/sandbox.md): on by default.
+ * The workspace and a private temp dir are writable, credential locations
+ * hidden, container sockets unreachable; the network per `network`.
+ */
+const SandboxSchema = z
+  .object({
+    /**
+     * `auto` (bubblewrap on Linux, Seatbelt on macOS), `off`, or a provider id
+     * (sandbox/registry.ts). Closed: a typo fails the load rather than leaving
+     * every session unsandboxed; a new provider adds its id here.
+     */
+    provider: z.enum(["auto", "off", "bwrap", "seatbelt", "docker"]).default("auto"),
+    /** What a sandboxed command may reach: everything, nothing, or `allowedHosts`. */
+    network: z.enum(["on", "off", "allowlist"]).default("on"),
+    /** Each a domain, a `*.` wildcard of one, or `localhost` (as a session's own allowlist). */
+    allowedHosts: z.array(z.string().min(1).max(253).refine(validAllowedHost, "not a host an allowlist can name")).max(256).default([]),
+    /** Paths hidden on top of the built-in list (`~` expands). */
+    hiddenPaths: z.array(z.string().min(1).max(4096)).max(256).default([]),
+    /** What of the hidden home stays readable, read-only (`~` expands): toolchains and tool settings with no secrets. */
+    homeReadable: z.array(z.string().min(1).max(4096)).max(256).default([...DEFAULT_HOME_READABLE]),
+    /**
+     * More places a sandboxed command may check a worktree of its repository
+     * out, on top of `<repo>-worktrees/` and `<repo>/.worktrees/` (`~`
+     * expands; a relative one is the repository's main checkout's): each
+     * repository gets `<root>/<repo>/`, each session its own folder there.
+     * Refused: `/`, the home or a dir holding it, a hidden dir of the home,
+     * `~/Library`, codeoid's config dir, a system dir (worktreeRootProblem).
+     */
+    worktreeRoots: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(4096)
+          .superRefine((root, ctx) => {
+            // Never a place whose contents run outside the sandbox, the home or `/` (#448 round 10, sandbox/worktrees.ts).
+            const problem = worktreeRootProblem(root, { configDir: getConfigDir() });
+            if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `not a worktree root: ${problem}` });
+          }),
+      )
+      .max(64)
+      .default([]),
+    /**
+     * Where sandboxed commands read other repositories, read-only (docs/sandbox.md,
+     * "Working across repositories"): `@parent` (the parent of the session's
+     * repository, the default), or absolute paths (`~` expands). `[]`: none.
+     * Refused as worktree roots are (never `/`, the home, a hidden dir of it, …),
+     * and never the host's temp dir or anything in it; a default that would be
+     * the home or in a temp dir falls back to none, said on the session.
+     */
+    projectRoots: z
+      .array(
+        z
+          .string()
+          .min(1)
+          .max(4096)
+          .superRefine((root, ctx) => {
+            if (root === PROJECT_ROOT_PARENT) return;
+            const problem = projectRootProblem(root, { configDir: getConfigDir() });
+            if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `not a project root: ${problem}` });
+          }),
+      )
+      .max(64)
+      .default([PROJECT_ROOT_PARENT]),
+    /** The bwrap binary (default: on PATH). */
+    bwrapPath: z.string().refine(isAbsolute, "must be an absolute path").optional(),
+    docker: z
+      .object({
+        image: z.string().min(1).max(512).default("node:22-bookworm-slim"),
+        runtime: z.string().min(1).max(64).optional(),
+        /** Let sandboxed commands reach the host's container runtime socket (root-equivalent): off by default. */
+        socket: z.boolean().default(false),
+      })
+      .default({ image: "node:22-bookworm-slim", socket: false }),
+    /** The git gateway (docs/git-gateway-design.md): agents' own git reaching remotes their owner connected. */
+    git: z.object({ enabled: z.boolean().default(true) }).default({ enabled: true }),
+    /** Agents' pushes through the git gateway (docs/git-gateway-design.md, docs/sandbox.md "Git fetch and push"). */
+    push: z
+      .object({
+        enabled: z.boolean().default(true),
+        /** Never pushed to (besides the remote's default branch); a trailing `*` matches a prefix (`release/*`). */
+        protectedBranches: z.array(z.string().min(1).max(255)).max(64).default(["main", "master"]),
+      })
+      .default({ enabled: true, protectedBranches: ["main", "master"] }),
+  })
+  .default({ provider: "auto", network: "on", allowedHosts: [], hiddenPaths: [], homeReadable: [...DEFAULT_HOME_READABLE], worktreeRoots: [], projectRoots: [PROJECT_ROOT_PARENT], docker: { image: "node:22-bookworm-slim", socket: false }, git: { enabled: true }, push: { enabled: true, protectedBranches: ["main", "master"] } });
+
+/** Secrets in what codeoid stores (docs/secrets-and-memory-design.md §2). */
+const SecretsSchema = z
+  .object({
+    /** Scrub stored conversations: off only to debug. */
+    enabled: z.boolean().default(true),
+    /**
+     * Also scrub what goes back to the model where codeoid hands it over (MCP
+     * results through the hub, the tool loops codeoid runs): the model gets a
+     * secret as a reference. Off: only what is stored is scrubbed.
+     */
+    beforeModel: z.boolean().default(true),
+    /** For sessions with no workstream; a workstream's own `captureSecrets` decides for its sessions. */
+    captureSecrets: z.enum(["drop", "vault"]).default("drop"),
+    /** Kept secrets not seen for this many days are forgotten. */
+    vaultDays: z.number().int().min(1).max(3650).default(30),
+    /** Commands (a program, or an argv prefix) whose calls aren't stored at all. */
+    dropCommands: z.array(z.string().min(1).max(256)).max(256).default([]),
+    /** More files whose contents are credentials (globs, by name or by path; `~` is the home). */
+    credentialFiles: z.array(z.string().min(1).max(1024)).max(256).default([]),
+  })
+  .strict()
+  .default({ enabled: true, beforeModel: true, captureSecrets: "drop", vaultDays: 30, dropCommands: [], credentialFiles: [] });
+
+export type SecretsConfig = z.infer<typeof SecretsSchema>;
+
 const CompressSchema = z
   .object({
     enabled: z.boolean().default(false),
@@ -341,6 +500,29 @@ const TelemetrySchema = z
   })
   .default({ osc8: "auto" });
 
+/** A model's price, USD per million tokens (#430). */
+const ModelPriceSchema = z.object({
+  input: z.number().nonnegative(),
+  output: z.number().nonnegative(),
+  cacheRead: z.number().nonnegative().optional(),
+  cacheWrite: z.number().nonnegative().optional(),
+  inputAbove200k: z.number().nonnegative().optional(),
+  outputAbove200k: z.number().nonnegative().optional(),
+  cacheReadAbove200k: z.number().nonnegative().optional(),
+  cacheWriteAbove200k: z.number().nonnegative().optional(),
+});
+
+/**
+ * Prices for estimating the cost of a turn on a backend that reports tokens
+ * but no cost (#430). Wins over the built-in snapshot; `{ input: 0, output: 0 }`
+ * marks a model as free.
+ */
+const PricingSchema = z
+  .object({
+    models: z.record(z.string().min(1), ModelPriceSchema).default({}),
+  })
+  .default({ models: {} });
+
 /**
  * Auto-rotation: proactively roll over Claude Code's backing session when
  * the context window gets close to the compaction ceiling. Codeoid's
@@ -371,6 +553,12 @@ const SessionSchema = z
     defaultProvider: z.string().trim().min(1).optional(),
     defaultModel: z.string().optional(),
     fallbackModel: z.string().optional(),
+    /**
+     * Thinking effort for a session created without one (#417), on codeoid's
+     * scale; each backend maps it (docs/thinking-effort.md). Unset = the
+     * backend's own default.
+     */
+    defaultEffort: z.enum(EFFORT_LEVELS).optional(),
     /**
      * Hard backstop against a wedged turn. If the provider event stream goes
      * completely silent (no events at all) for this many ms while the MODEL
@@ -414,6 +602,15 @@ const SessionSchema = z
      */
     resumeMaxSessions: z.number().int().min(1).default(200),
     /**
+     * Resume sessions without loading their history: a resumed session holds
+     * its metadata only, and loads its scrollback and canonical history the
+     * first time something uses them (attach, a prompt, a fork, …). Most
+     * resumed sessions are never opened before the next restart, and their
+     * history was most of the daemon's memory. Off = load every session's at
+     * start, as before.
+     */
+    lazyLoad: z.boolean().default(true),
+    /**
      * Per-turn workspace snapshots (#354): at the start of every turn the
      * session's working directory (minus .gitignore'd files, secrets and
      * dependency dirs) is recorded in a daemon-owned shadow git repository
@@ -454,16 +651,26 @@ const SessionSchema = z
      * The transcript is still the fallback. Off = transcript everywhere.
      */
     nativeContinuation: z.boolean().default(true),
+    /**
+     * Minutes a session may sit idle before its backend process (the Claude
+     * CLI, codex, pi, the Gemini CLI, Qwen) and the MCP servers it started are
+     * stopped (#451). The next message starts it again and resumes the same
+     * conversation. Never while a turn, background work or an approval is
+     * pending. 0 keeps every backend running for the daemon's lifetime.
+     */
+    idleReleaseMinutes: z.number().min(0).default(30),
   })
   .default({
     turnStallTimeoutMs: 300_000,
     mcpToolTimeoutMs: 120_000,
     attachTailBytes: 512 * 1024,
     resumeMaxSessions: 200,
+    lazyLoad: true,
     seedBudgetChars: 0,
     seedCharsPerToken: 2,
     seedWindowFraction: 0.7,
     nativeContinuation: true,
+    idleReleaseMinutes: 30,
   })
   // Enforce the "SDK signals first" contract across BOTH fields — not just the
   // defaults. An env override / config file could otherwise set the MCP timeout
@@ -556,6 +763,14 @@ const AuthSchemaFields = z
 const OAuthSchemaFields = z
   .object({
     clientId: z.string().optional(),
+    /**
+     * client_id codeoid authenticates as at ZeroID for the id_token exchange.
+     * ZeroID only lets the relying party an ID token was issued to redeem it
+     * (aud/azp), so this must be the client the IdP issued the ID token to.
+     * Defaults to GOOGLE_CLIENT_ID. Its secret comes from
+     * CODEOID_ZEROID_CLIENT_SECRET (env only, never config.json).
+     */
+    zeroidClientId: z.string().optional(),
   })
   .default({});
 
@@ -601,6 +816,12 @@ const DispatchSchema = z
     workerToolBudget: z.number().int().min(1).default(50),
     /** Base retry backoff (ms) for retryable failures — doubles per attempt, capped at leaseMs. */
     retryBaseMs: z.number().int().min(0).default(15_000),
+    /**
+     * Longest a loop attempt may stay `held` on an approval (ms). A held attempt
+     * keeps its worker session and occupies a `maxConcurrentWorkers` slot, so
+     * past this the hold lapses and the attempt settles as reclaimed.
+     */
+    holdMaxMs: z.number().int().min(60_000).default(2 * 60 * 60_000),
   })
   .default({
     enabled: true,
@@ -610,6 +831,7 @@ const DispatchSchema = z
     maxConcurrentWorkers: 2,
     workerToolBudget: 50,
     retryBaseMs: 15_000,
+    holdMaxMs: 2 * 60 * 60_000,
   });
 
 /**
@@ -640,6 +862,17 @@ const RoutinesSchema = z
     apiFiresPerHour: 30,
     missedGraceSeconds: 120,
   });
+
+/**
+ * Loops (docs/loops.md). `watchPollSeconds` is how often loop watches read
+ * GitHub for failing checks and review comments; a watch costs nothing
+ * between polls.
+ */
+const LoopsSchema = z
+  .object({
+    watchPollSeconds: z.number().int().min(60).max(86_400).default(300),
+  })
+  .default({ watchPollSeconds: 300 });
 
 /**
  * Outward control-plane MCP endpoint (`/mcp/control`, docs/mcp-control.md):
@@ -783,8 +1016,29 @@ const EmbedSchema = z
   .default({ allowedOrigins: [] });
 
 /** Per-backend provider settings. Append-only — one optional block per provider. */
+/**
+ * An opencode model id as codeoid hands it to opencode (`provider/model`):
+ * nothing opencode would substitute (`{file:…}`, `{env:…}`: it would read a
+ * file or variable into the id, sent with every request), no quote,
+ * backslash, whitespace or control character.
+ */
+export const OPENCODE_MODEL_ID = /^[^/\s{}"\\\u0000-\u001f]+\/[^\s{}"\\\u0000-\u001f]+$/;
+
 const ProvidersSchema = z
   .object({
+    /** Claude Code, driven in-process via `@anthropic-ai/claude-agent-sdk`. */
+    claude: z
+      .object({
+        /**
+         * Run this Claude Code CLI instead of the one bundled in the Agent
+         * SDK: a name on PATH (`claude`, the system install) or an absolute
+         * path. Omit for the bundled CLI, the version codeoid's sandbox is
+         * tested against. Used only when it reports a version no older than
+         * the bundled one (providers/claude/executable.ts).
+         */
+        command: z.string().optional(),
+      })
+      .default({}),
     /** pi coding agent (https://pi.dev) driven over `pi --mode rpc`. */
     pi: z
       .object({
@@ -864,15 +1118,63 @@ const ProvidersSchema = z
          * typed a word. codeoid's own memory tools are always offered.
          */
         mcpServers: z.array(z.string()).default([]),
+        /**
+         * Its turns cost nothing (#430). Unset: only a server on this machine
+         * (loopback) is; set true for your own server elsewhere on your
+         * network, false for one that bills (a gateway to a paid API).
+         */
+        free: z.boolean().optional(),
       })
       .default({ enabled: false, baseUrl: "http://127.0.0.1:8080/v1", apiKey: "sk-local", mcpServers: [] }),
+    /**
+     * opencode 2.x (https://opencode.ai), driven over its HTTP server. codeoid
+     * runs ONE private `opencode serve` per daemon, started on the first
+     * opencode session (docs/opencode.md).
+     */
+    opencode: z
+      .object({
+        /** Register the opencode backend in the provider catalog. */
+        enabled: z.boolean().default(true),
+        /** Binary to spawn — override for a wrapper script or absolute path. */
+        command: z.string().default("opencode"),
+        /**
+         * opencode's database for codeoid's sessions. Default: an `opencode`
+         * folder beside codeoid's own database (`dbPath`). Relative paths
+         * resolve from codeoid's config dir. Never the user's own opencode DB.
+         */
+        dbPath: z.string().optional(),
+        /**
+         * opencode's data, logs, state and caches (its XDG base dirs).
+         * Default: an `opencode` folder beside codeoid's transcript
+         * directory. Relative paths resolve from codeoid's config dir. Never
+         * the user's own `~/.local/share/opencode` or `~/.cache/opencode`.
+         */
+        dataDir: z.string().optional(),
+        /** opencode agent sessions run (`build`, `plan`, or a custom one); omit for opencode's default. */
+        agent: z.string().optional(),
+        /** Default model (`provider/model`, e.g. `anthropic/claude-sonnet-5`) when a session doesn't pick one; omit for opencode's default. */
+        model: z
+          .string()
+          .regex(OPENCODE_MODEL_ID, "must be `provider/model`, without `{`, `}`, quotes, backslashes or spaces")
+          .optional(),
+        /**
+         * Offer opencode's own hosted models (provider `opencode`: opencode.ai
+         * / Zen, its free no-key models included) and let the server fetch
+         * its model catalog from opencode.ai. Off: a session's prompts never
+         * go to a vendor codeoid wasn't given a credential for.
+         */
+        hostedModels: z.boolean().default(false),
+      })
+      .default({ enabled: true, command: "opencode", hostedModels: false }),
   })
   .default({
+    claude: {},
     pi: { enabled: true, command: "pi" },
     codex: { enabled: true, command: "codex" },
     geminiCli: { enabled: true, command: "gemini" },
     qwen: { enabled: true },
     llamacpp: { enabled: false, baseUrl: "http://127.0.0.1:8080/v1", apiKey: "sk-local", mcpServers: [] },
+    opencode: { enabled: true, command: "opencode", hostedModels: false },
   });
 
 /**
@@ -1116,20 +1418,31 @@ const RootSchema = z.object({
   memory: MemorySchema,
   workspaceIndex: WorkspaceIndexSchema,
   compress: CompressSchema,
+  secrets: SecretsSchema,
+  approvals: ApprovalsSchema,
+  sandbox: SandboxSchema,
   guard: GuardSchema,
   labeling: LabelingSchema,
   telemetry: TelemetrySchema,
+  pricing: PricingSchema,
   autoRotate: AutoRotateSchema,
   session: SessionSchema,
   conductor: ConductorSchema,
   dispatch: DispatchSchema,
   mcpControl: McpControlSchema,
   routines: RoutinesSchema,
+  loops: LoopsSchema,
   collaboration: CollaborationSchema,
   rateLimit: RateLimitSchema,
   pipeline: PipelineSchema,
   providers: ProvidersSchema,
   mcpServers: McpServersSchema,
+  /** Named lines of work (docs/workstreams-design.md). */
+  workstreams: workstreamsSchema,
+  /** Named credentials: ids and kinds only, never values (workstreams G2). */
+  credentials: credentialsSchema,
+  /** Where credential values live (workstreams G2). */
+  credentialStore: secretStoreSchema,
   hooks: HooksSchema,
   embed: EmbedSchema,
   push: PushSchema,
@@ -1151,6 +1464,43 @@ const RootSchema = z.object({
       setup: z.string().optional(),
     })
     .default({}),
+  /** Worktrees codeoid creates (forks, compare, routines). */
+  worktree: z
+    .object({
+      /** The repository setup recipe, `.codeoid/setup.yaml` (src/daemon/workspace-setup.ts). */
+      setup: z
+        .object({
+          /** Whether a recipe's `command` may run. `never` (default) still copies
+           *  and shares files; `trusted-repos` runs it only while the recipe is
+           *  the one trusted in `trustedRepos`. Reading a recipe executes nothing. */
+          runCommands: z.enum(["never", "trusted-repos"]).default("never"),
+          /** Trusted recipes, written by `codeoid worktree trust`: the primary
+           *  checkout and the recipe's git blob id (a changed recipe runs no
+           *  command until trusted again). A bare path is the older shape and
+           *  trusts no command. Paths are absolute. */
+          trustedRepos: z
+            .array(
+              z.union([
+                z.string().min(1).refine(isAbsolute, "must be an absolute path"),
+                z
+                  .object({
+                    path: z.string().min(1).refine(isAbsolute, "must be an absolute path"),
+                    recipeHash: z.string().regex(/^[0-9a-f]{40,64}$/, "must be a git blob id"),
+                    /** Who trusted it: honoured only for that owner's sessions. Absent = every owner. */
+                    trustedBy: z.string().min(1).max(512).optional(),
+                  })
+                  .strict(),
+              ]),
+            )
+            .max(256)
+            .default([]),
+        })
+        .default({ runCommands: "never", trustedRepos: [] }),
+    })
+    .default({ setup: { runCommands: "never", trustedRepos: [] } }),
+}).superRefine((cfg, ctx) => {
+  // Credential references across sections (workstreams G2): declared once, of a kind that fits.
+  for (const p of credentialProblems(cfg)) ctx.addIssue({ code: z.ZodIssueCode.custom, message: p.message, path: p.path });
 });
 
 type ParsedConfig = z.infer<typeof RootSchema>;
@@ -1218,6 +1568,23 @@ export interface CodeoidConfig {
     timeThresholdMs: number;
     debounceMs: number;
   };
+  /**
+   * Shell command approvals by risk (#431). Optional on the type so a
+   * hand-built config literal need not carry it; the defaults apply.
+   */
+  approvals?: { autoAllowLowRisk: boolean; askOnUnknown: boolean; sessionGrantHours?: number };
+  /**
+   * OS sandbox (#448, sandbox/policy.ts `SandboxConfig`). Optional on the
+   * type so a hand-built config literal need not carry it; absent = the
+   * defaults (on, `auto`, network on).
+   */
+  sandbox?: SandboxConfig;
+  /**
+   * Secrets in what codeoid stores (docs/secrets-and-memory-design.md §2).
+   * Optional on the type so a hand-built config literal need not carry it;
+   * absent = the defaults (on, detected values dropped).
+   */
+  secrets?: SecretsConfig;
   /** Homegrown CLI output compressor (RTK-style). Disabled by default. */
   compress: {
     enabled: boolean;
@@ -1248,6 +1615,10 @@ export interface CodeoidConfig {
   telemetry: {
     osc8: "auto" | "force" | "disable";
   };
+  /** Model prices that override the built-in snapshot (#430); keyed by model id. */
+  pricing?: {
+    models: Record<string, ModelPrice>;
+  };
   /** Auto-rotation of the Claude Code backing session near the context ceiling. */
   autoRotate: {
     enabled: boolean;
@@ -1263,14 +1634,20 @@ export interface CodeoidConfig {
     defaultProvider?: string;
     defaultModel?: string;
     fallbackModel?: string;
+    /** Thinking effort for a new session (#417); unset = the backend's default. */
+    defaultEffort?: EffortLevel;
     /** Stall watchdog: ms of event-stream silence while the model should be generating before a turn is force-recovered (0 = off; paused during tool execution and pending approvals). Defaults to 300000 when omitted. */
     turnStallTimeoutMs?: number;
     /** Per-call timeout (ms) for external MCP servers, surfaced as the SDK's per-server `timeout`. 0 = use SDK default. Defaults to 120000 when omitted. */
     mcpToolTimeoutMs?: number;
     /** Tail window (bytes) replayed on attach for `scrollback.paging` clients; older history is paged on demand. Defaults to 524288 (512 KiB) when omitted. */
     attachTailBytes?: number;
+    /** Minutes idle before a session's backend process and its MCP servers are stopped; the next message resumes (#451). 0 = never. Defaults to 30 when omitted. */
+    idleReleaseMinutes?: number;
     /** Sessions restored from disk at daemon start, newest-first by last activity. Resume is also time-boxed, so this is the coarse guard; the remainder stays on disk. Defaults to 200 when omitted. */
     resumeMaxSessions?: number;
+    /** Load a resumed session's history the first time it is used, not at start. Defaults to true when omitted. */
+    lazyLoad?: boolean;
     /** Per-turn workspace snapshots (#354). Enabled unless `enabled: false`. */
     checkpoints?: {
       enabled?: boolean;
@@ -1307,6 +1684,16 @@ export interface CodeoidConfig {
     setup?: string;
   };
   /**
+   * Worktrees codeoid creates. `setup` is the trust policy for the
+   * repository's `.codeoid/setup.yaml` recipe (workspace-setup.ts): its
+   * files are always applied; its command runs only under
+   * `runCommands: "trusted-repos"` for a recipe pinned in `trustedRepos`.
+   * Optional in the type; loadConfig fills it.
+   */
+  worktree?: {
+    setup: WorktreeSetupPolicy;
+  };
+  /**
    * Send-class dispatch queue (P4). Optional in the type so hand-built test
    * configs stay minimal; loadConfig always populates it. Absent = enabled
    * with defaults.
@@ -1331,6 +1718,8 @@ export interface CodeoidConfig {
    * configs stay minimal; absent = the defaults (enabled).
    */
   routines?: RoutinesConfigBlock;
+  /** Loops (see LoopsSchema). Optional in the type; absent = the defaults. */
+  loops?: { watchPollSeconds: number };
   dispatch?: {
     enabled: boolean;
     tickMs: number;
@@ -1339,6 +1728,8 @@ export interface CodeoidConfig {
     maxConcurrentWorkers: number;
     workerToolBudget: number;
     retryBaseMs: number;
+    /** Longest a loop attempt may stay held (ms). Optional for hand-built configs; default 2h. */
+    holdMaxMs?: number;
   };
   /**
    * Collaborative-session bounds (see CollaborationSchema). Optional in the
@@ -1382,6 +1773,11 @@ export interface CodeoidConfig {
    * configs stay minimal; loadConfig always populates it (schema defaults).
    */
   providers?: {
+    /** Optional so hand-built configs stay minimal; absent: the bundled CLI. */
+    claude?: {
+      /** A Claude Code CLI to run instead of the bundled one (providers/claude/executable.ts). */
+      command?: string;
+    };
     pi: {
       enabled: boolean;
       command: string;
@@ -1408,6 +1804,19 @@ export interface CodeoidConfig {
       model?: string;
       mcpServers: string[];
     };
+    /** Optional in the type (older hand-built configs predate it); loadConfig always fills it. */
+    opencode?: {
+      enabled: boolean;
+      command: string;
+      /** Absolute once loadConfig resolved it (default beside `dbPath`). */
+      dbPath?: string;
+      /** Absolute once loadConfig resolved it (default beside `transcriptDir`). */
+      dataDir?: string;
+      agent?: string;
+      model?: string;
+      /** opencode's own hosted models (provider `opencode`, opencode.ai) offered; default false. */
+      hostedModels?: boolean;
+    };
   };
   /**
    * Canonical MCP server registry — declared once, mounted on every backend
@@ -1418,6 +1827,16 @@ export interface CodeoidConfig {
   mcpServers?: Record<string, RawMcpServerConfig>;
   /** OAuth for remote MCP servers — see `RootSchema.mcpOAuth`. */
   mcpOAuth?: { redirectBaseUrl?: string };
+  /**
+   * Workstreams (docs/workstreams-design.md). Optional in the type so
+   * hand-built test configs stay minimal; loadConfig always populates it
+   * (schema default: none, isolation off).
+   */
+  workstreams?: WorkstreamsConfig;
+  /** Named credentials (ids and kinds). Optional in the type; loadConfig always fills it. */
+  credentials?: CredentialDecl[];
+  /** Where credential values live; `dir` paths absolute once loaded. */
+  credentialStore?: SecretStoreConfig;
   /**
    * Daemon-native hooks — dispatched at Session's seams for every backend.
    * Optional in the type so hand-built test configs stay minimal;
@@ -1479,6 +1898,7 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "ZEROID_ISSUER", path: "auth.issuer", kind: "string" },
   { env: "ZEROID_AUDIENCE", path: "auth.audience", kind: "string" },
   { env: "CODEOID_OAUTH_CLIENT_ID", path: "oauth.clientId", kind: "string" },
+  { env: "CODEOID_ZEROID_CLIENT_ID", path: "oauth.zeroidClientId", kind: "string" },
   { env: "ZEROID_ACCOUNT_ID", path: "agentIdentity.accountId", kind: "string" },
   { env: "ZEROID_PROJECT_ID", path: "agentIdentity.projectId", kind: "string" },
   { env: "ZEROID_REGISTRAR_KEY", path: "agentIdentity.registrarKey", kind: "string" },
@@ -1509,6 +1929,8 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_AUTO_ROTATE_MIN_TURNS", path: "autoRotate.minTurnsBeforeRotate", kind: "int" },
   { env: DEFAULT_PROVIDER_ENV, path: "session.defaultProvider", kind: "string" },
   { env: "CODEOID_DEFAULT_MODEL", path: "session.defaultModel", kind: "string" },
+  { env: "CODEOID_DEFAULT_EFFORT", path: "session.defaultEffort", kind: "string" },
+  { env: "CODEOID_IDLE_RELEASE_MINUTES", path: "session.idleReleaseMinutes", kind: "float" },
   { env: "CODEOID_MCP_OAUTH_REDIRECT_BASE_URL", path: "mcpOAuth.redirectBaseUrl", kind: "string" },
   // Dispatch kill switch — disable send-class fleet dispatch per-invocation
   // without touching config.json. Other dispatch knobs are file-config only,
@@ -1520,6 +1942,19 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   // Routines kill switch — stop every routine for one run of the daemon
   // without touching config.json (nothing is deleted). Other knobs: file only.
   { env: "CODEOID_ROUTINES_ENABLED", path: "routines.enabled", kind: "boolean" },
+  // OS sandbox (#448): provider (auto | off | bwrap | seatbelt | docker) and network.
+  { env: "CODEOID_SANDBOX", path: "sandbox.provider", kind: "string" },
+  { env: "CODEOID_SANDBOX_NETWORK", path: "sandbox.network", kind: "string" },
+  { env: "CODEOID_SANDBOX_ALLOWED_HOSTS", path: "sandbox.allowedHosts", kind: "csv" },
+  { env: "CODEOID_SANDBOX_HIDDEN_PATHS", path: "sandbox.hiddenPaths", kind: "csv" },
+  { env: "CODEOID_SANDBOX_HOME_READABLE", path: "sandbox.homeReadable", kind: "csv" },
+  { env: "CODEOID_SANDBOX_DOCKER_IMAGE", path: "sandbox.docker.image", kind: "string" },
+  { env: "CODEOID_SANDBOX_DOCKER_SOCKET", path: "sandbox.docker.socket", kind: "boolean" },
+  { env: "CODEOID_SANDBOX_WORKTREE_ROOTS", path: "sandbox.worktreeRoots", kind: "csv" },
+  { env: "CODEOID_SANDBOX_PROJECT_ROOTS", path: "sandbox.projectRoots", kind: "csv" },
+  { env: "CODEOID_SANDBOX_GIT", path: "sandbox.git.enabled", kind: "boolean" },
+  { env: "CODEOID_SANDBOX_PUSH", path: "sandbox.push.enabled", kind: "boolean" },
+  { env: "CODEOID_SANDBOX_PUSH_PROTECTED", path: "sandbox.push.protectedBranches", kind: "csv" },
   { env: "CODEOID_ROUTINES_MAX_CONCURRENT", path: "routines.maxConcurrentRuns", kind: "int" },
   { env: "CODEOID_MCP_CONTROL_ACTIONS", path: "mcpControl.allowActions", kind: "boolean" },
   { env: "CODEOID_MAX_SESSIONS_PER_USER", path: "rateLimit.maxSessionsPerUser", kind: "int" },
@@ -1545,10 +1980,13 @@ const ENV_OVERRIDES: readonly EnvOverride[] = [
   { env: "CODEOID_TURN_STALL_TIMEOUT_MS", path: "session.turnStallTimeoutMs", kind: "int" },
   { env: "CODEOID_MCP_TOOL_TIMEOUT_MS", path: "session.mcpToolTimeoutMs", kind: "int" },
   { env: "CODEOID_RESUME_MAX_SESSIONS", path: "session.resumeMaxSessions", kind: "int" },
+  { env: "CODEOID_SESSION_LAZY_LOAD", path: "session.lazyLoad", kind: "boolean" },
   { env: "CODEOID_SEED_BUDGET_CHARS", path: "session.seedBudgetChars", kind: "int" },
   { env: "CODEOID_SEED_CHARS_PER_TOKEN", path: "session.seedCharsPerToken", kind: "float" },
   { env: "CODEOID_SEED_WINDOW_FRACTION", path: "session.seedWindowFraction", kind: "float" },
   { env: "CODEOID_NATIVE_CONTINUATION", path: "session.nativeContinuation", kind: "boolean" },
+  // opencode's hosted models (opencode.ai) — off unless the owner opts in.
+  { env: "CODEOID_OPENCODE_HOSTED_MODELS", path: "providers.opencode.hostedModels", kind: "boolean" },
   // Embed-SSO trusted framing origins (comma-separated). Each is an exact
   // origin (scheme://host[:port]) permitted to frame the web UI and hand it a
   // credential via the URL hash. Empty ⇒ hash handoff disabled (safe default).
@@ -1667,6 +2105,8 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     ? {
         zeroidTokenEndpoint: `${resolvedZeroidUrl}/oauth2/token`,
         clientId: parsed.oauth.clientId ?? "codeoid",
+        zeroidClientId: parsed.oauth.zeroidClientId ?? googleClientId,
+        zeroidClientSecret: env.CODEOID_ZEROID_CLIENT_SECRET || undefined,
         googleClientId,
         googleClientSecret,
         accountId: parsed.agentIdentity.accountId,
@@ -1750,25 +2190,49 @@ export function loadConfig(opts: LoadOptions = {}): CodeoidConfig {
     },
     workspaceIndex: parsed.workspaceIndex,
     compress: parsed.compress,
+    secrets: parsed.secrets,
+    approvals: parsed.approvals,
+    sandbox: parsed.sandbox,
     guard: parsed.guard,
     labeling: parsed.labeling,
     telemetry: { osc8: osc8Mode },
+    pricing: parsed.pricing,
     autoRotate: parsed.autoRotate,
     session: parsed.session,
     conductor: parsed.conductor,
     dispatch: parsed.dispatch,
     mcpControl: parsed.mcpControl,
     routines: parsed.routines,
+    loops: parsed.loops,
     collaboration: parsed.collaboration,
     rateLimit: parsed.rateLimit,
     pipeline: parsed.pipeline,
-    providers: parsed.providers,
+    providers: {
+      ...parsed.providers,
+      // opencode's database lives with codeoid's data: beside codeoid's own
+      // database unless overridden, never the user's opencode home; its
+      // data, logs and caches beside codeoid's transcripts.
+      opencode: {
+        ...parsed.providers.opencode,
+        dbPath: parsed.providers.opencode.dbPath
+          ? configRelResolve(parsed.providers.opencode.dbPath)
+          : join(dirname(dbPath), "opencode", "opencode.db"),
+        dataDir: parsed.providers.opencode.dataDir
+          ? configRelResolve(parsed.providers.opencode.dataDir)
+          : join(dirname(transcriptDir), "opencode"),
+      },
+    },
     mcpServers: parsed.mcpServers,
     mcpOAuth: parsed.mcpOAuth,
+    workstreams: parsed.workstreams,
+    credentials: parsed.credentials,
+    credentialStore:
+      parsed.credentialStore.kind === "dir" ? { kind: "dir", path: configRelResolve(parsed.credentialStore.path) } : parsed.credentialStore,
     hooks: parsed.hooks,
     embed: parsed.embed,
     push: parsed.push,
     fork: parsed.fork,
+    worktree: parsed.worktree,
   };
 }
 

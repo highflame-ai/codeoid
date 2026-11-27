@@ -6,23 +6,32 @@
 
 import { randomUUID } from "node:crypto";
 import { createInterface } from "node:readline";
+import { approvalSandboxLine, formatToolRisk, mcpRefreshSummary, modeSummary, sandboxSummary } from "@highflame/codeoid-core";
 import type { CodeoidConfig } from "../config.js";
 import { PIPELINE_INPUT_REQUEST_PREFIX, PROTOCOL_VERSION } from "../protocol/types.js";
 import type {
+  ToolRisk,
   ClientMessage,
   CollaborationConfig,
+  EffortLevel,
   McpReconnectResult,
+  McpApprovePreview,
+  McpRefreshResult,
   CompareState,
   CompareTargetSpec,
   DaemonMessage,
   PipelineWire,
   SessionInfo,
   SessionApproveOutcome,
+  SandboxProviderWire,
+  SessionSandboxInfo,
+  SessionSandboxSetting,
 } from "../protocol/types.js";
 import { acquireToken, TokenError } from "./token.js";
 import { sanitizeTerminalOutput } from "../tui/ansi/codes.js";
 import { formatPackList, formatPackShow } from "./pack-format.js";
 import { formatPipeline, haltedRequestId } from "./pipeline-format.js";
+import { formatEvidence } from "./evidence-format.js";
 import { type PendingDialog, parseDialogAnswer } from "./dialog.js";
 import { formatRewind, parseUndoArgs } from "./rewind.js";
 import { awaitingApproval, compareSettled, formatCompare } from "./compare.js";
@@ -149,7 +158,7 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
     }
 
     case "session.message": {
-      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string } }; identity?: { name?: string; type?: string } };
+      const sm = msg as { role?: string; content?: string; messageId?: string; tool?: { name?: string; state?: { phase?: string; approvalId?: string; description?: string; risk?: ToolRisk; sandboxed?: boolean; sandboxNote?: string; sandboxDocker?: boolean; targetWorkstream?: { workstream?: string; warning?: string } } }; identity?: { name?: string; type?: string } };
       const id = sm.identity?.name ? `${DIM}${S(sm.identity.name)}${RESET} ` : "";
       switch (sm.role) {
         case "user":
@@ -178,7 +187,11 @@ export function renderStreamMessage(msg: DaemonMessage, state: StreamRenderState
             state.latestApprovalId = sm.tool?.state?.approvalId ?? null;
             state.latestApprovalMsgId = sm.messageId ?? null;
             state.lastPrompt = "tool";
-            return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n  Type 'yes' to approve, 'no' to deny\n`;
+            const risk = formatToolRisk(sm.tool?.state?.risk);
+            const sandbox = approvalSandboxLine(sm.tool?.state ?? {});
+            const tw = sm.tool?.state?.targetWorkstream;
+            const ws = `${tw?.workstream ? `  ⌂ workstream ${S(tw.workstream)}\n` : ""}${tw?.warning ? `  ${YELLOW}⚠ ${S(tw.warning)}${RESET}\n` : ""}`;
+            return `\n${id}${RED}⚡ ${name}: ${S(sm.tool?.state?.description)}${RESET}\n${ws}${risk ? `  ${RED}▲ ${S(risk)}${RESET}\n` : ""}${sandbox ? `  ${S(sandbox)}\n` : ""}  Type 'yes' to approve, 'no' to deny\n`;
           }
           return `\n${id}${YELLOW}⚡ ${name} [${phase}]${RESET}\n${reshow}`;
         }
@@ -350,10 +363,17 @@ export class TerminalClient {
         const status = this.#formatStatus(s.status);
         console.log(`  ${s.name.padEnd(20)} ${status.padEnd(20)} ${s.workdir}`);
         console.log(`  ${"".padEnd(20)} id: ${s.id}  clients: ${s.attachedClients}`);
-        if (s.effectiveClaudeAccount) {
-          // Which Claude account it bills, and whether that is its own choice.
-          const own = s.claudeAccount ? "" : " (daemon default)";
-          console.log(`  ${"".padEnd(20)} claude account: ${S(s.effectiveClaudeAccount)}${own}`);
+        const sandbox = sandboxSummary(s.sandbox);
+        if (sandbox) console.log(`  ${"".padEnd(20)} ${sandbox}`);
+        const mode = modeSummary(s);
+        if (mode) console.log(`  ${"".padEnd(20)} ${mode}`);
+        const ws = workstreamSummary(s.workstream);
+        if (ws) console.log(`  ${"".padEnd(20)} ${sanitizeTerminalOutput(ws)}`);
+        const effective = s.effectiveAccount ?? s.effectiveClaudeAccount;
+        if (effective) {
+          // Which account it bills on its backend, and whether that is its own choice.
+          const own = (s.account ?? s.claudeAccount) ? "" : " (default)";
+          console.log(`  ${"".padEnd(20)} ${s.providerId ?? "claude"} account: ${S(effective)}${own}`);
         }
         if (s.pendingDialog) {
           // What it is waiting on, and how to answer it from here (#348).
@@ -401,6 +421,15 @@ export class TerminalClient {
     this.#renderPacks(await this.#request({ type: "pipeline.pack.select", id: randomUUID(), packId: id }));
   }
 
+  async evidenceShow(evidenceId: string, opts: { full?: boolean } = {}): Promise<void> {
+    const resp = await this.#request({ type: "evidence.get", id: randomUUID(), evidenceId });
+    if (resp.type !== "evidence.record") {
+      this.#printError(resp);
+      return;
+    }
+    for (const line of formatEvidence(resp.evidence, opts)) console.log(line);
+  }
+
   async packShow(id: string, opts: { resolve?: boolean } = {}): Promise<void> {
     const resp = await this.#request({ type: "pipeline.pack.list", id: randomUUID() });
     if (resp.type !== "pipeline.pack.list.result") {
@@ -423,6 +452,130 @@ export class TerminalClient {
     for (const line of formatPackList(resp)) console.log(line);
   }
 
+  /** Change a session's OS sandbox (#448); a widening waits for the owner's yes on the session. */
+  async setSandbox(sessionIdOrName: string, sandbox: SessionSandboxSetting): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const resp = await this.#request({ type: "session.set_sandbox", id: randomUUID(), sessionId, sandbox });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const data = resp.data as { pending?: boolean; sandbox?: SessionSandboxInfo | null };
+    if (data.pending) {
+      console.log(`Asked on the session: it changes when its owner says yes (codeoid approve ${sessionIdOrName}, or the web UI).`);
+    }
+    const line = sandboxSummary(data.sandbox ?? undefined);
+    if (line) console.log(data.pending ? `  now: ${line}` : line);
+  }
+
+  /** Add a directory to what a session's commands write, or remove one (docs/sandbox.md, Working across repositories). */
+  /** The URL a connect from `path` would connect (its remote's, as the repository's config names it), or null (said). */
+  async sandboxGitResolve(path: string, remote?: string): Promise<{ url: string; rawUrl: string; writtenAs?: string; pushUrl?: string; rawPushUrl?: string; connected: boolean } | null> {
+    const resp = await this.#request({ type: "sandbox.git_connect", id: randomUUID(), action: "resolve", path, ...(remote ? { remote } : {}) });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return null;
+    }
+    return resp.data as { url: string; rawUrl: string; writtenAs?: string; pushUrl?: string; rawPushUrl?: string; connected: boolean };
+  }
+
+  /** The git gateway's connections (docs/git-gateway-design.md): connect, disconnect or list the caller's. */
+  async sandboxGitConnect(action: "connect" | "disconnect" | "list", o: { url?: string; path?: string; remote?: string; token?: string }): Promise<void> {
+    const resp = await this.#request({ type: "sandbox.git_connect", id: randomUUID(), action, ...o });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      // A connect (or a disconnect) that didn't happen is a failure to whoever runs the command (a script's `&&`).
+      process.exitCode = 1;
+      return;
+    }
+    const data = resp.data as { connections?: Array<{ url: string; kind: string; auth: string; connectedAt: number }>; url?: string; kind?: string; auth?: string; via?: string; removed?: boolean };
+    if (action === "list") {
+      const list = data.connections ?? [];
+      if (list.length === 0) console.log("No remote is connected for agents. Connect one: codeoid sandbox git connect [dir]");
+      for (const c of list) console.log(`  ${sanitizeTerminalOutput(c.url)}  ${c.kind}, ${c.auth === "ssh" ? "your ssh key" : c.auth === "token" ? "a token" : "your git credential"}  (since ${new Date(c.connectedAt).toISOString().slice(0, 10)})`);
+      return;
+    }
+    if (action === "disconnect") {
+      console.log(data.removed ? `Disconnected: agents' git no longer reaches ${sanitizeTerminalOutput(data.url ?? "")}.` : "It wasn't connected.");
+      return;
+    }
+    const how = data.auth === "ssh" ? "your ssh key (ssh-agent and ~/.ssh/config as git uses them)" : data.auth === "token" ? "the token you gave" : "your git credential for it (kept by codeoid, 0600)";
+    console.log(`Connected: agents in your sandboxed sessions may fetch from ${sanitizeTerminalOutput(data.url ?? "")} and push branches of their own, with ${how}.`);
+    if (data.via) console.log(`  As your ssh config says now: ${sanitizeTerminalOutput(data.via)} (taken once, as data; later changes to your ssh config don't apply until you connect again).`);
+    console.log("  Never a protected branch (sandbox.push.protectedBranches: main and master unless you set it) or the remote's default branch; no force push, no deletes, no tags. In guarded mode you're asked for each push.");
+    console.log("  A pushed branch runs the repository's CI as that branch defines it, with the CI's secrets.");
+    if (process.platform === "linux") console.log("  On Linux, Claude's own sandbox can't let in one unix socket alone: with a remote connected, its commands can reach the other unix sockets they can see (local database sockets stay hidden).");
+  }
+
+  async sandboxDir(sessionIdOrName: string, action: "add" | "remove", path: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const resp = await this.#request({ type: "session.sandbox_dir", id: randomUUID(), sessionId, action, path });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const data = resp.data as { pending?: boolean; message?: string; sandbox?: SessionSandboxInfo | null };
+    if (data.pending) console.log(`Asked on the session: ${path} is writable once its owner says yes (codeoid approve ${sessionIdOrName}, or the web UI), from its next turn.`);
+    else if (data.message) console.log(data.message);
+    const line = sandboxSummary(data.sandbox ?? undefined);
+    if (line) console.log(`  now: ${line}`);
+  }
+
+  /**
+   * Change what workstreams a session reads, or move it to another
+   * (workstreams §5.3, §7): `session.add_reference` / `remove_reference` /
+   * `set_workstream`. An `ask` workstream may be asked of the owner on the session.
+   */
+  async sessionWorkstream(
+    sessionIdOrName: string,
+    change: { kind: "add_reference"; workstream: string; paths?: string[] } | { kind: "remove_reference"; workstream: string } | { kind: "set_workstream"; workstream: string },
+  ): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const base = { id: randomUUID(), sessionId, workstream: change.workstream };
+    const resp = await this.#request(
+      change.kind === "add_reference"
+        ? { type: "session.add_reference", ...base, ...(change.paths?.length ? { paths: change.paths } : {}) }
+        : change.kind === "remove_reference"
+          ? { type: "session.remove_reference", ...base }
+          : { type: "session.set_workstream", ...base },
+    );
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const data = resp.data as { pending?: boolean; message?: string; workstream?: SessionInfo["workstream"] };
+    if (data.pending) console.log(`Asked on the session: it applies once its owner says yes (codeoid approve ${S(sessionIdOrName)}, or the web UI), from its next turn.`);
+    else console.log(change.kind === "set_workstream" ? "Moved: its servers, credentials and sandbox follow from its next turn." : "Done, from its next turn.");
+    const ws = workstreamSummary(data.workstream);
+    if (ws) console.log(`  ${sanitizeTerminalOutput(ws)}`);
+    const refs = data.workstream?.references ?? [];
+    if (refs.length > 0) console.log(`  reads: ${sanitizeTerminalOutput(refs.map((r) => `${r.workstream}${r.paths ? ` (${r.paths.join(", ")})` : ""}`).join("; "))}`);
+  }
+
+  /** The daemon's sandbox providers and whether each runs here (#448). */
+  async sandboxProviders(): Promise<void> {
+    const resp = await this.#request({ type: "sandbox.providers", id: randomUUID() });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      return;
+    }
+    const data = resp.data as { enabled: boolean; auto: string | null; default: { provider: string; network: string; dockerSocket?: boolean }; providers: SandboxProviderWire[] };
+    if (!data.enabled) {
+      console.log("This daemon has no OS sandbox.");
+      return;
+    }
+    console.log(`\n  Default: ${data.default.provider}${data.default.provider === "auto" && data.auto ? ` (${data.auto} here)` : ""}, network ${data.default.network}${data.default.dockerSocket ? ", Docker access (can reach the whole machine)" : ""}\n`);
+    for (const p of data.providers) {
+      const where = `${p.isolation} isolation, ${p.placement}, network ${p.network.join("/")}`;
+      console.log(`  ${p.id.padEnd(10)} ${p.available ? "available" : "not available"}  ${p.displayName} — ${where}`);
+      if (!p.available && p.reason) console.log(`  ${"".padEnd(10)} ${p.reason}`);
+    }
+    console.log();
+  }
+
   async createSession(
     name: string,
     workdir: string,
@@ -432,7 +585,23 @@ export class TerminalClient {
       providerId?: string;
       model?: string;
       claudeAccount?: string;
+      /** Account for the backend the session lands on (accounts.ts). */
+      account?: string;
+      effort?: EffortLevel | null;
       collaboration?: CollaborationConfig;
+      /** OS sandbox (#448); absent = the daemon's config. */
+      sandbox?: SessionSandboxSetting;
+      /** Home workstream (docs/workstreams-design.md); absent = the folder's. */
+      workstream?: string;
+      /** Other workstreams it may read (§7.2). */
+      references?: Array<{ workstream: string; paths?: string[] }>;
+      /**
+       * Asked when the choice conflicts with the folder's exclusive workstream
+       * and may be overridden (G3): shown what would change; true = confirm.
+       */
+      confirmOverride?: (warning: string) => Promise<boolean>;
+      /** Internal: the confirming retry's token. */
+      overrideToken?: string;
     } = {},
   ): Promise<void> {
     const resp = await this.#request({
@@ -445,17 +614,40 @@ export class TerminalClient {
       // a claude session.
       ...(opts.providerId ? { providerId: opts.providerId } : {}),
       ...(opts.model ? { model: opts.model } : {}),
+      ...(opts.effort !== undefined ? { effort: opts.effort } : {}),
       ...(opts.claudeAccount ? { claudeAccount: opts.claudeAccount } : {}),
+      ...(opts.account ? { account: opts.account } : {}),
       ...(opts.pack ? { pack: opts.pack } : {}),
       ...(opts.packRole ? { packRole: opts.packRole } : {}),
       ...(opts.collaboration ? { collaboration: opts.collaboration } : {}),
+      ...(opts.sandbox ? { sandbox: opts.sandbox } : {}),
+      ...(opts.workstream ? { workstream: opts.workstream } : {}),
+      ...(opts.overrideToken ? { override: { token: opts.overrideToken } } : {}),
+      ...(opts.references?.length ? { references: opts.references } : {}),
     });
+
+    const conflict = resp.type === "response.error" && resp.detail?.kind === "workstream_conflict" ? resp.detail.resolution.conflict : undefined;
+    if (conflict?.overrideToken && opts.confirmOverride && !opts.overrideToken) {
+      const ch = conflict.changes;
+      const warning = [
+        `⚠ This folder belongs to workstream "${S(conflict.folder)}" (exclusive).`,
+        `  A session here in "${S(conflict.chosen)}" gets ${ch && ch.gains.length > 0 ? `its servers (${S(ch.gains.join(", "))})` : "no servers of the folder's workstream"}${ch && ch.env.length > 0 ? ` and env ${S(ch.env.join(", "))}` : ""}${ch?.git ? `, commits as ${S(ch.git)}` : ""},`,
+        `  writes into "${S(conflict.folder)}"'s code${ch && ch.withholds.length > 0 ? `, and is not given ${S(ch.withholds.join(", "))}` : ""}.`,
+      ].join("\n");
+      if (await opts.confirmOverride(warning)) {
+        return this.createSession(name, workdir, { ...opts, overrideToken: conflict.overrideToken });
+      }
+    }
 
     if (resp.type === "response.ok") {
       const data = resp.data as SessionInfo;
       const profile = data.profile ? ` [pack: ${data.profile}]` : "";
       const provider = data.providerId ? ` [${data.providerId}]` : "";
       console.log(`Session created: ${data.name} (${data.id})${provider}${profile}`);
+      const sandbox = sandboxSummary(data.sandbox);
+      if (sandbox) console.log(`  ${sandbox}`);
+      const ws = workstreamSummary(data.workstream);
+      if (ws) console.log(`  ${sanitizeTerminalOutput(ws)}`);
       // Non-fatal binding notes (skipped cross-vendor bindings, unmapped
       // tiers) — the daemon adjusted something the operator should know about.
       for (const w of resp.warnings ?? []) console.log(`  ⚠ ${w}`);
@@ -472,6 +664,8 @@ export class TerminalClient {
       }
     } else {
       this.#printError(resp);
+      // A refused create is a failed command: scripts must be able to tell.
+      process.exitCode = 1;
     }
   }
 
@@ -760,6 +954,58 @@ export class TerminalClient {
     }
   }
 
+  /** `codeoid mcp refresh` — apply Claude's current MCP config to a session (#395). */
+  async mcpRefresh(sessionIdOrName: string): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    const resp = await this.#request({ type: "session.mcp_refresh", id: randomUUID(), sessionId });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      process.exitCode = 1;
+      return;
+    }
+    const r = resp.data as McpRefreshResult;
+    console.log(mcpRefreshSummary(r));
+  }
+
+  /** `codeoid mcp approve` — approve a project's MCP server for every backend in the workdir (#395). */
+  async mcpApprove(sessionIdOrName: string, server: string, opts: { path?: string; yes?: string } = {}): Promise<void> {
+    const sessionId = await this.#resolveSession(sessionIdOrName);
+    if (!sessionId) return;
+    // Review first: the entry in full, and the fingerprint an approval binds to.
+    const pv = await this.#request({ type: "mcp.approve.preview", id: randomUUID(), sessionId, server, ...(opts.path ? { path: opts.path } : {}) });
+    if (pv.type !== "response.ok") {
+      this.#printError(pv);
+      process.exitCode = 1;
+      return;
+    }
+    const p = pv.data as McpApprovePreview;
+    if (!opts.yes) {
+      // The repo wrote these: no terminal control sequences reach the screen.
+      const clean = sanitizeTerminalOutput;
+      console.log(clean(`${p.server}, from ${p.shownPath} — once approved, every backend in this directory runs it, with the daemon user's files and network:`));
+      for (const line of p.lines) console.log(clean(`  ${line}`));
+      console.log("  (shown exactly as it runs; characters that wouldn't show are escaped as \\u{…}, and a run of spaces counted)");
+      console.log("  (an env value that is exactly ${VAR} resolves from the daemon's environment when it starts; header values are sent as written)");
+      const q = (v: string) => clean(`'${v.replace(/'/g, "'\\''")}'`); // pasted back into a shell: quoted
+      console.log(`To approve exactly this entry: codeoid mcp approve --path ${q(p.path)} --yes ${p.fingerprint} -- ${q(sessionIdOrName)} ${q(p.server)}`);
+      return;
+    }
+    // The entry reviewed, not whatever is in the file now.
+    if (opts.yes !== p.fingerprint) {
+      console.error(`${p.server} changed since that review (now ${p.fingerprint}) — review it again.`);
+      process.exitCode = 1;
+      return;
+    }
+    const resp = await this.#request({ type: "mcp.approve", id: randomUUID(), sessionId, server, path: p.path, fingerprint: opts.yes });
+    if (resp.type !== "response.ok") {
+      this.#printError(resp);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`${server}: approved for every backend in this workdir — run \`codeoid mcp refresh ${sessionIdOrName}\` to use it now.`);
+  }
+
   /** `codeoid mcp reconnect` — redial one of the session backend's MCP servers (#389). */
   async mcpReconnect(sessionIdOrName: string, server: string): Promise<void> {
     const sessionId = await this.#resolveSession(sessionIdOrName);
@@ -810,20 +1056,21 @@ export class TerminalClient {
    * finishes a sign-in on its own only for the browser the web UI started it
    * from. `callbackUrl` finishes one started earlier, without a terminal.
    */
-  async mcpSignin(server: string, callbackUrl?: string): Promise<void> {
+  async mcpSignin(server: string, callbackUrl?: string, credential?: string): Promise<void> {
     if (callbackUrl) {
       await this.#finishMcpSignin(callbackUrl);
       return;
     }
     // Discovery and client registration are a few round trips to the provider.
-    const begun = await this.#request({ type: "mcp.oauth.begin", id: randomUUID(), server }, 45_000);
+    const begun = await this.#request({ type: "mcp.oauth.begin", id: randomUUID(), server, ...(credential ? { credential } : {}) }, 45_000);
     if (begun.type !== "mcp.oauth.begin.result") {
       this.#printError(begun);
       process.exitCode = 1;
       return;
     }
+    const as = credential ? ` (credential ${S(credential)})` : "";
     if (begun.status === "connected" || !begun.url) {
-      console.log(`${S(server)} is signed in.`);
+      console.log(`${S(server)}${as} is signed in.`);
       return;
     }
     console.log(`Open this address to sign in to ${S(server)}:\n\n  ${begun.url}\n`);
@@ -1031,7 +1278,7 @@ export class TerminalClient {
   async approveSession(
     sessionIdOrName: string,
     approved: boolean,
-    opts: { pick?: number; approvalId?: string; yes?: boolean } = {},
+    opts: { pick?: number; approvalId?: string; yes?: boolean; save?: "session" | "repository" } = {},
   ): Promise<void> {
     // Every way this can fail to answer exits non-zero — scripts gate on it.
     const fail = (...lines: string[]) => {
@@ -1117,6 +1364,15 @@ export class TerminalClient {
     // can't restyle or overwrite.
     if (all.length > 1) console.log(`${all.length} tool calls are waiting; this is [${n}] (pick another with --pick N):`);
     console.log(`${oneLine(pending.toolName)}  (${oneLine(pending.approvalId)})`);
+    const risk = formatToolRisk(pending.risk);
+    if (risk) console.log(`▲ ${oneLine(risk)}`);
+    const sandbox = approvalSandboxLine(pending);
+    if (sandbox) console.log(oneLine(sandbox));
+    // The workstream it acts in, and what approving confirms (workstreams §10), as the card says.
+    if (pending.targetWorkstream?.workstream) console.log(`⌂ workstream ${oneLine(pending.targetWorkstream.workstream)}`);
+    if (pending.targetWorkstream?.warning) console.log(`⚠ ${oneLine(pending.targetWorkstream.warning)}`);
+    // What --save would keep (docs/secrets-and-memory-design.md §4.1).
+    if (pending.ruleOffer) console.log(`⟲ --save session|repository keeps ${oneLine(pending.ruleOffer.rules.join(", "))}`);
     const shown = plainText(pending.input === undefined ? "" : JSON.stringify(pending.input, null, 2) ?? "");
     const cut = shown.length > APPROVE_SHOW_MAX;
     console.log(cut ? shown.slice(0, APPROVE_SHOW_MAX) : shown);
@@ -1139,6 +1395,7 @@ export class TerminalClient {
       sessionId,
       approvalId: pending.approvalId,
       approved,
+      ...(opts.save ? { save: opts.save, rules: pending.ruleOffer?.rules ?? [] } : {}),
     });
 
     if (resp.type !== "response.ok") {
@@ -1151,7 +1408,16 @@ export class TerminalClient {
       fail("That tool call was already answered or withdrawn — nothing was decided.");
       return;
     }
-    console.log(approved ? "Approved." : "Denied.");
+    const saved = (resp.data as { savedRules?: string[] } | undefined)?.savedRules;
+    console.log(
+      approved
+        ? saved?.length
+          ? `Approved, and saved ${saved.join(", ")} for this ${opts.save}.`
+          : saved
+            ? "Approved; a saved rule covers it already, so nothing more was saved."
+            : "Approved."
+        : "Denied.",
+    );
   }
 
   /**
@@ -1344,8 +1610,8 @@ export class TerminalClient {
     return this.#resolveSession(nameOrId);
   }
 
-  request(msg: ClientMessage): Promise<DaemonMessage> {
-    return this.#request(msg);
+  request(msg: ClientMessage, timeoutMs?: number): Promise<DaemonMessage> {
+    return this.#request(msg, timeoutMs);
   }
 
   /** Print a `response.error` (or an unexpected reply) the way every command does. */
@@ -1418,4 +1684,19 @@ export class TerminalClient {
       console.error(`Error: ${S(resp.error)} (${resp.code})`);
     }
   }
+}
+
+/** One line saying a session's home workstream and how it got it; undefined when it has none to say. */
+export function workstreamSummary(ws: SessionInfo["workstream"]): string | undefined {
+  if (!ws) return undefined;
+  if (!ws.id) return "workstream: none — choose one (`codeoid workstream match <dir>` says why)";
+  const label = ws.name && ws.name !== ws.id ? `${ws.name} (${ws.id})` : ws.id;
+  const how =
+    ws.source === "matched" ? `matched by ${ws.matchedBy ?? "a rule"}`
+    : ws.source === "default" ? "the default"
+    : ws.source === "explicit" ? "chosen"
+    : ws.source === "override" ? "chosen past the folder's own workstream"
+    : ws.source === "migrated" ? `from its folder${ws.matchedBy ? ` (${ws.matchedBy})` : ""}`
+    : ws.source;
+  return `workstream: ${label} — ${how}${ws.orphaned ? " — no longer configured: move it to another workstream" : ""}`;
 }

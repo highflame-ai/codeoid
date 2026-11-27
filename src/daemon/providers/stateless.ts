@@ -43,6 +43,10 @@ export class StatelessSessionProvider implements SessionProvider {
     return this.#inner.supportsMemoryTools ?? false;
   }
 
+  get free(): boolean {
+    return this.#inner.free ?? false;
+  }
+
   get appliesToolInputRewrite(): boolean {
     return this.#inner.appliesToolInputRewrite ?? false;
   }

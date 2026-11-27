@@ -1,6 +1,7 @@
 {
   "extends": "../../tsconfig.json",
   "compilerOptions": {
+    "tsBuildInfoFile": "../../.cache/tsc/protocol.tsbuildinfo",
     "rootDir": "src",
     "noEmit": true
   },

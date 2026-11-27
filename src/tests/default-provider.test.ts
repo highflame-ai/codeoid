@@ -30,6 +30,7 @@ import type { AttachedClient } from "../daemon/session.js";
 import type { AuthContext, SettingsSetResultMsg } from "../protocol/types.js";
 import { ALL_SCOPES } from "../protocol/scopes.js";
 import { configFilePaths } from "../config.js";
+import { secretPathVerdict } from "../daemon/secret-paths.js";
 
 const OWNER: AuthContext = {
   sub: "user:default-provider",
@@ -245,6 +246,19 @@ describe("settings.set session.defaultProvider", () => {
     expect(res.ok).toBe(false);
     expect(res.errors[0]).toMatchObject({ key: "providers.pi.enabled" });
     expect(onDisk().providers?.pi?.enabled).toBeUndefined();
+  });
+
+  it("checks the next boot without registering its opencode locations with the live daemon's gate", async () => {
+    const previewed = join(tmp, "proj", "oc.db");
+    const gate = () => secretPathVerdict("Read", { file_path: previewed }, { workdir: join(tmp, "proj"), configDir: join(tmp, "codeoid") })?.action;
+    expect(gate()).toBeUndefined();
+    const res = await setBatch([
+      { key: "session.defaultProvider", value: "claud" },
+      { key: "providers.opencode.dbPath", value: previewed },
+    ]);
+    expect(res.ok).toBe(false);
+    // Refused, and nothing restarted: the previewed database is an ordinary file still.
+    expect(gate()).toBeUndefined();
   });
 
   it("accepts enabling a backend and making it the default in one batch", async () => {

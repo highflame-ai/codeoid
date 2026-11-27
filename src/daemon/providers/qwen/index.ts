@@ -30,19 +30,22 @@
  */
 
 import type { McpTenant } from "../../mcp/oauth.js";
+import { allowedMcpNames } from "../acp/index.js";
 import { query, type Query, type SDKMessage, type SDKUserMessage } from "@qwen-code/sdk";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { createRequire } from "node:module";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { AsyncQueue } from "../../async-queue.js";
 import type { Store } from "../../store.js";
 import { buildMemoryMcpServer, MEMORY_TOOL_NAMES, type MemoryEngine } from "../../memory/index.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
+import { McpProxyLease, type McpProxyMount } from "../../mcp/proxy.js";
 import { resolveEnvMap } from "../../mcp/types.js";
 import { FLEET_TOOL_NAMES } from "../../fleet.js";
 import { resolveQwenBaseUrl, type CodeoidConfig } from "../../../config.js";
-import type { AuthContext } from "../../../protocol/types.js";
+import type { AuthContext, EffortLevel } from "../../../protocol/types.js";
 import type {
   ModelInfo,
   NormalizedTurnResult,
@@ -53,8 +56,15 @@ import type {
   CatalogEntry,
 } from "../interface.js";
 import { renderHistorySeed, type CanonicalTurn, type HistorySeedResult } from "../canonical.js";
-import { buildQwenEnv } from "../env.js";
+import { buildQwenEnv, withExtraEnv } from "../env.js";
 import type { LLMCallUsage } from "../../context-math.js";
+import type { ResolvedAccount } from "../../accounts.js";
+import { qwenAccountEnv } from "../../account-apply.js";
+import { preparePrivateHome, QWEN_HOME_LAYOUT, withLoginsSynced } from "../../sandbox/backend-home.js";
+import { programLocations } from "../../sandbox/policy.js";
+import { buildSandboxMcpServer, type RequestDirectoryInput, SANDBOX_MCP_SERVER_NAME } from "../../sandbox/request-directory.js";
+import type { SandboxRuntime } from "../../sandbox/session-sandbox.js";
+import type { SandboxHandle } from "../../sandbox/types.js";
 
 /** Where qwen-code persists a qwen.ai subscription login. */
 const QWEN_OAUTH_CREDS = join(homedir(), ".qwen", "oauth_creds.json");
@@ -70,6 +80,8 @@ interface PendingTool {
 }
 
 export interface QwenProviderInit {
+  /** The session's OS sandbox while on (ProviderSessionInit.sandbox, #448): the CLI the SDK spawns starts inside it. */
+  sandbox?: () => SandboxRuntime | null;
   sessionId: string;
   /** Persisted backing id from Store, or the session id itself on first run. */
   initialBackingId: string;
@@ -81,10 +93,23 @@ export interface QwenProviderInit {
   memory?: MemoryEngine;
   /** codeoid_fleet MCP server — conductor sessions only. */
   fleet?: { type: "sdk"; name: string; instance: unknown };
+  /** The sandbox's `request_directory`, decided by the session (sandbox/request-directory.ts): mounted in-process. */
+  requestDirectory?: (input: RequestDirectoryInput) => Promise<string>;
+  /** The daemon's OAuth MCP relay (#396): how this backend reaches the
+   *  registry's OAuth servers without holding their tokens. */
+  mcpProxy?: McpProxyMount;
   /** Cross-backend MCP registry — mounted natively (qwen owns its MCP client). */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   config?: CodeoidConfig;
+  /**
+   * This session's account for the backend, resolved when its query is
+   * built (accounts.ts); null = the daemon's own login. Throws when the
+   * chosen account can't be used — the turn fails, never another credential.
+   */
+  resolveAccount?: () => ResolvedAccount | null;
   onModels?: (models: ReadonlyArray<CatalogEntry>) => void;
+  /** Caller env for the child process (ProviderSessionInit.extraEnv), merged last via withExtraEnv. */
+  extraEnv?: Readonly<Record<string, string>>;
 }
 
 export class QwenProvider implements SessionProvider {
@@ -109,6 +134,12 @@ export class QwenProvider implements SessionProvider {
   #consumerTask: Promise<void> | null = null;
   #currentTurnQueue: AsyncQueue<ProviderEvent> | null = null;
   #builtSystemPromptAppend = "";
+  /** Fingerprint of the account the running query was built with ("" = the daemon's own). */
+  #builtAccount = "";
+  /** The thinking effort the live query runs at (#417); "" = the SDK's default. */
+  #builtEffort = "";
+  /** The OS sandbox the running query's CLI starts in (#448): closed when the query is replaced. */
+  #sandboxHandle: SandboxHandle | null = null;
   /** Bumped on every (re)build so an orphaned consumer can't clobber the new loop. */
   #loopGeneration = 0;
 
@@ -125,6 +156,10 @@ export class QwenProvider implements SessionProvider {
   /** Resolved gateway URL + credential path of the live loop — see #loadCatalog. */
   #currentBaseUrl: string | null = null;
   #currentAuthType: "openai" | "qwen-oauth" | null = null;
+  /** The key the running query was built with — the catalog asks with the same one, never the daemon's for an account's endpoint. */
+  #currentApiKey: string | null = null;
+  /** The running query is on a named account: its catalog isn't the backend's to publish. */
+  #onAccount = false;
   /** Guards backing-session recovery to one attempt — see the consumer's catch. */
   #backingRecoveryAttempted = false;
   /** Last content pushed to the CLI, replayed if recovery fires. */
@@ -133,7 +168,14 @@ export class QwenProvider implements SessionProvider {
   constructor(init: QwenProviderInit) {
     this.#backingId = coerceBackingId(init.initialBackingId, init.sessionId);
     this.#init = init;
+    this.#proxy = new McpProxyLease(
+      init.mcpProxy,
+      init.tenant ? { tenant: init.tenant, sessionId: init.sessionId, backendId: this.id, ...(init.mcpRegistry ? { view: init.mcpRegistry } : {}) } : null,
+    );
   }
+
+  /** This backend's proxy token for the registry's OAuth servers. */
+  readonly #proxy: McpProxyLease;
 
   // ── Public accessors ──────────────────────────────────────────────────────
 
@@ -170,6 +212,9 @@ export class QwenProvider implements SessionProvider {
   // ── AgentProvider ─────────────────────────────────────────────────────────
 
   runTurn(opts: TurnOpts): TurnRun {
+    // A new turn's usage starts from nothing, whatever an interrupted one left (#430).
+    if (this.#translateState) this.#translateState.turnUsage = undefined;
+    this.#seenSubagents.clear();
     this.#currentCanUseTool = opts.canUseTool;
     this.#currentSender = opts.sender ?? null;
 
@@ -255,7 +300,7 @@ export class QwenProvider implements SessionProvider {
     if (this.#currentAuthType !== "openai") return registry;
 
     const baseUrl = this.#currentBaseUrl ?? process.env.OPENAI_BASE_URL;
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = this.#currentApiKey;
     if (!baseUrl || !apiKey) return registry;
 
     try {
@@ -273,6 +318,14 @@ export class QwenProvider implements SessionProvider {
     }
   }
 
+  /** A new thinking effort on the running query, live (#417); back to the default needs a fresh query (next turn). */
+  async applyEffort(effort: EffortLevel | null): Promise<boolean> {
+    if (!this.#query || !this.#consumerTask || effort === null) return false;
+    const applied = await this.#query.setEffort(qwenEffort(effort));
+    if (applied) this.#builtEffort = effort;
+    return applied;
+  }
+
   async dispose(): Promise<void> {
     await this.teardown();
   }
@@ -280,6 +333,9 @@ export class QwenProvider implements SessionProvider {
   async teardown(): Promise<void> {
     this.#inputQueue?.close();
     this.#abortController?.abort();
+    // The CLI's sandbox goes with it (#448).
+    void this.#sandboxHandle?.close();
+    this.#sandboxHandle = null;
     if (this.#query) {
       try {
         await this.#query.close();
@@ -300,6 +356,7 @@ export class QwenProvider implements SessionProvider {
     this.#consumerTask = null;
     this.#query = null;
     this.#abortController = null;
+    this.#proxy.revoke();
   }
 
   // ── Internal ──────────────────────────────────────────────────────────────
@@ -336,14 +393,19 @@ export class QwenProvider implements SessionProvider {
 
   #ensureQueryLoop(opts: TurnOpts): void {
     const desiredAppend = opts.systemPromptAppend ?? "";
+    // Resolved per query build; throws (failing the turn) when the chosen
+    // account can't be used. A changed account rebuilds and resumes.
+    const account = this.#init.resolveAccount?.() ?? null;
+    const desiredAccount = account?.fingerprint ?? "";
     if (this.#consumerTask && this.#inputQueue && !this.#inputQueue.closed) {
       // The SDK fixes the system prompt at query construction, so a changed
       // append (before_turn hooks, refreshed memory index) needs a rebuild.
       // The fresh query RESUMES the same backing session, so nothing is lost.
-      if (this.#builtSystemPromptAppend === desiredAppend) return;
-      console.log(
-        `[qwen-provider ${this.#init.sessionId.slice(0, 8)}] systemPromptAppend changed — rebuilding query loop`,
-      );
+      if (this.#builtSystemPromptAppend === desiredAppend && this.#builtAccount === desiredAccount && this.#builtEffort === (opts.effort ?? "")) return;
+      // A changed effort that setEffort couldn't take (back to the default) rebuilds too (#417).
+      const what =
+        this.#builtSystemPromptAppend !== desiredAppend ? "systemPromptAppend" : this.#builtAccount !== desiredAccount ? "account" : "thinking effort";
+      console.log(`[qwen-provider ${this.#init.sessionId.slice(0, 8)}] ${what} changed — rebuilding query loop`);
       this.#inputQueue.close();
       this.#abortController?.abort();
     }
@@ -353,6 +415,8 @@ export class QwenProvider implements SessionProvider {
     this.#abortController = new AbortController();
     this.#inputQueue = new AsyncQueue<SDKUserMessage>();
     this.#builtSystemPromptAppend = desiredAppend;
+    this.#builtAccount = desiredAccount;
+    this.#builtEffort = opts.effort ?? "";
     this.#loopGeneration += 1;
     const myGeneration = this.#loopGeneration;
 
@@ -365,6 +429,10 @@ export class QwenProvider implements SessionProvider {
     // `{type:"sdk", name, instance}` shape, so the builder is reused as-is.
     const mcpServers: Record<string, unknown> = {
       ...registryServersForQwen(init.mcpRegistry),
+      // OAuth registry servers through the daemon's relay (#396), re-minted
+      // per query: the SDK hands this config to its CLI in-process (its
+      // initialize control message), not on argv or in the agent's env.
+      ...proxiedServersForQwen(this.#proxy),
       ...(init.memory
         ? {
             codeoid_memory: buildMemoryMcpServer(init.memory, {
@@ -374,15 +442,36 @@ export class QwenProvider implements SessionProvider {
           }
         : {}),
       ...(init.fleet ? { codeoid_fleet: init.fleet } : {}),
+      // The sandbox's ask for a directory to write (sandbox/request-directory.ts), in-process like memory.
+      ...(init.requestDirectory ? { [SANDBOX_MCP_SERVER_NAME]: buildSandboxMcpServer(init.sessionId, (_id, input) => (init.requestDirectory as (i: RequestDirectoryInput) => Promise<string>)(input)) } : {}),
     };
 
-    const authType = resolveQwenAuthType(qwenCfg?.authType);
-    const baseUrl = resolveQwenBaseUrl(qwenCfg?.baseUrl);
+    // An account is an API key with its endpoint; it replaces the configured auth.
+    const authType = account ? "openai" : resolveQwenAuthType(qwenCfg?.authType);
+    const baseUrl = account ? resolveQwenBaseUrl(account.account.baseUrl) : resolveQwenBaseUrl(qwenCfg?.baseUrl);
     const model = opts.model ?? qwenCfg?.model;
     this.#currentModel = model ?? null;
     this.#currentBaseUrl = baseUrl ?? null;
     this.#currentAuthType = authType;
+    this.#currentApiKey = account ? (account.account.token ?? null) : (process.env.OPENAI_API_KEY ?? null);
+    this.#onAccount = account !== null;
 
+    const qwenEnv = withExtraEnv(
+      {
+        ...buildQwenEnv(),
+        // An account's key, and none of the daemon's (blanked: the SDK merges over process.env).
+        // An account: its key and its own home, and none of the daemon's keys.
+        ...(account ? qwenAccountEnv(account, buildQwenEnv()) : {}),
+        ...(baseUrl ? { OPENAI_BASE_URL: baseUrl } : {}),
+        ...(model ? { OPENAI_MODEL: model } : {}),
+      },
+      init.extraEnv,
+    );
+    // The OS sandbox (#448): the SDK spawns a launcher that starts its CLI
+    // inside the session's sandbox. The last query's sandbox goes with it.
+    const sandboxed = qwenExecutableOption(init.sandbox?.() ?? null, qwenCfg?.command, qwenEnv);
+    void this.#sandboxHandle?.close();
+    this.#sandboxHandle = sandboxed.handle ?? null;
     this.#query = query({
       prompt: this.#inputQueue,
       options: {
@@ -390,22 +479,23 @@ export class QwenProvider implements SessionProvider {
         abortController: this.#abortController,
         // Explicit allowlist + blanking of everything else — the SDK MERGES
         // this over process.env rather than replacing it (see buildQwenEnv).
-        env: {
-          ...buildQwenEnv(),
-          ...(baseUrl ? { OPENAI_BASE_URL: baseUrl } : {}),
-          ...(model ? { OPENAI_MODEL: model } : {}),
-        },
+        // The caller's extra env goes on last; withExtraEnv refuses every
+        // OPENAI_/QWEN_/DASHSCOPE_ and credential-shaped key, so it can't
+        // undo the blanking or the account. Sandboxed: its private home.
+        env: sandboxed.env ?? qwenEnv,
         authType,
         ...(model ? { model } : {}),
         // qwen-code takes a LIST of capacity fallbacks (max 3), where the
         // Claude SDK takes a single id; codeoid tracks one, so wrap it.
         ...(opts.fallbackModel ? { fallbackModel: [opts.fallbackModel] } : {}),
-        ...(qwenCfg?.command ? { pathToQwenExecutable: qwenCfg.command } : {}),
+        ...(sandboxed.pathToQwenExecutable ? { pathToQwenExecutable: sandboxed.pathToQwenExecutable } : {}),
         // codeoid's gate is the only approval authority. `default` keeps
         // read-only tools uncontrolled and routes every write through
         // canUseTool; qwen-code's own `auto` mode would silently auto-approve
         // edits and shell commands, bypassing the gate entirely.
         permissionMode: "default",
+        // Thinking effort (#417); the SDK clamps it to what the model takes.
+        ...(opts.effort ? { effort: qwenEffort(opts.effort) } : {}),
         includePartialMessages: true,
         allowedTools: [
           ...(init.memory ? MEMORY_TOOL_NAMES.map((t) => `mcp__codeoid_memory__${t}`) : []),
@@ -413,6 +503,12 @@ export class QwenProvider implements SessionProvider {
         ],
         ...(Object.keys(mcpServers).length > 0
           ? { mcpServers: mcpServers as never }
+          : {}),
+        // Workstream isolation (G1): Qwen also loads MCP servers from its own
+        // settings (~/.qwen, a project's .qwen/ and .mcp.json): kept to the
+        // names codeoid mounts. Empty would mean "no filter".
+        ...(init.mcpRegistry?.isolated
+          ? { allowedMcpServerNames: allowedMcpNames(Object.keys(mcpServers)) }
           : {}),
         ...(desiredAppend
           ? {
@@ -453,7 +549,9 @@ export class QwenProvider implements SessionProvider {
 
     this.#hasQueried = true;
 
-    if (init.onModels) {
+    // Not for a named account: its endpoint and plan aren't every session's,
+    // and the catalog cache is per backend.
+    if (init.onModels && !this.#onAccount) {
       // Fired on every loop build, so a model added to the gateway shows up on
       // the next session rather than waiting for a daemon restart.
       void this.#loadCatalog()
@@ -571,13 +669,18 @@ export class QwenProvider implements SessionProvider {
     return synthetic;
   }
 
+  /** Kept across messages: a turn's usage is summed request by request (#430). */
+  #translateState: QwenTranslateState | null = null;
+
   /** Translate one SDKMessage into ProviderEvents. */
   #translate(msg: SDKMessage): void {
-    translateQwenMessage(msg, this.#emit.bind(this), this.id, {
-      pendingTools: this.#pendingTools,
-      seenSubagents: this.#seenSubagents,
-      requestedModel: this.#currentModel,
-    });
+    if (!this.#translateState) this.#translateState = { pendingTools: this.#pendingTools, seenSubagents: this.#seenSubagents };
+    const state = this.#translateState;
+    // Interrupt and a session reset swap these for fresh ones: follow them.
+    state.pendingTools = this.#pendingTools;
+    state.seenSubagents = this.#seenSubagents;
+    state.requestedModel = this.#currentModel;
+    translateQwenMessage(msg, this.#emit.bind(this), this.id, state);
   }
 }
 
@@ -593,6 +696,11 @@ export interface QwenTranslateState {
    * the requested id is the fallback.
    */
   requestedModel?: string | null;
+  /**
+   * This turn's usage so far, request by request (#430). qwen-code's result
+   * carries the session's cumulative totals, so a turn's own are summed here.
+   */
+  turnUsage?: LLMCallUsage & { calls: number };
 }
 
 /**
@@ -636,14 +744,29 @@ export function translateQwenMessage(
       }
 
       const perCall = m.message?.usage;
-      if (perCall) {
+      // qwen-code splits a request into a message per block type, all but the
+      // last with zeroed usage; a sub-agent's never has any. Neither is a
+      // report: a sub-agent's request is one whose spend is never told (#430).
+      const reported = !!perCall && (perCall.input_tokens ?? 0) + (perCall.output_tokens ?? 0) + (perCall.cache_read_input_tokens ?? 0) + (perCall.cache_creation_input_tokens ?? 0) > 0;
+      if (parentToolUseId && !reported) emit({ type: "model_request" });
+      if (perCall && reported) {
+        // qwen-code's input_tokens includes the cached ones it also reports as cache reads.
+        const cached = perCall.cache_read_input_tokens ?? 0;
         const usage: LLMCallUsage = {
-          inputTokens: perCall.input_tokens ?? 0,
-          cacheReadTokens: perCall.cache_read_input_tokens ?? 0,
+          inputTokens: Math.max(0, (perCall.input_tokens ?? 0) - cached),
+          cacheReadTokens: cached,
           cacheCreationTokens: perCall.cache_creation_input_tokens ?? 0,
           outputTokens: perCall.output_tokens ?? 0,
         };
-        emit({ type: "llm_call", usage, isPrimary: parentToolUseId === null });
+        emit({ type: "llm_call", usage, isPrimary: parentToolUseId === null, parentToolUseId });
+        // Every request costs, a sub-agent's included.
+        if (!state.turnUsage) state.turnUsage = { inputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, outputTokens: 0, calls: 0 };
+        const t = state.turnUsage;
+        t.inputTokens += usage.inputTokens;
+        t.cacheReadTokens += usage.cacheReadTokens;
+        t.cacheCreationTokens += usage.cacheCreationTokens;
+        t.outputTokens += usage.outputTokens;
+        t.calls += 1;
       }
 
       const content = Array.isArray(m.message?.content)
@@ -700,6 +823,11 @@ export function translateQwenMessage(
 
       if (event.type === "content_block_start" && event.content_block?.type === "thinking") {
         emit({ type: "thinking_delta", content: "", blockIndex: event.index, parentToolUseId });
+        break;
+      }
+      // Any other block (a tool call's input streams no text): the request's usage is still to come (#430).
+      if (event.type === "content_block_start") {
+        emit({ type: "model_output", parentToolUseId });
         break;
       }
       if (event.type === "content_block_delta" && event.delta) {
@@ -782,18 +910,31 @@ export function translateQwenMessage(
       // A turn is over: nothing may stay pending into the next one, or a stale
       // entry would mis-correlate a later same-named call.
       state.pendingTools.length = 0;
+      // qwen-code reports no usage for a sub-agent's requests (only the
+      // session's running total has them): a turn that ran one is unknown (#430).
+      const ranSubagent = state.seenSubagents.size > 0;
       state.seenSubagents.clear();
+      // The turn's own usage, summed per request — never the result's, which
+      // is the session's cumulative total (#430).
+      const turn = state.turnUsage;
+      state.turnUsage = undefined;
 
       const normalized: NormalizedTurnResult = {
         providerId,
         model: Object.keys(r.modelUsage ?? {})[0] ?? state.requestedModel ?? "unknown",
-        inputTokens: r.usage?.input_tokens ?? 0,
-        outputTokens: r.usage?.output_tokens ?? 0,
-        cacheReadTokens: r.usage?.cache_read_input_tokens ?? 0,
-        cacheCreationTokens: r.usage?.cache_creation_input_tokens ?? 0,
-        // The Qwen gateway does not price responses; cost stays 0 like the
-        // other non-Anthropic backends.
+        inputTokens: turn?.inputTokens ?? 0,
+        outputTokens: turn?.outputTokens ?? 0,
+        cacheReadTokens: turn?.cacheReadTokens ?? 0,
+        cacheCreationTokens: turn?.cacheCreationTokens ?? 0,
+        // Qwen doesn't price responses: the session prices the tokens. A turn
+        // that ran without reporting usage is unknown (a failed one spent
+        // nothing); so is one that used several models, whose tokens can't be
+        // priced at one model's rate, and one that ran a sub-agent.
         totalCostUsd: 0,
+        // A failed result that still went to the model (num_turns) spent too.
+        ...((!turn && (r.is_error !== true || (r.num_turns ?? 0) > 0)) || Object.keys(r.modelUsage ?? {}).length > 1 || ranSubagent
+          ? { costSource: "unknown" as const }
+          : {}),
         durationMs: r.duration_ms ?? 0,
         stopReason: r.subtype,
         isError: r.is_error,
@@ -1002,6 +1143,15 @@ export function unionCatalogs(
   return [...byId.values()];
 }
 
+/** The registry's OAuth servers as qwen MCP configs, through the relay (#396). */
+export function proxiedServersForQwen(lease: McpProxyLease): Record<string, unknown> {
+  const proxied = lease.renew();
+  if (!proxied) return {};
+  return Object.fromEntries(
+    proxied.servers.map((s) => [s.name, { httpUrl: s.url, headers: { Authorization: `Bearer ${proxied.token}` } }]),
+  );
+}
+
 /**
  * Registry servers for the qwen backend, as SDK MCP configs — a native mount,
  * since qwen-code owns its own MCP client. `${VAR}` env refs and
@@ -1009,7 +1159,7 @@ export function unionCatalogs(
  * in config; tool calls still gate through canUseTool.
  */
 export function registryServersForQwen(
-  registry: McpRegistry | undefined,
+  registry: McpServerView | undefined,
 ): Record<string, unknown> {
   if (!registry) return {};
   const out: Record<string, unknown> = {};
@@ -1045,4 +1195,46 @@ export function extractToolResultText(content: unknown): string {
     }
   }
   return parts.join("\n");
+}
+
+/** codeoid's effort scale on qwen-code's (#417): it has no Off or Minimal — both are its lowest, Low. */
+export function qwenEffort(effort: EffortLevel): "low" | "medium" | "high" | "xhigh" | "max" {
+  return effort === "off" || effort === "minimal" ? "low" : effort;
+}
+
+/**
+ * The argv the Qwen SDK would spawn its CLI with (its `pathToQwenExecutable`
+ * rules): the bundled CLI run by this runtime when none is configured, a
+ * script run by it, a name looked up on PATH, a native binary as is.
+ */
+export function qwenCliArgv(configured: string | undefined): string[] {
+  if (!configured) {
+    const pkg = createRequire(import.meta.url).resolve("@qwen-code/sdk/package.json");
+    return [process.execPath, join(dirname(pkg), "dist", "cli", "cli.js")];
+  }
+  if (!configured.includes("/")) return [Bun.which(configured) ?? configured];
+  const abs = resolvePath(configured);
+  return /\.(?:m?js|cjs)$/i.test(abs) ? [process.execPath, abs] : [abs];
+}
+
+/**
+ * The SDK's `pathToQwenExecutable` (#448): with the session's sandbox
+ * around the process, a launcher that starts the CLI inside it, in a private
+ * copy of its home (backend-home.ts: its login a private copy written back
+ * when the handle closes, its sessions the session's own; `env` gets `QWEN_HOME`), and the handle it runs in (the caller
+ * closes it when the query is replaced); else the configured command, or
+ * none (the bundled CLI). One launcher per session, rewritten in place.
+ */
+export function qwenExecutableOption<E extends Record<string, string | undefined>>(
+  rt: SandboxRuntime | null,
+  configured: string | undefined,
+  env: E,
+): { pathToQwenExecutable?: string; env?: E & { QWEN_HOME: string }; handle?: SandboxHandle } {
+  if (!rt?.plan.wrapsBackend) return configured ? { pathToQwenExecutable: configured } : {};
+  const argv = qwenCliArgv(configured);
+  const own = preparePrivateHome(env.QWEN_HOME || join(env.HOME || homedir(), ".qwen"), rt.privateHome("qwen"), QWEN_HOME_LAYOUT, { state: rt.stateDir("qwen") });
+  const withHome = { ...env, QWEN_HOME: own.home };
+  // Closed when the query is replaced or torn down: a login the CLI refreshed is written back then.
+  const handle = withLoginsSynced(rt.openSync(own.writable, { readable: [...own.readable, ...programLocations(argv[0] ?? "", argv.slice(1))] }), own, rt.warn);
+  return { pathToQwenExecutable: rt.launcher(handle, argv, Object.keys(withHome), "qwen"), env: withHome, handle };
 }

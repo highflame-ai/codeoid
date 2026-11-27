@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildProbeGate, detectEcosystem, type ProbeSpec } from "./gate-probes";
+import { buildProbeGate, detectEcosystem, diagnosticTail, type ProbeSpec } from "./gate-probes";
 import type { GateCtx, PipelineState } from "./interface";
 
 function tmp(): string {
@@ -140,5 +140,43 @@ describe("workdir guard", () => {
     const v = await evalProbe({ type: "file-exists", paths: ["x"] }, undefined);
     expect(v.pass).toBe(false);
     expect(v.reason).toContain("needs a workdir");
+  });
+});
+
+describe("probe evidence", () => {
+  test("a test probe that ran no tests fails as inconclusive, and its check is recorded", async () => {
+    const d = tmp();
+    writeFileSync(join(d, "package.json"), JSON.stringify({ scripts: { test: "echo 'Ran 0 tests across 0 files.'" } }));
+    const seen: string[] = [];
+    const c: GateCtx = {
+      ...ctx(d),
+      runCheck: async (spec, cwd) => {
+        seen.push(`${spec.id}@${cwd}:${spec.expectTests}`);
+        const { ephemeralCheck } = await import("../evidence/service");
+        const run = await ephemeralCheck(spec, cwd);
+        return { ...run, record: { ...run.outcome, id: "ev_1" } as never };
+      },
+    };
+    const v = await buildProbeGate("g", { type: "test" }, "exit", true).evaluate(c);
+    expect(v.pass).toBe(false);
+    expect(v.reason).toContain("inconclusive");
+    expect(v.evidenceIds).toEqual(["ev_1"]);
+    expect(seen).toEqual([`x:g:test@${d}:true`]);
+  });
+});
+
+
+describe("diagnosticTail", () => {
+  const outcome = (stdout: string, stderr: string) =>
+    ({ stdoutExcerpt: stdout, stderrExcerpt: stderr }) as Parameters<typeof diagnosticTail>[0];
+
+  test("long console noise on stdout cannot push the failure on stderr out", () => {
+    const tail = diagnosticTail(outcome("noise ".repeat(1_000), "expected 2, received 3"), 600);
+    expect(tail).toContain("expected 2, received 3");
+    expect(tail.length).toBeLessThanOrEqual(600 + 5);
+  });
+
+  test("uses the whole budget for the only stream there is", () => {
+    expect(diagnosticTail(outcome("x".repeat(2_000), ""), 500).length).toBe(501);
   });
 });

@@ -53,6 +53,7 @@ export function StatusBar({
   cols,
 }: Props) {
   const usage = focused?.info.usage;
+  const account = focused ? accountLabel(focused.info) : null;
   // Background-activity summary: count sessions (other than focused) with
   // unread messages or pending approvals. Shown as a single compact pill
   // at the end of the bar — no per-session chrome.
@@ -95,8 +96,6 @@ export function StatusBar({
         <>
           <Text dimColor>{"   │   "}</Text>
           <Text bold>{focused.info.name}</Text>
-          <Text dimColor>{" @ "}</Text>
-          <Text dimColor>{focused.info.workdir}</Text>
           <Text dimColor>{" · "}</Text>
           <Text
             color={
@@ -113,6 +112,10 @@ export function StatusBar({
           >
             {focused.info.status}
           </Text>
+          {/* A MISSING account fails the next turn, so it comes right after
+              the status — ahead of the model and backend, whose ids can
+              be long enough to push it off a 100-column terminal. */}
+          {account?.missing && <Text color="red">{` · ⚠ ${account.label}`}</Text>}
           {workingSec !== null && (
             <Text color="yellow" dimColor>
               {` · ${formatDuration(workingSec)}`}
@@ -155,6 +158,12 @@ export function StatusBar({
               </Text>
             </>
           )}
+          {/* The backend sits with the model (Claude is implied by its
+              model id). A working account is a descriptor and goes at the
+              end, beside the workdir. */}
+          {(focused.info.providerId ?? "claude") !== "claude" && (
+            <Text dimColor>{` on ${focused.info.providerId}`}</Text>
+          )}
           {focused.info.pinnedFiles && focused.info.pinnedFiles.length > 0 && (
             <>
               <Text dimColor>{" · pinned: "}</Text>
@@ -170,7 +179,7 @@ export function StatusBar({
             <>
               <Text dimColor>{"   │   "}</Text>
               <Text color="cyan" bold>
-                {formatCost(usage.totalCostUsd)}
+                {formatCostOf(usage)}
               </Text>
               {usage.lastTurnCostUsd !== undefined && usage.lastTurnCostUsd > 0 && (
                 <Text color="cyan" dimColor>
@@ -251,9 +260,45 @@ export function StatusBar({
           <Text color="red">⚠ {lastError}</Text>
         </>
       )}
+      {/* The workdir goes last: the line truncates at the terminal edge, and
+          a long path must never push the live status, cost, or error off
+          screen (the focus banner shows it in full). */}
+      {focused && (
+        <>
+          <Text dimColor>{"   │   "}</Text>
+          {account && !account.missing && <Text color="cyan">{`account: ${account.label} · `}</Text>}
+          <Text dimColor>{`@ ${focused.info.workdir}`}</Text>
+        </>
+      )}
       </Text>
     </Box>
   );
+}
+
+/**
+ * The account worth showing for the session's current backend, or null. A
+ * session that follows its backend's default and lands on the built-in
+ * `default` (the daemon's own login or environment) is the common case and
+ * says nothing; a pinned account, a non-default daemon default, or a missing
+ * account (which fails the next turn) is shown. A backend without accounts
+ * reports neither field and shows nothing. A missing label leads with what's
+ * wrong ("missing account: work", "missing default account: team"), so a
+ * narrow bar that cuts its end still says it.
+ */
+function accountLabel(info: TuiSession["info"]): { label: string; missing: boolean } | null {
+  // On a Claude session the daemon also reports the same choice under the
+  // Claude-only `claudeAccount` / `effectiveClaudeAccount` names.
+  const claude = (info.providerId ?? "claude") === "claude";
+  const choice = info.account ?? (claude ? info.claudeAccount : undefined);
+  const reported = info.effectiveAccount ?? (claude ? info.effectiveClaudeAccount : undefined);
+  if (choice === undefined && reported === undefined) return null;
+  const effective = reported ?? choice ?? "default";
+  const missing = effective.endsWith(" (missing)");
+  const name = missing ? effective.slice(0, -" (missing)".length) : effective;
+  if (choice !== undefined) return missing ? { label: `missing account: ${name}`, missing } : { label: effective, missing };
+  if (effective === "default") return null;
+  if (missing) return { label: `missing default account: ${name}`, missing };
+  return { label: `${effective} (following default)`, missing };
 }
 
 /** "12s" / "1m 23s" / "1h 5m" — compact working-duration stamp. */
@@ -281,6 +326,13 @@ function formatTokens(n: number): string {
  * whole dollars above (e.g. "$42", "$1.2k"). Tiny costs collapse to "$0.00"
  * rather than a noisy exponential.
  */
+/** The session's cost, marked when estimated (`~`) or partly unknown (`+`, `?`) — #430. */
+function formatCostOf(u: { totalCostUsd: number; costEstimated?: boolean; costUnknownTurns?: number }): string {
+  const unknown = u.costUnknownTurns ?? 0;
+  if (unknown > 0 && u.totalCostUsd === 0 && !u.costEstimated) return "$?";
+  return `${u.costEstimated ? "~" : ""}${formatCost(u.totalCostUsd)}${unknown > 0 ? "+" : ""}`;
+}
+
 function formatCost(usd: number): string {
   if (!Number.isFinite(usd) || usd <= 0) return "$0.00";
   if (usd < 10) return `$${usd.toFixed(2)}`;
@@ -348,4 +400,3 @@ function pickContextColor(inputTokens: number, contextWindow: number): string {
   if (r >= 0.5) return "yellow";
   return "green";
 }
-

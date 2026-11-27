@@ -6,7 +6,7 @@
 
 import { Database } from "bun:sqlite";
 import { chmodSync, existsSync } from "node:fs";
-import type { ModelInfo, PushPlatform, SessionInfo, SessionStatus } from "../protocol/types.js";
+import { EFFORT_LEVELS, type EffortLevel, type ModelInfo, type PushPlatform, type SessionInfo, type SessionStatus } from "../protocol/types.js";
 
 // ── Dispatch queue types (P4) ─────────────────────────────────────────────
 
@@ -14,15 +14,30 @@ export type DispatchTaskStatus =
   | "queued"
   | "claimed"
   | "running"
+  /**
+   * Parked on something outside the worker — an approval outside a loop's
+   * permission profile, say. Non-terminal, and deliberately invisible to
+   * reclaim: a held task is not a dead claim, it is one waiting on a person,
+   * and reclaiming it would burn the attempt for the human's response time.
+   */
+  | "held"
   | "done"
   | "failed"
   | "blocked";
+
+/**
+ * `attempt` is one bounded attempt of a loop run (docs/loop-engineering-design.md
+ * §5). It rides the same queue as send/spawn — the dispatcher stays the sole
+ * scheduler of worker attempts — but its lifecycle belongs to the loop host:
+ * no fleet events, no teardown on finish, and a reclaim is terminal.
+ */
+export type DispatchTaskKind = "send" | "spawn" | "attempt";
 
 export interface DispatchTaskRow {
   id: string;
   accountId: string;
   projectId: string;
-  kind: "send" | "spawn";
+  kind: DispatchTaskKind;
   shape: "ship" | "scout";
   targetSession: string | null;
   workdir: string | null;
@@ -36,6 +51,15 @@ export interface DispatchTaskRow {
   provider: string | null;
   /** Per-child model, already resolved against `provider`. NULL = provider default. */
   model: string | null;
+  /**
+   * A spawn's target home workstream (workstreams §10), checked when queued
+   * and again at claim. NULL = the folder's (every task before W4).
+   */
+  workstream: string | null;
+  /** The spawn's card confirmed an override or an `ask` folder (its approval card said so). */
+  workstreamOverride: boolean;
+  /** The config revision that confirmation was given at: it holds only at that one. */
+  workstreamRevision: string | null;
   status: DispatchTaskStatus;
   attempts: number;
   failureLimit: number;
@@ -59,6 +83,24 @@ export interface DispatchTaskRow {
    * "member 1 of 3" labels in a joined digest would shuffle between reads.
    */
   groupOrdinal: number | null;
+  /** Loop run this attempt belongs to. NULL for every non-attempt task. */
+  runId: string | null;
+  /** The loop's own attempt record. NULL for every non-attempt task. */
+  attemptId: string | null;
+  /**
+   * Claim generation — bumped on every claim and every reclaim. A worker's
+   * result is accepted only for the generation it was started under, so a
+   * worker replaced after a reclaim cannot complete or fail the task its
+   * successor now owns (§6 "Restart guarantees"). 0 = never claimed, which is
+   * what every row written before generations existed reads as.
+   */
+  generation: number;
+  /**
+   * Epoch ms a `held` task's hold lapses. A hold occupies a worker session and
+   * counts against the worker cap, so it must not be able to do so forever:
+   * past this, reclaim treats the hold as dead. NULL unless held.
+   */
+  heldUntil: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -82,7 +124,7 @@ interface RawDispatchRow {
   id: string;
   account_id: string;
   project_id: string;
-  kind: "send" | "spawn";
+  kind: DispatchTaskKind;
   shape: "ship" | "scout";
   target_session: string | null;
   workdir: string | null;
@@ -102,6 +144,13 @@ interface RawDispatchRow {
   created_by: string;
   group_id: string | null;
   group_ordinal: number | null;
+  run_id: string | null;
+  attempt_id: string | null;
+  generation: number;
+  held_until: number | null;
+  workstream?: string | null;
+  workstream_override?: number | null;
+  workstream_revision?: string | null;
   created_at: number;
   updated_at: number;
 }
@@ -120,6 +169,9 @@ function rowToDispatchTask(r: RawDispatchRow): DispatchTaskRow {
     // missing-column undefined and a stored NULL to the same "use default".
     provider: r.provider ?? null,
     model: r.model ?? null,
+    workstream: r.workstream ?? null,
+    workstreamOverride: r.workstream_override === 1,
+    workstreamRevision: r.workstream_revision ?? null,
     status: r.status,
     attempts: r.attempts,
     failureLimit: r.failure_limit,
@@ -132,6 +184,10 @@ function rowToDispatchTask(r: RawDispatchRow): DispatchTaskRow {
     createdBy: r.created_by,
     groupId: r.group_id ?? null,
     groupOrdinal: r.group_ordinal ?? null,
+    runId: r.run_id ?? null,
+    attemptId: r.attempt_id ?? null,
+    generation: r.generation ?? 0,
+    heldUntil: r.held_until ?? null,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };
@@ -188,6 +244,28 @@ function enableWalWithRetry(db: Database, dbPath: string): void {
   throw new Error(
     `could not switch ${dbPath} to WAL journal mode after ${WAL_RETRY_ATTEMPTS} attempts${because}`,
   );
+}
+
+/** A saved approval rule as stored (docs/secrets-and-memory-design.md §4.1). */
+export interface ApprovalRuleRow {
+  id: string;
+  owner: string;
+  scopeKind: string;
+  scopeKey: string;
+  scopeLabel: string;
+  rule: string;
+  effect: string;
+  createdAt: number;
+  expiresAt: number | null;
+  lastUsedAt: number | null;
+  useCount: number;
+}
+
+/** Which stored OAuth credential: a server at a URL, and a slot ('' / absent = its default sign-in). */
+export interface McpOAuthServerKey {
+  name: string;
+  url: string;
+  slot?: string;
 }
 
 export class Store {
@@ -285,6 +363,8 @@ export class Store {
     // Model selection — persisted so /model choice survives daemon restart.
     this.#addColumnIfMissing("sessions", "model", "TEXT");
     this.#addColumnIfMissing("sessions", "fallback_model", "TEXT");
+    // Thinking effort (#417), kept like the model. NULL = the backend's default.
+    this.#addColumnIfMissing("sessions", "effort", "TEXT");
     // Session role ("conductor") + backing provider id — persisted so the
     // conductor keeps its role and every session keeps its provider across
     // daemon restarts. NULL = normal session / claude (pre-upgrade rows).
@@ -318,6 +398,28 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_log(timestamp);
       CREATE INDEX IF NOT EXISTS idx_audit_session ON audit_log(session_id);
       CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions(account_id, project_id);
+
+      -- Remotes an owner connected for the git gateway (git-gateway/connect.ts): their sandboxed sessions' agents
+      -- may fetch and push there with the owner's credential. One owner's: it decides only that owner's sessions.
+      CREATE TABLE IF NOT EXISTS git_connections (
+        owner        TEXT NOT NULL,
+        url          TEXT NOT NULL,
+        kind         TEXT NOT NULL,
+        auth         TEXT NOT NULL,
+        connected_by TEXT NOT NULL,
+        connected_at INTEGER NOT NULL,
+        PRIMARY KEY (owner, url)
+      );
+
+      -- Branches agents made on a connected remote through the git gateway: the only existing ones they may move.
+      CREATE TABLE IF NOT EXISTS git_agent_branches (
+        owner      TEXT NOT NULL,
+        url        TEXT NOT NULL,
+        branch     TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        tip        TEXT,
+        PRIMARY KEY (owner, url, branch)
+      );
 
       CREATE TABLE IF NOT EXISTS session_pins (
         session_id  TEXT NOT NULL,
@@ -372,6 +474,50 @@ export class Store {
         PRIMARY KEY (account_id, project_id, workdir, provider_id, model)
       );
 
+      -- How each folder last resolved to a workstream, per tenant
+      -- (docs/workstreams-design.md §5.1): a repository rule that matches
+      -- differently later (an edited origin) is refused, not a silent re-home.
+      -- Detected secrets a workstream keeps (captureSecrets: "vault";
+      -- docs/secrets-and-memory-design.md §2.5): the value encrypted under a
+      -- key outside the database (secrets/vault.ts), so a copy of this file
+      -- alone holds none. Per tenant and workstream ('' = no workstream).
+      CREATE TABLE IF NOT EXISTS captured_secrets (
+        account_id   TEXT NOT NULL,
+        project_id   TEXT NOT NULL,
+        workstream   TEXT NOT NULL,
+        fingerprint  TEXT NOT NULL,
+        kind         TEXT NOT NULL,
+        sealed       BLOB NOT NULL,
+        session_id   TEXT,
+        first_seen   INTEGER NOT NULL,
+        last_seen    INTEGER NOT NULL,
+        PRIMARY KEY (account_id, project_id, workstream, fingerprint)
+      );
+
+      CREATE TABLE IF NOT EXISTS workstream_folders (
+        account_id  TEXT NOT NULL,
+        project_id  TEXT NOT NULL,
+        workdir     TEXT NOT NULL,
+        workstream  TEXT NOT NULL,
+        updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (account_id, project_id, workdir)
+      );
+
+      -- A repo's MCP server (a workdir's .mcp.json or project settings)
+      -- approved in codeoid to reach every backend there (#395). Bound to the
+      -- entry's fingerprint: a repo that edits the entry needs consent again.
+      -- Tenant- and workdir-scoped, like the sessions that use it.
+      CREATE TABLE IF NOT EXISTS mcp_workdir_approvals (
+        account_id  TEXT NOT NULL,
+        project_id  TEXT NOT NULL,
+        workdir     TEXT NOT NULL,
+        server      TEXT NOT NULL,
+        fingerprint TEXT NOT NULL,
+        approved_by TEXT NOT NULL,
+        approved_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (account_id, project_id, workdir, server, fingerprint)
+      );
+
       -- OAuth credentials for remote MCP servers (docs/mcp-oauth-design.md),
       -- one row per tenant, server and server URL: the registered client
       -- (dynamic registration result) and the tokens, with when they were
@@ -384,11 +530,14 @@ export class Store {
         project_id      TEXT NOT NULL,
         server          TEXT NOT NULL,
         server_url      TEXT NOT NULL,
+        -- A named credential's slot (workstreams §6.5 case 2: a second
+        -- sign-in to one server). '' = the server's default sign-in.
+        credential      TEXT NOT NULL DEFAULT '',
         client_json     TEXT,
         tokens_json     TEXT,
         tokens_saved_at INTEGER,
         updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
-        PRIMARY KEY (account_id, project_id, server, server_url)
+        PRIMARY KEY (account_id, project_id, server, server_url, credential)
       );
 
       -- Durable conductor identity (design R2): one row per tenant, reloaded
@@ -424,6 +573,29 @@ export class Store {
         PRIMARY KEY (workspace_id, command)
       );
 
+      -- Saved approval rules (docs/secrets-and-memory-design.md §4.1): an
+      -- owner's answer to a card for a scope. A rule is the owner's own, in
+      -- their tenant; scope_key is the session id, the repository's
+      -- workspace id or the workstream id (empty for everywhere). Removed
+      -- rules stay, inactive, for the audit trail.
+      CREATE TABLE IF NOT EXISTS approval_rules (
+        id           TEXT PRIMARY KEY,
+        account_id   TEXT NOT NULL,
+        project_id   TEXT NOT NULL,
+        owner        TEXT NOT NULL,
+        scope_kind   TEXT NOT NULL,
+        scope_key    TEXT NOT NULL,
+        scope_label  TEXT NOT NULL DEFAULT '',
+        rule         TEXT NOT NULL,
+        effect       TEXT NOT NULL,
+        created_at   INTEGER NOT NULL,
+        expires_at   INTEGER,
+        last_used_at INTEGER,
+        use_count    INTEGER NOT NULL DEFAULT 0,
+        is_active    INTEGER NOT NULL DEFAULT 1
+      );
+      CREATE INDEX IF NOT EXISTS approval_rules_owner ON approval_rules (account_id, project_id, owner, is_active);
+
       -- Durable dispatch work queue (P4, hermes-Kanban pattern). Tasks are
       -- the source of truth for send-class fleet actions: the queue — not
       -- the conductor's turn — owns their lifecycle, so a spawned worker
@@ -435,14 +607,14 @@ export class Store {
         id                TEXT PRIMARY KEY,
         account_id        TEXT NOT NULL,
         project_id        TEXT NOT NULL,
-        kind              TEXT NOT NULL,             -- 'send' | 'spawn'
+        kind              TEXT NOT NULL,             -- 'send' | 'spawn' | 'attempt'
         shape             TEXT NOT NULL,             -- 'ship' | 'scout'
         target_session    TEXT,                      -- send: existing session id
         workdir           TEXT,                      -- spawn: worker workdir
         prompt            TEXT NOT NULL,
         provider          TEXT,                      -- spawn: per-child backend id; NULL = daemon default
         model             TEXT,                      -- spawn: per-child model, resolved against the provider above
-        status            TEXT NOT NULL DEFAULT 'queued',
+        status            TEXT NOT NULL DEFAULT 'queued', -- queued|claimed|running|held|done|failed|blocked
         attempts          INTEGER NOT NULL DEFAULT 0,
         failure_limit     INTEGER NOT NULL DEFAULT 2,
         claim_owner       TEXT,                      -- daemon boot id
@@ -454,6 +626,10 @@ export class Store {
         created_by        TEXT NOT NULL,             -- conductor WIMSE URI / sub
         group_id          TEXT,                      -- dispatch group (barrier); NULL = a standalone task
         group_ordinal     INTEGER,                   -- 1-based position within the group; NULL when ungrouped
+        run_id            TEXT,                      -- attempt: loop run id; NULL otherwise
+        attempt_id        TEXT,                      -- attempt: loop attempt id; NULL otherwise
+        generation        INTEGER NOT NULL DEFAULT 0, -- claim generation; fences stale worker results
+        held_until        INTEGER,                   -- held: epoch ms the hold lapses; NULL otherwise
         created_at        INTEGER NOT NULL,
         updated_at        INTEGER NOT NULL
       );
@@ -497,6 +673,8 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_compare_runs_parent
         ON compare_runs(account_id, project_id, parent_session_id);
     `);
+    this.#addColumnIfMissing("git_connections", "ssh", "TEXT");
+    this.#addColumnIfMissing("git_agent_branches", "tip", "TEXT");
 
     // Per-child backend selection on spawn tasks. Additive so a database
     // written before collaborative sessions keeps its queued tasks: NULL on
@@ -544,6 +722,37 @@ export class Store {
       }
     }
 
+    // ── mcp_oauth_credentials: a credential slot in the key (rebuild) ─────
+    // Workstreams give one server several sign-ins (§6.5 case 2). The slot is
+    // part of the primary key, which SQLite can't change by ALTER, so the
+    // table is rebuilt once, in one transaction: every existing row becomes
+    // the default slot (''), exactly what it was.
+    {
+      const cols = this.#db.prepare("PRAGMA table_info(mcp_oauth_credentials)").all() as Array<{ name: string }>;
+      if (cols.length > 0 && !cols.some((c) => c.name === "credential")) {
+        this.#db.transaction(() => {
+          this.#db.exec(`
+            CREATE TABLE mcp_oauth_credentials_rebuild (
+              account_id      TEXT NOT NULL,
+              project_id      TEXT NOT NULL,
+              server          TEXT NOT NULL,
+              server_url      TEXT NOT NULL,
+              credential      TEXT NOT NULL DEFAULT '',
+              client_json     TEXT,
+              tokens_json     TEXT,
+              tokens_saved_at INTEGER,
+              updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+              PRIMARY KEY (account_id, project_id, server, server_url, credential)
+            );
+            INSERT INTO mcp_oauth_credentials_rebuild (account_id, project_id, server, server_url, credential, client_json, tokens_json, tokens_saved_at, updated_at)
+              SELECT account_id, project_id, server, server_url, '', client_json, tokens_json, tokens_saved_at, updated_at FROM mcp_oauth_credentials;
+            DROP TABLE mcp_oauth_credentials;
+            ALTER TABLE mcp_oauth_credentials_rebuild RENAME TO mcp_oauth_credentials;
+          `);
+        })();
+      }
+    }
+
     this.#addColumnIfMissing("dispatch_tasks", "group_id", "TEXT");
     this.#addColumnIfMissing("dispatch_tasks", "group_ordinal", "INTEGER");
     // Owning daemon (host:port) — the executor scope for claim + reclaim.
@@ -558,6 +767,19 @@ export class Store {
       `CREATE INDEX IF NOT EXISTS idx_dispatch_owner
          ON dispatch_tasks(owner_daemon, status, created_at);`,
     );
+    // Loop attempts (docs/loop-engineering-design.md §5) and claim generations
+    // (§6). NULL run/attempt ids = a send or spawn task, which is every row
+    // written before loops existed. generation 0 = "never claimed under
+    // generations": the first claim after the upgrade bumps it to 1, so a
+    // worker started by the old binary is fenced like any other stale one.
+    this.#addColumnIfMissing("dispatch_tasks", "run_id", "TEXT");
+    this.#addColumnIfMissing("dispatch_tasks", "attempt_id", "TEXT");
+    this.#addColumnIfMissing("dispatch_tasks", "generation", "INTEGER NOT NULL DEFAULT 0");
+    this.#addColumnIfMissing("dispatch_tasks", "held_until", "INTEGER");
+    // A spawn's target workstream (workstreams W4); NULL = the folder's.
+    this.#addColumnIfMissing("dispatch_tasks", "workstream", "TEXT");
+    this.#addColumnIfMissing("dispatch_tasks", "workstream_override", "INTEGER");
+    this.#addColumnIfMissing("dispatch_tasks", "workstream_revision", "TEXT");
     // AFTER the ALTERs, never inside the CREATE block above. On an existing
     // database `CREATE TABLE IF NOT EXISTS` is a no-op, so an index declared
     // there would run against a table that does not have the column yet and
@@ -578,6 +800,10 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_dispatch_panels
         ON dispatch_tasks(account_id, project_id, created_by, created_at DESC)
         WHERE group_id IS NOT NULL;
+      -- A loop reconciles its attempts by run on restart. Partial: only attempt
+      -- rows carry a run id, so send/spawn history never bloats it.
+      CREATE INDEX IF NOT EXISTS idx_dispatch_run
+        ON dispatch_tasks(run_id) WHERE run_id IS NOT NULL;
     `);
 
     // Pre-release single-row predecessor of provider_model_catalogs — never
@@ -857,6 +1083,18 @@ export class Store {
       .run(backingId, rotationDelta, rotatedAt ?? null, id);
   }
 
+  /** The session's persisted thinking effort (#417); null = never set (the backend's default). */
+  getSessionEffort(id: string): EffortLevel | null {
+    const row = this.#db.prepare("SELECT effort AS e FROM sessions WHERE id = ?").get(id) as { e: string | null } | undefined;
+    const e = row?.e ?? null;
+    return e !== null && (EFFORT_LEVELS as readonly string[]).includes(e) ? (e as EffortLevel) : null;
+  }
+
+  /** Persist the session's thinking effort; null clears it. */
+  setSessionEffort(id: string, effort: EffortLevel | null): void {
+    this.#db.prepare(`UPDATE sessions SET effort = ?, updated_at = datetime('now') WHERE id = ?`).run(effort, id);
+  }
+
   /**
    * Get the persisted model selection for a session. Either field may be
    * null if never set — caller falls back to config defaults.
@@ -979,6 +1217,64 @@ export class Store {
       .run(workspaceId, command, allowed ? 1 : 0);
   }
 
+  /** An owner's active saved approval rules (§4.1), expired ones left out. */
+  listApprovalRules(scope: { accountId: string; projectId: string; owner: string }, now: number = Date.now()): ApprovalRuleRow[] {
+    return this.#db
+      .prepare(
+        `SELECT id, owner, scope_kind AS scopeKind, scope_key AS scopeKey, scope_label AS scopeLabel, rule, effect,
+                created_at AS createdAt, expires_at AS expiresAt, last_used_at AS lastUsedAt, use_count AS useCount
+           FROM approval_rules
+          WHERE account_id = ? AND project_id = ? AND owner = ? AND is_active = 1 AND (expires_at IS NULL OR expires_at > ?)
+          ORDER BY created_at`,
+      )
+      .all(scope.accountId, scope.projectId, scope.owner, now) as ApprovalRuleRow[];
+  }
+
+  /** Save a rule; an active one with the same scope, rule and effect is kept instead (its expiry moved on). */
+  addApprovalRule(
+    scope: { accountId: string; projectId: string; owner: string },
+    rule: { id: string; scopeKind: string; scopeKey: string; scopeLabel: string; rule: string; effect: string; expiresAt: number | null },
+    now: number = Date.now(),
+  ): { id: string; created: boolean } {
+    return this.#db.transaction(() => {
+      const existing = this.#db
+        .prepare(
+          `SELECT id FROM approval_rules WHERE account_id = ? AND project_id = ? AND owner = ? AND scope_kind = ? AND scope_key = ? AND rule = ? AND effect = ?
+              AND is_active = 1 AND (expires_at IS NULL OR expires_at > ?)`,
+        )
+        .get(scope.accountId, scope.projectId, scope.owner, rule.scopeKind, rule.scopeKey, rule.rule, rule.effect, now) as { id: string } | null;
+      if (existing) {
+        if (rule.expiresAt !== null) this.#db.prepare("UPDATE approval_rules SET expires_at = MAX(COALESCE(expires_at, 0), ?) WHERE id = ? AND expires_at IS NOT NULL").run(rule.expiresAt, existing.id);
+        return { id: existing.id, created: false };
+      }
+      this.#db
+        .prepare(
+          `INSERT INTO approval_rules (id, account_id, project_id, owner, scope_kind, scope_key, scope_label, rule, effect, created_at, expires_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(rule.id, scope.accountId, scope.projectId, scope.owner, rule.scopeKind, rule.scopeKey, rule.scopeLabel, rule.rule, rule.effect, now, rule.expiresAt);
+      return { id: rule.id, created: true };
+    })();
+  }
+
+  /** Mark an owner's rule removed; false when there is no such active rule of theirs. */
+  removeApprovalRule(scope: { accountId: string; projectId: string; owner: string }, id: string): boolean {
+    const r = this.#db
+      .prepare("UPDATE approval_rules SET is_active = 0 WHERE id = ? AND account_id = ? AND project_id = ? AND owner = ? AND is_active = 1")
+      .run(id, scope.accountId, scope.projectId, scope.owner);
+    return r.changes > 0;
+  }
+
+  /** A session's own rules end with it. */
+  removeSessionApprovalRules(sessionId: string): void {
+    this.#db.prepare("UPDATE approval_rules SET is_active = 0 WHERE scope_kind = 'session' AND scope_key = ? AND is_active = 1").run(sessionId);
+  }
+
+  /** A rule ran a call: when, and how many times. */
+  noteApprovalRuleUse(id: string, now: number = Date.now()): void {
+    this.#db.prepare("UPDATE approval_rules SET last_used_at = ?, use_count = use_count + 1 WHERE id = ?").run(now, id);
+  }
+
   deleteConductorIdentity(accountId: string, projectId: string): void {
     this.#db
       .prepare(
@@ -993,15 +1289,22 @@ export class Store {
     id: string;
     accountId: string;
     projectId: string;
-    kind: "send" | "spawn";
+    kind: DispatchTaskKind;
     shape: "ship" | "scout";
     targetSession?: string;
     workdir?: string;
     prompt: string;
+    /** Loop run + attempt ids — required for `kind: "attempt"`, absent otherwise. */
+    runId?: string;
+    attemptId?: string;
     /** Per-child backend for a spawn task; omit for the daemon default. */
     provider?: string;
     /** Per-child model, already resolved against `provider`. */
     model?: string;
+    /** A spawn's target workstream, and whether it was confirmed past the folder's claim. */
+    workstream?: string;
+    workstreamOverride?: boolean;
+    workstreamRevision?: string;
     failureLimit: number;
     createdBy: string;
     /** Dispatch group for a barrier fan-out; omit for a standalone task. */
@@ -1021,8 +1324,8 @@ export class Store {
         `INSERT INTO dispatch_tasks
            (id, account_id, project_id, kind, shape, target_session, workdir,
             prompt, provider, model, failure_limit, created_by, group_id,
-            group_ordinal, owner_daemon, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            group_ordinal, owner_daemon, run_id, attempt_id, workstream, workstream_override, workstream_revision, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         task.id,
@@ -1040,6 +1343,11 @@ export class Store {
         task.groupId ?? null,
         task.groupOrdinal ?? null,
         task.ownerDaemon ?? null,
+        task.runId ?? null,
+        task.attemptId ?? null,
+        task.workstream ?? null,
+        task.workstreamOverride ? 1 : null,
+        task.workstreamRevision ?? null,
         task.now,
         task.now,
       );
@@ -1053,6 +1361,10 @@ export class Store {
    * failed retries) WITHOUT global head-of-line blocking: only the specific
    * deferred tasks are skipped, so neither sends nor other tenants' spawns
    * are starved by one capped tenant.
+   *
+   * Every claim bumps `generation`; the returned row carries the new value,
+   * which is the one the worker started from this claim must present when it
+   * completes or fails the task.
    */
   dispatchClaimNext(
     bootId: string,
@@ -1063,7 +1375,8 @@ export class Store {
     const row = this.#db
       .prepare(
         `UPDATE dispatch_tasks
-         SET status = 'claimed', claim_owner = ?, claimed_at = ?, updated_at = ?
+         SET status = 'claimed', claim_owner = ?, claimed_at = ?, updated_at = ?,
+             generation = generation + 1
          WHERE id = (
            SELECT id FROM dispatch_tasks
            WHERE status = 'queued'
@@ -1085,46 +1398,105 @@ export class Store {
     return row ? rowToDispatchTask(row) : null;
   }
 
-  /** Transition a claimed task to running (worker session known, if spawn). */
-  dispatchMarkRunning(id: string, workerSessionId: string | null, now: number): void {
-    this.#db
+  /**
+   * Transition a claimed task to running (worker session known, if spawn).
+   *
+   * Fenced like a result: false when the claim it was started under has been
+   * reclaimed in the meantime (a spawn that outlived the lease). Recording a
+   * worker on a claim that is no longer ours would hand the successor a
+   * session it never started.
+   */
+  dispatchMarkRunning(
+    id: string,
+    generation: number,
+    workerSessionId: string | null,
+    now: number,
+  ): boolean {
+    const res = this.#db
       .prepare(
         `UPDATE dispatch_tasks
          SET status = 'running', worker_session_id = COALESCE(?, worker_session_id), updated_at = ?
-         WHERE id = ?`,
+         WHERE id = ? AND generation = ? AND status IN ('claimed', 'running')`,
       )
-      .run(workerSessionId, now, id);
+      .run(workerSessionId, now, id, generation);
+    return res.changes > 0;
   }
 
-  /** Renew the lease on tasks whose workers are verifiably still alive. */
-  dispatchTouch(ids: string[], now: number): void {
-    if (ids.length === 0) return;
+  /**
+   * Renew the lease on tasks whose workers are verifiably still alive — only
+   * for the generation each was watched under, so a watcher left over from a
+   * replaced worker cannot keep its successor's claim artificially fresh.
+   */
+  dispatchTouch(
+    entries: ReadonlyArray<{ id: string; generation: number }>,
+    now: number,
+  ): void {
+    if (entries.length === 0) return;
     const stmt = this.#db.prepare(
-      "UPDATE dispatch_tasks SET claimed_at = ? WHERE id = ?",
+      "UPDATE dispatch_tasks SET claimed_at = ? WHERE id = ? AND generation = ?",
     );
     // One transaction: the batch is atomic (all-or-nothing) and commits once.
     this.#db.transaction(() => {
-      for (const id of ids) stmt.run(now, id);
+      for (const e of entries) stmt.run(now, e.id, e.generation);
     })();
   }
 
-  dispatchComplete(id: string, digest: string, now: number): void {
-    this.#db
+  /**
+   * Record a worker's success. Returns whether it applied.
+   *
+   * Guarded on the generation the worker was started under AND on a live
+   * claim. Without the guard a worker replaced after a reclaim — still
+   * running, finishing late — overwrote whatever its successor had recorded,
+   * or resurrected a task that had already gone terminal.
+   */
+  /**
+   * Applied to a dispatch task's prompt, result digest and error once it is
+   * settled (docs/secrets-and-memory-design.md §2.6): until then the prompt is
+   * what its worker is sent, as the conductor wrote it.
+   */
+  scrubText: ((text: string) => string) | undefined;
+
+  /** A settled task's texts, scrubbed in place. */
+  #scrubSettledTask(id: string): void {
+    const scrub = this.scrubText;
+    if (!scrub) return;
+    const row = this.#db.prepare("SELECT prompt, result_digest, error, status FROM dispatch_tasks WHERE id = ?").get(id) as
+      | { prompt: string; result_digest: string | null; error: string | null; status: string }
+      | null;
+    if (!row || !["done", "failed", "cancelled", "blocked"].includes(row.status)) return;
+    const prompt = scrub(row.prompt);
+    const digest = row.result_digest ? scrub(row.result_digest) : row.result_digest;
+    const error = row.error ? scrub(row.error) : row.error;
+    if (prompt !== row.prompt || digest !== row.result_digest || error !== row.error) {
+      this.#db.prepare("UPDATE dispatch_tasks SET prompt = ?, result_digest = ?, error = ? WHERE id = ?").run(prompt, digest, error, id);
+    }
+  }
+
+  dispatchComplete(id: string, generation: number, digest: string, now: number): boolean {
+    const res = this.#db
       .prepare(
         `UPDATE dispatch_tasks
          SET status = 'done', result_digest = ?, error = NULL, updated_at = ?
-         WHERE id = ?`,
+         WHERE id = ? AND generation = ? AND status IN ('claimed', 'running')`,
       )
-      .run(digest, now, id);
+      .run(digest, now, id, generation);
+    if (res.changes > 0) this.#scrubSettledTask(id);
+    return res.changes > 0;
   }
 
   /**
    * Record a failure. Retryable failures re-queue until `failure_limit`
    * attempts, then auto-block (hermes anti-spin); non-retryable ones (target
-   * gone, invalid input) go terminal immediately. Returns the final status.
+   * gone, invalid input) go terminal immediately. Returns the final status, or
+   * null when the update did not apply — the generation is stale or the claim
+   * is no longer live (same fence as `dispatchComplete`).
+   *
+   * A loop attempt never re-queues: retrying is the loop's decision (a new
+   * attempt with its own record), so any failure of one is terminal `failed`.
    */
   dispatchFail(
     id: string,
+    generation: number,
     error: string,
     now: number,
     opts: { retryable: boolean; notBefore?: number },
@@ -1134,22 +1506,142 @@ export class Store {
         opts.retryable
           ? `UPDATE dispatch_tasks
              SET attempts = attempts + 1,
-                 status = CASE WHEN attempts + 1 >= failure_limit THEN 'blocked' ELSE 'queued' END,
+                 status = CASE
+                   WHEN kind = 'attempt' THEN 'failed'
+                   WHEN attempts + 1 >= failure_limit THEN 'blocked'
+                   ELSE 'queued' END,
                  claim_owner = NULL, claimed_at = NULL, not_before = ?, error = ?, updated_at = ?
-             WHERE id = ?
+             WHERE id = ? AND generation = ? AND status IN ('claimed', 'running')
              RETURNING status`
           : `UPDATE dispatch_tasks
              SET attempts = attempts + 1, status = 'failed',
                  claim_owner = NULL, claimed_at = NULL, error = ?, updated_at = ?
-             WHERE id = ?
+             WHERE id = ? AND generation = ? AND status IN ('claimed', 'running')
              RETURNING status`,
       )
       .get(
         ...(opts.retryable
-          ? [opts.notBefore ?? null, error, now, id]
-          : [error, now, id]),
+          ? [opts.notBefore ?? null, error, now, id, generation]
+          : [error, now, id, generation]),
       ) as { status: "queued" | "blocked" | "failed" } | null;
+    if (row && row.status !== "queued") this.#scrubSettledTask(id);
     return row?.status ?? null;
+  }
+
+  /**
+   * Park a live loop attempt on something outside its worker (`held`) until
+   * `heldUntil`. Fenced on the generation like a result, since it is one: a
+   * stale worker's approval request must not park the claim its successor
+   * holds. Returns whether it applied.
+   *
+   * Attempts only. A hold exists so a loop can wait on a person without its
+   * attempt being reclaimed; a send or spawn has no loop to resolve the wait,
+   * so a held one would sit on a worker session with nobody to release it.
+   *
+   * Scoped to this daemon's tasks (or unowned pre-upgrade rows): another
+   * daemon's attempt is not this daemon's to park. The claim owner and worker
+   * are kept — the task is still this boot's, just not progressing.
+   */
+  dispatchHold(
+    id: string,
+    generation: number,
+    reason: string,
+    now: number,
+    heldUntil: number,
+    ownerDaemon?: string,
+  ): boolean {
+    const res = this.#db
+      .prepare(
+        `UPDATE dispatch_tasks
+         SET status = 'held', error = ?, held_until = ?, updated_at = ?
+         WHERE id = ? AND generation = ? AND status IN ('claimed', 'running')
+           AND kind = 'attempt'
+           AND (owner_daemon IS NULL OR owner_daemon IS ?)`,
+      )
+      .run(reason, heldUntil, now, id, generation, ownerDaemon ?? null);
+    return res.changes > 0;
+  }
+
+  /**
+   * Resume a held task as `running` with a fresh lease, at the same generation
+   * — the same worker carries on, so its eventual result still applies.
+   *
+   * Only for a hold THIS boot placed (`claim_owner = bootId`). A hold that
+   * outlived its boot waited on an approval that died with that process; the
+   * caller settles it as reclaimed (`dispatchSettleHeld`) instead, because
+   * resuming would read the worker's idle as success it never had.
+   */
+  dispatchUnhold(
+    id: string,
+    generation: number,
+    bootId: string,
+    now: number,
+    ownerDaemon?: string,
+  ): boolean {
+    const res = this.#db
+      .prepare(
+        `UPDATE dispatch_tasks
+         SET status = 'running', claimed_at = ?, held_until = NULL, error = NULL, updated_at = ?
+         WHERE id = ? AND generation = ? AND status = 'held' AND claim_owner IS ?
+           AND (owner_daemon IS NULL OR owner_daemon IS ?)`,
+      )
+      .run(now, now, id, generation, bootId, ownerDaemon ?? null);
+    return res.changes > 0;
+  }
+
+  /**
+   * Settle a held task terminal `failed` with `error`, bumping the generation so
+   * its worker can no longer report. Same fence and scope as `dispatchUnhold`,
+   * minus the boot check — it is how a hold that cannot be resumed ends.
+   */
+  dispatchSettleHeld(
+    id: string,
+    generation: number,
+    error: string,
+    now: number,
+    ownerDaemon?: string,
+  ): DispatchTaskRow | null {
+    const row = this.#db
+      .prepare(
+        `UPDATE dispatch_tasks
+         SET status = 'failed', attempts = attempts + 1, error = ?, claim_owner = NULL,
+             claimed_at = NULL, held_until = NULL, generation = generation + 1, updated_at = ?
+         WHERE id = ? AND generation = ? AND status = 'held'
+           AND (owner_daemon IS NULL OR owner_daemon IS ?)
+         RETURNING *`,
+      )
+      .get(error, now, id, generation, ownerDaemon ?? null) as RawDispatchRow | null;
+    if (row) this.#scrubSettledTask(id);
+    return row ? rowToDispatchTask(row) : null;
+  }
+
+  /**
+   * Cancel a loop attempt in any non-terminal state — terminal `failed` with
+   * `reason`. Not generation-fenced: cancellation is the loop controller's
+   * decision, not a worker's result, and must land whichever worker currently
+   * holds the claim. It bumps the generation instead, so that worker's late
+   * result is fenced off. Returns the settled row, or null when there was
+   * nothing to cancel (already terminal, not an attempt, another daemon's).
+   */
+  dispatchCancelAttempt(
+    id: string,
+    reason: string,
+    now: number,
+    ownerDaemon?: string,
+  ): DispatchTaskRow | null {
+    const row = this.#db
+      .prepare(
+        `UPDATE dispatch_tasks
+         SET status = 'failed', error = ?, claim_owner = NULL, claimed_at = NULL,
+             held_until = NULL, generation = generation + 1, updated_at = ?
+         WHERE id = ? AND kind = 'attempt'
+           AND status IN ('queued', 'claimed', 'running', 'held')
+           AND (owner_daemon IS NULL OR owner_daemon IS ?)
+         RETURNING *`,
+      )
+      .get(reason, now, id, ownerDaemon ?? null) as RawDispatchRow | null;
+    if (row) this.#scrubSettledTask(id);
+    return row ? rowToDispatchTask(row) : null;
   }
 
   /**
@@ -1159,6 +1651,16 @@ export class Store {
    * restarts burns through failure_limit and lands in 'blocked': the
    * stuck-loop escalation, in queue form. worker_session_id is preserved so
    * a re-claimed spawn can continue its (resumed) worker session.
+   *
+   * A reclaim bumps `generation`, fencing the replaced worker the moment its
+   * claim is declared dead rather than only at the next claim. A loop attempt
+   * is never re-queued: a reclaimed attempt goes terminal `failed`, and the
+   * loop decides whether to start another.
+   *
+   * A `held` row is parked, not dead, and is left alone — with two exceptions
+   * that bound it. Its hold lapsed (`held_until`), so it cannot sit on a worker
+   * slot forever; or a previous boot of this daemon placed it, so the approval
+   * it waited on died with that process and nothing will ever release it.
    */
   /**
    * Reclaim claims this daemon can prove are dead.
@@ -1179,10 +1681,16 @@ export class Store {
       .prepare(
         `UPDATE dispatch_tasks
          SET attempts = attempts + 1,
-             status = CASE WHEN attempts + 1 >= failure_limit THEN 'blocked' ELSE 'queued' END,
-             claim_owner = NULL, claimed_at = NULL,
-             error = COALESCE(error, 'reclaimed: stale claim'), updated_at = ?
-         WHERE status IN ('claimed', 'running')
+             status = CASE
+               WHEN kind = 'attempt' THEN 'failed'
+               WHEN attempts + 1 >= failure_limit THEN 'blocked'
+               ELSE 'queued' END,
+             claim_owner = NULL, claimed_at = NULL, held_until = NULL, generation = generation + 1,
+             error = CASE WHEN status = 'held' THEN 'reclaimed: hold lapsed or outlived its boot'
+                          ELSE COALESCE(error, 'reclaimed: stale claim') END,
+             updated_at = ?
+         WHERE (
+           status IN ('claimed', 'running')
            AND (
              -- Mine: a previous boot of THIS daemon crashed, or the lease ran out.
              (owner_daemon IS ? AND (claim_owner IS NOT ? OR claimed_at IS NULL OR claimed_at + ? < ?))
@@ -1190,6 +1698,15 @@ export class Store {
              -- is what let another daemon steal a healthy claim.
              OR (owner_daemon IS NULL AND (claimed_at IS NULL OR claimed_at + ? < ?))
            )
+         ) OR (
+           status = 'held'
+           AND (
+             -- Mine, held by a previous boot: the wait died with that process.
+             (owner_daemon IS ? AND claim_owner IS NOT ?)
+             -- Mine or unowned, and the hold lapsed.
+             OR ((owner_daemon IS NULL OR owner_daemon IS ?) AND held_until IS NOT NULL AND held_until < ?)
+           )
+         )
          RETURNING *`,
       )
       .all(
@@ -1200,7 +1717,12 @@ export class Store {
         now,
         leaseMs,
         now,
+        ownerDaemon ?? null,
+        bootId,
+        ownerDaemon ?? null,
+        now,
       ) as RawDispatchRow[];
+    for (const r of rows) if (r.status !== "queued") this.#scrubSettledTask(r.id);
     return rows.map(rowToDispatchTask);
   }
 
@@ -1319,6 +1841,10 @@ export class Store {
    * showing every other session's dispatches — target names, prompts' result
    * digests — would be the one place that scoping leaked. Filtered in SQL, not
    * after the fact, so `limit` still returns `limit` of the caller's own rows.
+   *
+   * Loop attempts are excluded (as on every fleet-board read): they are a
+   * loop's internals, not conductor dispatches, and get board rows of their
+   * own — one per run — in a later slice.
    */
   dispatchListForTenant(
     accountId: string,
@@ -1331,6 +1857,7 @@ export class Store {
         `SELECT * FROM dispatch_tasks
          WHERE account_id = ? AND project_id = ?
            AND (? IS NULL OR created_by = ?)
+           AND kind != 'attempt'
          ORDER BY created_at DESC LIMIT ?`,
       )
       .all(
@@ -1374,6 +1901,10 @@ export class Store {
    * Computed in SQL over the WHOLE table rather than by counting the capped
    * task list the snapshot ships: a tenant with more than `limit` tasks would
    * otherwise report "3 active" purely because the older ones fell off the page.
+   *
+   * Loop attempts are excluded (as on every fleet-board read): they are a
+   * loop's internals, not conductor dispatches, and get board rows of their
+   * own — one per run — in a later slice.
    */
   dispatchStatusCounts(
     accountId: string,
@@ -1382,10 +1913,10 @@ export class Store {
     const row = this.#db
       .prepare(
         `SELECT
-           SUM(CASE WHEN status IN ('queued','claimed','running') THEN 1 ELSE 0 END) AS active,
+           SUM(CASE WHEN status IN ('queued','claimed','running','held') THEN 1 ELSE 0 END) AS active,
            SUM(CASE WHEN status = 'blocked' THEN 1 ELSE 0 END) AS blocked
          FROM dispatch_tasks
-         WHERE account_id = ? AND project_id = ?`,
+         WHERE account_id = ? AND project_id = ? AND kind != 'attempt'`,
       )
       .get(accountId, projectId) as { active: number | null; blocked: number | null };
     // SUM over zero rows is NULL, not 0.
@@ -1402,6 +1933,10 @@ export class Store {
    * watermark. Re-sending a task the client already has is harmless — a delta
    * carries the whole row and is idempotent by construction — whereas dropping
    * one strands a node in a stale state until the next unrelated change.
+   *
+   * Loop attempts are excluded (as on every fleet-board read): they are a
+   * loop's internals, not conductor dispatches, and get board rows of their
+   * own — one per run — in a later slice.
    */
   dispatchTasksUpdatedSince(
     accountId: string,
@@ -1412,6 +1947,7 @@ export class Store {
       .prepare(
         `SELECT * FROM dispatch_tasks
          WHERE account_id = ? AND project_id = ? AND updated_at >= ?
+           AND kind != 'attempt'
          ORDER BY updated_at ASC`,
       )
       .all(accountId, projectId, since) as RawDispatchRow[];
@@ -1436,13 +1972,16 @@ export class Store {
       .all(accountId, projectId, sinceId) as DispatchEventRow[];
   }
 
-  /** Count of live (claimed/running) spawn tasks — the concurrency-cap read. */
+  /**
+   * Count of live worker tasks — the concurrency-cap read. Loop attempts are
+   * workers too, and a held one still holds its session, so both count.
+   */
   dispatchActiveSpawnCount(accountId: string, projectId: string): number {
     const row = this.#db
       .prepare(
         `SELECT COUNT(*) AS n FROM dispatch_tasks
          WHERE account_id = ? AND project_id = ?
-           AND kind = 'spawn' AND status IN ('claimed', 'running')`,
+           AND kind IN ('spawn', 'attempt') AND status IN ('claimed', 'running', 'held')`,
       )
       .get(accountId, projectId) as { n: number };
     return row.n;
@@ -1463,7 +2002,7 @@ export class Store {
         `INSERT INTO dispatch_events (account_id, project_id, task_id, type, digest, created_at)
          VALUES (?, ?, ?, ?, ?, ?)`,
       )
-      .run(event.accountId, event.projectId, event.taskId, event.type, event.digest, event.now);
+      .run(event.accountId, event.projectId, event.taskId, event.type, this.scrubText ? this.scrubText(event.digest) : event.digest, event.now);
   }
 
   dispatchEventsPending(accountId: string, projectId: string): DispatchEventRow[] {
@@ -1507,14 +2046,14 @@ export class Store {
   /** A tenant's stored OAuth state for one MCP server, or undefined. */
   getMcpOAuthCredential(
     tenant: { accountId: string; projectId: string },
-    server: { name: string; url: string },
+    server: McpOAuthServerKey,
   ): { client?: Record<string, unknown>; tokens?: Record<string, unknown>; tokensSavedAt?: number } | undefined {
     const row = this.#db
       .prepare(
         `SELECT client_json, tokens_json, tokens_saved_at FROM mcp_oauth_credentials
-         WHERE account_id = ? AND project_id = ? AND server = ? AND server_url = ?`,
+         WHERE account_id = ? AND project_id = ? AND server = ? AND server_url = ? AND credential = ?`,
       )
-      .get(tenant.accountId, tenant.projectId, server.name, server.url) as
+      .get(tenant.accountId, tenant.projectId, server.name, server.url, server.slot ?? "") as
       | { client_json: string | null; tokens_json: string | null; tokens_saved_at: number | null }
       | null;
     if (!row) return undefined;
@@ -1528,36 +2067,50 @@ export class Store {
   /** Save the client a server registered for this tenant (dynamic registration). */
   saveMcpOAuthClient(
     tenant: { accountId: string; projectId: string },
-    server: { name: string; url: string },
+    server: McpOAuthServerKey,
     client: object,
   ): void {
     this.#db
       .prepare(
-        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, client_json, updated_at)
-         VALUES (?, ?, ?, ?, ?, datetime('now'))
-         ON CONFLICT(account_id, project_id, server, server_url) DO UPDATE SET
+        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, credential, client_json, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(account_id, project_id, server, server_url, credential) DO UPDATE SET
            client_json = excluded.client_json, updated_at = excluded.updated_at`,
       )
-      .run(tenant.accountId, tenant.projectId, server.name, server.url, JSON.stringify(client));
+      .run(tenant.accountId, tenant.projectId, server.name, server.url, server.slot ?? "", JSON.stringify(client));
   }
 
   /** Save a tenant's tokens for a server, stamped with when they were issued. */
   saveMcpOAuthTokens(
     tenant: { accountId: string; projectId: string },
-    server: { name: string; url: string },
+    server: McpOAuthServerKey,
     tokens: object,
     savedAtMs: number,
   ): void {
     this.#db
       .prepare(
-        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, tokens_json, tokens_saved_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, datetime('now'))
-         ON CONFLICT(account_id, project_id, server, server_url) DO UPDATE SET
+        `INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, credential, tokens_json, tokens_saved_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(account_id, project_id, server, server_url, credential) DO UPDATE SET
            tokens_json = excluded.tokens_json,
            tokens_saved_at = excluded.tokens_saved_at,
            updated_at = excluded.updated_at`,
       )
-      .run(tenant.accountId, tenant.projectId, server.name, server.url, JSON.stringify(tokens), savedAtMs);
+      .run(tenant.accountId, tenant.projectId, server.name, server.url, server.slot ?? "", JSON.stringify(tokens), savedAtMs);
+  }
+
+  /**
+   * Delete one named credential slot of a server for every tenant and URL
+   * (the credential was removed). Never the default sign-in (slot ""). Returns
+   * the tenants that had a row.
+   */
+  clearMcpOAuthSlot(server: string, slot: string): Array<{ accountId: string; projectId: string }> {
+    if (!slot) return [];
+    const rows = this.#db
+      .prepare("SELECT DISTINCT account_id, project_id FROM mcp_oauth_credentials WHERE server = ? AND credential = ?")
+      .all(server, slot) as Array<{ account_id: string; project_id: string }>;
+    this.#db.prepare("DELETE FROM mcp_oauth_credentials WHERE server = ? AND credential = ?").run(server, slot);
+    return rows.map((r) => ({ accountId: r.account_id, projectId: r.project_id }));
   }
 
   /**
@@ -1567,11 +2120,11 @@ export class Store {
    */
   clearMcpOAuth(
     tenant: { accountId: string; projectId: string },
-    server: { name: string; url: string },
+    server: McpOAuthServerKey,
     what: "tokens" | "client" | "all",
   ): void {
-    const where = "account_id = ? AND project_id = ? AND server = ? AND server_url = ?";
-    const args = [tenant.accountId, tenant.projectId, server.name, server.url] as const;
+    const where = "account_id = ? AND project_id = ? AND server = ? AND server_url = ? AND credential = ?";
+    const args = [tenant.accountId, tenant.projectId, server.name, server.url, server.slot ?? ""] as const;
     if (what === "all") {
       this.#db.prepare(`DELETE FROM mcp_oauth_credentials WHERE ${where}`).run(...args);
       return;
@@ -1598,6 +2151,136 @@ export class Store {
            cached_at = excluded.cached_at`,
       )
       .run(providerId, JSON.stringify(models));
+  }
+
+  /** Approve a repo's MCP server (this exact entry) for every backend in a workdir (#395). */
+  approveWorkdirMcpServer(
+    scope: { accountId: string; projectId: string; workdir: string },
+    server: string,
+    fingerprint: string,
+    approvedBy: string,
+  ): void {
+    this.#db
+      .prepare(
+        `INSERT OR IGNORE INTO mcp_workdir_approvals (account_id, project_id, workdir, server, fingerprint, approved_by)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(scope.accountId, scope.projectId, scope.workdir, server, fingerprint, approvedBy);
+  }
+
+  /**
+   * Every credential value the database holds (docs/secrets-and-memory-design.md
+   * §2.2): MCP OAuth tokens and client secrets, and the conductor's API key —
+   * matched exactly wherever they show up, never stored again.
+   */
+  knownSecretValues(): Array<{ label: string; value: string }> {
+    const out: Array<{ label: string; value: string }> = [];
+    const oauth = this.#db.prepare("SELECT server, credential, client_json, tokens_json FROM mcp_oauth_credentials").all() as Array<{
+      server: string;
+      credential: string;
+      client_json: string | null;
+      tokens_json: string | null;
+    }>;
+    for (const r of oauth) {
+      const label = `oauth:${r.credential || r.server}`;
+      for (const json of [r.tokens_json, r.client_json]) {
+        if (!json) continue;
+        try {
+          const obj = JSON.parse(json) as Record<string, unknown>;
+          for (const k of ["access_token", "refresh_token", "id_token", "client_secret"]) {
+            const v = obj[k];
+            if (typeof v === "string") out.push({ label, value: v });
+          }
+        } catch {
+          // Unreadable: nothing to match.
+        }
+      }
+    }
+    const conductor = this.#db.prepare("SELECT api_key FROM conductor_identity").all() as Array<{ api_key: string }>;
+    for (const r of conductor) out.push({ label: "daemon:conductor-key", value: r.api_key });
+    return out;
+  }
+
+  /** Keep a detected secret (sealed by the caller), or note it was seen again. */
+  putCapturedSecret(row: { accountId: string; projectId: string; workstream: string; fingerprint: string; kind: string; sealed: Uint8Array; sessionId?: string; at: number }): void {
+    this.#db
+      .prepare(
+        `INSERT INTO captured_secrets (account_id, project_id, workstream, fingerprint, kind, sealed, session_id, first_seen, last_seen)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT (account_id, project_id, workstream, fingerprint) DO UPDATE SET last_seen = excluded.last_seen, session_id = excluded.session_id`,
+      )
+      .run(row.accountId, row.projectId, row.workstream, row.fingerprint, row.kind, row.sealed, row.sessionId ?? null, row.at, row.at);
+  }
+
+  /** A tenant's kept secrets, newest first, without their values; one workstream's when given. */
+  listCapturedSecrets(scope: { accountId: string; projectId: string; workstream?: string }): Array<{ workstream: string; fingerprint: string; kind: string; sessionId: string | null; firstSeen: number; lastSeen: number }> {
+    const rows = (
+      scope.workstream === undefined
+        ? this.#db.prepare("SELECT workstream, fingerprint, kind, session_id, first_seen, last_seen FROM captured_secrets WHERE account_id = ? AND project_id = ? ORDER BY last_seen DESC").all(scope.accountId, scope.projectId)
+        : this.#db
+            .prepare("SELECT workstream, fingerprint, kind, session_id, first_seen, last_seen FROM captured_secrets WHERE account_id = ? AND project_id = ? AND workstream = ? ORDER BY last_seen DESC")
+            .all(scope.accountId, scope.projectId, scope.workstream)
+    ) as Array<{ workstream: string; fingerprint: string; kind: string; session_id: string | null; first_seen: number; last_seen: number }>;
+    return rows.map((r) => ({ workstream: r.workstream, fingerprint: r.fingerprint, kind: r.kind, sessionId: r.session_id, firstSeen: r.first_seen, lastSeen: r.last_seen }));
+  }
+
+  /** A kept secret's sealed value, in one workstream. */
+  capturedSecret(scope: { accountId: string; projectId: string; workstream: string; fingerprint: string }): { kind: string; sealed: Uint8Array } | undefined {
+    const row = this.#db
+      .prepare("SELECT kind, sealed FROM captured_secrets WHERE account_id = ? AND project_id = ? AND workstream = ? AND fingerprint = ?")
+      .get(scope.accountId, scope.projectId, scope.workstream, scope.fingerprint) as { kind: string; sealed: Uint8Array } | null;
+    return row ?? undefined;
+  }
+
+  /** Forget a kept secret; true when there was one. */
+  deleteCapturedSecret(scope: { accountId: string; projectId: string; workstream: string; fingerprint: string }): boolean {
+    return (
+      this.#db
+        .prepare("DELETE FROM captured_secrets WHERE account_id = ? AND project_id = ? AND workstream = ? AND fingerprint = ?")
+        .run(scope.accountId, scope.projectId, scope.workstream, scope.fingerprint).changes > 0
+    );
+  }
+
+  /** Forget kept secrets not seen since `before` (ms); returns how many. */
+  expireCapturedSecrets(before: number): number {
+    return this.#db.prepare("DELETE FROM captured_secrets WHERE last_seen < ?").run(before).changes;
+  }
+
+  /** The workstream a folder last resolved to, for this tenant (workstreams §5.1). */
+  workstreamFolder(scope: { accountId: string; projectId: string; workdir: string }): string | undefined {
+    const row = this.#db
+      .prepare("SELECT workstream FROM workstream_folders WHERE account_id = ? AND project_id = ? AND workdir = ?")
+      .get(scope.accountId, scope.projectId, scope.workdir) as { workstream: string } | null;
+    return row?.workstream;
+  }
+
+  /** Every recorded folder by workstream, across tenants (the read fence: workstreams are daemon-wide config). */
+  workstreamFoldersByWorkstream(): Map<string, string[]> {
+    const rows = this.#db.prepare("SELECT DISTINCT workstream, workdir FROM workstream_folders").all() as { workstream: string; workdir: string }[];
+    const out = new Map<string, string[]>();
+    for (const r of rows) {
+      const list = out.get(r.workstream) ?? [];
+      list.push(r.workdir);
+      out.set(r.workstream, list);
+    }
+    return out;
+  }
+
+  setWorkstreamFolder(scope: { accountId: string; projectId: string; workdir: string }, workstream: string): void {
+    this.#db
+      .prepare(
+        `INSERT INTO workstream_folders (account_id, project_id, workdir, workstream) VALUES (?, ?, ?, ?)
+         ON CONFLICT (account_id, project_id, workdir) DO UPDATE SET workstream = excluded.workstream, updated_at = datetime('now')`,
+      )
+      .run(scope.accountId, scope.projectId, scope.workdir, workstream);
+  }
+
+  /** The (server, fingerprint) pairs a tenant approved for a workdir. */
+  workdirMcpApprovals(scope: { accountId: string; projectId: string; workdir: string }): Set<string> {
+    const rows = this.#db
+      .prepare("SELECT server, fingerprint FROM mcp_workdir_approvals WHERE account_id = ? AND project_id = ? AND workdir = ?")
+      .all(scope.accountId, scope.projectId, scope.workdir) as { server: string; fingerprint: string }[];
+    return new Set(rows.map((r) => `${r.server}\u0000${r.fingerprint}`));
   }
 
   /** Persist a window a completed turn reported, in the scope it was seen. */
@@ -1739,6 +2422,60 @@ export class Store {
     return rows.map(compareRowFrom);
   }
 
+  /** Connect (replace) a remote for one owner's agents (the git gateway). */
+  setGitConnection(c: { owner: string; url: string; kind: string; auth: string; connectedBy: string; ssh?: string }): void {
+    this.#db
+      .prepare("INSERT OR REPLACE INTO git_connections (owner, url, kind, auth, connected_by, connected_at, ssh) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(c.owner, c.url, c.kind, c.auth, c.connectedBy, Date.now(), c.ssh ?? null);
+  }
+
+  /** Disconnect; whether it was connected. Its agents' branch record goes too. */
+  removeGitConnection(owner: string, url: string): boolean {
+    this.#db.prepare("DELETE FROM git_agent_branches WHERE owner = ? AND url = ?").run(owner, url);
+    return this.#db.prepare("DELETE FROM git_connections WHERE owner = ? AND url = ?").run(owner, url).changes > 0;
+  }
+
+  /** A branch an agent made (or moved) on a connected remote through the gateway, with the tip it pushed. */
+  noteGitAgentBranch(owner: string, url: string, branch: string, tip: string): void {
+    this.#db
+      .prepare("INSERT INTO git_agent_branches (owner, url, branch, created_at, tip) VALUES (?, ?, ?, ?, ?) ON CONFLICT(owner, url, branch) DO UPDATE SET tip = excluded.tip, created_at = excluded.created_at")
+      .run(owner, url, branch, Date.now(), tip);
+  }
+
+  /** Forget the agents' branches the remote no longer has (one recreated later under that name is someone else's). */
+  pruneGitAgentBranches(owner: string, url: string, heads: ReadonlySet<string>, since = Date.now()): void {
+    // Only what was recorded before the remote was asked: a branch pushed meanwhile isn't in that answer.
+    const rows = this.#db.prepare("SELECT branch FROM git_agent_branches WHERE owner = ? AND url = ? AND created_at < ?").all(owner, url, since) as Array<{ branch: string }>;
+    for (const { branch } of rows) {
+      if (!heads.has(branch)) this.#db.prepare("DELETE FROM git_agent_branches WHERE owner = ? AND url = ? AND branch = ? AND created_at < ?").run(owner, url, branch, since);
+    }
+  }
+
+  /** The branches agents made on `url` for `owner`, each with the tip an agent last pushed. */
+  gitAgentBranches(owner: string, url: string): Map<string, string> {
+    const rows = this.#db.prepare("SELECT branch, tip FROM git_agent_branches WHERE owner = ? AND url = ?").all(owner, url) as Array<{ branch: string; tip: string | null }>;
+    return new Map(rows.filter((r) => r.tip).map((r) => [r.branch, r.tip as string]));
+  }
+
+  /** One owner's connection for a URL, if any. */
+  gitConnection(owner: string, url: string): { owner: string; url: string; kind: "ssh" | "https"; auth: "ssh" | "git-credential" | "token"; connectedBy: string; connectedAt: number; ssh: string | null } | null {
+    const row = this.#db
+      .prepare("SELECT owner, url, kind, auth, connected_by AS connectedBy, connected_at AS connectedAt, ssh FROM git_connections WHERE owner = ? AND url = ?")
+      .get(owner, url) as { owner: string; url: string; kind: string; auth: string; connectedBy: string; connectedAt: number; ssh: string | null } | null;
+    if (!row || (row.kind !== "ssh" && row.kind !== "https") || !["ssh", "git-credential", "token"].includes(row.auth)) return null;
+    return row as ReturnType<Store["gitConnection"]> & object;
+  }
+
+  /** One owner's connections, newest first. */
+  listGitConnections(owner: string): Array<{ url: string; kind: string; auth: string; connectedAt: number }> {
+    return this.#db.prepare("SELECT url, kind, auth, connected_at AS connectedAt FROM git_connections WHERE owner = ? ORDER BY connected_at DESC").all(owner) as Array<{
+      url: string;
+      kind: string;
+      auth: string;
+      connectedAt: number;
+    }>;
+  }
+
   audit(subject: string, action: string, sessionId?: string, detail?: string): void {
     // An audit write must NEVER crash the daemon. The session_id FK can fail
     // when the referenced session is no longer in the sessions table — e.g. a
@@ -1750,7 +2487,7 @@ export class Store {
         .prepare(
           "INSERT INTO audit_log (subject, session_id, action, detail) VALUES (?, ?, ?, ?)",
         )
-        .run(subject, sessionId ?? null, action, detail ?? null);
+        .run(subject, sessionId ?? null, action, detail && this.scrubText ? this.scrubText(detail) : (detail ?? null));
     } catch {
       // Retry unlinked (FK can't fail) so the entry is still recorded; fold
       // the orphaned session id into the detail. Swallow anything further.

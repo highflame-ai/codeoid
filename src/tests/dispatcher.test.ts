@@ -14,6 +14,7 @@ import {
   NonRetryableDispatchError,
   type DispatcherHost,
 } from "../daemon/dispatch.js";
+import { DaemonStoppingError } from "../daemon/session.js";
 import { Store, type DispatchEventRow, type DispatchTaskRow } from "../daemon/store.js";
 import type { SessionStatus } from "../protocol/types.js";
 
@@ -632,5 +633,41 @@ describe("dispatch barrier — N-way join", () => {
     const members = store.dispatchGroupMembers(TENANT.accountId, TENANT.projectId, groupId);
     expect(members.map((m) => m.id)).toEqual(taskIds);
     expect(members.map((m) => m.groupId)).toEqual([groupId, groupId, groupId]);
+  });
+});
+
+describe("a tick in flight as the daemon stops", () => {
+  /** What Session.send throws once drain began: the real one, which dispatch.ts knows by name. */
+  const stopping = () => new DaemonStoppingError();
+
+  test("a spawn or send refused because the daemon is stopping goes back to the queue, no attempt spent", async () => {
+    const spawn = enqueueSpawn();
+    const send = enqueueSend();
+    host.spawnError = stopping();
+    host.sendError = stopping();
+    await dispatcher.tick();
+    for (const id of [spawn, send]) {
+      const row = store.dispatchGet(id)!;
+      expect(row.status).toBe("queued");
+      expect(row.attempts).toBe(0);
+      expect(row.error).toBeNull();
+    }
+    expect(host.audits.filter((a) => a.startsWith("dispatch.released"))).toHaveLength(2);
+    expect(host.audits.some((a) => a.startsWith("dispatch.failed"))).toBe(false);
+  });
+
+  test("any other failure still spends an attempt", async () => {
+    const spawn = enqueueSpawn();
+    host.spawnError = new Error("boom");
+    await dispatcher.tick();
+    expect(store.dispatchGet(spawn)!.attempts).toBe(1);
+  });
+
+  test("a stopped dispatcher's tick claims nothing more", async () => {
+    const spawn = enqueueSpawn();
+    dispatcher.stop();
+    await dispatcher.tick();
+    expect(store.dispatchGet(spawn)!.status).toBe("queued");
+    expect(host.spawned).toHaveLength(0);
   });
 });

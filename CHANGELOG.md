@@ -6,7 +6,221 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-23
+
+0.5.0 was tagged on 2026-10-15, but its release build failed and it was never published, so on npm 0.6.0 follows 0.4.4.
+0.4.1 to 0.4.4 shipped without changelog sections, so this section also lists changes made since 0.4.0 that shipped in them; it isn't a complete record of those four releases.
+
+Highlights:
+
+- Agents' commands run in an OS sandbox by default (bubblewrap on Linux, Seatbelt on macOS, or Docker), and autonomous mode runs inside it without asking; sandboxed agents can fetch and push through the git gateway without your credentials entering the sandbox.
+- New backends and accounts: opencode (and its 75+ model providers), local llama.cpp servers, any number of OpenAI-compatible endpoints, and several named accounts for every backend, Amazon Bedrock for Claude included. Claude Fable 5.2 is supported.
+- Workstreams give each line of work its own MCP servers and credentials, and what codeoid stores never holds a secret's value.
+- Loops repair code until the daemon's own checks pass, routines run agents on a schedule, and watches start loops from failing CI.
+- Turns can be taken back, forked from or compared across backends; a Slack frontend joins the web UI, the TUI and Telegram.
+
+Upgrading: what existing users will notice.
+
+- **Agents' commands are sandboxed by default.** Where the sandbox can't run, interactive sessions still run and say "not sandboxed: <why>". Settings are under `sandbox.*` (docs/sandbox.md).
+- **Autonomous mode no longer asks for approvals.** The sandbox is its boundary, and what the sandbox can't hold is refused instead of asked. An autonomous session, routine, loop or dispatched worker refuses to start without a sandbox that works, unless its owner turned the sandbox off. `approvals.askOnUnknown` no longer has an effect.
+- **Delegated tokens can no longer change `sandbox.*`, `worktree.setup.*` or a backend's `providers.*.command`.** Only the owner's own token can, and each change is audited.
+- **A second daemon on the same data directory is refused.** It exits and names the daemon that holds the data.
+- **Idle sessions stop their backend after 30 minutes**, and resume on the next message (`session.idleReleaseMinutes`; `0` keeps the old behaviour).
+- **Unattended runs never prompt for a skill command.** Approve it beforehand with `codeoid skill allow '<cmd>'`. Skill commands with a `*` glob are refused.
+- **`codeoid approve` confirms before it answers.** Without a terminal it needs `--yes`, and it exits 1 when it didn't answer.
+- **Self-hosted Google sign-in against ZeroID 1.12 or newer needs `CODEOID_ZEROID_CLIENT_SECRET`** (#375).
+
 ### Added
+
+- **Git fetch and push from inside the sandbox, through the git gateway** (#477).
+  A sandboxed agent's own `git fetch`, `pull` and `push` reach the remotes you connect, on every backend and with the network off. Your ssh key or git credential stays in the daemon and never enters the sandbox.
+  Every push is checked: only the agent's own branches, fast-forward only, never main, master or the remote's default branch, and no force pushes, deletes or tags. In guarded mode each push asks you.
+  Connect with `codeoid sandbox git connect [dir] [--remote r | --url u] [--token]` (also `ls` and `disconnect`), from your own token only. See [docs/sandbox.md](docs/sandbox.md), "Git fetch and push: the git gateway".
+
+- **Claude Fable 5.2, and an opt-in Claude Code CLI of your own** (#478).
+  The Claude Agent SDK goes from 0.3.281 to 0.3.322 (Claude Code 2.1.322), which Fable 5.2 needs. The pin is exact, because later releases stop sandboxed commands from creating git worktrees.
+  `providers.claude.command` runs another Claude Code CLI, such as your system `claude`, so a new model doesn't have to wait for an SDK bump. A CLI that is older than the bundled one, missing, or reports no version falls back to the bundled CLI and says why. A newer one runs, with a note that codeoid's sandbox is untested on it.
+
+- **`codeoid settings` changes settings from a terminal** (#478).
+  `codeoid settings ls [filter] | get <key> | set <key> [value] | unset <key>` covers the web UI's settings drawer, with the same rules on who may change what.
+  Values are type-checked before they are sent. A secret is prompted for or read from stdin, and refused on the command line.
+
+- **Saved approval rules** (#474).
+  In guarded mode an approval card also offers **allow for this session** (8 hours, `approvals.sessionGrantHours`) and **allow in this repository**, and shows the rule it would save. This works in the web UI, Telegram, Slack and `codeoid approve --save session|repository`.
+  Rules belong to the user who saved them. Manage them in Settings → Approvals or with `codeoid approvals ls | add | rm`. Deny rules refuse in every mode.
+  Offers stay narrow: `verb:*` only for build and check commands, anything else exactly as it ran. High-risk, not-understood or credential-naming commands never run on a rule, and sessions an agent or automation made get no allow rules. See [docs/approvals.md](docs/approvals.md), "Saved rules".
+
+- **Slack frontend: talk to the conductor from a Slack DM, and approve there** (#469).
+  It uses Socket Mode, so the daemon needs no public URL. Only allowlisted Slack users (`CODEOID_SLACK_ALLOWED_USER_IDS`) can use it, each acting with their own ZeroID key (`/codeoid auth <key>`).
+  A plain DM goes to the conductor; `/codeoid auth | ls | attach | conductor | stop | who` do the rest. Approval cards show the call, its workstream, risk, sandbox state and cost. Only the user a card was sent to can press it, once, and it closes when answered elsewhere. You are told when another of your sessions is waiting on you.
+  A DM that looks like a key or token is refused. Setup is in [docs/slack.md](docs/slack.md), and `--no-slack` turns it off.
+
+- **Memory records every tool call with its result and exit code** (#471).
+  Completed tool calls, and the reply after them, weren't reaching memory, so `recall` couldn't return what a command printed. Now every call is stored with its result, parallel and background calls included.
+  Each shell call also records its exit code, its directory and how long it took. Each episode records the backend, the model and whose turn it was.
+  `recall` takes `only_failed`, `backend`, `origin` and `cwd`. Quoted text, paths, file names, flags and identifiers return exact matches first, and `get_episode` can return the end of a long output first. Episodes stored earlier aren't backfilled.
+
+- **Workstreams: each line of work gets its own servers and credentials** (#461, #462).
+  `workstreams` in config.json groups folders (`~/Workspace/acme-*`) and repositories (`github.com/acme/*`) into named workstreams, with an optional default, marked `exclusive` or `suggest`. Every session gets one home workstream, decided when it is created (`codeoid new --workstream <id>`) and kept across restarts. `codeoid workstream ls | show | match <dir> | import` show and propose them.
+  A workstream's credentials are declared by id and kind, never by value. The value lives in `~/.codeoid/.env` (`CODEOID_CRED_<ID>`) or in a `dir` store such as a mounted Kubernetes Secret. Its env and git identity reach its sessions.
+  With `workstreams.isolateGlobalServers: true` a session reaches only built-ins, its workstream's MCP servers, and its folder's own servers. Servers that need a credential go through the daemon, so no backend holds a secret (opencode turns are refused under isolation for now). `codeoid mcp signin <server> --credential <id>` signs in to one server once per workstream.
+  Putting a session in a folder another workstream holds exclusively asks you to confirm (`--override`). Nothing changes until you configure workstreams. See docs/CONFIGURATION.md, "Workstreams", and [docs/workstreams-design.md](docs/workstreams-design.md).
+
+- **Loops: repair runs that the daemon verifies with its own checks** (#426, #425).
+  `codeoid loop start "<objective>" --workdir <dir> --check <cmd> [--test] [--wait]` runs a worker agent in its own worktree until the daemon's own checks pass. The verified tree is then delivered as one commit on its own branch. The worker can only ask for verification, never declare itself done.
+  You can pause, resume, steer and cancel a loop. It has attempt and time budgets, and daemon downtime and approval waits aren't charged to them. A spent subscription or API allowance is recognised and waited out instead of costing an attempt.
+  Use it from `codeoid loop …`, the web UI's loops panel, or `/loop` and `/loops` in the TUI. Guide: [docs/loops.md](docs/loops.md).
+
+- **Loop watches, routines that start a loop, and an Automation drawer** (#427).
+  A watch starts a repair loop when a CI check you mapped fails on a watched branch, or when someone you allow comments `@codeoid` on one of your open pull requests: `codeoid loop watch add --workdir <dir> (--branch <b>… | --my-prs) --ci "<check>: <cmd>" [--review] [--trust <login>]`. It acts only on heads that you, or a login you trust, vouched for, as GitHub authenticates them.
+  `codeoid routine add … --loop --verify "id: cmd"` makes a routine's run a loop run. Its `--check` still decides, at no cost, whether there is work.
+  The web UI's Automation drawer has Loop runs, Watches and Routines tabs, and routines can now be created and edited there. "Needs you" lists failing watches and routines that paused or failed.
+
+- **Evidence for every check a pipeline gate runs** (#422).
+  A check is now `pass`, `fail`, `inconclusive`, `error` or `cancelled`, and what ran, on which tree, and its full output are kept. The output is redacted, readable only by you, and pruned after 30 days or once it passes 2 GiB.
+  A failing gate's reason carries the end of the output, so the agent's next try sees why it failed. See it with `codeoid evidence <id>`, in `codeoid pipeline show`, or with "Show check output" in the web cockpit.
+  An auto-derived test probe that runs zero tests is now inconclusive, not a pass.
+
+- **Worktrees codeoid makes can build: `.codeoid/setup.yaml`** (#424).
+  Forks, compare branches and routine worktrees can copy gitignored files (`.env`) from your main checkout, link directories (`node_modules`), and run a setup command.
+  The command runs only with `worktree.setup.runCommands: trusted-repos` and a recipe you trusted with `codeoid worktree trust`. Trust is pinned to the recipe's content, so a changed command stops running until you trust it again. It runs only on committed content whose base is already in your checkout's history.
+
+- **The workdir picker browses the whole filesystem** (#444).
+  **Browse…** in the New session dialog (and in the loop, routine and import forms) used to be stuck in your home folder.
+  Now one box filters the folder or jumps to a path (`/usr/lo`, `~/…`), and Tab completes. Places offer Home, Computer and your recent workdirs, git repositories get a badge, and a toggle shows hidden folders.
+  Credential stores, `/proc`, `/sys` and `/dev` are never listed. The picker now needs `session:create` as well as `fs:read`, and `CODEOID_FS_BROWSE_ROOT` still bounds it.
+
+- **Accounts for every backend: several per backend, switchable per session** (#392, #408, #409, #410).
+  Claude, Codex, the Gemini CLI, OpenAI, Gemini, Qwen, pi, llama.cpp and each endpoint take named accounts. Each backend has a default, and each session has its own choice, which survives backend switches and restarts. Switching mid-conversation keeps the conversation.
+  Sign in without a shell with `codeoid account login <name> [--backend codex]` (Claude through `claude setup-token`, Codex through device auth), type in a key with `add-key`, or add a Claude gateway with `add-gateway`. `codeoid account ls | default | use | rm` and `codeoid new --account` cover the rest. In the web UI use Settings → Accounts and the session bar's account picker; in the TUI, `/account`.
+  A removed account refuses to run rather than fall back to another credential. A named account refuses a workdir whose project settings would send its key elsewhere. See docs/CONFIGURATION.md, "Accounts".
+
+- **Amazon Bedrock accounts for Claude** (#412).
+  `codeoid account add-bedrock <name> [--base-url] [--set NAME[=value]] [--from-settings <file>]`, or Settings → Accounts, holds a Bedrock bearer token, an optional endpoint, the region, and the model ids the `opus` / `sonnet` / `haiku` / `fable` aliases map to.
+  `--from-settings` moves an existing Bedrock setup from a Claude `settings.json` into an account. A workdir whose Claude settings set AWS or OTEL variables is refused for a Bedrock account.
+
+- **Several OpenAI-compatible endpoints, added while the daemon runs** (#405, #406, #407).
+  Each endpoint is a backend of its own (`oai:<name>`), so local servers (llama.cpp, vLLM, Ollama) and hosted gateways run side by side. Add one with `codeoid endpoint ls | add | set | rm | test | import-pi` or in the web UI, with no restart.
+  A stored key or header is only ever sent to the server it was entered for, and requests never follow redirects.
+  The TUI's `/provider`, `/model` and `/account` pickers now offer every backend and its models, not only Claude's.
+
+- **Model servers in one list, with templates** (#475).
+  Settings → Model servers replaces the separate OpenAI, Local (llama.cpp) and OpenAI endpoints tabs. The built-in servers come first, with their status.
+  "Add endpoint" starts from a template: OpenAI, OpenRouter, Groq, Together, DeepSeek, Fireworks, Mistral, Ollama, LM Studio, llama.cpp, vLLM or Custom. In a terminal, use `codeoid endpoint templates` and `codeoid endpoint add <name> --template <id>`.
+
+- **Run sessions on a local llama.cpp server** (#365).
+  The `llamacpp` backend drives a `llama-server` you run yourself, with no API key and no per-token cost. It is off by default (`providers.llamacpp.enabled`).
+  The context window comes from the server. External MCP servers are opt-in (`providers.llamacpp.mcpServers`), because their tool definitions can fill a local context. See [docs/local-models.md](docs/local-models.md).
+
+- **Compare backends side by side** (#357).
+  Send one prompt to 2–4 backends or models at once. Each branch runs in its own fork and git worktree from the same point, the latest turn or an earlier one.
+  For each branch you see its reply, the files it changed, and its cost and time, then keep the best. Use "⚖ compare" in the web UI, `codeoid compare run <s> --with claude,codex:gpt-5.5 [--at N] <prompt>` (also `show`, `ls` and `keep`), or `/compare` in the TUI. The session must be in a git repository.
+
+- **Fork from any earlier turn, with the files as they were then** (#356).
+  A new session carries the conversation through that turn and runs in its own git worktree, with the files as they were right after it, optionally on another backend.
+  Use "⑃ fork from here" on a message, `codeoid turns <session>` and `codeoid fork <session> --at N [--backend id] [--shared]`, or `/turns` and `/fork` in the TUI.
+
+- **Go back a turn on any backend, optionally restoring the files** (#355).
+  Take back a message, or go back to any earlier point. The agent forgets what was taken back, and the message returns to your input box.
+  Use "↩ go back to here" in the web UI, `/undo` in the TUI and `codeoid attach`, or `codeoid undo <session> [files [yes|force]]`.
+  Restoring files is opt-in and previewed first. It never touches ignored or secret files, and it won't overwrite your own edits since the agent's last turn unless you confirm. The preview lists what it can't undo: MCP calls, `git push`, installs and the like.
+
+- **Stable turn ids, a workspace snapshot per turn, and history that survives a restart** (#354).
+  A prompt and the agent's reply share one turn id, and `session.turns` lists them. A message sent mid-turn joins the running turn.
+  At each turn's start codeoid snapshots the working directory into its own shadow git repository, never your repository, leaving out ignored and secret files.
+  The backend-neutral conversation is saved to disk. Before, after a restart a fork or backend switch silently carried no conversation, and a stateless backend (OpenAI, the Gemini API) forgot the session.
+
+- **Answer an agent's questions from every surface; unattended runs never prompt** (#348).
+  `codeoid attach` and the TUI show and answer yes/no, pick-list and free-text questions. `codeoid ls` shows a pending question, and `codeoid approve` answers it.
+  Unattended runs never wait on a question. A skill command must be approved beforehand with `codeoid skill allow '<cmd>' [--workdir <dir>]` (or `deny`). A pipeline phase's own question halts the phase until you answer it (Answer in the web UI, or `codeoid pipeline revise <id> "<answer>"`).
+  Skill commands with a `*` glob, or with text after an inner `)`, are refused, because they can't be granted as one exact rule.
+
+- **CI runs the real sandbox and the real Claude Code and Codex CLIs** (#478, #480).
+  A `sandbox-real` job runs the sandbox tests against real bubblewrap, which CI used to skip. The Claude Code and Codex CLIs run inside a real daemon against aimock, a local stand-in for the Anthropic and OpenAI APIs: a reply, an approved and a denied tool call, and a restart.
+
+- **Agents' commands run in an OS sandbox, on by default** (#448).
+  The workspace and a private temp dir are writable; everything else is read-only (`rm -rf ~` fails with "Read-only file system"); codeoid's config and data, every agent CLI's login, `~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/.docker`, `~/.gnupg`, `~/.config/gh`, `~/.netrc`, `~/.git-credentials`, keyrings and the paths in `sandbox.hiddenPaths` aren't there at all; container runtime sockets can't be reached; the network is `on`, `off` or an `allowlist`, per session, and with it `off` or an allowlist local services' unix sockets that let a connection in by who you are (Postgres, MySQL/MariaDB, Redis, …) can't be reached either.
+  bubblewrap on Linux and Seatbelt on macOS (`auto`), or Docker when chosen, behind one pluggable provider interface ([docs/sandbox-providers.md](docs/sandbox-providers.md), with what Forge needs to slot in).
+  Claude runs its commands in Claude Code's own sandbox with codeoid's policy (it can hold a host allowlist); Codex runs its workspace-write sandbox inside codeoid's bubblewrap, so in autonomous mode its sandbox is the boundary; pi, the Gemini CLI and Qwen Code run whole inside the session's sandbox; opencode runs each shell line in the calling session's sandbox; HTTP backends run no commands.
+  A daemon-wide default (`sandbox.*`, `CODEOID_SANDBOX*`, the Sandbox settings tab), and per session: `codeoid new --sandbox`, the new-session dialog, `session.create`, `/sandbox`, `codeoid sandbox set`; routines and loops take one too, and forks keep their parent's. Turning a session's sandbox off or widening it is a confirm its owner answers on the session, in every mode, and audited; running one command outside it (Claude's unsandboxed retry, Codex asking for more) is asked in guarded and interactive mode and refused in autonomous mode.
+  Where the sandbox can't run, interactive sessions run and say "not sandboxed: <why>" on the session and on every approval; autonomous sessions, routines and loops refuse to start.
+  The session header, `codeoid ls`, approval cards (web, CLI, Telegram) show whether commands are sandboxed.
+  See [docs/sandbox.md](docs/sandbox.md): what is protected per provider and per backend, what isn't, and what remains to verify on macOS and with Docker.
+
+- **Sandboxed sessions can make git worktrees, each in a folder of its own** (#448).
+  `git worktree add`, commit, rebase, `remove` and `prune` work inside the sandbox, in the session's own folder of each worktree location: `<repo>-worktrees/<folder>/`, and `<root>/<repo>/<folder>/` for each `sandbox.worktreeRoots` entry (`CODEOID_SANDBOX_WORKTREE_ROOTS`, Settings > Sandbox). The folder is named after the session with a short id (`fix-login-3f9a2c1d`), stays the same across a rename and a restart, and the session's system prompt tells the agent where it is. Nothing is made inside your checkout, and the folder (with `<repo>-worktrees/` when that is left empty) is removed while empty, at a turn's end and with the session; never anything with something in it.
+  Everything else in a location stays read-only to the session: your worktrees, other sessions' folders, codeoid's fork, loop and `--worktree` checkouts, and anything made there later; every existing worktree's admin dir is held. A worktree added or removed anywhere never rebuilds a session's sandbox (a Claude query, and its background tasks, keep running): instead every admin dir is checked against git's own layout when the sandbox is built, at every turn's end and at destroy, what a command changed there (its `gitdir`, `commondir`, a `config.worktree`, a planted `config` or hook, a duplicate a `git worktree repair` would adopt) is restored, and what can't be restored with certainty (an admin dir replaced by a link: the link is removed) is said and left; both on the session and in the audit log (`session.worktree_entry_restored`). A worktree is the session's own only when it made it, never because an admin dir says so. A `worktreeRoots` entry where tools load programs or settings (`~/.config`, `~/.local`, `~/Library`, …), the home or `/` fails the config's load, and a relative one is judged again where it leads (`../.config`); a root that doesn't exist is never made away from the repository.
+  The end-of-turn warning names a worktree in the session's folder whose `.git` points anywhere but its own admin dir, and an admin dir that changed. See [docs/sandbox.md](docs/sandbox.md#git-worktrees-inside-the-sandbox).
+
+- **Sandboxed sessions work across repositories: other repositories readable, more directories writable** (#448).
+  Everything under a session's **project roots** is readable to its commands, read-only: by default the parent of its repository (a session in `~/Workspace/codeoid` reads `~/Workspace/*`: the repositories beside it, and what other sessions did in their checkouts there). `sandbox.projectRoots` (`CODEOID_SANDBOX_PROJECT_ROOTS`, Settings > Sandbox) sets it, `@parent` being the default; per session at create `codeoid new --project-root <dir>` / `--no-project-roots` or the new-session dialog. What the sandbox hides anywhere stays hidden inside a root, and so do the credential files anywhere in it, codeoid's worktrees of the repositories there included (`.env`, `.env.*` but examples, `.envrc`, `.npmrc`, `*.pem`, `*.key`, private keys, kubeconfigs, Terraform state, `.aws/`, …), and a repository's `.git/config` carrying a credential (git there then can't read its config, said); a root too big to look through (20000 directories) isn't used, said. On Claude's own sandbox a link in a root is left out, never shown by where it leads, and nothing hidden is shown again. `/`, the home, a dir holding it, a hidden dir of it, `~/Library`, system dirs and the host's temp dir or anything in it are refused; a default that would be the home (a repository directly in it) or in a temp dir falls back to none, and a workspace in no repository has no default root, said on the session.
+  A session can be given **more directories to write**, each treated as its workspace (its git structure and project settings held, its own worktree folder there, the end-of-turn git look): `/sandbox add <dir>` / `/sandbox remove <dir>`, `codeoid sandbox add|remove <session> <dir>`, `codeoid new --add-dir <dir>`, the new-session dialog. Adding is a widening: its owner's own, undelegated, confirmed on the session, audited. What is added is the directory the path really is when granted (the card names it); one replaced by a link or removed later is dropped, said, never followed. A git or project settings dir (`.git`, `.claude/`, …) or one inside it is never added; a folder of repositories is, with each one's git structure and settings held. The agent can ask with codeoid's `request_directory` tool (every backend that runs commands): in guarded and interactive mode its owner gets a card with the directory and the reason; in autonomous mode (an unattended run's too) a repository, or a dir in one, under a project root, named with no symbolic link, is added unasked and anything else refused at once with a reason; a guarded unattended run is never parked. Added directories survive a restart and are inherited by forks. A change takes effect at the session's next turn with no background work running (Claude's query rebuilt, a process backend restarted then), never mid-work; until then it shows as pending.
+  The chip, `codeoid ls` and approval cards say what the sandbox reads and writes besides the workspace. A session whose workspace is the home itself is allowed and says "sandboxed: workspace is your home — only credentials are protected". See [docs/sandbox.md](docs/sandbox.md#working-across-repositories).
+
+- **Docker access, an opt-in for tests that start containers** (#448).
+  `sandbox.docker.socket` (`CODEOID_SANDBOX_DOCKER_SOCKET`) or a session's own `--docker-socket` lets sandboxed commands reach the container runtime's socket (Docker, rootless Docker, Podman; Docker Desktop on macOS) with `DOCKER_HOST` set; never the client's credentials. Off by default, a widening its owner confirms, and said on the chip and every approval card: it can reach the whole machine. Only that runtime's socket is shown: libvirt's, LXD's, Incus's and every other runtime's stay hidden in every sandbox, as do the system D-Bus and screen's sessions. On Claude's Linux sandbox, which can only allow every unix socket, the host's `/tmp` (tmux, X11, ssh-agent sockets) is hidden too, so are local databases' sockets with the network off, and what stays reachable is said. A runtime socket you can't connect to isn't opened up. See [docs/sandbox.md](docs/sandbox.md#docker-access).
+
+- **Autonomous mode never waits on approvals; the OS sandbox is its boundary** (#448).
+  An autonomous session, routine, loop or dispatched worker doesn't start without a sandbox that runs (or its owner's own choice to turn it off), so inside it a shell command of any risk level runs unasked, high and not understood included, and a write lands wherever it leads, outside the working directory too; risk levels are information there (on cards in guarded mode, in the audit log).
+  What the sandbox can't be left to hold is refused at once instead of asked, the agent told what was refused and that the owner can do it or switch the session to guarded mode, with an info line in the transcript and an audit entry (`session.autonomous_refuse`): a command asking to run outside the sandbox or to widen it, a file tool writing the repository's git structure or project settings, a write to a Claude settings file on a named account, a search or command reaching a directory that holds credentials, and a path a backend couldn't resolve for certain. Credential reads stay refused in every mode.
+  A question to the owner (`AskUserQuestion`) and a fleet dispatch still ask, so they are all an unattended run parks on.
+  When the autonomous tool budget runs out the session still goes back to guarded mode, and now says so at once: an info line ("Autonomous budget spent: now guarded, writes and commands will ask; raise the budget or switch back to autonomous."), `autonomousBudgetSpent` on the session's info, and a mode line in `codeoid ls`.
+  Guarded and interactive mode are unchanged. `approvals.askOnUnknown` no longer has an effect (still accepted).
+  See [docs/approvals.md](docs/approvals.md#autonomous-mode).
+
+- **A second daemon on the same data is refused** (#447).
+  `codeoid start` locks each directory the daemon owns (its database's, transcripts and checkpoints, opencode's database and data dirs, memory's) before it opens anything, and a start on data another live daemon uses exits, naming that daemon (pid, host, port) and how to clear a stale lock, instead of running alongside it and corrupting both.
+  A lock left by a daemon that's gone (killed outright: its pid no longer runs, or now belongs to another process) is taken over with a log line; one from another machine (told by its machine id) is never guessed at, and one from a container restarted after a crash is taken over once it hasn't been refreshed for 10 minutes.
+  See [docs/CONFIGURATION.md](docs/CONFIGURATION.md#one-daemon-per-data-directory).
+
+- **opencode as a backend** (#447).
+  opencode 2.2 opens its 75+ model providers (GitHub Copilot, OpenRouter, Bedrock, Vertex, Azure, local Ollama, …) to sessions, routines and loops, with codeoid's approvals, spend caps and memory on top.
+  codeoid runs one private opencode server per daemon — started by the first opencode session, loopback-only with a fresh password, its own database beside codeoid's (`providers.opencode.dbPath`), restarted if it dies and stopped with the daemon — so codeoid's sessions never mix with your own opencode.
+  Every action opencode takes asks codeoid's gate first, under codeoid's tool names (a shell command is `Bash` with its command line), including its subagents', whose own allow rules codeoid turns into asks; codeoid answers each once, never "always", and refuses what it can't show.
+  Shell commands are judged by risk as Claude's are (#431), in the directory opencode runs them in.
+  Replies and thinking stream into the session's history; stop, resume after a restart, native forks, models with their reasoning variants as efforts, real per-step cost and tokens (opencode's own figure, never re-priced; a routine's cap stops a turn as the spend lands), codeoid's memory, blackboard and registry MCP servers, subagents and background subagents, slash commands and skills, questions, and messages that steer a running turn all work.
+  `providers.opencode.agent` picks the opencode agent (`plan` for read-only planning).
+  A turn part of whose spend opencode didn't report (a step stopped while the model answered, a dropped connection that couldn't be read back) is of unknown cost, as is one opencode prices at $0 (a subscription sign-in, a free model) unless `pricing.models` prices it (#430).
+  docs/opencode.md has setup and limits.
+  opencode's own hosted models (opencode.ai's Zen, free ones included, which opencode would otherwise pick as the default with no credential, and Go: providers `opencode` and `opencode-go`) are off unless `providers.opencode.hostedModels` (`CODEOID_OPENCODE_HOSTED_MODELS`) is set: not offered, not listed, not re-enabled by your opencode config (under their ids, a `canonical` copy, a provider pointed at opencode.ai, or one whose host setting (`region`, `resourceName`, …) isn't a plain name; a credential your config keeps in a `{file:…}` is still carried), and opencode doesn't fetch its catalog from opencode.ai. A carried `enabled_providers` stays a restriction, and codeoid's own providers are added to it. A turn with no usable model fails before anything is sent, saying what to set.
+
+- **Approvals judge what a shell command does** (#431).
+  Every shell command an agent wants to run is parsed (pipelines, chains, subshells, `bash -c`, `sudo`, `xargs`, `find -exec` and other wrappers seen through) and given a risk level: low, medium, high, or not understood.
+  The levels are guidance drawn from reading the command line, not a sandbox.
+  High-risk commands (`rm -rf ~`, `git push --force`, `curl … | sh`, writes to start-up files, credential reads, `sudo`) and ones that can't be read ask in guarded mode (autonomous mode runs them in its OS sandbox, #448), and a command naming one of codeoid's credential files is refused like the file tools, as a best effort: a command written in a way the reader doesn't recognise is medium instead.
+  Low is a strict allow-list (vetted read-only programs, no options that run or write, no `cd`, variables, assignments, loops or writing redirects, every path inside the workspace), so `approvals.autoAllowLowRisk`, which lets guarded mode run low-risk reads without asking, can't be tricked into running anything unusual.
+  Everyday idioms (`IFS= read -r`, `PATH=…:$PATH`, `EDITOR=vim`, arithmetic on loop counters) are medium, not not-understood, so they don't stall unattended runs.
+  The approval prompt shows the level and the reason on every surface, and rewind's "not undone by going back" list uses the same reading.
+  On Claude, a high-risk or not-understood command never runs on a `permissions.allow` rule without codeoid's gate seeing it.
+  Protecting credentials and files outside the workspace for real needs the agent's commands to run in a sandbox (#448).
+  See [docs/approvals.md](docs/approvals.md), which lists the known ways past "high".
+
+- **End-to-end tests against a scripted backend** (#429).
+  `bun run test:e2e` boots a real daemon per test on a throwaway home and drives it through the web UI (Chromium, via Playwright) and the CLI, with a scripted backend that replays a written conversation instead of a model: no credentials, the same result every time.
+  The first journeys: creating a session and seeing the reply and tool call, approving from the web UI, denying from the CLI while the web UI shows the request, a second device attaching mid-turn, a daemon restart, going back a turn with the files restored, forking from an earlier turn, and a backend error mid-turn.
+  CI runs it on every PR. e2e/README.md says how to add one.
+
+- **Choose how hard the model thinks, per session, on every backend** (#417).
+  One scale (Default, Off, Minimal, Low, Medium, High, Extra high, Max), mapped to each backend's own setting: Claude's effort, Codex's and OpenAI's reasoning effort, Qwen's and pi's levels, Gemini's thinking budget or level, llama.cpp's chat-template switches, and the Gemini CLI's model settings.
+  Set it from the web UI's **effort** selector, `/effort` (web, TUI, Telegram), `codeoid new --effort`, or `session.defaultEffort` for new sessions.
+  It stays with the session, like its model; it applies live where the backend can take it, otherwise from the next turn, and never cuts a running turn short.
+  The pickers offer the levels each model takes where the backend reports them (Claude, Codex, pi); elsewhere every level, marked as unknown.
+  docs/thinking-effort.md says what each level means on each backend.
+
+- **An MCP server added through Claude reaches every backend in that directory** (#395).
+  codeoid imported only Claude's global servers, once at start; a `claude mcp add` (local scope) or a project's `.mcp.json` stayed Claude-only.
+  Now each session sees, on every backend, its directory's servers too: your own always, a project's once approved — in Claude Code (read only from your `~/.claude.json`), or in codeoid after reviewing the entry in full (the drawer's **Review & approve**, or `codeoid mcp approve`, which prints it and approves only with `--yes <fingerprint>`), bound to exactly the entry shown.
+  Changes apply when you ask: the drawer shows "MCP servers changed", and **Refresh MCP servers** (`/mcp refresh`, `codeoid mcp refresh`) restarts the backend, which resumes the conversation; it waits for a running turn or background work, and picks up global changes (`claude mcp add -s user`) too.
+  A server that answers with the MCP sign-in challenge is held back from that account's backends that would only get 401s, and the drawer says to adopt it.
+  Agents' file tools now ask before reading or writing `~/.claude.json` (autonomous mode refuses it), since that is where Claude Code's approvals live.
+  docs/mcp-backends.md says which server reaches which backend, and why.
+
+- **Codex, the Gemini CLI and Qwen use OAuth MCP servers** (#396).
+  An OAuth server in codeoid's registry (`"oauth": true`, or one adopted from Claude's config) used to reach only the daemon-run backends and Claude; Settings said "Not reachable from codex, gemini-cli, qwen yet".
+  These backends now mount it through a loopback relay on the daemon, with a token that belongs to the session and ends with it.
+  The server's own token stays in the daemon: the backend, its config, its argv and the agent's shell never see it.
+  The relay carries the whole MCP protocol (tools, resources, prompts, progress, cancellation, and the server's own requests, such as asking the user a question), and a sign-in mid-session reaches a running session without a restart.
+  The daemon's own MCP client now runs on the official MCP SDK for remote servers, shared with the relay.
 
 - **Sign in to an MCP server from codeoid instead of an interactive Claude Code session** (#390).
   A remote OAuth server in Claude's own config (`~/.claude.json`, a `.mcp.json`) could only be signed in to through `/mcp` in a Claude Code terminal, so in a codeoid session it just reported "needs authentication".
@@ -170,7 +384,133 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `skipWhenSatisfied`, a review-kind entry or fix gate). Findings loops
   require a pack; an explicit-`phases` plan cannot declare one.
 
+### Changed
+
+- **A resumed session loads its history the first time it is used** (#457).
+  At start a resumed session now holds only what the session list and the fleet board need. On data shaped like a real daemon's (147 sessions), the memory resumed sessions hold dropped from 271 MB to 6.5 MB, and the daemon was ready 44% sooner. Nothing a client sees changes.
+  `session.lazyLoad: false` (`CODEOID_SESSION_LAZY_LOAD`) loads every session at start, as before.
+
+- **Shutdown waits for work to finish instead of a fixed half second** (#456).
+  Stopping the daemon now waits for each unfinished turn to record its end, bounded per backend, so a turn's last events are saved before the store closes.
+
+- **`codeoid approve` shows what the session is actually waiting on, and confirms first** (#349).
+  It lists only the calls the daemon is parked on, each with the exact input that runs if approved. `--id <approvalId>` picks one by a stable id, and `--pick N` still works.
+  A yes/no question now gets the same confirm prompt as a tool call, and needs `--yes` without a terminal. Input too long to show in full needs `--yes` too.
+  It exits 1 whenever it didn't answer: nothing waiting, refused, not confirmed, or answered elsewhere.
+
 ### Fixed
+
+- **Releases publish again, and only what main tested** (#479).
+  The release workflow rewrote package versions at tag time, which the frozen install then refused, so v0.5.0 never reached npm. Now a tag must be on main and already carry the repository's version.
+  A release reruns every PR check on the tagged commit and creates the GitHub Release from this changelog. A new check on every PR installs the packed packages with npm and with bun and runs the installed `codeoid`, and another starts the new build on data recorded by the last published release.
+
+- **A command that only lists, sizes, tests or prints a path isn't refused as reaching credentials** (#476).
+  On an unsandboxed session in autonomous mode, `ls /`, `ls ~`, `echo /`, `du -sh /`, `find / -name x` and `test -d /` were refused as reaching a directory that holds credentials. Only a command that can read files under such a directory is refused now.
+  The refusal now says the session isn't sandboxed and how to turn the sandbox on (`codeoid sandbox set <name> auto`).
+
+- **An endpoint's model dropdown offers what its server serves** (#475).
+  It offered only the endpoint's configured models. Now it lists those first, then every chat model the server's `/models` lists.
+  A configured model the server doesn't list is marked "(not listed by the server)", and models the server marks as not for chat (embeddings, rerankers) aren't offered. The last list is kept across a restart, and a server that is down costs one request per 30 s.
+
+- **A Telegram approval card shows the call it asks about** (#472).
+  It showed only the model's own description of the call. Now it shows the command, a write's path and content, or an edit's old and new text, in a code block that the model's text can't pass off as the card's own lines.
+  If Telegram refuses the card, a notice says where to answer, instead of the turn waiting on a card nobody can see.
+
+- **A command's quoted pattern isn't taken for a secret's value** (#470).
+  In `grep -E '^CLERK_SECRET_KEY=' config/.env | cut …`, the quoted pattern and the command after it were taken for the key's value, which garbled the stored command.
+
+- **A fork no longer takes over the background agents its parent started** (#428).
+  Forking a Claude session while it had background subagents running made the fork take them over, and both sessions reported their results. Now the parent's background work reports only to the parent.
+  The fork stops any of the parent's tasks it sees, refuses their tool calls, and tells its model once that work started before the fork belongs to the original session. The parent's cloud agents are never stopped, because that would end the cloud session they share.
+
+- **A dispatched worker replaced after its lease ran out can't complete the task it lost** (#423).
+  Completion matched the task by id alone. Every claim now carries a generation, and a completion counts only with the generation it started under.
+
+- **Google sign-in works against ZeroID 1.12 or newer** (#375).
+  ZeroID now accepts an ID-token exchange only from an authenticated client. The exchange authenticates as `oauth.zeroidClientId` (default `GOOGLE_CLIENT_ID`, or `CODEOID_ZEROID_CLIENT_ID`) with `CODEOID_ZEROID_CLIENT_SECRET`, which is read from the environment only.
+  The daemon warns at start when the secret is missing, and a 401 names the variable.
+
+- **Claude and Codex sign-in work on macOS** (#411, #413, #414).
+  Signing in from the web UI or `codeoid account login` failed on macOS, and on older util-linux (Debian 12, Ubuntu 22.04), with "script: tcgetattr/ioctl: Operation not supported on socket".
+  A real Claude sign-in code also hung on "Finishing", and a successful sign-in would have stored a token cut short at 80 columns.
+
+- **On Codex, what you approve runs, and you see it first** (#368, #369).
+  codeoid answered Codex's approval requests with outdated decision words, so approved commands and file edits never ran, though they were shown as completed. Now approve runs the call and deny doesn't.
+  A file edit's card shows the real diff. codeoid declines without asking when it can't show what would happen, and network access is its own approval.
+  A Codex thread that can't be resumed now continues from codeoid's history instead of starting empty (#408).
+
+- **The web UI asks for every scope, so Settings opens with an API key** (#378).
+  Its own list of scopes was missing the settings and fleet scopes, so Settings and the fleet board failed with "Missing scope: settings:read".
+  A key whose ZeroID identity was created with the older list is still capped by that identity.
+
+- **Memory keeps every byte and no longer freezes the daemon** (#379).
+  Embedding ran on the main thread and froze every session for about 450 ms per batch; it now runs on a worker thread. Tool output is no longer cut at 64 KiB: the full body is kept compressed, and `get_episode` pages through it.
+  Each episode is embedded in up to 8 windows, so recall finds a failure buried in a long log. `memory.embeddings.enabled` (`CODEOID_MEMORY_EMBEDDINGS`) and `memory.embeddings.maxWindows` control it.
+
+- **A fork that overflows the model's window recovers** (#381).
+  A fork's carried-over history was sized at 3.5 characters per token, so code-heavy history overflowed the window and every later message failed with "Prompt is too long". It is now sized at 2 characters per token.
+  A first turn rejected as too long retries up to 3 times with half the history each time, and `/rotate` works on a session stuck this way.
+  `session.seedBudgetChars`, `seedCharsPerToken` and `seedWindowFraction` set the sizing.
+
+- **Switching models on an OpenAI-compatible endpoint (`oai:…`) works.**
+  The model dropdown listed the endpoint's models, but the switch checked the pick against a list that is always empty for endpoints, so every pick failed with "Available: " and nothing after it, and the session stayed on its default model. Both now read the same list. A model id the endpoint isn't configured with (the dropdown's custom id) is passed to the server, which judges it; a Claude model id is refused there, saying why.
+- **A session's replies name the backend they come from.**
+  Every session was labelled "(Claude)" whatever its backend; it now reads "(Codex)", "(Qwen Code)", the endpoint's name, and so on, and follows a backend switch. Claude sessions read as before.
+
+- **A monorepo package session can't plant its package's Claude settings, and going back a turn never follows a working directory swapped for a link** (#448).
+  The working directory and every directory between it and the repository's top can't be moved aside from inside the sandbox any more, nor can a repository inside an added directory or any directory holding a path the sandbox keeps read-only. Before, a sandboxed command could move `packages/app` aside and make it again around a planted `.claude/settings.json`, whose hook a later Claude start there would run on the host. The working directory is pinned by its identity too, and the daemon's own work in it (the snapshots at each turn, going back a turn, a fork from a turn and its setup, a client's file read, the project's MCP config, the end-of-turn git looks) checks it before and after and refuses, says and audits a change; before, a working directory swapped for a link to the home had the home snapshotted, and going back a turn wrote and deleted files there.
+  Every path a sandbox binds is pinned and bound as it was, never resolved again at a launch: before, a directory another session swapped for a link (one this session holds in place, or keeps read-only) was bound where the link led at this session's next command, writable, the daemon's private dir with every session's launchers included. An agent's own added directory is let go once another session works in it. See [docs/sandbox.md](docs/sandbox.md#pinned-paths).
+
+- **A directory the sandbox binds by name is never followed to where a link put there leads** (#448).
+  The workspace (a monorepo's top), the working directory, every added directory, every project root and the session's worktree folders are pinned when the session is created, the directory granted or the root first resolved: by real path and identity. Every sandbox build, every launch inside one (bubblewrap, Seatbelt, Docker, a launcher script written once included), Claude's own sandbox settings and every tool call at the gate check it first; one swapped for a link, made anew or gone refuses the command, and the session says what changed. A changed added dir is dropped at the next turn; a changed workspace stops the session's commands until it is put back. The dirs between a writable directory and another shown inside it can't be moved aside from inside (this also restores the same protection for a hidden file's dirs in a workspace under the home). Before, a session granted the repository holding its own workspace, or a directory inside another session's checkout, could get the home bound writable.
+
+- **A directory the agent added itself keeps a project root's credential hiding** (#448).
+  An autonomous `request_directory` grant no longer makes the repository's `.env`, keys or a token in its git config readable; one the owner adds (or approves) still does, and the owner's card now says so. An autonomous grant is also refused for another session's workspace, worktree folder or added directory (or a dir in or holding one), a checkout in a worktree location (forks, loops, `--worktree`), and the session's own main checkout from a fork; the owner's card warns of the same.
+
+- **More credentials are hidden in a project root** (#448).
+  Every git config git may read with a credential (a bare mirror's, a submodule's under `.git/modules`, a worktree's `config.worktree`, a file one includes, a credential store in the git dir), `extraheader` in every syntax git accepts, inline credential helpers and tokens in a URL's query; private keys by their usual names (`*_rsa`, `*_ed25519`, `id_*`, deploy keys, `*.ppk`, `*.p8`); a Mercurial `hgrc`, Yarn's `.yarnrc.yml` and Composer's `auth.json` holding one. A root named through a link is read and hidden where it really is (on bubblewrap its credential files showed through the link's path; on Claude's sandbox every command failed).
+
+- **A routine's added directories are checked and kept by their real path when it is defined** (#448), so a `~/…` or link-named one works at every run instead of being dropped, and one that can't be added is refused up front. A fork in a linked worktree is no longer told its own repository's git config is hidden. The look through roots for credentials no longer holds up the daemon and is done once per resolution, and a default root too big to look through says what counts and what to set.
+
+- **Agents in a sandboxed session can read other Claude sessions' transcripts again.**
+  `~/.claude/projects` is on the sandbox's read-only home allowlist by default: shell commands and Claude's file tools can look up what another session did, never change it. Remove it from `sandbox.homeReadable` to hide them (a secret once pasted into a session is in its transcript).
+
+- **A nested glob is no longer refused as a read of a process's environment.**
+  `cat src/*/*.ts`, or `grep x ~/.claude/projects/*/*.jsonl`, was refused in every mode with "/proc/<pid>/environ holds credentials": a bare `*` component could spell "proc", and was taken for /proc at any depth. A pattern counts as /proc only at the root or after what can lead anywhere (`$d`, `..`); `$HOME/…` is the home on a line that doesn't set HOME. Real reads of a process's environment are still refused.
+
+- **A refused tool call no longer shows as completed.**
+  When codeoid refused a call (a credential, a denial) and the backend then reported it finished, the card turned "completed" with the refusal as its output. It stays cancelled now, with the reason; a refused Edit or Write says so under its diff.
+- **A session shows "waiting approval" only once there is an approval to answer.**
+  It was set as the tool call started, a moment before the gate had the approval, so a client reacting to it (MCP control's `wait`) could find nothing pending.
+
+- **Stopping the daemon with memory on no longer crashes Bun.**
+  Shutdown terminated the embedding model's worker thread, and doing that while onnxruntime held it (loading the model, running a batch, or with its native finalizers still pending) made Bun panic (`NAPI FATAL ERROR`, the daemon dying with SIGILL) before memory's store was closed and the data-dir lock released.
+  The worker now stops itself: it finishes what it is running, lets the native finalizers run, and exits; it is never terminated from outside.
+- **On Claude, a Grep or Glob relative path is judged where the CLI resolves it** (#447).
+  After the agent's Bash `cd`s, the CLI resolves a search's relative `path` (and a missing one) from there, but codeoid judged it from the working directory, so `../../.codeoid/config.json` could read codeoid's own key; it is now judged from the directory the CLI reports, and a relative path is asked about when it reports none.
+
+- **Idle sessions no longer keep their backend running forever** (#451).
+  A session left idle for `session.idleReleaseMinutes` (default 30; `CODEOID_IDLE_RELEASE_MINUTES`, also in Settings) has its backend process (the Claude CLI, codex, pi, the Gemini CLI, Qwen) and the MCP servers it started stopped; the next message starts it again and resumes the same conversation.
+  Before, every session that had run a turn kept them for the daemon's lifetime, so memory grew with the number of sessions ever used: enough on a busy machine to exhaust RAM and swap.
+  A session whose last turn failed is released too. What the backend started and left running when it stopped (codex and the Gemini CLI are killed outright, so their MCP servers and commands used to survive) is killed with it, as `terminateBackend` does; an account-change release now does the same.
+  A running turn, agent background work or a pending approval is never cut off. `0` keeps the old behaviour; a very long limit is honoured (it no longer fires at once past about 24 days).
+- **Spend caps work on every backend, and costs are never shown as $0 when they aren't known** (#430).
+  Codex, OpenAI-compatible endpoints, Gemini, Qwen and the Gemini CLI recorded every turn as costing $0, so a routine's `--max-cost` and `--daily-cost` never stopped anything there.
+  Now a backend that reports tokens but no cost has them priced at the model's list price (a snapshot of LiteLLM's table, overridable per model in `pricing.models`), shown as an estimate (`~$0.42`); a model on your own machine costs nothing (llama-server on a loopback address; a proxy there to a paid API isn't free unless you say so); and a turn whose cost can't be known shows as `$?`, and stops a capped routine run instead of letting it run uncapped.
+  OpenAI's cached prompt tokens and Gemini's cached and thinking tokens are now counted as such, Codex counts every request of a turn (not only its last), and Qwen a turn's own tokens (not the session's running total), so the cache figures and the estimates are right; a Qwen turn that ran a sub-agent is of unknown cost, whether it ended or was stopped, since qwen-code reports no usage for a sub-agent's requests.
+  The Gemini API backend's default model is now Gemini 2.5 Flash, and its picker offers 3.5 Flash and 2.5 Pro / Flash / Flash-Lite: the 2.0 and 1.5 models it offered are retired.
+
+- **The web UI's tool badge follows the call** (#429).
+  The badge read a tool call's state once, so it stayed at "executing" or "waiting confirmation" after the call finished, until the page was reloaded.
+
+- **The capabilities drawer no longer shows credentials from MCP servers or hooks** (#394).
+  Its `claude.config` response already left out env and header values, but returned MCP servers' `args`, `url` and `command`, and hook commands, verbatim, and a Claude config keeps secrets there just as often (`--api-key sk-…`, `--token=…`, `postgres://user:pass@…`, `?api_key=…`, a token in the path, `curl -H "Authorization: Bearer …"`).
+  Commands and args are no longer sent at all: a server shows its program's name and how many args it has, a hook its program's name (`curl …`), and the drawer points at the file for the full text.
+  A URL is shown from the URL parser's own reading, so the host is always the one it resolves to and is never hidden; userinfo, the query, the fragment and any path segment that isn't a plain word (an id, a key, `;key=value`) are hidden.
+  The adopt hint, adopt's errors and its audit rows, transport errors in Settings' MCP list, and MCP tool-call errors in the daemon log and the transcript are redacted too; hook matchers, env and header key names are bounded and redacted.
+  A settings or `.mcp.json` file over 1 MB is shown as one "(file too large)" row instead of being read, since the CLI still loads it; `~/.claude.json`, which also holds Claude Code's history, is read up to 64 MB.
+  Adopting from the drawer still works: it matches the URL as shown, except for a project's server whose URL has parts hidden, which is adopted only by its full URL (consent to `https://host/…/mcp` isn't consent to the tenant a repo put behind the `…`); the drawer says so and how.
+  The drawer's adopt check runs only for servers that need a sign-in, against an index built once per look, so a repo file of thousands of servers no longer stalls the daemon when it opens.
 
 - **An MCP server that failed when a session started no longer stays failed for the whole session** (#389).
   A Claude session redials its backend's MCP servers on demand (the capabilities drawer's Reconnect button, `/mcp reconnect <server>` in the web UI and TUI, `codeoid mcp reconnect`, or the new `session.mcp_reconnect` message, which needs `session:send`).
@@ -298,6 +638,28 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   left the skill broken on every subsequent install and trust. A dangling link
   is now repaired in place; a real directory or a live link is still never
   touched.
+
+### Security
+
+- **What codeoid stores never holds a secret's value** (#467).
+  This covers transcripts, the history other backends are seeded from, scrollback, memory and share bundles. A value codeoid knows (a declared credential, an account's key, an MCP sign-in, the daemon's own keys) is replaced by its name, `‹credential:gh-highflame›`. Anything else shaped like a credential is replaced by a fingerprint, `‹secret:github-token:3f9a2c1b›`.
+  The output of a command that exists to print a credential (`gh auth token`, `printenv`, `cat .env`, …) isn't stored, and neither is the content of a write to a credential file. MCP results are scrubbed before the model sees them (`secrets.beforeModel`).
+  Detected values are dropped by default. A workstream can keep them encrypted with `captureSecrets: "vault"`, revealed only to the owner's own token. `codeoid secret ls | reveal | forget | promote | scrub` manages them, and `scrub` rewrites data stored before this change (with the daemon stopped).
+  The backend has still seen the value, and a CLI backend keeps its own copy. See docs/CONFIGURATION.md, "Secrets in what codeoid stores".
+
+- **Delegated tokens can no longer change the sandbox, worktree setup, or which program a backend runs** (#424, #448, #478).
+  `sandbox.*`, `worktree.setup.*` and every `providers.*.command` (Claude, Codex, pi, the Gemini CLI, opencode, Qwen) need the owner's own token, and each change is audited from old value to new. Before, a delegated token with `settings:write` could point a backend's command at any program.
+
+- **Agents' file tools can't read codeoid's credential files** (#392).
+  On every backend and in every mode, file tools are refused codeoid's credential files, the agent CLIs' logins and `/proc/*/environ`; on Claude this is enforced in the PreToolUse hook too. A search rooted above those files asks first.
+
+- **Cross-workspace memory search stays inside the caller's tenant** (#415).
+  On a daemon shared by several tenants, the conductor's `fleet_recall` and `fleet_find`, and `session.search` with scope `all`, could return another tenant's memory. The memory store now enforces the tenant itself.
+  On first start after upgrading, the owner of each existing workspace is recorded once. A workspace whose owner can't be proven is left out of cross-workspace search.
+
+- **A hook-rewritten call is refused on a backend that would run the original** (#367).
+  Codex, the Gemini CLI and Qwen run the input they first proposed, whatever codeoid answers. So a `tool_call` hook's rewrite was shown and approved there while the original ran. Such calls are now refused before they are shown, and audited.
+  pi now replaces the input with the rewrite exactly, instead of merging it key by key.
 
 ## [0.4.0] - 2026-07-29
 

@@ -62,6 +62,12 @@ const general: SettingsTab = {
         cfg("session.fallbackModel", "Fallback model", "Retried automatically on a 429/529 from the primary model (Claude only). Alias or full id.", {
           envVar: "CODEOID_FALLBACK_MODEL",
         }),
+        cfg("session.idleReleaseMinutes", "Stop idle backends after (minutes)", "A session idle this long has its backend process (the Claude CLI, codex, pi, …) and everything it started (MCP servers, commands still running) stopped, freeing their memory; the next message starts it again and resumes the conversation. Never while a turn, background work or an approval is pending. 0 keeps them running.", {
+          kind: "float",
+          envVar: "CODEOID_IDLE_RELEASE_MINUTES",
+          min: 0,
+          default: 30,
+        }),
         cfg("session.turnStallTimeoutMs", "Turn stall timeout (ms)", "Force-recover a turn whose model stream goes silent this long. 0 disables the watchdog.", {
           kind: "int",
           envVar: "CODEOID_TURN_STALL_TIMEOUT_MS",
@@ -85,6 +91,12 @@ const general: SettingsTab = {
           envVar: "CODEOID_RESUME_MAX_SESSIONS",
           min: 1,
           default: 200,
+          advanced: true,
+        }),
+        cfg("session.lazyLoad", "Load history on first use", "A resumed session loads its scrollback and history the first time it is opened or used, not at daemon start. Off loads every session's at start (more memory).", {
+          kind: "boolean",
+          envVar: "CODEOID_SESSION_LAZY_LOAD",
+          default: true,
           advanced: true,
         }),
       ],
@@ -154,6 +166,125 @@ const general: SettingsTab = {
         cfg("fork.setup", "Fork setup command", "Shell command run once in a fresh fork worktree to make it buildable (e.g. `bun install`).", {
           placeholder: "bun install",
         }),
+      ],
+    },
+    {
+      id: "worktree-setup",
+      title: "Worktree setup recipe",
+      description:
+        "A repository's committed .codeoid/setup.yaml says which ignored files to copy and which directories to share (writable links into your checkout) into a worktree codeoid creates. Those steps always apply; its command is a separate opt-in, per recipe.",
+      fields: [
+        cfg(
+          "worktree.setup.runCommands",
+          "Run recipe commands",
+          "Whether a recipe's setup command may run in a new worktree. With Trusted recipes it runs only while the recipe is the one you trusted with `codeoid worktree trust` in that repository — a changed recipe runs nothing until trusted again. It runs the repository's committed scripts as you. Reading a recipe never runs anything.",
+          {
+            kind: "enum",
+            default: "never",
+            applies: "live",
+            options: [
+              { value: "never", label: "Never", description: "Copy and share files only." },
+              { value: "trusted-repos", label: "Trusted recipes", description: "Run the command of a recipe trusted with `codeoid worktree trust`." },
+            ],
+          },
+        ),
+      ],
+    },
+  ],
+};
+
+const sandbox: SettingsTab = {
+  id: "sandbox",
+  title: "Sandbox",
+  icon: "🛡",
+  description:
+    "The OS sandbox agents' commands run in (docs/sandbox.md): the workspace and a private temp dir writable, everything else read-only, credential stores hidden, container sockets unreachable. Each session can choose its own; autonomous sessions, routines and loops don't start where it can't run.",
+  groups: [
+    {
+      id: "sandbox-default",
+      title: "Default for new sessions",
+      description: "What a session gets when it doesn't choose. A running session keeps its own until changed on it.",
+      fields: [
+        cfg("sandbox.provider", "Sandbox", "auto: bubblewrap on Linux, Seatbelt on macOS. docker: a container of the image below. off: agents' commands run with your full rights, unattended work too.", {
+          kind: "enum",
+          envVar: "CODEOID_SANDBOX",
+          default: "auto",
+          applies: "next-session",
+          options: [
+            { value: "auto", label: "Automatic", description: "bubblewrap on Linux, Seatbelt on macOS." },
+            { value: "bwrap", label: "bubblewrap (Linux)" },
+            { value: "seatbelt", label: "Seatbelt (macOS)" },
+            { value: "docker", label: "Docker", description: "A container per backend or command; the image must carry the backend's runtime." },
+            { value: "off", label: "Off", description: "No sandbox: commands can read your credentials and change any file you can." },
+          ],
+        }),
+        cfg("sandbox.network", "Network", "What a sandboxed command may reach. allowlist: only the hosts below — enforced by Claude's own sandbox only; elsewhere it means no network, and the session says so.", {
+          kind: "enum",
+          envVar: "CODEOID_SANDBOX_NETWORK",
+          default: "on",
+          applies: "next-session",
+          options: [
+            { value: "on", label: "On" },
+            { value: "off", label: "Off" },
+            { value: "allowlist", label: "Allowlist" },
+          ],
+        }),
+        cfg("sandbox.allowedHosts", "Allowed hosts", "With the allowlist: hosts a command may reach (example.com, *.example.com).", {
+          kind: "string[]",
+          envVar: "CODEOID_SANDBOX_ALLOWED_HOSTS",
+          applies: "next-session",
+        }),
+        cfg("sandbox.hiddenPaths", "More hidden paths", "Hidden on top of the built-in list (codeoid's data, ~/.ssh, ~/.aws, ~/.kube, ~/.docker, ~/.gnupg, ~/.config/gh, ~/.netrc, agent logins, keyrings, …). ~ expands.", {
+          kind: "string[]",
+          envVar: "CODEOID_SANDBOX_HIDDEN_PATHS",
+          applies: "next-session",
+        }),
+        cfg("sandbox.worktreeRoots", "More worktree locations", "More places a sandboxed session may check out git worktrees, on top of <repo>-worktrees/ and <repo>/.worktrees/: each repository gets <root>/<repo>/, and each session writes only its own folder there. ~ expands; a relative path is the repository's (at most one level up: ../wt). A root that isn't there is used only once you create it. Refused: /, your home or a dir holding it, a hidden dir of your home (~/.config, ~/.local, …), ~/Library, codeoid's config dir, a system dir, a dir holding the repository.", {
+          kind: "string[]",
+          envVar: "CODEOID_SANDBOX_WORKTREE_ROOTS",
+          applies: "next-session",
+        }),
+        cfg("sandbox.projectRoots", "Project roots (readable)", "Where sandboxed commands may read other repositories, read-only — and see what other sessions did in their checkouts there. @parent is the parent of the session's repository (e.g. ~/Workspace for a session in ~/Workspace/codeoid), the default. ~ expands. Credentials and secret files (.env, .npmrc, …) stay hidden inside. Writing elsewhere is per session: /sandbox add <dir>, or the agent asks (request_directory). Refused: /, your home or a dir holding it, a hidden dir of your home, ~/Library, codeoid's config dir, a system dir; empty: none.", {
+          kind: "string[]",
+          envVar: "CODEOID_SANDBOX_PROJECT_ROOTS",
+          default: ["@parent"],
+          applies: "next-session",
+        }),
+        cfg("sandbox.git.enabled", "Git gateway for agents", "Agents' own git fetch and push reach remotes you connected (codeoid sandbox git connect) with your existing credentials, which never enter the sandbox. Off: no session gets the gateway.", {
+          kind: "boolean",
+          envVar: "CODEOID_SANDBOX_GIT",
+        }),
+        cfg("sandbox.push.enabled", "Push for agents", "Agents' own git push reaches remotes you connected (codeoid sandbox git connect) through the git gateway, with your existing credentials, which never enter the sandbox: branches of their own, fast-forward only; never main, master or the remote's default branch, no deletes, no tags. Guarded and interactive mode ask you per push; autonomous mode pushes. Off: fetch still works, pushes are refused.", {
+          kind: "boolean",
+          envVar: "CODEOID_SANDBOX_PUSH",
+          default: true,
+          applies: "next-session",
+        }),
+        cfg("sandbox.push.protectedBranches", "Branches agents never push to", "Besides the remote's default branch, always protected. A trailing * matches a prefix (release/*).", {
+          kind: "string[]",
+          envVar: "CODEOID_SANDBOX_PUSH_PROTECTED",
+          default: ["main", "master"],
+          applies: "next-session",
+        }),
+        cfg("sandbox.docker.socket", "Docker access", "Let sandboxed commands reach the container runtime's socket (Docker, rootless Docker, Podman; Docker Desktop on macOS) — for tests that start containers (testcontainers). Docker access can reach the whole machine: a container can mount /. Sessions say \"sandboxed, Docker access\"; a session can turn it on for itself (asked of its owner).", {
+          kind: "boolean",
+          envVar: "CODEOID_SANDBOX_DOCKER_SOCKET",
+          default: false,
+          applies: "next-session",
+        }),
+      ],
+    },
+    {
+      id: "sandbox-providers",
+      title: "Providers",
+      fields: [
+        cfg("sandbox.bwrapPath", "bubblewrap binary", "Absolute path to bwrap. Unset: the one on PATH.", { advanced: true, applies: "next-session", placeholder: "/usr/bin/bwrap" }),
+        cfg("sandbox.docker.image", "Docker image", "The image a Docker sandbox runs. It must carry what the backend runs (a shell; node for pi and the Gemini CLI).", {
+          envVar: "CODEOID_SANDBOX_DOCKER_IMAGE",
+          default: "node:22-bookworm-slim",
+          applies: "next-session",
+        }),
+        cfg("sandbox.docker.runtime", "Docker runtime", "runsc runs each container on gVisor (a separate kernel).", { advanced: true, applies: "next-session", placeholder: "runsc" }),
       ],
     },
   ],
@@ -356,6 +487,7 @@ const fleet: SettingsTab = {
         cfg("dispatch.tickMs", "Tick interval (ms)", "Dispatcher claim/reclaim/deliver cadence.", { kind: "int", min: 250, default: 5000, advanced: true }),
         cfg("dispatch.leaseMs", "Claim lease (ms)", "An unrenewed claim past this is reclaimed.", { kind: "int", min: 10000, default: 600000, advanced: true }),
         cfg("dispatch.retryBaseMs", "Retry backoff base (ms)", "Base backoff for retryable failures — doubles per attempt.", { kind: "int", min: 0, default: 15000, advanced: true }),
+        cfg("dispatch.holdMaxMs", "Approval hold limit (ms)", "Longest a loop attempt may wait on an approval while keeping its worker slot.", { kind: "int", min: 60000, default: 7200000, advanced: true }),
       ],
     },
     {
@@ -379,6 +511,14 @@ const fleet: SettingsTab = {
         cfg("routines.apiFiresPerHour", "API fires per hour", "Fires accepted per routine per hour on its API endpoint.", { kind: "int", min: 1, max: 10000, default: 30, advanced: true }),
         cfg("routines.missedGraceSeconds", "Missed-fire grace (s)", "A fire later than this (the daemon was down) is missed; the routine's catch-up setting decides what happens.", { kind: "int", min: 10, max: 86400, default: 120, advanced: true }),
         cfg("routines.tickMs", "Scheduler tick (ms)", "How often the scheduler checks for due routines.", { kind: "int", min: 250, max: 60000, default: 1000, advanced: true }),
+      ],
+    },
+    {
+      id: "loops",
+      title: "Loops",
+      description: "Runs that pursue an objective until the daemon's own checks pass (docs/loops.md). Watches start repair runs from failing CI checks and review comments.",
+      fields: [
+        cfg("loops.watchPollSeconds", "Watch poll interval (s)", "How often loop watches read GitHub for failing checks and review comments.", { kind: "int", min: 60, max: 86400, default: 300, advanced: true }),
       ],
     },
     {
@@ -439,6 +579,18 @@ const claude: SettingsTab = {
         }),
       ],
     },
+    {
+      id: "claude-cli",
+      title: "Claude Code CLI",
+      fields: [
+        cfg(
+          "providers.claude.command",
+          "Claude Code CLI",
+          "Empty: the CLI bundled with codeoid, which its sandbox is tested against. `claude` (your system install) or an absolute path: run that one instead, e.g. for a model the bundled CLI doesn't support yet. Used only if it is no older than the bundled CLI; a newer one runs, and sessions say its sandbox behaviour is untested. It runs as you: only your own token can change it.",
+          { advanced: true, placeholder: "claude" },
+        ),
+      ],
+    },
   ],
 };
 
@@ -470,7 +622,7 @@ const codex: SettingsTab = {
             { value: "never", label: "Never", description: "Autonomous." },
           ],
         }),
-        env("CODEX_SANDBOX_POLICY", "Sandbox policy", "Filesystem/network sandbox Codex runs under. codeoid pins full access by default (it is the trust authority).", {
+        env("CODEX_SANDBOX_POLICY", "Sandbox policy (without codeoid's sandbox)", "Codex's own sandbox when codeoid's OS sandbox is off or can't run. With it on, codex runs workspace-write inside codeoid's sandbox and this is ignored (see the Sandbox tab).", {
           kind: "enum",
           default: "danger-full-access",
           advanced: true,
@@ -516,6 +668,52 @@ const pi: SettingsTab = {
         cfg("providers.pi.enabled", "Enable pi", "Register the pi backend in the provider catalog.", { kind: "boolean", default: true }),
         cfg("providers.pi.command", "pi command", "Binary to spawn — a wrapper script or absolute path.", { default: "pi", advanced: true }),
         env("PI_CONFIG_DIR", "pi config dir", "Override pi's config/credential directory.", { advanced: true }),
+      ],
+    },
+  ],
+};
+
+const opencode: SettingsTab = {
+  id: "opencode",
+  title: "opencode",
+  icon: "◇",
+  description:
+    "opencode 2.2.5+ over its HTTP server: one private server per daemon (docs/opencode.md). Its model credentials are codeoid's own — the Anthropic, OpenAI and Google keys, the Qwen backend's key, the OpenAI-compatible endpoints — handed to opencode from files, never through its environment; or a sign-in stored in codeoid's opencode database. Every setting here is read when the daemon starts its opencode server.",
+  groups: [
+    {
+      id: "opencode-provider",
+      title: "Backend",
+      fields: [
+        cfg("providers.opencode.enabled", "Enable opencode", "Register the opencode backend in the provider catalog.", { kind: "boolean", default: true }),
+        cfg("providers.opencode.command", "opencode command", "Binary to spawn — a name on PATH, a wrapper script or an absolute path. Must be opencode 2.2.5 or a later 2.2.", {
+          default: "opencode",
+          advanced: true,
+        }),
+        cfg("providers.opencode.agent", "Agent", "The opencode agent sessions run: `build`, `plan` (read-only planning), or one of your own. Empty: opencode's default (`build`).", {
+          placeholder: "build",
+        }),
+        cfg("providers.opencode.model", "Default model", "Model for sessions that don't pick one, as `provider/model` (e.g. `qwen/qwen3.8-max`, `anthropic/claude-sonnet-5`). Empty: opencode's default among the models codeoid offers it; with none, a turn fails saying what to set.", {
+          placeholder: "provider/model",
+        }),
+        cfg(
+          "providers.opencode.hostedModels",
+          "opencode's hosted models",
+          "Offer opencode's own hosted models (provider `opencode`: opencode.ai / Zen, its free no-key models included), and let opencode fetch its model catalog from opencode.ai. Off: they're not offered, nor picked as a default, and a session's code goes only to providers codeoid or your opencode config gave a credential for.",
+          { kind: "boolean", default: false },
+        ),
+      ],
+    },
+    {
+      id: "opencode-storage",
+      title: "Storage",
+      description: "Where codeoid's opencode keeps its sessions and files — never your own opencode's.",
+      fields: [
+        cfg("providers.opencode.dbPath", "Database", "opencode's database for codeoid's sessions. Default: `opencode/opencode.db` beside codeoid's database. Relative paths resolve from codeoid's config dir. Moving it starts opencode's sessions afresh (codeoid's history carries over).", {
+          advanced: true,
+        }),
+        cfg("providers.opencode.dataDir", "Data dir", "opencode's logs, shell output, state and caches. Default: an `opencode` folder beside codeoid's transcript dir. Relative paths resolve from codeoid's config dir.", {
+          advanced: true,
+        }),
       ],
     },
   ],
@@ -636,10 +834,23 @@ const frontends: SettingsTab = {
       ],
     },
     {
+      id: "slack",
+      title: "Slack",
+      description: "Set the app and bot tokens and an allowlist to run the Slack frontend (docs/slack.md).",
+      fields: [
+        secret("CODEOID_SLACK_APP_TOKEN", "App token", "App-level token (xapp-…) with connections:write: the Socket Mode connection."),
+        secret("CODEOID_SLACK_BOT_TOKEN", "Bot token", "Bot User OAuth Token (xoxb-…) the app posts with."),
+        env("CODEOID_SLACK_ALLOWED_USER_IDS", "Allowed member ids", "Slack member ids permitted to use the app (required with the tokens).", {
+          kind: "string[]",
+        }),
+        env("CODEOID_SLACK_TEAM_ID", "Workspace id", "Only messages from this Slack workspace (T…) are taken. Unset: any workspace the app receives from.", {}),
+      ],
+    },
+    {
       id: "web",
       title: "Web",
       fields: [
-        env("CODEOID_FS_BROWSE_ROOT", "File-browser root", "Root directory the web file picker is allowed to browse. Defaults to your home directory.", {}),
+        env("CODEOID_FS_BROWSE_ROOT", "File-browser root", "Bounds the web folder picker and every session workdir to this directory. Unset: the picker browses the whole filesystem (starting at your home directory) and workdirs can be anywhere.", {}),
         cfg("embed.allowedOrigins", "Embed SSO allowed origins", "Parent origins (scheme://host[:port]) permitted to frame the web UI and pre-authenticate it via the URL-hash handoff. Empty = the hash handoff is disabled (safe default).", {
           kind: "string[]",
           envVar: "CODEOID_EMBED_ALLOWED_ORIGINS",
@@ -681,7 +892,7 @@ const hooks: SettingsTab = {
 
 export const SETTINGS_MANIFEST: SettingsManifest = {
   version: MANIFEST_VERSION,
-  tabs: [general, memory, fleet, claude, codex, geminiCli, pi, openai, gemini, llamacpp, identity, frontends, hooks],
+  tabs: [general, sandbox, memory, fleet, claude, codex, geminiCli, pi, opencode, openai, gemini, llamacpp, identity, frontends, hooks],
 };
 
 // ── Derived accessors ─────────────────────────────────────────────────────────
@@ -699,4 +910,9 @@ export function manifestFields(): SettingField[] {
 /** Look up a field by its client-facing `key`. */
 export function fieldByKey(key: string): SettingField | undefined {
   return manifestFields().find((f) => f.key === key);
+}
+
+/** `providers.<backend>.command`: which program a backend runs, as the daemon's user. */
+export function isBackendCommandKey(key: string): boolean {
+  return /^providers\.[A-Za-z0-9]+\.command$/.test(key);
 }

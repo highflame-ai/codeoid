@@ -190,6 +190,9 @@ function usageTotals(u: NonNullable<SessionInfo["usage"]>): Record<string, unkno
     cacheReadTokens: u.cacheReadTokens,
     cacheCreationTokens: u.cacheCreationTokens,
     totalCostUsd: u.totalCostUsd,
+    // Without these an agent enforcing a budget would read an unknown cost as $0 (#430).
+    ...(u.costEstimated ? { costEstimated: true } : {}),
+    ...(u.costUnknownTurns ? { costUnknownTurns: u.costUnknownTurns } : {}),
     numTurns: u.numTurns,
     ...(u.contextWindow !== undefined ? { contextWindow: u.contextWindow } : {}),
     ...(u.lastTurnInputTokens !== undefined ? { lastTurnInputTokens: u.lastTurnInputTokens } : {}),
@@ -843,6 +846,9 @@ export class ControlMcpHttp {
     if (typeof auth.exp === "number" && auth.exp > 0 && auth.exp <= Math.floor(Date.now() / 1000)) {
       return jsonError(401, "unauthorized", { "WWW-Authenticate": 'Bearer error="invalid_token"' });
     }
+    // What MCP control sends is automation acting for the token's holder, never
+    // the person themselves (#430) — on its own copy, never one a client shares.
+    auth = { ...auth, automation: true };
     if (this.#config.requireDelegated && auth.delegationDepth < 1) {
       this.#host.audit(auth.sub, "mcp.control.denied", undefined, "reason=not_delegated");
       return jsonError(403, "this endpoint accepts only delegated agent tokens");

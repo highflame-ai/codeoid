@@ -6,11 +6,11 @@
  */
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { Store } from "../daemon/store.js";
-import { PiProvider } from "../daemon/providers/pi/index.js";
+import { PiProvider, piThinkingLevels } from "../daemon/providers/pi/index.js";
 import type {
   ProviderEvent,
   ToolApprovalFn,
@@ -57,13 +57,23 @@ let tmp: string;
 let store: Store;
 let provider: PiProvider | null;
 
+let savedEnv: Record<string, string | undefined> = {};
 beforeEach(() => {
   tmp = mkdtempSync(join(tmpdir(), "codeoid-pi-test-"));
   store = new Store(join(tmp, "codeoid.db"));
   provider = null;
+  // pi runs from an overlay of its agent dir under codeoid's config (#417):
+  // both kept in the test's own directory, never the user's.
+  savedEnv = { XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME, PI_CODING_AGENT_DIR: process.env.PI_CODING_AGENT_DIR };
+  process.env.XDG_CONFIG_HOME = join(tmp, "xdg");
+  process.env.PI_CODING_AGENT_DIR = join(tmp, "pi-agent");
 });
 
 afterEach(async () => {
+  for (const [k, v] of Object.entries(savedEnv)) {
+    if (v === undefined) delete process.env[k];
+    else process.env[k] = v;
+  }
   await provider?.teardown();
   try {
     store.close();
@@ -160,6 +170,29 @@ async function collect(events: AsyncIterable<ProviderEvent>): Promise<ProviderEv
 }
 
 describe("PiProvider", () => {
+  it("a turn pi priced at $0 with tokens spent is left for the session to price, not trusted as $0 (#430)", async () => {
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("hello no-cost")).events);
+    const done = events.find((e) => e.type === "turn_done") as Extract<ProviderEvent, { type: "turn_done" }>;
+    expect(done.result.inputTokens).toBe(100);
+    expect(done.result.costSource).toBeUndefined();
+  });
+
+  it("after the session is reset, a turn counts its own tokens — pi's stats start over with the new session (#430)", async () => {
+    const p = makeProvider();
+    await collect(p.runTurn(turnOpts("hello")).events);
+    await collect(p.runTurn(turnOpts("hello")).events);
+    p.resetToNewSession("fresh-backing");
+    const events = await collect(p.runTurn(turnOpts("hello")).events);
+    expect(events.find((e) => e.type === "turn_done")).toMatchObject({ result: { inputTokens: 100, outputTokens: 40 } });
+  });
+
+  it("a turn pi priced is pi's own figure (#430)", async () => {
+    const p = makeProvider();
+    const events = await collect(p.runTurn(turnOpts("hello")).events);
+    expect(events.find((e) => e.type === "turn_done")).toMatchObject({ result: { costSource: "backend" } });
+  });
+
   it("T1: streams a text turn and settles with per-turn usage", async () => {
     const p = makeProvider();
     const events = await collect(p.runTurn(turnOpts("hello")).events);
@@ -342,6 +375,22 @@ describe("PiProvider", () => {
     }
   });
 
+  it("T12: an interrupt before pi is up stops the turn: the prompt never goes out, the history seed waits for the next", async () => {
+    const p = makeProvider();
+    p.seedFromHistory([{ role: "user", content: "earlier question" }]);
+    // pi's process is still starting: there is nothing to send an abort to.
+    const run = p.runTurn(turnOpts("hello"));
+    await run.interrupt();
+    const events = await collect(run.events);
+    expect(events.some((e) => e.type === "text_delta")).toBe(false);
+    expect(events.find((e) => e.type === "turn_done")).toMatchObject({ result: { stopReason: "interrupted", inputTokens: 0, totalCostUsd: 0 } });
+
+    const next = await collect(p.runTurn(turnOpts("echo-prompt")).events);
+    const done = next.find((e) => e.type === "text_done");
+    expect(done?.type === "text_done" && done.content).toContain("earlier question");
+    expect(next.find((e) => e.type === "turn_done")).toMatchObject({ result: { inputTokens: 100 } });
+  });
+
   it("T10: second turn reports usage as a DELTA, not the cumulative total", async () => {
     const p = makeProvider();
     await collect(p.runTurn(turnOpts("hello")).events);
@@ -409,5 +458,53 @@ describe("PiProvider – memory tools (#178 Phase 4)", () => {
       .map((e) => (e as { content: string }).content)
       .join("");
     expect(text).toContain('MCP:echo:{"msg":"hi"}');
+  });
+});
+
+describe("PiProvider – thinking effort (#417)", () => {
+  const said = (events: ProviderEvent[]) => (events.find((e) => e.type === "text_done") as { content: string } | undefined)?.content;
+
+  it("sets pi's thinking level per turn, live between turns, and back to pi's own for the default", async () => {
+    const p = makeProvider();
+    expect(said(await collect(p.runTurn(turnOpts("echo-thinking", { effort: "high" })).events))).toBe("thinking:high");
+    expect(await p.applyEffort("low")).toBe(true);
+    expect(said(await collect(p.runTurn(turnOpts("echo-thinking", { effort: "low" })).events))).toBe("thinking:low");
+    expect(said(await collect(p.runTurn(turnOpts("echo-thinking")).events))).toBe("thinking:medium"); // pi's own default
+    await p.teardown();
+  });
+
+  it("reports which levels each model takes, as pi-ai decides them", () => {
+    expect(piThinkingLevels({ reasoning: false })).toEqual(["off"]);
+    expect(piThinkingLevels({ reasoning: true })).toEqual(["off", "minimal", "low", "medium", "high"]);
+    expect(piThinkingLevels({ reasoning: true, thinkingLevelMap: { minimal: null, xhigh: "x", max: "m" } })).toEqual(["off", "low", "medium", "high", "xhigh", "max"]);
+  });
+});
+
+describe("PiProvider – thinking effort stays in the session (#417)", () => {
+  it("Default is the user's own pi default; pi's writes of a level never reach their settings", async () => {
+    const agent = join(tmp, "pi-agent");
+    mkdirSync(agent, { recursive: true });
+    writeFileSync(join(agent, "settings.json"), JSON.stringify({ defaultThinkingLevel: "low", theme: "dark" }));
+    writeFileSync(join(agent, "auth.json"), "{}");
+    const p = makeProvider();
+    expect((await collect(p.runTurn(turnOpts("echo-thinking", { effort: "xhigh" })).events)).find((e) => e.type === "text_done")).toMatchObject({ content: "thinking:xhigh" });
+    expect((await collect(p.runTurn(turnOpts("echo-thinking")).events)).find((e) => e.type === "text_done")).toMatchObject({ content: "thinking:low" });
+    await p.teardown();
+    // pi ran from an overlay: its own settings copy, the user's logins linked.
+    expect(JSON.parse(readFileSync(join(agent, "settings.json"), "utf8"))).toEqual({ defaultThinkingLevel: "low", theme: "dark" });
+    const overlayRoot = join(tmp, "xdg", "codeoid", "accounts", "pi-session");
+    const [overlay] = readdirSync(overlayRoot);
+    expect(lstatSync(join(overlayRoot, overlay!, "auth.json")).isSymbolicLink()).toBe(true);
+    expect(lstatSync(join(overlayRoot, overlay!, "settings.json")).isSymbolicLink()).toBe(false);
+  });
+});
+
+describe("PiProvider – thinking effort across a model change (#417)", () => {
+  it("sends the level again after a model change, which re-applies pi's own", async () => {
+    const p = makeProvider();
+    await collect(p.runTurn(turnOpts("echo-thinking", { effort: "xhigh" })).events);
+    const after = await collect(p.runTurn(turnOpts("echo-thinking", { effort: "xhigh", model: "openai/gpt-5" })).events);
+    expect(after.find((e) => e.type === "text_done")).toMatchObject({ content: "thinking:xhigh" });
+    await p.teardown();
   });
 });

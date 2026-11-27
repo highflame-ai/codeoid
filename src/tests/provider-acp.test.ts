@@ -26,6 +26,7 @@ import type { CodeoidConfig } from "../config.js";
 import type { Store } from "../daemon/store.js";
 import { MemoryMcpHttp, MEMORY_MCP_SERVER_NAME } from "../daemon/memory/mcp-http.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
+import { McpProxy } from "../daemon/mcp/proxy.js";
 import type { RawMcpServerConfig } from "../config.js";
 import { MemoryEngine } from "../daemon/memory/engine.js";
 import { SqliteEpisodeStore } from "../daemon/memory/store.js";
@@ -104,6 +105,25 @@ describe("GeminiAcpProvider over fake-acp", () => {
     const complete = events.find((e) => e.type === "tool_complete");
     expect(complete && (complete as { output: string }).output).toBe("removed");
     expect(events.some((e) => e.type === "text_done" || (e.type === "text_delta" && e.content === "Cleaned up."))).toBe(true);
+  });
+
+  it("A2b: an edit's request names its file in `locations`, not rawInput: the gate and the card are shown it", async () => {
+    const p = makeProvider();
+    const gated: Array<{ name: string; input: Record<string, unknown> }> = [];
+    const events = await collect(
+      p.runTurn(
+        turnOpts("please use-edit /w/src/a.ts", {
+          canUseTool: async (_id, _approvalId, toolName, input) => {
+            gated.push({ name: toolName, input });
+            return { behavior: "allow" as const };
+          },
+        }),
+      ),
+    );
+    await p.teardown();
+    expect(gated).toEqual([{ name: "acp_edit", input: { locations: ["/w/src/a.ts"] } }]);
+    const start = events.find((e) => e.type === "tool_start") as { input: Record<string, unknown> } | undefined;
+    expect(start?.input).toEqual({ title: "Edit /w/src/a.ts", locations: ["/w/src/a.ts"] });
   });
 
   it("A3: denial picks the reject option and the tool never runs", async () => {
@@ -366,6 +386,33 @@ describe("GeminiAcpProvider — VWS memory mount (#178 Phase 2)", () => {
     const stdio = servers.find((s) => s.name === "ghstdio");
     expect(stdio?.command).toBe("npx");
     expect(stdio?.args).toEqual(["-y", "@mcp/gh"]);
+  });
+
+  it("mounts OAuth registry servers through the daemon's relay, the token as a header in the ACP request (#396)", async () => {
+    const raw = (p: Partial<RawMcpServerConfig>): RawMcpServerConfig =>
+      ({ args: [], env: {}, headers: {}, trust: "prompt", scope: "session", enabled: true, native: false, ...p }) as RawMcpServerConfig;
+    const reg = new McpRegistry({ notes: raw({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false });
+    const proxy = new McpProxy({ registry: reg, credentials: null, baseUrl: () => "http://127.0.0.1:7400" });
+    const p = new GeminiAcpProvider({
+      sessionId: "sess-1",
+      initialBackingId: "sess-1",
+      command: process.execPath,
+      argsPrefix: [FIXTURE],
+      store: {} as Store,
+      mcpRegistry: reg,
+      tenant: { accountId: "a", projectId: "p" },
+      mcpProxy: proxy,
+    });
+    const events = await collect(p.runTurn(turnOpts("echo-mcp")));
+    const servers = JSON.parse(textOf(events).replace(/^MCP:/, "")) as Array<{ name: string; url: string; headers: Array<{ name: string; value: string }> }>;
+    const notes = servers.find((s) => s.name === "notes")!;
+    expect(notes.url).toBe(proxy.url("notes"));
+    const token = notes.headers.find((h) => h.name === "Authorization")!.value.replace(/^Bearer /, "");
+    const ask = () =>
+      proxy.handle(new Request(proxy.url("notes"), { method: "POST", headers: { Authorization: `Bearer ${token}`, Host: "127.0.0.1:7400" }, body: "{}" }), true);
+    expect((await ask()).status).not.toBe(403); // a live token
+    await p.teardown();
+    expect((await ask()).status).toBe(403); // revoked with the backend
   });
 
   it("seedText prepends the strategy block (session map) to the next prompt", async () => {

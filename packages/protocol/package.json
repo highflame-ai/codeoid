@@ -1,6 +1,6 @@
 {
   "name": "@highflame/codeoid-protocol",
-  "version": "0.4.0",
+  "version": "0.6.0",
   "description": "Codeoid client↔daemon wire protocol — message/event types + permission scopes. Shared by the daemon, web UI, and mobile client.",
   "license": "MIT",
   "type": "module",

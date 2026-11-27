@@ -303,7 +303,9 @@ describe("T2 – autonomous mode single-decrement", () => {
           toolId: "bash-t1",
           sdkToolUseId: toolUseId,
           name: "Bash",
-          input: { command: "ls /tmp" },
+          // No path in it: `ls /tmp` asks wherever /tmp holds credential files
+          // (a config dir another test left there), which isn't this test's point.
+          input: { command: "ls -la" },
           approvalId: "ap-bash-1",
         },
         {

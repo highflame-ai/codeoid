@@ -13,7 +13,7 @@
 
 import { Component, For, Show, createMemo, createSignal, onCleanup, onMount } from "solid-js";
 
-import { formatCostUsd, formatTokens } from "../lib/format";
+import { formatSessionCost, formatTokens } from "../lib/format";
 import { costShare, fleetEconomics, type FleetEconomics } from "../lib/fleet-economics";
 import { buildTimeline, groupByDay, type TimelineDay, type TimelineEntry, type TimelineKind } from "../lib/fleet-timeline";
 import {
@@ -25,6 +25,7 @@ import {
 } from "../lib/fleet-lanes";
 import { fleetBoard, subscribeFleet, taskSession, unsubscribeFleet } from "../state/fleet";
 import { focusSession } from "../state/sessions";
+import { providerLabel } from "../state/providers";
 
 /**
  * Semantic colours for the status vocabulary (§6). Deliberately separate from
@@ -108,8 +109,10 @@ const FleetRail: Component = () => {
     return fleetEconomics(b.conductor ? [b.conductor, ...b.workers] : b.workers);
   });
 
+  // Docked beside the chat from a tablet up; on a phone it would leave the chat (and the approval card
+  // naming what a dispatch does) a sliver, so there the chat has the width and the fleet is in fleet_list.
   return (
-    <aside class="flex w-72 shrink-0 flex-col overflow-y-auto border-l border-border bg-bg-elev/40">
+    <aside class="hidden w-72 shrink-0 flex-col overflow-y-auto border-l border-border bg-bg-elev/40 md:flex">
       <header class="sticky top-0 z-10 space-y-1 border-b border-border bg-bg-elev/95 px-3 py-2 backdrop-blur">
         <div class="flex items-center gap-2">
           <h3 class="text-[11px] font-semibold uppercase tracking-wider text-fg-muted">Fleet</h3>
@@ -137,9 +140,9 @@ const FleetRail: Component = () => {
             onClick={() => setShowSpend((v) => !v)}
             aria-expanded={showSpend()}
             class="ml-auto rounded px-1 text-accent transition hover:bg-bg-hover"
-            title="Fleet cost across every backend — click for the per-backend split"
+            title={`Fleet cost across every backend (${formatSessionCost(board().agg).title}) — click for the per-backend split`}
           >
-            {formatCostUsd(board().agg.totalCostUsd)} {showSpend() ? "▾" : "▸"}
+            {formatSessionCost(board().agg).text} {showSpend() ? "▾" : "▸"}
           </button>
         </div>
         <Show when={showSpend()}>
@@ -291,7 +294,7 @@ const BackendSpendTable: Component<{ econ: FleetEconomics }> = (props) => (
         {(b) => (
           <li class="flex items-center gap-2 font-mono text-[10px]">
             <span class="w-20 shrink-0 truncate text-fg-muted" title={b.providerId}>
-              {b.providerId}
+              {providerLabel(b.providerId)}
             </span>
             {/* A share bar, not a percentage: the question is "which backend is
                 most of the bill", and a bar answers it without arithmetic. */}
@@ -308,7 +311,7 @@ const BackendSpendTable: Component<{ econ: FleetEconomics }> = (props) => (
               class="w-14 shrink-0 text-right text-accent"
               title={`${formatTokens(b.inputTokens)} in · ${formatTokens(b.outputTokens)} out`}
             >
-              {formatCostUsd(b.costUsd)}
+              {formatSessionCost({ totalCostUsd: b.costUsd, costEstimated: b.costEstimated, costUnknownTurns: b.costUnknownTurns }).text}
             </span>
           </li>
         )}

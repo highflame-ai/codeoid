@@ -5,12 +5,13 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "bun:test";
+import { Database } from "bun:sqlite";
 import { mkdtempSync, rmSync, mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SETTINGS_MANIFEST, manifestFields } from "../daemon/settings/manifest.js";
 import { getSnapshot, applyPatches } from "../daemon/settings/store.js";
-import { validateConfigObject, configFilePaths } from "../config.js";
+import { validateConfigObject, configFilePaths, loadConfig } from "../config.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { Store } from "../daemon/store.js";
 import { TranscriptStore } from "../daemon/transcript.js";
@@ -128,6 +129,30 @@ describe("settings store", () => {
     expect(onDisk.session.turnStallTimeoutMs).toBe(200_000);
   });
 
+  it("the Sandbox tab's Docker access and worktree locations (#448 follow-up): defaults, written, read back, and loaded", () => {
+    const before = getSnapshot();
+    expect(before.values["sandbox.docker.socket"]).toEqual({ value: false, source: "default" });
+    expect(before.values["sandbox.worktreeRoots"]?.value ?? []).toEqual([]);
+    const r = applyPatches([
+      { key: "sandbox.docker.socket", value: true },
+      { key: "sandbox.worktreeRoots", value: ["~/wt", "../shared-worktrees"] },
+    ]);
+    expect(r).toMatchObject({ ok: true, errors: [] });
+    const s = getSnapshot();
+    expect(s.values["sandbox.docker.socket"]).toEqual({ value: true, source: "config" });
+    expect(s.values["sandbox.worktreeRoots"]).toEqual({ value: ["~/wt", "../shared-worktrees"], source: "config" });
+    const onDisk = JSON.parse(readFileSync(configFilePaths().configPath, "utf8"));
+    expect(onDisk.sandbox.docker).toMatchObject({ socket: true });
+    expect(onDisk.sandbox.worktreeRoots).toEqual(["~/wt", "../shared-worktrees"]);
+    const loaded = loadConfig({ raw: onDisk, env: {}, quiet: true });
+    expect(loaded.sandbox?.docker.socket).toBe(true);
+    expect(loaded.sandbox?.worktreeRoots).toEqual(["~/wt", "../shared-worktrees"]);
+    // The env vars override.
+    const env = loadConfig({ raw: {}, env: { CODEOID_SANDBOX_DOCKER_SOCKET: "true", CODEOID_SANDBOX_WORKTREE_ROOTS: "/a,/b" }, quiet: true });
+    expect(env.sandbox?.docker.socket).toBe(true);
+    expect(env.sandbox?.worktreeRoots).toEqual(["/a", "/b"]);
+  });
+
   it("rejects an out-of-range value and writes NOTHING", () => {
     applyPatches([{ key: "memory.enabled", value: false }]); // establish a file
     const before = readFileSync(configFilePaths().configPath, "utf8");
@@ -216,6 +241,59 @@ describe("settings store", () => {
     expect(existsSync(configFilePaths().envPath)).toBe(false); // nothing written
   });
 
+  it("the opencode tab: its settings, each applied when the daemon restarts its opencode server", () => {
+    const tab = SETTINGS_MANIFEST.tabs.find((t) => t.id === "opencode");
+    const fields = tab?.groups.flatMap((g) => g.fields) ?? [];
+    expect(fields.map((f) => f.key)).toEqual([
+      "providers.opencode.enabled",
+      "providers.opencode.command",
+      "providers.opencode.agent",
+      "providers.opencode.model",
+      "providers.opencode.hostedModels",
+      "providers.opencode.dbPath",
+      "providers.opencode.dataDir",
+    ]);
+    for (const f of fields) expect([f.key, f.applies]).toEqual([f.key, "restart"]);
+    expect(fields.filter((f) => f.advanced).map((f) => f.key)).toEqual(["providers.opencode.command", "providers.opencode.dbPath", "providers.opencode.dataDir"]);
+  });
+
+  it("writes opencode settings, and loadConfig resolves its paths from the config dir", () => {
+    const r = applyPatches([
+      { key: "providers.opencode.model", value: "qwen/qwen3.8-max" },
+      { key: "providers.opencode.agent", value: "plan" },
+      { key: "providers.opencode.dataDir", value: "oc-data" },
+      { key: "providers.opencode.dbPath", value: "/var/lib/oc/opencode.db" },
+    ]);
+    expect(r.ok).toBe(true);
+    expect(r.restartRequired).toBe(true);
+    const s = getSnapshot();
+    expect(s.values["providers.opencode.model"]).toEqual({ value: "qwen/qwen3.8-max", source: "config" });
+    expect(s.values["providers.opencode.dataDir"]).toEqual({ value: "oc-data", source: "config" });
+    const oc = loadConfig().providers?.opencode;
+    expect(oc).toMatchObject({ enabled: true, agent: "plan", model: "qwen/qwen3.8-max", dbPath: "/var/lib/oc/opencode.db", dataDir: join(tmp, "codeoid", "oc-data") });
+  });
+
+  it("opencode's hosted models are off unless set, from the settings or CODEOID_OPENCODE_HOSTED_MODELS", () => {
+    expect(loadConfig().providers?.opencode?.hostedModels).toBe(false);
+    expect(getSnapshot().values["providers.opencode.hostedModels"]).toMatchObject({ value: false });
+    const r = applyPatches([{ key: "providers.opencode.hostedModels", value: true }]);
+    expect(r.ok).toBe(true);
+    expect(r.restartRequired).toBe(true);
+    expect(loadConfig().providers?.opencode?.hostedModels).toBe(true);
+    expect(loadConfig({ env: { ...process.env, CODEOID_OPENCODE_HOSTED_MODELS: "false" } }).providers?.opencode?.hostedModels).toBe(false);
+  });
+
+  it("refuses an opencode default model opencode would expand a substitution in, and writes nothing", () => {
+    applyPatches([{ key: "memory.enabled", value: false }]); // establish a file
+    const before = readFileSync(configFilePaths().configPath, "utf8");
+    for (const value of ["x/{file:/home/u/.ssh/id_ed25519}", "anthropic/{env:OPENCODE_PASSWORD}"]) {
+      const r = applyPatches([{ key: "providers.opencode.model", value }]);
+      expect(r.ok).toBe(false);
+      expect(r.errors[0]?.key).toBe("providers.opencode.model");
+    }
+    expect(readFileSync(configFilePaths().configPath, "utf8")).toBe(before);
+  });
+
   it("quotes an env value with spaces (round-trips through the loader)", () => {
     const r = applyPatches([{ key: "CODEOID_FS_BROWSE_ROOT", value: "/path with space" }]);
     expect(r.ok).toBe(true);
@@ -269,6 +347,19 @@ describe("settings RPC handlers", () => {
     )) as { type: string; manifest: { tabs: unknown[] } };
     expect(ok.type).toBe("settings.schema.result");
     expect(ok.manifest.tabs.length).toBeGreaterThan(0);
+  });
+
+  it("worktree setup settings: a delegated token is refused, and a change is audited old → new", async () => {
+    const owner = auth([SCOPES.SETTINGS_WRITE, SCOPES.SETTINGS_READ]);
+    const patch = { type: "settings.set" as const, id: "w1", patches: [{ key: "worktree.setup.runCommands", value: "trusted-repos" }] };
+    const denied = await mgr().handle(patch, { ...owner, delegationDepth: 1 }, client);
+    expect(denied).toMatchObject({ type: "response.error", code: "forbidden" });
+    const ok = await mgr().handle(patch, owner, client);
+    expect(ok).toMatchObject({ type: "settings.set.result", ok: true });
+    const db = new Database(join(tmp, "codeoid.db"), { readonly: true });
+    const row = db.query("SELECT detail FROM audit_log WHERE action = 'settings.set.worktree_setup'").get() as { detail: string } | null;
+    db.close();
+    expect(row?.detail).toBe('key=worktree.setup.runCommands old="never" new="trusted-repos"');
   });
 
   it("settings.get requires settings:read and returns a snapshot", async () => {

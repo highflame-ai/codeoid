@@ -24,6 +24,7 @@
  */
 
 import { type NativeTurnRef, type ProviderEvent, isSubagentEvent } from "./interface.js";
+import { SHELL_LAUNCH_ANCHORS } from "../fork-isolation.js";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -143,12 +144,39 @@ export const TOOL_OUTPUT_LIMITS: Readonly<Record<string, number>> = {
   default_mcp: 16_384,
 };
 
+/**
+ * Characters kept from the END of an output cut to size, per category. A
+ * shell result ends with what the CLI itself wrote after the command's own
+ * output — the line that names a command moved to the background, which is
+ * how a fork tells its parent's background work apart (fork-isolation.ts).
+ */
+const TOOL_OUTPUT_TAILS: Readonly<Record<string, number>> = {
+  run_shell: 400,
+};
+
+/**
+ * A shell result with a launch anchor near its end keeps everything from the
+ * last anchor on, up to this much, instead of the fixed tail: the CLI's
+ * launch text can run longer than that tail.
+ */
+const SHELL_LAUNCH_TAIL_MAX = 1024;
+
+/** How much of a shell result's end to keep: from its last launch anchor, or the fixed tail. */
+function shellTail(output: string, fixed: number): number {
+  const at = Math.max(...SHELL_LAUNCH_ANCHORS.map((a) => output.lastIndexOf(a)));
+  return at === -1 ? fixed : Math.min(output.length - at, SHELL_LAUNCH_TAIL_MAX);
+}
+
 export function limitToolOutput(canonicalName: string, output: string): string {
   const limit = canonicalName.startsWith("mcp__")
     ? TOOL_OUTPUT_LIMITS.default_mcp
     : (TOOL_OUTPUT_LIMITS[canonicalName] ?? Number.POSITIVE_INFINITY);
   if (!Number.isFinite(limit) || output.length <= limit) return output;
-  return `${output.slice(0, limit)}\n…output truncated at ${limit} chars (full output was ${output.length} chars)`;
+  const fixed = TOOL_OUTPUT_TAILS[canonicalName] ?? 0;
+  const tail = Math.min(canonicalName === "run_shell" ? shellTail(output, fixed) : fixed, limit);
+  if (tail === 0) return `${output.slice(0, limit)}\n…output truncated at ${limit} chars (full output was ${output.length} chars)`;
+  const head = limit - tail;
+  return `${output.slice(0, head)}\n…output truncated (full output was ${output.length} chars): kept the first ${head} and the last ${tail}, which follow\n${output.slice(-tail)}`;
 }
 
 // ── Native message shapes ─────────────────────────────────────────────────────
@@ -364,6 +392,27 @@ export class CanonicalHistoryAccumulator {
   #currentTurnId: string | undefined;
   /** Notified after every committed change (see CanonicalHistoryChange). */
   onChange: ((change: CanonicalHistoryChange) => void) | undefined;
+  /**
+   * Applied to every turn as it is committed, before it is kept or persisted:
+   * the session's secret scrubbing (docs/secrets-and-memory-design.md §2), so
+   * no backend is ever seeded with a value codeoid wouldn't store.
+   */
+  scrubTurn: ((turn: CanonicalTurn) => CanonicalTurn) | undefined;
+  /** Applied to every turn a seed brings in (a fork's parent's history, a rewind's): it may predate scrubbing. */
+  scrubSeed: ((turn: CanonicalTurn) => CanonicalTurn) | undefined;
+
+  /** Fails closed: a turn that can't be scrubbed keeps none of its text. */
+  #scrubbed(turn: CanonicalTurn, scrub = this.scrubTurn): CanonicalTurn {
+    if (!scrub) return turn;
+    try {
+      return scrub(turn);
+    } catch {
+      const content = "‹not stored: it couldn't be checked for secrets›";
+      return turn.role === "user"
+        ? { ...turn, content, ...(turn.prompt !== undefined ? { prompt: content } : {}) }
+        : { ...turn, content, ...(turn.thinking ? { thinking: "" } : {}), ...(turn.toolCalls ? { toolCalls: [] } : {}) };
+    }
+  }
 
   // In-progress assistant turn state — reset on each turn_done.
   #currentText = "";
@@ -394,14 +443,14 @@ export class CanonicalHistoryAccumulator {
     turnId?: string,
     extra?: { prompt?: string; at?: string; background?: boolean },
   ): void {
-    const turn: CanonicalTurn = {
+    const turn: CanonicalTurn = this.#scrubbed({
       role: "user",
       content,
       ...(turnId ? { turnId } : {}),
       ...(extra?.prompt !== undefined && extra.prompt !== content ? { prompt: extra.prompt } : {}),
       ...(extra?.at ? { at: extra.at } : {}),
       ...(extra?.background ? { background: true } : {}),
-    };
+    });
     this.#currentTurnId = turnId;
     this.#lastTextBlock = null;
     this.#history.push(turn);
@@ -475,7 +524,7 @@ export class CanonicalHistoryAccumulator {
         const produced =
           this.#currentText.length > 0 || toolCalls.length > 0 || this.#currentThinking.length > 0;
         if (produced) {
-          const turn: CanonicalTurn = {
+          const turn: CanonicalTurn = this.#scrubbed({
             role: "assistant",
             content: this.#currentText,
             ...(this.#currentTurnId ? { turnId: this.#currentTurnId } : {}),
@@ -484,7 +533,7 @@ export class CanonicalHistoryAccumulator {
             providerId: event.result.providerId,
             model: event.result.model,
             ...(event.result.nativeRef ? { native: event.result.nativeRef } : {}),
-          };
+          });
           this.#history.push(turn);
           this.#emit({ op: "append", turn });
         }
@@ -522,7 +571,7 @@ export class CanonicalHistoryAccumulator {
    */
   seed(turns: readonly CanonicalTurn[]): void {
     this.#clear();
-    this.#history = turns.map((t) => structuredClone(t));
+    this.#history = turns.map((t) => this.#scrubbed(structuredClone(t), this.scrubSeed));
     this.#currentTurnId = lastTurnId(this.#history);
     this.#emit({ op: "replace", turns: this.#history });
   }

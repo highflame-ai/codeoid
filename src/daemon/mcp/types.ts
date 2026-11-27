@@ -24,6 +24,9 @@ export interface McpStdioTransport {
   /** Literal subprocess env. A `${VAR}` value is resolved from the daemon's own
    *  environment at mount time so secrets never live in the config file. */
   env: Record<string, string>;
+  /** Where it runs: a workdir server (#395) in its workdir, as Claude, Codex,
+   *  the Gemini CLI and Qwen run it; otherwise the daemon user's home. */
+  cwd?: string;
 }
 
 /** POST JSON-RPC to a streamable-HTTP endpoint. */
@@ -35,6 +38,13 @@ export interface McpHttpTransport {
   bearerTokenEnv?: string;
   /** OAuth per the MCP authorization spec; the daemon holds the token. */
   oauth?: McpOAuthConfig;
+  /**
+   * A named credential this server is called with (workstreams §6.5 case 2):
+   * a REFERENCE, never the value — the daemon reads the value from its secret
+   * store when it connects (mcp/upstream.ts), so no spec, config view or
+   * backend argv ever carries it. `header` absent = `Authorization: Bearer`.
+   */
+  credential?: { id: string; header?: string };
 }
 
 /** A remote server's OAuth settings. Everything is optional: with none, the
@@ -73,6 +83,18 @@ export interface McpServerSpec {
   native: boolean;
   /** Built-in (codeoid_memory) — not user-declarable; always readonly+session. */
   builtin: boolean;
+  /**
+   * Where the entry comes from (#395), when not codeoid's own config:
+   * `claude-global` — imported from `~/.claude.json` at the daemon level;
+   * `claude-local` — the session's workdir in the user's own `~/.claude.json`;
+   * `claude-repo` — the workdir's `.mcp.json` or project settings (the repo's
+   * choice, reaching other backends only once approved).
+   * The workdir ones live only in a session's view, never the registry.
+   */
+  origin?: "claude-global" | "claude-local" | "claude-repo";
+  /** For a workdir entry: a fingerprint of its config, so two workdirs'
+   *  same-named servers are different clients (and a repo's edit is a new entry). */
+  variant?: string;
 }
 
 /** The one namespaced tool name used across ALL backends, so isSafeTool /
@@ -104,7 +126,7 @@ export function isOAuthServer(spec: McpServerSpec): boolean {
  * fixed at start). They cannot carry a refreshing OAuth token, so they do not
  * mount OAuth servers natively (docs/mcp-oauth-design.md §5).
  */
-export const NATIVE_MOUNT_BACKENDS: readonly string[] = ["claude", "codex", "gemini-cli", "qwen"];
+export const NATIVE_MOUNT_BACKENDS: readonly string[] = ["claude", "codex", "gemini-cli", "qwen", "opencode"];
 
 /**
  * Native-mount backends that still get OAuth servers, through an in-process
@@ -113,9 +135,15 @@ export const NATIVE_MOUNT_BACKENDS: readonly string[] = ["claude", "codex", "gem
  */
 export const OAUTH_BRIDGED_BACKENDS: readonly string[] = ["claude"];
 
-/** Backends an OAuth server does not reach at all yet. */
+/**
+ * Native-mount backends that get OAuth servers through the daemon's loopback
+ * relay (#396, mcp/proxy.ts), with a per-session proxy token.
+ */
+export const OAUTH_PROXIED_BACKENDS: readonly string[] = ["codex", "gemini-cli", "qwen", "opencode"];
+
+/** Backends an OAuth server does not reach at all yet (none, since #396). */
 export const OAUTH_UNSUPPORTED_BACKENDS: readonly string[] = NATIVE_MOUNT_BACKENDS.filter(
-  (b) => !OAUTH_BRIDGED_BACKENDS.includes(b),
+  (b) => !OAUTH_BRIDGED_BACKENDS.includes(b) && !OAUTH_PROXIED_BACKENDS.includes(b),
 );
 
 /** True when `spec` should be delivered by codeoid owning the client (Model B
@@ -128,7 +156,22 @@ export function isProxied(spec: McpServerSpec): boolean {
  *  of the config file; a literal (no `${...}`) passes through unchanged. */
 export function resolveEnvValue(value: string, env: Record<string, string | undefined>): string {
   const m = /^\$\{(\w+)\}$/.exec(value);
-  return m ? (env[m[1]] ?? "") : value;
+  if (!m) return value;
+  // Never a workstream credential: the daemon's environment carries every
+  // workstream's (CODEOID_CRED_*), and a server config naming one would hand
+  // one workstream's secret to a server of any (workstreams W1 audit).
+  return isDaemonOwnedEnvName(m[1]) ? "" : (env[m[1]] ?? "");
+}
+
+/**
+ * Variables no MCP server config may name by `${VAR}` or `bearerTokenEnv`:
+ * the workstream credentials (credentials/store.ts). Narrow on purpose — a
+ * user's own config naming one of their own `CODEOID_*` variables keeps
+ * working as before; a repository's config can name none of codeoid's at all
+ * (workdir-servers.ts withoutDaemonSecrets).
+ */
+export function isDaemonOwnedEnvName(name: string): boolean {
+  return name.startsWith("CODEOID_CRED_");
 }
 
 /** Resolve every value in an env map via {@link resolveEnvValue}. */

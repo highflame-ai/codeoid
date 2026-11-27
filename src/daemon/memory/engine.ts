@@ -13,7 +13,7 @@
 
 import type { Embedder } from "./embedder.js";
 import { normalize } from "./embedder.js";
-import type { SqliteEpisodeStore } from "./store.js";
+import { type SqliteEpisodeStore, type WorkspaceTenant, workstreamReadable , hasFactFilter } from "./store.js";
 import { DEFAULT_WEIGHTS, rank, type RankerWeights } from "./ranker.js";
 import type { Reranker } from "./reranker.js";
 import { embedWindows, indexView } from "./lossless.js";
@@ -23,6 +23,15 @@ import type {
   RecallHit,
   RecallQuery,
 } from "./types.js";
+
+/**
+ * Where searchSessions() looks: one workspace, or — when `workspaceId` is absent
+ * — every workspace `tenant` owns. The union makes a tenant mandatory for the
+ * cross-workspace form, so no caller can search the whole store (#415).
+ */
+export type SearchSessionsScope =
+  | { workspaceId: string; tenant?: WorkspaceTenant }
+  | { workspaceId?: undefined; tenant: WorkspaceTenant };
 
 /**
  * One session in the results list returned by searchSessions() — contains
@@ -46,6 +55,8 @@ export interface SessionSearchHit {
     createdAt: number;
     score: number;
     filePaths: string[];
+    /** The workstream that wrote it (workstreams §6.4); absent when untagged. */
+    workstreamId?: string;
   }>;
 }
 
@@ -189,7 +200,16 @@ export class MemoryEngine {
    * the full body is kept verbatim, and only a bounded view of it is
    * full-text indexed and embedded (lossless.ts explains the split).
    */
-  ingest(episode: Omit<Episode, "id">): Episode {
+  /**
+   * Applied to an episode's text before it is stored (docs/secrets-and-memory-design.md §2.6):
+   * the daemon's secret scrubbing, so nothing that ingests — a session, a raw-output spill,
+   * an import — stores a secret's value. Unset: stored as given.
+   */
+  scrubText: ((text: string, ctx: { workstream?: string; sessionId?: string }) => string) | undefined;
+
+  ingest(raw: Omit<Episode, "id">): Episode {
+    const ctx = { ...(raw.workstreamId ? { workstream: raw.workstreamId } : {}), sessionId: raw.sessionId };
+    const episode = this.scrubText ? { ...raw, summary: this.scrubText(raw.summary, ctx), content: this.scrubText(raw.content, ctx) } : raw;
     const view = indexView(episode.content);
     const saved = this.#store.insert(
       view === episode.content ? episode : { ...episode, content: view, fullContent: episode.content },
@@ -203,8 +223,8 @@ export class MemoryEngine {
   }
 
   /** The verbatim body of an episode in `workspaceId` — not just its index view. */
-  getFullContentScoped(id: string, workspaceId: string): string | null {
-    if (!this.#store.getEpisodeInWorkspace(id, workspaceId)) return null;
+  getFullContentScoped(id: string, workspaceId: string, workstreams?: readonly string[]): string | null {
+    if (!this.getEpisodeScoped(id, workspaceId, workstreams)) return null;
     return this.#store.getFullContent(id);
   }
 
@@ -217,6 +237,26 @@ export class MemoryEngine {
     while (this.#embedRunning || this.#embedQueue.length > 0) {
       await new Promise((r) => setTimeout(r, 25));
     }
+  }
+
+  /** Each session's workstream filter (workstreams §6.4), read at every call by the memory tools. */
+  #workstreamScopes = new Map<string, () => readonly string[] | undefined>();
+
+  /**
+   * Scope a session's memory tools to the workstreams it may read (its home
+   * and references), read live; returns the unregister. Every transport's
+   * tools carry the session id, so this one seam covers them all.
+   */
+  scopeSession(sessionId: string, workstreams: () => readonly string[] | undefined): () => void {
+    this.#workstreamScopes.set(sessionId, workstreams);
+    return () => {
+      if (this.#workstreamScopes.get(sessionId) === workstreams) this.#workstreamScopes.delete(sessionId);
+    };
+  }
+
+  /** The workstreams a session's memory tools may read; undefined = no filter. */
+  workstreamsOf(sessionId: string): readonly string[] | undefined {
+    return this.#workstreamScopes.get(sessionId)?.();
   }
 
   /** Hybrid retrieval. */
@@ -241,12 +281,18 @@ export class MemoryEngine {
     if (queryVector) bestWindowScores(this.#store.loadVectorMatrix(q.workspaceId), queryVector, vectorScores);
     const vectorIds = topIds(vectorScores, this.#vectorK);
 
+    // A query by a fact ("what failed in this repo") also takes what matches it directly.
+    const factIds = hasFactFilter(q) ? this.#store.recentMatching(q.workspaceId, q, 200) : [];
+    // A query for exact text (quoted, a command, an identifier): what holds it comes first.
+    const exactText = exactQueryText(q.query);
+    const exactIds = exactText ? this.#store.containing(q.workspaceId, exactText, Math.max(limit, 10), q) : [];
+
     // Union candidates.
-    const candidateIds = [...new Set([...ftsHits.keys(), ...vectorIds])];
+    const candidateIds = [...new Set([...exactIds, ...ftsHits.keys(), ...vectorIds, ...factIds])];
     if (candidateIds.length === 0) return [];
 
     const episodes = this.#store.filter(candidateIds, q);
-    const hits = rank(episodes, {
+    const ranked = rank(episodes, {
       queryVector,
       vectorScores,
       ftsHits,
@@ -254,14 +300,24 @@ export class MemoryEngine {
       now,
       weights: this.#weights,
     });
+    if (exactIds.length === 0) return ranked.slice(0, limit);
+    const exact = new Set(exactIds);
+    const first = ranked.filter((h) => exact.has(h.episode.id)).map((h) => ({ ...h, exact: true }));
+    const rest = ranked.filter((h) => !exact.has(h.episode.id));
+    return [...first, ...rest].slice(0, limit);
+  }
 
-    return hits.slice(0, limit);
+  /** Record that `tenant` owns `workspaceId`, making the workspace reachable by
+   *  that tenant's cross-workspace retrieval. Idempotent; called by every session
+   *  at construction, before it writes its first episode. */
+  registerWorkspace(workspaceId: string, tenant: WorkspaceTenant): void {
+    this.#store.registerWorkspaceTenant(workspaceId, tenant);
   }
 
   /**
    * Cross-workspace hybrid retrieval — the conductor's path. Unlike recall()
-   * (scoped to one workspace), this unions FTS + vector candidates across ALL
-   * workspaces and ranks them in a SINGLE batch, so the ranker's BM25
+   * (scoped to one workspace), this unions FTS + vector candidates across every
+   * workspace the caller's TENANT owns and ranks them in a SINGLE batch, so the ranker's BM25
    * min-max normalization is GLOBAL and scores are comparable across
    * workspaces. That fixes the small-workspace-domination failure a naive
    * per-workspace merge has (a small workspace's batch-relative scores no
@@ -269,12 +325,20 @@ export class MemoryEngine {
    */
   async recallGlobal(q: {
     query: string;
+    /** Whose workspaces to search. Required: one daemon can serve several
+     *  tenants, and nothing outside this tenant may be returned (#415). */
+    tenant: WorkspaceTenant;
     limit?: number;
     filePaths?: string[];
     /** Candidate pool per channel before ranking. Larger than the per-workspace
      * default so many sessions are represented across the whole corpus. */
     candidateK?: number;
   }): Promise<RecallHit[]> {
+    // Typed callers cannot omit it; refuse an untyped one rather than search
+    // the whole store.
+    if (!q.tenant?.accountId || !q.tenant.projectId) {
+      throw new Error("recallGlobal requires the caller's tenant");
+    }
     const limit = q.limit ?? 8;
     const candidateK = q.candidateK ?? Math.max(this.#ftsK, 100);
     const now = Date.now();
@@ -284,14 +348,15 @@ export class MemoryEngine {
         ? normalize((await this.#embedder.embed([q.query]))[0]!)
         : null;
 
-    // Global FTS candidates (all workspaces).
-    const ftsRows = this.#store.ftsSearchGlobal(q.query, candidateK);
+    // FTS candidates across the tenant's workspaces.
+    const ftsRows = this.#store.ftsSearchGlobal(q.query, candidateK, q.tenant);
     const ftsHits = new Map<string, number>(ftsRows.map((r) => [r.id, r.bm25]));
 
-    // Global vector candidates: cosine over every workspace's (in-sync) matrix.
+    // Vector candidates: cosine over each of the tenant's (in-sync) matrices.
+    const workspaces = new Set(this.#store.listWorkspaceIds(q.tenant));
     const vectorScores = new Map<string, number>();
     if (queryVector) {
-      for (const ws of this.#store.listWorkspaceIds()) {
+      for (const ws of workspaces) {
         bestWindowScores(this.#store.loadVectorMatrix(ws), queryVector, vectorScores);
       }
     }
@@ -300,7 +365,11 @@ export class MemoryEngine {
     const candidateIds = [...new Set([...ftsHits.keys(), ...vectorIds])];
     if (candidateIds.length === 0) return [];
 
-    const episodes = this.#store.episodesByIds(candidateIds);
+    // Both candidate channels are already tenant-scoped; re-check ownership on
+    // the rows themselves so a future candidate source cannot widen the result.
+    const episodes = this.#store
+      .episodesByIds(candidateIds)
+      .filter((e) => workspaces.has(e.workspaceId));
     const hits = rank(episodes, {
       queryVector,
       vectorScores,
@@ -319,14 +388,16 @@ export class MemoryEngine {
   }
 
   /** Tenant-scoped fetch by id — the only variant safe to expose to a model. */
-  getEpisodeScoped(id: string, workspaceId: string): Episode | null {
-    return this.#store.getEpisodeInWorkspace(id, workspaceId);
+  getEpisodeScoped(id: string, workspaceId: string, workstreams?: readonly string[]): Episode | null {
+    const ep = this.#store.getEpisodeInWorkspace(id, workspaceId);
+    return ep && workstreamReadable(ep.workstreamId, workstreams) ? ep : null;
   }
 
   /** List recent episodes (for the warm-tier index / timeline UI). `offset`
-   *  enables ordered pagination over the full workspace history. */
-  timeline(workspaceId: string, limit = 40, offset = 0): Episode[] {
-    return this.#store.listRecent(workspaceId, limit, offset);
+   *  enables ordered pagination over the full workspace history; `workstreams`
+   *  keeps it to what they may read (RecallQuery.workstreams). */
+  timeline(workspaceId: string, limit = 40, offset = 0, workstreams?: readonly string[]): Episode[] {
+    return this.#store.listRecent(workspaceId, limit, offset, workstreams);
   }
 
   /**
@@ -339,10 +410,8 @@ export class MemoryEngine {
    * The log bonus rewards sessions that match broadly (many episodes) over
    * sessions that happen to contain a single high-score hit.
    */
-  async searchSessions(opts: {
+  async searchSessions(opts: SearchSessionsScope & {
     query: string;
-    /** Absent = cross-workspace (global) resolution — the conductor's path. */
-    workspaceId?: string;
     limit?: number;
     /** Episode-hit candidates to consider before grouping. */
     candidatePoolSize?: number;
@@ -366,8 +435,19 @@ export class MemoryEngine {
       (global ? Math.max(150, limit * 15) : Math.max(40, limit * 5));
     const snippetsPerSession = opts.snippetsPerSession ?? 3;
 
+    // A workspace given together with a tenant must belong to it, so a caller
+    // that forwards a client-supplied workspace id cannot cross tenants.
+    if (!global && opts.tenant && !this.#store.isWorkspaceOwnedBy(opts.workspaceId!, opts.tenant)) {
+      return [];
+    }
+
     const hits = global
-      ? await this.recallGlobal({ query: opts.query, limit: pool, candidateK: pool })
+      ? await this.recallGlobal({
+          query: opts.query,
+          tenant: opts.tenant!,
+          limit: pool,
+          candidateK: pool,
+        })
       : await this.recall({
           query: opts.query,
           workspaceId: opts.workspaceId!,
@@ -443,6 +523,7 @@ export class MemoryEngine {
           createdAt: h.episode.createdAt,
           score: h.score,
           filePaths: h.episode.filePaths,
+          ...(h.episode.workstreamId ? { workstreamId: h.episode.workstreamId } : {}),
         })),
       });
     }
@@ -611,4 +692,29 @@ function excerpt(content: string, query: string, maxLen: number): string {
   const prefix = start > 0 ? "…" : "";
   const suffix = end < content.length ? "…" : "";
   return prefix + content.slice(start, end).trim() + suffix;
+}
+
+/**
+ * The text a query asks for exactly, or null: a quoted query (`"npm run build"`), or one that
+ * reads as a command or an identifier rather than prose — a single token with a path, flag or
+ * dot in it (`src/daemon/session.ts`, `--frozen-lockfile`, `MAX_TOKENS`), or words with a flag
+ * (`git rebase --onto`). Embeddings do badly on these; exact matches go first.
+ */
+export function exactQueryText(query: string): string | null {
+  const q = query.trim();
+  const quoted = /^(["'`])(.+)\1$/.exec(q);
+  if (quoted && quoted[2]!.trim().length >= 2) return quoted[2]!.trim();
+  if (q.length < 3 || q.length > 200) return null;
+  if (!/\s/.test(q)) {
+    // A path (`src/x.ts`, `./run.sh`), a file name with an extension, a flag, an assignment, an
+    // identifier with `_` or camelCase, a `CONSTANT_NAME`: not a hyphenated word (`rate-limiting`),
+    // an abbreviation (`e.g.`) or a plain capitalised word (`TODO`).
+    if (/\//.test(q) || /^--?[A-Za-z]/.test(q) || /=/.test(q)) return q;
+    if (/^[\w-]{2,}\.[A-Za-z0-9]{1,8}$/.test(q) && !/^[a-z]\.[a-z]\.?$/i.test(q)) return q;
+    if (/^[A-Za-z_$][\w$]*$/.test(q) && (/_/.test(q) || /[a-z][A-Z]/.test(q))) return q;
+    return null;
+  }
+  // A command: words with a flag, and not a question (`what does -v do`).
+  if (/(?:^|\s)--?[A-Za-z]/.test(q) && q.split(/\s+/).length <= 8 && !/\?|^(?:what|how|why|when|where|which|who|does|do|is|are|can|should)\b/i.test(q)) return q;
+  return null;
 }

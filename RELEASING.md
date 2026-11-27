@@ -38,7 +38,11 @@ bun install && (cd web && bun install)   # refresh both lockfiles
 1. `bun run version:set X.Y.Z`, then refresh both lockfiles.
 2. Move the `## [Unreleased]` notes into a new `## [X.Y.Z]` section in
    [`CHANGELOG.md`](CHANGELOG.md).
-3. Open a PR, get CI green, merge to `main`.
+3. Open a PR, get CI green, merge to `main`. CI includes the release gate's
+   automated checks ([docs/release-gate.md](docs/release-gate.md)): the package
+   installs (npm and bun) and works (`scripts/check-artifact.ts`), and the last
+   published release's data opens in this build (`scripts/check-upgrade.ts`).
+   Both run by hand too.
 4. Tag from `main` and push (tags are not branch-protected):
 
    ```bash
@@ -47,11 +51,20 @@ bun install && (cd web && bun install)   # refresh both lockfiles
    git push origin vX.Y.Z
    ```
 
-[`.github/workflows/release.yml`](.github/workflows/release.yml) then builds the
-web UI, runs the test suite, verifies the three versions match the tag, publishes
-protocol → core → CLI with
-[provenance](https://docs.npmjs.com/generating-provenance-statements), and opens a
-GitHub Release. Install with:
+[`.github/workflows/release.yml`](.github/workflows/release.yml) then:
+
+- refuses a tag whose commit isn't on `main`, or whose version isn't already the
+  repository's (the bump is step 1, in a PR; the workflow never rewrites
+  versions: v0.5.0 failed to publish because it did);
+- runs every PR check again on the tagged commit (it reuses `pr-check.yml`):
+  lint, typecheck, the unit suite, e2e, the web checks, the real-sandbox tests,
+  and the release gate's checks;
+- verifies the three versions and their internal ranges against the tag,
+  publishes protocol → core → CLI through `scripts/publish-if-new.sh` with
+  [provenance](https://docs.npmjs.com/generating-provenance-statements), and
+  creates the GitHub Release from the CHANGELOG section.
+
+Install with:
 
 ```bash
 bun install -g @highflame/codeoid   # or: bunx @highflame/codeoid

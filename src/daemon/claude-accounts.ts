@@ -11,11 +11,10 @@
  * Tokens never leave this module except into a subprocess environment.
  */
 
-import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { atomicWrite, getConfigDir } from "../config.js";
+import { AccountError, AccountStore } from "./accounts.js";
 import {
   CLAUDE_DEFAULT_ACCOUNT,
   type ClaudeAccountInfo,
@@ -28,23 +27,47 @@ export interface StoredClaudeAccount {
   token: string;
   baseUrl?: string;
   headers?: Record<string, string>;
+  /** `bedrock` only: settings from BEDROCK_SETTINGS (region, model mappings, telemetry). */
+  env?: Record<string, string>;
   createdAt: string;
   updatedAt: string;
+  generation?: number;
 }
 
-interface StoreFile {
-  version: 1;
-  defaultAccount?: string;
-  accounts: StoredClaudeAccount[];
-}
 
 /** A session's account, resolved for one query: what to apply, and whether it changed. */
 export interface ResolvedClaudeAccount {
   name: string;
+  kind: ClaudeAccountKind;
   /** Changes whenever the credential does (a re-login, a new token) — never logged. */
   fingerprint: string;
   apply(env: Record<string, string>): Record<string, string>;
+  /** The model id to hand the CLI for codeoid's `model` on this account (see `bedrockModel`). */
+  model(model: string): string;
 }
+
+/**
+ * Model ids on a Bedrock account. codeoid stores a session's model as a
+ * first-party id (`opus` → `claude-opus-5-5`), but the Claude CLI applies an
+ * account's `ANTHROPIC_DEFAULT_<FAMILY>_MODEL` mapping only to the alias — a
+ * full id goes to the endpoint as `us.anthropic.<id>`. So a first-party id of
+ * a family the account maps is handed over as that family's alias (keeping a
+ * `[1m]` suffix); anything else as it is.
+ */
+export function bedrockModel(model: string, settings: Record<string, string> | undefined): string {
+  const m = /^claude-(opus|sonnet|haiku|fable)-[^[\]]+(\[[a-z0-9]+\])?$/.exec(model);
+  if (!m || !settings?.[`ANTHROPIC_DEFAULT_${m[1]!.toUpperCase()}_MODEL`]) return model;
+  return `${m[1]}${m[2] ?? ""}`;
+}
+
+/** The daemon's own model settings: first-party ids, meaningless to a Bedrock account. */
+const MODEL_SETTINGS = new Set([
+  "ANTHROPIC_MODEL",
+  "ANTHROPIC_SMALL_FAST_MODEL",
+  "ANTHROPIC_DEFAULT_OPUS_MODEL",
+  "ANTHROPIC_DEFAULT_SONNET_MODEL",
+  "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+]);
 
 /**
  * Explicit credential / backend-selection variables the Claude CLI reads. Kept
@@ -95,6 +118,7 @@ export function isClaudeCredentialVar(name: string): boolean {
   if (name.startsWith("ANTHROPIC_")) return !ANTHROPIC_KEEP.has(name);
   if ((CLAUDE_CREDENTIAL_ENV as readonly string[]).includes(name)) return true;
   return (
+    name === "AWS_BEARER_TOKEN_BEDROCK" ||
     name.startsWith("CLAUDE_CODE_USE_") ||
     /^CLAUDE_CODE_SKIP_[A-Z_]+_AUTH$/.test(name) ||
     name.endsWith("_FILE_DESCRIPTOR") ||
@@ -152,9 +176,10 @@ export function validateAccountInput(input: {
   token: string;
   baseUrl?: string;
   headers?: Record<string, string>;
+  env?: Record<string, string>;
 }): void {
   validateAccountName(input.name);
-  if (!["subscription", "gateway", "api-key"].includes(input.kind)) {
+  if (!["subscription", "gateway", "api-key", "bedrock"].includes(input.kind)) {
     throw new ClaudeAccountError(`unknown account kind ${JSON.stringify(input.kind)}`);
   }
   // Any control character (CR/LF, NUL, …): a NUL makes the spawn throw with
@@ -162,28 +187,33 @@ export function validateAccountInput(input: {
   if (!input.token || CONTROL_CHARS.test(input.token)) {
     throw new ClaudeAccountError("the token must be a single non-empty line with no control characters");
   }
-  if (input.kind === "gateway") {
-    if (!input.baseUrl) throw new ClaudeAccountError("a gateway account needs its base URL");
+  if (input.kind === "gateway" && !input.baseUrl) throw new ClaudeAccountError("a gateway account needs its base URL");
+  if (input.baseUrl !== undefined) {
+    // A Bedrock endpoint is optional: without one the CLI goes to AWS.
+    if (input.kind !== "gateway" && input.kind !== "bedrock") throw new ClaudeAccountError(`a ${input.kind} account has no base URL`);
+    const what = input.kind === "gateway" ? "gateway base URL" : "Bedrock endpoint";
     let url: URL;
     try {
       url = new URL(input.baseUrl);
     } catch {
-      throw new ClaudeAccountError("the gateway base URL isn't a valid URL");
+      throw new ClaudeAccountError(`the ${what} isn't a valid URL`);
     }
     // The URL is shown to anyone who can list accounts: no credentials in it.
     if (url.username || url.password || url.search || url.hash) {
-      throw new ClaudeAccountError("the gateway base URL must not carry credentials, a query string or a fragment — put a key in the token or a header");
+      throw new ClaudeAccountError(`the ${what} must not carry credentials, a query string or a fragment — put a key in the token${input.kind === "gateway" ? " or a header" : ""}`);
     }
     const loopback = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]";
     if (url.protocol !== "https:" && !(url.protocol === "http:" && loopback)) {
       // The token rides every request; plain http would send it in the clear.
-      throw new ClaudeAccountError("the gateway base URL must be https (http only for localhost)");
+      throw new ClaudeAccountError(`the ${what} must be https (http only for localhost)`);
     }
-  } else {
-    if (input.baseUrl) throw new ClaudeAccountError(`a ${input.kind} account has no base URL`);
-    if (input.headers && Object.keys(input.headers).length > 0) {
-      throw new ClaudeAccountError(`a ${input.kind} account has no extra headers`);
-    }
+  }
+  if (input.kind !== "gateway" && input.headers && Object.keys(input.headers).length > 0) {
+    throw new ClaudeAccountError(`a ${input.kind} account has no extra headers`);
+  }
+  // Which settings a Bedrock account takes is checked by the store.
+  if (input.kind !== "bedrock" && input.env !== undefined) {
+    throw new ClaudeAccountError(`a ${input.kind} account takes no settings`);
   }
   for (const [k, v] of Object.entries(input.headers ?? {})) {
     if (!HEADER_NAME_RE.test(k)) throw new ClaudeAccountError(`invalid header name: ${JSON.stringify(k)}`);
@@ -229,6 +259,22 @@ export function applyAccountEnv(env: Record<string, string>, account: StoredClau
       if (headers.length > 0) out.ANTHROPIC_CUSTOM_HEADERS = headers.map(([k, v]) => `${k}: ${v}`).join("\n");
       break;
     }
+    case "bedrock":
+      // The daemon's model settings name first-party ids; only the account's
+      // own mappings mean anything on its endpoint. Nor does the daemon's AWS
+      // or telemetry setup, if an operator lets it through to agents
+      // (CODEOID_AGENT_ENV_ALLOW): an AWS_ENDPOINT_URL or config file there
+      // would receive this account's token, and telemetry headers there would
+      // pair with this account's collector. The region is kept.
+      for (const k of MODEL_SETTINGS) delete out[k];
+      for (const k of Object.keys(out)) {
+        if ((k.startsWith("AWS_") && k !== "AWS_REGION" && k !== "AWS_DEFAULT_REGION") || k.startsWith("OTEL_")) delete out[k];
+      }
+      for (const [k, v] of Object.entries(account.env ?? {})) out[k] = v;
+      out.CLAUDE_CODE_USE_BEDROCK = "1";
+      out.AWS_BEARER_TOKEN_BEDROCK = account.token;
+      if (account.baseUrl) out.ANTHROPIC_BEDROCK_BASE_URL = account.baseUrl;
+      break;
     default:
       // Never "strip everything and set nothing": the CLI would fall back to
       // the stored login, a credential nobody chose for this session.
@@ -237,112 +283,73 @@ export function applyAccountEnv(env: Record<string, string>, account: StoredClau
   return out;
 }
 
-function fingerprintOf(a: StoredClaudeAccount): string {
-  return createHash("sha256")
-    .update(JSON.stringify([a.name, a.kind, a.token, a.baseUrl ?? "", Object.entries(a.headers ?? {}).sort()]))
-    .digest("hex")
-    .slice(0, 16);
-}
 
+/**
+ * The `claude` backend's accounts, in the shape #392's callers use. Backed by
+ * the store for every backend (accounts.ts); `claude-accounts.json` is only
+ * read once, to import it.
+ */
 export class ClaudeAccountStore {
-  readonly #path: string;
-  #data: StoreFile | null = null;
+  readonly store: AccountStore;
 
-  constructor(path: string = join(getConfigDir(), "claude-accounts.json")) {
-    this.#path = path;
-  }
-
-  #load(): StoreFile {
-    if (this.#data) return this.#data;
-    if (!existsSync(this.#path)) {
-      this.#data = { version: 1, accounts: [] };
-      return this.#data;
-    }
-    let parsed: Partial<StoreFile>;
-    try {
-      parsed = JSON.parse(readFileSync(this.#path, "utf8")) as Partial<StoreFile>;
-    } catch (err) {
-      // Fail closed — the default may name an account we can no longer read —
-      // but say exactly what to fix.
-      // Not the parser's message: it can quote a slice of the file — a token.
-      throw new ClaudeAccountError(`${this.#path} is not valid JSON — fix or remove it`);
-    }
-    // Validate each entry as if it were being added: a hand-edited entry with
-    // an unknown kind or a bad token must not be applied.
-    const accounts = (Array.isArray(parsed.accounts) ? parsed.accounts : []).filter((a): a is StoredClaudeAccount => {
-      try {
-        validateAccountInput(a as StoredClaudeAccount);
-        return true;
-      } catch (err) {
-        console.error(`[codeoid] ignoring invalid Claude account in ${this.#path}: ${err instanceof Error ? err.message : String(err)}`);
-        return false;
-      }
-    });
-    this.#data = {
-      version: 1,
-      accounts,
-      ...(typeof parsed.defaultAccount === "string" ? { defaultAccount: parsed.defaultAccount } : {}),
-    };
-    return this.#data;
-  }
-
-  #save(data: StoreFile): void {
-    atomicWrite(this.#path, `${JSON.stringify(data, null, 2)}\n`, 0o600);
-    this.#data = data;
+  /** `path`: a legacy `claude-accounts.json` to import from (tests); its sibling `accounts.json` is the store. */
+  constructor(storeOrLegacyPath?: AccountStore | string) {
+    this.store =
+      storeOrLegacyPath instanceof AccountStore
+        ? storeOrLegacyPath
+        : storeOrLegacyPath
+          ? new AccountStore({
+              path: join(dirname(storeOrLegacyPath), "accounts.json"),
+              homesRoot: join(dirname(storeOrLegacyPath), "accounts"),
+              legacyClaudePath: storeOrLegacyPath,
+            })
+          : new AccountStore();
   }
 
   list(): ClaudeAccountInfo[] {
-    return this.#load().accounts.map(toAccountInfo).sort((a, b) => a.name.localeCompare(b.name));
+    return this.store.list("claude").map(({ backend: _b, envNames: _e, ...a }) => a as ClaudeAccountInfo);
   }
 
   get(name: string): StoredClaudeAccount | undefined {
-    return this.#load().accounts.find((a) => a.name === name);
+    const a = this.store.get("claude", name);
+    return a ? (a as StoredClaudeAccount) : undefined;
   }
 
   has(name: string): boolean {
-    return name === CLAUDE_DEFAULT_ACCOUNT || this.get(name) !== undefined;
+    return this.store.has("claude", name);
   }
 
   /** The daemon default's name — `default` when none is set. */
   getDefault(): string {
-    return this.#load().defaultAccount ?? CLAUDE_DEFAULT_ACCOUNT;
+    return this.store.getDefault("claude");
   }
 
-  upsert(input: { name: string; kind: ClaudeAccountKind; token: string; baseUrl?: string; headers?: Record<string, string> }): StoredClaudeAccount {
-    validateAccountInput(input);
-    const data = this.#load();
-    const now = new Date().toISOString();
-    const prev = data.accounts.find((a) => a.name === input.name);
-    const next: StoredClaudeAccount = {
-      name: input.name,
-      kind: input.kind,
-      token: input.token,
-      ...(input.baseUrl ? { baseUrl: input.baseUrl } : {}),
-      ...(input.headers && Object.keys(input.headers).length > 0 ? { headers: { ...input.headers } } : {}),
-      createdAt: prev?.createdAt ?? now,
-      updatedAt: now,
-    };
-    this.#save({ ...data, accounts: [...data.accounts.filter((a) => a.name !== input.name), next] });
-    return next;
+  /** Add or replace (the #392 contract: `claude.accounts.set` always replaces). */
+  upsert(input: {
+    name: string;
+    kind: ClaudeAccountKind;
+    token: string;
+    baseUrl?: string;
+    headers?: Record<string, string>;
+    env?: Record<string, string>;
+  }): StoredClaudeAccount {
+    try {
+      validateAccountInput(input);
+      this.store.upsert({ backend: "claude", ...input, replace: true });
+    } catch (err) {
+      throw err instanceof AccountError ? new ClaudeAccountError(err.message) : err;
+    }
+    return this.get(input.name)!;
   }
 
-  /** Remove an account. Clears the default if it was the default. Returns whether it existed. */
+  /** Remove an account. Refused for the default account (set another first). Returns whether it existed. */
   remove(name: string): boolean {
-    const data = this.#load();
-    if (!data.accounts.some((a) => a.name === name)) return false;
-    const { defaultAccount, ...rest } = data;
-    this.#save({
-      ...rest,
-      accounts: data.accounts.filter((a) => a.name !== name),
-      ...(defaultAccount && defaultAccount !== name ? { defaultAccount } : {}),
-    });
-    return true;
+    return this.store.remove("claude", name);
   }
 
   setDefault(name: string): void {
     if (!this.has(name)) throw new ClaudeAccountError(`no Claude account named ${JSON.stringify(name)}`);
-    const { defaultAccount: _old, ...rest } = this.#load();
-    this.#save(name === CLAUDE_DEFAULT_ACCOUNT ? rest : { ...rest, defaultAccount: name });
+    this.store.setDefault("claude", name);
   }
 
   /**
@@ -355,23 +362,41 @@ export class ClaudeAccountStore {
   resolve(sessionChoice: string | null): ResolvedClaudeAccount | null {
     // `null` follows the daemon default; a literal "default" PINS the built-in
     // account (the daemon's own environment) whatever the default is.
-    const name = sessionChoice ?? this.getDefault();
+    let name: string;
+    try {
+      // Through the store first: it fails closed when Claude's accounts can't
+      // be read (an unreadable legacy file), even for a session following a
+      // default that would otherwise read as the built-in one.
+      if (sessionChoice !== CLAUDE_DEFAULT_ACCOUNT) this.store.resolve("claude", sessionChoice);
+      name = sessionChoice ?? this.getDefault();
+    } catch (err) {
+      // An unreadable accounts file: say that, not "no longer exists".
+      throw new ClaudeAccountError(err instanceof Error ? err.message : String(err));
+    }
     if (name === CLAUDE_DEFAULT_ACCOUNT) return null;
     if (isGatewayLaunch(process.env)) {
       throw new ClaudeAccountError(
         `Claude accounts are disabled behind the Highflame gateway — "${name}" would route around it. This session runs on the gateway's credential.`,
       );
     }
-    const account = this.get(name);
-    if (!account) {
-      throw new ClaudeAccountError(
-        `Claude account "${name}" no longer exists — choose another for this session (codeoid account use <session> <account>)`,
-      );
+    let resolved: ReturnType<AccountStore["resolve"]>;
+    try {
+      resolved = this.store.resolve("claude", name);
+    } catch (err) {
+      if (this.store.get("claude", name) === undefined && !(err instanceof Error && /not valid JSON/.test(err.message))) {
+        throw new ClaudeAccountError(
+          `Claude account "${name}" no longer exists — choose another for this session (codeoid account use <session> <account>)`,
+        );
+      }
+      throw new ClaudeAccountError(err instanceof Error ? err.message : String(err));
     }
+    const account = resolved!.account as StoredClaudeAccount;
     return {
       name: account.name,
-      fingerprint: fingerprintOf(account),
+      kind: account.kind,
+      fingerprint: resolved!.fingerprint,
       apply: (env) => applyAccountEnv(env, account),
+      model: (model) => (account.kind === "bedrock" ? bedrockModel(model, account.env) : model),
     };
   }
 }
@@ -405,11 +430,50 @@ const REDIRECTING_ENV = new Set([
   "NODE_EXTRA_CA_CERTS", "NODE_TLS_REJECT_UNAUTHORIZED", "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_OPTIONS",
   "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB",
 ]);
-function redirectsCredential(key: string): boolean {
-  return isClaudeCredentialVar(key) || REDIRECTING_ENV.has(key);
+function redirectsCredential(key: string, kind: ClaudeAccountKind): boolean {
+  if (isClaudeCredentialVar(key) || REDIRECTING_ENV.has(key)) return true;
+  if (kind !== "bedrock") return false;
+  // The CLI's AWS SDK reads its whole configuration from AWS_* — a config or
+  // credentials file of the repo's own can carry an `endpoint_url` that gets
+  // the bearer token; a profile can pick one from the user's. Only the region
+  // is safe (the CLI validates it, so the host stays AWS's).
+  if (key.startsWith("AWS_")) return key !== "AWS_REGION" && key !== "AWS_DEFAULT_REGION";
+  // Where telemetry (and the telemetry headers' key) goes, and what content
+  // it carries to the account's collector.
+  return key.startsWith("OTEL_");
 }
 
-export function projectCredentialOverride(workdir: string): { file: string; key: string } | null {
+/** Settings keys the CLI runs as a command to obtain or refresh a credential (or its headers). */
+const HELPER_KEYS = ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport", "gcpAuthRefresh", "otelHeadersHelper", "proxyAuthHelper"] as const;
+
+/**
+ * A Claude settings file as the CLI reads it: a UTF-8 BOM stripped, UTF-16
+ * with a BOM decoded. Reading it any other way lets a file the CLI applies
+ * look unreadable here — a BOM was enough to hide a redirect from the check.
+ * `undefined` for an empty file; throws when it can't be parsed.
+ */
+export function readClaudeSettings(file: string): unknown {
+  const raw = readFileSync(file);
+  let text: string;
+  if (raw[0] === 0xff && raw[1] === 0xfe) text = raw.subarray(2).toString("utf16le");
+  else if (raw[0] === 0xfe && raw[1] === 0xff) text = Buffer.from(raw.subarray(2)).swap16().toString("utf16le");
+  else text = raw.toString("utf8").replace(/^\uFEFF/, "");
+  if (!text.trim()) return undefined;
+  return JSON.parse(text);
+}
+
+/** The first key in a parsed settings object that would redirect `kind`'s credential. */
+function overridingKey(parsed: unknown, helpers: readonly string[], isRedirect: (key: string) => boolean): string | null {
+  if (!parsed || typeof parsed !== "object") return null;
+  const settings = parsed as Record<string, unknown>;
+  for (const key of helpers) if (settings[key] !== undefined) return key;
+  if (settings.env && typeof settings.env === "object") {
+    for (const key of Object.keys(settings.env)) if (isRedirect(key)) return `env.${key}`;
+  }
+  return null;
+}
+
+export function projectCredentialOverride(workdir: string, kind: ClaudeAccountKind): { file: string; key: string } | null {
   const home = resolve(homedir());
   for (let dir = resolve(workdir); ; dir = dirname(dir)) {
     if (dir === home) break; // ~/.claude/settings.json is the user's own settings, not a project's
@@ -418,22 +482,40 @@ export function projectCredentialOverride(workdir: string): { file: string; key:
       if (!existsSync(file)) continue;
       let parsed: unknown;
       try {
-        parsed = JSON.parse(readFileSync(file, "utf8"));
+        parsed = readClaudeSettings(file);
       } catch {
-        // Unreadable here means unreadable for the CLI too — nothing applied.
-        continue;
+        // Fail closed: a file the check can't read is one it can't vouch for,
+        // and the CLI's reader has accepted forms this one didn't.
+        return { file, key: "(a file codeoid can't parse — fix or remove it)" };
       }
-      if (!parsed || typeof parsed !== "object") continue;
-      const settings = parsed as { env?: unknown; apiKeyHelper?: unknown; awsAuthRefresh?: unknown; awsCredentialExport?: unknown };
-      for (const key of ["apiKeyHelper", "awsAuthRefresh", "awsCredentialExport"] as const) {
-        if (settings[key] !== undefined) return { file, key };
-      }
-      if (settings.env && typeof settings.env === "object") {
-        for (const key of Object.keys(settings.env)) if (redirectsCredential(key)) return { file, key: `env.${key}` };
-      }
+      const key = overridingKey(parsed, HELPER_KEYS, (k) => redirectsCredential(k, kind));
+      if (key) return { file, key };
     }
     if (dirname(dir) === dir) break;
   }
   return null;
+}
+
+/**
+ * Does the user's own Claude settings file set a credential? Its `env`
+ * applies over every session's environment, so a credential there (a Bedrock
+ * setup, a base URL) runs a named account's session on that credential
+ * instead — or sends the account's token to its endpoint. A named account
+ * refuses to run until it is moved into an account. Proxies, CA bundles and
+ * telemetry there are the user's own setup and are left alone.
+ */
+export function userCredentialOverride(configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude")): { file: string; key: string } | null {
+  const file = join(configDir, "settings.json");
+  if (!existsSync(file)) return null;
+  let parsed: unknown;
+  try {
+    parsed = readClaudeSettings(file);
+  } catch {
+    return null; // the user's own file: the CLI reports it, nothing to vouch for
+  }
+  // apiKeyHelper outranks an account's key; the other helpers are the user's
+  // own cloud / proxy / telemetry setup.
+  const key = overridingKey(parsed, ["apiKeyHelper"], isClaudeCredentialVar);
+  return key ? { file, key } : null;
 }
 

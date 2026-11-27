@@ -1,6 +1,7 @@
 /**
  * fake-mcp-stdio — a minimal stdio MCP server for McpHub tests. Newline JSON-RPC:
- * answers initialize / tools/list / tools/call. One tool `echo` returns its args.
+ * answers initialize / tools/list / tools/call. One tool `echo` returns its args;
+ * `where` (listed only with FAKE_MCP_WHERE=1) says which process answered, and in what directory.
  */
 export {}; // module scope — keeps top-level `buf`/`send` out of the global fixture namespace
 
@@ -12,6 +13,7 @@ function send(obj: unknown): void {
 const TOOLS = [
   { name: "echo", description: "Echo the arguments back as text.", inputSchema: { type: "object", properties: { msg: { type: "string" } } } },
   { name: "boom", description: "Always errors.", inputSchema: { type: "object", properties: {} } },
+  ...(process.env.FAKE_MCP_WHERE === "1" ? [{ name: "where", description: "This process's pid and working directory.", inputSchema: { type: "object", properties: {} } }] : []),
 ];
 
 let buf = "";
@@ -43,6 +45,8 @@ process.stdin.on("data", (chunk: Buffer) => {
         const args = (msg.params?.arguments ?? {}) as Record<string, unknown>;
         if (name === "echo") {
           send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: `echo:${JSON.stringify(args)}` }], isError: false } });
+        } else if (name === "where") {
+          send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: JSON.stringify({ pid: process.pid, cwd: process.cwd() }) }], isError: false } });
         } else if (name === "boom") {
           send({ jsonrpc: "2.0", id, result: { content: [{ type: "text", text: "kaboom" }], isError: true } });
         } else {

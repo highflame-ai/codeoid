@@ -8,14 +8,21 @@
  *   - ZeroID JWT verification on every connection
  */
 
+import { SANDBOX_MCP_PATH } from "./sandbox/request-directory.js";
+import { createSecretStore } from "./credentials/store.js";
+import type { SandboxRegistry } from "./sandbox/registry.js";
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { ZeroIdVerifier, type AuthConfig } from "./auth.js";
 import type { TokenVerifier } from "./verifier.js";
 import {
+  LOCAL_ACCOUNT_ID,
+  LOCAL_PROJECT_ID,
   LocalVerifier,
   removeLocalTokenFile,
   writeLocalTokenFile,
 } from "./local-auth.js";
+import { SecretService } from "./secrets/service.js";
 import { SessionManager } from "./session-manager.js";
 import { Store } from "./store.js";
 import { TranscriptStore } from "./transcript.js";
@@ -41,16 +48,19 @@ import { McpHub } from "./mcp/hub.js";
 import { MCP_OAUTH_CALLBACK_PATH, McpOAuth, mcpOAuthBindingCookieName } from "./mcp/oauth.js";
 import { redact } from "./auth/backend-login.js";
 import { importClaudeMcpServers } from "./mcp/import-claude.js";
+import { isLoopbackAddress, MCP_PROXY_PATH_PREFIX, McpProxy } from "./mcp/proxy.js";
 import {
   type CompressionRegistry,
   createRegistry,
 } from "./compress/index.js";
 import { createHookBus } from "./hooks/bus.js";
+import { stopOpencodeServers } from "./providers/opencode/server.js";
 import type { CodeoidConfig, McpControlConfig } from "../config.js";
 import { CAPABILITIES, PROTOCOL_VERSION, type AuthContext, type DaemonMessage } from "../protocol/types.js";
 import { parseAuthMsg, parseClientMessage } from "@highflame/codeoid-protocol/schemas";
 import type { AttachedClient } from "./session.js";
 import type { Frontend, FrontendContext } from "../frontends/types.js";
+import { loadShellParser } from "./shell/parse.js";
 import type { Server } from "node:http";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
@@ -189,10 +199,28 @@ export interface DaemonConfig {
    */
   fullConfig?: CodeoidConfig;
   /**
+   * The data-dir locks `codeoid start` took for this daemon (data-lock.ts),
+   * released on shutdown, after everything else. Absent for an embedder or a
+   * test, which takes none.
+   */
+  dataLock?: { release(): void; signalsHandled?(): void; onLost?(fn: (path: string) => void): void };
+  /**
    * Outward control-plane MCP endpoint (`/mcp/control`, docs/mcp-control.md).
    * Absent or `enabled: false` = not mounted (the path 404s).
    */
   mcpControl?: McpControlConfig;
+  /**
+   * The OS sandbox providers sessions run their commands in (#448).
+   * `codeoid start` passes the daemon's; absent (tests, embedders) =
+   * sessions aren't sandboxed and carry no `sandbox` in their info.
+   */
+  sandboxRegistry?: SandboxRegistry;
+  /**
+   * Where the keys for secret handling live (docs/secrets-and-memory-design.md
+   * §2): `codeoid start` passes the config dir, so what sessions store is
+   * scrubbed. Absent (tests, embedders): stored as it came.
+   */
+  secretsConfigDir?: string;
 }
 
 interface AuthenticatedSocket {
@@ -211,7 +239,12 @@ export class DaemonServer {
   #memoryMcp: MemoryMcpHttp | null = null;
   #mcpRegistry: McpRegistry | null = null;
   #mcpHub: McpHub | null = null;
+  /** Secret handling for what sessions store and what the hub hands back (docs/secrets-and-memory-design.md §2). */
+  #secretService?: SecretService;
+  #mcpProxy: McpProxy | null = null;
   #bunServer: ReturnType<typeof Bun.serve> | null = null;
+  /** Boot recovery done: until then every request is answered 503 (`start`). */
+  #ready = false;
   /** Capabilities advertised on auth.ok — SERVER_CAPABILITIES plus PUSH when a
    *  push transport is configured, so clients can feature-detect push support. */
   #advertisedCapabilities: string[];
@@ -273,6 +306,14 @@ export class DaemonServer {
       });
       this.#oauthHandler = new OAuthHandler(config.oauth, idp);
       console.log(`[codeoid] auth provider: ${idp.name}`);
+      if (!config.oauth.zeroidClientSecret) {
+        // ZeroID v1.12+ refuses an id_token exchange from an unauthenticated
+        // client. Warn rather than fail so codeoid still starts against an
+        // older ZeroID that does not require it.
+        console.warn(
+          `[codeoid] CODEOID_ZEROID_CLIENT_SECRET is not set: ZeroID v1.12+ will refuse Google sign-in (register a confidential client "${config.oauth.zeroidClientId}" at ZeroID and set its secret)`,
+        );
+      }
     } else if (config.oauth) {
       console.warn("[codeoid] local mode: Google OAuth sign-in disabled (it needs ZeroID)");
     }
@@ -322,6 +363,9 @@ export class DaemonServer {
           `${maxCreationsPerHour || "unlimited"}/hr per subject`,
       );
     }
+    if (config.secretsConfigDir) {
+      this.#secretService = new SecretService({ ...(config.fullConfig?.secrets ? { config: config.fullConfig.secrets } : {}), configDir: config.secretsConfigDir, store: this.#store });
+    }
     this.#manager = new SessionManager(
       this.#store, this.#transcriptStore, identityManager, rateLimiter,
       // Memory is wired post-construction via initMemory() — see start()
@@ -334,6 +378,8 @@ export class DaemonServer {
         // it is what distinguishes two daemons on one machine, and it survives
         // restarts so a daemon still recognises its own crashed run.
         daemonId: `${this.#config.host}:${this.#config.port}`,
+        ...(config.sandboxRegistry ? { sandboxRegistry: config.sandboxRegistry } : {}),
+        ...(this.#secretService ? { secretService: this.#secretService } : {}),
       },
     );
 
@@ -368,11 +414,30 @@ export class DaemonServer {
     // final audit/usage writes land in store + memory) BEFORE store/memory
     // close — hence store/memory are registered first (they close last) and
     // sessions is registered after them (drains first).
+    // LIFO: registered first, so it runs last — the data is let go once
+    // nothing of this daemon's writes to it any more.
+    const dataLock = config.dataLock;
+    if (dataLock) this.#shutdown.register("data-lock", () => dataLock.release());
+    // A lock removed or taken over under this daemon: it stops, rather than share the data with another.
+    dataLock?.onLost?.(() => {
+      // A shutdown already under way drains and exits on its own: cutting it short loses what it was flushing.
+      if (this.#shutdown.isShuttingDown) return;
+      this.#shutdown.shutdown("data-lock-lost").then(
+        () => process.exit(1),
+        () => process.exit(1),
+      );
+    });
     this.#shutdown.register("memory", async () => {
       if (this.#memory) await this.#memory.close();
     });
-    this.#shutdown.register("mcp", () => this.#mcpHub?.closeAll());
+    this.#shutdown.register("mcp", async () => {
+      await this.#mcpProxy?.closeAll();
+      this.#mcpHub?.closeAll();
+    });
     this.#shutdown.register("store", () => this.#store.close());
+    // The shared opencode server outlives any one session; it stops once
+    // they have drained (LIFO: registered before "sessions", runs after it).
+    this.#shutdown.register("opencode", () => stopOpencodeServers());
     this.#shutdown.register("sessions", () => this.#manager.drain(10_000));
     // LIFO: registered after sessions → stops BEFORE the drain, so the
     // dispatcher can't claim new work or inject events into draining sessions.
@@ -380,6 +445,7 @@ export class DaemonServer {
     // Registered after the dispatcher, so (LIFO) it stops scheduling before
     // the session drain interrupts any run in flight.
     this.#shutdown.register("routines", () => this.#manager.stopRoutines());
+    this.#shutdown.register("loops", () => this.#manager.stopLoops());
     this.#shutdown.register("websockets", () => {
       for (const { ws } of this.#sockets.values()) {
         ws.close(1001, "Server shutting down");
@@ -434,15 +500,13 @@ export class DaemonServer {
   async start(): Promise<void> {
     // Install signal handlers
     this.#shutdown.install();
+    // The daemon's handlers release the lock now (the `data-lock` step): the lock's interim ones step aside.
+    this.#config.dataLock?.signalsHandled?.();
 
-    // Publish the local-mode token for clients on this machine BEFORE the
-    // socket opens, so `codeoid tui` in another terminal can never observe a
-    // listening daemon without a readable token.
-    const localMode = this.#config.localMode;
-    if (localMode?.tokenFile) {
-      writeLocalTokenFile(localMode.tokenFile, localMode.token);
-      console.log(`[codeoid] local-mode token published to ${localMode.tokenFile} (0600)`);
-    }
+    // The approval gate judges shell commands as it decides (#431): load the
+    // parser before any session runs. A failure leaves every command
+    // `unknown` (asked about), never waved through.
+    await loadShellParser().catch((err) => console.error(`[codeoid] the shell parser failed to load; every shell command will ask: ${err instanceof Error ? err.message : String(err)}`));
 
     // Boot memory engine if configured — before resume so ingestion queue is ready.
     if (this.#config.memory) {
@@ -494,6 +558,34 @@ export class DaemonServer {
             );
           }
         }
+        // One-time: record the owning tenant of every persisted session's
+        // workspace, so cross-workspace search (scoped by tenant, #415) still
+        // reaches memory written before ownership was tracked. Runs after the
+        // re-key above so it registers the ids episodes now carry.
+        if (this.#memory.store.needsWorkspaceTenantBackfill()) {
+          try {
+            const started = Date.now();
+            const r = this.#memory.store.backfillWorkspaceTenants({
+              sessions: this.#store.listAllSessionsForMigration(),
+              workspaceIdFor: workspaceIdFromPath,
+              extraTenants: [{ accountId: LOCAL_ACCOUNT_ID, projectId: LOCAL_PROJECT_ID }],
+              probeRoots: [homedir()],
+            });
+            if (r.applied) {
+              const unowned =
+                r.unowned > 0
+                  ? `; ${r.unowned} workspace(s) from destroyed sessions have no provable owner and stay out of cross-workspace search`
+                  : "";
+              console.log(
+                `[codeoid] memory: recorded the owner of ${r.registered} workspace(s) in ${Date.now() - started}ms${unowned}`,
+              );
+            }
+          } catch (err) {
+            console.error(
+              `[codeoid] memory workspace-owner backfill failed (non-fatal; retried next boot): ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
       } catch (err) {
         console.error(
           `[codeoid] memory init failed, continuing without recall: ${err instanceof Error ? err.message : String(err)}`,
@@ -513,8 +605,10 @@ export class DaemonServer {
     const mcpServers = { ...imported, ...(this.#config.fullConfig?.mcpServers ?? {}) };
     const importedCount = Object.keys(imported).length;
     if (importedCount > 0) console.log(`[codeoid] mcp: imported ${importedCount} server(s) from ~/.claude.json`);
+    const explicit = new Set(Object.keys(this.#config.fullConfig?.mcpServers ?? {}));
     this.#mcpRegistry = new McpRegistry(mcpServers, {
       memoryEnabled: this.#memory != null,
+      imported: new Set(Object.keys(imported).filter((n) => !explicit.has(n))),
     });
     // OAuth for remote servers is codeoid's own — no Highflame dependency. The
     // redirect is the daemon's loopback unless an externally reachable base is
@@ -530,7 +624,38 @@ export class DaemonServer {
       toolTimeoutMs: this.#config.fullConfig?.session.mcpToolTimeoutMs,
       daemonEnv: process.env,
       credentials: mcpOAuth,
+      // Named credentials' values (workstreams G2): the hub and the relay
+      // read them per request, so no backend ever holds one.
+      secrets: createSecretStore(this.#config.fullConfig?.credentialStore),
     });
+    // The relay for backends that own their MCP clients (#396). Its URL is the
+    // loopback, whatever the daemon binds: the agent subprocess is local.
+    this.#mcpProxy = new McpProxy({
+      registry: this.#mcpRegistry,
+      credentials: mcpOAuth,
+      hub: this.#mcpHub,
+      baseUrl: () => `http://127.0.0.1:${this.#config.port}`,
+      env: process.env,
+      requestTimeoutMs: this.#config.fullConfig?.session.mcpToolTimeoutMs,
+    });
+    this.#mcpHub.proxy = this.#mcpProxy;
+    const secretService = this.#secretService;
+    if (secretService?.enabled && secretService.config.beforeModel) this.#mcpHub.setResultScrub((text) => secretService.scrub(text).text);
+    if (secretService) {
+      // The relay's per-session tokens are credentials too: matched while they live.
+      const live = new Set<string>();
+      this.#mcpProxy.tokenListener = {
+        minted: (t) => {
+          live.add(t);
+          secretService.known.invalidate();
+        },
+        revoked: (t) => {
+          live.delete(t);
+          secretService.known.invalidate();
+        },
+      };
+      secretService.addKnown("mcp-proxy", () => [...live].map((value) => ({ label: "daemon:mcp-relay-token", value })));
+    }
     for (const w of this.#mcpRegistry.warnings) console.warn(`[codeoid] ${w}`);
     // Goal blackboard: loopback URL regardless of bind address — the agent
     // subprocess runs on this host, and the endpoint must not become
@@ -538,28 +663,17 @@ export class DaemonServer {
     this.#manager.setBlackboardUrl(
       `http://127.0.0.1:${this.#config.port}${BLACKBOARD_MCP_PATH}`,
     );
+    // The sandbox's `request_directory` (sandbox/request-directory.ts): loopback too.
+    this.#manager.setSandboxMcpUrl(`http://127.0.0.1:${this.#config.port}${SANDBOX_MCP_PATH}`);
     this.#manager.setMcp(this.#mcpRegistry, this.#mcpHub, mcpOAuth);
     const mcpCount = this.#mcpRegistry.list().filter((s) => !s.builtin).length;
     if (mcpCount > 0) console.log(`[codeoid] mcp: ${mcpCount} external server(s) registered`);
 
-    // Resume sessions from transcripts
-    const resumed = await this.#manager.resumeSessions();
-    if (resumed > 0) {
-      console.log(`[codeoid] resumed ${resumed} session(s) from transcript`);
-    }
-
-    // Start the dispatch queue AFTER resume: the first tick reclaims tasks
-    // claimed by the previous boot, and surviving workers must already be
-    // back in the session map for continuation to find them.
-    this.#manager.startDispatcher();
-
-    // Re-drive any SDLC pipelines interrupted mid-run before the restart
-    // (no-op when the pipeline feature is disabled).
-    this.#manager.startPipelines();
-    // After resume: boot recovery closes runs a previous process left in flight.
-    this.#manager.startRoutines();
-
-    // Start Bun HTTP + WebSocket server
+    // Bind before anything that takes over a previous boot's state (resume,
+    // the dispatcher's reclaim, routine and pipeline recovery): those assume
+    // that boot is gone, and a start whose port another daemon holds would
+    // otherwise run them against that live daemon's database before failing
+    // here. Until recovery is done every request is answered 503.
     const self = this;
     const authConfig = this.#config.auth;
 
@@ -571,6 +685,9 @@ export class DaemonServer {
       idleTimeout: IDLE_TIMEOUT_SECONDS,
 
       async fetch(req, server) {
+        if (!self.#ready) {
+          return new Response("codeoid is starting", { status: 503, headers: { "Retry-After": "1" } });
+        }
         const url = new URL(req.url);
 
         // WebSocket upgrade
@@ -604,6 +721,26 @@ export class DaemonServer {
         // request 401s anyway.
         if (url.pathname === BLACKBOARD_MCP_PATH) {
           return self.#manager.blackboardMcp.handle(req);
+        }
+
+        // The sandbox's `request_directory` (sandbox/request-directory.ts): a session's token is its scope, and only
+        // the agents on this host (loopback peers, whatever the daemon binds) reach it.
+        if (url.pathname === SANDBOX_MCP_PATH) {
+          if (!isLoopbackAddress(server.requestIP(req)?.address)) return new Response("Forbidden", { status: 403 });
+          return self.#manager.sandboxMcp.handle(req);
+        }
+
+        // OAuth MCP relay (#396): Codex, the Gemini CLI and Qwen mount OAuth
+        // servers here with a per-session proxy token. Loopback peers only,
+        // whatever the daemon binds: the agents run on this host.
+        if (url.pathname.startsWith(MCP_PROXY_PATH_PREFIX)) {
+          const proxy = self.#mcpProxy;
+          if (!proxy) return new Response("not found", { status: 404 });
+          return proxy.handle(req, isLoopbackAddress(server.requestIP(req)?.address), {
+            // A relayed call may stay quiet as long as its tool runs (or a
+            // person answers the server): not the daemon's 10 s idle cut.
+            liftIdleTimeout: () => server.timeout(req, 0),
+          });
         }
 
         // Outward control plane (#251). Authorizes with the SAME verifier as
@@ -838,6 +975,7 @@ export class DaemonServer {
               // Registered backends, default first — feeds the new-session
               // provider picker (see AuthOkMsg.providers).
               providers: self.#manager.providerIds(),
+              providerInfo: self.#manager.providerInfo(),
               // Which issuer authenticated this connection. Clients render
               // "local" as a visible badge — degradation must never be silent.
               authMode: self.#verifier.mode,
@@ -949,6 +1087,35 @@ export class DaemonServer {
 
     console.log(`[codeoid] daemon listening on ${this.#config.host}:${this.#config.port}`);
 
+    // Publish the local-mode token for clients on this machine once the port
+    // is ours (a start that couldn't bind must not replace a running daemon's
+    // token), in the same tick as the bind: no request is answered before
+    // the token is readable.
+    const localMode = this.#config.localMode;
+    if (localMode?.tokenFile) {
+      writeLocalTokenFile(localMode.tokenFile, localMode.token);
+      console.log(`[codeoid] local-mode token published to ${localMode.tokenFile} (0600)`);
+    }
+
+    // Resume sessions from transcripts
+    const resumed = await this.#manager.resumeSessions();
+    if (resumed > 0) {
+      console.log(`[codeoid] resumed ${resumed} session(s) from transcript`);
+    }
+
+    // Start the dispatch queue AFTER resume: the first tick reclaims tasks
+    // claimed by the previous boot, and surviving workers must already be
+    // back in the session map for continuation to find them.
+    this.#manager.startDispatcher();
+    this.#manager.startLoops();
+
+    // Re-drive any SDLC pipelines interrupted mid-run before the restart
+    // (no-op when the pipeline feature is disabled).
+    this.#manager.startPipelines();
+    // After resume: boot recovery closes runs a previous process left in flight.
+    this.#manager.startRoutines();
+    this.#ready = true;
+
     // Start all registered frontends
     const ctx: FrontendContext = {
       manager: this.#manager,
@@ -972,6 +1139,23 @@ export class DaemonServer {
 
   async stop(): Promise<void> {
     await this.#shutdown.shutdown("manual");
+  }
+
+  /**
+   * After a {@link start} that failed (its port taken, say): close what start
+   * opened before it failed, memory above all, whose embedding worker torn
+   * down with native work pending crashes Bun (#453), and nothing else. Not
+   * {@link stop}: its steps remove this port's local-mode token, which on a
+   * taken port is the running daemon's.
+   */
+  async abortStart(): Promise<void> {
+    const memory = this.#memory;
+    this.#memory = null;
+    try {
+      await memory?.close();
+    } catch (err) {
+      console.error(`[codeoid] closing memory after a failed start failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /** Complete an MCP server sign-in from the provider's redirect, and tell

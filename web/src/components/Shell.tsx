@@ -23,6 +23,7 @@ import CenterPane from "./CenterPane";
 import FileViewer from "./files/FileViewer";
 import HelpModal from "./HelpModal";
 import IdentityDrawer from "./IdentityDrawer";
+import LoopsPanel from "./LoopsPanel";
 import NewSessionModal from "./NewSessionModal";
 import PackBrowser from "./PackBrowser";
 import PipelineRunner from "./PipelineRunner";
@@ -73,6 +74,7 @@ const Shell: Component = () => {
       <SettingsDrawer />
       <PackBrowser />
       <PipelineRunner />
+      <LoopsPanel />
       <HelpModal />
     </>
   );

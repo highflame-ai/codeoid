@@ -11,7 +11,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { CodeoidConfig } from "../config.js";
@@ -304,6 +304,129 @@ describe("ClaudeProvider.continueNatively", () => {
     expect(existsSync(dir) ? require("node:fs").readdirSync(dir) : []).toEqual([]);
     expect(p.backingSessionId).toBe("fresh-backing");
     expect(p.hasQueried).toBe(false);
+  });
+
+  // ── A fork's copy of its parent's cloud agents (fork-isolation.ts, round 3 H-1) ──
+
+  /**
+   * A forkSession that, beside the JSONL, copies the parent's cloud agent
+   * registrations (`<project>/<session>/remote-agents/`) — what the CLI
+   * restores and polls on resume. The SDK doesn't copy them today; this is
+   * the copy the fork must never resume with.
+   */
+  /** What forkSession mints: a session id (the clear refuses anything else). */
+  const FORKED = "1f0c2a4e-7b3d-4c5e-9a8b-0d1e2f3a4b5c";
+  const PARENT = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d";
+  const copyingSdk = (projectCwd: string, opts: { forkedId?: string; after?: (project: string) => void } = {}) => {
+    const project = join(configDir, "projects", claudeProjectDirName(projectCwd));
+    const registration = (taskId: string, spawnedAt: number) => JSON.stringify({ taskId, remoteTaskType: "remote-agent", sessionId: `cse_${taskId}`, title: "review", command: "review --fix", spawnedAt });
+    const sidecar = (id: string) => join(project, id, "remote-agents");
+    const forkedId = opts.forkedId ?? FORKED;
+    mkdirSync(sidecar(PARENT), { recursive: true });
+    writeFileSync(join(project, `${PARENT}.jsonl`), "{}\n");
+    writeFileSync(join(sidecar(PARENT), "remote-agent-rparent1.meta.json"), registration("rparent1", Date.parse("2026-10-27T09:00:00.000Z")));
+    return {
+      project,
+      sidecar,
+      sdk: sdk({
+        forkSession: async () => {
+          if (forkedId !== PARENT) {
+            writeFileSync(join(project, `${forkedId}.jsonl`), "{}\n");
+            mkdirSync(sidecar(forkedId), { recursive: true });
+            for (const name of readdirSync(sidecar(PARENT))) writeFileSync(join(sidecar(forkedId), name), readFileSync(join(sidecar(PARENT), name)));
+            // One the fork itself launched, after its boundary (a rewind inside the fork re-forks it).
+            writeFileSync(join(sidecar(forkedId), "remote-agent-rforkown.meta.json"), registration("rforkown", Date.parse("2026-10-27T11:00:00.000Z")));
+            writeFileSync(join(sidecar(forkedId), "remote-agent-rbroken.meta.json"), "{not json");
+          }
+          opts.after?.(project);
+          return { sessionId: forkedId };
+        },
+        getSessionMessages: async (id, o) => {
+          if (!o?.dir) return [{ uuid: `read-${id}` }];
+          const file = join(configDir, "projects", claudeProjectDirName(o.dir), `${id}.jsonl`);
+          return readFileSync(file, "utf8").trim().split("\n").map((l) => JSON.parse(l) as { uuid: string });
+        },
+      }),
+    };
+  };
+  const forkProvider = (nativeSdk: ClaudeNativeSdk) =>
+    new ClaudeProvider({
+      sessionId: "sess", initialBackingId: "fresh-backing", workspaceId: "ws", store: {} as never, nativeSdk,
+      forkBoundary: () => "2026-10-27T10:00:00.000Z",
+      isForeignTask: (id) => id === "rparent1",
+    });
+
+  it("a fork's native copy is cleared of the parent's cloud agents before it is resumed; the parent's session is untouched", async () => {
+    const { sdk: s, sidecar } = copyingSdk("/src/repo");
+    const p = forkProvider(s);
+    const r = await p.continueNatively({ history, forkFrom: { backingId: PARENT, ref: "uuid-9", dir: "/src/repo" }, maxChars: 1e6, workdir: "/w" });
+    expect(r).toEqual({ via: "fork", backingId: FORKED });
+    // The parent's (and an unreadable one) gone; the fork's own, spawned after its boundary, kept.
+    expect(readdirSync(sidecar(FORKED))).toEqual(["remote-agent-rforkown.meta.json"]);
+    expect(readdirSync(sidecar(PARENT))).toEqual(["remote-agent-rparent1.meta.json"]);
+  });
+
+  it("a session that isn't a fork keeps its own cloud agents across a rewind's native copy", async () => {
+    const { sdk: s, sidecar } = copyingSdk("/src/repo");
+    const p = provider(s);
+    await p.continueNatively({ history, forkFrom: { backingId: PARENT, ref: "uuid-9", dir: "/src/repo" }, maxChars: 1e6, workdir: "/w" });
+    expect(readdirSync(sidecar(FORKED)).length).toBe(3);
+  });
+
+  // ── Round 4 (L4-5, I4-2): the clear never reaches past the fork's own files ──
+
+  /** A native fork the clear refused: built from history instead, and the abandoned copy (`forkedId`'s) removed. */
+  const expectRefused = async (s: ClaudeNativeSdk, project: string, forkedId?: string) => {
+    const r = await forkProvider(s).continueNatively({ history, forkFrom: { backingId: PARENT, ref: "uuid-9", dir: "/src/repo" }, maxChars: 1e6, workdir: join(configDir, "w") });
+    expect(r?.via).toBe("history");
+    if (forkedId) expect(existsSync(join(project, `${forkedId}.jsonl`))).toBe(false);
+    // The parent's session and registrations are untouched.
+    expect(existsSync(join(project, `${PARENT}.jsonl`))).toBe(true);
+    expect(readdirSync(join(project, PARENT, "remote-agents"))).toEqual(["remote-agent-rparent1.meta.json"]);
+  };
+
+  it("refuses a sidecar that is a symlink, leaving what it points at alone", async () => {
+    const elsewhere = join(configDir, "elsewhere");
+    const { sdk: s, project } = copyingSdk("/src/repo", {
+      after: (proj) => {
+        mkdirSync(elsewhere);
+        writeFileSync(join(elsewhere, "remote-agent-rvictim.meta.json"), "{}");
+        rmSync(join(proj, FORKED, "remote-agents"), { recursive: true });
+        symlinkSync(elsewhere, join(proj, FORKED, "remote-agents"));
+      },
+    });
+    await expectRefused(s, project, FORKED);
+    expect(readdirSync(elsewhere)).toEqual(["remote-agent-rvictim.meta.json"]);
+  });
+
+  it("refuses a session dir that is a symlink: here, to the parent's own", async () => {
+    const { sdk: s, project } = copyingSdk("/src/repo", {
+      after: (proj) => {
+        rmSync(join(proj, FORKED), { recursive: true });
+        symlinkSync(join(proj, PARENT), join(proj, FORKED));
+      },
+    });
+    await expectRefused(s, project, FORKED);
+  });
+
+  it("only a missing dir is empty: one it can't read refuses the fork", async () => {
+    const { sdk: s, project } = copyingSdk("/src/repo", {
+      after: (proj) => {
+        rmSync(join(proj, FORKED, "remote-agents"), { recursive: true });
+        writeFileSync(join(proj, FORKED, "remote-agents"), "not a dir");
+      },
+    });
+    await expectRefused(s, project, FORKED);
+  });
+
+  it("refuses a forked id that isn't a session id, or is the source's own, and removes nothing by it", async () => {
+    const odd = copyingSdk("/src/repo", { forkedId: "../forked" });
+    await expectRefused(odd.sdk, odd.project);
+    // Named by that id, outside any session: left alone.
+    expect(existsSync(join(odd.project, "../forked.jsonl"))).toBe(true);
+    rmSync(join(configDir, "projects"), { recursive: true, force: true });
+    const same = copyingSdk("/src/repo", { forkedId: PARENT });
+    await expectRefused(same.sdk, same.project);
   });
 });
 

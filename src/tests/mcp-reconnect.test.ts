@@ -15,7 +15,8 @@ import type { BackendMcpServerState, ProviderEvent } from "../daemon/providers/i
 import { MockSessionProvider } from "../daemon/providers/mock/session-provider.js";
 import { ProviderRegistry } from "../daemon/providers/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
-import { MCP_TIMINGS, cleanMcpError } from "../daemon/session.js";
+import { cleanMcpError } from "../daemon/mcp/redact.js";
+import { MCP_TIMINGS } from "../daemon/session.js";
 import { McpHub } from "../daemon/mcp/hub.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { Store } from "../daemon/store.js";
@@ -203,6 +204,28 @@ describe("session.mcp_reconnect", () => {
     const id = await sessionAfterFirstTurn(m);
     const r = (await reconnect(m, id)) as { data: McpReconnectResult };
     expect(r.data.error).toContain("--url=https://slack.example.com/mcp");
+  });
+
+  it("the hint's URL carries no credential (#394)", async () => {
+    writeFileSync(join(tmp, "work", ".mcp.json"), JSON.stringify({ mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp?token=hunter2" } } }));
+    answer = () => ({ status: "needs-auth", tools: [] });
+    const m = manager();
+    m.setMcp(new McpRegistry({}, { memoryEnabled: false }), new McpHub({}));
+    const id = await sessionAfterFirstTurn(m);
+    const r = (await reconnect(m, id)) as { data: McpReconnectResult };
+    expect(r.data.error).toContain("https://slack.example.com/mcp?…");
+    expect(r.data.error).not.toContain("hunter2");
+  });
+
+  it("asks for the full URL when another entry reads the same once hidden", async () => {
+    writeFileSync(join(tmp, "home", ".claude.json"), JSON.stringify({ projects: { [join(tmp, "work")]: { mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp?k=one" } } } } }));
+    writeFileSync(join(tmp, "work", ".mcp.json"), JSON.stringify({ mcpServers: { slack: { type: "http", url: "https://slack.example.com/mcp?k=two" } } }));
+    answer = () => ({ status: "needs-auth", tools: [] });
+    const m = manager();
+    m.setMcp(new McpRegistry({}, { memoryEnabled: false }), new McpHub({}));
+    const id = await sessionAfterFirstTurn(m);
+    const r = (await reconnect(m, id)) as { data: McpReconnectResult };
+    expect(r.data.error).toContain("--url <the full URL from");
   });
 
   it("someone who couldn't adopt isn't pointed at adopting", async () => {

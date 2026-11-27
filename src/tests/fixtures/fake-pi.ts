@@ -24,7 +24,11 @@
 
 const sessionId = `fake-${process.pid}`;
 const sessionFile = `/tmp/fake-pi-${process.pid}.jsonl`;
+/** pi's thinking level (#417): "medium" at start, as pi's own default. */
+let thinkingLevel = "medium";
 let turns = 0;
+/** What pi charged so far: a prompt with "no-cost" runs on a model pi has no price for (#430). */
+let costTotal = 0;
 
 const pendingUi = new Map<string, (resp: Record<string, unknown>) => void>();
 let uiSeq = 0;
@@ -58,6 +62,7 @@ if (process.env.FAKE_PI_NO_BRIDGE !== "1") {
 
 async function runPrompt(message: string): Promise<void> {
   turns += 1;
+  if (!message.includes("no-cost")) costTotal += 0.01;
   emit({ type: "agent_start" });
 
   if (message.includes("use-tool")) {
@@ -147,6 +152,49 @@ async function runPrompt(message: string): Promise<void> {
       result: { content: [{ type: "text", text: "wrote file" }] },
       isError: false,
     });
+  } else if (message.startsWith("read-file:")) {
+    // What this process can read at a path (the OS sandbox tests, #448).
+    let text: string;
+    try {
+      text = `CONTENT:${(await Bun.file(message.slice("read-file:".length).trim()).text()).trim()}`;
+    } catch (err) {
+      text = `UNREADABLE:${err instanceof Error ? err.message : String(err)}`;
+    }
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } });
+  } else if (message.startsWith("write-file:")) {
+    // Whether this process can write a path (`write-file:<path>`; the OS sandbox tests, #448 round 1).
+    let text: string;
+    try {
+      await Bun.write(message.slice("write-file:".length).trim(), "WRITTEN-BY-BACKEND\n");
+      text = "WROTE";
+    } catch (err) {
+      text = `UNWRITABLE:${err instanceof Error ? err.message : String(err)}`;
+    }
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } });
+  } else if (message.startsWith("refresh-login:")) {
+    // A token refresh that rotates the refresh token, saved as real CLIs do (#448 round 2):
+    // `refresh-login:<path>` writes in place; `refresh-login:<path>|rename` writes a temp file and renames it over.
+    const [path = "", how] = message.slice("refresh-login:".length).trim().split("|");
+    const rotated = `${JSON.stringify({ anthropic: { type: "oauth", access: "NEW-ACCESS", refresh: "ROTATED-REFRESH", expires: 1 } })}\n`;
+    let text: string;
+    try {
+      if (how === "rename") {
+        await Bun.write(`${path}.tmp`, rotated);
+        require("node:fs").renameSync(`${path}.tmp`, path);
+      } else {
+        await Bun.write(path, rotated);
+      }
+      text = "REFRESHED";
+    } catch (err) {
+      text = `UNSAVED:${err instanceof Error ? err.message : String(err)}`;
+    }
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } });
+  } else if (message.includes("echo-env:")) {
+    // One variable of this process's environment (`echo-env:<NAME>`).
+    const text = `ENV:${process.env[message.slice(message.indexOf("echo-env:") + "echo-env:".length).trim()] ?? ""}`;
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }], stopReason: "stop" } });
+  } else if (message.includes("echo-thinking")) {
+    emit({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: `thinking:${thinkingLevel}` }], stopReason: "stop" } });
   } else if (message.includes("echo-prompt")) {
     // Reflect the FULL received prompt back — lets tests prove what
     // actually reached pi (e.g. the prepended history seed).
@@ -216,7 +264,7 @@ function handle(cmd: Record<string, unknown>): void {
           sessionId,
           sessionFile,
           isStreaming: false,
-          thinkingLevel: "off",
+          thinkingLevel,
           messageCount: turns,
         },
       });
@@ -227,7 +275,7 @@ function handle(cmd: Record<string, unknown>): void {
           sessionFile,
           sessionId,
           tokens: { input: turns * 100, output: turns * 40, cacheRead: turns * 10, cacheWrite: 0, total: turns * 150 },
-          cost: turns * 0.01,
+          cost: costTotal,
           // Real pi (0.80.6) reports its current model's window here; the
           // fixture omitted it, so nothing exercised that path.
           contextUsage: { tokens: turns * 150, contextWindow: 1_048_576, percent: 0 },
@@ -238,8 +286,8 @@ function handle(cmd: Record<string, unknown>): void {
       respond(cmd.id, "get_available_models", {
         data: {
           models: [
-            { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5", contextWindow: 200_000 },
-            { id: "gpt-5", provider: "openai", name: "GPT-5", contextWindow: 400_000 },
+            { id: "claude-sonnet-4-5", provider: "anthropic", name: "Claude Sonnet 4.5", contextWindow: 200_000, reasoning: true },
+            { id: "gpt-5", provider: "openai", name: "GPT-5", contextWindow: 400_000, reasoning: true, thinkingLevelMap: { minimal: null, xhigh: "xhigh" } },
           ],
         },
       });
@@ -255,10 +303,30 @@ function handle(cmd: Record<string, unknown>): void {
       });
       return;
     case "set_model":
+      // pi re-applies its own level on a model change (clamped, or its default).
+      thinkingLevel = "medium";
       respond(cmd.id, "set_model", { data: {} });
       return;
+    case "set_thinking_level": {
+      thinkingLevel = String(cmd.level);
+      // As real pi does: the level is saved as the global default, in place, in its agent dir's settings.json.
+      const dir = process.env.PI_CODING_AGENT_DIR;
+      if (dir) {
+        const file = `${dir}/settings.json`;
+        let settings: Record<string, unknown> = {};
+        try {
+          settings = JSON.parse(require("node:fs").readFileSync(file, "utf8"));
+        } catch {}
+        require("node:fs").writeFileSync(file, JSON.stringify({ ...settings, defaultThinkingLevel: thinkingLevel }));
+      }
+      respond(cmd.id, "set_thinking_level");
+      return;
+    }
     case "switch_session":
     case "new_session":
+      // As real pi: a new session file, whose stats count from zero (#430).
+      turns = 0;
+      costTotal = 0;
       respond(cmd.id, String(cmd.type), { data: { cancelled: false } });
       return;
     case "abort":

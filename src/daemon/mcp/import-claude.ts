@@ -3,10 +3,10 @@
  * codeoid registry so servers a user already configured for Claude become
  * available on EVERY backend (S5 of docs/provider-mcp-registry-design.md).
  *
- * Scope: only the top-level (global) `mcpServers` block is imported — it's
- * daemon-wide, matching the registry's shape. Per-project servers
- * (`projects[workdir].mcpServers`) stay claude-only for now: they're
- * workdir-scoped and don't fit a daemon-wide registry (documented limitation).
+ * Scope: the user's global servers only — daemon-wide, matching the
+ * registry's shape. A workdir's servers (`projects[workdir].mcpServers`, a
+ * `.mcp.json`, project settings) reach a session through its own view
+ * instead (mcp/session-view.ts, #395).
  *
  * Config `mcpServers` WINS on a name collision (an explicit codeoid entry
  * overrides an imported one). Imported servers default to `trust: prompt` — a
@@ -14,13 +14,19 @@
  */
 
 import { readFileSync } from "node:fs";
-import { homedir } from "node:os";
+import os from "node:os";
 import { join } from "node:path";
 import type { RawMcpServerConfig } from "../../config.js";
 
-/** Best-effort read of the global `mcpServers` from `~/.claude.json`, mapped to
- *  registry `RawMcpServerConfig`s. Never throws — a missing/malformed file, or
- *  an entry that is neither stdio nor http, is simply skipped. */
+/** HOME first: `os.homedir()` caches at process start (claude-config.ts). */
+function homedir(): string {
+  return process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
+}
+
+/** Best-effort read of the user's global MCP servers — `~/.claude.json`'s
+ *  top-level `mcpServers` (Claude Code takes none from its settings files) —
+ *  mapped to registry `RawMcpServerConfig`s. Never throws: a missing or
+ *  malformed file, or an entry that is neither stdio nor http, is skipped. */
 export function importClaudeMcpServers(
   home: string = homedir(),
 ): Record<string, RawMcpServerConfig> {
@@ -33,9 +39,9 @@ export function importClaudeMcpServers(
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
   const raw = (parsed as Record<string, unknown>).mcpServers;
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return {};
-
   const out: Record<string, RawMcpServerConfig> = {};
   for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+    if (name.startsWith("_")) continue;
     const spec = mapEntry(value);
     if (spec) out[name] = spec;
   }
@@ -44,7 +50,7 @@ export function importClaudeMcpServers(
 
 /** Map one `~/.claude.json` server entry (stdio `{command,args,env}` or http
  *  `{url,headers}`) to a registry `RawMcpServerConfig` with codeoid defaults. */
-function mapEntry(value: unknown): RawMcpServerConfig | null {
+export function mapEntry(value: unknown): RawMcpServerConfig | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
   const v = value as Record<string, unknown>;
   const base = {

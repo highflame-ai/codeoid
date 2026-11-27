@@ -37,7 +37,7 @@ one-way door, and how clients discover the token.
 | `session:approve` | Approve / deny tool requests; also required for `/mode`, `/pin`, `/unpin` |
 | `session:read` | Read-only fleet visibility (conductor): list / find / summarize sessions |
 | `session:dispatch` | Send-class fleet routing (conductor): direct / interrupt / spawn on the owner's behalf |
-| `fs:read` | Read files + list directories under a session's workdir |
+| `fs:read` | Read files + list directories under a session's workdir. With `session:create` too, browse folder names anywhere under `CODEOID_FS_BROWSE_ROOT` (default: the whole host, never credential stores) to pick a workdir |
 | `settings:read` | Read the settings manifest + current (non-secret) configuration |
 | `settings:write` | Write daemon configuration (`config.json` + `.env`), including secrets |
 
@@ -87,9 +87,16 @@ CODEOID_RESUME_MAX_SESSIONS=200          # sessions restored from disk at startu
                                         #   Resume is also time-boxed, so raising this costs
                                         #   startup time; the remainder stays on disk and loads
                                         #   on a later restart.
+CODEOID_SESSION_LAZY_LOAD=true          # a resumed session loads its scrollback and history the
+                                        #   first time it is used (opened, sent to, forked, …),
+                                        #   not at start; false loads every session's at start
+CODEOID_IDLE_RELEASE_MINUTES=30         # minutes idle before a session's backend process and
+                                        #   everything it started (MCP servers, commands still
+                                        #   running) are stopped; the next message resumes it
+                                        #   and re-reads project MCP/hook files (#451). 0 = keep.
 CODEOID_DEFAULT_PROVIDER=claude         # backend for sessions created without --provider
-                                        #   (claude | codex | pi | qwen | gemini-cli | openai | gemini |
-                                        #    llamacpp — see docs/local-models.md).
+                                        #   (claude | codex | pi | qwen | gemini-cli | opencode | openai |
+                                        #    gemini | llamacpp — see docs/local-models.md, docs/opencode.md).
                                         #   An unknown, disabled or uninstalled backend stops the
                                         #   daemon at startup. Resumed sessions and the conductor
                                         #   keep their own backend.
@@ -101,6 +108,16 @@ CODEOID_MCP_CONTROL_ACTIONS=false       # also allow create / send / interrupt /
 # Routines (scheduled and triggered agent runs) — see docs/routines.md. On by default.
 CODEOID_ROUTINES_ENABLED=true           # run the scheduler and accept routine commands
 CODEOID_ROUTINES_MAX_CONCURRENT=2       # routine runs executing at once, across all routines
+
+# OS sandbox for agents' commands — see docs/sandbox.md. On by default.
+CODEOID_SANDBOX=auto                    # auto | bwrap | seatbelt | docker | off
+CODEOID_SANDBOX_NETWORK=on              # on | off | allowlist
+CODEOID_SANDBOX_ALLOWED_HOSTS=          # with allowlist: github.com,*.npmjs.org
+CODEOID_SANDBOX_HIDDEN_PATHS=           # more paths to hide: ~/work/.env
+CODEOID_SANDBOX_HOME_READABLE=          # replaces the home allowlist: ~/.bun,~/.cargo/bin,~/.gitconfig
+CODEOID_SANDBOX_DOCKER_IMAGE=node:22-bookworm-slim
+CODEOID_SANDBOX_DOCKER_SOCKET=false     # Docker access: commands reach the container runtime (root-equivalent)
+CODEOID_SANDBOX_WORKTREE_ROOTS=         # more worktree locations: ~/wt,../shared-worktrees (each repo gets <root>/<repo>/, each session a folder there)
 
 # Forks, backend switches and rewinds (docs/FEATURES.md#how-a-fork-switch-or-rewind-carries-the-conversation)
 CODEOID_NATIVE_CONTINUATION=true        # hand Claude/Codex the conversation in their own form; false = text transcript
@@ -146,6 +163,13 @@ ANTHROPIC_API_KEY=sk-ant-...            # if set, clusters get LLM-quality label
 GOOGLE_CLIENT_ID=...                    # Google IdP client id
 GOOGLE_CLIENT_SECRET=...                # Google IdP client secret
 CODEOID_OAUTH_CLIENT_ID=codeoid          # optional: OAuth client id (default "codeoid")
+# The Google ID token is exchanged at ZeroID for a ZeroID token. ZeroID v1.12+
+# only accepts that exchange from an authenticated client the ID token was
+# issued to, so register a confidential client at ZeroID whose client_id is
+# GOOGLE_CLIENT_ID (token_endpoint_auth_method client_secret_post, with the
+# Google issuer configured for that audience) and set its secret here.
+CODEOID_ZEROID_CLIENT_ID=...             # optional: defaults to GOOGLE_CLIENT_ID
+CODEOID_ZEROID_CLIENT_SECRET=...         # env only; required by ZeroID v1.12+
 
 # Telegram frontend
 TELEGRAM_BOT_TOKEN=...
@@ -154,7 +178,8 @@ TELEGRAM_ALLOWED_USER_IDS=123,456
 
 ### Config file
 
-Optional `~/.codeoid/config.json` (env vars take precedence):
+Optional `~/.codeoid/config.json` (env vars take precedence).
+How shell commands are approved by risk (`approvals.*`) is in [approvals.md](approvals.md).
 
 ```json
 {
@@ -176,6 +201,109 @@ Optional `~/.codeoid/config.json` (env vars take precedence):
 }
 ```
 
+### Claude Code CLI
+
+The Claude backend runs the Claude Code CLI bundled with the Agent SDK. codeoid pins that version, and its sandbox is tested against it (a CLI update once changed what Claude's own sandbox lets a command write, unannounced: #478). To run another, such as your system install for a model the bundled CLI doesn't support yet, set `providers.claude.command`:
+
+```json
+{ "providers": { "claude": { "command": "claude" } } }
+```
+
+- A name on the daemon's PATH (`claude`) or an absolute path. Unset: the bundled CLI.
+- It is used only when its `--version` is no older than the bundled CLI's. Otherwise, or when it isn't found or reports no version, sessions run the bundled CLI and say why.
+- A newer one runs, and each session says once that codeoid's sandbox behaviour on it is untested.
+- Read when the daemon starts: change it, then restart the daemon.
+- Only your own token can change it, or any backend's `command` (`providers.*.command`): a delegated token is refused, and every change is audited old → new (`settings.set.backend_command`). It runs as you.
+- Also in the web UI (Settings → Claude → Claude Code CLI, under advanced), and from a terminal: `codeoid settings set providers.claude.command claude` (`codeoid settings unset providers.claude.command` to go back).
+
+### Changing settings from a terminal
+
+`codeoid settings` reads and writes the same settings as the web UI's settings drawer, checked and applied the same way:
+
+```bash
+codeoid settings ls [filter] [--advanced]   # every setting, its value and where it comes from
+codeoid settings get <key>                  # one setting, and what it does
+codeoid settings set <key> <value>          # a secret is prompted for (or read from stdin), never taken from the command line
+codeoid settings unset <key>                # back to the default
+```
+
+### opencode
+
+The opencode backend (opencode 2.2.5 or a later 2.2.x) is on by default when an `opencode` binary resolves. codeoid runs one private `opencode serve` per daemon, with its own database; docs/opencode.md has setup, credentials, and what it supports.
+
+```json
+{
+  "providers": {
+    "opencode": {
+      "enabled": true,
+      "command": "opencode",
+      "dbPath": "opencode/opencode.db",
+      "dataDir": "opencode",
+      "agent": "build",
+      "model": "qwen/qwen3.8-max",
+      "hostedModels": false
+    }
+  }
+}
+```
+
+- `dbPath` — opencode's database for codeoid's sessions. Default: an `opencode` folder beside codeoid's own database (`dbPath` / `CODEOID_DB_PATH`); a relative path resolves from codeoid's config dir. It is never your own opencode's database.
+- `dataDir` — opencode's logs, shell output, state, caches and temp files (its XDG data, state and cache dirs, as `data/`, `state/`, `cache/` under it, and its `TMPDIR`, as `tmp/`). Default: an `opencode` folder beside codeoid's transcript dir (`transcriptDir` / `CODEOID_TRANSCRIPT_DIR`); a relative path resolves from codeoid's config dir. Nothing goes to your own `~/.local/share/opencode` or `~/.cache/opencode`, nor to a shared `/tmp/opencode`.
+- `agent` — the opencode agent sessions run (`build`, `plan`, or your own); omit for opencode's default.
+- `model` — the default model, `provider/model`, for sessions that don't pick one; omit for opencode's default among the models it has a credential for (with none, a turn fails, saying what to set). Refused with `{`, `}`, quotes, backslashes or spaces in it (opencode would expand a `{file:…}` there).
+- `hostedModels` (`CODEOID_OPENCODE_HOSTED_MODELS`) — offer opencode's own hosted models (provider `opencode`: opencode.ai / Zen, its free no-key models included) and let opencode fetch its model catalog from opencode.ai. Default `false`: they aren't offered, listed or picked as a default, your opencode config can't enable them, and a session's code only goes to providers codeoid or your opencode config gave a credential for (docs/opencode.md, *opencode's hosted models*).
+- Credentials are codeoid's own: its `ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and `GOOGLE_API_KEY` (or `GEMINI_API_KEY`), each sent to the gateway its `*_BASE_URL` names when one does, its Qwen backend on an API key or its default account (`providers.qwen`, as provider `qwen`), and its OpenAI-compatible endpoints (as `oai-<name>`). codeoid writes each to a file only it can read and names the file in opencode's config; the files are removed when the server stops, and a daemon that's gone has its files removed when another starts (each daemon keeps its own). The opencode server's environment carries no key, nor a proxy URL with credentials in it. Sign-ins stored in codeoid's opencode database (`OPENCODE_DB=<that path> opencode auth login`) work too. `codeoid account` doesn't apply to it.
+- Every setting here is read when the daemon starts; change one, then restart the daemon (the settings UI says so).
+
+### OS sandbox
+
+Agents' commands run in an OS sandbox, on by default ([sandbox.md](sandbox.md)): the workspace and a private temp dir writable, the project roots (by default the parent of the session's repository) readable, everything else read-only, your home hidden whole but for a read-only allowlist, credential stores hidden, container sockets unreachable.
+
+```json
+{
+  "sandbox": {
+    "provider": "auto",
+    "network": "on",
+    "allowedHosts": [],
+    "hiddenPaths": ["~/work/.env"],
+    "homeReadable": ["~/.bun", "~/.cargo/bin", "~/.gitconfig", "~/.volta"],
+    "projectRoots": ["@parent", "~/src/shared"],
+    "bwrapPath": "/usr/bin/bwrap",
+    "docker": { "image": "node:22-bookworm-slim", "runtime": "runsc" }
+  }
+}
+```
+
+- `provider` (`CODEOID_SANDBOX`) — `auto` (bubblewrap on Linux, Seatbelt on macOS), `bwrap`, `seatbelt`, `docker`, or `off`. The default for new sessions; each session can choose its own (`codeoid new --sandbox …`, the new-session dialog, `/sandbox`), and turning one off is asked of its owner.
+- `network` (`CODEOID_SANDBOX_NETWORK`) — `on`, `off` or `allowlist`; `allowedHosts` (`CODEOID_SANDBOX_ALLOWED_HOSTS`) for the allowlist. Only Claude's own sandbox enforces an allowlist; elsewhere it means no network, and the session says so. With `off` or `allowlist`, local services' unix sockets that let a connection in by who you are (Postgres, MySQL/MariaDB, Redis, …) are hidden too ([sandbox.md](sandbox.md#what-is-protected)).
+- `hiddenPaths` (`CODEOID_SANDBOX_HIDDEN_PATHS`) — more paths to hide, on top of codeoid's data, the agent CLIs' logins and the usual credential stores (`~` expands). An entry here also beats `homeReadable`.
+- `homeReadable` (`CODEOID_SANDBOX_HOME_READABLE`, comma separated) — what of your home a sandboxed command may read (read-only); the rest of the home isn't there. Default: toolchains and tool settings that hold no secret (`~/.bun`, `~/.cargo/bin`, `~/.cargo/registry`, `~/.cargo/git`, `~/.rustup`, `~/.nvm`, `~/.npm`, `~/.local/bin`, `~/.local/lib`, `~/.local/share/{pnpm,uv,pipx,mise}`, `~/.local/share/claude/versions`, `~/.pyenv`, `~/go/pkg`, `~/go/bin`, `~/.gitconfig`, `~/.config/git/{config,ignore,attributes}`); a link in one of these works only where it leads into the list (or outside the home): what it leads to elsewhere in the home stays hidden. Setting it replaces the list: never add a file holding a token (`~/.npmrc`).
+- Every `sandbox.*` change through `settings.set` needs an undelegated token, and is audited old → new.
+- `bwrapPath` — the bubblewrap binary (default: on `PATH`). Claude Code's own sandbox on Linux also needs `socat`.
+- `docker.image` (`CODEOID_SANDBOX_DOCKER_IMAGE`) and `docker.runtime` — what a Docker sandbox runs, and `runsc` for gVisor.
+- `docker.socket` (`CODEOID_SANDBOX_DOCKER_SOCKET`, default `false`) — Docker access: sandboxed commands can reach the host's container runtime socket (Docker, rootless Docker, Podman; Docker Desktop on macOS), with `DOCKER_HOST` set, for tests that start containers. Root-equivalent (a container can mount `/`), so every session with it says "sandboxed, Docker access"; a session turns it on for itself with `--docker-socket` / `/sandbox … docker`, asked of its owner ([sandbox.md](sandbox.md#docker-access)).
+- `worktreeRoots` (`CODEOID_SANDBOX_WORKTREE_ROOTS`, comma separated) — more places a sandboxed session may check a git worktree of its repository out, on top of `<repo>-worktrees/` (`~` expands; a relative path is the repository's main checkout's, at most one level up, judged again where it leads: `../.config` of a repository in your home is refused; never inside the checkout). A root may be shared: each repository gets `<root>/<repo>/`, and a sandboxed session writes only its own folder there. A root that doesn't exist is used once you create it (codeoid makes one only beside the repository). The config fails to load on `/`, the home or a dir holding it, anything in a hidden dir of the home (`~/.config`, `~/.local`, …), `~/Library`, codeoid's config dir or a system dir ([sandbox.md](sandbox.md#git-worktrees-inside-the-sandbox)).
+- `projectRoots` (`CODEOID_SANDBOX_PROJECT_ROOTS`, comma separated; Settings > Sandbox > "Project roots (readable)") — where sandboxed commands may read other repositories, read-only: absolute dirs (`~` expands) and `@parent`, the parent of the session's repository (the default: a session in `~/Workspace/codeoid` reads `~/Workspace/*`). `[]` is none. What the sandbox hides stays hidden inside, and so do the credential files anywhere there (`.env*`, `*.pem`, `*.key`, private keys, `.npmrc`, kubeconfigs, Terraform state, a `.git/config` with a token in it, …; a root with more than 20000 directories to look through isn't used, said). The config fails to load on the same places as `worktreeRoots`, and on the host's temp dir or anything in it; a default that would be your home (a repository directly in it) or in a temp dir falls back to none, and a workspace in no repository has no default root, said on the session. A session can have its own at create (`codeoid new --project-root <dir>`, `--no-project-roots`, the new-session dialog); more than the daemon's is a widening (`session:approve`, undelegated). Writing in another directory is per session: `codeoid new --add-dir <dir>`, `/sandbox add <dir>`, `codeoid sandbox add <session> <dir>`, or the agent's `request_directory` ([sandbox.md](sandbox.md#working-across-repositories)).
+- Where the sandbox can't run, interactive sessions run unsandboxed and say so on every approval; autonomous sessions, routines and loops refuse to start. `codeoid sandbox providers` shows what runs here.
+
+### One daemon per data directory
+
+A daemon owns its data: the directory of its database (`dbPath`, `~/.codeoid/` by default), its transcripts and checkpoints (`transcriptDir`), opencode's database and data dirs (`providers.opencode.dbPath`, `providers.opencode.dataDir`) and memory's database dir. Two daemons on the same data would corrupt each other's state, so `codeoid start` takes a lock on each of those directories (a `codeoid-daemon.lock` file in it, recording the daemon's pid, host, machine id, boot, pid namespace and process start time) before it opens or cleans up anything, and a second start on any of them is refused, naming the daemon that holds it:
+
+```
+[codeoid] the daemon couldn't start: another codeoid daemon (pid 4242 on laptop, port 7400, since …) uses /home/u/.codeoid: process 4242 still runs. …
+```
+
+Stop that daemon first, or give the second one data of its own. The simplest way is to start it with its own `XDG_CONFIG_HOME` (its config, database, transcripts, memory and opencode's data all move there). Otherwise every owned directory must differ: a new `CODEOID_DB_PATH` in the same directory still collides, and so do memory's database (`memory.dbPath`) and opencode's dirs, which default beside the database and transcripts. A refusal names the directory, what of the daemon's data the settings put there, and the setting for each.
+
+- The lock goes when the daemon stops, however it stops (a signal, a signal while it is still starting, a failed start). A daemon killed outright (`kill -9`, a crash) leaves it; the next start takes it over, with a line in its log, only when the process that took it is provably gone: on this machine and boot, in the same pid namespace, its pid no longer runs, or now runs another process (a different start time, read the same whatever time zone or locale the start runs under).
+- This machine and boot means the hostname, the machine id (`/etc/machine-id` on Linux, the hardware UUID on macOS) and the boot id all match, each where either side has one: VMs cloned from one template and images with a baked-in machine id share it, so it alone proves nothing. A lock from anywhere else is never taken over: another machine (data on a shared or network home), an earlier boot of this one (after a power loss, or a crash and a reboot: it can't be told from a twin machine with the same name and id), a renamed machine, or another pid namespace (a container restarted after its daemon was killed). The start is refused, naming the holder and the lock file; if that daemon is gone, remove the file and start again. In a container, give `docker stop` time for the daemon's 30-second shutdown grace (`docker stop -t 40`) so the lock is released.
+- A running daemon checks every minute that its locks are still its own. One removed, or taken over by another start, stops the daemon (it shuts down as on a signal, saying why in its log), so two daemons never keep writing the same data.
+- A start that dies while it takes over a stale lock leaves a `.takeover` guard beside it; the next start judges the guard as it judges a lock, and removes it when that start is gone.
+- The lock file is read only as a small regular file, never through a symlink; anything else at its path refuses the start, saying so. A directory the lock has to create is made private (0700); an existing one is left as it is. A data directory that can't be created or written (a parent you can't write, a path through a file, a read-only filesystem) refuses the start, saying which and why.
+- Nothing of a live daemon's is ever removed or changed while deciding.
+- Only `codeoid start` takes it. Every other command (`codeoid ls`, `send`, `attach`, `settings`, …) talks to the running daemon and needs no lock.
+
 ### `~/.codeoid/.env` — env-only secrets
 
 Some daemon settings are env-only (notably the Telegram frontend). Rather than
@@ -192,6 +320,275 @@ TELEGRAM_ALLOWED_USER_IDS=6714605885
 # CLAUDE_CODE_OAUTH_TOKEN=    # written by Settings → Claude → "Sign in with Claude"
 # ANTHROPIC_API_KEY=          # only if you have neither a sign-in nor a Claude Code login
 ```
+
+## Model prices
+
+Some backends report what each turn cost (Claude, pi, opencode); the others report tokens only (Codex, OpenAI and OpenAI-compatible endpoints, Gemini, Qwen).
+A $0 with tokens from a backend that reports cost isn't a price (a gateway, a subscription sign-in, a model the backend's catalog prices at $0): its tokens are priced as below, under the backend's model id (`provider/model` on opencode).
+For those, codeoid prices the tokens at the model's list price, so session totals, routine spend caps and the fleet board count them; the UI marks such a total as an estimate (`~$0.42`).
+A model on your own machine costs nothing: llama.cpp on a loopback host (`127.0.0.1`, `localhost`) that answers `/props` as llama-server (a proxy on a loopback port doesn't, so it isn't free unless you say so).
+For your own server elsewhere on your network, set `providers.llamacpp.free: true`; anything else (it could be a gateway forwarding to a paid API) is priced like any other backend, and a price in `pricing.models` always wins.
+
+Prices come from a snapshot of [LiteLLM's maintained price table](https://github.com/BerriAI/litellm) (MIT), shipped with codeoid; `bun scripts/update-pricing.ts` refreshes it.
+Your own prices win, per model, in USD per million tokens:
+
+```json
+{
+  "pricing": {
+    "models": {
+      "qwen3-coder-plus": { "input": 1, "output": 5 },
+      "my-company-model": { "input": 2, "output": 8, "cacheRead": 0.2 },
+      "my-ollama-model": { "input": 0, "output": 0 }
+    }
+  }
+}
+```
+
+`cacheRead` and `cacheWrite` default to the input price; `inputAbove200k` / `outputAbove200k` (and `cacheReadAbove200k` / `cacheWriteAbove200k`, which default to the cache rates raised as input's is) apply to a request whose prompt is over 200k tokens.
+Each request is billed at its own tier when the backend reported every request's tokens; otherwise the whole turn is billed at its largest request's tier.
+The snapshot never lists a model as free (a provider's free tier isn't the model's price elsewhere); only `pricing.models` can.
+The snapshot is keyed by bare model ids (`claude-sonnet-4-5`, `gpt-5`); opencode names its models `provider/model` (`anthropic/claude-sonnet-4-5`), which the snapshot never matches, so an opencode model needs its entry here under that id.
+A model with no price (here or in the snapshot) has an **unknown** cost, shown as `$?` (or `$0.42+` when some turns were priced), never as $0; a routine with a spend cap stops on such a turn (docs/routines.md).
+The Gemini CLI reports no token counts, so its turns are always of unknown cost; so is a turn whose usage never arrived (a server that leaves it out of the stream), a turn that ended mid-way (an error, a stop) without saying what it spent, or while a request was still streaming (its usage comes only when it ends), a Qwen turn that used more than one model, a Qwen turn that ran a sub-agent (qwen-code reports no usage for its requests), and an opencode turn part of whose spend went unreported (docs/opencode.md, Cost).
+A turn that failed before reaching the model spent nothing.
+Qwen doesn't report thinking tokens separately, so a Qwen estimate leaves them out.
+
+## Worktree setup recipe
+
+A worktree codeoid creates (a fork, a compare branch, a routine's `--worktree` run) holds tracked files only.
+A repository says how to make one usable in a committed `.codeoid/setup.yaml`:
+
+```yaml
+copy: [.env, "config/*.local.json"]   # ignored files, copied from your checkout
+share: [node_modules]                  # directories, linked to your checkout
+command: bun install --ignore-scripts  # runs in the new worktree, only once you trust it
+timeoutSec: 600
+resources: { ports: 2, env: [DATABASE_URL] }   # declared only, for now
+```
+
+The recipe is read from your checkout's committed `HEAD`, never from a branch, the new worktree, or uncommitted edits, so a branch can't change how its own worktree is prepared.
+`copy` takes ignored files only, never overwrites anything, and never follows a symlink out of the repository.
+`share` is a deliberate isolation break: each entry is a writable link into your checkout, so a worker writing there changes it for you and for every other worktree.
+Keep it to regenerable dependency directories; config and tooling directories (`.claude`, `.codeoid`, `.vscode`, `.idea`, `.husky`, `.git*`) are refused.
+
+The `command` runs only when you opt in twice.
+Set `worktree.setup.runCommands` to `trusted-repos` (Settings, or `config.json`), then run `codeoid worktree trust` in the repository.
+It shows the command and records the repository with the recipe's git blob id, direnv-allow style, and with who trusted it: on a shared daemon, the entry applies only to that person's sessions.
+When the recipe changes, its command stops running and the session says so until you trust it again; `codeoid worktree trust --off` withdraws trust.
+
+A trusted command also runs only when the worktree's own base commit is reviewed content.
+That commit must carry the very recipe you trusted, and be on your checkout's branch (an ancestor of its `HEAD`).
+A fork from another branch, a fetched pull request, a fork of a session on a `codeoid/*` branch with commits of its own, or the work-in-progress commit codeoid saves when a session ends all fail that check.
+Such a worktree still gets its copied files and shared directories; its command is skipped, and the session says why.
+This doesn't cover everything: an agent working directly in your checkout can still commit to your branch, and those commits pass.
+That is one more reason to prefer `--ignore-scripts`.
+
+Trust covers the repository's committed content at setup time, not just the one line you reviewed.
+The command runs as you, on a clean checkout of the worktree's base commit (a fork's uncommitted changes are applied only after it), together with every script it invokes from that tree: `package.json` lifecycle scripts, a `Makefile`, a script in the repo.
+Prefer a command that runs no repository scripts, such as `bun install --ignore-scripts` or `npm ci --ignore-scripts`.
+A setup failure is reported as an infrastructure problem, not the agent's; a routine run fails before its agent starts.
+Recipes aren't supported on Windows.
+
+## Workstreams
+
+A workstream is a named line of work: a company, a client, a project, a team, a personal setup.
+Each session belongs to exactly one, its home, and the home decides what the session is given.
+The design is [workstreams-design.md](workstreams-design.md).
+
+### Setting up workstreams
+
+Nothing is enforced until the last step, so you can try each one safely.
+
+1. See a proposal: `codeoid workstream import` (it looks in `~/Workspace`; `--root <dir>` for another folder) groups your repositories by their git remote's owner and lists the MCP servers in Claude's global config, as a config block to review. It writes nothing.
+2. Add the workstreams you want, in Settings → Workstreams in the web UI or in the `workstreams` block of `config.json` (below). Give each one an id and match rules, and a `share` policy if other workstreams shouldn't read it.
+3. Check a few folders with `codeoid workstream match <dir>`. It shows the workstream a folder gets and the rule that chose it. A path rule wins over a remote rule, so add one for a repository whose remote matches the wrong workstream.
+4. Declare the credentials your workstreams use and set their values, in Settings → Credentials or as described under [Credentials](#credentials). Then give each workstream its servers, env and git identity.
+5. Turn on isolation: the toggle in Settings → Workstreams, or `"isolateGlobalServers": true`. From then on a session gets only its workstream's servers and credentials, and can't read other workstreams' folders or memory.
+
+To go back, turn isolation off. Your workstreams stay configured, and sessions get every server again.
+
+```jsonc
+"workstreams": {
+  "default": "personal",            // home for a folder nothing matches; leave out to have none
+  "isolateGlobalServers": false,    // on: a session gets only its workstream's servers (W1)
+  "items": [
+    { "id": "acme", "name": "Acme", "claim": "exclusive",
+      "match": { "paths": ["~/Workspace/acme-*"], "remotes": ["github.com/acme/*"] } },
+    { "id": "research", "match": { "paths": ["~/Workspace/research/**"] } },
+    { "id": "personal" }
+  ]
+}
+```
+
+A session's home is decided at create: `--workstream <id>` (or the web picker), else the folder's, else `default`.
+`codeoid workstream match <dir>` says what a folder resolves to and which rule decided it; `codeoid workstream ls` and `show <id>` list the configuration.
+
+Matching:
+
+- A path rule matches the folder it names and everything below it; `~` is your home; `x`, `x/` and `x/**` are the same rule.
+  A folder matches as you gave it and as its real path, and a rule whose fixed part (`~/Workspace` in `~/Workspace/acme-*`) is a symlink matches through it too.
+  Nothing else: links are never searched for. If the path you gave and the real path match different workstreams, the folder gets no home until you choose one.
+- A remote rule matches the repository's `origin` (or `upstream`) as `host/owner/repo`, read from the repository's git config without running git.
+  An ssh `Host` alias in `~/.ssh/config` reads as its `HostName`.
+  A match through `upstream` alone only suggests the workstream.
+- An exclusive claim beats any suggestion. Then the most specific rule wins: any path rule beats any remote rule, then the rule with more literal folders, then more literal characters.
+  Two workstreams tied on a folder give it no home until you choose one. Remote rules are case-insensitive.
+
+`claim: "exclusive"` means the folder runs only with its own workstream: choosing another one for a session there, or forking a session of another workstream into it, is refused.
+A delegated token can confirm a folder's own workstream but not choose another; every choice is in the audit log (`session.workstream`).
+`claim: "suggest"` (the default) only pre-selects it.
+
+A session keeps its home.
+A restart never matches the folder again, so changing the rules affects new sessions only.
+A session from before workstreams were configured is given its folder's home once, the first time it resumes (`source: migrated`).
+A home deleted from the config leaves its sessions marked orphaned; removing the whole `workstreams` block turns workstreams off instead.
+A session whose stored home is unreadable or invalid gets no home (it is never re-matched to its folder).
+
+### Credentials
+
+A credential is declared by id and kind in `credentials`; its value is never in `config.json`.
+
+```jsonc
+"credentials": [
+  { "id": "gh-acme",  "kind": "env" },                                   // an env var a workstream sets
+  { "id": "hf-key",   "kind": "header", "header": "X-Highflame-APIKey" }, // sent in a header to an MCP server
+  { "id": "gh-bot",   "kind": "bearer" },                                 // sent as Authorization: Bearer
+  { "id": "slack-hf", "kind": "oauth", "server": "slack" }                // a second OAuth sign-in to one server
+],
+"credentialStore": { "kind": "env-file" }   // or { "kind": "dir", "path": "/var/run/secrets/codeoid" }
+```
+
+- `env-file` (default) reads `CODEOID_CRED_<ID>` (`gh-acme` → `CODEOID_CRED_GH_ACME`) from the daemon's environment or `~/.codeoid/.env`. The `CODEOID_` prefix keeps every value out of every agent process.
+- `dir` reads one file per id from a directory: a mounted Kubernetes Secret, a Vault agent's sink. Read-only, and hidden from every agent like codeoid's own secrets.
+- An OAuth slot is signed in with `codeoid mcp signin <server> --credential <id>`.
+
+Every reference to a credential is checked when the config loads: declared once, of a kind that fits where it is used.
+
+### What a workstream gives its sessions
+
+```jsonc
+{ "id": "acme", "match": { "remotes": ["github.com/acme/*"] },
+  "env": { "GH_TOKEN": { "secret": "gh-acme" } },     // read from the store when the session starts
+  "git": { "name": "Acme Bot", "email": "bot@acme.example" },
+  "mcpServers": ["web", { "server": "github", "credential": "gh-bot" }, { "server": "slack", "credential": "slack-hf" }],
+  "extends": ["base"], "exclude": ["notes"] }
+```
+
+- **env and git identity** reach the backend's process (not opencode's shared server yet). A name codeoid owns for the backend (`ANTHROPIC_*`, `PATH`, `LD_*`, …) fails the config load.
+- **mcpServers** take effect with `isolateGlobalServers: true`. Then a session reaches built-ins, the servers its home names, and the folder's own servers only when the folder is the home's; no home, the conductor's, or a deleted one: built-ins only.
+  - Claude runs with a strict MCP config: nothing from `~/.claude.json`, a `.mcp.json`, a plugin or an agent's own. Every HTTP server it reaches is codeoid's, called by the daemon (tools only: a server's prompts and resources don't pass); a stdio server needing no secret is the CLI's to run, inside the session's sandbox as before.
+  - Codex, the Gemini CLI and Qwen are kept to codeoid's servers: Codex has every server its own configs declare (`/etc/codex/`, `~/.codex/config.toml`, a project's `.codex/config.toml`) turned off, and its apps and plugins off — a codeoid server named like one of those is refused, since codex would lend it that entry's headers; the Gemini CLI and Qwen are started with only codeoid's server names allowed. opencode can't be kept to them yet: under isolation its turns are refused.
+  - Every backend mounts natively only servers that need no secret — none in a header, an env value, the URL (a token in its path or query) or the command line. An HTTP server that needs one goes through the daemon's relay; a stdio one isn't given, and the session says so.
+  - A server config can never name a workstream credential's variable: `${CODEOID_CRED_*}` resolves empty and such a `bearerTokenEnv` is ignored (a repository's config can name none of codeoid's variables at all, as before).
+  - A credential's value is read by the daemon when it calls the server, never handed to a backend. A server removed from a workstream fails on the next call, mid-turn; the tool list catches up at the next turn.
+- **skillDirs** are accepted but not applied yet (the daemon says so at start).
+
+Under isolation a session you create in a folder with no workstream is refused until you choose one; sessions the daemon starts there (loops, routines, dispatch) get built-ins only.
+
+### Editing them live
+
+Settings → Workstreams and Settings → Credentials in the web UI (or the `workstream.*` / `credential.*` messages) edit `config.json` and `.env` directly; the whole config is validated before anything is written.
+A change applies at once to new sessions and to every call a session makes through codeoid; a running session's backend is rebuilt with its workstream's servers, env and credentials as they are now at its next turn.
+A session keeps its workstream: editing rules never moves a session to another.
+A value set in the daemon's own environment (`CODEOID_CRED_<ID>=… codeoid start`) wins over `.env`, so setting it from the UI is refused: change it where it is set.
+Removing an OAuth credential signs every user out of that slot, so declaring the id again later starts from no sign-in.
+
+### Overrides
+
+Choosing a workstream for a folder another workstream holds exclusively is refused with what it would change.
+`codeoid new … --workstream <id>` then asks to confirm, or `--override` confirms without asking (needs `session:approve` on an undelegated token; audited as `workstream.override`).
+A workstream with `allowOverride: false` can't be overridden at all.
+
+A folder's workstream is remembered: if its repository later matches a different one (its `origin` was changed), the next session there must choose.
+
+### Reading another workstream, and moving a session
+
+With `isolateGlobalServers: true` a session is fenced off from every other workstream's folders and memory:
+- its sandbox shows its home's folders read-only as its project roots (never the whole `@parent`), and hides other workstreams' folders;
+- a file tool (Read, Grep, Glob, Write, Edit, on every backend, in every mode) in another workstream's folder is refused, naming that workstream;
+- `recall`, `timeline` and `get_episode` leave out episodes another workstream wrote (episodes from before workstreams stay visible in their repository).
+
+A workstream's folders are the directories its path rules name on this machine (a glob such as `~/Workspace/acme-*` expands to the folders it matches, never to `~/Workspace`), plus the folders where its sessions were started by their folder's own match.
+The more specific rule decides: a catch-all workstream over `~/Workspace` is fenced off from `~/Workspace/acme-api` when that is another's, and inside a folder of another workstream's, only what the session may read (its own workdir, its home's folders, what a reference grants) stays readable.
+The home itself is never a workstream's folder.
+
+Limits: a repository matched only by a remote rule is fenced once a session has been started there (its folder is recorded then); one never opened is not. A session's commands in an unsandboxed session (`--sandbox off`) can still read other workstreams' folders; only its file tools are fenced.
+
+A **reference** lets a session read another workstream: its folders read-only (or only some), and its memory. Never its servers, credentials or accounts, and never a write.
+The workstream being read decides, by its `share`:
+
+| `share` | A reference to it is… |
+| --- | --- |
+| `open` | granted. |
+| `ask` | granted when its owner asks with `session:approve` on an undelegated token; asked of the owner on the session otherwise. |
+| `closed` | refused. A reference granted before it was closed gives nothing. |
+
+```bash
+codeoid new <name> <dir> --ref pub --ref acme:~/Workspace/acme-api   # at create
+codeoid workstream ref add <session> pub                               # later (the session header's chip too)
+codeoid workstream ref rm <session> pub
+codeoid workstream move <session> <workstream>                         # another home
+```
+
+Moving a session takes its whole conversation with it, so it follows the `share` of its old home and of every workstream it has read from (for its lifetime, even after the reference is gone; each home it leaves counts too). Moving from the default workstream, or from no home, is always allowed; past another workstream's exclusive folder it is an override (needs `session:approve`).
+A session homed in another workstream's folder (chosen at create, or moved) reads that folder, so the folder's workstream's `share` decides there too: `closed` refuses it, `ask` needs `session:approve`.
+Each change is saved at once and applies at the session's next turn (a turn running keeps what it started with): its backend is rebuilt with the new servers, credentials and sandbox.
+
+A search with no folder (Grep or Glob over the workdir) is refused when another workstream's folder is inside the workdir: search a narrower folder.
+
+
+### The conductor and workstreams
+
+The conductor is homed in a reserved workstream of its own: no workstream's servers, env or folders. It reads across all of them through its fleet tools, which take a `workstream` filter and name each result's workstream.
+With `isolateGlobalServers: true`, a `closed` workstream gives the conductor its sessions' status and metadata only (in `fleet_list`), never their text: `fleet_find` and `fleet_recall` never return them (not even that something matched), `fleet_summary` gives status only, `machine_map` leaves out their branches, and a worker of a closed workstream reports that it finished, not what it found. Episodes from before workstreams are judged by their session's home (as recorded; for one that no longer runs, its stored binding, else its folder's record, else its folder now). A workstream deleted from the config has no policy left: its sessions' text is no longer withheld. Closing a workstream doesn't reach back: what the conductor was told while it was open (its own transcript, a task's digest on `fleet_tasks`) stays.
+
+The conductor acts only through sessions homed where the work belongs. `fleet_spawn` takes `workstream` (else the folder's; a folder with none, or one whose repository's remote now matches another workstream than before, must be given one) and follows the same rules as a create: past a workstream's exclusive folder, or into an `ask` workstream's folder, the spawn's approval card says so (naming the workstream it passes), and only the session owner's own approval of that card confirms it: the approval adds a one-time token to that very call, which its handler accepts only if the spawn would still be judged exactly as the card showed, at the config revision it was shown at. A closed workstream's folder never takes another's worker, and a closed workstream's worker works only in its own folders. Every send-class card (web, Telegram, the TUI, `codeoid approve`, the terminal) names the workstream the action runs in.
+
+### Moving an existing setup
+
+`codeoid workstream import [--root <dir>]` proposes workstreams from your repositories' remotes and lists Claude's global MCP servers to assign. It writes nothing; isolation stays off until you turn it on.
+
+## Secrets in what codeoid stores
+
+What codeoid stores never holds a secret's value: the transcript, the history a backend is seeded from, the scrollback a client replays, memory, and a shared bundle. Where one appears it is replaced by a reference:
+
+- `‹credential:gh-highflame›` for a value codeoid already knows: a declared credential, a backend account's key, an MCP sign-in, the daemon's own keys. Its value stays where it lives.
+- `‹secret:github-token:3f9a2c1b›` for one found by its shape (a token format, a private key, a URL's password, a value assigned to a name like `DB_PASSWORD`). The last part is a fingerprint: the same secret has the same reference everywhere, and the value can't be worked out from it.
+
+A command that exists to print a credential (`gh auth token`, `printenv`, `op read`, `cat .env`, …) is stored without its output, and a file tool writing a credential file (`.env`, `~/.netrc`, a private key) without what it wrote.
+
+The value of a detected secret is dropped. A workstream can keep them instead, so you can get one back later:
+
+```jsonc
+{ "workstreams": { "items": [ { "id": "acme", "captureSecrets": "vault" } ] } }
+```
+
+Kept secrets are encrypted under a key outside the database, belong to the workstream that kept them, and are forgotten after `secrets.vaultDays` (30) unless promoted:
+
+```bash
+codeoid secret ls                                  # what is kept, never the values
+codeoid secret reveal acme:3f9a2c1b                # the value (your own token only; audited)
+codeoid secret promote acme:3f9a2c1b --as acme-gh  # make it a declared credential
+codeoid secret forget acme:3f9a2c1b
+codeoid secret scrub --dry-run                     # what was stored before this, scrubbed (stop the daemon first)
+```
+
+Settings, under `secrets`:
+
+| Setting | Default | |
+| --- | --- | --- |
+| `enabled` | `true` | Turn it off only to debug. |
+| `beforeModel` | `true` | Also scrub MCP results before they go back to the model (through codeoid's hub). |
+| `captureSecrets` | `"drop"` | For sessions with no workstream; a workstream's own setting decides for its sessions. |
+| `vaultDays` | `30` | Kept secrets not seen for this long are forgotten. |
+| `dropCommands` | `[]` | Commands whose calls aren't stored at all (`"my-vault dump"`). |
+| `credentialFiles` | `[]` | More files whose contents are credentials (globs, by name or path). |
+
+A value found only by the name it sits under (`DB_PASSWORD=…`) is replaced there, but not remembered: repeated bare later, it isn't recognised. A token of a distinct format (a vendor's token, a JWT, a bearer token) is, for the rest of the daemon's run.
+
+An OpenAI-compatible, Gemini or llama.cpp session is sent its earlier turns from codeoid's stored history: from the next turn on, its model sees a secret it read earlier as the reference.
+
+Limits. The backend has already seen a value by the time codeoid stores the result, and a CLI backend keeps its own copy (Claude Code's `~/.claude/projects`, Codex's sessions), which codeoid doesn't change. A secret with no known shape, that codeoid doesn't know, in a command not on the list, still gets through. Design: [secrets-and-memory-design.md](secrets-and-memory-design.md).
 
 ## Signing a backend in, instead of pasting a key
 
@@ -228,6 +625,34 @@ codeoid account use review --follow-default  # track the daemon default again
 codeoid account rm gw-team-a
 ```
 
+**Amazon Bedrock accounts.**
+A `bedrock` account runs Claude on Bedrock with a bearer token (`AWS_BEARER_TOKEN_BEDROCK`), either on AWS itself or on a Bedrock-compatible endpoint.
+It can carry the settings that belong with that token: the region, the Bedrock model IDs the `opus` / `sonnet` / `haiku` / `fable` aliases map to, and telemetry.
+
+```bash
+codeoid account add-bedrock aws --set AWS_REGION=us-east-1     # AWS itself; the token is asked for
+codeoid account add-bedrock team --base-url https://bedrock.example.com/v1 \
+  --set ANTHROPIC_DEFAULT_SONNET_MODEL=us.anthropic.claude-sonnet-5 \
+  --set CLAUDE_CODE_ENABLE_TELEMETRY=1 --set OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.com \
+  --set OTEL_EXPORTER_OTLP_HEADERS                            # asked for without echo; never on the command line
+codeoid account add-bedrock team --from-settings ~/.claude/settings.json --replace   # move an existing setup into an account
+```
+
+The settings an account takes are the region (`AWS_REGION`, `ANTHROPIC_SMALL_FAST_MODEL_AWS_REGION`, `ANTHROPIC_BEDROCK_REGION_PREFIX`), `ANTHROPIC_BEDROCK_SERVICE_TIER`, the models (`ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`, `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL` with their `_NAME`, `_DESCRIPTION` and `_SUPPORTED_CAPABILITIES`), `CLAUDE_CODE_SKIP_BEDROCK_AUTH`, `CLAUDE_CODE_AUTO_COMPACT_WINDOW`, `CLAUDE_CODE_ENABLE_TELEMETRY`, and the `OTEL_METRICS_EXPORTER`, `OTEL_LOGS_EXPORTER` and `OTEL_EXPORTER_OTLP_{PROTOCOL,ENDPOINT,HEADERS}` telemetry variables; anything else is refused.
+`--replace` replaces the whole account, so give every setting again (or `--from-settings` once more).
+The web form shows settings as typed, except `OTEL_EXPORTER_OTLP_HEADERS`, which usually carries a key and is masked; like a token, no setting's value is ever sent back to a client.
+Telemetry headers need a telemetry endpoint set beside them, which must be https (or localhost).
+Without mappings the Claude CLI uses its own Bedrock model IDs (a first-party ID such as `claude-sonnet-5` becomes `us.anthropic.claude-sonnet-5`); map the aliases when your endpoint serves different ones.
+A session's model is then sent by its family: with `ANTHROPIC_DEFAULT_OPUS_MODEL` set, a session on `opus` or any `claude-opus-*` ID (including `[1m]`) runs on the mapped ID, and a fallback model in the same family is dropped, since it would be the same model.
+`/model` also takes a Bedrock model ID or inference-profile ARN directly (`us.anthropic.claude-…`, `arn:aws:bedrock:…`); a session switched back to another kind of account keeps that ID until you change it.
+The daemon's own `ANTHROPIC_MODEL` / `ANTHROPIC_DEFAULT_*_MODEL` don't apply to a Bedrock account; only its own settings do.
+Nor do the daemon's AWS variables other than the region, or its `OTEL_*` variables, even when `CODEOID_AGENT_ENV_ALLOW` lets them through to agents: they could send the account's token or telemetry key elsewhere.
+codeoid's memory labeler calls the Anthropic API with the daemon's own key whatever account a session uses; leave memory off if no session content may leave your Bedrock setup.
+
+Claude Code applies the `env` block of your own `~/.claude/settings.json` over every session's environment, whatever its account.
+A named account of any kind therefore refuses to run while that file sets a credential or provider variable (a Bedrock setup, `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`, …) or an `apiKeyHelper`: move it into an account (`--from-settings` reads a Bedrock setup) and remove it from the file.
+Proxies, CA bundles, telemetry and model settings there are yours and are left alone.
+
 **How a switch keeps the conversation.**
 An account is only the credential a session's Claude subprocess starts with.
 Claude keeps its session history as local files in one config directory, shared by every account, so a switched session restarts its Claude query with the new credential and resumes the same Claude session.
@@ -241,24 +666,27 @@ Choosing `default` explicitly pins a session to the built-in account, so it stay
 
 **A session never silently changes account.**
 Applying an account removes every competing Claude credential or provider variable before setting its own (all of `ANTHROPIC_*` except model settings, every `CLAUDE_CODE_USE_*` provider switch, token file descriptors, and the like), so a stray `ANTHROPIC_API_KEY` can't take over a subscription session.
-A named account also refuses to run in a workdir whose own Claude settings (`.claude/settings.json` or `settings.local.json`, in the workdir or a parent below your home directory) set a credential variable such as `ANTHROPIC_BASE_URL`, or an `apiKeyHelper`, since a cloned repo could otherwise send the account's token to a host of its choosing.
+A named account also refuses to run in a workdir whose own Claude settings (`.claude/settings.json` or `settings.local.json`, in the workdir or a parent below your home directory) set a credential variable such as `ANTHROPIC_BASE_URL` or `ANTHROPIC_BEDROCK_BASE_URL`, or a credential helper (`apiKeyHelper`, `awsAuthRefresh`, `otelHeadersHelper`, …), since a cloned repo could otherwise send the account's token to a host of its choosing.
+Those files are read as the Claude CLI reads them (a byte-order mark or UTF-16 makes no difference), and one codeoid can't parse is refused rather than skipped.
+The CLI also re-reads them while a turn runs, so on a named account an agent's edit to a Claude settings file always waits for your approval, and is refused in autonomous mode, which waits on no one; a shell command that writes one can't be checked this way.
+A Bedrock account also refuses every `AWS_*` variable there but the region (a repo's own AWS config file can name an endpoint that receives the token) and every `OTEL_*` variable (where its telemetry, and the telemetry key, go and what they carry).
 Switching a session's account, or replacing or removing the account it runs on, stops the session's Claude process if it is idle, so no process keeps running on the old credential.
 A session whose account was removed refuses to run until you switch it, rather than falling back to another credential.
-One thing this cannot override is an `apiKeyHelper` in your Claude settings file, since that is configuration of the shared config directory rather than environment.
 
 **`codeoid account login` never touches your own `claude login`.**
 It runs `claude setup-token` against a throwaway config directory and keeps only the token it prints, so signing a second account in can't replace the personal sign-in your other sessions use.
 
 **Where it is stored.**
-Accounts live in `~/.codeoid/claude-accounts.json`, mode 0600.
-Tokens are never sent to a client: listing accounts shows names, kinds, and a gateway's URL and header names only.
+Accounts live in `~/.codeoid/accounts.json`, mode 0600, with every other backend's (below).
+A `claude-accounts.json` from an earlier version is imported on first start and left as it was.
+Tokens are never sent to a client: listing accounts shows names, kinds, a gateway's or Bedrock endpoint's URL, and header and setting names only.
 Managing accounts needs `settings:write` (listing needs `settings:read`).
 Choosing a session's account needs `settings:write` too, whichever way: creating a session with `--account`, `account use` (including back to `default`), and forking or comparing a session that has an account of its own.
 It decides whose credential the agent runs on, which account is billed, and where the conversation is sent.
 The account list is daemon-wide, not per tenant: like the rest of `settings:write`, it belongs to whoever runs the daemon.
 
 **Agents can't read the stored tokens.**
-Agent file tools are refused on codeoid's credential files (`claude-accounts.json`, `config.json`, `.env`, `codeoid.db`, the local-mode token), on each agent CLI's own stored login (`~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.qwen/oauth_creds.json`, `~/.gemini/oauth_creds.json`), and on any process's `/proc/<pid>/environ` or memory, in every mode.
+Agent file tools are refused on codeoid's credential files (`accounts.json`, `claude-accounts.json`, `endpoints.json`, `config.json`, `.env`, `codeoid.db`, the local-mode token), on every account's home under `~/.codeoid/accounts/`, on each agent CLI's own stored login (`~/.claude/.credentials.json`, Codex's `auth.json`, `~/.qwen/oauth_creds.json`, the Gemini CLI's `oauth_creds.json` and `google_accounts.json`, pi's `auth.json`), on codeoid's opencode credential files and database (`codeoid-credentials/` and `opencode.db` beside it, see `providers.opencode.dbPath`) and its opencode server's config, data, state and cache dirs (`config/` beside the database; `data/`, `state/` and `cache/` of `providers.opencode.dataDir`, less the tool and shell output opencode names to the model, see docs/opencode.md), and on any process's `/proc/<pid>/environ` or memory, in every mode.
 On Claude this is enforced in a `PreToolUse` hook as well as the approval gate, so it also holds for reads the CLI would allow by itself.
 A search rooted above those files, such as a `Grep` over your home directory, is never auto-approved and waits for you instead.
 
@@ -271,3 +699,60 @@ To keep a Claude session's credential out of the environment its shell commands,
 That is the Claude CLI's own switch: on Linux it needs bubblewrap and runs every shell command in a sandbox, so codeoid leaves the choice to you.
 
 **Behind the Highflame gateway** (a Forge sandbox, where the daemon's environment carries an `x-highflame-apikey` header), named accounts are refused: they would route requests around the gateway's guardrails and audit.
+
+## Accounts for every backend
+
+Every backend can hold several accounts the same way: two ChatGPT sign-ins for Codex, a team and a personal key for Qwen or the Gemini CLI, a second key for a local endpoint.
+Each backend has its own default, and a session holds one choice per backend, so switching a session from Codex to Qwen and back keeps the account it had on each.
+The design is in [backend-accounts-design.md](backend-accounts-design.md).
+
+```bash
+codeoid account login work --backend codex          # ChatGPT sign-in: open the link, enter the code shown
+codeoid account add-key personal --backend gemini-cli   # a Gemini API key, asked for without echo
+codeoid account add-key team --backend qwen --base-url bailian-plan-intl   # a Coding Plan key, asked for without echo
+codeoid account add-key team --backend openai
+codeoid account add-key team --backend pi --key-var OPENROUTER_API_KEY     # pi: one or more provider keys
+codeoid account add-key staging --backend oai:gpu-box --header x-team      # another key or headers for an endpoint
+codeoid account ls                                  # every backend; --backend <id> for one
+codeoid account default work --backend codex
+codeoid account use review work                     # for the backend the session is on now
+codeoid account use review team --backend qwen      # takes effect when it is switched to qwen
+codeoid account rm work --backend codex
+```
+
+What each backend's account is:
+
+| Backend | Kinds | How it is applied |
+|---|---|---|
+| `codex` | ChatGPT sign-in, API key | its own `CODEX_HOME` |
+| `gemini-cli` | API key | its own `GEMINI_CLI_HOME`, selecting API-key auth |
+| `openai`, `gemini`, `llamacpp` | API key | the request's key, every turn |
+| `qwen` | API key with its endpoint (a preset or a URL) | the key and base URL of the query |
+| `pi` | provider keys (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, …) | those variables, without pi's own stored logins |
+| `oai:<endpoint>` | a key and/or headers | instead of the endpoint's own |
+
+The Qwen OAuth free tier ended on 2026-04-15, so a Qwen account is always a key.
+
+**How a switch keeps the conversation.**
+Codex, the Gemini CLI and pi keep their login in a directory.
+Each of their accounts gets a home under `~/.codeoid/accounts/<backend>/<name>/` in which every file of the vendor's own home is a link to the real one — config, MCP settings, skills, session history — except the login itself.
+A switched session therefore restarts the backend on the new credential and resumes the same conversation; one whose native resume fails continues from codeoid's own copy of the history.
+HTTP backends pick the new key up on the next request.
+
+**A session never silently changes account.**
+Applying an account removes the daemon's own credential variables for that backend first, so a stray `OPENAI_API_KEY` can't take over a ChatGPT session.
+A session whose account was removed refuses to run until you switch it.
+An endpoint account is tied to the server it was entered for: if the endpoint later points elsewhere, its accounts refuse to run until re-entered.
+A named Gemini CLI account refuses to run in a workdir whose `.env`, `.gemini/.env` or `.gemini/settings.json` (in the workdir or a parent below your home directory) would redirect its credential, naming the file.
+A named Qwen account does the same for `.qwen/settings.json` (a `modelProviders` entry, an auth type or base URL), `.qwen/.env` and `.env`, and runs in its own Qwen home whose settings are yours without provider entries, so neither a cloned repo nor your own provider list can send its key elsewhere.
+A backend's default account can't be removed until you set another default (`codeoid account default <name> --backend <id>`, or `default`), so the sessions following it never move to another credential.
+
+**Signing in never touches your own login.**
+`codeoid account login` runs the vendor's own command (`claude setup-token`, `codex login --device-auth`) against a staging directory, and only a completed sign-in becomes the account's.
+A Gemini CLI account is an API key: a consumer Google (AI Pro/Ultra) subscription can't be used with codeoid, so there is no Google sign-in.
+An existing account is only replaced with `--replace`.
+
+**A key-only backend needs no key in the environment** once it has an account: OpenAI and Gemini appear as backends as soon as one is added.
+A session following such a backend's built-in default still needs `OPENAI_API_KEY` / `GOOGLE_API_KEY`, and says so instead of failing with a 401.
+
+Managing accounts and choosing a session's account need `settings:write` from a token that wasn't delegated; listing needs `settings:read`.

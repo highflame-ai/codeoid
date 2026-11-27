@@ -6,8 +6,9 @@
  */
 
 import { Component, createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js";
+import { WorkstreamChip } from "./WorkstreamChip";
 
-import { formatCostUsd, formatTokens, relativeTime } from "../lib/format";
+import { formatSessionCost, formatTokens, relativeTime } from "../lib/format";
 import {
   countVisible,
   filterFleet,
@@ -43,6 +44,7 @@ import type { SessionInfo, SessionStatus } from "../protocol/types";
 import FileTree from "./files/FileTree";
 import { openNewSessionModal } from "./NewSessionModal";
 import AnalyticsPanel from "./AnalyticsPanel";
+import { providerLabel } from "../state/providers";
 
 /** Focus a session and, on mobile, close the off-canvas drawer. */
 function pickSession(id: string): void {
@@ -456,6 +458,9 @@ const SessionRow: Component<{
           <Show when={props.session.role === "conductor"}>
             <ConductorBadge />
           </Show>
+          <Show when={props.session.workstream?.id && props.session.role !== "conductor"}>
+            <WorkstreamChip session={props.session} />
+          </Show>
           <Show when={workerShape(props.session)}>
             {(shape) => <WorkerShapeBadge shape={shape()} />}
           </Show>
@@ -469,8 +474,8 @@ const SessionRow: Component<{
           </Show>
           <Show when={props.session.usage}>
             {(u) => (
-              <span class="font-mono text-[11px] text-accent" title="Estimated cost">
-                {formatCostUsd(u().totalCostUsd)}
+              <span class="font-mono text-[11px] text-accent" title={formatSessionCost(u()).title}>
+                {formatSessionCost(u()).text}
               </span>
             )}
           </Show>
@@ -526,7 +531,7 @@ const SessionRow: Component<{
               class="rounded border border-accent/40 bg-accent/10 px-1 font-mono text-[10px] text-accent"
               title={`Backend: ${props.session.providerId}${props.session.model ? ` · model: ${props.session.model}` : ""}`}
             >
-              {props.session.providerId}
+              {providerLabel(props.session.providerId)}
             </span>
           </Show>
           {/* Ambient pack, from `profile` ("pack-id" or "pack-id (role)").
@@ -675,10 +680,12 @@ const PanelProgress: Component<{
 /** A child's position and state within the live fan-out. */
 const PanelMemberBadge: Component<{
   ordinal: number;
-  status: "queued" | "claimed" | "running" | "done" | "failed" | "blocked";
+  status: "queued" | "claimed" | "running" | "held" | "done" | "failed" | "blocked";
 }> = (props) => {
   const look = () => {
     switch (props.status) {
+      case "held":
+        return { cls: "border-warn/50 bg-warn/10 text-warn", note: "waiting on you" };
       case "running":
       case "claimed":
         return { cls: "border-warn/50 bg-warn/10 text-warn animate-pulse", note: "working" };

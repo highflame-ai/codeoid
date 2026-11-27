@@ -21,6 +21,10 @@ import {
   fetchOAuthProvider,
   consumeEmbedToken,
   readLocalModeToken,
+  redeemLocalLink,
+  forgetLocalModeToken,
+  STORAGE_KEY_LOCAL_TOKEN,
+  LOCAL_LINK_FRAGMENT,
   AuthError,
 } from "./auth";
 
@@ -273,36 +277,81 @@ describe("consumeEmbedToken", () => {
 // ── F. Local mode (no ZeroID) ────────────────────────────────────────────────
 
 describe("readLocalModeToken + local-mode precedence", () => {
-  const W = globalThis as { window?: unknown };
+  const W = globalThis as { window?: unknown; history?: unknown };
   let savedWindow: unknown;
+  let savedHistory: unknown;
+  let replaced: string[];
 
   beforeEach(() => {
     savedWindow = W.window;
-    W.window = {};
+    savedHistory = W.history;
+    replaced = [];
+    W.window = { location: { hash: "", pathname: "/ui/", search: "" } };
+    W.history = { replaceState: (_s: unknown, _t: string, url: string) => replaced.push(url) };
   });
   afterEach(() => {
     if (savedWindow === undefined) delete W.window;
     else W.window = savedWindow;
+    if (savedHistory === undefined) delete W.history;
+    else W.history = savedHistory;
   });
 
-  function injectLocalToken(token: string): void {
-    (W.window as { __CODEOID_LOCAL_TOKEN__?: string }).__CODEOID_LOCAL_TOKEN__ = token;
+  /** The daemon serving the page says it is in local mode (no secret in the page, #448 round 4). */
+  function localModePage(hash = ""): void {
+    W.window = { __CODEOID_LOCAL_MODE__: true, location: { hash, pathname: "/ui/", search: "" } };
   }
 
-  it("returns null when the daemon injected nothing (ZeroID mode)", () => {
+  it("returns null on a ZeroID daemon's page, even with a local token stored", () => {
+    store.set(STORAGE_KEY_LOCAL_TOKEN, "codeoid_local_abc");
     expect(readLocalModeToken()).toBeNull();
   });
 
-  it("ignores a non-string or empty global", () => {
-    (W.window as { __CODEOID_LOCAL_TOKEN__?: unknown }).__CODEOID_LOCAL_TOKEN__ = 42;
+  it("reads the token a link signed this page in with, on a local-mode page; ignores anything else stored", () => {
+    localModePage();
     expect(readLocalModeToken()).toBeNull();
-    (W.window as { __CODEOID_LOCAL_TOKEN__?: unknown }).__CODEOID_LOCAL_TOKEN__ = "";
+    store.set(STORAGE_KEY_LOCAL_TOKEN, "not-a-local-token");
     expect(readLocalModeToken()).toBeNull();
-  });
-
-  it("reads the injected token", () => {
-    injectLocalToken("codeoid_local_abc");
+    store.set(STORAGE_KEY_LOCAL_TOKEN, "codeoid_local_abc");
     expect(readLocalModeToken()).toBe("codeoid_local_abc");
+    forgetLocalModeToken();
+    expect(readLocalModeToken()).toBeNull();
+  });
+
+  it("a page carrying a token global is not believed: the token comes only from a link", () => {
+    (W.window as Record<string, unknown>).__CODEOID_LOCAL_TOKEN__ = "codeoid_local_injected";
+    localModePage();
+    (W.window as Record<string, unknown>).__CODEOID_LOCAL_TOKEN__ = "codeoid_local_injected";
+    expect(readLocalModeToken()).toBeNull();
+  });
+
+  it("a link's code is exchanged once for the token, taken out of the URL (other fragment content kept), and kept", async () => {
+    localModePage(`#route=x&${LOCAL_LINK_FRAGMENT}=c0de`);
+    const asked: Array<{ url: string; body: string }> = [];
+    const fetchFn = (async (url: string, init?: RequestInit) => {
+      asked.push({ url, body: String(init?.body) });
+      return new Response(JSON.stringify({ token: "codeoid_local_linked" }), { status: 200 });
+    }) as unknown as typeof fetch;
+    expect(await redeemLocalLink(fetchFn)).toBe("codeoid_local_linked");
+    expect(asked).toEqual([{ url: "/ui/local-session", body: JSON.stringify({ code: "c0de" }) }]);
+    expect(replaced).toEqual(["/ui/#route=x"]);
+    expect(readLocalModeToken()).toBe("codeoid_local_linked");
+  });
+
+  it("no code in the URL: nothing asked", async () => {
+    localModePage("#route=x");
+    const fetchFn = (async () => {
+      throw new Error("must not be asked");
+    }) as unknown as typeof fetch;
+    expect(await redeemLocalLink(fetchFn)).toBeNull();
+    expect(replaced).toEqual([]);
+  });
+
+  it("a spent or expired code says how to get a new one, and is still taken out of the URL", async () => {
+    localModePage(`#${LOCAL_LINK_FRAGMENT}=spent`);
+    const fetchFn = (async () => new Response(JSON.stringify({ error: "this sign-in link has expired or was already used — run `codeoid ui` for a new one" }), { status: 403 })) as unknown as typeof fetch;
+    await expect(redeemLocalLink(fetchFn)).rejects.toThrow(/codeoid ui/);
+    expect(replaced).toEqual(["/ui/"]);
+    expect(readLocalModeToken()).toBeNull();
   });
 
   it("BEATS a stored ZeroID key — the daemon's posture is authoritative", async () => {
@@ -310,7 +359,8 @@ describe("readLocalModeToken + local-mode precedence", () => {
     // ZeroID and then be rejected on the daemon handshake, dumping the user at
     // a sign-in screen on a daemon that needs no sign-in.
     rememberApiKey("zid_sk_stale");
-    injectLocalToken("codeoid_local_wins");
+    localModePage();
+    store.set(STORAGE_KEY_LOCAL_TOKEN, "codeoid_local_wins");
     mockFetch({ access_token: "should-not-be-used" });
 
     const result = await resolveToken({});
@@ -319,7 +369,8 @@ describe("readLocalModeToken + local-mode precedence", () => {
   });
 
   it("yields to an explicitly supplied token (embed handoff)", async () => {
-    injectLocalToken("codeoid_local_abc");
+    localModePage();
+    store.set(STORAGE_KEY_LOCAL_TOKEN, "codeoid_local_abc");
     const result = await resolveToken({ token: "explicit-jwt" });
     expect(result.token).toBe("explicit-jwt");
   });

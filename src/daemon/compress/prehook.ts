@@ -72,6 +72,29 @@ export function rewriteBashToolInput(
 }
 
 /**
+ * The command a rewritten call really runs, and the directory it runs in
+ * (#431): the approval gate judges that, not the wrapper. Only a line exactly
+ * as rewriteBashToolInput writes it is seen through: codeoid's own wrapper,
+ * a canonical payload and one quoted `--cwd`, nothing before or after. The
+ * agent can write that prefix itself, so anything else (a look-alike path,
+ * a second command after it, another argument the wrapper would take
+ * instead) is judged as the line it is.
+ */
+export function decodeCompressedCommand(command: string, wrapperPath: string = resolveWrapperPath()): { command: string; cwd: string } | null {
+  const prefix = `bun ${shellQuote(wrapperPath)} --b64 `;
+  if (!command.startsWith(prefix)) return null;
+  const m = /^([A-Za-z0-9+/]+={0,2}) --cwd ([A-Za-z0-9_./@:+=-]+|'(?:[^']|'\\'')*')$/.exec(command.slice(prefix.length));
+  if (!m) return null;
+  const decoded = Buffer.from(m[1]!, "base64").toString("utf8");
+  // Base64 decoding is lenient; a payload that doesn't round-trip isn't ours.
+  if (Buffer.from(decoded, "utf8").toString("base64") !== m[1]) return null;
+  const quoted = m[2]!;
+  const cwd = quoted.startsWith("'") ? quoted.slice(1, -1).replace(/'\\''/g, "'") : quoted;
+  if (shellQuote(cwd) !== quoted) return null;
+  return { command: decoded, cwd };
+}
+
+/**
  * Minimal single-quote shell escape. We only need it for paths which shouldn't
  * normally contain quotes, but belt-and-suspenders.
  */

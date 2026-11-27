@@ -352,3 +352,43 @@ describe("TranscriptStore — rotation, bounded load, output cap (#85)", () => {
     expect(await Bun.file(`${small.transcriptPath("gone")}.2`).exists()).toBe(false);
   });
 });
+
+describe("TranscriptStore — the log as it was (lazy session loading)", () => {
+  test("a read as of a tail's marks leaves out what was appended since, whatever its seqs, rotated or not", async () => {
+    const small = new TranscriptStore(tmpDir, { segmentMaxBytes: 1500, maxRotatedSegments: 3 });
+    const ids: string[] = [];
+    // Seqs that go back down, as an older daemon's restarts left them.
+    for (let i = 0; i < 6; i++) {
+      const msg = makeMsg(`before ${i} ${"x".repeat(120)}`);
+      ids.push(msg.messageId);
+      await small.append("asof", msg, i < 4 ? i : i - 4);
+    }
+    await small.flush();
+    const want = (await small.loadTranscript("asof")).map((e) => (e.message as SessionMessage).messageId);
+    expect(want).toEqual(ids);
+    const tail = await small.transcriptTail("asof");
+    expect(tail).toMatchObject({ nextSeq: 2, hasEntries: true });
+    // Appended since, at seqs the log already holds, and enough to rotate the files.
+    for (let i = 0; i < 4; i++) await small.append("asof", makeMsg(`after ${i} ${"y".repeat(200)}`), 2 + i);
+    await small.flush();
+    expect(await Bun.file(`${small.transcriptPath("asof")}.2`).exists()).toBe(true);
+    const got = await small.loadTranscript("asof", { asOf: tail.files });
+    expect(got.map((e) => (e.message as SessionMessage).messageId)).toEqual(want);
+    const gotSync = small.loadTranscriptSync("asof", { asOf: tail.files });
+    expect(gotSync.map((e) => (e.message as SessionMessage).messageId)).toEqual(want);
+  });
+
+  test("a log with entries but no seqs has entries; an unreadable one is an error, never an empty log", async () => {
+    const { appendFileSync, chmodSync } = await import("node:fs");
+    const path = store.transcriptPath("noseq");
+    appendFileSync(path, `${JSON.stringify({ timestamp: "t", message: makeMsg("no seq") })}\n`);
+    expect(await store.transcriptTail("noseq")).toMatchObject({ nextSeq: 0, hasEntries: true });
+    chmodSync(path, 0o000);
+    try {
+      await expect(store.transcriptTail("noseq")).rejects.toThrow();
+    } finally {
+      chmodSync(path, 0o600);
+    }
+    expect(await store.transcriptTail("missing")).toEqual({ nextSeq: 0, hasEntries: false, files: [] });
+  });
+});

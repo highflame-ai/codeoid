@@ -175,7 +175,7 @@ function bashToolTurn(): ProviderEvent[] {
       toolId: "t1",
       sdkToolUseId: "sdk-t1",
       name: "Bash",
-      input: { command: "rm -rf /tmp/x" },
+      input: { command: "npm run build" },
       approvalId: "a1",
     },
     { type: "text_done", content: "done" },
@@ -644,7 +644,7 @@ describe("hook rewrite on a backend that can't apply it (#367)", () => {
 
   it("a hook that returns the input unchanged is not a rewrite — allowed even on such a backend", async () => {
     const hooks = new HookBus([
-      commandEntry(`printf '{"updatedInput":{"command":"rm -rf /tmp/x"}}'`, { name: "echoer", matcher: "^Bash$" }),
+      commandEntry(`printf '{"updatedInput":{"command":"npm run build"}}'`, { name: "echoer", matcher: "^Bash$" }),
     ]);
     const provider = new MockSessionProvider("mock-session", [bashToolTurn()]);
     provider.appliesToolInputRewrite = false;

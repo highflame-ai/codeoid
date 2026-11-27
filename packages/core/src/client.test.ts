@@ -15,7 +15,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 
-import { CodeoidClient } from "./client.js";
+import { CodeoidClient, RequestError } from "./client.js";
 import type { ClientStatus, ConnectOptions } from "./client.js";
 
 // ── Controllable mock WebSocket ───────────────────────────────────────────
@@ -182,6 +182,17 @@ describe("CodeoidClient", () => {
     const bad = c.request({ type: "session.attach", id: "req-2", sessionId: "s" });
     ws.recv({ type: "response.error", requestId: "req-2", error: "nope", code: "not_found" });
     await expect(bad).rejects.toThrow("nope");
+  });
+
+  it("a refusal keeps its code and structured detail, not only its words", async () => {
+    const c = track(makeClient());
+    const ws = await connectClient(c);
+    const bad = c.request({ type: "loop.watch.update", id: "req-9", watchId: "lw_1", trustHead: { main: "a".repeat(40) } });
+    const detail = { kind: "head_moved", branch: "main", head: "b".repeat(40), pinned: "a".repeat(40) } as const;
+    ws.recv({ type: "response.error", requestId: "req-9", error: "main's head is … now", code: "invalid_request", detail });
+    const err = await bad.catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RequestError);
+    expect(err).toMatchObject({ message: "main's head is … now", code: "invalid_request", detail });
   });
 
   it("resolves waitForResult requests on their typed result frame", async () => {

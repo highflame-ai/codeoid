@@ -319,6 +319,8 @@ describe("SessionManager session.search scope plumbing", () => {
     );
     expect(calls.length).toBe(1);
     expect("workspaceId" in calls[0]!).toBe(false);
+    // Cross-workspace is the caller's tenant only, never the whole store (#415).
+    expect(calls[0]!.tenant).toEqual({ accountId: "acc", projectId: "proj" });
 
     await manager.handle(
       {
@@ -380,6 +382,7 @@ describe("SessionManager session.search scope plumbing", () => {
 
     expect(calls.length).toBe(1);
     expect("workspaceId" in calls[0]!).toBe(false);
+    expect(calls[0]!.tenant).toEqual({ accountId: "acc", projectId: "proj" });
 
     store.close();
     rmSync(dir, { recursive: true, force: true });

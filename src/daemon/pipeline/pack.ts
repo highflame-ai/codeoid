@@ -20,7 +20,8 @@ import {
   renderLedger,
   SEVERITIES,
 } from "./findings";
-import { buildProbeGate, probePathEscapes, type ProbeSpec } from "./gate-probes";
+import { ephemeralCheck } from "../evidence/service";
+import { buildProbeGate, diagnosticTail, probePathEscapes, type ProbeSpec } from "./gate-probes";
 import type {
   GatePlugin,
   Pack,
@@ -493,26 +494,20 @@ function buildGate(g: PackManifest["gates"][number], dir: string, trusted: boole
       at,
       async evaluate(ctx) {
         const cwd = ctx.pipeline.workdir ?? dir;
-        const proc = Bun.spawn(["sh", "-c", run], { cwd, stdout: "ignore", stderr: "ignore" });
-        const TIMED_OUT = Symbol("timeout");
-        let timer: ReturnType<typeof setTimeout> | undefined;
-        try {
-          const result = await Promise.race<number | typeof TIMED_OUT>([
-            proc.exited,
-            new Promise((res) => {
-              timer = setTimeout(() => res(TIMED_OUT), GATE_COMMAND_TIMEOUT_MS);
-            }),
-          ]);
-          if (result === TIMED_OUT) {
-            proc.kill();
-            return { pass: false, reason: `command gate "${g.id}" timed out after ${GATE_COMMAND_TIMEOUT_MS}ms: ${run}` };
-          }
-          return result === 0
-            ? { pass: true }
-            : { pass: false, reason: `command gate "${g.id}" failed (exit ${result}): ${run}` };
-        } finally {
-          clearTimeout(timer);
-        }
+        const runner = ctx.runCheck ?? ephemeralCheck;
+        const { outcome, record } = await runner(
+          { id: `${ctx.phase.id}:${g.id}`, label: g.id, command: run, timeoutMs: GATE_COMMAND_TIMEOUT_MS },
+          cwd,
+        );
+        const evidenceIds = record ? [record.id] : [];
+        if (outcome.result === "cancelled") return { pass: false, cancelled: true, reason: "check cancelled", evidenceIds };
+        if (outcome.result === "pass") return { pass: true, evidenceIds };
+        const tail = diagnosticTail(outcome);
+        return {
+          pass: false,
+          reason: `command gate "${g.id}" ${outcome.result} — ${outcome.reason}: ${run}${tail ? `\n${tail}` : ""}`,
+          evidenceIds,
+        };
       },
     };
   }

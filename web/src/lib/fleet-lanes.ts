@@ -83,6 +83,10 @@ export function nodeState(task: FleetTaskWire, session: SessionInfo | null): Fle
       return "done";
     case "queued":
       return "queued";
+    case "held":
+      // Parked on something outside the worker — an approval the run's profile
+      // does not cover. That is a human's decision, whatever the session says.
+      return "awaiting";
     case "claimed":
     case "running": {
       if (session === null) {
@@ -96,7 +100,14 @@ export function nodeState(task: FleetTaskWire, session: SessionInfo | null): Fle
       if (session.status === "error") return "failed";
       return BUSY.has(session.status) ? "working" : "idle";
     }
+    default:
+      return assertNever(task.status);
   }
+}
+
+/** Compile-time exhaustiveness: a new dispatch status must be classified here. */
+function assertNever(status: never): never {
+  throw new Error(`unclassified dispatch status: ${String(status)}`);
 }
 
 /** The four triage lanes of §4, in display order. */

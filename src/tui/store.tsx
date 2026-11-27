@@ -19,6 +19,7 @@ import type {
   ToolState,
   ToolWaitingConfirmationState,
 } from "../protocol/types.js";
+import { formatToolRisk } from "@highflame/codeoid-core";
 import type { TuiAction, TuiSession, TuiState } from "./types.js";
 
 /**
@@ -44,6 +45,7 @@ function isActiveToolCall(msg: SessionMessage): boolean {
 }
 
 const initialState: TuiState = {
+  providers: [],
   sessions: new Map(),
   order: [],
   focused: null,
@@ -70,6 +72,8 @@ function blankSession(info: TuiSession["info"]): TuiSession {
 
 function reducer(state: TuiState, action: TuiAction): TuiState {
   switch (action.type) {
+    case "providers.set":
+      return { ...state, providers: action.providers };
     case "connection.change":
       return { ...state, connection: action.state };
 
@@ -314,6 +318,8 @@ function applyMessage(
       approvalId: st.approvalId,
       toolName: msg.tool.name,
       description: st.description,
+      ...(formatToolRisk(st.risk) ? { risk: formatToolRisk(st.risk) } : {}),
+      ...(st.targetWorkstream?.warning ? { risk: `${st.targetWorkstream.warning}${formatToolRisk(st.risk) ? ` · ${formatToolRisk(st.risk)}` : ""}` } : {}),
     };
   }
 

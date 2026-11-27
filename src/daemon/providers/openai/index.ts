@@ -15,6 +15,8 @@
  */
 
 import type { McpTenant } from "../../mcp/oauth.js";
+import type { EffortLevel } from "../../../protocol/types.js";
+import { effortRejectionHint } from "../effort.js";
 import OpenAI from "openai";
 import { AsyncQueue } from "../../async-queue.js";
 import type {
@@ -42,6 +44,18 @@ import {
 import { SessionMcpTools, type McpServerSource } from "../../mcp/tool-source.js";
 import type { McpHub } from "../../mcp/hub.js";
 
+/** A per-turn connection (see OpenAIProviderInit.connection). */
+export interface OpenAIConnection {
+  baseURL: string;
+  apiKey?: string;
+  headers?: Record<string, string>;
+  /** Changes when anything a request depends on changes. */
+  fingerprint: string;
+  /** Per-endpoint request shape, overriding the static options. */
+  streamUsage?: boolean;
+  maxTokensField?: "max_tokens" | "max_completion_tokens";
+}
+
 export interface OpenAIProviderInit {
   /**
    * Override the id/displayName this instance reports. Lets the same
@@ -53,12 +67,50 @@ export interface OpenAIProviderInit {
    */
   id?: string;
   displayName?: string;
+  /**
+   * A model on the user's own machine (llama.cpp): its turns cost nothing
+   * (#430). A function is asked each turn (an endpoint whose address can change).
+   */
+  free?: boolean | (() => boolean);
+  /**
+   * Settles what `free` answers, before a turn's first request (#430): a turn
+   * that fails or is stopped part-way is priced by it, with no result to wait for.
+   */
+  proveFree?: () => Promise<void>;
   /** Explicit API key — falls back to OPENAI_API_KEY env var. */
   apiKey?: string;
+  /**
+   * The session's account, per turn (accounts.ts): its key replaces the
+   * static `apiKey` and the client is rebuilt when the account changes. A
+   * throw fails the turn (a removed account never falls back).
+   */
+  resolveApiKey?: () => { key: string; fingerprint: string } | null;
   /** Default model when TurnOpts.model is absent. */
   defaultModel?: string;
+  /**
+   * Resolve the default model at the start of each turn (when TurnOpts.model
+   * is absent), ahead of `defaultModel` — an endpoint's configured default can
+   * change while sessions run on it.
+   */
+  resolveDefaultModel?: () => Promise<string | undefined>;
   /** Override base URL (useful for Azure OpenAI or local proxies). */
   baseURL?: string;
+  /**
+   * Resolve the connection at the start of every turn, instead of the static
+   * `apiKey` / `baseURL` above — a user-defined endpoint (openai-endpoints.ts)
+   * whose key or URL can change, or which can be removed, while sessions run
+   * on it. The client is rebuilt when `fingerprint` changes; a throw fails the
+   * turn with its message.
+   */
+  connection?: () => OpenAIConnection;
+  /**
+   * Send `stream_options.include_usage` (default true). Some OpenAI-compatible
+   * servers reject the field outright.
+   */
+  streamUsage?: boolean;
+  /** Output-token cap for `model`, and the field the server expects it in. */
+  maxTokens?: (model: string) => number | undefined;
+  maxTokensField?: "max_tokens" | "max_completion_tokens";
   /** Memory engine — when present, the memory recall tools are offered as
    *  function tools so the model can page the verbatim store on demand. */
   memory?: MemoryEngine;
@@ -83,12 +135,17 @@ export interface OpenAIProviderInit {
    * reported on the turn result. Only a server that can say (llama-server's
    * `/props`) passes one; without it the daemon falls back to its tables.
    */
-  contextWindow?: () => Promise<number | undefined>;
+  contextWindow?: (model: string) => Promise<number | undefined>;
   /**
    * Rewrite the tool list before it is sent, for servers stricter than
    * OpenAI's about tool schemas (llama.cpp compiles them into a grammar).
    */
   toolsTransform?: (tools: OpenAIFunctionTool[]) => OpenAIFunctionTool[];
+  /**
+   * The request fields for a thinking effort (#417). Default: OpenAI's
+   * `reasoning_effort`. A server that names it otherwise (llama.cpp) says how.
+   */
+  effortParams?: (effort: EffortLevel) => Record<string, unknown>;
 }
 
 const OPENAI_CHAT_MODEL = (id: string) =>
@@ -100,14 +157,34 @@ const OPENAI_FALLBACK_MODELS: ModelInfo[] = [
   { id: "o3-mini", displayName: "o3-mini" },
 ];
 
+/** Requests to an endpoint refuse redirects (they'd carry its headers along); say so plainly. */
+export const REDIRECT_HINT =
+  "redirected elsewhere — set the base URL to the final address (redirects aren't followed, so credentials stay with this server)";
+
+/** Is `err` — or what it wraps (the SDK's "Connection error.") — a refused redirect? */
+export function isRedirectRefusal(err: unknown): boolean {
+  let e = err as { code?: unknown; cause?: unknown } | undefined;
+  for (let depth = 0; e && depth < 4; depth++, e = e.cause as typeof e) {
+    if (e.code === "UnexpectedRedirect") return true;
+  }
+  return false;
+}
+
 export class OpenAIProvider implements AgentProvider {
   /** tool-loop runs `verdict.updatedInput ?? args` (see AgentProvider.appliesToolInputRewrite). */
   readonly appliesToolInputRewrite = true;
   readonly id: string;
   readonly displayName: string;
 
-  #client: OpenAI;
+  #client: OpenAI | null = null;
+  #clientFingerprint: string | null = null;
+  #staticConnection: { baseURL?: string; apiKey?: string };
+  #connection: OpenAIProviderInit["connection"] | null;
+  #streamUsage: boolean;
+  #maxTokens: ((model: string) => number | undefined) | null;
+  #maxTokensField: "max_tokens" | "max_completion_tokens";
   #defaultModel: string;
+  #resolveDefaultModel: (() => Promise<string | undefined>) | null;
   #memory: MemoryEngine | null;
   #workspaceId: string;
   #tenant: McpTenant | undefined;
@@ -116,17 +193,34 @@ export class OpenAIProvider implements AgentProvider {
   #mcpHub: McpHub | null;
   #modelFilter: (id: string) => boolean;
   #fallbackModels: ModelInfo[];
-  #contextWindow: (() => Promise<number | undefined>) | null;
+  #contextWindow: ((model: string) => Promise<number | undefined>) | null;
   #toolsTransform: ((tools: OpenAIFunctionTool[]) => OpenAIFunctionTool[]) | null;
+  #effortParams: (effort: EffortLevel) => Record<string, unknown>;
+  #resolveApiKey: (() => { key: string; fingerprint: string } | null) | null;
+  readonly #free: boolean | (() => boolean);
+  readonly #proveFree: (() => Promise<void>) | null;
+
+  get free(): boolean {
+    return typeof this.#free === "function" ? this.#free() : this.#free;
+  }
 
   constructor(init: OpenAIProviderInit = {}) {
     this.id = init.id ?? "openai";
+    this.#free = init.free ?? false;
+    this.#proveFree = init.proveFree ?? null;
     this.displayName = init.displayName ?? "GPT (OpenAI)";
-    this.#client = new OpenAI({
-      apiKey: init.apiKey ?? process.env.OPENAI_API_KEY ?? "missing",
+    this.#staticConnection = {
       ...(init.baseURL ? { baseURL: init.baseURL } : {}),
-    });
+      // An empty key is a deliberate "no key" (a local server), not a cue to
+      // fall back to OPENAI_API_KEY and hand the user's key to that server.
+      ...(init.apiKey !== undefined ? { apiKey: init.apiKey } : {}),
+    };
+    this.#connection = init.connection ?? null;
+    this.#streamUsage = init.streamUsage ?? true;
+    this.#maxTokens = init.maxTokens ?? null;
+    this.#maxTokensField = init.maxTokensField ?? "max_tokens";
     this.#defaultModel = init.defaultModel ?? "gpt-4o";
+    this.#resolveDefaultModel = init.resolveDefaultModel ?? null;
     this.#memory = init.memory ?? null;
     this.#workspaceId = init.workspaceId ?? init.sessionId ?? "";
     this.#tenant = init.tenant;
@@ -137,6 +231,60 @@ export class OpenAIProvider implements AgentProvider {
     this.#fallbackModels = init.fallbackModels ?? OPENAI_FALLBACK_MODELS;
     this.#contextWindow = init.contextWindow ?? null;
     this.#toolsTransform = init.toolsTransform ?? null;
+    this.#effortParams = init.effortParams ?? openAIEffortParams;
+    this.#resolveApiKey = init.resolveApiKey ?? null;
+  }
+
+  /**
+   * The client for this turn. With a `connection` resolver it is rebuilt
+   * whenever the endpoint's URL, key or headers changed since the last turn;
+   * otherwise it is built once from the static options.
+   */
+  #clientForTurn(): { client: OpenAI; conn: OpenAIConnection | null } {
+    if (!this.#connection) {
+      // An account's key, when the session has one; rebuilt when it changes.
+      const account = this.#resolveApiKey?.() ?? null;
+      const fingerprint = account?.fingerprint ?? "";
+      if (this.#client && this.#clientFingerprint !== fingerprint) this.#client = null;
+      this.#clientFingerprint = fingerprint;
+      if (account) {
+        this.#client ??= new OpenAI({
+          apiKey: account.key,
+          ...(this.#staticConnection.baseURL ? { baseURL: this.#staticConnection.baseURL } : {}),
+          organization: null,
+          project: null,
+        });
+        return { client: this.#client, conn: null };
+      }
+      this.#client ??= new OpenAI({
+        // "" = keyless (the SDK refuses an empty key; a local server ignores the header).
+        apiKey:
+          this.#staticConnection.apiKey === "" ? "not-needed" : (this.#staticConnection.apiKey ?? process.env.OPENAI_API_KEY ?? "missing"),
+        ...(this.#staticConnection.baseURL ? { baseURL: this.#staticConnection.baseURL } : {}),
+      });
+      return { client: this.#client, conn: null };
+    }
+    const conn = this.#connection();
+    if (!this.#client || this.#clientFingerprint !== conn.fingerprint) {
+      // A keyless endpoint sends no Authorization at all (as /models does): the
+      // SDK needs a non-empty key, so its header is dropped (null removes it),
+      // unless the user set their own — a gateway may reject a bogus Bearer.
+      const ownAuth = Object.keys(conn.headers ?? {}).some((h) => h.toLowerCase() === "authorization");
+      const headers = { ...(conn.apiKey === undefined && !ownAuth ? { Authorization: null } : {}), ...conn.headers };
+      this.#client = new OpenAI({
+        apiKey: conn.apiKey ?? "not-needed",
+        baseURL: conn.baseURL,
+        // Never the daemon's OPENAI_ORG_ID / OPENAI_PROJECT_ID: this is someone else's server.
+        organization: null,
+        project: null,
+        ...(Object.keys(headers).length > 0 ? { defaultHeaders: headers } : {}),
+        // A redirect would carry custom auth headers (x-api-key, api-key) to
+        // wherever it points — fetch strips only Authorization cross-origin.
+        fetchOptions: { redirect: "error" },
+      });
+      this.#clientFingerprint = conn.fingerprint;
+    }
+    return { client: this.#client, conn };
   }
 
   /** The memory recall tools are offered whenever a memory engine is wired,
@@ -167,9 +315,15 @@ export class OpenAIProvider implements AgentProvider {
     ac: AbortController,
     startMs: number,
   ): Promise<void> {
-    const model = opts.model ?? this.#defaultModel;
+    let model = opts.model ?? this.#defaultModel;
 
     try {
+      await this.#proveFree?.().catch(() => undefined);
+      if (!opts.model && this.#resolveDefaultModel) model = (await this.#resolveDefaultModel()) ?? this.#defaultModel;
+      const { client, conn } = this.#clientForTurn();
+      const maxTokens = this.#maxTokens?.(model);
+      const streamUsage = conn?.streamUsage ?? this.#streamUsage;
+      const maxTokensField = conn?.maxTokensField ?? this.#maxTokensField;
       const { chatHistory, userMessage } = splitForStateless(opts);
 
       // Build the messages array: system prompt + chat history + current user turn.
@@ -221,6 +375,8 @@ export class OpenAIProvider implements AgentProvider {
 
       let finalText = "";
       let inputTokens = 0;
+      let cacheReadTokens = 0;
+      let largestPrompt = 0;
       let outputTokens = 0;
       let stopReason: string | undefined;
 
@@ -230,16 +386,53 @@ export class OpenAIProvider implements AgentProvider {
       // must answer. A no-memory turn runs exactly one round (tools undefined).
       for (let round = 0; ; round++) {
         const offerTools = tools && round < MAX_MEMORY_TOOL_ROUNDS;
-        const stream = await this.#client.chat.completions.create(
+        // The request counts once the server takes it (#430) — a refusal (a bad
+        // key, an unknown model, an outage) spent nothing; one stopped while
+        // pending may have.
+        const spent = () => {
+          try {
+            queue.push({ type: "model_request" });
+          } catch {
+            // The turn's queue already closed.
+          }
+        };
+        let stream!: Awaited<ReturnType<typeof client.chat.completions.create>>;
+        // No silent SDK retries: each attempt may be billed (a gateway that
+        // fails after the upstream answered), and a retried request would be
+        // counted once (#430). A rate limit is refused before any work, so it
+        // alone is retried here — counted as unsent each time.
+        for (let attempt = 0; ; attempt++) {
+        try {
+          stream = await client.chat.completions.create(
           {
             model,
             messages,
             stream: true,
-            stream_options: { include_usage: true },
+            ...(streamUsage ? { stream_options: { include_usage: true } } : {}),
+            ...(maxTokens ? { [maxTokensField]: maxTokens } : {}),
             ...(offerTools ? { tools } : {}),
+            // Thinking effort (#417): a model that doesn't reason rejects it, and the turn says so.
+            ...(opts.effort ? this.#effortParams(opts.effort) : {}),
           },
-          { signal: ac.signal },
-        );
+          { signal: ac.signal, maxRetries: 0 },
+          );
+          break;
+        } catch (err) {
+          // Only a refusal before any work is unsent: anything else (a 5xx, a
+          // timeout, a reset — say a gateway that fails after the upstream
+          // request was billed) may have spent (#430).
+          if (ac.signal.aborted || !isRefusal(err)) spent();
+          if (!ac.signal.aborted && (err as { status?: number })?.status === 429 && attempt < RATE_LIMIT_RETRIES) {
+            await new Promise((r) => setTimeout(r, 1_000 * 2 ** attempt));
+            if (ac.signal.aborted) return;
+            continue;
+          }
+          throw err;
+        }
+        }
+        spent();
+        // The request's usage, from its usage chunks.
+        let roundUsage: RoundUsage | null = null;
 
         let roundText = "";
         // OpenAI streams tool_calls as indexed deltas — accumulate by index.
@@ -266,13 +459,29 @@ export class OpenAIProvider implements AgentProvider {
             if (tc.function?.name) slot.name = tc.function.name;
             if (tc.function?.arguments) slot.args += tc.function.arguments;
           }
-          if (chunk.usage) {
-            inputTokens += chunk.usage.prompt_tokens ?? 0;
-            outputTokens += chunk.usage.completion_tokens ?? 0;
-          }
+          // Field by field, the largest seen: right for a server that repeats it
+          // cumulatively and for one that splits it across chunks (#430).
+          if (chunk.usage) roundUsage = mergeUsage(roundUsage, chunk.usage as unknown as RoundUsage);
           if (choice?.finish_reason) finish = choice.finish_reason;
         }
         if (ac.signal.aborted) return;
+        if (roundUsage) {
+          // prompt_tokens includes the cached ones; split them out (#430), as
+          // the other backends report them, so each is priced at its rate.
+          const cached = roundUsage.prompt_tokens_details?.cached_tokens ?? 0;
+          const usage = {
+            inputTokens: Math.max(0, (roundUsage.prompt_tokens ?? 0) - cached),
+            cacheReadTokens: cached,
+            cacheCreationTokens: 0,
+            outputTokens: roundUsage.completion_tokens ?? 0,
+          };
+          inputTokens += usage.inputTokens;
+          cacheReadTokens += cached;
+          outputTokens += usage.outputTokens;
+          largestPrompt = Math.max(largestPrompt, roundUsage.prompt_tokens ?? 0);
+          // This request's own usage, once, so a turn that ends mid-loop is still counted.
+          queue.push({ type: "llm_call", isPrimary: true, usage });
+        }
         if (chunks === 0) {
           // A stream that ends before its first chunk is a failure the server
           // reported in a form the client could not parse: llama-server sends
@@ -331,7 +540,7 @@ export class OpenAIProvider implements AgentProvider {
 
       // Best-effort: a window the server can't report leaves the daemon on its
       // tables, which is where it would have been anyway.
-      const contextWindow = await this.#contextWindow?.().catch(() => undefined);
+      const contextWindow = await this.#contextWindow?.(model).catch(() => undefined);
 
       queue.push({ type: "text_done", content: finalText });
 
@@ -340,9 +549,11 @@ export class OpenAIProvider implements AgentProvider {
         model,
         inputTokens,
         outputTokens,
-        cacheReadTokens: 0,
+        cacheReadTokens,
         cacheCreationTokens: 0,
-        totalCostUsd: 0, // OpenAI does not return cost in the streaming response.
+        totalCostUsd: 0, // no cost in the response: the session prices the tokens (#430)
+        ...(largestPrompt > 0 ? { largestPromptTokens: largestPrompt } : {}),
+        ...(this.free ? { costSource: "free" as const } : {}),
         durationMs: Date.now() - startMs,
         stopReason,
         ...(contextWindow !== undefined && contextWindow > 0 ? { contextWindow } : {}),
@@ -351,9 +562,10 @@ export class OpenAIProvider implements AgentProvider {
       queue.push({ type: "turn_done", result });
     } catch (err) {
       if (!ac.signal.aborted) {
+        const text = isRedirectRefusal(err) ? `the server ${REDIRECT_HINT}` : err instanceof Error ? err.message : String(err);
         queue.push({
           type: "error",
-          message: `${this.displayName}: ${err instanceof Error ? err.message : String(err)}`,
+          message: `${this.displayName}: ${text}${opts.effort ? effortRejectionHint(text, opts.effort) : ""}`,
         });
       }
     } finally {
@@ -363,7 +575,7 @@ export class OpenAIProvider implements AgentProvider {
 
   async listModels(): Promise<ModelInfo[]> {
     try {
-      const resp = await this.#client.models.list();
+      const resp = await this.#clientForTurn().client.models.list();
       return resp.data
         .filter((m) => this.#modelFilter(m.id))
         // A local server names its model by the file it loaded; the path is
@@ -377,4 +589,39 @@ export class OpenAIProvider implements AgentProvider {
   async dispose(): Promise<void> {
     // Stateless — nothing to tear down.
   }
+}
+
+/** OpenAI's reasoning effort for codeoid's scale (#417): Off is "none"; it has nothing above XHigh, so Max is XHigh. */
+export function openAIEffortParams(effort: EffortLevel): Record<string, unknown> {
+  return { reasoning_effort: effort === "off" ? "none" : effort === "max" ? "xhigh" : effort };
+}
+
+/** Retries of a rate-limited request (#430): refused before any work, so unbilled. */
+const RATE_LIMIT_RETRIES = 2;
+
+/** Two usage chunks of one request, field by field, the larger of each. */
+function mergeUsage(a: RoundUsage | null, b: RoundUsage): RoundUsage {
+  const max = (x?: number, y?: number) => (x === undefined ? y : y === undefined ? x : Math.max(x, y));
+  return {
+    prompt_tokens: max(a?.prompt_tokens, b.prompt_tokens),
+    completion_tokens: max(a?.completion_tokens, b.completion_tokens),
+    prompt_tokens_details: { cached_tokens: max(a?.prompt_tokens_details?.cached_tokens, b.prompt_tokens_details?.cached_tokens) },
+  };
+}
+
+/** A completion request's usage, as the stream reports it. */
+interface RoundUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  prompt_tokens_details?: { cached_tokens?: number };
+}
+
+/**
+ * A request the server refused before doing any work (#430): a client error
+ * it answered at once — bad request, bad key, forbidden, no such model,
+ * unprocessable, rate limited. Anything else may have been billed.
+ */
+function isRefusal(err: unknown): boolean {
+  const status = (err as { status?: unknown } | null)?.status;
+  return typeof status === "number" && [400, 401, 403, 404, 422, 429].includes(status);
 }

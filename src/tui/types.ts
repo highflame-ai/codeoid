@@ -7,7 +7,7 @@
  * pending approval).
  */
 
-import type { SessionInfo, SessionMessage, ToolState } from "../protocol/types.js";
+import type { ProviderInfo, SessionInfo, SessionMessage, ToolState } from "../protocol/types.js";
 
 /** UI-facing session state — derived from daemon events. */
 export interface TuiSession {
@@ -32,11 +32,14 @@ export interface TuiSession {
     approvalId: string;
     toolName: string;
     description: string;
+    /** A shell command's risk, said in the prompt (#431). */
+    risk?: string;
   } | null;
 }
 
 /** Top-level TUI state. */
 export interface TuiState {
+  providers: ProviderInfo[];
   /** All sessions by id. */
   sessions: Map<string, TuiSession>;
   /** Ordered list of session ids for rendering. */
@@ -67,10 +70,23 @@ export type ModalState =
   | { kind: "confirm-destroy"; sessionId: string }
   | { kind: "help" }
   | { kind: "search"; query: string }
-  | { kind: "model" };
+  /** `/loops`: the owner's loop runs, opened on one when `runId` is given. */
+  | { kind: "loops"; runId?: string }
+  /**
+   * Backend pickers carry the session they were opened for, so a focus
+   * change while one is open (reconnect, sessions.set) cannot retarget it.
+   */
+  | { kind: "model" | "provider" | "effort"; sessionId: string }
+  /**
+   * The account picker also carries the backend whose accounts it lists: if
+   * the session moves to another backend while it is open, it closes rather
+   * than quietly offering (or applying) another backend's accounts.
+   */
+  | { kind: "account"; sessionId: string; backend: string };
 
 /** UI action type — reducer fan-in. */
 export type TuiAction =
+  | { type: "providers.set"; providers: ProviderInfo[] }
   | { type: "connection.change"; state: TuiState["connection"] }
   | { type: "error"; message: string }
   | { type: "sessions.set"; sessions: SessionInfo[] }

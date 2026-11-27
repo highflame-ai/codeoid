@@ -9,18 +9,19 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../daemon/store.js";
-import { McpOAuth, type McpTenant } from "../daemon/mcp/oauth.js";
+import { McpOAuth, type McpTenant, withSlot } from "../daemon/mcp/oauth.js";
 import type { McpServerSpec } from "../daemon/mcp/types.js";
 import { McpHub } from "../daemon/mcp/hub.js";
 import { McpRegistry } from "../daemon/mcp/registry.js";
 import { SessionManager } from "../daemon/session-manager.js";
 import { TranscriptStore } from "../daemon/transcript.js";
 import { registryServersForClaude } from "../daemon/providers/claude/index.js";
-import { registryServersForQwen } from "../daemon/providers/qwen/index.js";
+import { proxiedServersForQwen, registryServersForQwen } from "../daemon/providers/qwen/index.js";
+import { McpProxy, McpProxyLease } from "../daemon/mcp/proxy.js";
 import { SCOPES } from "../protocol/scopes.js";
 import type { McpServerStatus } from "../protocol/types.js";
 import type { RawMcpServerConfig } from "../config.js";
-import { FakeOAuthMcp } from "./fixtures/fake-oauth-mcp.js";
+import { FAKE_TOOL_NAMES, FakeOAuthMcp } from "./fixtures/fake-oauth-mcp.js";
 
 const TENANT: McpTenant = { accountId: "acc-1", projectId: "proj-1" };
 const OTHER: McpTenant = { accountId: "acc-2", projectId: "proj-2" };
@@ -104,8 +105,13 @@ describe("connecting", () => {
     expect(token).toBeTruthy();
     const call = await fetch(fake.mcpUrl, {
       method: "POST",
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "whoami", arguments: {} } }),
+      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "t", version: "1" } },
+      }),
     });
     expect(call.status).toBe(200);
   });
@@ -333,11 +339,12 @@ describe("the hub calls an OAuth server with the tenant's token", () => {
     const s = spec();
     await connect(oauth, s);
     const hub = new McpHub({ credentials: oauth });
-    expect((await hub.listTools(s, scope(TENANT))).map((t) => t.name)).toEqual(["whoami"]);
+    expect((await hub.listTools(s, scope(TENANT))).map((t) => t.name)).toEqual([...FAKE_TOOL_NAMES]);
     const res = await hub.callTool(s, "whoami", {}, scope(TENANT));
     expect(res).toEqual({ text: "you are user-1", isError: false });
     // The upstream session id the server issued is carried on later requests.
-    expect(fake.lastMcpHeaders?.get("mcp-session-id")).toBe("fake-session-1");
+    expect(fake.lastMcpHeaders?.get("mcp-session-id")).toMatch(/^[0-9a-f]{16}$/);
+    expect(fake.openSessions).toBe(1);
     hub.closeAll();
   });
 
@@ -403,6 +410,16 @@ describe("native-mount backends", () => {
     expect(reg.forNativeMount("gemini-cli").map((s) => s.name)).toEqual(["plain"]);
     // The daemon-owned client still sees it.
     expect(reg.forBackend("openai").map((s) => s.name)).toEqual(["notes", "plain"]);
+  });
+
+  it("qwen gets OAuth servers through the relay, with the proxy token as a header (#396)", () => {
+    const reg = new McpRegistry({ notes: raw({ url: "https://notes.example.com/mcp", oauth: true }) }, { memoryEnabled: false });
+    const proxy = new McpProxy({ registry: reg, credentials: null, baseUrl: () => "http://127.0.0.1:7400" });
+    const lease = new McpProxyLease(proxy, { tenant: TENANT, sessionId: "s1", backendId: "qwen" });
+    const servers = proxiedServersForQwen(lease) as Record<string, { httpUrl: string; headers: Record<string, string> }>;
+    expect(servers.notes?.httpUrl).toBe(proxy.url("notes"));
+    expect(servers.notes?.headers.Authorization).toMatch(/^Bearer \S{40,}$/);
+    expect(proxiedServersForQwen(new McpProxyLease(proxy, null))).toEqual({}); // no tenant, nothing mounted
   });
 });
 
@@ -472,7 +489,7 @@ describe("mcp.oauth.* through the session manager", () => {
     };
     expect(statusOf(before.snapshot, "notes")?.oauth).toEqual({
       status: "disconnected",
-      unsupportedBackends: ["codex", "gemini-cli", "qwen"], // claude reaches it through codeoid (#390)
+      unsupportedBackends: [], // claude through codeoid (#390), codex / gemini-cli / qwen through the relay (#396)
     });
     expect(statusOf(before.snapshot, "plain")?.oauth).toBeUndefined();
 
@@ -527,7 +544,7 @@ describe("mcp.oauth.* through the session manager", () => {
         }).snapshot,
         "notes",
       );
-    expect(await get(TENANT)).toMatchObject({ health: "connected", tools: ["whoami"] });
+    expect(await get(TENANT)).toMatchObject({ health: "connected", tools: [...FAKE_TOOL_NAMES] });
     expect(await get(OTHER)).toMatchObject({ health: "idle", tools: [] });
     hub.closeAll();
   });
@@ -604,10 +621,55 @@ describe("credential binding and limits", () => {
     await connect(oauth, s, TENANT);
     const hub = new McpHub({ credentials: oauth });
     await hub.listTools(s, { workspaceId: "w", sessionId: "s", tenant: TENANT });
-    expect(hub.statusFor("notes", TENANT)?.tools).toEqual(["whoami"]);
+    expect(hub.statusFor("notes", TENANT)?.tools).toEqual([...FAKE_TOOL_NAMES]);
     expect(hub.hasClient("notes", TENANT)).toBe(true);
     expect(hub.statusFor("notes", OTHER)).toBeUndefined();
     expect(hub.hasClient("notes", OTHER)).toBe(false);
     hub.closeAll();
   });
 });
+
+describe("credential slots: a second sign-in to one server (workstreams §6.5 case 2)", () => {
+  it("each slot signs in, stays signed in and signs out on its own; a completion lands in the slot it began for", async () => {
+    fake = new FakeOAuthMcp();
+    const oauth = engine();
+    const base = spec();
+    const work = withSlot(base, "work");
+    await connect(oauth, base);
+    expect(oauth.status(base, TENANT)).toBe("connected");
+    expect(oauth.status(work, TENANT)).toBe("disconnected");
+    // complete() resolves the BASE spec by name; the pending sign-in carries the slot.
+    const begun = await oauth.begin(work, TENANT);
+    if (begun.status !== "redirect") throw new Error("expected a redirect");
+    const done = await oauth.complete({ callbackUrl: await signIn(begun.url) }, { tenant: TENANT }, () => base);
+    expect(done.slot).toBe("work");
+    expect(oauth.status(work, TENANT)).toBe("connected");
+    expect(await oauth.accessToken(work, TENANT)).not.toBe(await oauth.accessToken(base, TENANT));
+    oauth.disconnect(work, TENANT);
+    expect(oauth.status(work, TENANT)).toBe("disconnected");
+    expect(oauth.status(base, TENANT)).toBe("connected");
+  });
+});
+
+describe("the slot migration", () => {
+  it("rebuilds an old table once, every row becoming the default slot", () => {
+    const { Database } = require("bun:sqlite") as typeof import("bun:sqlite");
+    const path = join(tmp, "old.db");
+    const db = new Database(path);
+    db.exec(`CREATE TABLE mcp_oauth_credentials (
+      account_id TEXT NOT NULL, project_id TEXT NOT NULL, server TEXT NOT NULL, server_url TEXT NOT NULL,
+      client_json TEXT, tokens_json TEXT, tokens_saved_at INTEGER, updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY (account_id, project_id, server, server_url));
+      INSERT INTO mcp_oauth_credentials (account_id, project_id, server, server_url, tokens_json) VALUES ('acc-1', 'proj-1', 'notes', 'https://n/mcp', '{"access_token":"t"}');`);
+    db.close();
+    const migrated = new Store(path);
+    expect(migrated.getMcpOAuthCredential(TENANT, { name: "notes", url: "https://n/mcp" })?.tokens).toEqual({ access_token: "t" });
+    expect(migrated.getMcpOAuthCredential(TENANT, { name: "notes", url: "https://n/mcp", slot: "work" })).toBeUndefined();
+    migrated.saveMcpOAuthTokens(TENANT, { name: "notes", url: "https://n/mcp", slot: "work" }, { access_token: "w" }, 1);
+    expect(migrated.getMcpOAuthCredential(TENANT, { name: "notes", url: "https://n/mcp" })?.tokens).toEqual({ access_token: "t" });
+    migrated.close();
+    // A second open is a no-op.
+    new Store(path).close();
+  });
+});
+

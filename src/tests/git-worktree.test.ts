@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import {
+  applyCarriedState,
   createForkWorktree,
   currentBranch,
   isGitRepo,
@@ -58,6 +59,37 @@ describe("validateBranchName", () => {
 });
 
 describe("createForkWorktree", () => {
+  it("deferCarry: a clean checkout first, then applyCarriedState brings edits, deletions and staged files — untracked ones untouched", async () => {
+    writeFileSync(join(repo, "gone.txt"), "x\n");
+    await g(["add", "gone.txt"], repo);
+    await g(["commit", "-m", "gone"], repo);
+    writeFileSync(join(repo, "file.txt"), "committed\nWIP edit\n");
+    rmSync(join(repo, "gone.txt"));
+    writeFileSync(join(repo, "staged.txt"), "new\n");
+    await g(["add", "staged.txt"], repo);
+    const parentStatus = await g(["status", "--porcelain"], repo);
+
+    const wt = await createForkWorktree({ workdir: repo, label: "defer", shortId: "d1", deferCarry: true });
+    expect(wt.carry).toBeDefined();
+    expect(readFileSync(join(wt.path, "file.txt"), "utf8")).toBe("committed\n");
+    expect(existsSync(join(wt.path, "gone.txt"))).toBe(true);
+    writeFileSync(join(wt.path, "setup-made.txt"), "untracked\n");
+
+    await applyCarriedState(wt.path, wt.carry!);
+    expect(readFileSync(join(wt.path, "file.txt"), "utf8")).toBe("committed\nWIP edit\n");
+    expect(existsSync(join(wt.path, "gone.txt"))).toBe(false);
+    expect(readFileSync(join(wt.path, "staged.txt"), "utf8")).toBe("new\n");
+    expect(readFileSync(join(wt.path, "setup-made.txt"), "utf8")).toBe("untracked\n");
+    expect(await g(["rev-parse", "HEAD"], wt.path)).toBe(await g(["rev-parse", "HEAD"], repo));
+    // The parent is untouched.
+    expect(await g(["status", "--porcelain"], repo)).toBe(parentStatus);
+  });
+
+  it("deferCarry on a clean parent carries nothing", async () => {
+    const wt = await createForkWorktree({ workdir: repo, label: "defer", shortId: "d2", deferCarry: true });
+    expect(wt.carry).toBeUndefined();
+  });
+
   it("carries the parent's UNCOMMITTED tracked edit into an isolated worktree, parent untouched", async () => {
     // Parent has a dirty tracked edit.
     writeFileSync(join(repo, "file.txt"), "committed\nWIP edit\n");

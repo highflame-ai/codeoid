@@ -16,10 +16,13 @@
  */
 
 import type { McpTenant } from "../../mcp/oauth.js";
+import type { EffortLevel } from "../../../protocol/types.js";
+import { effortRejectionHint } from "../effort.js";
 import {
   GoogleGenerativeAI,
   type FunctionDeclaration,
   type GenerateContentStreamResult,
+  type GenerationConfig,
   type Part,
 } from "@google/generative-ai";
 import { AsyncQueue } from "../../async-queue.js";
@@ -44,12 +47,14 @@ import {
   memoryToolsAsGemini,
 } from "../tool-loop.js";
 import { SessionMcpTools } from "../../mcp/tool-source.js";
-import type { McpRegistry } from "../../mcp/registry.js";
+import type { McpServerView } from "../../mcp/registry.js";
 import type { McpHub } from "../../mcp/hub.js";
 
 export interface GeminiProviderInit {
   /** Explicit API key — falls back to GOOGLE_API_KEY env var. */
   apiKey?: string;
+  /** The session's account, per turn (accounts.ts): its key replaces `apiKey`. A throw fails the turn. */
+  resolveApiKey?: () => { key: string; fingerprint: string } | null;
   /** Model to use when TurnOpts.model is absent. */
   defaultModel?: string;
   /** Memory engine — when present, the memory recall tools are offered as
@@ -62,9 +67,18 @@ export interface GeminiProviderInit {
   sessionId?: string;
   /** Cross-backend MCP registry + daemon-owned client — external servers reach
    *  this backend (which has no MCP client) through the hub. */
-  mcpRegistry?: McpRegistry;
+  mcpRegistry?: McpServerView;
   mcpHub?: McpHub;
 }
+
+/** The Gemini API models the picker offers (#430: every one has a price in the snapshot). */
+export const GEMINI_MODELS: ReadonlyArray<{ id: string; displayName: string }> = [
+  { id: "gemini-3.5-flash", displayName: "Gemini 3.5 Flash" },
+  { id: "gemini-2.5-pro", displayName: "Gemini 2.5 Pro" },
+  { id: "gemini-2.5-flash", displayName: "Gemini 2.5 Flash" },
+  { id: "gemini-2.5-flash-lite", displayName: "Gemini 2.5 Flash-Lite" },
+];
+export const GEMINI_DEFAULT_MODEL = "gemini-2.5-flash";
 
 export class GeminiProvider implements AgentProvider {
   /** tool-loop runs `verdict.updatedInput ?? args` (see AgentProvider.appliesToolInputRewrite). */
@@ -73,17 +87,20 @@ export class GeminiProvider implements AgentProvider {
   readonly displayName = "Gemini (Google)";
 
   #apiKey: string;
+  #resolveApiKey: (() => { key: string; fingerprint: string } | null) | null;
   #defaultModel: string;
   #memory: MemoryEngine | null;
   #workspaceId: string;
   #tenant: McpTenant | undefined;
   #sessionId: string;
-  #mcpRegistry: McpRegistry | null;
+  #mcpRegistry: McpServerView | null;
   #mcpHub: McpHub | null;
 
   constructor(init: GeminiProviderInit = {}) {
     this.#apiKey = init.apiKey ?? process.env.GOOGLE_API_KEY ?? "";
-    this.#defaultModel = init.defaultModel ?? "gemini-2.0-flash";
+    this.#resolveApiKey = init.resolveApiKey ?? null;
+    // A current, priced model (#430): 2.0 and 1.5 are retired, and their turns couldn't be priced.
+    this.#defaultModel = init.defaultModel ?? GEMINI_DEFAULT_MODEL;
     this.#memory = init.memory ?? null;
     this.#workspaceId = init.workspaceId ?? init.sessionId ?? "";
     this.#tenant = init.tenant;
@@ -144,7 +161,7 @@ export class GeminiProvider implements AgentProvider {
     startMs: number,
   ): Promise<void> {
     const model = opts.model ?? this.#defaultModel;
-    const genAI = new GoogleGenerativeAI(this.#apiKey);
+    const genAI = new GoogleGenerativeAI(this.#resolveApiKey?.()?.key ?? this.#apiKey);
     // Tools offered: the memory tools when a memory engine is wired, plus the
     // ask-user tool when the session can raise dialogs. With neither this stays
     // the plain single-call text path (unchanged behavior).
@@ -179,6 +196,11 @@ export class GeminiProvider implements AgentProvider {
       ...(declarations.length > 0
         ? { tools: [{ functionDeclarations: declarations as unknown as FunctionDeclaration[] }] }
         : {}),
+      // Thinking effort (#417). This SDK predates `thinkingConfig` in its
+      // types but sends generationConfig as given; the API reads it.
+      ...(opts.effort && geminiThinkingConfig(model, opts.effort)
+        ? { generationConfig: { thinkingConfig: geminiThinkingConfig(model, opts.effort) } as GenerationConfig }
+        : {}),
     });
 
     try {
@@ -196,6 +218,8 @@ export class GeminiProvider implements AgentProvider {
 
       let finalText = "";
       let inputTokens = 0;
+      let cacheReadTokens = 0;
+      let largestPrompt = 0;
       let outputTokens = 0;
       let stopReason: string | undefined;
       // First message is the user turn; later rounds send functionResponse parts.
@@ -206,13 +230,28 @@ export class GeminiProvider implements AgentProvider {
       // a runaway/cost guard. A no-memory turn ends after one round (no calls).
       for (let round = 0; ; round++) {
         let streamResult: GenerateContentStreamResult;
+        // The request counts once the API takes it (#430): a refusal spent
+        // nothing; one stopped while pending may have.
+        const spent = () => {
+          try {
+            queue.push({ type: "model_request" });
+          } catch {
+            // The turn's queue already closed.
+          }
+        };
         try {
           streamResult = await chat.sendMessageStream(message, { signal: ac.signal });
+          spent();
         } catch (err) {
-          if (ac.signal.aborted) return;
+          if (ac.signal.aborted) {
+            spent();
+            return;
+          }
+          // Only a refusal before any work is unsent; a 5xx or a reset may have spent (#430).
+          if (!isRefusal(err)) spent();
           queue.push({
             type: "error",
-            message: `Gemini API error: ${err instanceof Error ? err.message : String(err)}`,
+            message: `Gemini API error: ${err instanceof Error ? err.message : String(err)}${opts.effort ? effortRejectionHint(err instanceof Error ? err.message : String(err), opts.effort) : ""}`,
           });
           return;
         }
@@ -229,8 +268,27 @@ export class GeminiProvider implements AgentProvider {
         if (ac.signal.aborted) return;
 
         const response = await streamResult.response;
-        inputTokens += response.usageMetadata?.promptTokenCount ?? 0;
-        outputTokens += response.usageMetadata?.candidatesTokenCount ?? 0;
+        // Cached prompt tokens are priced apart, and thinking tokens are billed as output (#430).
+        const usage = response.usageMetadata as
+          | { promptTokenCount?: number; candidatesTokenCount?: number; cachedContentTokenCount?: number; thoughtsTokenCount?: number }
+          | undefined;
+        const cached = usage?.cachedContentTokenCount ?? 0;
+        inputTokens += Math.max(0, (usage?.promptTokenCount ?? 0) - cached);
+        largestPrompt = Math.max(largestPrompt, usage?.promptTokenCount ?? 0);
+        // This request's own usage, so a turn that ends mid-loop is still counted
+        // (#430) — only when the API sent it: zeros would hide what it spent.
+        if (usage) queue.push({
+          type: "llm_call",
+          isPrimary: true,
+          usage: {
+            inputTokens: Math.max(0, (usage?.promptTokenCount ?? 0) - cached),
+            cacheReadTokens: cached,
+            cacheCreationTokens: 0,
+            outputTokens: (usage?.candidatesTokenCount ?? 0) + (usage?.thoughtsTokenCount ?? 0),
+          },
+        });
+        cacheReadTokens += cached;
+        outputTokens += (usage?.candidatesTokenCount ?? 0) + (usage?.thoughtsTokenCount ?? 0);
         finalText = roundText;
         stopReason = response.candidates?.[0]?.finishReason
           ? String(response.candidates[0].finishReason)
@@ -267,9 +325,10 @@ export class GeminiProvider implements AgentProvider {
         model,
         inputTokens,
         outputTokens,
-        cacheReadTokens: 0,
+        cacheReadTokens,
         cacheCreationTokens: 0,
-        totalCostUsd: 0, // Gemini does not return cost in the API response.
+        totalCostUsd: 0, // no cost in the response: the session prices the tokens (#430)
+        ...(largestPrompt > 0 ? { largestPromptTokens: largestPrompt } : {}),
         durationMs: Date.now() - startMs,
         stopReason,
       };
@@ -291,12 +350,7 @@ export class GeminiProvider implements AgentProvider {
     // Gemini's REST model-list endpoint requires a separate authenticated call.
     // Return a static list of well-known models; this is enough for the
     // session model-picker UI and can be replaced with a live fetch in Phase 2.
-    return [
-      { id: "gemini-2.0-flash", displayName: "Gemini 2.0 Flash" },
-      { id: "gemini-2.0-flash-lite", displayName: "Gemini 2.0 Flash Lite" },
-      { id: "gemini-1.5-pro", displayName: "Gemini 1.5 Pro" },
-      { id: "gemini-1.5-flash", displayName: "Gemini 1.5 Flash" },
-    ];
+    return GEMINI_MODELS.map((m) => ({ ...m, ...(m.id === this.#defaultModel ? { isDefault: true } : {}) }));
   }
 
   async dispose(): Promise<void> {
@@ -331,4 +385,32 @@ export function splitForStateless(opts: TurnOpts): {
     chatHistory: history,
     userMessage: opts.userMessage,
   };
+}
+
+/**
+ * A thinking effort as Gemini's thinkingConfig (#417), by model family.
+ * 2.5 models take a token budget: 0 turns thinking off, except on Pro (its
+ * floor is 128); Flash-Lite thinks from 512; Flash and Flash-Lite stop at
+ * 24576. 3.x models take a level — Pro only Low and High, Flash also Minimal
+ * and Medium. Other models don't think: nothing is sent.
+ */
+export function geminiThinkingConfig(model: string, effort: EffortLevel): Record<string, unknown> | null {
+  if (/gemini-2\.5/.test(model)) {
+    const pro = /pro/.test(model);
+    // From Minimal up every budget is at least 512, Flash-Lite's floor.
+    const budgets: Record<EffortLevel, number> = { off: 0, minimal: 512, low: 2048, medium: 8192, high: 16384, xhigh: 24576, max: 32768 };
+    return { thinkingBudget: Math.min(Math.max(budgets[effort], pro ? 128 : 0), pro ? 32768 : 24576) };
+  }
+  if (/gemini-3/.test(model)) {
+    if (/pro/.test(model)) return { thinkingLevel: effort === "off" || effort === "minimal" || effort === "low" ? "low" : "high" };
+    const level = effort === "off" || effort === "minimal" ? "minimal" : effort === "low" ? "low" : effort === "medium" ? "medium" : "high";
+    return { thinkingLevel: level };
+  }
+  return null;
+}
+
+/** A request the API refused before doing any work (#430): a client error it answered at once. */
+function isRefusal(err: unknown): boolean {
+  const status = (err as { status?: unknown } | null)?.status;
+  return typeof status === "number" && [400, 401, 403, 404, 422, 429].includes(status);
 }

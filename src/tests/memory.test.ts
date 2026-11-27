@@ -372,7 +372,10 @@ describe("workspace-id migration (re-key legacy episodes to tenant)", () => {
     store.close();
   });
 
-  it("recovers an orphan (destroyed session) only when its workspace is single-tenant", () => {
+  it("leaves orphans (destroyed sessions) on their old id, even in a directory one surviving tenant uses", () => {
+    // Surviving sessions cannot prove who owned a destroyed one: tenant B may
+    // have used soloDir and been destroyed, which a single-tenant check would
+    // misread as A's. Orphans stay unowned and invisible to cross-tenant reads.
     const store = new SqliteEpisodeStore(dbPath);
     const soloDir = "/tmp/solo-proj";
     const sharedDir = "/tmp/shared-proj";
@@ -381,14 +384,15 @@ describe("workspace-id migration (re-key legacy episodes to tenant)", () => {
 
     store.migrateWorkspaceIdsToTenant(
       [
-        sess("s-solo", soloDir, TENANT_A), // single tenant → orphan recovered
-        sess("s-shared-a", sharedDir, TENANT_A), // two tenants on sharedDir →
-        sess("s-shared-b", sharedDir, TENANT_B), // ambiguous → orphan left alone
+        sess("s-solo", soloDir, TENANT_A),
+        sess("s-shared-a", sharedDir, TENANT_A),
+        sess("s-shared-b", sharedDir, TENANT_B),
       ],
       workspaceIdFromPath,
     );
 
-    expect(store.listRecent(workspaceIdFromPath(soloDir, TENANT_A), 10).map((e) => e.id)).toContain(soloOrphan.id);
+    expect(store.listRecent(workspaceIdFromPath(soloDir, TENANT_A), 10).map((e) => e.id)).not.toContain(soloOrphan.id);
+    expect(store.getEpisode(soloOrphan.id)!.workspaceId).toBe(legacyWorkspaceIdFromPath(soloDir));
     expect(store.getEpisode(sharedOrphan.id)!.workspaceId).toBe(legacyWorkspaceIdFromPath(sharedDir));
     store.close();
   });

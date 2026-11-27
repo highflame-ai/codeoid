@@ -1,7 +1,9 @@
 import { describe, it, expect } from "bun:test";
 import {
   formatCollaborationCost,
+  formatSessionCost,
   formatTokens,
+  formatTurnCost,
   formatCostUsd,
   formatDuration,
   formatPercent,
@@ -183,5 +185,45 @@ describe("formatCollaborationCost", () => {
     expect(
       formatCollaborationCost({ children: 3, totalCostUsd: 0, inputTokens: 0, outputTokens: 0, numTurns: 0 }),
     ).toBe("this goal so far: $0 · 0/0 tok · 0 turns · across 4 sessions");
+  });
+});
+
+describe("formatSessionCost (#430)", () => {
+  it("shows a reported cost as is", () => {
+    expect(formatSessionCost({ totalCostUsd: 0.42 }).text).toBe("$0.42");
+  });
+  it("marks an estimate", () => {
+    const c = formatSessionCost({ totalCostUsd: 0.42, costEstimated: true });
+    expect(c.text).toBe("~$0.42");
+    expect(c.title).toContain("estimated");
+  });
+  it("never shows unknown cost as $0", () => {
+    expect(formatSessionCost({ totalCostUsd: 0, costUnknownTurns: 2 }).text).toBe("$?");
+    expect(formatSessionCost({ totalCostUsd: 0.42, costUnknownTurns: 1 }).text).toBe("$0.42+");
+    expect(formatSessionCost({ totalCostUsd: 0.42, costEstimated: true, costUnknownTurns: 1 }).text).toBe("~$0.42+");
+    expect(formatSessionCost({ totalCostUsd: 0, costUnknownTurns: 1 }).title).toContain("unknown");
+  });
+  it("has nothing to show before any usage", () => {
+    expect(formatSessionCost(undefined).text).toBe("—");
+  });
+});
+
+describe("formatTurnCost (#430)", () => {
+  it("never shows an unknown turn as $0, and marks an estimate", () => {
+    expect(formatTurnCost(0, "unknown")).toBe("$?");
+    expect(formatTurnCost(0.42, "estimated")).toBe("~$0.42");
+    expect(formatTurnCost(0.42, "backend")).toBe("$0.42");
+    expect(formatTurnCost(0, "free")).toBe("$0");
+  });
+});
+
+describe("formatToolRisk (#431)", () => {
+  it("says the level and the most serious reason, and nothing for a low-risk command", async () => {
+    const { formatToolRisk } = await import("./format.js");
+    expect(formatToolRisk({ level: "high", reasons: ["rm deletes ~", "runs rm"] })).toBe("high risk: rm deletes ~");
+    expect(formatToolRisk({ level: "unknown", reasons: ["a syntax error"] })).toBe("not understood: a syntax error");
+    expect(formatToolRisk({ level: "medium", reasons: [] })).toBe("medium risk");
+    expect(formatToolRisk({ level: "low", reasons: [] })).toBe("");
+    expect(formatToolRisk(undefined)).toBe("");
   });
 });

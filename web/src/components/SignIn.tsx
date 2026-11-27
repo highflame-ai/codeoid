@@ -13,6 +13,7 @@ import { Component, Show, createSignal, onMount } from "solid-js";
 
 import {
   fetchOAuthProvider,
+  isLocalModeDaemon,
   registerWebAgent,
   rememberApiKey,
   rememberedApiKey,
@@ -119,16 +120,27 @@ const SignIn: Component<{ onSignedIn: () => void }> = (props) => {
             disabled={busy()}
           />
           {/*
-            A loopback local-mode daemon injects its token and this screen never
-            renders. It IS reached when the daemon runs `--local` on a wide bind
-            (where injecting into the HTML would hand control to anyone who can
-            reach the port), so name the paste-it path rather than leaving the
-            operator staring at a ZeroID-only prompt.
+            A local-mode daemon never puts its token in the page (#448 round 4:
+            a sandboxed agent command on the loopback could read it). On a
+            loopback bind a one-time link signs the browser in; this screen shows
+            when there was none, or it was spent. On a wide bind there are no
+            links: paste the token.
           */}
-          <span class="block text-[11px] text-fg-faint">
-            No account? Start the daemon with <code class="font-mono">codeoid start --local</code>{" "}
-            and paste its <code class="font-mono">codeoid_local_…</code> token here.
-          </span>
+          <Show
+            when={isLocalModeDaemon()}
+            fallback={
+              <span class="block text-[11px] text-fg-faint">
+                No account? Start the daemon with <code class="font-mono">codeoid start --local</code>{" "}
+                and paste its <code class="font-mono">codeoid_local_…</code> token here.
+              </span>
+            }
+          >
+            <span class="block text-[11px] text-fg-faint">
+              This daemon is in local mode: open the link <code class="font-mono">codeoid start</code> printed,
+              or run <code class="font-mono">codeoid ui</code> for a new one — or paste its{" "}
+              <code class="font-mono">codeoid_local_…</code> token here.
+            </span>
+          </Show>
         </label>
 
         <button

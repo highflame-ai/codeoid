@@ -6,7 +6,7 @@
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { secretPathVerdict } from "../daemon/secret-paths.js";
 
@@ -29,7 +29,7 @@ const verdict = (input: unknown, tool = "Read") => secretPathVerdict(tool, input
 
 describe("secretPathVerdict", () => {
   test("denies the credential files, on every backend's input key", () => {
-    for (const name of ["claude-accounts.json", "config.json", ".env", "local-token-7400", "claude-accounts.json.123.ab.tmp", "codeoid.db", "codeoid.db-wal"]) {
+    for (const name of ["claude-accounts.json", "endpoints.json", "endpoint-models.json", "endpoint-models.json.123.ab.tmp", "config.json", ".env", "local-token-7400", "claude-accounts.json.123.ab.tmp", "codeoid.db", "codeoid.db-wal"]) {
       expect(verdict({ file_path: join(configDir, name) })?.action).toBe("deny");
     }
     expect(verdict({ absolute_path: join(configDir, ".env") })?.action).toBe("deny"); // gemini / qwen read_file
@@ -55,10 +55,50 @@ describe("secretPathVerdict", () => {
     expect(verdict({ source: join(configDir, ".env"), destination: join(workdir, "x") }, "move_file")?.action).toBe("deny");
   });
 
+  test("denies pi's logins where pi reads them, a ~ in PI_CODING_AGENT_DIR included (#417)", () => {
+    const saved = { dir: process.env.PI_CODING_AGENT_DIR, home: process.env.HOME };
+    process.env.HOME = join(root, "home");
+    process.env.PI_CODING_AGENT_DIR = "~/pi-agent";
+    try {
+      expect(verdict({ file_path: join(root, "home", "pi-agent", "auth.json") })?.action).toBe("deny");
+    } finally {
+      for (const [k, v] of [["PI_CODING_AGENT_DIR", saved.dir], ["HOME", saved.home]] as const) {
+        if (v === undefined) delete process.env[k];
+        else process.env[k] = v;
+      }
+    }
+  });
+
+  test("denies a multi-file edit when any of its files is a secret, not only the first (opencode's patch)", () => {
+    const harmless = join(root, "home", "code", "notes.txt");
+    expect(verdict({ file_path: harmless, files: [harmless, join(configDir, "config.json")] }, "Edit")?.action).toBe("deny");
+    expect(verdict({ file_path: harmless, files: [harmless] }, "Edit")).toBeNull();
+  });
+
   test("denies a process environment or memory", () => {
     for (const p of ["/proc/self/environ", "/proc/1234/environ", "/proc/self/mem", "/proc/self/fd/3", "/proc/self/task/9/environ"]) {
       expect(verdict({ file_path: p })?.action).toBe("deny");
     }
+  });
+
+  test("denies one reached through a process's root link, and a credential file through it, for a pid that isn't running too (#447 round-18 audit)", () => {
+    for (const p of ["/proc/4242/root/proc/4242/environ", "/proc/self/root/proc/4242/environ", "/proc/4242/task/1/root/proc/1/environ", "/proc/4242/root/proc/4242/root/proc/1/fd/3", `/proc/4242/root${configDir}/config.json`]) {
+      expect([p, verdict({ file_path: p })?.action]).toEqual([p, "deny"]);
+    }
+    expect(verdict({ file_path: "/proc/4242/status" })).toBeNull();
+    expect(verdict({ file_path: "/proc/4242/root/etc/hostname" })).toBeNull();
+  });
+
+  test("takes `..` after a link as the kernel does: /dev/fd/../.. is /proc, and /proc/self/cwd is the workdir the tool opens it from (#447 round-19 audit)", () => {
+    for (const p of ["/dev/fd/../../4242/environ", "/dev/fd/../environ", "/proc/self/cwd/../../.codeoid/config.json", "/dev/fd/../cwd/../../.codeoid/config.json"]) {
+      expect([p, verdict({ file_path: p })?.action]).toEqual([p, "deny"]);
+    }
+    // A link inside the workdir pointing out of it: `..` after it is the parent of its target.
+    symlinkSync(join(configDir, "accounts"), join(workdir, "acc"));
+    mkdirSync(join(configDir, "accounts"));
+    expect(verdict({ file_path: "acc/../config.json" })?.action).toBe("deny");
+    // What resolves the same either way is as before.
+    expect(verdict({ file_path: "src/../README.md" })).toBeNull();
   });
 
   test("asks — never auto-runs — a search rooted above the credential files", () => {
@@ -68,6 +108,16 @@ describe("secretPathVerdict", () => {
     expect(verdict({ pattern: "*", path: "/proc" }, "Glob")?.action).toBe("ask");
     // No root = the workdir: a session whose workdir holds the config dir asks too.
     expect(secretPathVerdict("Grep", { pattern: "sk-ant-" }, { workdir: join(root, "home"), configDir })?.action).toBe("ask");
+    // opencode's card for reaching outside the workdir names directories.
+    expect(verdict({ directories: [configDir], tool: "grep" }, "opencode_external_directory")?.action).toBe("ask");
+    expect(verdict({ directories: [join(root, "home", "code")], tool: "grep" }, "opencode_external_directory")).toBeNull();
+  });
+
+  test("asks before any tool touches ~/.claude.json — its tokens, and where MCP approvals live (#395)", () => {
+    const file = join(homedir(), ".claude.json");
+    expect(verdict({ file_path: file })?.action).toBe("ask");
+    expect(verdict({ file_path: file, content: "{}" }, "Write")?.action).toBe("ask");
+    expect(verdict({ file_path: join(homedir(), ".claude.jsonx") })).toBeNull();
   });
 
   test("leaves everything else alone — including the rest of the config dir", () => {

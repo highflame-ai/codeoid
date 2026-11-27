@@ -9,12 +9,16 @@
  * Ranking and collection are pure (`lib/attention.ts`); this is the surface.
  */
 
-import { Component, For, Show, createSignal, onCleanup } from "solid-js";
+import { Component, For, Show, createSignal, onCleanup, onMount } from "solid-js";
 
 import { relativeTime } from "../lib/format";
 import type { AttentionItem, AttentionKind } from "../lib/attention";
 import { attentionCount, attentionItems } from "../state/attention";
 import { nowTick } from "../state/clock";
+import { openLoopRun, showRoutines, showWatches } from "./LoopsPanel";
+import { watchLoops } from "../state/loops";
+import { watchRoutines } from "../state/routines";
+import { watchWatches } from "../state/watches";
 import { focusSession } from "../state/sessions";
 
 const KIND_STYLE: Record<AttentionKind, { cls: string; label: string }> = {
@@ -36,6 +40,12 @@ const AttentionInbox: Component = () => {
     window.addEventListener("keydown", onKey);
     onCleanup(() => window.removeEventListener("keydown", onKey));
   }
+  // A loop run that waits on you has no session status of its own to show
+  // it, so keep the run list fresh in the background while the inbox lives.
+  onMount(() => onCleanup(watchLoops()));
+  // The same for watches whose poll fails and routines whose runs fail.
+  onMount(() => onCleanup(watchWatches()));
+  onMount(() => onCleanup(watchRoutines()));
 
   return (
     <div class="relative">
@@ -69,7 +79,9 @@ const AttentionInbox: Component = () => {
             fallback={
               <p class="px-3 py-4 text-xs text-fg-muted">
                 Nothing is waiting on you. Agents that wedge on an approval, ask a
-                question, or hit the failure limit show up here.
+                question, or hit the failure limit show up here, and so do
+                loop runs that ask you something or are blocked, watches
+                whose poll fails, and routines whose last run failed.
               </p>
             }
           >
@@ -111,23 +123,42 @@ const Row: Component<{ item: AttentionItem; onGo: () => void }> = (props) => {
   return (
     <li class="border-b border-border/40 last:border-b-0">
       {/* A stopped task whose worker was torn down has nowhere to go, so it
-          renders as a plain row rather than a button that does nothing. */}
+          renders as a plain row rather than a button that does nothing. A
+          loop run's row opens the run. */}
       <Show
-        when={props.item.sessionId}
-        fallback={<div class="flex flex-col gap-1 px-3 py-2">{body}</div>}
-      >
-        {(id) => (
+        when={!props.item.runId && !props.item.watchId && !props.item.routineId}
+        fallback={
           <button
             type="button"
             onClick={() => {
-              focusSession(id());
+              if (props.item.runId) openLoopRun(props.item.runId);
+              else if (props.item.watchId) showWatches(props.item.watchId);
+              else if (props.item.routineId) showRoutines(props.item.routineId);
               props.onGo();
             }}
             class="flex w-full flex-col gap-1 px-3 py-2 text-left transition hover:bg-bg-hover"
           >
             {body}
           </button>
-        )}
+        }
+      >
+        <Show
+          when={props.item.sessionId}
+          fallback={<div class="flex flex-col gap-1 px-3 py-2">{body}</div>}
+        >
+          {(id) => (
+            <button
+              type="button"
+              onClick={() => {
+                focusSession(id());
+                props.onGo();
+              }}
+              class="flex w-full flex-col gap-1 px-3 py-2 text-left transition hover:bg-bg-hover"
+            >
+              {body}
+            </button>
+          )}
+        </Show>
       </Show>
     </li>
   );

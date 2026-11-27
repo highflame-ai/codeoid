@@ -18,7 +18,7 @@ import type {
   OAuthClientMetadata,
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
-import type { Store } from "../store.js";
+import type { McpOAuthServerKey, Store } from "../store.js";
 import type { McpOAuthConfig, McpServerSpec } from "./types.js";
 
 export interface McpTenant {
@@ -76,6 +76,8 @@ export interface McpOAuthOptions {
 
 interface PendingSignIn {
   server: string;
+  /** The credential slot being signed in (workstreams §6.5 case 2); absent = the default. */
+  slot?: string;
   tenant: McpTenant;
   state: string;
   /** Secret the starting browser holds (as a cookie); see {@link McpOAuth.complete}. */
@@ -154,8 +156,10 @@ export class McpOAuth implements McpCredentialSource {
     const oauth = oauthOf(spec);
     this.#sweepPending();
     const state = randomBytes(24).toString("base64url");
+    const slot = slotOf(spec);
     const pending: PendingSignIn = {
       server: spec.name,
+      ...(slot ? { slot } : {}),
       tenant,
       state,
       binding: randomBytes(32).toString("base64url"),
@@ -186,7 +190,7 @@ export class McpOAuth implements McpCredentialSource {
     input: { callbackUrl: string } | { state: string; code?: string; error?: string; errorDescription?: string },
     proof: McpOAuthProof,
     resolveSpec: (server: string) => McpServerSpec | undefined,
-  ): Promise<{ server: string; tenant: McpTenant }> {
+  ): Promise<{ server: string; tenant: McpTenant; slot?: string }> {
     const params = "callbackUrl" in input ? parseCallback(input.callbackUrl) : input;
     const pending = params.state ? this.#pending.get(params.state) : undefined;
     if (!pending || pending.expiresAt < this.#now()) {
@@ -203,8 +207,10 @@ export class McpOAuth implements McpCredentialSource {
       throw new Error(`Sign-in to ${pending.server} failed: ${params.errorDescription ?? params.error}`);
     }
     if (!params.code) throw new Error(`Sign-in to ${pending.server} returned no authorization code.`);
-    const spec = resolveSpec(pending.server);
-    if (!spec) throw new Error(`MCP server "${pending.server}" is no longer configured.`);
+    const base = resolveSpec(pending.server);
+    if (!base) throw new Error(`MCP server "${pending.server}" is no longer configured.`);
+    // The slot the sign-in was started for, never the default one.
+    const spec = pending.slot ? withSlot(base, pending.slot) : base;
     const oauth = oauthOf(spec);
     const provider = this.#provider(spec, oauth, pending.tenant, pending);
     const result = await auth(provider, {
@@ -214,13 +220,13 @@ export class McpOAuth implements McpCredentialSource {
       fetchFn: this.#fetch,
     });
     if (result !== "AUTHORIZED") throw new Error(`Sign-in to ${pending.server} did not complete.`);
-    this.#rejected.delete(keyOf(spec.name, pending.tenant));
-    this.#bumpSignIn(spec.name, pending.tenant);
-    return { server: pending.server, tenant: pending.tenant };
+    this.#rejected.delete(keyOf(spec, pending.tenant));
+    this.#bumpSignIn(spec, pending.tenant);
+    return { server: pending.server, tenant: pending.tenant, ...(pending.slot ? { slot: pending.slot } : {}) };
   }
 
   async accessToken(spec: McpServerSpec, tenant: McpTenant): Promise<string | undefined> {
-    const key = keyOf(spec.name, tenant);
+    const key = keyOf(spec, tenant);
     const tokens = this.#tokens(spec, tenant);
     if (!tokens) return undefined;
     const stale = this.#rejected.get(key) === tokens.access_token;
@@ -234,7 +240,7 @@ export class McpOAuth implements McpCredentialSource {
   }
 
   rejected(spec: McpServerSpec, tenant: McpTenant, token: string): void {
-    this.#rejected.set(keyOf(spec.name, tenant), token);
+    this.#rejected.set(keyOf(spec, tenant), token);
   }
 
   /** Whether the tenant has a credential the daemon can use (or refresh). */
@@ -251,19 +257,34 @@ export class McpOAuth implements McpCredentialSource {
 
   credentialStamp(spec: McpServerSpec, tenant: McpTenant): string | undefined {
     if (!this.signedIn(spec, tenant)) return undefined;
-    return String(this.#signIns.get(keyOf(spec.name, tenant)) ?? 0);
+    return String(this.#signIns.get(keyOf(spec, tenant)) ?? 0);
   }
 
-  #bumpSignIn(server: string, tenant: McpTenant): void {
+  #bumpSignIn(server: McpServerSpec, tenant: McpTenant): void {
     const key = keyOf(server, tenant);
     this.#signIns.set(key, (this.#signIns.get(key) ?? 0) + 1);
   }
 
   /** Forget the tenant's tokens for a server (its client registration stays). */
   disconnect(spec: McpServerSpec, tenant: McpTenant): void {
-    this.#bumpSignIn(spec.name, tenant);
+    this.#bumpSignIn(spec, tenant);
     this.#store.clearMcpOAuth(tenant, serverOf(spec), "tokens");
-    this.#rejected.delete(keyOf(spec.name, tenant));
+    this.#rejected.delete(keyOf(spec, tenant));
+  }
+
+  /**
+   * Forget a credential slot of a server entirely (its credential was
+   * removed): every tenant's tokens and client registration, at every URL.
+   * Returns the tenants that had one, so their clients can be dropped.
+   */
+  forgetSlot(server: string, slot: string): McpTenant[] {
+    const tenants = this.#store.clearMcpOAuthSlot(server, slot);
+    for (const t of tenants) {
+      const key = keyOf({ name: server, slot }, t);
+      this.#signIns.set(key, (this.#signIns.get(key) ?? 0) + 1);
+      this.#rejected.delete(key);
+    }
+    return tenants;
   }
 
   // ── internals ──────────────────────────────────────────────────────────────
@@ -299,7 +320,7 @@ export class McpOAuth implements McpCredentialSource {
       console.error(`[codeoid] mcp oauth: refreshing ${spec.name} failed: ${err instanceof Error ? err.message : String(err)}`);
       return undefined;
     }
-    this.#rejected.delete(keyOf(spec.name, tenant));
+    this.#rejected.delete(keyOf(spec, tenant));
     return this.#tokens(spec, tenant)?.access_token;
   }
 
@@ -330,6 +351,7 @@ export class McpOAuth implements McpCredentialSource {
       store: this.#store,
       server: spec.name,
       serverUrl: urlOf(spec),
+      ...(slotOf(spec) ? { slot: slotOf(spec) } : {}),
       tenant,
       pending,
       redirectUrl: this.redirectUrl,
@@ -345,6 +367,8 @@ interface StoredProviderOptions {
   store: Store;
   server: string;
   serverUrl: string;
+  /** The credential slot read and written (workstreams §6.5 case 2); absent = the default. */
+  slot?: string;
   tenant: McpTenant;
   pending: PendingSignIn;
   redirectUrl: string;
@@ -363,8 +387,8 @@ class StoredProvider implements OAuthClientProvider {
     this.#o = o;
   }
 
-  get #server(): { name: string; url: string } {
-    return { name: this.#o.server, url: this.#o.serverUrl };
+  get #server(): McpOAuthServerKey {
+    return { name: this.#o.server, url: this.#o.serverUrl, ...(this.#o.slot ? { slot: this.#o.slot } : {}) };
   }
 
   get redirectUrl(): string {
@@ -462,8 +486,21 @@ function scopeOf(oauth: McpOAuthConfig): string | undefined {
 }
 
 /** A server's store address: its name and the URL its tokens are bound to. */
-function serverOf(spec: McpServerSpec): { name: string; url: string } {
-  return { name: spec.name, url: urlOf(spec) };
+/** Which stored credential a spec is called with: its server and URL, and its slot (workstreams §6.5 case 2). */
+function serverOf(spec: McpServerSpec): McpOAuthServerKey {
+  const slot = slotOf(spec);
+  return { name: spec.name, url: urlOf(spec), ...(slot ? { slot } : {}) };
+}
+
+/** `spec` called with credential slot `slot` (an OAuth server's second sign-in). */
+export function withSlot(spec: McpServerSpec, slot: string): McpServerSpec {
+  if (spec.transport.kind !== "http") return spec;
+  return { ...spec, transport: { ...spec.transport, credential: { id: slot } }, variant: `${spec.variant ?? ""}#oauth:${slot}` };
+}
+
+/** The credential slot a spec is called with: its transport's named credential; none = the default sign-in. */
+export function slotOf(spec: McpServerSpec): string | undefined {
+  return spec.transport.kind === "http" ? spec.transport.credential?.id : undefined;
 }
 
 function safeEqual(a: string, b: string): boolean {
@@ -472,8 +509,9 @@ function safeEqual(a: string, b: string): boolean {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
-function keyOf(server: string, tenant: McpTenant): string {
-  return `${tenant.accountId}\u0000${tenant.projectId}\u0000${server}`;
+function keyOf(spec: McpServerSpec | { name: string; slot?: string }, tenant: McpTenant): string {
+  const slot = "transport" in spec ? slotOf(spec) : spec.slot;
+  return `${tenant.accountId}\u0000${tenant.projectId}\u0000${spec.name}\u0000${slot ?? ""}`;
 }
 
 function sameTenant(a: McpTenant, b: McpTenant): boolean {

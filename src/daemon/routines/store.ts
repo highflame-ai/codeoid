@@ -16,8 +16,10 @@
 import { Database } from "bun:sqlite";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { BUSY_TIMEOUT_MS } from "../store.js";
+import type { LoopStatus } from "../loops/types.js";
 import {
   ACTIVE_RUN_STATUSES,
+  OUTCOME_RUN_STATUSES,
   type RoutineRow,
   type RoutineSpec,
   type RunRow,
@@ -63,6 +65,9 @@ interface RunDbRow {
   reason: string | null;
   check_output: string | null;
   payload: string | null;
+  loop_run_id: string | null;
+  loop_status: string | null;
+  cost_unknown?: number | null;
 }
 
 /** sha256 of an API token — only the hash is stored. */
@@ -72,6 +77,16 @@ export function hashToken(token: string): string {
 
 export class RoutineStore {
   readonly #db: Database;
+  /**
+   * Applied to a run's check output, summary and reason as they are written
+   * (docs/secrets-and-memory-design.md §2.6). Not the payload: the run reads it
+   * back as its data, and it is what whoever fired the routine sent.
+   */
+  scrubText: ((text: string) => string) | undefined;
+
+  #scrub(v: string | null): string | null {
+    return v && this.scrubText ? this.scrubText(v) : v;
+  }
 
   constructor(db: Database | string) {
     this.#db = typeof db === "string" ? new Database(db, { create: true }) : db;
@@ -133,6 +148,26 @@ export class RoutineStore {
         ON routine_runs(routine_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_routine_runs_status
         ON routine_runs(status);
+    `);
+    // Loop routines (added later): the loop run a routine run started.
+    const cols = (this.#db.prepare("PRAGMA table_info(routine_runs)").all() as Array<{ name: string }>).map((c) => c.name);
+    for (const c of ["loop_run_id", "loop_status"]) {
+      if (!cols.includes(c)) this.#db.exec(`ALTER TABLE routine_runs ADD COLUMN ${c} TEXT`);
+    }
+    // A run that spent an amount nobody can count (#430).
+    if (!cols.includes("cost_unknown")) this.#db.exec("ALTER TABLE routine_runs ADD COLUMN cost_unknown INTEGER NOT NULL DEFAULT 0");
+    // What a run spent on a later UTC day than it started, for that day's cap (#430).
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS routine_spend_carry (
+        run_id       TEXT NOT NULL,
+        routine_id   TEXT NOT NULL,
+        day          INTEGER NOT NULL,
+        cost_usd     REAL NOT NULL DEFAULT 0,
+        cost_unknown INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (run_id, day)
+      );
+      CREATE INDEX IF NOT EXISTS idx_routine_spend_carry_routine
+        ON routine_spend_carry(routine_id, day);
     `);
   }
 
@@ -280,8 +315,9 @@ export class RoutineStore {
     this.#db
       .prepare(
         `INSERT INTO routine_runs (id, routine_id, account_id, project_id, trigger, status, scheduled_for, created_at,
-           started_at, ended_at, session_id, cost_usd, input_tokens, output_tokens, summary, reason, check_output, payload)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           started_at, ended_at, session_id, cost_usd, input_tokens, output_tokens, summary, reason, check_output, payload,
+           loop_run_id, loop_status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         run.id,
@@ -298,10 +334,12 @@ export class RoutineStore {
         run.costUsd,
         run.inputTokens,
         run.outputTokens,
-        run.summary,
-        run.reason,
-        run.checkOutput,
+        this.#scrub(run.summary),
+        this.#scrub(run.reason),
+        this.#scrub(run.checkOutput),
         run.payload,
+        run.loopRunId,
+        run.loopStatus,
       );
   }
 
@@ -320,6 +358,9 @@ export class RoutineStore {
       reason: "reason",
       checkOutput: "check_output",
       payload: "payload",
+      loopRunId: "loop_run_id",
+      loopStatus: "loop_status",
+      costUnknown: "cost_unknown",
     };
     const sets: string[] = [];
     const vals: (string | number | null)[] = [];
@@ -327,7 +368,8 @@ export class RoutineStore {
       const col = cols[k];
       if (!col || v === undefined) continue;
       sets.push(`${col} = ?`);
-      vals.push(v as string | number | null);
+      const scrubbed = (k === "summary" || k === "reason" || k === "checkOutput") && typeof v === "string" ? this.#scrub(v) : v;
+      vals.push(typeof scrubbed === "boolean" ? (scrubbed ? 1 : 0) : (scrubbed as string | number | null));
     }
     if (sets.length === 0) return;
     this.#db.prepare(`UPDATE routine_runs SET ${sets.join(", ")} WHERE id = ?`).run(...vals, id);
@@ -365,12 +407,56 @@ export class RoutineStore {
     return rows.map(toRun);
   }
 
-  /** Spend since `since` (ms) — the daily cap's numerator. */
+  /**
+   * The newest run that ended with an outcome, by when it ended: what "how is
+   * this routine doing" means. Skipped, cancelled and interrupted runs are
+   * not outcomes, so a loop routine's blocked loop is not hidden behind the
+   * fires skipped while it ran.
+   */
+  lastOutcome(routineId: string): RunRow | undefined {
+    const ph = OUTCOME_RUN_STATUSES.map(() => "?").join(", ");
+    const row = this.#db
+      .prepare(
+        `SELECT * FROM routine_runs WHERE routine_id = ? AND status IN (${ph}) AND ended_at IS NOT NULL ORDER BY ended_at DESC, rowid DESC LIMIT 1`,
+      )
+      .get(routineId, ...OUTCOME_RUN_STATUSES) as RunDbRow | null;
+    return row ? toRun(row) : undefined;
+  }
+
+  /** True when what was spent since `since` (ms) includes an amount nobody can count (#430). */
+  unknownCostSince(routineId: string, since: number): boolean {
+    const row = this.#db
+      .prepare(
+        `SELECT (SELECT COUNT(*) FROM routine_runs WHERE routine_id = ? AND created_at >= ? AND cost_unknown = 1)
+              + (SELECT COUNT(*) FROM routine_spend_carry WHERE routine_id = ? AND day >= ? AND cost_unknown = 1) AS n`,
+      )
+      .get(routineId, since, routineId, since) as { n: number };
+    return row.n > 0;
+  }
+
+  /**
+   * Spend since `since` (ms) — the daily cap's numerator: the runs started
+   * since, and what earlier runs went on to spend since (#430). A run's own
+   * row holds all it spent; the carry is only the part on a later day.
+   */
   costSince(routineId: string, since: number): number {
     const row = this.#db
-      .prepare("SELECT COALESCE(SUM(cost_usd), 0) AS c FROM routine_runs WHERE routine_id = ? AND created_at >= ?")
-      .get(routineId, since) as { c: number };
+      .prepare(
+        `SELECT (SELECT COALESCE(SUM(cost_usd), 0) FROM routine_runs WHERE routine_id = ? AND created_at >= ?)
+              + (SELECT COALESCE(SUM(cost_usd), 0) FROM routine_spend_carry WHERE routine_id = ? AND day >= ?) AS c`,
+      )
+      .get(routineId, since, routineId, since) as { c: number };
     return row.c;
+  }
+
+  /** What a run spent on a UTC day after the one it started (`day`, ms at 00:00 UTC). */
+  carrySpend(runId: string, routineId: string, day: number, costUsd: number, unknown: boolean): void {
+    this.#db
+      .prepare(
+        `INSERT INTO routine_spend_carry (run_id, routine_id, day, cost_usd, cost_unknown) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT (run_id, day) DO UPDATE SET cost_usd = excluded.cost_usd, cost_unknown = excluded.cost_unknown`,
+      )
+      .run(runId, routineId, day, costUsd, unknown ? 1 : 0);
   }
 
   /** Session ids of finished runs, newest first — retention picks from here. */
@@ -403,10 +489,12 @@ export class RoutineStore {
    * Keep a routine's newest `keep` finished runs; delete older ones — except
    * what later runs still read: anything since `keepSince` (today's spend,
    * which the daily cap sums), the newest summary ({{last_summary}}), and the
-   * newest handled run (CODEOID_ROUTINE_SINCE).
+   * newest handled run (CODEOID_ROUTINE_SINCE), and the newest outcome
+   * (`lastOutcome`, which a long run of skips must not push out).
    */
   trimRuns(routineId: string, keep: number, keepSince: number): void {
     const ph = ACTIVE_RUN_STATUSES.map(() => "?").join(", ");
+    const outcomes = OUTCOME_RUN_STATUSES.map(() => "?").join(", ");
     this.#db
       .prepare(
         `DELETE FROM routine_runs WHERE routine_id = ? AND status NOT IN (${ph}) AND created_at < ?
@@ -418,9 +506,14 @@ export class RoutineStore {
              ORDER BY created_at DESC, rowid DESC LIMIT 1)
            AND rowid NOT IN (
              SELECT rowid FROM routine_runs WHERE routine_id = ? AND status IN ('succeeded', 'silent') AND started_at IS NOT NULL
-             ORDER BY created_at DESC, rowid DESC LIMIT 1)`,
+             ORDER BY created_at DESC, rowid DESC LIMIT 1)
+           AND rowid NOT IN (
+             SELECT rowid FROM routine_runs WHERE routine_id = ? AND status IN (${outcomes}) AND ended_at IS NOT NULL
+             ORDER BY ended_at DESC, rowid DESC LIMIT 1)`,
       )
-      .run(routineId, ...ACTIVE_RUN_STATUSES, keepSince, routineId, ...ACTIVE_RUN_STATUSES, keep, routineId, routineId);
+      .run(routineId, ...ACTIVE_RUN_STATUSES, keepSince, routineId, ...ACTIVE_RUN_STATUSES, keep, routineId, routineId, routineId, ...OUTCOME_RUN_STATUSES);
+    // Carried spend only ever counts for its own day.
+    this.#db.prepare("DELETE FROM routine_spend_carry WHERE routine_id = ? AND day < ?").run(routineId, keepSince);
   }
 
   /** The last run that produced a summary — feeds {{last_summary}}. */
@@ -444,15 +537,34 @@ export class RoutineStore {
   /** Delete a routine's runs (with the routine). */
   deleteRuns(routineId: string): void {
     this.#db.prepare("DELETE FROM routine_runs WHERE routine_id = ?").run(routineId);
+    this.#db.prepare("DELETE FROM routine_spend_carry WHERE routine_id = ?").run(routineId);
+  }
+
+  /** Everyone who holds a routine, once each, with their tenant. */
+  owners(): Array<{ sub: string; accountId: string; projectId: string }> {
+    return (
+      this.#db.prepare("SELECT DISTINCT account_id, project_id, owner_sub FROM routines").all() as Array<{
+        account_id: string;
+        project_id: string;
+        owner_sub: string;
+      }>
+    ).map((r) => ({ sub: r.owner_sub, accountId: r.account_id, projectId: r.project_id }));
+  }
+
+  /** Runs following a loop run they started — still open until the loop ends. */
+  loopFollowingRuns(): RunRow[] {
+    return this.activeRuns().filter((r) => r.loopRunId !== null);
   }
 
   /**
    * Boot recovery: runs that were checking or running belong to a process that
    * is gone, so they are closed as interrupted. Queued runs never started and
-   * stay queued — an API fire answered 202 still runs after a restart.
+   * stay queued — an API fire answered 202 still runs after a restart. A run
+   * following a loop is left open: the loop survives the restart, and the
+   * scheduler picks the run up again.
    */
   interruptActiveRuns(now: number, reason: string): RunRow[] {
-    const active = this.activeRuns().filter((r) => r.status !== "queued");
+    const active = this.activeRuns().filter((r) => r.status !== "queued" && r.loopRunId === null);
     for (const r of active) this.updateRun(r.id, { status: "interrupted", endedAt: now, reason });
     return active;
   }
@@ -508,5 +620,8 @@ function toRun(r: RunDbRow): RunRow {
     reason: r.reason,
     checkOutput: r.check_output,
     payload: r.payload,
+    loopRunId: r.loop_run_id ?? null,
+    loopStatus: (r.loop_status as LoopStatus | null) ?? null,
+    ...(r.cost_unknown ? { costUnknown: true } : {}),
   };
 }

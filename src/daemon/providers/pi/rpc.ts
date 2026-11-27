@@ -38,6 +38,8 @@ export interface PiSpawnOptions {
   onEvent: (frame: PiFrame) => void;
   /** Called once when the process exits (code/signal for diagnostics). */
   onExit: (info: { code: number | null; signal: string | null; stderrTail: string }) => void;
+  /** Start pi inside the session's OS sandbox (#448, SandboxHandle.wrap). Absent = as is. */
+  wrap?: (argv: readonly string[], opts: { cwd: string; env: Record<string, string> }) => { argv: string[]; env: Record<string, string> };
 }
 
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -57,10 +59,13 @@ export class PiRpcProcess {
 
   constructor(opts: PiSpawnOptions) {
     this.#onEvent = opts.onEvent;
-    this.#proc = spawn(opts.command, [...(opts.argsPrefix ?? []), "--mode", "rpc", ...(opts.args ?? [])], {
+    const argv = [opts.command, ...(opts.argsPrefix ?? []), "--mode", "rpc", ...(opts.args ?? [])];
+    const wrapped = opts.wrap ? opts.wrap(argv, { cwd: opts.cwd, env: opts.env }) : { argv, env: opts.env };
+    const [bin = opts.command, ...rest] = wrapped.argv;
+    this.#proc = spawn(bin, rest, {
       cwd: opts.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: opts.env,
+      env: wrapped.env,
     });
 
     this.#proc.stdout.setEncoding("utf8");
@@ -98,6 +103,11 @@ export class PiRpcProcess {
 
   get alive(): boolean {
     return !this.#exited;
+  }
+
+  /** The child's pid while it runs (process-tree kill on terminateBackend). */
+  get pid(): number | undefined {
+    return this.#exited ? undefined : this.#proc.pid;
   }
 
   /**

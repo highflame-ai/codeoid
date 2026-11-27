@@ -456,14 +456,46 @@ describe("DaemonMessage routing", () => {
           return `login.submit:${msg.ok}`;
         case "backend.login.cancel.result":
           return `login.cancel:${msg.ok}`;
+        case "backend.login.wait.result":
+          return `login.wait:${msg.ok}`;
         case "skill.grant.result":
           return `skill.grant:${msg.allowed}`;
+        case "worktree.trust.result":
+          return `worktree.trust:${msg.trusted}`;
+        case "workstream.list.result":
+          return `workstream.list:${msg.workstreams.length}`;
+        case "workstream.resolve.result":
+          return `workstream.resolve:${msg.resolution.home ?? "none"}`;
+        case "workstreams.changed":
+          return `workstreams.changed:${msg.revision}`;
+        case "credential.list.result":
+          return `credential.list:${msg.credentials.length}`;
+        case "secret.list.result":
+          return `secrets:${msg.secrets.length}`;
+        case "secret.reveal.result":
+          return `secret:${msg.kind}`;
+        case "approval_rules.list.result":
+          return `approval_rules:${msg.rules.length}`;
+        case "approval_rules.add.result":
+          return `approval_rule:${msg.rule.rule}`;
         case "session.turns.result":
           return `turns:${msg.turns.length}`;
         case "session.approvals.result":
           return `approvals:${msg.approvals.length}`;
         case "claude.accounts.result":
           return `claude-accounts:${msg.accounts.length}`;
+        case "accounts.result":
+          return `accounts:${msg.backends.length}`;
+        case "accounts.changed":
+          return `accounts.changed:${msg.backend}`;
+        case "providers.result":
+          return `providers:${msg.providers.length}`;
+        case "providers.changed":
+          return `providers.changed:${msg.providers.length}`;
+        case "endpoints.result":
+          return `endpoints:${msg.endpoints.length}`;
+        case "endpoints.test.result":
+          return `endpoints.test:${msg.ok}`;
         case "session.rewind.result":
           return `rewind:${msg.removedTurns}`;
         case "compare.state":
@@ -482,6 +514,16 @@ describe("DaemonMessage routing", () => {
           return `routine.token:${msg.routineId}`;
         case "routine.preview.result":
           return `routine.preview:${msg.fires.length}`;
+        case "evidence.record":
+          return `evidence:${msg.evidence.result}`;
+        case "loop.snapshot":
+          return `loop:${msg.run.status}`;
+        case "loop.list.result":
+          return `loops:${msg.runs.length}`;
+        case "loop.watch.snapshot":
+          return `loop.watch:${msg.watch.enabled}`;
+        case "loop.watch.list.result":
+          return `loop.watches:${msg.watches.length}`;
         case "mcp.oauth.begin.result":
           return `mcp.oauth.begin:${msg.status}`;
         case "mcp.oauth.complete.result":

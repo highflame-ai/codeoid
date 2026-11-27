@@ -32,6 +32,7 @@ import PartsView, { hasRichParts } from "./PartsView";
 import { openRewind } from "../RewindModal";
 import { openForkFromHere } from "../ForkFromHereModal";
 import { openCompare } from "../CompareModal";
+import { RiskLine, SandboxLine } from "./ApprovalBar";
 
 const ROLE_LABEL: Record<MessageRole, string> = {
   user: "you",
@@ -344,6 +345,15 @@ const ToolBlock: Component<{ msg: SessionMessage }> = (props) => {
           {(t().state as { output?: string }).output ?? "no error message"}
         </div>
       </Show>
+      {/* A refused or interrupted edit: the diff stays as the body, and why it didn't run under it. */}
+      <Show when={(editInput() || writeInput()) && t().state.phase === "cancelled"}>
+        <div class="rounded border border-danger/40 bg-danger/10 px-2 py-1.5 text-xs text-danger">
+          cancelled — {(t().state as { reason: string }).reason}
+          <Show when={(t().state as { message?: string }).message}>
+            : {(t().state as { message?: string }).message}
+          </Show>
+        </div>
+      </Show>
     </div>
     }>
       {(card) => <FleetActionCard card={card()} state={t().state} toolId={t().toolId} />}
@@ -456,6 +466,8 @@ const WaitingConfirmationBody: Component<{
           <div class="rounded bg-bg-active/50 px-2 py-1.5 text-sm text-fg">
             {props.state.description}
           </div>
+          <RiskLine risk={props.state.risk} />
+          <SandboxLine sandboxed={props.state.sandboxed} sandboxNote={props.state.sandboxNote} sandboxDocker={props.state.sandboxDocker} />
           <LazyJsonDetails value={props.state.input} />
         </div>
       </Match>
@@ -491,22 +503,26 @@ const LazyJsonDetails: Component<{ value: unknown }> = (props) => {
 };
 
 const PhaseBadge: Component<{ state: ToolState }> = (props) => {
-  const phase = props.state.phase;
-  const cls =
-    phase === "completed"
+  // Read through props on every render: a tool's state changes in place
+  // (executing → completed), and a value captured once would freeze the badge.
+  const phase = () => props.state.phase;
+  const cls = () => {
+    const p = phase();
+    return p === "completed"
       ? "border-success/40 text-success"
-      : phase === "executing" || phase === "streaming"
+      : p === "executing" || p === "streaming"
         ? "border-warn/40 text-warn animate-pulse"
-        : phase === "waiting_confirmation"
+        : p === "waiting_confirmation"
           ? "border-accent/40 text-accent"
-          : phase === "cancelled"
+          : p === "cancelled"
             ? "border-danger/40 text-danger"
             : "border-border text-fg-faint";
+  };
   return (
     <span
-      class={`rounded border px-1.5 py-0.5 text-[10px] uppercase tracking-wider ${cls}`}
+      class={`rounded border px-1.5 py-0.5 text-[10px] uppercase tracking-wider ${cls()}`}
     >
-      {phase.replace("_", " ")}
+      {phase().replace("_", " ")}
     </span>
   );
 };

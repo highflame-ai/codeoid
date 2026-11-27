@@ -26,6 +26,12 @@ export interface McpOAuthBeginMsg {
   id: string;
   /** Registry server name. */
   server: string;
+  /**
+   * A named OAuth credential (a slot: a second sign-in to this server, e.g.
+   * one per workstream — docs/workstreams-design.md §6.5). Absent = the
+   * server's default sign-in.
+   */
+  credential?: string;
 }
 
 export interface McpOAuthCompleteMsg {
@@ -39,6 +45,8 @@ export interface McpOAuthDisconnectMsg {
   type: "mcp.oauth.disconnect";
   id: string;
   server: string;
+  /** The slot to sign out of; absent = the default sign-in. */
+  credential?: string;
 }
 
 /**

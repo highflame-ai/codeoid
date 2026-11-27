@@ -13,7 +13,7 @@
  */
 
 import type { SessionMessage } from "../../protocol/types.js";
-import type { Episode } from "./types.js";
+import type { Episode, EpisodeOrigin } from "./types.js";
 import { takeSpill } from "../compress/spill.js";
 
 export interface ChunkerContext {
@@ -24,6 +24,10 @@ export interface ChunkerContext {
    *  When set, a tool result naming a spill file is stored with the raw
    *  output in place of the compressed text the agent saw. */
   spillDir?: string;
+  /** What the session knows of a tool call (docs/secrets-and-memory-design.md §3): where it ran, its exit code, how long it ran. */
+  toolFacts?: (messageId: string) => { cwd?: string; exitCode?: number; durationMs?: number } | undefined;
+  /** Who and what produced the episodes of the turn running now. */
+  turnFacts?: () => { backend?: string; model?: string; origin?: EpisodeOrigin; workstream?: string };
 }
 
 /** Paths seen in a tool input — used for path-overlap ranking. */
@@ -65,6 +69,19 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
+interface OpenToolCall {
+  messageId: string;
+  toolName: string;
+  input: unknown;
+  filePaths: string[];
+  startedAt: number;
+  userPrompt: string | null;
+  priorAssistantText: string;
+  createdBy: string;
+  /** Who and what, and in which workstream, as they were when the call opened (it may complete after a later turn began). */
+  facts: { backend?: string; model?: string; origin?: EpisodeOrigin; workstream?: string };
+}
+
 export class EpisodeChunker {
   #ctx: ChunkerContext;
   #onEpisode: (ep: Omit<Episode, "id">) => void;
@@ -73,16 +90,10 @@ export class EpisodeChunker {
   #pendingUserPrompt: string | null = null;
   /** Assistant reasoning accumulated between tool calls. */
   #pendingAssistantText: string[] = [];
-  /** Open tool_call episode awaiting completion. */
-  #openToolCall: {
-    messageId: string;
-    toolName: string;
-    input: unknown;
-    filePaths: string[];
-    startedAt: number;
-    userPrompt: string | null;
-    priorAssistantText: string;
-  } | null = null;
+  /** Tool calls awaiting their result, by message id: a turn can run several at once. */
+  #openToolCalls = new Map<string, OpenToolCall>();
+  #lastAssistantBy: string | null = null;
+  #lastAssistantAt: string | null = null;
 
   constructor(ctx: ChunkerContext, onEpisode: (ep: Omit<Episode, "id">) => void) {
     this.#ctx = ctx;
@@ -94,62 +105,60 @@ export class EpisodeChunker {
     switch (msg.role) {
       case "user":
         this.#closeStandaloneAssistantTurnIfAny();
+        // What the previous turn left unsaid (a reply after its calls) is its own episode.
+        this.#flushReply();
         this.#pendingUserPrompt = msg.content;
         this.#pendingAssistantText = [];
         break;
 
       case "assistant":
-        if (this.#openToolCall) {
-          // Assistant text between tool calls — treat as follow-up reasoning for next tool call.
-          this.#pendingAssistantText.push(msg.content);
-        } else {
-          // Plain assistant turn with no tool use — emit user+assistant combined.
-          this.#emitTurnEpisode(msg.content, msg.timestamp, msg.identity.sub);
-          this.#pendingUserPrompt = null;
-          this.#pendingAssistantText = [];
-        }
+        // Held until it is known what it is: reasoning for the call that follows it (a call opens
+        // with it), or the turn's answer, stored with the prompt when the turn ends (#flushReply).
+        this.#pendingAssistantText.push(msg.content);
+        this.#lastAssistantBy = msg.identity.sub;
+        this.#lastAssistantAt = msg.timestamp;
         break;
 
       case "tool_call": {
         if (!msg.tool) break;
         const phase = msg.tool.state.phase;
         if (phase === "executing" || phase === "waiting_confirmation") {
-          // Close any prior unfinished tool_call before opening a new one.
-          if (this.#openToolCall) {
-            this.#emitOpenToolCall("unfinished", msg.timestamp, msg.identity.sub);
-          }
+          // Already open (a call asked, then approved): keep what it opened with.
+          if (this.#openToolCalls.has(msg.messageId)) break;
           const input =
             "input" in msg.tool.state ? (msg.tool.state.input as unknown) : {};
-          this.#openToolCall = {
+          this.#openToolCalls.set(msg.messageId, {
             messageId: msg.messageId,
             toolName: msg.tool.name,
             input,
             filePaths: extractFilePaths(msg.tool.name, input),
-            startedAt: Date.parse(msg.timestamp),
+            startedAt: Date.parse(msg.timestamp) || Date.now(),
+            createdBy: msg.identity.sub,
+            facts: this.#ctx.turnFacts?.() ?? {},
             userPrompt: this.#pendingUserPrompt,
             priorAssistantText: this.#pendingAssistantText.join("\n\n"),
-          };
+          });
           this.#pendingAssistantText = [];
         } else if (phase === "completed" || phase === "cancelled") {
-          if (
-            this.#openToolCall &&
-            this.#openToolCall.messageId === msg.messageId
-          ) {
-            const output =
-              phase === "completed" && "output" in msg.tool.state
-                ? (msg.tool.state.output as string | undefined)
-                : undefined;
-            this.#emitOpenToolCall(output ?? "", msg.timestamp, msg.identity.sub);
+          if (this.#openToolCalls.has(msg.messageId)) {
+            const state = msg.tool.state as { output?: unknown; message?: unknown };
+            const output = phase === "completed" ? state.output : state.message;
+            const reason = (msg.tool.state as { reason?: unknown }).reason;
+            this.#emitOpenToolCall(
+              msg.messageId,
+              typeof output === "string" && output ? output : phase === "cancelled" ? (reason === "interrupted" ? "interrupted" : "cancelled") : "",
+              msg.timestamp,
+              msg.identity.sub,
+            );
           }
         }
         break;
       }
 
       case "tool_result": {
-        // If the SDK ever surfaces explicit tool_result messages, treat as completion.
-        if (this.#openToolCall) {
-          this.#emitOpenToolCall(msg.content, msg.timestamp, msg.identity.sub);
-        }
+        // If the SDK ever surfaces explicit tool_result messages, treat as the oldest open call's completion.
+        const first = this.#openToolCalls.keys().next().value;
+        if (first !== undefined) this.#emitOpenToolCall(first, msg.content, msg.timestamp, msg.identity.sub);
         break;
       }
 
@@ -168,17 +177,55 @@ export class EpisodeChunker {
     }
   }
 
-  /** Call when the turn is done (SDK result message) to flush any standalone assistant turn. */
+  /**
+   * Call when the turn is done (SDK result message): a call still open never
+   * got its result (a backend that settled it unseen) and closes as
+   * unfinished; a reply that came after the turn's tool calls is the turn's
+   * answer, and becomes its episode.
+   */
   onTurnEnd(): void {
+    // A call still open may be background work that completes later: it stays open, its episode
+    // closing with its result. Bounded: past an hour, or past 64 open, the oldest close unfinished.
+    const now = Date.now();
+    for (const [id, tc] of [...this.#openToolCalls]) {
+      if (!(now - tc.startedAt <= 3_600_000) || this.#openToolCalls.size > 64) this.#emitOpenToolCall(id, "unfinished", new Date().toISOString(), tc.createdBy);
+    }
+    this.#flushReply();
     this.#closeStandaloneAssistantTurnIfAny();
+  }
+
+  /**
+   * The turn's answer: the text no call took as its reasoning, one episode with the prompt it
+   * answers. The prompt stays for the rest of the turn (a turn can end and go on: a mid-turn
+   * boundary), until the next prompt.
+   */
+  #flushReply(): void {
+    if (this.#pendingAssistantText.length === 0) return;
+    this.#emitTurnEpisode(this.#pendingAssistantText.join("\n\n"), this.#lastAssistantAt ?? new Date().toISOString(), this.#lastAssistantBy ?? this.#ctx.createdBy);
+    this.#pendingAssistantText = [];
+  }
+
+  /** A turn the backend began itself (a background wake): what came before is stored, and no prompt goes on. */
+  onAdoptedTurn(): void {
+    this.#flushReply();
+    this.#pendingUserPrompt = null;
+  }
+
+  /**
+   * The session is ending (destroyed, the daemon stopping): every call still open is stored as
+   * unfinished, and what the turn said is stored, so nothing it did is lost.
+   */
+  flushAll(): void {
+    for (const [id, tc] of [...this.#openToolCalls]) this.#emitOpenToolCall(id, "unfinished", new Date().toISOString(), tc.createdBy);
+    this.#flushReply();
   }
 
   // ── Episode emission ──────────────────────────────────────────────────
 
-  #emitOpenToolCall(output: string, timestamp: string, createdBy: string): void {
-    const tc = this.#openToolCall;
+  #emitOpenToolCall(messageId: string, output: string, timestamp: string, createdBy: string): void {
+    const tc = this.#openToolCalls.get(messageId);
     if (!tc) return;
-    this.#openToolCall = null;
+    this.#openToolCalls.delete(messageId);
 
     const parts: string[] = [];
     if (tc.userPrompt) parts.push(`# User intent\n${tc.userPrompt}`);
@@ -198,6 +245,7 @@ export class EpisodeChunker {
     const content = parts.join("\n\n");
     const summary = `${tc.toolName}(${summarizeInput(tc.input)})`;
 
+    const facts = this.#ctx.toolFacts?.(tc.messageId);
     this.#onEpisode({
       workspaceId: this.#ctx.workspaceId,
       sessionId: this.#ctx.sessionId,
@@ -209,6 +257,11 @@ export class EpisodeChunker {
       tokenEstimate: estimateTokens(content),
       createdAt: Date.parse(timestamp) || Date.now(),
       createdBy,
+      ...this.#turnFacts(tc.facts),
+      ...(tc.facts.workstream ? { workstreamId: tc.facts.workstream } : {}),
+      ...(facts?.cwd ? { cwd: facts.cwd } : {}),
+      ...(facts?.exitCode !== undefined ? { exitCode: facts.exitCode } : {}),
+      ...(facts?.durationMs !== undefined ? { durationMs: facts.durationMs } : {}),
     });
 
     // Leave pendingUserPrompt in place — later tool calls in the same turn share it.
@@ -239,6 +292,7 @@ export class EpisodeChunker {
       tokenEstimate: estimateTokens(content),
       createdAt: Date.parse(timestamp) || Date.now(),
       createdBy,
+      ...this.#turnFacts(),
     });
   }
 
@@ -253,7 +307,14 @@ export class EpisodeChunker {
       tokenEstimate: estimateTokens(text),
       createdAt: Date.parse(timestamp) || Date.now(),
       createdBy,
+      ...this.#turnFacts(),
     });
+  }
+
+  #turnFacts(at?: OpenToolCall["facts"]): { backend?: string; model?: string; origin?: EpisodeOrigin } {
+    const f = at ?? this.#ctx.turnFacts?.();
+    if (!f) return {};
+    return { ...(f.backend ? { backend: f.backend } : {}), ...(f.model ? { model: f.model } : {}), ...(f.origin ? { origin: f.origin } : {}) };
   }
 
   #closeStandaloneAssistantTurnIfAny(): void {

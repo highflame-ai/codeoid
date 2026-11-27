@@ -13,11 +13,13 @@
 import type {
   AuthContext,
   ContentPart,
+  EffortLevel,
   ProviderCommand,
   SessionMode,
   UiRequestMethod,
 } from "../../protocol/types.js";
 import type { CanonicalTurn, HistorySeedResult } from "./canonical.js";
+import type { BackendHostFiles } from "../sandbox/host-file-tools.js";
 import type { LLMCallUsage } from "../context-math.js";
 import type { PackSubagent } from "../pipeline/subagents.js";
 
@@ -51,6 +53,21 @@ export type ToolApprovalFn = (
    * waiting on an answer nobody will read.
    */
   signal?: AbortSignal,
+  /**
+   * The agent that asked, when it isn't the session's main agent (Claude: the
+   * SDK's `agentID`, which for a background agent is its task id). Lets the
+   * gate refuse an agent that isn't this session's (a fork's parent's).
+   */
+  agentId?: string,
+  /**
+   * The directory the backend reports this call runs in (Claude's Bash keeps
+   * a `cd` between calls, and the CLI resolves a Grep or Glob's relative
+   * `path` from there too; its PreToolUse hook's `cwd`): a shell call's
+   * risk and a tool's relative paths are judged from there (#431,
+   * secret-paths.ts). Null: the backend's cwd may have
+   * moved and it didn't say where. Absent: the backend runs in the workdir.
+   */
+  shellCwd?: string | null,
 ) => Promise<{
   behavior: "allow" | "deny";
   updatedInput?: Record<string, unknown>;
@@ -72,6 +89,12 @@ export interface UiRequest {
   prefill?: string;
   /** Auto-cancel deadline in ms. Absent = wait for a human (or interrupt). */
   timeoutMs?: number;
+  /**
+   * Aborted when the backend no longer wants the answer (it settled the
+   * question itself: its call ended, its agent stopped). The dialog is
+   * dismissed everywhere and settles cancelled, reason `withdrawn`.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -87,9 +110,10 @@ export interface UiResponse {
    * Why a cancelled dialog got no answer: a client dismissed it, its own
    * `timeoutMs` elapsed, the turn was interrupted / the session torn down, or
    * the turn is unattended (`unattended` — the daemon is driving it, e.g. a
-   * pipeline phase, and never prompts). Absent when answered.
+   * pipeline phase, and never prompts), or the provider withdrew it
+   * (`withdrawn`, its `signal`). Absent when answered.
    */
-  reason?: "dismissed" | "timeout" | "interrupted" | "unattended";
+  reason?: "dismissed" | "timeout" | "interrupted" | "unattended" | "withdrawn";
 }
 
 /** Raise a dialog and await the user's answer. Implemented by Session. */
@@ -102,6 +126,14 @@ export type UiRequestFn = (req: UiRequest) => Promise<UiResponse>;
  */
 export const BUDGET_STOP_MESSAGE = "Stopped at the spend ceiling for this run (maxBudgetUsd).";
 
+/**
+ * The turn error a backend reports when it stopped itself under a spend
+ * ceiling because a request's spend can't be counted: its backend put no
+ * price on tokens it used and codeoid has none either (#430). Not over
+ * budget: the run can't tell, so it fails, as a capped run of unknown cost does.
+ */
+export const UNPRICED_STOP_MESSAGE = "Stopped: this run has a spend ceiling, and a request's spend has no price (set one in pricing.models).";
+
 export interface TurnOpts {
   /**
    * Full canonical history up to and including the current user turn.
@@ -113,6 +145,8 @@ export interface TurnOpts {
   userMessage: string;
   model?: string;
   fallbackModel?: string;
+  /** Thinking effort for this turn (#417), on codeoid's scale; absent = the backend's default. */
+  effort?: EffortLevel;
   workdir: string;
   systemPromptAppend?: string;
   /** Session's unified approval gate — same semantics across all providers. */
@@ -186,6 +220,19 @@ export interface NormalizedTurnResult {
   /** Claude-specific; 0 for other providers. */
   cacheCreationTokens: number;
   totalCostUsd: number;
+  /**
+   * Where `totalCostUsd` comes from (#430). `backend`: the backend said what
+   * the turn cost (Claude, pi). `free`: nothing to pay (a model on this
+   * machine). `unknown`: the backend can't tell (no token counts). Absent: it
+   * gave tokens but no cost, and the session prices them.
+   */
+  costSource?: "backend" | "free" | "unknown";
+  /**
+   * The largest single request's prompt in the turn (input + cache), for a
+   * backend that sums several requests into the turn's counts and reports no
+   * per-request usage (#430): prices with a long-context tier need it.
+   */
+  largestPromptTokens?: number;
   durationMs: number;
   /**
    * Context window of the model that ran this turn, as the backend stated it.
@@ -200,6 +247,13 @@ export interface NormalizedTurnResult {
   stopReason?: string;
   isError?: boolean;
   errorMessage?: string;
+  /**
+   * The backend's own result text for a turn it flagged as an error without
+   * an error subtype (Claude: `subtype: "success"`, `is_error: true`) — where
+   * the CLI puts a usage-limit or "API Error: …" notice. Text the CLI wrote,
+   * possibly the model's: read only with CLI-shaped rules (classifyCliNotice).
+   */
+  resultText?: string;
   /**
    * Where this turn ends in the backend's OWN record of the conversation, for
    * a backend that can later fork or resume from that point natively (#387).
@@ -314,6 +368,8 @@ export type ProviderEvent =
        * the daemon's approval sanitizer doesn't need per-tool hardcoding.
        */
       patchableKeys?: string[];
+      /** As {@link ToolApprovalFn}'s `shellCwd`: where the backend reports this shell call runs. */
+      shellCwd?: string | null;
     }
   /** Fired when a tool result is available (from the provider's user message). */
   | {
@@ -326,13 +382,49 @@ export type ProviderEvent =
       declinedByBackend?: boolean;
       /** A tool_result hook replaced `output`: the backend's own record still holds the original. */
       redacted?: boolean;
+      /** A shell call's exit code, where the backend reports it as a field (Codex, opencode). */
+      exitCode?: number;
+      /** How long it ran, where the backend reports it (Codex): a call it ran unasked is announced only once done. */
+      durationMs?: number;
     }
   | { type: "subagent_start"; agentId: string; agentType: string }
   | { type: "subagent_stop"; agentId: string }
   | { type: "mcp_init"; servers: Record<string, string>; tools: Record<string, string[]> }
   /** Per-LLM-call usage, split by primary vs subagent (null parent_tool_use_id = primary). */
-  | { type: "llm_call"; usage: LLMCallUsage; isPrimary: boolean }
+  | {
+      type: "llm_call";
+      usage: LLMCallUsage;
+      isPrimary: boolean;
+      /** The request's id, for a backend that reports one request several times: a repeat replaces the earlier report (#430). */
+      requestId?: string;
+      /** The sub-agent whose request this is (its spawning tool call's id), where the backend says (#430). */
+      parentToolUseId?: string | null;
+    }
+  /**
+   * A request was sent to the model (#430), for a backend whose usage arrives
+   * only when the request ends: a turn stopped before then still spent.
+   */
+  | { type: "model_request" }
+  /**
+   * The model began streaming an output block (a tool call's, say) that no
+   * text or thinking delta shows (#430): its request's usage hasn't come yet.
+   */
+  | { type: "model_output"; parentToolUseId?: string | null }
   | { type: "api_retry"; attempt?: number; retryDelayMs?: number; errorStatus?: number | null }
+  /**
+   * The backend's plan rate-limit state changed (Claude's `rate_limit_event`,
+   * subscription accounts only). `rejected` means requests are refused until
+   * `resetsAt` (epoch ms) — the exact reset a usage-limit error's text often
+   * gives only as a wall-clock time. Observational: nothing retries on it.
+   */
+  | {
+      type: "rate_limit";
+      status: "allowed" | "allowed_warning" | "rejected";
+      resetsAt?: number;
+      limitType?: string;
+      /** Extra usage (overage) is carrying requests past the spent window — nothing is refused. */
+      overage?: boolean;
+    }
   | { type: "tool_progress"; toolName?: string; elapsedSeconds?: number }
   /**
    * Provider-authored standalone message — extension output, status cards,
@@ -358,7 +450,15 @@ export type ProviderEvent =
    * denied. Distinct from a tool approval, whose SDK turn is still live.
    */
   | { type: "approval_pending"; command: string }
-  | { type: "error"; message: string };
+  /**
+   * The turn failed. `detail` is the backend's STRUCTURED error, when it gave
+   * one (codex's `codexErrorInfo` + reset instant — codexErrorDetail): read by
+   * the usage-limit classifier, never shown. `message` stays the display text.
+   * `result`: what the failed turn spent, for a backend that counts it itself
+   * (opencode): recorded as the turn's cost, instead of an estimate from the
+   * `llm_call`s Session saw (#430).
+   */
+  | { type: "error"; message: string; detail?: Record<string, unknown>; result?: NormalizedTurnResult };
 
 /**
  * True when a text/thinking ProviderEvent was produced by a subagent
@@ -391,6 +491,8 @@ export interface BackgroundTaskSnapshot {
   kind: string;
   description: string;
   status: string;
+  /** The backend says it's ambient (a watcher it started itself): not the agent's work. */
+  ambient?: boolean;
 }
 
 /**
@@ -472,6 +574,13 @@ export interface TurnRun {
   /** Push a message mid-turn (ClaudeProvider only). */
   pushMidTurn?(content: string, priority: "now" | "next" | "later"): void;
   /**
+   * False once the run can't take a `pushMidTurn` any more: the backend's
+   * turn already ended, though Session may not have read its end yet. The
+   * message then starts a turn of its own, as on a backend with no mid-turn
+   * injection. Absent means it always can.
+   */
+  acceptsMidTurn?(): boolean;
+  /**
    * Signal that the consumer has stopped reading `events` — called from
    * Session's turn-exit path, exactly once per run.
    *
@@ -505,6 +614,11 @@ export interface ModelInfo {
   /** Context window in tokens, when the backend publishes it on its catalog.
    *  qwen-code and pi do; Claude and codex report the window per turn. */
   contextWindow?: number;
+  /** Thinking efforts the model takes, when the backend reports them (#417). */
+  efforts?: EffortLevel[];
+  defaultEffort?: EffortLevel;
+  /** The model the backend runs when none is chosen. */
+  isDefault?: boolean;
 }
 
 /**
@@ -521,6 +635,12 @@ export interface CatalogEntry {
   displayName: string;
   description?: string;
   contextWindow?: number;
+  /** Thinking efforts the model takes (#417), when the backend reports them; [] = it doesn't think. */
+  efforts?: EffortLevel[];
+  /** The backend's default effort for the model, when it says. */
+  defaultEffort?: EffortLevel;
+  /** The model the backend runs when none is chosen, when it says (the effort picker reads its levels). */
+  isDefault?: boolean;
 }
 
 /**
@@ -598,6 +718,23 @@ export interface AgentProvider {
    */
   reconnectMcpServer?(name: string): Promise<BackendMcpServerState | null>;
   /**
+   * Thinking effort (#417): how a change reaches this backend. Absent or
+   * "turn" = it takes each turn's `TurnOpts.effort`; "restart" = only when the
+   * backend starts (the Gemini CLI's settings), so the session rebuilds it
+   * before the next turn.
+   */
+  readonly effortChange?: "turn" | "restart";
+  /** What Default means on this backend now, once known (#417) — for the session's pickers. */
+  readonly defaultEffort?: EffortLevel | null;
+  /** The model it runs when the session names none, once known. */
+  readonly runningModel?: string | null;
+  /**
+   * Apply a new effort to the running backend now, where it can (Claude,
+   * Qwen, pi) — never cutting a turn short. True when it did; false (or
+   * absent) = it applies from the next turn's options.
+   */
+  applyEffort?(effort: EffortLevel | null): Promise<boolean>;
+  /**
    * Hand this (fresh) backend an existing conversation in its OWN native form,
    * instead of a transcript in the first prompt (#387): fork its own
    * conversation at `forkFrom` when given, else build native history from
@@ -616,6 +753,11 @@ export interface AgentProvider {
    */
   readonly supportsMemoryTools?: boolean;
   /**
+   * Its turns cost nothing (a model on the user's own server, #430) — also the
+   * ones that end with no result, which the session records itself.
+   */
+  readonly free?: boolean;
+  /**
    * True when the backend runs the `updatedInput` an `allow` verdict carries —
    * a hook's rewrite of a tool call, or an approver's form answers — instead
    * of the input it proposed. Absent = false: a backend that only hears
@@ -625,6 +767,22 @@ export interface AgentProvider {
    * applies the new input to what it actually executes.
    */
   readonly appliesToolInputRewrite?: boolean;
+  /**
+   * False when, in autonomous mode, the backend runs tool calls WITHOUT
+   * asking canUseTool — so codeoid's autonomous tool budget (and
+   * `onBudgetExhausted`) cannot see, count or stop them. Codex: autonomous
+   * maps to `approvalPolicy: "never"`. Absent = true (every call is gated).
+   * A loop controller falls back to wall-time limits (supervisor.ts) there.
+   */
+  readonly enforcesToolBudget?: boolean;
+  /**
+   * Pids of the processes this backend spawned itself (its CLI / app-server)
+   * that are alive now. Session.terminateBackend snapshots their whole tree
+   * before the teardown and kills what outlives it (process-tree.ts). Absent
+   * or empty = unknown (in-process backends; qwen-code, whose SDK spawns
+   * internally): only the teardown runs.
+   */
+  backendProcessIds?(): Promise<number[]>;
   dispose(): Promise<void>;
 }
 
@@ -638,6 +796,14 @@ export interface AgentProvider {
 export interface SessionProvider extends AgentProvider {
   /** Set by Session before each runTurn(). Handles "backing session lost" errors. */
   onRecoveryNeeded: ((content: string) => void) | undefined;
+  /**
+   * Set by Session. A backend that could not resume its native conversation
+   * (a thread written under another account's home, a vendor that lost it)
+   * and is about to start an empty one calls this, synchronously, before it
+   * sends the prompt: Session seeds it with the canonical history so the
+   * conversation carries on instead of silently starting over.
+   */
+  onHistoryLost?: (() => void) | undefined;
   /**
    * The session-lifetime event listener (at most one — the owning Session).
    * Session-scoped events MUST be delivered here and never through
@@ -655,12 +821,42 @@ export interface SessionProvider extends AgentProvider {
    */
   readonly continuesAfterBackgroundWork?: boolean;
   /**
+   * How long, at most, the backend takes to end a turn (its result, spend
+   * included) after an interrupt. A daemon shutting down waits that long for
+   * an interrupted turn's end, then gives up on it (`DRAIN_SETTLE_MS` when unset).
+   */
+  readonly interruptSettleMs?: number;
+  /**
    * Stop background tasks by id (the ids of the `background_tasks` level).
    * What Stop does when no turn is in flight: without it, nobody holding only
    * `session:interrupt` could halt a misbehaving background agent. Optional —
-   * a backend with no background work never has any to stop.
+   * a backend with no background work never has any to stop. Resolves to
+   * the ids it couldn't stop (still running), [] when every stop went through.
    */
-  stopBackgroundTasks?(taskIds: readonly string[]): Promise<void>;
+  stopBackgroundTasks?(taskIds: readonly string[]): Promise<string[]>;
+  /**
+   * On a fork, why a tool call is its parent's work and is refused, or null:
+   * the backend's own check (the Claude provider's), run again by Session on
+   * an input a codeoid hook rewrote, since the backend checked the input it
+   * proposed. Absent on a backend with no such check.
+   */
+  foreignCallRefusal?(toolName: string, input: unknown, agentId: string | undefined): string | null;
+  /**
+   * Where the backend's own file tools must read outside the sandbox while
+   * it is on (#448 round 8, sandbox/host-file-tools.ts): what it put there
+   * itself for the model (Claude's saved tool output for this session, its
+   * skills' own files). Read only, never written. Absent: nothing.
+   */
+  hostReadable?(): readonly string[];
+  /**
+   * What the backend's own file tools keep outside the sandbox as context,
+   * never as code (#448 round 9): readable (its user-tier agents, commands,
+   * rules, CLAUDE.md, installed plugins' skills), writable (its background
+   * tasks' output, its scratch dir), `.md` files writable (Claude's
+   * auto-memory and plan dirs), and the hidden paths its searches leave out.
+   * Held to in autonomous mode with the sandbox's own bounds. Absent: none.
+   */
+  hostFiles?(): BackendHostFiles;
   /** Underlying backing session ID (for display and Store persistence). */
   readonly backingSessionId: string;
   /** True once runTurn() has been called at least once (guards agent registration). */

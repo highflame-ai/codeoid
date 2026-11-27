@@ -13,11 +13,11 @@
 import React from "react";
 import { useEffect, useState } from "react";
 import { Box, Text } from "ink";
-import type { SessionMessage, ToolInfo } from "../../protocol/types.js";
+import type { SessionMessage, ToolInfo, ToolRisk } from "../../protocol/types.js";
 import { renderMarkdown, type Segment } from "../markdown.js";
 import { computeDiff, truncateToolOutput } from "../diff.js";
 import { fileUri, maybeLink } from "../osc8.js";
-import { isBackgroundWake, parseBackgroundWake } from "@highflame/codeoid-core";
+import { formatToolRisk, isBackgroundWake, parseBackgroundWake } from "@highflame/codeoid-core";
 
 export interface MessageRowProps {
   msg: SessionMessage;
@@ -228,6 +228,20 @@ function ToolRow({
       {phase === "waiting_confirmation" && "description" in tool.state && (
         <Text color="red" dimColor>
           {(tool.state as { description: string }).description}
+        </Text>
+      )}
+      {/* The workstream a fleet dispatch acts in, and what approving confirms (workstreams §10). */}
+      {phase === "waiting_confirmation" && (tool.state as { targetWorkstream?: { workstream?: string } }).targetWorkstream?.workstream && (
+        <Text color="cyan">⌂ workstream {(tool.state as { targetWorkstream?: { workstream?: string } }).targetWorkstream?.workstream}</Text>
+      )}
+      {phase === "waiting_confirmation" && (tool.state as { targetWorkstream?: { warning?: string } }).targetWorkstream?.warning && (
+        <Text color="yellow" bold>
+          ⚠ {(tool.state as { targetWorkstream?: { warning?: string } }).targetWorkstream?.warning}
+        </Text>
+      )}
+      {phase === "waiting_confirmation" && formatToolRisk((tool.state as { risk?: ToolRisk }).risk) && (
+        <Text color={(tool.state as { risk?: ToolRisk }).risk?.level === "medium" ? "yellow" : "red"} bold>
+          ▲ {formatToolRisk((tool.state as { risk?: ToolRisk }).risk)}
         </Text>
       )}
       {isEdit &&

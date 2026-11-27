@@ -35,8 +35,9 @@ import { openCapabilitiesDrawer } from "../CapabilitiesDrawer";
 import { openHelpModal } from "../HelpModal";
 import { openPackBrowser } from "../PackBrowser";
 import { openPipelineRunner } from "../PipelineRunner";
+import { openLoopStart, showLoops } from "../LoopsPanel";
 import { openSettings } from "../SettingsDrawer";
-import { openModelPicker } from "../SessionControls";
+import { openEffortPicker, openModelPicker } from "../SessionControls";
 import { openIdentityDrawer } from "../IdentityDrawer";
 import { openExportModal } from "../SessionExportModal";
 import { openImportModal } from "../SessionImportModal";
@@ -247,6 +248,8 @@ const PromptBox: Component = () => {
           showSettings: openSettings,
           showPacks: openPackBrowser,
           showPipeline: openPipelineRunner,
+          showLoops,
+          showLoopStart: openLoopStart,
           showExport: openExportModal,
           showImport: openImportModal,
           onSessionForked: (forked) => {
@@ -255,6 +258,7 @@ const PromptBox: Component = () => {
           },
           showHelp: openHelpModal,
           showModelPicker: openModelPicker,
+          showEffortPicker: openEffortPicker,
         });
         clearDraft(draftKey());
         setText("");
@@ -422,7 +426,7 @@ const PromptBox: Component = () => {
         </Show>
         <div class="px-1 text-[10px] text-fg-faint">
           /new · /rename · /interrupt · /rotate · /mode · /model · /packs ·
-          /pipeline · /export · /import · /who · /agents · /skills · /mcp ·
+          /pipeline · /loop · /loops · /export · /import · /who · /agents · /skills · /mcp ·
           /hooks · /destroy
         </div>
       </div>

@@ -18,8 +18,10 @@ vi.mock("../state/sessions", () => ({
 }));
 
 import ForkFromHereModal, { openForkFromHere } from "./ForkFromHereModal";
+import { ingestAuthProviders } from "../state/providers";
 
 beforeEach(() => {
+  ingestAuthProviders({ providers: ["claude", "pi"] });
   requestMock.mockReset();
   focusMock.mockReset();
 });

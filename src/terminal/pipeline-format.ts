@@ -49,6 +49,10 @@ export function formatPipeline(p: PipelineWire): string[] {
     if (ph.feedback && ph.feedback.length > 0) {
       out.push(`        revisions: ${ph.feedback.length}`);
     }
+    if (ph.evidence && ph.evidence.length > 0) {
+      const last = ph.evidence[ph.evidence.length - 1];
+      out.push(`        evidence: ${ph.evidence.length} check(s), latest ${last}  (codeoid evidence <id>)`);
+    }
     // The findings loop (review → fix → re-review): where it stands, and what
     // the engine runs next while the phase is still in motion.
     if (ph.findings) {

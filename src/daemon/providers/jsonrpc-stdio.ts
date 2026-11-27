@@ -38,6 +38,11 @@ export interface StdioJsonRpcSpawnOptions {
    */
   onServerRequest: (method: string, params: Record<string, unknown>) => Promise<unknown>;
   onExit: (info: { code: number | null; signal: string | null; stderrTail: string }) => void;
+  /**
+   * Start the process inside the session's OS sandbox (#448): the argv and
+   * env that run `command args` there (SandboxHandle.wrap). Absent = as is.
+   */
+  wrap?: (argv: readonly string[], opts: { cwd: string; env: Record<string, string> }) => { argv: string[]; env: Record<string, string> };
 }
 
 const REQUEST_TIMEOUT_MS = 30_000;
@@ -57,10 +62,12 @@ export class StdioJsonRpcProcess {
 
   constructor(opts: StdioJsonRpcSpawnOptions) {
     this.#opts = opts;
-    this.#proc = spawn(opts.command, opts.args, {
+    const wrapped = opts.wrap ? opts.wrap([opts.command, ...opts.args], { cwd: opts.cwd, env: opts.env }) : null;
+    const [bin, ...argv] = wrapped ? wrapped.argv : [opts.command, ...opts.args];
+    this.#proc = spawn(bin ?? opts.command, argv, {
       cwd: opts.cwd,
       stdio: ["pipe", "pipe", "pipe"],
-      env: opts.env,
+      env: wrapped ? wrapped.env : opts.env,
     });
     // A child that dies mid-write must not crash the daemon: without an
     // error listener, stdin's EPIPE becomes an uncaught stream error. The
@@ -82,6 +89,11 @@ export class StdioJsonRpcProcess {
 
   get alive(): boolean {
     return !this.#exited;
+  }
+
+  /** The child's pid while it runs (process-tree kill on terminateBackend). */
+  get pid(): number | undefined {
+    return this.#exited ? undefined : this.#proc.pid;
   }
 
   /** Client→server request; resolves with the JSON-RPC result. */
