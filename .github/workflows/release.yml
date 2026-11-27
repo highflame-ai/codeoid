@@ -6,6 +6,7 @@ on:
       - "v*.*.*"
 
 env:
+  RELEASE_VERSION: ${{ github.event.release.tag_name || github.ref_name }}
   REGEX_PATTERN: "^v[0-9]+\\.[0-9]+\\.[0-9]+$"
 
 jobs:
@@ -24,16 +25,62 @@ jobs:
         id: validate_tag
         shell: bash
         run: |-
-          if [[ "${GITHUB_REF_NAME}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
-            echo "Valid version format: ${GITHUB_REF_NAME}"
+          if [[ "${{ env.RELEASE_VERSION }}" =~ ${{ env.REGEX_PATTERN }} ]] ; then
+            echo "Valid version format: ${{ env.RELEASE_VERSION }}"
           else
-            echo "Invalid version format: ${GITHUB_REF_NAME}"
+            echo "Invalid version format: ${{ env.RELEASE_VERSION }}"
             exit 1
           fi
 
-  highflame-release:
+  highflame-version-validate:
     needs:
       - highflame-validate
+    permissions:
+      contents: 'read'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Verify package versions match
+        shell: bash
+        run: |-
+          set -euo pipefail
+
+          RELEASE_VERSION="${RELEASE_VERSION#v}"
+          echo "Expected version: $RELEASE_VERSION"
+
+          # Root package.json
+          ROOT_VERSION=$(jq -r '.version // empty' package.json)
+          echo "package.json version: $ROOT_VERSION"
+
+          # Protocol package.json
+          PROTOCOL_VERSION=$(jq -r '.version // empty' packages/protocol/package.json)
+          echo "packages/protocol/package.json version: $PROTOCOL_VERSION"
+
+          # Core package.json
+          CORE_VERSION=$(jq -r '.version // empty' packages/core/package.json)
+          echo "packages/core/package.json version: $CORE_VERSION"
+
+          # Validate all versions
+          if [[ "$ROOT_VERSION" != "$RELEASE_VERSION" ]] || \
+            [[ "$PROTOCOL_VERSION" != "$RELEASE_VERSION" ]] || \
+            [[ "$CORE_VERSION" != "$RELEASE_VERSION" ]]; then
+            echo "::error::Package version mismatch!"
+            echo "Expected: $RELEASE_VERSION"
+            echo "package.json: $ROOT_VERSION"
+            echo "packages/protocol/package.json: $PROTOCOL_VERSION"
+            echo "packages/core/package.json: $CORE_VERSION"
+            exit 1
+          fi
+
+          echo "All package versions match: $RELEASE_VERSION"
+
+  highflame-release:
+    needs:
+      - highflame-version-validate
     permissions:
       contents: write
       id-token: write
@@ -43,48 +90,6 @@ jobs:
         uses: actions/checkout@v6
         with:
           persist-credentials: false
-
-      - name: Extract version from release
-        id: version
-        env:
-          RELEASE_NAME: ${{ github.event.release.tag_name || github.ref_name }}
-        shell: bash
-        run: |-
-          VERSION=$(echo "$RELEASE_NAME" | sed 's|^v||g')
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
-          echo "Releasing version: $VERSION"
-
-      - name: Update root package.json
-        env:
-          VERSION: ${{ steps.version.outputs.VERSION }}
-        shell: bash
-        run: |-
-          jq ".version = \"${VERSION}\"" package.json > package.json.tmp
-          mv package.json.tmp package.json
-          echo "Updated root package.json:"
-          grep '"version"' package.json
-
-      - name: Update protocol package.json
-        env:
-          VERSION: ${{ steps.version.outputs.VERSION }}
-        shell: bash
-        run: |-
-          cd packages/protocol
-          jq ".version = \"${VERSION}\"" package.json > package.json.tmp
-          mv package.json.tmp package.json
-          echo "Updated protocol package.json:"
-          grep '"version"' package.json
-
-      - name: Update core package.json
-        env:
-          VERSION: ${{ steps.version.outputs.VERSION }}
-        shell: bash
-        run: |-
-          cd packages/core
-          jq ".version = \"${VERSION}\"" package.json > package.json.tmp
-          mv package.json.tmp package.json
-          echo "Updated core package.json:"
-          grep '"version"' package.json
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -107,27 +112,12 @@ jobs:
         shell: bash
         run: bun install --frozen-lockfile
 
-      - name: Update the dependencies version
-        shell: bash
-        run: |-
-          VERSION="${GITHUB_REF_NAME#v}"
-
-          jq --arg version "^${VERSION}" '
-            .dependencies["@highflame/codeoid-core"] = $version |
-            .dependencies["@highflame/codeoid-protocol"] = $version' \
-            package.json > package.json.tmp && mv package.json.tmp package.json
-
-          cd packages/core
-          jq --arg version "^${VERSION}" \
-            '.peerDependencies["@highflame/codeoid-protocol"] = $version' \
-            package.json > package.json.tmp && mv package.json.tmp package.json
-
       # Every publishable package ships at the SAME version, and the tag is that
       # version. One gate replaces per-package version bookkeeping: if this
       # passes, all three publishes below are known-correct and known-new.
       - name: Verify workspace versions are in lockstep with the tag
         shell: bash
-        run: bun run check:versions "${{ env.GITHUB_REF_NAME }}"
+        run: bun run check:versions "${{ env.RELEASE_VERSION }}"
 
       - name: Build web UI
         shell: bash
@@ -139,16 +129,6 @@ jobs:
       - name: Test
         shell: bash
         run: bun run test
-
-      - name: Verify package version matches the tag
-        shell: bash
-        run: |-
-          PKG="$(node -p "require('./package.json').version")"
-          TAG="${GITHUB_REF_NAME#v}"
-          if [ "$PKG" != "$TAG" ]; then
-            echo "::error::package.json version ($PKG) does not match tag ($TAG)"
-            exit 1
-          fi
 
       # @highflame/codeoid-protocol is a workspace dependency of codeoid; publish it FIRST
       # (only when its version is new) so codeoid's published dep resolves.
